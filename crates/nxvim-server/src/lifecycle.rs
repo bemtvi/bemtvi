@@ -608,6 +608,24 @@ impl EditHost {
             }
         }
 
+        // Re-read the filetype / fileencoding now that `BufReadPost`/`BufNewFile` has
+        // run: a read callback may set either (`vim.bo.filetype = "python"` from a
+        // shebang/content detector — the canonical "detect filetype in a
+        // `BufReadPost`" pattern — or `vim.bo.fileencoding = …`), and that write
+        // already landed via `apply_lua_effects` inside `fire_lifecycle` above. The
+        // snapshots at the top of this pass predate it, so the `FileType` /
+        // `EncodingChanged` decisions below must read the *current* values —
+        // otherwise `FileType` fires for the stale pre-callback filetype (a spurious
+        // `FileType <detected>` before the real `FileType python`) and only reaches
+        // the callback's filetype a diff later via the `run_pending` re-diff,
+        // decoupled from `BufReadPost` and out of neovim's `BufReadPost → FileType`
+        // order; the encoding baseline seeded below would likewise record the stale
+        // value and fire a late `EncodingChanged`.
+        let cur_ft = self.editor.buffer_filetype(buf);
+        let ft_changed = self.fired_filetype.get(&buf) != Some(&cur_ft);
+        let cur_enc = self.editor.buffer_fileencoding(buf).unwrap_or_default();
+        let enc_changed = matches!(self.fired_encoding.get(&buf), Some(prev) if prev != &cur_enc);
+
         // FileType, on first set and on every filetype *change* (see `ft_changed`).
         // The pattern is the buffer's filetype — an explicit one (`:set ft`,
         // `nx.bo.filetype`, or a core-created special buffer's `set_filetype`: the
@@ -693,6 +711,19 @@ impl EditHost {
         // (doc-floats excluded) list.
         for &w in &self.known_windows {
             if let Some(b) = self.editor.window_buffer(w) {
+                // Hold a buffer whose open is still pending (a deferred `:edit` whose
+                // content lands later this convergence): it's empty and unnamed now,
+                // so firing `BufWinEnter` here would announce the placeholder — ahead
+                // of `BufReadPost`/`FileType` and against the wrong (pre-load)
+                // filetype. Skip it *and* leave it out of the baseline, so it fires
+                // once, in neovim's order, over the filled buffer on the load diff —
+                // the window-visibility twin of the `pending_open` gate on
+                // `BufReadPost`/`BufEnter` above (which use the *current* buffer's
+                // pending state; here every displayed buffer is checked, so a
+                // background window filled by a session restore is covered too).
+                if self.editor.has_pending_open(b) {
+                    continue;
+                }
                 new_map.insert(w, b);
                 if shown.insert(b) {
                     newly_shown.push(b);

@@ -510,6 +510,35 @@ async fn bufreadpost_callback_reads_buffer_name_from_snapshot() {
     assert_eq!(msg, file.display().to_string());
 }
 
+#[tokio::test]
+async fn bufreadpost_setting_filetype_fires_filetype_autocmd() {
+    // A BufReadPost (here via the `BufRead` alias) callback that sets the buffer's
+    // filetype — the standard "detect by shebang / content" pattern — must trigger
+    // the matching `FileType` autocmd. The file has no recognized extension, so its
+    // detected filetype is empty; the callback promotes it to `python`, and a
+    // `FileType python` handler must fire for that late assignment.
+    let dir = temp_dir("au_ft_from_bufread");
+    let file = dir.join("script"); // no extension -> no detected filetype
+    std::fs::write(&file, "#!/usr/bin/env -S uv run\nprint('hi')\n").expect("write script");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufRead', {\n\
+         \x20 callback = function(ev)\n\
+         \x20   if vim.bo[ev.buf].filetype == '' then\n\
+         \x20     vim.bo[ev.buf].filetype = 'python'\n\
+         \x20   end\n\
+         \x20 end })\n\
+         vim.api.nvim_create_autocmd('FileType', {\n\
+         \x20 pattern = 'python',\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'ft=' .. a.match end })\n",
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, '|'))").await;
+    assert_eq!(msg, "ft=python");
+}
+
 // ----- Phase 3: mode event (InsertEnter) -------------------------------------
 
 #[tokio::test]
@@ -1453,4 +1482,123 @@ async fn bufwinenter_fires_for_a_buffer_shown_in_a_non_current_window() {
     .unwrap();
     let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await;
     assert_eq!(msg, "a.rs,noname");
+}
+
+#[tokio::test]
+async fn bufreadpost_setting_filetype_fires_filetype_once_in_order() {
+    // The canonical "detect the filetype in a read autocmd" pattern: a `BufReadPost`
+    // callback overrides the buffer's filetype (here `.lua` -> `python`, the shebang
+    // case). `FileType` must fire exactly ONCE, for the callback's final filetype,
+    // and right after `BufReadPost` (neovim's `BufReadPost` -> `FileType` order).
+    //
+    // Regression: the `FileType` decision used a snapshot taken *before* `BufReadPost`
+    // ran, so it fired `FileType lua` (the stale, pre-override filetype) and only
+    // reached `FileType python` a diff later via the `run_pending` re-diff — a
+    // spurious extra fire, for the wrong filetype, decoupled from `BufReadPost`.
+    // Exercised on the deferred open path (a `BufReadCmd` handler is registered, as
+    // the built-in explorer does, so `:edit` defers), where the bug surfaced.
+    let dir = temp_dir("au_ft_after_bufread");
+    let file = dir.join("thing.lua"); // detected ft = lua, overridden to python
+    std::fs::write(&file, "-- x\nreturn 1\n").expect("write");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufReadCmd', { pattern = '*',\n\
+         \x20 callback = function(a) if a.isdir then return true end end })\n\
+         vim.api.nvim_create_autocmd('BufReadPost', { pattern = '*',\n\
+         \x20 callback = function(ev)\n\
+         \x20   _G.log[#_G.log+1] = 'read'\n\
+         \x20   vim.bo[ev.buf].filetype = 'python'\n\
+         \x20 end })\n\
+         vim.api.nvim_create_autocmd('FileType', { pattern = '*',\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'ft:' .. a.match end })\n",
+    )
+    .await;
+    exec_lua(&rpc, "_G.log = {}").await; // drop the startup buffer's events
+                                         // Read the log the moment `:edit` converges — `exec_lua` drives no further
+                                         // lifecycle emit — so a `FileType` that only fires on a *later* input, or a
+                                         // spurious extra fire, is observed rather than masked.
+    nxvim_test_harness::feed(&rpc, &format!(":edit {}<CR>", file.display()));
+    let _ = rpc.request("nvim_get_mode", vec![]).await;
+    let v = exec_lua(&rpc, "return table.concat(_G.log, ' ')").await;
+    assert_eq!(v.as_str().unwrap_or("<nil>"), "read ft:python");
+}
+
+#[tokio::test]
+async fn deferred_open_fires_read_events_in_order_before_bufwinenter() {
+    // On the deferred open path (a `BufReadCmd` handler registered, as the built-in
+    // explorer does), a `:edit` into a *new* buffer must fire the read lifecycle in
+    // neovim's order — `BufReadPost` -> `FileType` -> `BufEnter` -> `BufWinEnter` —
+    // every event seeing the loaded buffer's final filetype.
+    //
+    // Regression: `BufWinEnter` was not gated by the buffer's pending-open state, so
+    // it fired *first*, over the empty/unnamed placeholder buffer and against the
+    // pre-load filetype — e.g. `BufWinEnter(lua) BufReadPost(lua) FileType(python)
+    // BufEnter(python)`.
+    let dir = temp_dir("au_deferred_order");
+    let a = dir.join("a.txt");
+    let b = dir.join("thing.lua"); // detected ft = lua, overridden to python on read
+    std::fs::write(&a, "aaa\n").expect("write a");
+    std::fs::write(&b, "-- b\nreturn 2\n").expect("write b");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufReadCmd', { pattern = '*',\n\
+         \x20 callback = function(x) if x.isdir then return true end end })\n\
+         -- Override the filetype first, so the loggers below observe the final one.\n\
+         vim.api.nvim_create_autocmd('BufReadPost', { pattern = '*',\n\
+         \x20 callback = function(ev) vim.bo[ev.buf].filetype = 'python' end })\n\
+         for _, ev in ipairs({ 'BufReadPost', 'BufEnter', 'BufWinEnter' }) do\n\
+         \x20 vim.api.nvim_create_autocmd(ev, { pattern = '*', callback = function(x)\n\
+         \x20   _G.log[#_G.log+1] = x.event .. '(' .. vim.bo[x.buf].filetype .. ')' end })\n\
+         end\n\
+         vim.api.nvim_create_autocmd('FileType', { pattern = '*', callback = function(x)\n\
+         \x20 _G.log[#_G.log+1] = 'FileType(' .. x.match .. ')' end })\n",
+    )
+    .await;
+    exec_lua(&rpc, "_G.log = {}").await; // drop the startup file's events
+    nxvim_test_harness::feed(&rpc, &format!(":edit {}<CR>", b.display()));
+    let _ = rpc.request("nvim_get_mode", vec![]).await;
+    let v = exec_lua(&rpc, "return table.concat(_G.log, ' ')").await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "BufReadPost(python) FileType(python) BufEnter(python) BufWinEnter(python)",
+    );
+}
+
+#[tokio::test]
+async fn bufreadpost_setting_fileencoding_does_not_fire_spurious_encodingchanged() {
+    // A `BufReadPost` callback that sets `vim.bo.fileencoding` is part of
+    // establishing the buffer's encoding on read — like detection — so it must NOT
+    // fire `EncodingChanged` (which fires only on a *later* in-place change). The
+    // baseline is seeded silently with the callback's value.
+    //
+    // Regression twin of the `FileType` fix: the encoding decision used a snapshot
+    // taken *before* `BufReadPost` ran, so the baseline recorded the stale
+    // pre-callback encoding and a `run_pending` re-diff then fired a spurious,
+    // decoupled `EncodingChanged`.
+    let dir = temp_dir("au_enc_from_bufread");
+    let file = dir.join("thing.txt");
+    std::fs::write(&file, "hello\n").expect("write");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufReadCmd', { pattern = '*',\n\
+         \x20 callback = function(a) if a.isdir then return true end end })\n\
+         vim.api.nvim_create_autocmd('BufReadPost', { pattern = '*',\n\
+         \x20 callback = function(ev) vim.bo[ev.buf].fileencoding = 'latin1' end })\n\
+         vim.api.nvim_create_autocmd('EncodingChanged', { pattern = '*',\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'enc:' .. a.match end })\n",
+    )
+    .await;
+    exec_lua(&rpc, "_G.log = {}").await; // drop startup events
+    nxvim_test_harness::feed(&rpc, &format!(":edit {}<CR>", file.display()));
+    let _ = rpc.request("nvim_get_mode", vec![]).await;
+    let v = exec_lua(&rpc, "return table.concat(_G.log, ' ')").await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "",
+        "no spurious EncodingChanged"
+    );
 }

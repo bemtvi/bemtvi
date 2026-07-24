@@ -39,6 +39,7 @@ codesign -dv --verbose=4 nxvim
 spctl -a -t exec -vv nxvim
 ```
 
-The TUI binary is not stapled (Apple does not support stapling a notarization ticket to a
-standalone executable), so the `spctl` check performs an online verification. A terminal
-install (`curl … | tar xz`) sets no quarantine attribute and runs offline regardless.
+The macOS TUI ships as a Developer ID Installer `.pkg` (installing to `/usr/local/bin`)
+and the GUI as a `.app` inside a `.dmg` — both notarized and **stapled**, so Gatekeeper
+verifies a download offline. The installed `nxvim` binary itself carries the
+hardened-runtime Developer ID signature the `codesign` check above confirms.

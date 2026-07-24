@@ -119,7 +119,7 @@ Matchers are called with a dot; prefix any with `.never` to invert
 | `t:current_line()` | The cursor's line. |
 | `t:keymaps([mode])` | The defined maps (maparg shape). |
 | `t:float()` | The content float — `{ text, lines, title }` — or nil. |
-| `t:message()` / `t:cmdline()` / `t:statusline()` | The message / command / status line text. |
+| `t:message()` / `t:statusline()` | The message / status line text. |
 
 ### Hermetic seams
 

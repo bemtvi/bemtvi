@@ -97,7 +97,7 @@ resolution order is simply: the **`nx.wso`** overlay when present, otherwise the
 
 ## Workspaces and the remote daemon
 
-A workspace pairs with the [edit-host split](edit-host-split.md): launch
+A workspace pairs with the [edit-host split](../edit-host-split.md): launch
 `--workspace` together with `--connect-daemon` and the workspace root is resolved
 from the daemon's working directory after connect, so you edit a remote project
 as a first-class workspace with the layout restored locally. (`--workspace` is a

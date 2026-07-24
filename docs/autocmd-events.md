@@ -25,6 +25,8 @@ exact compare — so a `FileType rust` autocmd never glob-matches a path.
 | `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
 | `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. |
 | `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. |
+| `BufWinEnter` | A buffer first becomes *displayed* in a window (its window-visibility goes 0 → ≥1) — including buffers a session/workspace restore fills into non-current windows, which the current-buffer events never visit. A no-arg `:split` (already displayed) and merely focusing another window don't fire it; a hidden buffer re-shown does. | `buf` / `file` set. **Gated on a registered handler.** |
+| `BufReadCmd` | A deferred open is about to perform its default read — vim's "replace the default read" hook. A handler that returns `true` **claims** the read: it owns filling the buffer (e.g. the file explorer listing a directory) and the default load is skipped. | `match` / `file` is the path; `args.isdir` says whether it's a directory. **Gated on a registered handler.** |
 | `BufDelete` | Just before a buffer is deleted (`:bdelete`), while its state still exists. | `buf` / `file` set. |
 
 Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter`.
@@ -33,9 +35,9 @@ Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a 
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
-| `BufWritePre` | Before a buffer is written to disk (`:w`, `:wall`, and finalized off-tick saves). | `match` / `file` is the path; glob-matchable, e.g. a `*.rs` format-on-save hook. |
+| `BufWritePre` | At a write's autocmd point (`:w`, `:wall`, and finalized off-tick saves), just before `BufWritePost` — but **after** the bytes are already on disk: the core writes synchronously and Lua fires at convergence, so a handler cannot transform what is written. | `match` / `file` is the path; glob-matchable (`*.rs`). The firing order (`Pre` → `Post`) and buffer context match neovim; only the relation to the disk write differs. |
 | `BufWrite` | Same point as `BufWritePre` — the bare-name spelling. | An alias for `BufWritePre` (see [Event aliases](#event-aliases)); handlers on both spellings fire once. |
-| `BufWritePost` | After a successful write. | The hook format-on-save and "reload affected tools" plugins use. |
+| `BufWritePost` | After a successful write. | The hook "reload affected tools" plugins use. |
 
 ## Window & tab
 
@@ -100,6 +102,13 @@ Fired by the built-in plugin manager (`nx.plugins`). See [Writing nxvim plugins]
 | --- | --- | --- |
 | `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. |
 | `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `nx.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |
+
+## User
+
+`User` is the freeform event namespace: any plugin (or nxvim itself) fires one with
+`nx.autocmd.exec("User", { pattern = "MyEvent", data = … })`, and a handler
+subscribes by `pattern`. nxvim fires `User DaemonStatusChanged` whenever a daemon
+session's connection phase changes (read the phase with `nx.daemon.status()`).
 
 ## Event aliases
 

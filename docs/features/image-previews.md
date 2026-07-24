@@ -17,7 +17,8 @@ nx.o.imagepreview = true        -- or :set imagepreview
 ```
 
 With it on, opening a file with an image extension —
-`png`, `jpg`/`jpeg`, `gif`, `bmp`, `webp`, `tiff`/`tif`, `ico`, `tga`
+`png`, `jpg`/`jpeg`, `gif`, `bmp`, `webp`, `tiff`/`tif`, `ico`, `tga`, `qoi`,
+`ppm`/`pgm`/`pbm`/`pnm`
 (case-insensitive) — loads it as an **inert preview buffer**: the bytes are never
 decoded as text, the rope stays empty, and the window projects an image the
 client paints. The path is retained, so the buffer still has a name. With the

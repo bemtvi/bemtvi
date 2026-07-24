@@ -7,18 +7,25 @@ navigation, and a generation token that drops a stale response for a query you'v
 already typed past. No input loop runs in Lua — a source is just a thin driver
 that *streams candidates in* and *handles confirm*.
 
-It ships with three sources — `files`, `live_grep`, `buffers` — and registering
-your own is a few lines.
+It ships with a set of built-in sources — `files`, `live_grep`, `buffers`,
+`curbuf`, `diagnostics`, `keymaps`, `marks`, `jumplist`, `pickers` — and
+registering your own is a few lines.
 
 ## Using a picker
 
-The three built-in sources are bound out of the box, plus a **resume** map:
+The built-in sources are bound out of the box, plus a **resume** map:
 
 | Map | Source |
 | --- | --- |
 | `<leader>ff` | `files` — fuzzy file finder |
 | `<leader>fg` | `live_grep` — live grep |
 | `<leader>fb` | `buffers` — open buffers (scoped to the focused layer, like `:ls`) |
+| `<leader>f/` | `curbuf` — fuzzy find in the current buffer |
+| `<leader>fd` | `diagnostics` — diagnostics |
+| `<leader>fk` | `keymaps` — keymaps |
+| `<leader>fm` | `marks` — marks |
+| `<leader>fj` | `jumplist` — the jumplist |
+| `<leader>fi` | `pickers` — the registered pickers themselves |
 | `<leader>fr` | `resume` — reopen the last picker where you left off |
 
 These are overridable defaults — your own map for the same key wins, and you can
@@ -108,7 +115,9 @@ nx.picker.source({
 A source can be **asynchronous** — wrap `items` in `nx.async` and stream from a
 subprocess. nxvim is promise-only, so an async source returns its promise and the
 engine awaits it; there is no `done` callback. Reap any spawned job on close via
-`ctx.on_cancel`. This is how the built-in `files` source works:
+`ctx.on_cancel`. This is essentially how the built-in `files` source works (the
+shipped one adds a fallback chain — `find`, then an `nx.fs` walk — for when `rg`
+is missing):
 
 ```lua
 nx.picker.source({
@@ -153,8 +162,9 @@ a runaway-source safety bound.
 
 Set `dynamic = true` and the source re-runs on **every prompt edit** with the
 local fuzzy matcher bypassed — the source itself does the filtering. It reads the
-live prompt from `ctx.query` and the working directory from `ctx.cwd`. This is how
-live grep works (re-spawning `rg` per query):
+live prompt from `ctx.query` and the working directory from `ctx.cwd`. This is
+essentially how live grep works (re-spawning `rg` per query; the shipped source
+falls back to `grep`, then an `nx.fs` match, when `rg` is missing):
 
 ```lua
 nx.picker.source({
@@ -211,6 +221,10 @@ the source, which in turn overrides the picker default:
 | `align` + `margin` | Placement, like a float (`"top-left"` … `"center"` … `"bottom-right"`, default centered). |
 | `preview` | `"file"` / `"location"` / `nil` (no pane). |
 | `prompt_pos` | `"top"` (default) or `"bottom"` (telescope-style, input under the results). |
+| `query` | Initial prompt text — the picker opens already filtered against it, caret at its end. Default `""`. |
+| `title` | A title centered on the box's top border (the shipped sources set their own); `nil` for none. |
+| `multiselect` | Whether `<Tab>` marks rows for a batch action (default `true`); `false` is a single-choice picker. |
+| `layer` | Where a confirmed item opens: `"main"` crosses back to the main editor area first; `"active"` (the default) opens in the focused layer. The shipped `files` / `live_grep` set `"main"`. |
 | `debounce` | Milliseconds before a `dynamic` source re-runs; `0` off. |
 
 ```lua
@@ -235,7 +249,8 @@ nx.keymap.set("picker", "<Tab>", nx.picker.actions.confirm)
 nx.keymap.set("picker", "<C-n>", function() end)
 ```
 
-The actions are `next`, `prev`, `confirm`, `cancel`, `send_to_list`,
+The actions are `next`, `prev`, `confirm`, `confirm_tab`, `confirm_split`,
+`confirm_vsplit`, `cancel`, `send_to_list`,
 `toggle_select`, `clear_select`, `preview_half_down`, `preview_half_up`,
 `preview_page_down`, `preview_page_up`, `backspace`, `delete`, `left`, `right`,
 `to_start`, `to_end`. The one key that is *not* a map is an

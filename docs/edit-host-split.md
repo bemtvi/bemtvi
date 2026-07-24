@@ -74,7 +74,7 @@ In the **GUI**, `:connect nxvim://…` does the same at runtime.
 | Stays **local** (zero round-trips) | Goes **remote** (over the wire) |
 | --- | --- |
 | Every keystroke, motion, operator, undo | Opening / saving files and the file explorer |
-| The Lua VM and the redraw | Processes — `vim.system` / `jobstart` / `:terminal` |
+| The Lua VM and the redraw | Processes — `nx.run` / `nx.run_stream` / `nx.process` / `:terminal` |
 | Your config + shada *(default; see below)* | File-watching — `:checktime` / `'autoread'` / `FileChangedShell` |
 | | LSP requests |
 
@@ -94,8 +94,9 @@ so it is **always** remote-config. See [`examples/remote-config`](../examples/re
 ### The split-brain filesystem (for Lua)
 
 One subtlety the split forces: *which* filesystem does Lua see? nxvim splits it on
-purpose. **Project-facing** fs APIs route to the daemon — `vim.fn.glob` /
-`filereadable` / `readblob` / `executable`, root detection, a picker's previewer, a
+purpose. **Project-facing** fs APIs route to the daemon — the async `nx.fs` surface
+(`nx.fs.read` / `nx.fs.readdir` / `nx.fs.stat` / `nx.fs.watch` / …), root detection,
+a picker's previewer, a
 VCS-status provider — so they see the **project** on the remote. Config and shada stay
 **local** by default, or move to the daemon with `--remote-config` (see above). (This
 is the `LuaFs` seam.)

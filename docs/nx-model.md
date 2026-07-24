@@ -42,9 +42,9 @@ internally; the API just makes it the documented contract:
 
 1. **Reads are snapshots.** `nx.buf.lines(b)` and friends read the state pushed at
    Lua entry. Documented, not disguised as live access.
-2. **Writes are queued effects.** Applied at the settle point, not instantly. An
-   async writer guards with a changedtick (`nx.buf.edit{ tick = t, … }`) and fails
-   loud if the buffer moved under it.
+2. **Writes are queued effects.** Applied at the settle point, not instantly. The
+   buffer mutations (`nx.buf.set_lines` / `nx.buf.set_text`) validate loud up
+   front, queue the edit, and return a promise that fulfils once it has landed.
 3. **Nothing blocks, ever.** No wait-pumps, no blocking reads, no uv handles.
    Anything that waits returns a **promise** you `nx.await` inside `nx.async`, or —
    for streaming — an async-iterator (`nx.run_stream` + `nx.await_each`). See
@@ -104,11 +104,14 @@ canonical list):
   `endswith`, `vim.list_extend`, `vim.deepcopy`, `vim.inspect`, `vim.json`.
 - **Declarative registrations** — a *partial* `vim.api` of `nvim_create_autocmd` /
   `augroup` / `del` / `clear` (→ `nx.on`), `nvim_create_user_command`
-  (→ `nx.command`), and `nvim_set_hl` (→ `nx.hl.define`), plus `vim.filetype.add`.
-- **Callback-shaped async** — `vim.notify`, `vim.schedule`, `vim.defer_fn`,
-  `vim.ui.input` / `select`, and `vim.system` in its callback form.
-- **Treesitter highlight toggle** — `vim.treesitter.start` / `stop`, mapping to the
-  `nx.bo.filetype` / `nx.bo.ts_highlight` buffer nouns.
+  (→ `nx.command`), and `nvim_set_hl` (→ `nx.hl.define`).
+- **Callback-shaped async** — `vim.notify`, `vim.schedule`, `vim.defer_fn`, and
+  `vim.ui.input` / `select` (process spawning is `nx.run` / `nx.run_stream` —
+  there is no `vim.system`).
+- **Treesitter foldexpr** — `vim.treesitter.foldexpr`, neovim's spelling of the
+  native `'foldexpr'` marker (`nx.treesitter.foldexpr`). Highlighting itself is
+  declarative buffer state — the `nx.bo.filetype` / `nx.bo.ts_highlight` nouns —
+  not a function call.
 
 The list is intentionally small — these convenience spellings, and nothing more;
 everything else (LSP, treesitter, processes, the filesystem, …) is `nx.*`.

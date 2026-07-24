@@ -22,7 +22,7 @@ is a few lines on top of these. Reach for the highest-level one that fits:
 | Plugin-owned content you update by hand (a list, a report) | **`nx.view`** | An inert buffer you set lines on and mount in a dock / split / float. |
 | To ask the user something (text, choice, yes/no) | **`nx.ui.input` / `select` / `confirm`** | Async prompt widgets — return a promise. |
 | To pop up read-only content (a hint, a tooltip) | **`nx.ui.float`** | A bordered content overlay, dismissed by the next key. |
-| A real, editable window placed over the layout | **`nvim_open_win`** (float form) | The low-level escape hatch — a true floating window. |
+| A real, editable window placed over the layout | **`nvim_open_win`** (float form, RPC) | The low-level escape hatch — a true floating window (see [Floating windows directly](#floating-windows-directly)). |
 
 ## Components — reactive UIs
 
@@ -143,7 +143,8 @@ v:mount({ dock = "left", size = 30 })
 A view opts into the workspace session by passing `persist` — a stable, plugin-chosen
 string id (instance-unique within your plugin) — to `create`. The editor records only the
 `(namespace, id)` pair and the view's slot in the layout, **never its content**: the plugin
-owns what's worth saving and stores it in its own [`nx.shada.plugin()`](shada) store, keyed
+owns what's worth saving and stores it in its own
+[`nx.shada.plugin()`](../plans/2026-06-26-plugin-shada-namespaces.md) store, keyed
 by the same id.
 
 On restart the editor reopens the layout with each persisted view's slot held by an empty
@@ -313,27 +314,26 @@ offsets, the explicit form `align` + `margin` sugar over.
 ## Floating windows directly
 
 When you need a **real, editable window** over the layout — not a view or a widget —
-`nvim_open_win`'s float form is the low-level primitive. It returns a window id
-synchronously (the op is queued and applied after the current Lua chunk), so you can
-configure it right away. (Most plugins won't reach here — `nx.view:mount{ float }`
-is the same window with less boilerplate.)
+the float form of `nvim_open_win` is the low-level primitive. It lives on the **RPC**
+surface (the `nvim_*` methods a client, test, or remote tool drives), not in config
+Lua: nxvim's Lua API deliberately omits the mutating `vim.api.nvim_*` entity surface
+(ADR 0002), so a plugin opens its float through `nx.view:mount{ float = … }` or a
+component instead — the same window with the lifecycle managed for you (pass
+`grab = false` for a non-modal panel focus can leave).
 
 ```lua
-local buf = vim.api.nvim_create_buf(false, true)
-vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "an editable float" })
-
-local win = vim.api.nvim_open_win(buf, true, {
-  relative = "editor", width = 40, height = 3, align = "center",
-  border = "rounded", title = " scratch ",
-})
-vim.api.nvim_win_set_config(win, { height = 6 })   -- move / resize live
-vim.api.nvim_win_close(win, true)                  -- dismiss
+-- over RPC (a client or test):
+-- win = nvim_open_win(buf, true, { relative = "editor", width = 40, height = 3,
+--                                  align = "center", border = "rounded", title = " scratch " })
+-- nvim_win_set_config(win, { height = 6 })   -- move / resize live
+-- nvim_win_close(win, true)                  -- dismiss
 ```
 
-`nvim_win_get_config(win)` reads a window's float config back (`{ relative = "" }`
-for a tiled window), and `nx.win.gettype(win)` returns `"popup"` for a float. A
-float is a real window — it holds an editable buffer, splits are disallowed, and
-`:q` / focus / `:only` treat it as an overlay rather than part of the tiled tree.
+From Lua the float *reads* are first-class: `nvim_win_get_config(win)` (alias of
+`nx.win.config`) reads a window's float config back (`{ relative = "" }` for a tiled
+window), and `nx.win.gettype(win)` returns `"popup"` for a float. A float is a real
+window — it holds an editable buffer, splits are disallowed, and `:q` / focus /
+`:only` treat it as an overlay rather than part of the tiled tree.
 
 ## Try it
 

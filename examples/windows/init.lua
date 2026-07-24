@@ -62,14 +62,18 @@ end, {})
 --------------------------------------------------------------------------------
 -- 3. :WinDemo — the programmatic write surface. Opens a vertical split on the
 --    current buffer, parks its cursor a few lines down, then reports the layout.
---    (nvim_open_win returns the new window's id synchronously; the real window is
---    created when the queued op drains, the "Lua queues, core mutates" flow.)
+--    (Mutation from Lua goes through `vim.cmd` — the "Lua queues, core mutates"
+--    flow — so the new window only exists on the NEXT tick; read its id there
+--    with nx.on_next_tick.)
 --------------------------------------------------------------------------------
 vim.api.nvim_create_user_command("WinDemo", function()
-  local win = vim.api.nvim_open_win(0, true, { vertical = true })
-  vim.api.nvim_win_set_cursor(win, { 3, 0 })
-  vim.notify("[WinDemo] opened window " .. tostring(win)
-    .. "; now " .. #vim.api.nvim_list_wins() .. " windows. Try :WinList")
+  vim.cmd("vsplit")
+  nx.on_next_tick(function()
+    local win = vim.api.nvim_get_current_win()
+    nx.win.set_cursor(win, 3, 0)
+    vim.notify("[WinDemo] opened window " .. tostring(win)
+      .. "; now " .. #vim.api.nvim_list_wins() .. " windows. Try :WinList")
+  end)
 end, {})
 
 -- Hybrid line numbers make it easy to see each window keeps its own cursor/view.

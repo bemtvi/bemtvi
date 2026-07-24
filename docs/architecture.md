@@ -84,11 +84,11 @@ subsystems:
 | `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
 | `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library, embedded on its own thread by the `nxvim` / `nxvim-gui` binaries; the `--daemon` role reuses it as the remote fs/process half of the edit-host split. |
-| `nxvim-lua`     | `lua/`                                                | Embedded Lua runtime (vendored PUC Lua 5.4, the single backend) and the `vim.*` standard library. |
+| `nxvim-lua`     | `lua/`                                                | Embedded Lua runtime (vendored PUC Lua 5.4, the single backend) and the `nx.*` Lua prelude (plus its bounded `vim.*` alias layer). |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
 | `nxvim-ts`      | `tree_sitter/`                                       | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
 | `nxvim-lsp`     | `lsp/`                                                | The native **LSP client**: protocol, transport, manager — nxvim's own stdio spawning, driving the in-core editing features. `nxvim-server/src/lsp/` is the editing-loop glue on top. |
-| `nxvim-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C, shared by search and `:s` (engine-global mutex). |
+| `nxvim-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C (engine-global mutex): Lua's `vim.regex` / `vim.fn.substitute`, and `/` search + `:s` under `:set regexsyntax=vim`. |
 | `nxvim-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
 | `nxvim-gui`     | (a GUI frontend)                                     | The native GUI **client** on winit + wgpu + glyphon; the GUI sibling of `nxvim-tui`, consuming the same `View`. |
 | `nxvim-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
@@ -110,7 +110,9 @@ core rpc lua ts  rpc  view
 The diagram shows the principal spine; the same one-way graph also carries the
 edges it elides — `nxvim` and `nxvim-server` both onto `nxvim-lsp`, `nxvim-lua`
 onto `nxvim-ts` (the treesitter query/control bridge), `nxvim-gui` onto
-`nxvim-server` + `nxvim-view`, and `nxvim-server` onto `nxvim-regex`.
+`nxvim-server` + `nxvim-view`, and `nxvim-lua` onto `nxvim-regex` (with
+`nxvim-core`'s optional `vim-regex` feature — enabled by `nxvim-server` —
+putting the same engine behind `:set regexsyntax=vim`).
 
 The treesitter engine is a normal crate dependency now: `nxvim-server`
 constructs it and installs it on the editor (which owns a `Box<dyn SyntaxEngine>`
@@ -130,7 +132,7 @@ and lets every front end share identical behavior.
 ┌──────────────────────────┐         msgpack-RPC          ┌──────────────────────────┐
 │  Client (nxvim-tui)      │  ───── nx_input ─────────▶   │  Server (nxvim-server)   │
 │  • crossterm input       │  ◀──── redraw events ─────── │  • nxvim-core (model)    │
-│  • paints the grid       │  ───── nx_command ───────▶   │  • nxvim-lua (vim.*)     │
+│  • paints the grid       │  ───── nx_command ───────▶   │  • nxvim-lua (nx.*)      │
 │  • owns NO editor state  │  ◀──── responses ──────────  │  • nvim_* API surface    │
 └──────────────────────────┘                              └──────────────────────────┘
         main thread                                              its own thread
@@ -172,8 +174,9 @@ editor stays local; `:connect` swaps onto a *fresh local server* whose seams poi
 the daemon and re-attaches the same window (`nxvim_gui::run`'s session loop), since the
 editor transport is always the in-process duplex. See
 [the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
-**split-brain filesystem rule** for the Lua bridge, decided up front: *project-facing*
-fs APIs (`vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
+**split-brain filesystem rule** for the Lua bridge, decided up front: the
+*project-facing* fs API — the async `nx.fs.*` (there are no synchronous Lua fs
+builtins) — routes
 through the `LuaFs` seam — local disk by default, the remote daemon in a split — so
 file-picker previewers, root detection, and VCS-status providers see the *project*; while raw Lua
 `io.*`/`os.*`, `require`/`package.path`, the runtimepath (`nvim_get_runtime_file`), and
@@ -226,21 +229,21 @@ onto a shared pool.
 
 #### Multi-source scheduling & event ordering
 
-The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **eight**
+The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **ten**
 event sources against the single-threaded editor: RPC input from the UI, the LSP
 manager, the async-runtime actor (`evloop.rs` — timers and child processes),
-terminal child output, off-tick file opens and write-acks from the daemon fs
-seam, `:TSInstall` grammar-build completions, and daemon file-watch events. The
+terminal child output, off-tick file opens, write-acks, and `:cd` completions
+from the daemon fs seam, `:TSInstall` grammar-build completions, daemon
+file-watch events, and daemon link-status changes. The
 first three are the always-on primary sources; the rest service the terminal,
 edit-host/daemon, and treesitter-install features. Treesitter highlighting is
 *not* among them — the engine runs in-process and is queried synchronously
 during `redraw`, so it needs no channel or arm. Each source is an mpsc
-channel; the
+channel (the link status a `watch`); the
 matching async actor (a `Send` background task) only ever ferries ids / bytes /
 durations back, never the `!Send` editor or Lua state. This is nxvim's analog of
 neovim's main-thread + worker-thread model, where workers hand results to the one
-editor thread by enqueuing events — see
-[neovim's threading model](neovim-threading-model.md) for the reference design.
+editor thread by enqueuing events.
 
 Two ordering properties hold, and one is a deliberate divergence worth recording:
 
@@ -306,8 +309,9 @@ The client-protocol verbs — the ones a UI actually speaks (input, attach,
 resize) — are `nx_*`: `nx_input`, `nx_input_mouse`, `nx_ui_attach`,
 `nx_ui_try_resize`, `nx_command`. The editing-API methods keep the familiar
 neovim spelling (`nvim_buf_get_lines`, `nvim_open_win`, `nvim_win_set_cursor`,
-…) as muscle-memory names for config and Lua, but they are nxvim's own methods
-with nxvim's own semantics.
+…) as muscle-memory names, but they are nxvim's own methods with nxvim's own
+semantics (a read-heavy subset is also aliased into Lua as `vim.api.*`; the
+window/tab *mutation* verbs are RPC-only).
 
 ### View protocol (UI)
 
@@ -550,17 +554,21 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   `nvim_win_get_buf`/`set_buf`, `nvim_win_get_cursor`/`set_cursor` (window-handled,
   `0` = current), `nvim_win_get_width`/`height` + setters, `nvim_win_close`,
   `nvim_win_get_config`/`nvim_win_get_position`, and `nvim_open_win` (both the
-  split form and the float form). The Lua bindings follow the established "Lua
-  queues, core mutates" flow: window *reads* resolve against the `nx._wins`
-  mirror the server pushes before each Lua entry; window *mutations* queue a
-  `WindowOp` drained into the core after the chunk.
+  split form and the float form). Window *reads* (plus `nvim_set_current_win`)
+  are aliased into Lua and resolve against the `nx._wins` mirror the server
+  pushes before each Lua entry; the window *mutation* verbs are **RPC-only** —
+  internally they queue a `WindowOp` drained into the core (the same queue the
+  private `nx._open_win`/`nx._win_*` bridges feed for `nx.view` and the UI
+  primitives), but no public Lua `nvim_open_win`/`nvim_win_set_*` binding
+  exists.
 - **Floating windows.** A float is a `Window` the layout tree does **not** own: it
   lives in `WindowTree.floats` (ids kept sorted by `(zindex, id)`), carries a
   `FloatConfig` (`relative` editor/win/cursor, `anchor`, `row`/`col`, `width`/
   `height`, `zindex`, `focusable`, `border`, `title`), and is positioned
   absolutely by a second `layout()` pass after the tiled rects are known — so it
   steals no space from its siblings and paints on top. `nvim_open_win` with a
-  non-empty `relative` opens one (RPC and Lua, the latter via `WindowOp::OpenFloat`);
+  non-empty `relative` opens one (an RPC verb, via `WindowOp::OpenFloat`; from
+  Lua, floats come from `nx.view:mount{ float = … }` / `nx.ui.float`);
   the client draws it as an opaque, bordered, titled overlay above the tiled
   layout (see [*View protocol*](#view-protocol-ui)). Focus, the window list, and
   close already span floats because they key off `WindowId`.
@@ -690,10 +698,13 @@ cell (past a dock's title prefix) to a `(layer, tab)`. (Design:
 [`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md),
 [`docs/plans/2026-06-14-per-region-tablines.md`](plans/2026-06-14-per-region-tablines.md).)
 
-Already on `WindowOptions`: the number gutter (`number`/`relativenumber`), the
+Already on `WindowOptions`: the number gutter (`number`/`relativenumber`/
+`numberwidth`), the
 cursor-line highlight (`cursorline`), soft word-wrap (`wrap`, with its `gj`/`gk`
-display motions, `breakindent`/`showbreak`), and the horizontal-scroll options.
-Still pending: **more window-local options** (`colorcolumn`, …) beyond those.
+display motions, `breakindent`/`showbreak`), the horizontal-scroll options, and
+the later arrivals — `scrolloff`, `signcolumn`, `colorcolumn`, `foldcolumn`,
+`fillchars`, `winhighlight`.
+Still pending: the long tail of vim's window-local options beyond those.
 Floating windows are otherwise complete (model,
 paint, dynamic config, edge semantics); the remaining float fidelity knobs
 (`style="minimal"`, `footer`, `bufpos`, `relative="mouse"`) grow as a consumer
@@ -808,8 +819,9 @@ first frame. The Lua
 surface is provided as a bundled **Lua prelude**
 (the `nxvim-lua/src/prelude/` modules, the analogue of neovim's `runtime/lua/vim/`):
 `vim.tbl_*`, `vim.split`, `vim.inspect`, `vim.g`/`vim.o`/`vim.opt`/`vim.env`,
-`vim.notify`, `vim.log`, user commands, and autocmds; FS/env-touching helpers
-(`vim.fn.stdpath`/`getftime`/`mkdir`, …) are Rust-backed. `:colorscheme <name>`
+`vim.notify`, `vim.log`, user commands, and autocmds; env-touching helpers
+(`vim.fn.stdpath`, …) are Rust-backed, and there are no synchronous fs
+builtins — filesystem access is the async `nx.fs`. `:colorscheme <name>`
 sources `colors/<name>.lua` off the runtimepath and fires the `ColorScheme`
 autocmd. A colorscheme is just Lua: its `setup()` compiles a highlight table
 (typically cached as Lua bytecode under `stdpath("cache")`), and `load()`
@@ -889,8 +901,10 @@ The native engine above *is* nxvim's treesitter. There is no Lua parser/AST
 platform: per [ADR 0002](decisions/0002-native-plugin-system.md) the vendored
 neovim `vim.treesitter` Lua (the `LanguageTree` / `get_parser` / `TSNode`
 machinery and the Rust primitives that backed it) was **deleted** — it existed
-only to host third-party neovim plugins, a non-goal. There is no `nx.treesitter`
-*nor* `vim.treesitter` table at all (`vim.treesitter.*` is wholly absent). What
+only to host third-party neovim plugins, a non-goal. There is no parser-facing
+`nx.treesitter` API: the `nx.treesitter` table holds only the `foldexpr` marker
+for `foldmethod=expr` (with `vim.treesitter.foldexpr` as its one muscle-memory
+alias — the rest of `vim.treesitter.*` is absent). What
 remains is a tiny control surface over the engine, and it is **declarative buffer
 state**, not a verb API:
 
@@ -898,8 +912,7 @@ state**, not a verb API:
   language, `nx.bo.ts_highlight` chooses whether the engine paints it. There is no
   `start`/`stop` verb — setting the filetype and flipping `ts_highlight` *is* how
   you start/stop highlighting. `:set filetype` / `:setf` write the same per-buffer
-  override, so there is a no-Lua path too (the web build, which has no Lua, drives
-  it from the ex line).
+  override, so there is a no-Lua path too, straight from the ex line.
 - **Query customization is the native bridge `nx._nx_set_ts_query(lang, name,
   text|nil)`** — it queues a `TsOp::SetQuery` the server pushes straight onto the
   engine, installing a `highlights` / `injections` / `indents` override (a
@@ -972,9 +985,9 @@ vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse
 (`'mousemodel'`), middle-click paste, and the floating-overlay gestures (the
 completion popup, picker, `select`, wildmenu, and panel), sent as the same
 `nx_input_mouse` the TUI uses (the server owns the hit-test, so the GUI forwards a
-raw cell and carries no overlay geometry of its own). Still
-deferred: wide-char column fidelity (a char index stands in for a screen column),
-and undercurl is drawn as a plain underline.
+raw cell and carries no overlay geometry of its own). Wide-char + emoji rendering
+landed too (CJK cell-snapping, an emoji mask/scale pass that keeps the grid). Still
+deferred: undercurl is drawn as a plain underline.
 Because the GUI can't be black-box
 tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
 frontend-specific translation layers have Tier-1 tests — the winit→notation input
@@ -1024,12 +1037,17 @@ fs/process half is OPFS or a remote daemon over WebTransport.
   `nxvim --daemon` over **WebTransport** (a JS msgpack-RPC client, `web/rpc.mjs`,
   reached with `?daemon=nxvim://…`). All three ride the same off-tick `HostEffects` fs
   seam the native edit-host split uses; the Worker fulfills fs requests between ticks.
-- **Lua config runs.** Unlike the old core-only web build, `init.lua` is sourced at
-  startup: options / keymaps / autocmds / user commands / highlights apply (`require`
-  of further modules / plugins does not — empty runtimepath). **LSP and *native*
-  treesitter** are gated off the wasm build (`:TSInstall` fails loud); syntax
-  **highlighting** is still present, done JS-side via web-tree-sitter
-  (`web/highlight.js` + the generated `web/vendor/` grammars).
+- **Lua config runs — plugins included.** Unlike the old core-only web build,
+  `init.lua` is sourced at startup: options / keymaps / autocmds / user commands /
+  highlights apply. There is no on-disk runtimepath, so multi-file plugins ship
+  *amalgamated*: `web/amalgamate-plugins.mjs` bundles each plugin tree into
+  `package.preload` under a per-plugin synthetic runtimepath root, so `require` and
+  shada attribution behave as they do natively. **LSP works over the daemon wire**
+  (the sync `SyncLspClient` replaces the async manager on wasm — `web/verify-lsp.mjs`);
+  only the *native* treesitter engine is off the wasm build: syntax
+  **highlighting** is done JS-side via web-tree-sitter
+  (`web/highlight.js` + the generated `web/vendor/` grammars), and `:TSInstall`
+  fetches a prebuilt `.wasm` grammar.
 - **Excluded from the workspace.** It targets `wasm32-unknown-emscripten` and links C
   via `emcc`, so it is in the root Cargo.toml's `[workspace] exclude` (the host
   `cargo build/test/clippy --workspace` never touches it) and pins its own
@@ -1139,13 +1157,14 @@ screen," and that is exactly the shape of these tests.
   [the docked-panels plan](plans/2026-06-14-permanent-docked-panels.md)). Every
   widget's keys are rebindable through the real keymap engine
   ([configurable widget keys](plans/2026-06-16-configurable-widget-keys.md)).
-  Still ahead: the manifest loader / built-in package manager.
+  The **built-in package manager** has landed too: `nx.plugins` — declarative
+  specs, async git install, eager + lazy (`cmd`/`event`/`ft`/`keys`) activation,
+  `:PluginSync`, and the `:Plugins` dashboard.
 - **Treesitter control.** `:TSInstall` / `:TSUpdate` / `:TSInstallInfo` have
   **landed**: the native arm fetches + compiles each grammar into the data dir
   off the editor thread (`nxvim_ts::install`, with a pinned checksum-verified Zig
   fetched on demand when no system `cc`/`clang`/`gcc`/`zig`/`$NXVIM_CC` is found),
-  and the browser arm fetches a *prebuilt* `.wasm` grammar instead; a real
-  nvim-treesitter plugin that registers `:TSInstall` shadows the native arm. The
+  and the browser arm fetches a *prebuilt* `.wasm` grammar instead. The
   `:set`-driven highlight toggle has landed too. (Residual `:TSInstall` edges —
   grammars needing `tree-sitter generate`, no install-from-`HEAD` — are tracked in
   [*Known approximations*](known-approximations.md).) Treesitter **injections**
@@ -1159,14 +1178,15 @@ screen," and that is exactly the shape of these tests.
   is no Lua parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
   **Lua-driven indent remains the one deferred item on this axis.**
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
-  per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
+  per-window view state, the `<C-w>` family, and the `nvim_win_*` RPC + Lua-read surface),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay
   layer, `nvim_win_set_config`, and the `:q`/`:only`/focus/autocmd edge
   semantics), and **tab pages** (a `Vec<TabSlot>` deriving the active
   `WindowTree`, the tabline, `gt`/`:tab*`/`<C-w>T`, the `Tab*` autocmds, the
   `nvim_tabpage_*` Lua surface, and `showtabline`) are all implemented — see
-  [*Windows*](#windows). What remains on this axis is more window-local options
-  (`colorcolumn`, …).
+  [*Windows*](#windows). What remains on this axis is the long tail of vim's
+  window-local options (`colorcolumn`, `scrolloff`, `signcolumn`, `foldcolumn`,
+  `fillchars`, and `winhighlight` are already wired).
 - **The `nx.*` config surface** — `init.lua` targets nxvim's own API
   ([ADR 0002](decisions/0002-native-plugin-system.md)); the prelude's current
   vim-shaped spelling is donor code, refactored under `nx` where it serves
@@ -1194,14 +1214,16 @@ screen," and that is exactly the shape of these tests.
   doc explains how to enumerate them straight from the code (`grep -rn
   'INCOMPLETE:'` for approximations, the `nx._notimpl` raises / runtime
   `nx._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
-  that have no call site to tag — the bulk of vim's options beyond the handful
-  nxvim honors (window-local `number`/`relativenumber`/`cursorline`/`wrap` + the
-  horizontal-scroll `sidescroll`/`sidescrolloff`, the buffer-local indentation
-  options, and global `showtabline` are wired; many others are not) and richer diagnostic
+  that have no call site to tag — the bulk of vim's options beyond the subset
+  nxvim honors (the registry is `canonical()` in
+  `crates/nxvim-core/src/editor/options.rs`: the window-local gutter / wrap /
+  scroll options, the buffer-local indentation options, and a steadily growing
+  set besides; many others are not wired) and richer diagnostic
   surfaces. (Blocking reads — `vim.fn.input` / `vim.fn.confirm` / `vim.fn.getcharstr`
   / `vim.wait` and the coroutine pump that hosted them — are **not** part of the
   `nx` model: nothing in it blocks the editor, so
-  the only prompt surface is the callback-shaped `vim.ui.input` / `vim.ui.select`.)
+  the only prompt surface is the promise-based `nx.ui.input` / `nx.ui.select`,
+  with callback-shaped `vim.ui.*` aliases.)
   Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
   **window-local** number-gutter options `number` / `relativenumber`, the
@@ -1243,14 +1265,14 @@ screen," and that is exactly the shape of these tests.
   child processes; on completion it sends a typed `LoopEvent` back to the single
   server thread, which runs the matching Lua callback by id (the `nx._cb_fns`
   registry, the keymap-callback shape applied to async work). `vim.schedule`
-  defers to convergence, `vim.defer_fn` fires on wall-clock time, and
-  `vim.system`'s `on_exit` fires off-tick. neovim's libuv-as-public-API surface
+  defers to convergence, `vim.defer_fn` fires on wall-clock time, and process
+  completions settle their promises off-tick (there is no `vim.system` —
+  spawning is the promise-based `nx.run`). neovim's libuv-as-public-API surface
   — `vim.uv` / `vim.loop`, both the **handle** primitives
   (`new_timer`/`new_check`/`new_fs_event`/`spawn`) and the synchronous `fs_*` /
   scalars — is **not** part of the `nx` model and is absent entirely.
-  Async primitives are the `nx` API's job (`nx.run` / `nx.timer` / `nx.fs`) —
-  the existing timer/process machinery is the donor for those
-  ([ADR 0002](decisions/0002-native-plugin-system.md)).
+  The `nx` async primitives (`nx.run` / `nx.timer` / `nx.fs`) are built on this
+  machinery ([ADR 0002](decisions/0002-native-plugin-system.md)).
 - The `vim.*` glue, kept only as far as colorschemes need
   ([ADR 0002](decisions/0002-native-plugin-system.md)).
   (The backend is vendored PUC Lua 5.4, the single baked-in backend — see

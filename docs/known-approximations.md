@@ -36,20 +36,23 @@ as a guide, not the registry.
 These are whole areas where the subsystem itself is absent or only partly built,
 so a config that leans on one meets a nil value or a generic error rather than a
 named gap — worth knowing up front. (Subsystems that are now **fully built** — the
-tree-sitter platform with `start`/`stop`, on-disk and customized queries,
-injections, incremental updates, and `:TSInstall` fetch/compile — aren't listed;
-only the edges that still diverge are.)
+native tree-sitter engine with its `nx.bo.filetype` / `nx.bo.ts_highlight` nouns,
+on-disk and customized queries, injections, incremental updates, and `:TSInstall`
+fetch/compile — aren't listed; only the edges that still diverge are.)
 
-- **Treesitter — two edges remain.** The `vim.treesitter` platform is built (see
-  the [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md) and
-  [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md)). What still
-  diverges: (1) the decoration-provider highlighter `highlighter.new` fails loud
-  (`nx._notimpl`) — nxvim's `start`/`stop` drives the in-core Rust engine
-  instead, so a highlight-only `start` never builds a Lua-side `LanguageTree` and
-  `highlighter.active[buf].tree` reads nil until something calls `get_parser`;
-  (2) **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
+- **Treesitter — a native engine, not neovim's Lua platform.** The vendored
+  `vim.treesitter` Lua platform (`get_parser`, `LanguageTree`, `highlighter.*`,
+  `query.get`) was deleted (see
+  [the deletion plan](plans/2026-06-12-vendored-treesitter-deletion.md) and
+  [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md)) — a plugin
+  reaching for it hits a loud nil index. Highlighting is driven by the in-core
+  Rust engine through the declarative buffer nouns `nx.bo.filetype` /
+  `nx.bo.ts_highlight` (the one `vim.treesitter` survivor is the `foldexpr`
+  marker), and query customization rides the runtimepath `queries/` /
+  `after/queries/` overlay (next bullet).
+  **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
   wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
-  Rust indent stays. `query.get` returns nil for a missing on-disk query file.
+  Rust indent stays.
 - **Treesitter query resolution — additive, host-only.** The query bridge
   ([design](specs/2026-06-08-treesitter-query-bridge-design.md)) merges a language's
   bundled base with runtimepath `queries/` + `after/queries/` and the `; inherits:`
@@ -66,10 +69,10 @@ only the edges that still diverge are.)
   for it hits a loud nil index. Both the libuv **handle** surface (`new_timer` /
   `new_check` / `new_fs_event` / `spawn` / `new_pipe`, the plugin event-loop
   primitives) and the synchronous `fs_*` / scalar primitives (`fs_realpath`,
-  `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`) are gone. Async lives in the
-  `nx` API (`nx.run` / `nx.timer` / `nx.fs`); the synchronous host info the
-  LSP-config paths need is read through `vim.fn` (`executable` / `exepath` /
-  `glob` / `filereadable` / `resolve` / …) instead.
+  `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`) are gone. There are no
+  synchronous filesystem `vim.fn` builtins either (no blocking I/O ever runs on
+  the editor thread): async lives in the `nx` API (`nx.run` / `nx.timer` /
+  `nx.fs`), and the LSP-config root search runs on the same async `nx.fs` seam.
 - **Broad options surface.** The set of honored options has grown well past the
   indentation knobs (the authoritative list is `crates/nxvim-core/src/options.rs`).
   `:set` (and `:setlocal` / `vim.bo` / `nvim_{set,get}_option_value`) honors: the
@@ -107,8 +110,9 @@ only the edges that still diverge are.)
   (the merge picks the most-specific `@lsp.*` winner, it doesn't blend neovim's
   `@lsp.type.<t>` + per-modifier stack); **theme-gated** (an undefined group is
   dropped so the floor shows); **no `range`** (only `full`/`full/delta`);
-  **`highlight_token` is a loud gap** (`nx._notimpl` — a Lua callback on the
-  decode hot path); `get_at_pos` reads the cached mirror even for a `stop`ped
+  **no `highlight_token` hook** (neovim's per-token Lua callback on the decode
+  hot path — the name is absent, a loud nil index);
+  `get_at_pos` reads the cached mirror even for a `stop`ped
   buffer; no per-client granularity (one cache per buffer); repaints mid-insert
   (`update_in_insert` always on). See `docs/plans/2026-06-08-lsp-semantic-tokens.md`.
 - **LSP inlay hints approximations.** Painted inline, opt-in
@@ -119,10 +123,11 @@ only the edges that still diverge are.)
   `range` request is deferred; **per-buffer enable only** (no per-client
   granularity); horizontal-scroll (`leftcol>0`) + inline hints is best-effort;
   repaints mid-insert. See `docs/plans/2026-06-08-lsp-inlay-hints.md`.
-- **Synchronous prompts — one caveat.** `vim.fn.input`/`confirm` return inline
-  via a pumped coroutine (`nx._pump`), but only *pumped* entry points (`:lua`
-  chunk, keymap, user command) can prompt — Lua sourced at startup or off a bare
-  callback has no coroutine to yield from. See `examples/sync-prompts/`.
+- **No synchronous prompts.** The blocking `vim.fn.input` / `vim.fn.confirm`
+  are omitted by design (loud gaps like the rest of unimplemented `vim.fn.*`) —
+  prompting is promise-only: `nx.ui.input` / `nx.ui.select` / `nx.ui.confirm`,
+  awaited inside `nx.async`. A config expecting an inline return must be
+  reshaped onto the promise. See `examples/ui-prompt/`.
 - **`nx.statusline` segment registry — v1 deferrals.** The lualine-shaped surface
   is built (`nx.statusline.setup`/`segment`/`invalidate`; built-ins composed in
   `nxvim_core::statusline::compose_segments`, custom segments rendered per window
@@ -157,7 +162,6 @@ limitation, so they tend to surface together. The notable ones:
 
 | Limitation | What it affects |
 |---|---|
-| LSP helpers not window-arg-aware (always use the current window) | `make_position_params(window)` is now window-aware (reads the passed window's buffer + cursor), and `open_floating_preview` returns real float handles (a `relative="cursor"` float over a scratch buffer, auto-closing on cursor move). **Remaining:** the completion-doc preview box is still a single bespoke box with no separate preview-window handle / `completeopt` matrix (the completion menu is server-owned chrome, not a window). Note: splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*. |
-| No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
-| Core honors a fixed set of buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `softtabstop` / `expandtab` / `commentstring` / `regexsyntax` / `fileencoding` / `bomb` are recorded but inert |
+| The completion menu is server-owned chrome, not a window | The completion-doc preview is a single bespoke box with no separate preview-window handle / `'completeopt'` matrix. (The `vim.lsp.util` helper surface — `make_position_params`, `open_floating_preview`, `make_text_document_params`, `locations_to_items` — is gone with the compat layer: LSP goes through the native `nx.lsp.*` verbs, hover/signature through the cursor float, and `apply_workspace_edit` loads unopened files into buffers on the spot. Splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*.) |
+| Core honors a fixed set of buffer-local options | `vim.bo` / `nvim_set_option_value` writes outside the wired set — `filetype` / `ts_highlight` / `tabstop` / `shiftwidth` / `softtabstop` / `expandtab` / `autoindent` / `smartindent` / `autopairs` / `indentemptylines` / `commentstring` / `regexsyntax` / `fileencoding` / `bomb` / `fileformat` / `modifiable` / `modified` / the fold options (`foldmethod` / `foldexpr` / `foldmarker` / `foldnestmax` / `foldminlines`) — are recorded but inert (`buftype` is mirrored read-only) |
 | Diagnostic-display surfaces are approximations, not gaps — all four ship. `underline`, `virtual_text` (inline end-of-line message), `signs` (gutter glyph), and the on-demand float (`vim.diagnostic.open_float`) are implemented — see `docs/plans/2026-06-08-diagnostic-display-surfaces.md`. | `vim.diagnostic.config` keys other than `underline` / `virtual_text` / `signs` (`virtual_lines`, `severity_sort`, and the `config.float` pre-style defaults). `open_float` ignores its `opts` (scope/severity filters, `format`/`header`/`prefix`/`border`) — the default cursor-line scope shows, in the bottom panel (plain lines, like hover) not a cursor-anchored bordered popup. The `virtual_text` table honors `prefix` and the `signs` table its `text` glyph map; their `format` / `severity` filters and sign `priority`/`culhl` are not applied, the line's most-severe diagnostic wins the one inline slot / sign cell, and the sign column is client-side only (a fixed 2 cells not subtracted from `nxvim-core`'s text width, so a full-width line under `nowrap` can clip its last two cells). |

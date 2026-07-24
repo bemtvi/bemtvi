@@ -7,7 +7,7 @@ privileged access. That makes them honest reference implementations — if a
 behavior can be built in one of these, it can be built in yours.
 
 They live in their own repositories under
-[`github.com/davidrios`](https://github.com/davidrios) and are each installable
+[`github.com/nxvim`](https://github.com/nxvim) and are each installable
 with the [built-in manager](plugin-authoring.md):
 
 ```lua

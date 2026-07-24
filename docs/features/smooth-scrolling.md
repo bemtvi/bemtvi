@@ -8,7 +8,7 @@ mouse wheel, or an off-screen jump like `G`/`gg`/a search — the editor emits a
 `scroll` descriptor (the from/to lines and a duration) and the client
 interpolates the slide locally over its own wall clock with an ease-out curve.
 Because the animation runs **client-side**, it stays smooth even over a slow
-[remote daemon](edit-host-split.md) link, and any new keystroke interrupts the
+[remote daemon](../edit-host-split.md) link, and any new keystroke interrupts the
 in-flight slide and snaps straight to the destination.
 
 Single-line motions at the window edge, typing in insert/command mode, and edits

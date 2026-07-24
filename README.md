@@ -17,7 +17,7 @@ nxvim's own too — pure-Lua modules that fill the highlight registry through th
 
 Test the client-only live demo at https://nxvim-demo.netlify.app. Use the `:eo`
 command to open a local file or `:luao` to load a local lua file as config.
-Use :setf LANG to activate treesitter if not auto detected or :TSInstall to
+Use `:setf LANG` to activate treesitter if not auto detected or `:TSInstall` to
 install the highlighter for your chosen language.
 
 ---
@@ -126,9 +126,10 @@ client-side tree-sitter highlighter).
   `number`/`relativenumber`, `numberwidth`, `signcolumn`, `cursorline`,
   `breakindent`/`showbreak`, and horizontal-scroll options are honored.
 - **Folds** — `zo`/`zc`/`za`, `zR`/`zM`, `zj`/`zk`, and a fold column, with
-  five fold methods selected by `foldmethod`: `manual` (`zf`), `indent`,
-  `marker` (literal `{{{`/`}}}`), `expr` (a Lua `foldexpr`), and `syntax`
-  driven by treesitter — plus LSP `textDocument/foldingRange`.
+  four fold methods selected by `foldmethod`: `manual` (`zf`), `indent`,
+  `marker` (literal `{{{`/`}}}`), and `expr` — whose `foldexpr` can be the
+  native tree-sitter expression (`v:lua.nx.treesitter.foldexpr()`), a generic
+  Lua expression, or the LSP marker driving `textDocument/foldingRange`.
 - **Search & substitute** — interactive `/` and `?` with `n`/`N`, `hlsearch`,
   and `incsearch`, plus `:s` with the `g`/`i`/`I`/`n`/`c` flags. Two
   interchangeable regex dialects, selected by the `'regexsyntax'` option: **PCRE**
@@ -196,7 +197,9 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
   Viewport `z`-commands (`zt zz zb`, `z.`/`z-`) reposition the screen.
 - **Text objects** — `iw aw iW aW`, quotes (`i" a"`, `i' a'`, and backtick),
   brackets (`i( a(`, `i{ a{`, `i[ a[`, `i< a<`, plus `ib`/`ab` and `iB`/`aB`),
-  paragraph (`ip ap`), and sentence (`is as`).
+  paragraph (`ip ap`), sentence (`is as`), and the tree-sitter objects
+  (`if`/`af` function, `ia`/`aa` argument, `ic`/`ac` comment, `it`/`at`
+  type/class).
 - **Operators** — `d c y`, paste (`p P`), shift (`>>`/`<<`, `>motion`/`<motion`,
   `>ip`), reindent (`=`, `==`, `=motion`, `gg=G`), comment toggle (`gc`/`gcc`,
   with a per-filetype `commentstring`), replace (`r`), case-toggle (`~`), join
@@ -220,8 +223,8 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
 
 Not yet wired (see the [roadmap](#not-yet-implemented-roadmap)): `%` match-pair,
 the paragraph/sentence motions (`{ } ( )`), the screen motions (`H M L`), the
-`gu`/`gU`/`g~` case operators, `gq` reflow, tag objects (`it`/`at`), and macros
-(`q`/`@`).
+`gu`/`gU`/`g~` case operators, `gq` reflow, HTML tag objects (in nxvim `it`/`at`
+are the tree-sitter type/class object), and macros (`q`/`@`).
 
 ---
 
@@ -295,7 +298,7 @@ nothing more.
 
 ### Runnable examples
 
-The [`examples/`](examples) directory has ~70 self-contained, end-to-end-verified
+The [`examples/`](examples) directory has ~85 self-contained, end-to-end-verified
 configs — one per feature (treesitter, LSP, floats, registers, tabs, mouse,
 statusline, completion, picker, snippets, decor, docks, quickfix, image
 previews, …). Each is a config dir you point nxvim at:
@@ -382,7 +385,7 @@ nxvim tracks vim/neovim's **observable editing behavior**, but it is a fresh
 rust-native implementation, not a port — so some things differ by design and many
 things simply aren't built yet. The canonical, always-current list of gaps lives
 in **[docs/known-approximations.md](docs/known-approximations.md)** (and, more
-precisely, in `INCOMPLETE:` comments and `vim._notimpl` raises in the code). The
+precisely, in `INCOMPLETE:` comments and `nx._notimpl` raises in the code). The
 highlights:
 
 ### Intentional deviations (these will not change)
@@ -427,13 +430,16 @@ highlights:
 - **Some motions.** `%` match-pair, the paragraph/sentence motions
   (`{` `}` `(` `)`), and the screen motions (`H` `M` `L`) aren't wired yet.
 - **More window-local options.** `wrap`, `number`/`relativenumber`,
-  `numberwidth`, `signcolumn`, `cursorline`, `breakindent`/`showbreak`, the
-  fold options (`foldenable`/`foldcolumn`/`foldlevel`), and the horizontal-scroll
-  options are honored; the rest (`colorcolumn`, `cursorcolumn`, …) are not.
-- **A broad options surface.** `:set` honors the search booleans, the
-  number-gutter and horizontal-scroll window options, and the buffer-local
-  indentation options plus `commentstring` — but the bulk of vim's hundreds of
-  options are missing (writes to unsupported options are recorded but inert).
+  `numberwidth`, `signcolumn`, `cursorline`, `colorcolumn`,
+  `breakindent`/`showbreak`, the fold options
+  (`foldenable`/`foldcolumn`/`foldlevel`), and the horizontal-scroll
+  options are honored; the rest (`cursorcolumn`, `list`, …) are not.
+- **A broad options surface.** `:set` knows ~75 options — the search booleans,
+  the window options above, the buffer-local indentation options plus
+  `commentstring`, the fold / mouse / statusline / encoding families, and
+  more — and fails loud (`E518`) on anything else; the bulk of vim's hundreds
+  of options are missing. (The Lua surface is lenient instead: a `vim.o`/`nx.o`
+  write to an unmodeled name is recorded with a warning but inert.)
 - **The `gu`/`gU`/`g~` case operators and the `:map`-family ex-commands.** Case
   is toggled via `~`; keymaps are set via `vim.keymap.set` / `nvim_set_keymap`.
   Both intentionally postponed.
@@ -451,7 +457,7 @@ as a whole one. You can enumerate exactly what a given config trips at runtime.
 
 ---
 
-## Vide-coded
+## Vibe-coded
 
 I started this project on a whim just to test the limits of current day vibe-coding.
 I wanted to see how far I could go, but I didn't expect the answer to turn out to be
@@ -466,7 +472,7 @@ managed to advance. Of course Claude didn't do all of it by itself, I'm a pretty
 seasoned software engineer, so I constantly steered it in the "right" direction and
 I also made all architecture decisions, although with Claude's help. I also didn't
 review the code, apart from skimming it while it was being generated as a coarse
-sanity check, and interrupting and correcting Claude on eggregious mistakes. At times
+sanity check, and interrupting and correcting Claude on egregious mistakes. At times
 I had 4 Claude Code instances implementing 4 features in parallel, thankfully Claude
 doesn't care about conflicts. lol. I had to signup for the Max 20x plan and almost
 maxed out the weekly limit, that's how fast I was going.

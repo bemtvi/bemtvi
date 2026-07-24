@@ -6,7 +6,7 @@ Try, in order:
   3. <C-w>l then G   focus the right window and jump to the last line.
   4. <C-w>h          focus back left — its cursor is right where you left it.
   5. 5<C-w>>         widen the focused window by 5 columns; <C-w>= re-equalizes.
-  6. :WinDemo        open another split from Lua (nvim_open_win) and report it.
+  6. :WinDemo        open another split from Lua (vim.cmd) and report it.
   7. <C-w>o          drop all but the focused window; :q closes one at a time.
 
 Both windows show THIS buffer, so an edit in one appears in the other instantly

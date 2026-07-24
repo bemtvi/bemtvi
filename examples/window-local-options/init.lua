@@ -24,18 +24,22 @@
 --------------------------------------------------------------------------------
 vim.api.nvim_create_user_command("GutterDemo", function()
   local original = vim.api.nvim_get_current_win()
-  local fresh = vim.api.nvim_open_win(0, true, { vertical = true }) -- focused
+  vim.cmd("vsplit") -- queued: the new (focused) window exists on the NEXT tick
 
-  -- Window-local writes via vim.wo: they change only the named window's gutter.
-  vim.wo[fresh].number = false
-  vim.wo[fresh].relativenumber = false
-  vim.wo[original].number = true
-  vim.wo[original].relativenumber = true
+  nx.on_next_tick(function()
+    local fresh = vim.api.nvim_get_current_win()
 
-  vim.notify(string.format(
-    "win %d: gutter off  |  win %d: hybrid gutter — same buffer, two gutters",
-    fresh, original
-  ))
+    -- Window-local writes via vim.wo: they change only the named window's gutter.
+    vim.wo[fresh].number = false
+    vim.wo[fresh].relativenumber = false
+    vim.wo[original].number = true
+    vim.wo[original].relativenumber = true
+
+    vim.notify(string.format(
+      "win %d: gutter off  |  win %d: hybrid gutter — same buffer, two gutters",
+      fresh, original
+    ))
+  end)
 end, {})
 
 --------------------------------------------------------------------------------

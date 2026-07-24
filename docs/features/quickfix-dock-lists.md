@@ -62,7 +62,7 @@ buffer's TODO lines to a saved location list:
 ```lua
 nx.keymap.set("n", "<leader>lt", function()
   local items = {}
-  for i, line in ipairs(nx.api.nvim_buf_get_lines(0, 0, -1, false)) do
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(0, 0, -1, false)) do
     if line:match("TODO") then
       items[#items + 1] = { filename = nx.buf.name(), lnum = i, text = line }
     end

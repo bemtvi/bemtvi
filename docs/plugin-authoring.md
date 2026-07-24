@@ -140,7 +140,7 @@ renders the continuations on a non-focus `nx.component{ surface = "float" }`. It
 packaged exactly as above (`lua/nxvim-keys-helper/init.lua` with `setup`/`add`) and
 carries its own test suite.
 
-The [`examples/`](../examples) directory has ~40 self-contained configs — one per
+The [`examples/`](../examples) directory has ~85 self-contained configs — one per
 feature — that double as plugin-authoring references.
 
 ## Testing

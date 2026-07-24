@@ -2227,6 +2227,33 @@ impl EditHost {
         self.settle_events(true);
     }
 
+    /// Land the typed result of an off-tick `nx.git.*` op (the daemon `git_op` leg's reply) —
+    /// the wasm twin of the native `on_loop_event`'s [`LoopEvent::GitResult`](crate::evloop)
+    /// arm, and the git sibling of [`Self::fs_op_result`]. `reply` is the `["ok", <git-value>]
+    /// | ["err", code, message]` envelope re-encoded to msgpack bytes by the Worker (bytes,
+    /// since `show`'s blob is raw); this decodes it (via [`nxvim_lua::git_result_from_value`])
+    /// into the `Result<GitValue, GitError>` the promise resolves / rejects with, runs the
+    /// callback, drains, then settles and repaints. A malformed reply decodes to a loud
+    /// `EWIRE` `GitError`, never a silent success.
+    pub fn git_op_result(&mut self, id: u64, reply: Vec<u8>) {
+        let result = match rmpv::decode::read_value(&mut &reply[..]) {
+            Ok(value) => nxvim_lua::git_result_from_value(&value),
+            Err(e) => Err(nxvim_lua::GitError {
+                code: "EWIRE".to_string(),
+                message: format!("nx.git: malformed git_op reply: {e}"),
+            }),
+        };
+        if let Err(e) =
+            self.lua
+                .run_callback(id, false, nxvim_lua::CallbackArgs::GitResult { result })
+        {
+            self.editor
+                .echo(format!("E5108: Error in nx.git handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
     /// Land the typed result of an off-tick `nx.http.fetch` (the `http_op` leg's reply, or the
     /// browser `fetch()`'s result) — the wasm twin of the native `on_loop_event`'s
     /// [`LoopEvent::HttpResult`](crate::evloop) arm. `reply` is the `["ok", <response>] |

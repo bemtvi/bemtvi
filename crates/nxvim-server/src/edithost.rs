@@ -195,6 +195,17 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob, local: bool);
 
+    /// Off-tick `nx.git.*` op (`nx._git_op`) over the daemon `git_op` leg — the wasm twin of
+    /// the native `loop_command(LoopCommand::Git)`. Fire-and-forget: the op runs
+    /// `nxvim_git::run_git_job` on the daemon and its typed result returns *inbound* via
+    /// [`EditHost::git_op_result`](crate::EditHost::git_op_result), not here. Unlike `nx.fs`
+    /// there is **no** serverless (OPFS) fallback — there is no in-browser git engine — so the
+    /// editor tick gates this on a connected daemon ([`Self::has_remote_fs`]) and rejects the
+    /// op loud when there is none. The wasm impl forwards the typed job to the Worker, which
+    /// sends one `git_op` request over WebTransport and lands the reply through `git_op_result`.
+    #[cfg(not(feature = "native"))]
+    fn git_op(&mut self, id: u64, job: nxvim_lua::GitJob, local: bool);
+
     /// Off-tick `nx.http.fetch` request (`nx._http_fetch`) — the wasm twin of the native
     /// `loop_command(LoopCommand::Http)`. Fire-and-forget: the round-trip runs in the Worker
     /// (the daemon `http_op` leg when connected, else the browser's own `fetch()`) and its

@@ -83,6 +83,12 @@ const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "num
 // rides as pointer+length (re-encoded msgpack — a `read` result is raw bytes Rust decodes).
 const eh_take_fs_op_requests = M.cwrap("eh_take_fs_op_requests", "number", ["number"]);
 const eh_fs_op_result = M.cwrap("eh_fs_op_result", null, ["number", "number", "number", "number"]);
+// Remote `nx.git.*` leg (`git_op`): the editor enqueues each op off-tick; the Worker runs it
+// over a connected daemon (git runs where the repo is). No serverless fallback — the core
+// rejects a daemonless git op loud, so nothing is enqueued without a daemon. The reply lands
+// via `eh_git_op_result`.
+const eh_take_git_op_requests = M.cwrap("eh_take_git_op_requests", "number", ["number"]);
+const eh_git_op_result = M.cwrap("eh_git_op_result", null, ["number", "number", "number", "number"]);
 // Remote `nx.http.fetch` leg (`http_op`): the editor enqueues each request off-tick; the Worker
 // runs the round-trip over a connected daemon (`http_op`) else the browser's own `fetch()`
 // (serverless — no daemon needed), and lands the reply via `eh_http_result`. The reply rides as
@@ -1682,6 +1688,59 @@ async function daemonFsOp(req) {
   }
 }
 
+// Forward the off-tick `nx.git.*` ops the tick enqueued, routed to the daemon (the `git_op`
+// leg — git runs where the repo is). There is NO serverless fallback (no in-browser git
+// engine): the core rejects a daemonless git op loud, so this is only reached with a daemon.
+// Each produces the `["ok", <git-value>] | ["err", code, message]` envelope `landGitOpResult`
+// re-encodes to msgpack and lands via `eh_git_op_result`. The git twin of `drainFsOpRequests`.
+async function drainGitOpRequests() {
+  let didWork = false;
+  for (;;) {
+    const ops = JSON.parse(readStr(eh_take_git_op_requests(h)));
+    if (ops.length === 0) return didWork;
+    didWork = true;
+    for (const op of ops) {
+      const id = op.id;
+      const req = { ...op };
+      delete req.id;
+      delete req.local; // git in web is always daemon-side; the flag is irrelevant here
+      let reply;
+      try {
+        reply = await daemonGitOp(req);
+      } catch (e) {
+        reply = ["err", "EGIT", String(e && e.message ? e.message : e)];
+      }
+      landGitOpResult(id, reply);
+    }
+  }
+}
+
+// Run one `nx.git` op against the daemon (the `git_op` leg). A dropped link returns a loud
+// error, never a silent empty result.
+async function daemonGitOp(req) {
+  if (!daemon) return ["err", "ENOTCONN", daemonError || "daemon not connected"];
+  try {
+    return await daemon.request("git_op", [req]);
+  } catch (e) {
+    return ["err", "EGIT", String(e && e.message ? e.message : e)];
+  }
+}
+
+// Land one `nx.git` op reply into the tick: re-encode the daemon's `["ok"|"err", …]` envelope
+// to msgpack bytes (`show`'s blob survives as `bin`) and hand them to `eh_git_op_result`, which
+// decodes them through the shared `gitwire` codec and resolves/rejects the op's promise. The
+// git twin of `landFsOpResult`.
+function landGitOpResult(id, reply) {
+  const bytes = encode(reply);
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  try {
+    eh_git_op_result(h, id, ptr, bytes.length);
+  } finally {
+    if (ptr) M._free(ptr);
+  }
+}
+
 // Forward the streaming `nx.fs.watch` arms/disarms the tick enqueued to the daemon (the
 // `luafs_watch` leg — Phase 3b). The daemon answers with `luafs_change`/`luafs_watch_err` pushes
 // (`onDaemonNotify`). Only reached in a daemon session — the tick gates the watch on a connected
@@ -2256,6 +2315,10 @@ async function runLoopSAB(ctrl, data) {
     // Request/response within this pass (we're not parked), so each reply lands before the
     // repaint below — the op's promise resolves and the UI sees its effect.
     const fsOpWork = await drainFsOpRequests();
+    // Forward any off-tick `nx.git.*` ops the tick enqueued to the daemon (the `git_op` leg —
+    // git runs where the repo is). Daemon-only (a serverless git op is rejected in-core, so
+    // nothing is enqueued without a daemon). Each reply lands before the repaint below.
+    const gitOpWork = await drainGitOpRequests();
     // Forward any off-tick `nx.http.fetch` the tick enqueued — to the daemon (`http_op`) when
     // connected, else the browser's own `fetch()` (serverless — no daemon needed). Each reply
     // lands before the repaint below, so the fetch's promise resolves and the UI sees its effect.
@@ -2287,13 +2350,13 @@ async function runLoopSAB(ctrl, data) {
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
     drainClipboardWrites();
-    if (fired || acks.length || fsWork || fsOpWork || httpWork || mountWork || notified || tsLanded || termFlushed) {
+    if (fired || acks.length || fsWork || fsOpWork || gitOpWork || httpWork || mountWork || notified || tsLanded || termFlushed) {
       postMessage(redrawMsg({ acks, results }));
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
     // flush (tab hidden) writes immediately with the exit cursor. The checkpoint write is
     // async (OPFS) — awaiting it here is fine (the thread isn't parked yet).
-    if (acks.length || results.length || fsWork || fsOpWork || httpWork) {
+    if (acks.length || results.length || fsWork || fsOpWork || gitOpWork || httpWork) {
       shadaDirty = true;
       shadaDueMs = nowMs() + SHADA_DEBOUNCE_MS;
     }

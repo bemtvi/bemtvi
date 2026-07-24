@@ -159,6 +159,13 @@ struct Sink {
     /// typed result via [`eh_fs_op_result`]. Always enqueued on wasm (there is always *some* fs —
     /// OPFS is the serverless fallback), unlike the daemon-only proc leg.
     fs_ops: Vec<(u64, nxvim_lua::FsJob, bool)>,
+    /// Off-tick `nx.git.*` ops the editor enqueued this convergence (the `git_op` leg):
+    /// `(cb_id, job, local)` per `nx.git.*` call, recorded by [`git_op`](HostEffects::git_op).
+    /// Drained by [`eh_take_git_op_requests`]; the Worker routes each to the daemon `git_op`
+    /// leg over WebTransport and lands the typed result via [`eh_git_op_result`]. Only enqueued
+    /// when a daemon is connected — there is no in-browser git engine, so a serverless session
+    /// rejects the op loud in the tick (the editor never records it here).
+    git_ops: Vec<(u64, nxvim_lua::GitJob, bool)>,
     /// Off-tick `nx.http.fetch` requests the editor enqueued this convergence (the `http_op`
     /// leg): `(cb_id, request)` per `nx.http.fetch`, recorded by [`http_op`](HostEffects::http_op).
     /// Drained by [`eh_take_http_requests`]; the Worker routes each to the daemon `http_op` leg
@@ -758,6 +765,14 @@ impl HostEffects for WasmEffects {
         // plugin management is local (see the plan doc). The typed result returns via
         // `eh_fs_op_result`.
         self.sink.borrow_mut().fs_ops.push((id, job, local));
+    }
+
+    fn git_op(&mut self, id: u64, job: nxvim_lua::GitJob, local: bool) {
+        // An off-tick `nx.git` op: record the (cb_id, job, local) for the Worker to route to
+        // the daemon `git_op` leg (`eh_take_git_op_requests`). Only reached when a daemon is
+        // connected — the editor tick rejects a serverless git op loud before it gets here
+        // (there is no in-browser git engine). The typed result returns via `eh_git_op_result`.
+        self.sink.borrow_mut().git_ops.push((id, job, local));
     }
 
     fn http_op(&mut self, id: u64, request: nxvim_lua::HttpRequest, local: bool) {
@@ -2014,6 +2029,44 @@ fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob, local: bool) -> serde_json::V
     serde_json::Value::Object(o)
 }
 
+/// Lower a [`GitJob`](nxvim_lua::GitJob) into the JSON object the Worker forwards as a
+/// `git_op` request map: `{ id, op, … }`. The op name + field names match the daemon's
+/// `nxvim_lua::git_job_from_value` decoder. The git twin of [`fs_job_to_json`].
+fn git_job_to_json(id: u64, job: &nxvim_lua::GitJob, local: bool) -> serde_json::Value {
+    use nxvim_lua::GitJob;
+    let mut o = serde_json::Map::new();
+    o.insert("id".into(), serde_json::json!(id));
+    o.insert("local".into(), serde_json::json!(local));
+    let mut put = |k: &str, v: serde_json::Value| {
+        o.insert(k.into(), v);
+    };
+    match job {
+        GitJob::Discover { path } => {
+            put("op", "discover".into());
+            put("path", path.clone().into());
+        }
+        GitJob::Head { path } => {
+            put("op", "head".into());
+            put("path", path.clone().into());
+        }
+        GitJob::Show { file, rev } => {
+            put("op", "show".into());
+            put("file", file.clone().into());
+            put("rev", rev.clone().into());
+        }
+        GitJob::DiffFile { path, file } => {
+            put("op", "diff_file".into());
+            put("path", path.clone().into());
+            put("file", file.clone().into());
+        }
+        GitJob::Status { path } => {
+            put("op", "status".into());
+            put("path", path.clone().into());
+        }
+    }
+    serde_json::Value::Object(o)
+}
+
 /// Drain the off-tick `nx.fs` ops the editor enqueued since the last call, as a JSON array of
 /// `luafs_op` request objects (`[{ id, op, path, … }, …]`), emptying the queue so each is
 /// forwarded exactly once. The Worker sends one `luafs_op` request per object and lands the
@@ -2060,6 +2113,50 @@ pub unsafe extern "C" fn eh_fs_op_result(
     let Some(handle) = h.as_mut() else { return };
     let reply = as_byte_vec(data, len);
     handle.host.fs_op_result(id.max(0.0) as u64, reply);
+}
+
+/// Drain the off-tick `nx.git` ops the editor enqueued since the last call, as a JSON array of
+/// `git_op` request objects (`[{ id, op, path, … }, …]`), emptying the queue so each is
+/// forwarded exactly once. The Worker sends one `git_op` request per object over WebTransport
+/// and lands the reply via [`eh_git_op_result`]. Only non-empty when a daemon is connected (a
+/// serverless git op is rejected loud before it reaches the sink). The git twin of
+/// [`eh_take_fs_op_requests`]; caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_git_op_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    {
+        let sink = handle.sink.borrow();
+        if sink.git_ops.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
+    let ops: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().git_ops)
+        .iter()
+        .map(|(id, job, local)| git_job_to_json(*id, job, *local))
+        .collect();
+    into_owned_cstr(serde_json::Value::Array(ops).to_string())
+}
+
+/// Land the typed result of an off-tick `nx.git` op (the `git_op` leg's reply): resolve /
+/// reject the promise enqueued under `id`, then settle + repaint. `reply` is the `["ok",
+/// <git-value>] | ["err", code, message]` envelope re-encoded to **msgpack bytes** by the
+/// Worker (pointer+length, not a C string, because `show`'s blob carries raw bytes); Rust
+/// decodes it through the shared `nxvim_lua::gitwire` codec. The git twin of
+/// [`eh_fs_op_result`]. See [`EditHost::git_op_result`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
+/// bytes (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_git_op_result(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
+    let Some(handle) = h.as_mut() else { return };
+    let reply = as_byte_vec(data, len);
+    handle.host.git_op_result(id.max(0.0) as u64, reply);
 }
 
 // ============================================================================

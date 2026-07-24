@@ -2826,6 +2826,33 @@ impl EditHost {
                 };
                 self.fx.fs_op(id, job, local)
             }
+            // `nx.git.*` on wasm: hand the whole job to the Worker's daemon `git_op` leg.
+            // Unlike `nx.fs` there is NO OPFS fallback — there is no in-browser git engine —
+            // so a serverless session (no daemon) rejects the op LOUD in the tick (the
+            // `FsWatch` precedent), never a silent empty result. A `?daemon=` web session
+            // routes it over the wire, where the daemon runs `run_git_job` against the real
+            // repo. No path rebase: the plugin callers pass absolute paths.
+            #[cfg(not(feature = "native"))]
+            LoopOp::Git { id, job, local } => {
+                if self.fx.has_remote_fs() {
+                    self.fx.git_op(id, job, local);
+                } else {
+                    let result = Err(nxvim_lua::GitError {
+                        code: "ENODAEMON".to_string(),
+                        message: "nx.git requires a daemon in this session \
+                                  (a serverless web session has no git engine)"
+                            .to_string(),
+                    });
+                    if let Err(e) =
+                        self.lua
+                            .run_callback(id, false, CallbackArgs::GitResult { result })
+                    {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.git handler: {e}"));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
             // `nx.http.fetch` on wasm: hand the request to the Worker (the daemon `http_op`
             // leg when connected, else the browser's own `fetch()`). No host gate — the
             // browser always has `fetch()`, so a serverless session runs HTTP directly.

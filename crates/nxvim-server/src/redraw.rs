@@ -2088,7 +2088,7 @@ impl EditHost {
             .max(1);
         let pane_h = box_h.max(1);
 
-        let (lines, first_line, loc, title, highlights) = match &m.preview {
+        let (lines, first_line, loc, title, highlights, filetype) = match &m.preview {
             Some(target) => {
                 self.ensure_preview(&target.path);
                 let len = self.preview_cache.lines.len();
@@ -2177,7 +2177,15 @@ impl EditHost {
                     }
                     _ => None,
                 };
-                (shown, start + 1, loc, target.path.clone(), highlights)
+                let filetype = cache.lang.clone();
+                (
+                    shown,
+                    start + 1,
+                    loc,
+                    target.path.clone(),
+                    highlights,
+                    filetype,
+                )
             }
             // The picker has a preview pane, but this row carries no target.
             None => {
@@ -2188,6 +2196,7 @@ impl EditHost {
                     None,
                     String::new(),
                     Value::Array(Vec::new()),
+                    String::new(),
                 )
             }
         };
@@ -2206,6 +2215,9 @@ impl EditHost {
             (Value::from("width"), Value::from(preview_w as u64)),
             (Value::from("loc"), loc_value),
             (Value::from("highlights"), highlights),
+            // The treesitter language the pane was highlighted as (empty ⇒ no grammar),
+            // mirroring a window's `filetype`. Lets a help `doc/*.txt` report `vimdoc`.
+            (Value::from("filetype"), Value::from(filetype.as_str())),
         ]))
     }
 
@@ -2273,26 +2285,37 @@ impl EditHost {
     /// file's matches never re-parses). Highlights are keyed by 0-based file line; empty
     /// when the read failed (`ok = false`) or no grammar is installed for the path.
     fn store_preview(&mut self, p: &std::path::Path, lines: Vec<String>, ok: bool) {
-        let highlights = if ok {
-            nxvim_core::language_of_path(Some(p)).map_or_else(HashMap::new, |lang| {
-                // Trailing newline to match the engine's buffer invariant (it treats
-                // the last line as a phantom: `len_lines - 1`); without it a
-                // single-line file parses to zero lines and drops every span.
-                let text = lines.join("\n") + "\n";
-                let mut by_line: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
-                for span in self.editor.preview_highlights(lang, &text, 0, lines.len()) {
-                    by_line.entry(span.line).or_default().push(span);
-                }
-                by_line
+        // The highlight language: the extension's grammar, or — for a vim help
+        // `doc/*.txt`, which no extension rule catches — `vimdoc`, decided from the
+        // file's last non-blank line (where the `ft=help` modeline lives).
+        let lang = if ok {
+            nxvim_core::language_of_path(Some(p)).or_else(|| {
+                let last = lines
+                    .iter()
+                    .rfind(|l| !l.trim().is_empty())
+                    .map_or("", |l| l.as_str());
+                nxvim_core::language_of_help_doc(p, last)
             })
         } else {
-            HashMap::new()
+            None
         };
+        let highlights = lang.map_or_else(HashMap::new, |lang| {
+            // Trailing newline to match the engine's buffer invariant (it treats
+            // the last line as a phantom: `len_lines - 1`); without it a
+            // single-line file parses to zero lines and drops every span.
+            let text = lines.join("\n") + "\n";
+            let mut by_line: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
+            for span in self.editor.preview_highlights(lang, &text, 0, lines.len()) {
+                by_line.entry(span.line).or_default().push(span);
+            }
+            by_line
+        });
         self.preview_cache = PreviewCache {
             path: Some(p.to_path_buf()),
             lines,
             ok,
             highlights,
+            lang: lang.unwrap_or_default().to_string(),
         };
     }
 
@@ -2345,6 +2368,11 @@ pub(crate) struct PreviewCache {
     /// file is parsed on a path miss). `project_preview` maps the windowed slice to
     /// char columns + per-frame style ids; an empty map ⇒ no grammar (plain preview).
     highlights: HashMap<usize, Vec<nxvim_core::Span>>,
+    /// The treesitter language the preview was highlighted as (`"rust"`, `"vimdoc"`,
+    /// …), or empty when the path has no known grammar. Surfaced to clients as the
+    /// preview's `filetype`, mirroring a window's — and the seam that lets a help
+    /// `doc/*.txt` resolve to `vimdoc` even though its extension alone wouldn't.
+    lang: String,
 }
 
 /// Cap on the bytes pulled into a single preview read / fetch — a guard against a huge

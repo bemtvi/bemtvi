@@ -2726,6 +2726,37 @@ pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
     })
 }
 
+/// The treesitter grammar for a vim **help** file, or `None` when `path` isn't one.
+/// Help files aren't identified by extension alone (plain `.txt` is not help), so this
+/// can't fold into [`language_of_path`]: it applies neovim's rule — a `.txt` under a
+/// `doc/` directory whose file carries a `vim:…ft=help…` modeline. `last_line` is the
+/// file's last non-blank line (where the modeline lives). The grammar is `vimdoc`
+/// (neovim's `filetype=help` maps to the `vimdoc` parser); callers slot this beside
+/// `language_of_path` so a help preview/buffer highlights when that parser is installed.
+pub fn language_of_help_doc(path: &Path, last_line: &str) -> Option<&'static str> {
+    if path.extension()?.to_str()? != "txt" {
+        return None;
+    }
+    if path.parent()?.file_name()?.to_str()? != "doc" {
+        return None;
+    }
+    is_help_modeline(last_line).then_some("vimdoc")
+}
+
+/// Whether `line` is a vim modeline selecting the help filetype (`ft=help` /
+/// `filetype=help`), matching neovim's `doc/*.txt` detection. A modeline is a `vim:`
+/// token at line start or after whitespace, followed by `:`/space-delimited options;
+/// we accept it when any option is exactly `ft=help` or `filetype=help`.
+fn is_help_modeline(line: &str) -> bool {
+    line.match_indices("vim:").any(|(i, _)| {
+        let at_boundary = i == 0 || line.as_bytes()[i - 1].is_ascii_whitespace();
+        at_boundary
+            && line[i + 4..]
+                .split(|c: char| c == ':' || c.is_whitespace())
+                .any(|opt| opt == "ft=help" || opt == "filetype=help")
+    })
+}
+
 /// Whether `path`'s extension names a raster image nxvim can preview — the gate
 /// for `'imagepreview'` ([`crate::options::Options::imagepreview`]). Extension-only
 /// (no content sniffing): cheap, and the same way the filetype is decided

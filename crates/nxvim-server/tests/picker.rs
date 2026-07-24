@@ -1766,6 +1766,74 @@ nx.picker.source {{
     assert_eq!(preview_loc(&preview), Some((4, 1)));
 }
 
+/// A vim help file (`doc/*.txt` with a `ft=help` modeline) resolves its preview
+/// highlight language to `vimdoc`, even though the `.txt` extension alone maps to no
+/// grammar — while an ordinary `.txt` (no modeline / not under `doc/`) stays plain and
+/// a `.rs` still resolves to `rust`. This is grammar-independent: it asserts the
+/// preview pane's reported `filetype`, which drives (and, when the `vimdoc` parser is
+/// installed, produces) the actual highlighting.
+#[tokio::test]
+async fn help_doc_preview_resolves_to_vimdoc() {
+    let dir = temp_dir("picker_preview_help");
+    let doc = dir.join("doc");
+    std::fs::create_dir_all(&doc).unwrap();
+    // A real help file: under doc/, .txt, with a trailing vim ft=help modeline.
+    std::fs::write(
+        doc.join("thing.txt"),
+        "*thing*\tThe thing.\n\nBody text.\n\nvim:tw=78:ft=help:\n",
+    )
+    .unwrap();
+    // A plain .txt under doc/ but WITHOUT the modeline stays unhighlighted.
+    std::fs::write(doc.join("plain.txt"), "just notes\nno modeline\n").unwrap();
+    // A .rs still resolves by extension.
+    std::fs::write(dir.join("code.rs"), "fn main() {}\n").unwrap();
+    let help = doc.join("thing.txt");
+    let plain = doc.join("plain.txt");
+    let code = dir.join("code.rs");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "ft_test",
+  preview = "location",
+  items = function(ctx)
+    ctx.push {{ text = "help", path = "{help}", row = 1, col = 0 }}
+    ctx.push {{ text = "plain", path = "{plain}", row = 1, col = 0 }}
+    ctx.push {{ text = "code", path = "{code}", row = 1, col = 0 }}
+  end,
+  confirm = function(item) _G.picked = item.path end,
+}}
+"#,
+        help = help.display(),
+        plain = plain.display(),
+        code = code.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    let filetype_of = |menu: &[(Value, Value)]| -> String {
+        let preview = preview_of(menu).expect("picker carries a preview pane");
+        map_get(&preview, "filetype")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+
+    exec_lua(&rpc, "nx.picker.open('ft_test')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    assert_eq!(filetype_of(&menu), "vimdoc", "help doc -> vimdoc");
+
+    feed(&rpc, "<C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu updates"));
+    assert_eq!(filetype_of(&menu), "", "plain .txt stays unhighlighted");
+
+    feed(&rpc, "<C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu updates"));
+    assert_eq!(
+        filetype_of(&menu),
+        "rust",
+        ".rs still resolves by extension"
+    );
+}
+
 #[tokio::test]
 async fn preview_scrolls_with_ctrl_dufb() {
     let dir = temp_dir("picker_preview_scroll");

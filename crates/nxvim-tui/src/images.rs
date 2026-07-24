@@ -5,10 +5,10 @@
 //! pass `None`, so the image area stays blank there.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 
-use image::imageops::FilterType;
-use image::{DynamicImage, ImageReader};
+use image::DynamicImage;
+pub(crate) use nxvim_view::images::ImageFetch;
+use nxvim_view::images::{decode_bytes, decode_file, RemoteImages, MAX_EDGE};
 use nxvim_view::ImageData;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
@@ -18,24 +18,10 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// A request to fetch a remote (daemon-session) preview's bytes over the editor RPC.
-/// The store can't read the marker's `path` off its own disk — the file is on the
-/// daemon — so it emits one of these; the event loop fulfils it with
-/// `nxvim_image_read` and feeds the bytes back via [`ImageStore::deliver`].
-pub(crate) struct ImageFetch {
-    pub path: String,
-    /// The preview's on-disk version `(size, mtime_ms)`, echoed back so a stale reply
-    /// for a superseded version is dropped rather than replacing newer bytes.
-    pub version: (u64, u64),
-}
-
-/// Cap the longest edge of a decoded image (pixels) before building its protocol.
-/// A preview never needs more than the terminal can show, so this bounds the held
-/// image and the per-resize re-encode cost for a huge file — the never-freeze
-/// guard — while staying generous enough that even a big / hi-dpi terminal looks
-/// crisp. (The full-resolution decode still happens once; only the retained copy
-/// is shrunk.)
-const MAX_EDGE: u32 = 2560;
+// The fetch request / remote byte cache / bounded decode helpers are the
+// toolkit-neutral half shared with the GUI; they live in [`nxvim_view::images`].
+// (`ImageFetch` is re-exported so the event loop can keep naming
+// `images::ImageFetch`.)
 
 /// The client's image renderer: the terminal-graphics [`Picker`] (protocol + cell
 /// pixel size, detected once at startup) plus a path-keyed cache of decoded,
@@ -43,30 +29,12 @@ const MAX_EDGE: u32 = 2560;
 pub(crate) struct ImageStore {
     picker: Picker,
     cache: HashMap<String, CacheEntry>,
-    /// Out-of-band byte fetches for remote (daemon-session) previews, keyed by path —
-    /// the bytes aren't on local disk, so they're requested over the editor RPC.
-    remote: HashMap<String, RemoteSlot>,
+    /// Out-of-band byte fetches for remote (daemon-session) previews (shared with
+    /// the GUI; see [`RemoteImages`]).
+    remote: RemoteImages,
     /// The sink the event loop drains to issue `nxvim_image_read` requests; a reply
     /// comes back via [`ImageStore::deliver`].
     fetch_tx: UnboundedSender<ImageFetch>,
-}
-
-/// A remote preview's out-of-band byte fetch (see [`ImageFetch`]), keyed by path.
-struct RemoteSlot {
-    /// The on-disk version `(size, mtime_ms)` this fetch was issued for; a changed
-    /// version (a watch reload) supersedes it with a fresh fetch.
-    version: (u64, u64),
-    state: RemoteState,
-}
-
-/// Where a remote preview's byte fetch stands.
-enum RemoteState {
-    /// A request is in flight; paint the loading placeholder until it lands.
-    Pending,
-    /// The fetched bytes, ready to decode.
-    Ready(Vec<u8>),
-    /// The fetch failed (a read error / vanished file); paint the error placeholder.
-    Failed,
 }
 
 /// One path's cache slot: the file version it was decoded at (size + mtime-ms) and
@@ -96,7 +64,7 @@ impl ImageStore {
         ImageStore {
             picker: detect_picker(),
             cache: HashMap::new(),
-            remote: HashMap::new(),
+            remote: RemoteImages::new(),
             fetch_tx,
         }
     }
@@ -114,7 +82,9 @@ impl ImageStore {
         // A remote preview's bytes live on the daemon; make sure a fetch is in flight
         // (or already resolved) for this version before deciding what to decode.
         if image.remote {
-            self.ensure_remote_fetch(path, version);
+            if let Some(req) = self.remote.ensure_fetch(path, version) {
+                let _ = self.fetch_tx.send(req);
+            }
         }
         // (Re)decode when there's no entry or the on-disk version moved (the latter
         // also retries a file whose earlier decode failed but has since been fixed).
@@ -123,13 +93,13 @@ impl ImageStore {
         // a local preview reads the shared disk.
         if self.cache.get(path).map(|e| e.version) != Some(version) {
             if image.remote {
-                if let Some(bytes) = self.remote_ready(path, version).map(<[u8]>::to_vec) {
-                    let decoded = decode_bytes(&bytes).map(|img| self.decoded_from(img));
+                if let Some(bytes) = self.remote.ready(path, version).map(<[u8]>::to_vec) {
+                    let decoded = decode_bytes(&bytes, MAX_EDGE).map(|img| self.decoded_from(img));
                     self.cache
                         .insert(path.to_string(), CacheEntry { version, decoded });
                 }
             } else {
-                let decoded = decode(path).map(|img| self.decoded_from(img));
+                let decoded = decode_file(path, MAX_EDGE).map(|img| self.decoded_from(img));
                 self.cache
                     .insert(path.to_string(), CacheEntry { version, decoded });
             }
@@ -147,7 +117,7 @@ impl ImageStore {
         }
         // No usable image: a remote fetch still in flight reads as "loading"; anything
         // else (a decode failure, an errored fetch) is a hard "cannot read".
-        let msg = if self.is_loading(path, version) {
+        let msg = if self.remote.is_loading(path, version) {
             format!("[image: loading {path}]")
         } else {
             format!("[image: cannot read {path}]")
@@ -163,49 +133,6 @@ impl ImageStore {
         }
     }
 
-    /// Make sure a fetch over `nxvim_image_read` is in flight (or already resolved) for
-    /// `path` at `version`. Sends exactly one request per (path, version): the slot
-    /// dedupes resends while a fetch is pending and across frames, and a changed
-    /// version (a watch reload) issues a fresh request. The reply returns via
-    /// [`deliver`](Self::deliver).
-    fn ensure_remote_fetch(&mut self, path: &str, version: (u64, u64)) {
-        if self.remote.get(path).map(|s| s.version) == Some(version) {
-            return; // already fetching this version, or its bytes/failure are cached
-        }
-        let _ = self.fetch_tx.send(ImageFetch {
-            path: path.to_string(),
-            version,
-        });
-        self.remote.insert(
-            path.to_string(),
-            RemoteSlot {
-                version,
-                state: RemoteState::Pending,
-            },
-        );
-    }
-
-    /// The fetched bytes for a remote preview if they've arrived and still match
-    /// `version`, else `None` (in flight, failed, or a superseded version).
-    fn remote_ready(&self, path: &str, version: (u64, u64)) -> Option<&[u8]> {
-        match self.remote.get(path) {
-            Some(RemoteSlot {
-                version: v,
-                state: RemoteState::Ready(bytes),
-            }) if *v == version => Some(bytes),
-            _ => None,
-        }
-    }
-
-    /// Whether a remote fetch for `path` at `version` is still in flight (so the
-    /// placeholder reads "loading" rather than "cannot read").
-    fn is_loading(&self, path: &str, version: (u64, u64)) -> bool {
-        matches!(
-            self.remote.get(path),
-            Some(RemoteSlot { version: v, state: RemoteState::Pending }) if *v == version
-        )
-    }
-
     /// Receive an `nxvim_image_read` reply for a remote preview (routed from the event
     /// loop): cache the bytes, or mark the fetch failed, so the next paint
     /// decodes/falls-back. A reply for a version no longer requested is dropped (a
@@ -216,14 +143,7 @@ impl ImageStore {
         version: (u64, u64),
         result: Result<Vec<u8>, String>,
     ) {
-        if self.remote.get(&path).map(|s| s.version) != Some(version) {
-            return; // a newer fetch (or a closed preview) superseded this reply
-        }
-        let state = match result {
-            Ok(bytes) => RemoteState::Ready(bytes),
-            Err(_) => RemoteState::Failed,
-        };
-        self.remote.insert(path, RemoteSlot { version, state });
+        self.remote.deliver(path, version, result);
     }
 }
 
@@ -348,40 +268,4 @@ fn centered_fit(area: Rect, px: (u32, u32), font: (u16, u16)) -> Rect {
         w,
         h,
     )
-}
-
-/// Read and decode an image file into a [`DynamicImage`], guessing the format from
-/// its contents (not just the extension). `None` on any read / decode error.
-fn decode(path: &str) -> Option<DynamicImage> {
-    let img = ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
-    Some(downscale(img))
-}
-
-/// Decode in-memory image `bytes` — a remote preview's bytes fetched over the editor
-/// RPC (`nxvim_image_read`), which the client can't read off its own disk. Guesses the
-/// format from the contents like [`decode`] and applies the same downscale. `None` on a
-/// decode error (a corrupt / unsupported file → the placeholder).
-fn decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
-    let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
-    Some(downscale(img))
-}
-
-/// Downscale an oversized image to the preview cap (aspect-preserving), so the retained
-/// copy and every re-encode stay bounded regardless of the source size — the shared
-/// tail of [`decode`] / [`decode_bytes`].
-fn downscale(img: DynamicImage) -> DynamicImage {
-    if img.width().max(img.height()) > MAX_EDGE {
-        img.resize(MAX_EDGE, MAX_EDGE, FilterType::Triangle)
-    } else {
-        img
-    }
 }

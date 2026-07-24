@@ -12,8 +12,11 @@ use ratatui::Frame;
 use rmpv::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::anim::{arm_animation, lerp, Animation};
 use crate::images::ImageStore;
+use nxvim_view::{
+    arm_scroll, elide_keep_tail, elide_middle, gutter_cell, lerp, pmenu_row, pmenu_start,
+    ScrollAnim,
+};
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
     PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View, VirtChunk,
@@ -168,7 +171,14 @@ fn bt(b: nxvim_view::Border) -> BorderType {
 /// and return the painted buffer. This drives the *same* `render` the live
 /// client uses, so tests assert on exactly what a user would see.
 pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
-    paint_doc_scrolled(view, width, height, 0)
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, view, None, None))
+        .expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 /// Like [`paint`], but also returns the terminal cursor position the frame
@@ -184,29 +194,10 @@ pub fn paint_with_cursor(
     use ratatui::Terminal;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
-        .draw(|frame| render(frame, view, None, 0, None))
+        .draw(|frame| render(frame, view, None, None))
         .expect("draw");
     let cursor = terminal.get_cursor_position().ok().map(|p| (p.x, p.y));
     (terminal.backend().buffer().clone(), cursor)
-}
-
-/// Like [`paint`], but with the completion doc preview scrolled down `doc_scroll`
-/// lines — the hook a test uses to assert the mouse-wheel scroll offset actually
-/// shifts the rendered docs. Not part of the client's runtime API.
-#[doc(hidden)]
-pub fn paint_doc_scrolled(
-    view: &View,
-    width: u16,
-    height: u16,
-    doc_scroll: u16,
-) -> ratatui::buffer::Buffer {
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
-    terminal
-        .draw(|frame| render(frame, view, None, doc_scroll, None))
-        .expect("draw");
-    terminal.backend().buffer().clone()
 }
 
 /// The terminal cursor shape for the current mode, matching vim/neovim's default
@@ -226,15 +217,15 @@ pub fn cursor_style(view: &View) -> SetCursorStyle {
 }
 
 /// A headless mirror of the client's render state — the `View` and the in-flight
-/// scroll `Animation` — driven by `redraw` notifications exactly as the live
-/// event loop drives them (via [`arm_animation`]). Lets tests exercise the
+/// scroll [`ScrollAnim`] — driven by `redraw` notifications exactly as the live
+/// event loop drives them (via [`arm_scroll`]). Lets tests exercise the
 /// scroll-animation lifecycle (which the event loop owns) without a real
 /// terminal or RPC connection. Not part of the client's runtime API.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ScrollHarness {
     view: View,
-    anim: Option<Animation>,
+    anim: Option<ScrollAnim>,
 }
 
 #[doc(hidden)]
@@ -247,7 +238,7 @@ impl ScrollHarness {
     /// animation the same way the live event loop does.
     pub fn on_redraw(&mut self, params: &[Value]) {
         self.view.update(params);
-        self.anim = arm_animation(&self.view, self.anim.take());
+        self.anim = arm_scroll(&self.view, self.anim.take());
     }
 
     /// Whether a scroll animation is currently in flight.
@@ -262,7 +253,7 @@ impl ScrollHarness {
         use ratatui::Terminal;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal
-            .draw(|frame| render(frame, &self.view, self.anim.as_ref(), 0, None))
+            .draw(|frame| render(frame, &self.view, self.anim.as_ref(), None))
             .expect("draw");
         terminal.backend().buffer().clone()
     }
@@ -277,8 +268,7 @@ impl ScrollHarness {
 pub(crate) fn render(
     frame: &mut Frame,
     view: &View,
-    anim: Option<&Animation>,
-    doc_scroll: u16,
+    anim: Option<&ScrollAnim>,
     mut images: Option<&mut ImageStore>,
 ) {
     // The command line is the last row. Each window draws its own status line at the
@@ -378,7 +368,7 @@ pub(crate) fn render(
     // The insert-mode completion popup floats over the focused window's text area,
     // drawn after the windows so it sits on top.
     if let (Some(pmenu), Some((inner, _, _))) = (&view.pmenu, focused_inner) {
-        render_pmenu(frame, inner, pmenu, doc_scroll);
+        render_pmenu(frame, inner, pmenu);
     }
 
     // The floating selectable-list menu (`nx.ui.select`) floats the same way,
@@ -793,16 +783,6 @@ impl FloatTheme {
     }
 }
 
-/// A float's inner content rect (past its border), or the whole `area` for a
-/// borderless float. Shared by the renderer and [`text_inner_rect`] so a focused
-/// float's cursor/popup anchor lands on the cells the border left for content.
-fn float_inner(area: Rect, border: Option<BorderType>) -> Rect {
-    match border {
-        Some(border) => float_block(border, None, FloatTheme::default()).inner(area),
-        None => area,
-    }
-}
-
 /// Paint one window into `area`: the theme background, the number gutter, the
 /// text body (or an interpolated slide when `anim` is set), and a status line on
 /// the bottom row. Returns the text-inner rect (past the gutter) and the
@@ -812,7 +792,7 @@ fn render_window(
     area: Rect,
     win: &WindowView,
     view: &View,
-    anim: Option<&Animation>,
+    anim: Option<&ScrollAnim>,
     images: Option<&mut ImageStore>,
 ) -> (Rect, u16, u16) {
     // The status line is the window's bottom row (when this window shows one, per
@@ -905,18 +885,13 @@ fn render_window(
 
     match anim {
         Some(a) => {
-            // `arm_animation` never arms a zero-duration slide; guard the divide
-            // anyway so progress can't become NaN/inf if that ever changes.
-            let raw = if a.duration.is_zero() {
-                1.0
-            } else {
-                (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0)
-            };
-            let t = 1.0 - (1.0 - raw).powi(3); // ease-out cubic
-                                               // The slide is a screen-row offset into the band: `off` is the viewport
-                                               // top's band-row index, `cur_row` the cursor's. The band already
-                                               // interleaves any `virt_lines`, so advancing whole screen rows slides
-                                               // them correctly. `off` is a slice index (band `rows[0]` is the anchor).
+            let t = a.progress();
+            // The rest of the arm reads the band snapshot, not the clock.
+            let a = &a.data;
+            // The slide is a screen-row offset into the band: `off` is the viewport
+            // top's band-row index, `cur_row` the cursor's. The band already
+            // interleaves any `virt_lines`, so advancing whole screen rows slides
+            // them correctly. `off` is a slice index (band `rows[0]` is the anchor).
             let off = lerp(a.from_row, a.to_row, t).round() as usize;
             let cur_row = lerp(a.from_cursor_row, a.to_cursor_row, t).round() as usize;
             anim_lines = a.lines.iter().skip(off).take(height).cloned().collect();
@@ -1185,7 +1160,7 @@ fn render_window(
     // neutral palette is converted to ratatui styles once here so `cell_style` can
     // compose them with `.patch`/`.fg`/… as it walks each row's cells.
     let palette: Vec<Style> = match anim {
-        Some(a) => &a.styles,
+        Some(a) => &a.data.styles,
         None => &view.styles,
     }
     .iter()
@@ -1450,6 +1425,9 @@ fn render_fold_column(
 
 /// A sign glyph fitted to exactly `width` cells: truncated if too wide, then
 /// right-padded with spaces (so a 1-cell `E` fills the 2-cell column as `E `).
+/// Deliberately NOT shared with the GUI (`nxvim_view::fit`): the TUI measures
+/// display width for CJK/emoji fidelity, while the GUI's column math is
+/// char-based throughout.
 fn pad_to_width(s: &str, width: usize) -> String {
     let mut out = truncate_to_width(s, width);
     let painted: usize = out
@@ -1458,37 +1436,6 @@ fn pad_to_width(s: &str, width: usize) -> String {
         .sum();
     out.push_str(&" ".repeat(width.saturating_sub(painted)));
     out
-}
-
-/// Build one `width`-cell gutter cell for a row whose buffer line is `num`
-/// (`None` for a `~` filler). Numbers are right-aligned with a trailing space,
-/// except the hybrid cursor line whose absolute number is left-aligned — vim's
-/// layout.
-fn gutter_cell(
-    num: Option<usize>,
-    current_line: usize,
-    number: bool,
-    relativenumber: bool,
-    width: usize,
-) -> String {
-    let Some(n) = num else {
-        return " ".repeat(width);
-    };
-    let is_current = n == current_line;
-    if number && relativenumber && is_current {
-        // Hybrid cursor line: absolute number, left-aligned.
-        format!("{n:<width$}")
-    } else {
-        let value = if !relativenumber {
-            n // number-only: absolute on every line
-        } else if is_current {
-            0 // relativenumber-only cursor line shows 0
-        } else {
-            n.abs_diff(current_line)
-        };
-        let field = width.saturating_sub(1); // reserve the trailing space
-        format!("{value:>field$} ")
-    }
 }
 
 /// The theme inputs `highlight_line` needs that come from the active
@@ -2557,7 +2504,7 @@ fn cmdline_prompt_width(view: &View) -> u16 {
 /// first so the text beneath doesn't bleed through; the list scrolls to keep the
 /// selected item visible when there are more items than rows. The box is clamped
 /// to `text_area` so it never paints outside the editable region.
-fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scroll: u16) {
+fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData) {
     let Some(area) = popup_rect(text_area, pmenu) else {
         return;
     };
@@ -2588,7 +2535,7 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
     // The documentation preview floats beside the popup (its own bordered box).
-    render_pmenu_doc(frame, text_area, area, &pmenu.doc, doc_scroll);
+    render_pmenu_doc(frame, text_area, area, &pmenu.doc);
 }
 
 /// Draw the floating selectable-list menu (`nx.ui.select`) as a bordered overlay
@@ -3106,75 +3053,6 @@ fn menu_row_line(
     Line::from(out)
 }
 
-/// First visible item index for a popup whose inner content area is `rows` tall
-/// with `selected` highlighted: scroll the list to keep the selection in view,
-/// else start at the top. The single source of truth shared by [`render_pmenu`]
-/// and [`pmenu_geometry`] so a click maps to the same row the renderer drew.
-fn pmenu_start(selected: Option<usize>, rows: usize) -> usize {
-    match selected {
-        Some(s) if s >= rows => s + 1 - rows,
-        _ => 0,
-    }
-}
-
-/// The focused window's text-area inner rect (past its number gutter) for a
-/// `width`×`height` terminal showing `view` — the cell space the popup and its
-/// doc box anchor in. Mirrors the window layout in [`render`]/[`render_window`];
-/// shared by the popup and doc-box geometry so hit-tests land on exactly the
-/// cells the renderer draws. An empty rect before the first redraw (no window).
-fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
-    let Some(win) = view.focused() else {
-        return Rect::new(0, 0, 0, 0);
-    };
-    let tabline_rows = u16::from(!view.tabline.is_empty());
-    let global_status_rows = u16::from(!view.global_status.is_empty());
-    let dock = DockLayout::new(
-        Rect::new(0, 0, width, height),
-        view,
-        tabline_rows,
-        global_status_rows,
-    );
-    // A focused float's content sits inside its border; the popup anchors there.
-    // The focused window may live in a dock, so offset by its region's origin.
-    let area = pad_rect(
-        float_inner(
-            window_area(dock.content(win.region), win),
-            win.border.map(bt),
-        ),
-        win.padding,
-    );
-    // The text body is the window rect minus its bottom status row — when this
-    // window shows one (per `'laststatus'`); otherwise it claims the whole rect.
-    let text_area = if win.status_visible {
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)[0]
-    } else {
-        area
-    };
-    // The fold-marker gutter sits at the very left (before the sign and number
-    // columns), mirroring `render_window` — without it the popup anchor drifts
-    // left by the foldcolumn width whenever `'foldcolumn'` is on.
-    let text_area = if win.foldcolumn_width > 0 {
-        Layout::horizontal([Constraint::Length(win.foldcolumn_width), Constraint::Min(0)])
-            .split(text_area)[1]
-    } else {
-        text_area
-    };
-    // Reserve the sign column first (left of the number gutter), mirroring
-    // `render_window`, so the popup anchors past both gutters.
-    let gutter_area = if win.sign_width > 0 {
-        Layout::horizontal([Constraint::Length(win.sign_width), Constraint::Min(0)])
-            .split(text_area)[1]
-    } else {
-        text_area
-    };
-    if win.number_width > 0 {
-        Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
-            .split(gutter_area)[1]
-    } else {
-        gutter_area
-    }
-}
-
 /// The popup box rect (border included), anchored under the completion word and
 /// clamped to `text_area`. `None` when it can't fit a border plus one content
 /// cell each way. Shared by the renderer and the doc-box geometry.
@@ -3199,13 +3077,11 @@ fn popup_rect(text_area: Rect, pmenu: &PmenuData) -> Option<Rect> {
     (area.width >= 3 && area.height >= 3).then_some(area)
 }
 
-/// The documentation preview box's rect (border included) and its maximum scroll
-/// offset (wrapped content height minus the visible inner rows, `0` when it all
-/// fits) — laid out beside the `popup` within `text_area`: to its right when
-/// there's room, else to its left (vim's `completeopt=popup` shape), top-aligned
-/// with the popup. `None` when there are no docs or no room either side. Pure, so
-/// the renderer and the wheel hit-test share one layout.
-fn doc_rect(text_area: Rect, popup: Rect, doc: &[String]) -> Option<(Rect, u16)> {
+/// The documentation preview box's rect (border included), laid out beside the
+/// `popup` within `text_area`: to its right when there's room, else to its left
+/// (vim's `completeopt=popup` shape), top-aligned with the popup. `None` when
+/// there are no docs or no room either side.
+fn doc_rect(text_area: Rect, popup: Rect, doc: &[String]) -> Option<Rect> {
     if doc.is_empty() {
         return None;
     }
@@ -3247,28 +3123,17 @@ fn doc_rect(text_area: Rect, popup: Rect, doc: &[String]) -> Option<(Rect, u16)>
         width: box_w,
         height: box_h,
     };
-    // Visible content rows = inner height; anything past that is reachable only by
-    // scrolling.
-    let max_scroll = wrapped.saturating_sub(area.height.saturating_sub(2));
-    Some((area, max_scroll))
+    Some(area)
 }
 
 /// Draw the selected item's documentation in a bordered preview box beside the
-/// popup, scrolled down `doc_scroll` lines (clamped so it can't scroll past the
-/// end). Content is wrapped to the box width and clipped to the box; nothing is
+/// popup. Content is wrapped to the box width and clipped to the box; nothing is
 /// drawn when there are no docs or no room beside the popup. Markdown is shown as
 /// plain lines (the server's markup distiller yields lines, not styled spans).
-fn render_pmenu_doc(
-    frame: &mut Frame,
-    text_area: Rect,
-    popup: Rect,
-    doc: &[String],
-    doc_scroll: u16,
-) {
-    let Some((area, max_scroll)) = doc_rect(text_area, popup, doc) else {
+fn render_pmenu_doc(frame: &mut Frame, text_area: Rect, popup: Rect, doc: &[String]) {
+    let Some(area) = doc_rect(text_area, popup, doc) else {
         return;
     };
-    let scroll = doc_scroll.min(max_scroll);
     let block = Block::new().borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
@@ -3278,121 +3143,10 @@ fn render_pmenu_doc(
             .map(|l| Line::from(l.as_str()))
             .collect::<Vec<_>>(),
     );
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
-/// Headless geometry of the completion doc preview box for a `width`x`height`
-/// terminal showing `view`: `(x, y, width, height, max_scroll)` in screen cells,
-/// or `None` when no preview is drawn. `max_scroll` is the largest `doc_scroll`
-/// that still reveals new content. The event loop uses it to hit-test the mouse
-/// wheel and clamp the scroll; a test uses it to find the box. Mirrors the layout
-/// in [`render`], so the hit-test lands on exactly the painted cells.
-#[doc(hidden)]
-pub fn pmenu_doc_geometry(
-    width: u16,
-    height: u16,
-    view: &View,
-) -> Option<(u16, u16, u16, u16, u16)> {
-    let pmenu = view.pmenu.as_ref()?;
-    let text_inner = text_inner_rect(width, height, view);
-    let popup = popup_rect(text_inner, pmenu)?;
-    let (area, max_scroll) = doc_rect(text_inner, popup, &pmenu.doc)?;
-    Some((area.x, area.y, area.width, area.height, max_scroll))
-}
-
-/// Headless geometry of the completion popup's inner item area for a
-/// `width`×`height` terminal showing `view`: `(x, y, width, height, start)` in
-/// screen cells, where `start` is the first visible item index — or `None` when
-/// no popup is drawn. The event loop uses it to hit-test the mouse: the wheel
-/// moves the selection while it is over the box, and a left-click on row `r`
-/// chooses item `start + (r - y)`. Mirrors the layout in [`render_pmenu`] (same
-/// reason as [`pmenu_doc_geometry`]).
-#[doc(hidden)]
-pub fn pmenu_geometry(width: u16, height: u16, view: &View) -> Option<(u16, u16, u16, u16, usize)> {
-    let pmenu = view.pmenu.as_ref()?;
-    let text_inner = text_inner_rect(width, height, view);
-    let area = popup_rect(text_inner, pmenu)?;
-    let inner = Block::new().borders(Borders::ALL).inner(area);
-    let start = pmenu_start(pmenu.selected, inner.height as usize);
-    Some((inner.x, inner.y, inner.width, inner.height, start))
-}
-
-/// One popup row padded to `width` cells: the `label` left-aligned, and the
-/// `detail` (a type/source hint) right-aligned when it fits after a one-cell gap.
-/// A too-long label is truncated. Char-count widths are exact for the ASCII
-/// identifiers completion labels usually are.
-/// Shorten `s` to at most `width` chars, keeping its head and tail and dropping the
-/// middle behind a single `…` when it won't fit — so a too-long preview path shows
-/// both its root and its filename instead of just the start. Char-based, matching
-/// the rest of the picker's column math.
-fn elide_middle(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
-        return s.to_string();
-    }
-    if width <= 1 {
-        return chars.iter().take(width).collect();
-    }
-    let keep = width - 1; // one column for the `…`
-    let front = keep / 2; // favour the tail (filename) with the larger half
-    let back = keep - front;
-    let head: String = chars[..front].iter().collect();
-    let tail: String = chars[chars.len() - back..].iter().collect();
-    format!("{head}…{tail}")
-}
-
-fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
-    let label: String = label.chars().take(width).collect();
-    let label_w = label.chars().count();
-    let detail_w = detail.chars().count();
-    if !detail.is_empty() && label_w + 1 + detail_w <= width {
-        let pad = width - label_w - detail_w;
-        format!("{label}{}{detail}", " ".repeat(pad))
-    } else {
-        format!("{label:<width$}")
-    }
-}
-
-/// Truncate a picker row `label` to `width` columns while keeping the file name (the
-/// path tail) visible. When a path overflows the row, drop whole leading directory
-/// components behind a single `…` so the file name survives — instead of the plain
-/// head-cut the caller would otherwise apply, which truncates the *tail* and hides
-/// the very thing you scan for. `spans` (matched-char char ranges into `label`) are
-/// remapped onto the returned string so highlights still land on the right chars.
-///
-/// A row that already fits — or a non-path row (no `/`) — is returned unchanged, so
-/// only file paths get the tail-priority treatment; the caller's head-cut still
-/// applies to plain labels. When even the file name alone can't fit, the tail is
-/// kept (the name is truncated only because it's impossible to show whole).
-fn elide_keep_tail(label: &str, spans: &[(u16, u16)], width: usize) -> (String, Vec<(u16, u16)>) {
-    let chars: Vec<char> = label.chars().collect();
-    let n = chars.len();
-    if n <= width || width == 0 || !label.contains('/') {
-        return (label.to_string(), spans.to_vec());
-    }
-    // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
-    let drop = n - (width - 1);
-    // Prefer a clean cut just after a path separator — the smallest `/`-boundary at
-    // or past `drop` keeps the most directory context that still fits. None ⇒ raw cut.
-    let cut = (drop..n).find(|&i| chars[i - 1] == '/').unwrap_or(drop);
-    let mut out = String::with_capacity(width);
-    out.push('…');
-    out.extend(&chars[cut..]);
-    // Remap spans: original index `i` (≥ cut) renders at display index `i - cut + 1`
-    // (the `…` occupies index 0). A span wholly inside the dropped prefix vanishes.
-    let shift = cut as i64 - 1;
-    let remapped = spans
-        .iter()
-        .filter_map(|&(s, e)| {
-            let ns = (s as i64).max(cut as i64) - shift;
-            let ne = (e as i64).min(n as i64) - shift;
-            (ns < ne).then_some((ns as u16, ne as u16))
-        })
-        .collect();
-    (out, remapped)
-}
+// `pmenu_start` / `pmenu_row` / `elide_middle` / `elide_keep_tail` /
+// `gutter_cell` are the char-based fitting helpers shared with the GUI — they
+// live in [`nxvim_view::fit`] so the two clients' popup rows and click geometry
+// can't drift apart.

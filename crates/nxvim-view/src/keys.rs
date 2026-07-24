@@ -140,3 +140,22 @@ pub fn encode_paste(text: &str) -> String {
     }
     out
 }
+
+/// The `nx_input_mouse` modifier string for a mouse event's live modifier state —
+/// e.g. Ctrl+Shift → `"CS"`. The server's parser accepts the chars in any order
+/// with the `-` separator optional, so concatenation is enough. Drives
+/// shift-click (extend the selection) and Ctrl/Alt gestures; each frontend maps
+/// its native modifier flags to the three booleans.
+pub fn mouse_modifier(ctrl: bool, shift: bool, alt: bool) -> String {
+    let mut s = String::new();
+    if ctrl {
+        s.push('C');
+    }
+    if shift {
+        s.push('S');
+    }
+    if alt {
+        s.push('A');
+    }
+    s
+}

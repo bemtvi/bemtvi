@@ -71,6 +71,17 @@ pub struct ReconnectSpec {
 }
 
 impl ReconnectSpec {
+    /// Fail loud on `keep_buffers = true`: the swap always brings up a fresh session
+    /// (buffers come from the new backend), and carrying local buffers across is not
+    /// implemented — say so rather than dropping them silently. Every client's swap
+    /// builder calls this first.
+    pub fn reject_keep_buffers(&self) -> Result<()> {
+        if self.keep_buffers {
+            bail!("nx.session.reconnect: keep_buffers = true is not supported yet");
+        }
+        Ok(())
+    }
+
     /// Parse the normalized wire spec (the `nx.session.reconnect` Lua surface guarantees the
     /// shape, but a bad payload still fails loud here rather than swapping onto nothing).
     pub fn from_value(value: &Value) -> Result<Self> {

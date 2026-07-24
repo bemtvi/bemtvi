@@ -14,21 +14,19 @@
 //!
 //! The semantic-view decode/input layer is frontend-neutral and lives in the
 //! [`nxvim_view`] crate (it mirrors the server's view, parses each `redraw`, and
-//! holds the msgpack accessors). The TUI-specific work is split across submodules:
-//! [`anim`] is the scroll-animation state machine, [`render`] paints the frame,
-//! [`images`] renders `'imagepreview'` pictures via ratatui-image, and [`keys`]
-//! encodes key events. This module keeps only the event loop and transport.
+//! holds the msgpack accessors) — including the scroll-slide state machine
+//! ([`ScrollAnim`](nxvim_view::ScrollAnim) / [`arm_scroll`](nxvim_view::arm_scroll))
+//! this client drives from its clock. The TUI-specific work is split across
+//! submodules: [`render`] paints the frame, [`images`] renders `'imagepreview'`
+//! pictures via ratatui-image, and [`keys`] encodes key events. This module keeps
+//! only the event loop and transport.
 
-mod anim;
 mod images;
 mod keys;
 mod render;
 
 pub use keys::encode_key;
-pub use render::{
-    cursor_style, paint, paint_doc_scrolled, paint_with_cursor, pmenu_doc_geometry, pmenu_geometry,
-    ScrollHarness,
-};
+pub use render::{cursor_style, paint, paint_with_cursor, ScrollHarness};
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
@@ -46,7 +44,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::sleep;
 
-use anim::{arm_animation, Animation};
+use nxvim_view::{arm_scroll, ScrollAnim};
 use ratatui::DefaultTerminal;
 use render::render;
 
@@ -399,7 +397,7 @@ where
     let mut image_store = images::ImageStore::new(img_fetch_tx);
 
     let mut view = View::default();
-    let mut anim: Option<Animation> = None;
+    let mut anim: Option<ScrollAnim> = None;
     let mut term_events = EventStream::new();
     // The cursor shape last sent to the terminal, so we re-emit the escape only
     // when the mode actually changes the shape rather than on every redraw.
@@ -517,7 +515,7 @@ where
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "redraw" => {
                         view.update(&params);
-                        anim = arm_animation(&view, anim.take());
+                        anim = arm_scroll(&view, anim.take());
                         draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
                         // Match the cursor shape to the mode (a thin bar in insert
                         // mode). Emitted only on change so it doesn't flicker.
@@ -572,7 +570,7 @@ where
             // Animation frame tick (~60fps). Disabled when nothing is animating,
             // so the future is never even created in the idle case.
             _ = sleep(Duration::from_millis(16)), if anim.is_some() => {
-                if anim.as_ref().is_some_and(|a| a.start.elapsed() >= a.duration) {
+                if anim.as_ref().is_some_and(ScrollAnim::done) {
                     anim = None; // settle: render the destination view below
                 }
                 draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
@@ -605,14 +603,10 @@ where
                 let rpc = rpc.clone();
                 let tx = img_bytes_tx.clone();
                 tokio::spawn(async move {
-                    let result = match rpc
-                        .request("nxvim_image_read", vec![Value::from(path.as_str())])
-                        .await
-                    {
-                        Ok(Value::Binary(bytes)) => Ok(bytes),
-                        Ok(other) => Err(format!("nxvim_image_read: unexpected reply {other:?}")),
-                        Err(e) => Err(e.to_string()),
-                    };
+                    let result = nxvim_view::images::image_read_reply(
+                        rpc.request("nxvim_image_read", vec![Value::from(path.as_str())])
+                            .await,
+                    );
                     let _ = tx.send((path, version, result));
                 });
             },
@@ -655,27 +649,19 @@ fn send_mouse(rpc: &Rpc, button: &str, action: &str, mods: &str, row: u16, col: 
 fn draw_frame(
     terminal: &mut DefaultTerminal,
     view: &View,
-    anim: Option<&Animation>,
+    anim: Option<&ScrollAnim>,
     image_store: &mut images::ImageStore,
 ) -> Result<()> {
-    terminal.draw(|frame| render(frame, view, anim, 0, Some(image_store)))?;
+    terminal.draw(|frame| render(frame, view, anim, Some(image_store)))?;
     Ok(())
 }
 
-/// The `nx_input_mouse` modifier string for a crossterm mouse event's
-/// modifiers — e.g. Shift+Ctrl → `"CS"`. The server's parser accepts the chars in
-/// any order with the `-` separator optional, so concatenation is enough. Drives
-/// shift-click (extend the selection) and the future Ctrl/Alt gestures.
+/// The `nx_input_mouse` modifier string for a crossterm mouse event's modifiers —
+/// the shared [`nxvim_view::mouse_modifier`] over crossterm's flags.
 fn mouse_modifier(mods: KeyModifiers) -> String {
-    let mut s = String::new();
-    if mods.contains(KeyModifiers::CONTROL) {
-        s.push('C');
-    }
-    if mods.contains(KeyModifiers::SHIFT) {
-        s.push('S');
-    }
-    if mods.contains(KeyModifiers::ALT) {
-        s.push('A');
-    }
-    s
+    nxvim_view::mouse_modifier(
+        mods.contains(KeyModifiers::CONTROL),
+        mods.contains(KeyModifiers::SHIFT),
+        mods.contains(KeyModifiers::ALT),
+    )
 }

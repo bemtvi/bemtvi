@@ -58,31 +58,35 @@ check items off as they land; delete when done. Bug fixes follow the TDD rule
 
 ## B. Cross-client dedup (move into nxvim-view / nxvim-server)
 
-- [ ] **B1. Scroll-anim snapshot+lifecycle → nxvim-view** (`Animation`/`ScrollAnim`,
-  `arm_*`, `repaints_destination`); also clone `ScrollData` once instead of 15
-  field-by-field clones. Subsumes A4.
-- [ ] **B2. Remote-image fetch cache → nxvim-view** — `RemoteSlot`/`RemoteState`/
-  `ensure_remote_fetch`/`remote_ready`/`deliver`/`decode*`/`MAX_EDGE`/`ImageFetch`
-  duplicated verbatim: `nxvim-tui/src/images.rs` vs `nxvim-gui/src/images.rs` (~130
-  toolkit-neutral lines). Keep only paint layers per client.
-- [ ] **B3. `parse_connect_uri` → nxvim-server** — byte-identical in
-  `nxvim/src/main.rs:1264-1290` and `nxvim-gui/src/session.rs:615-641`.
-- [ ] **B4. Daemon-session plumbing → nxvim-server** — reconnecting child-slot factory
-  ×5 (main.rs:859,1005; session.rs:66,119,155), `daemon_log_stderr` ×2
-  (main.rs:977 vs session.rs:388), spawn-cmd resolution ×2, `ready_tx` handshake
-  scaffold ×2, `keep_buffers` bail ×2.
-- [ ] **B5. Pure text-fitting helpers → nxvim-view** — `elide_middle`, `pmenu_row`,
-  `elide_keep_tail`, `pmenu_start`, `gutter_cell`, `mouse_modifier`,
-  `fetch_image_bytes` (tui render.rs:3113-3398/lib.rs:607-681 vs gui
-  render.rs:3676-3781/mouse.rs:39/lib.rs:444). NOTE drift to resolve while merging:
-  gui `pmenu_start` has a `rows > 0` guard tui lacks; `pad_to_width`/`expand_tabs`
-  differ (tui display-width + Cow fast path vs gui char-count + per-row alloc) — keep
-  the width-aware TUI variants, document why, or share them too.
-- [ ] **B6. Dead client pmenu plumbing** — delete `pmenu_geometry`/`pmenu_doc_geometry`
-  (tui render.rs:3296-3331, exported lib.rs:29, zero callers) and the always-0
-  `doc_scroll` param threaded through both render stacks (tui render.rs:281→2591,
-  gui render.rs:624→2529); fix stale GUI `mouse_wheel` docstring
-  (gui lib.rs:1091-1096) describing retired client-side overlay scroll.
+- [x] **B1. Scroll-anim snapshot+lifecycle → nxvim-view** — DONE. One `ScrollAnim`
+  (a single `ScrollData` clone + arm instant, `done()`/`progress()`) plus
+  `arm_scroll`/`repaints_destination` in `nxvim-view/src/anim.rs`; the TUI keeps
+  its owned skip/take band build, the GUI its `ScrollFrame::of` borrow projection.
+  Subsumed A4; `nxvim-gui/tests/scroll_band.rs` still locks the band contract.
+- [x] **B2. Remote-image fetch cache → nxvim-view** — DONE. `nxvim_view::images`:
+  `ImageFetch`, `RemoteImages` (ensure_fetch *returns* the request so the module
+  stays transport-free), `decode_file`/`decode_bytes`/`MAX_EDGE`. Clients keep only
+  their paint layers (ratatui protocol / wgpu texture).
+- [x] **B3. `parse_connect_uri` → nxvim-server** — DONE, in daemon.rs with
+  `CONNECT_URI_SCHEME`; the GUI re-exports it so `tests/remote.rs` covers the
+  shared copy.
+- [x] **B4. Daemon-session plumbing → nxvim-server** — DONE.
+  `session_spawn.rs`: `spawn_session_thread` (duplex + thread + ready-channel
+  handshake), `connect_daemon_respawning` (the ×5 child-slot factory),
+  `daemon_log_stderr`, `env_daemon_command`/`DAEMON_CMD_ENV`;
+  `ReconnectSpec::reject_keep_buffers`. GUI server errors now surface at join.
+- [x] **B5. Pure text-fitting helpers → nxvim-view** — DONE. `fit.rs`
+  (`pmenu_start` with the GUI's `rows > 0` guard, `pmenu_row`, `elide_middle`,
+  `elide_keep_tail`, `gutter_cell` with the TUI's `Option<usize>` filler arg),
+  `keys::mouse_modifier(ctrl, shift, alt)`, `images::image_read_reply` (the
+  inlined `fetch_image_bytes` successor). `pad_to_width`/`expand_tabs` stay
+  deliberately per-client (TUI display-width vs GUI char-based column math) —
+  documented on both sides.
+- [x] **B6. Dead client pmenu plumbing** — DONE. `pmenu_geometry`/
+  `pmenu_doc_geometry` (+ their private `text_inner_rect`/`float_inner` support
+  and `paint_doc_scrolled`) deleted; the always-0 `doc_scroll` param removed from
+  both render stacks; GUI `mouse_wheel` docstring rewritten (server hit-tests
+  wheel events; nothing scrolls client-side).
 
 ## C. Server-src dedup
 

@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use nxvim_gui::ScrollAnim;
+use nxvim_gui::{ScrollAnim, ScrollFrame};
 use nxvim_view::ScrollData;
 
 /// A minimal three-row gesture with one overlay entry per layer under test.
@@ -34,7 +34,7 @@ fn gesture() -> ScrollData {
 fn band_frame_carries_inline_diagnostics() {
     let data = gesture();
     let anim = ScrollAnim::new(&data);
-    let frame = anim.frame();
+    let frame = ScrollFrame::of(&anim);
     assert_eq!(
         frame.diagnostics_virt,
         &data.diagnostics_virt[..],

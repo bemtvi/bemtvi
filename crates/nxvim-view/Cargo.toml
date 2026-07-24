@@ -10,3 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 rmpv.workspace = true
+# Decode + bound 'imagepreview' pictures (the shared half of each client's image
+# rendering; see src/images.rs).
+image.workspace = true

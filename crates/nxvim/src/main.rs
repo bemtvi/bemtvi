@@ -32,16 +32,16 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 
 mod test_runner;
 use nxvim_server::{
-    bind_quic_listener, connect_daemon_reconnecting, connect_quic_reconnecting, mint_token,
-    run as run_server, run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource,
-    DaemonClient, ReconnectHandle, ReconnectPolicy, ReconnectSpec, ReconnectTransport, ServerInit,
+    bind_quic_listener, connect_daemon_respawning, connect_quic_reconnecting, daemon_log_stderr,
+    env_daemon_command, mint_token, parse_connect_uri, run as run_server,
+    run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource, DaemonClient, ReconnectHandle,
+    ReconnectPolicy, ReconnectSpec, ReconnectTransport, ServerInit, CONNECT_URI_SCHEME,
 };
 
 /// The shada-namespace + workspace options derived from the command line. The namespace
@@ -357,17 +357,10 @@ const DAEMON_FLAG: &str = "--daemon";
 /// auth gate); pass an explicit `0.0.0.0:PORT` to accept off-host connections.
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8765";
 
-/// URI scheme the daemon prints and `--connect-daemon` accepts to reach a QUIC
-/// listener: `nxvim://HOST:PORT/TOKEN?cert=HASH` — host/port to dial, the bearer
-/// TOKEN on the path, the TOFU cert HASH in the query. A positional argument with this
-/// scheme selects the QUIC connect path over the default stdio-child split.
-const CONNECT_URI_SCHEME: &str = "nxvim://";
-
-/// Env var naming the command to spawn as the daemon for `--connect-daemon`. Run
-/// through `sh -c`, so a full command line works verbatim — e.g.
-/// `NXVIM_DAEMON_CMD="ssh host nxvim --daemon"`. Unset = spawn this same binary
-/// (`current_exe --daemon`) for a local two-process split over stdio pipes.
-const DAEMON_CMD_ENV: &str = "NXVIM_DAEMON_CMD";
+// A positional argument with the daemon URI scheme (`nxvim_server::CONNECT_URI_SCHEME`,
+// `nxvim://HOST:PORT/TOKEN?cert=HASH`) selects the QUIC connect path over the default
+// stdio-child split; `parse_connect_uri` (also nxvim-server's, shared with the GUI)
+// splits it into the dial pieces.
 
 /// Internal, debug-only flag that runs this binary as a scripted mock language
 /// server (see `nxvim_lsp::mock`), used by the LSP test suite as a hermetic
@@ -842,12 +835,7 @@ fn drive_tui_with_swaps(
 fn build_session_from_spec(
     spec: ReconnectSpec,
 ) -> Result<(tokio::io::DuplexStream, std::thread::JoinHandle<Result<()>>)> {
-    if spec.keep_buffers {
-        // The swap always brings up a fresh session (buffers come from the new backend);
-        // carrying local buffers across is not implemented. Say so loudly rather than
-        // dropping them silently.
-        bail!("nx.session.reconnect: keep_buffers = true is not supported yet");
-    }
+    spec.reject_keep_buffers()?;
     let config_source = spec.config_source;
     let shada = ShadaOpts {
         namespace: None,
@@ -859,29 +847,18 @@ fn build_session_from_spec(
         ReconnectTransport::Spawn { command } => {
             spawn_edit_host_session(None, shada, config_source, move || {
                 // Reconnecting stdio child running the spec's command (structured argv, or a
-                // `sh -c` line like `run_with_daemon`'s `$NXVIM_DAEMON_CMD`). The current child
-                // lives on the link thread; each (re)dial replaces + reaps it.
-                let slot: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
-                    std::sync::Arc::new(std::sync::Mutex::new(None));
-                let make = move || {
-                    let slot = slot.clone();
-                    let command = command.clone();
-                    async move {
-                        let mut child = command
-                            .to_command()
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(daemon_log_stderr())
-                            .kill_on_drop(true)
-                            .spawn()?;
-                        let stdout = child.stdout.take().expect("daemon stdout piped");
-                        let stdin = child.stdin.take().expect("daemon stdin piped");
-                        *slot.lock().unwrap() = Some(child);
-                        Ok((stdout, stdin))
-                    }
-                };
-                let (client, handle) =
-                    connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+                // `sh -c` line like `run_with_daemon`'s `$NXVIM_DAEMON_CMD`); each (re)dial
+                // re-spawns it on the link thread. The daemon's stderr goes to the private
+                // temp log (it can't share the TUI's terminal).
+                let (client, handle) = connect_daemon_respawning(
+                    "spawning the daemon",
+                    move || {
+                        let mut c = command.to_command();
+                        c.stderr(daemon_log_stderr());
+                        Ok(c)
+                    },
+                    ReconnectPolicy::default(),
+                )?;
                 Ok((client, Some(handle), Box::new(())))
             })
         }
@@ -944,52 +921,17 @@ fn run_daemon_listen(addr: SocketAddr) -> Result<()> {
 
 /// Build the [`tokio::process::Command`] for the daemon child. Defaults to *this*
 /// binary in `--daemon` mode (a local two-process split over stdio pipes); if
-/// [`DAEMON_CMD_ENV`] is set, run that command line through `sh -c` instead — so a
-/// remote daemon (`ssh host nxvim --daemon`) is just an env var, no code change.
+/// `$NXVIM_DAEMON_CMD` is set ([`env_daemon_command`]), run that command line through
+/// `sh -c` instead — so a remote daemon (`ssh host nxvim --daemon`) is just an env
+/// var, no code change.
 fn daemon_command() -> Result<tokio::process::Command> {
-    use tokio::process::Command;
-    if let Some(cmd) = std::env::var_os(DAEMON_CMD_ENV) {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd);
-        Ok(c)
-    } else {
-        let exe = std::env::current_exe()?;
-        let mut c = Command::new(exe);
-        c.arg(DAEMON_FLAG);
-        Ok(c)
+    if let Some(c) = env_daemon_command() {
+        return Ok(c);
     }
-}
-
-/// Open the daemon's stderr log as a **private, symlink-safe** file under the temp dir.
-/// The daemon's diagnostics can't share the terminal with the TUI, so they go here;
-/// `tail` it to debug the daemon side. Two properties matter on a shared `/tmp`:
-///
-/// - **No symlink clobber (CWE-377).** A fixed name (`nxvim-daemon.log`) opened with the
-///   symlink-following [`File::create`](std::fs::File::create) let another local user
-///   pre-plant a symlink at that path and have the daemon's stderr *truncate* one of the
-///   victim's files. The path is now per-pid and opened with `create_new`
-///   (`O_CREAT | O_EXCL`), which refuses to follow a symlink; any leftover (only ever
-///   *our own* per-pid name) is removed first, and if the create still fails — e.g. an
-///   attacker re-planted the name under `/tmp`'s sticky bit — stderr is discarded rather
-///   than written through a hostile path.
-/// - **Not world-readable.** Created `0600` so daemon diagnostics (paths, errors) aren't
-///   exposed to other users of a shared temp dir; the old `File::create` left it `0644`.
-fn daemon_log_stderr() -> Stdio {
-    let path = std::env::temp_dir().join(format!("nxvim-daemon-{}.log", std::process::id()));
-    // Best-effort: clear a stale file from a prior same-pid run (only ever ours). If
-    // another user owns the name under the sticky bit this fails harmlessly — the
-    // `create_new` below then also fails and we fall back to discarding stderr.
-    let _ = std::fs::remove_file(&path);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(&path)
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
+    let exe = std::env::current_exe()?;
+    let mut c = tokio::process::Command::new(exe);
+    c.arg(DAEMON_FLAG);
+    Ok(c)
 }
 
 /// Run the **local** edit-host over a stdio-piped `--daemon` child (`--connect-daemon`,
@@ -1006,29 +948,17 @@ fn run_with_daemon(
         // Reconnecting: re-spawn the daemon command on each (re)dial so a dropped link
         // (the daemon died, or — for an `NXVIM_DAEMON_CMD="ssh …"` split — the hop dropped
         // on sleep) re-establishes the seams in place, keeping the editor's local state.
-        // The current child lives on the link thread (kill_on_drop reaps the previous one
-        // when the next dial replaces it).
-        let slot: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let make = move || {
-            let slot = slot.clone();
-            async move {
-                // The daemon's stderr can't share the terminal with the TUI; send it to a
-                // private, symlink-safe log the user can tail to diagnose the daemon side.
-                let stderr = daemon_log_stderr();
-                let mut child = daemon_command()?
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(stderr)
-                    .kill_on_drop(true)
-                    .spawn()?;
-                let stdout = child.stdout.take().expect("daemon stdout piped");
-                let stdin = child.stdin.take().expect("daemon stdin piped");
-                *slot.lock().unwrap() = Some(child);
-                Ok((stdout, stdin))
-            }
-        };
-        let (client, handle) = connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+        // The daemon's stderr can't share the terminal with the TUI; send it to the
+        // private, symlink-safe log the user can tail to diagnose the daemon side.
+        let (client, handle) = connect_daemon_respawning(
+            "spawning the daemon",
+            || {
+                let mut c = daemon_command()?;
+                c.stderr(daemon_log_stderr());
+                Ok(c)
+            },
+            ReconnectPolicy::default(),
+        )?;
         Ok((client, Some(handle), Box::new(())))
     })
 }
@@ -1099,51 +1029,9 @@ where
         )> + Send
         + 'static,
 {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    // Carries only the handshake/setup outcome back here; the thread then owns the duplex's
-    // server end + the daemon guard for the session's lifetime.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
-    let server_thread = std::thread::spawn(move || -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("failed to build server runtime");
-        runtime.block_on(async move {
-            // Connect + resolve config/shada + assemble the ServerInit. A failure is reported
-            // to the waiting caller via `ready_tx` (so it returns Err and keeps the current
-            // session) and ends the thread cleanly — the error is surfaced once, not again at
-            // join. `_guard` (the stdio child, or `()`) lives until the editor quits.
-            let (init, _guard) =
-                match assemble_edit_host_init(file, shada, config_source, connect).await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return Ok(());
-                    }
-                };
-            if ready_tx.send(Ok(())).is_err() {
-                return Ok(()); // caller gave up waiting; nothing to serve
-            }
-            run_server(server_end, init)
-                .await
-                .map_err(|err| anyhow!("edit-host error: {err}"))
-        })
-    });
-
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok((client_end, server_thread)),
-        // The thread reported a handshake/setup failure and is winding down; join it and
-        // surface the error rather than returning a dead session.
-        Ok(Err(e)) => {
-            let _ = server_thread.join();
-            Err(e)
-        }
-        Err(_) => {
-            let _ = server_thread.join();
-            Err(anyhow!("edit-host server thread exited before connecting"))
-        }
-    }
+    nxvim_server::spawn_session_thread(move || async move {
+        assemble_edit_host_init(file, shada, config_source, connect).await
+    })
 }
 
 /// Connect to the daemon, resolve the session config + shada from `config_source`, and
@@ -1255,38 +1143,6 @@ where
         daemon_link,
     };
     Ok((init, guard))
-}
-
-/// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces
-/// [`connect_quic`] needs: the `https://HOST:PORT` dial URL (WebTransport requires the
-/// `https` scheme), the bearer `TOKEN` (the path), and the TOFU cert `HASH` (the `cert`
-/// query). Fails loud on a malformed URI rather than dialing a half-specified target.
-fn parse_connect_uri(uri: &str) -> Result<(String, String, String)> {
-    let rest = uri.strip_prefix(CONNECT_URI_SCHEME).ok_or_else(|| {
-        anyhow!("daemon connect URI must start with {CONNECT_URI_SCHEME}: {uri:?}")
-    })?;
-    let (authority, after) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow!("daemon connect URI is missing the /TOKEN path: {uri:?}"))?;
-    if authority.is_empty() {
-        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
-    }
-    let (token, query) = after
-        .split_once('?')
-        .ok_or_else(|| anyhow!("daemon connect URI is missing the ?cert=HASH query: {uri:?}"))?;
-    if token.is_empty() {
-        return Err(anyhow!("daemon connect URI has an empty TOKEN: {uri:?}"));
-    }
-    let cert_hash = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("cert="))
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow!("daemon connect URI is missing cert=HASH: {uri:?}"))?;
-    Ok((
-        format!("https://{authority}"),
-        cert_hash.to_owned(),
-        token.to_owned(),
-    ))
 }
 
 /// Best-effort human-readable text from a thread panic payload.

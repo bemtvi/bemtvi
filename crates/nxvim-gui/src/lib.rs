@@ -74,10 +74,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_view::{
-    DiagSign, DiagSpan, DiagVirt, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View,
-    VirtChunk, VirtPlacement,
-};
+use nxvim_view::{arm_scroll, ResizeCursor, View};
+// Re-exported for the Tier-1 band data-contract tests (`tests/scroll_band.rs`).
+pub use nxvim_view::ScrollAnim;
 use rmpv::Value;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -86,7 +85,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
 
-use render::{Renderer, ScrollFrame};
+use render::Renderer;
+pub use render::ScrollFrame;
 
 /// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
 /// auto-scrolling (≈25 lines/sec). winit only re-reports a drag (a `CursorMoved`
@@ -184,16 +184,11 @@ impl GuiConfig {
     }
 }
 
-/// A request to fetch a remote (daemon-session) image preview's bytes over the editor
-/// RPC. The image store (render thread) emits one when it sees a `remote` preview it
-/// can't read off local disk; the IO thread fulfils it with `nxvim_image_read` and
-/// posts the bytes back as [`UserEvent::ImageBytes`].
-pub(crate) struct ImageFetch {
-    pub path: String,
-    /// The preview's on-disk version `(size, mtime_ms)`, echoed back so a stale reply
-    /// for a superseded version is dropped rather than replacing newer bytes.
-    pub version: (u64, u64),
-}
+// The image store (render thread) emits an `ImageFetch` when it sees a `remote`
+// preview it can't read off local disk; the IO thread fulfils it with
+// `nxvim_image_read` and posts the bytes back as [`UserEvent::ImageBytes`]. The
+// request type itself is the shared client model's (`nxvim_view::images`).
+pub(crate) use nxvim_view::images::ImageFetch;
 
 /// A request from the App to bring up a **new** session, swapping the live one. Built off
 /// the UI thread by the session loop (see [`run`]) and reported back via
@@ -281,7 +276,7 @@ pub fn run(
             let mut stream = initial.stream;
             let mut current_handle = Some(initial.handle);
             let mut next_remote = initial.remote;
-            let mut retired: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            let mut retired: Vec<std::thread::JoinHandle<anyhow::Result<()>>> = Vec::new();
             // A finished `:connect` build delivers its new session here, so the handshake
             // (run off the UI thread on the blocking pool) doesn't stall the current
             // session's redraws while it's in flight.
@@ -442,16 +437,13 @@ pub fn run(
                             let rpc = rpc.clone();
                             let proxy = proxy.clone();
                             tokio::spawn(async move {
-                                let result = match rpc
-                                    .request("nxvim_image_read", vec![Value::from(path.as_str())])
-                                    .await
-                                {
-                                    Ok(Value::Binary(bytes)) => Ok(bytes),
-                                    Ok(other) => {
-                                        Err(format!("nxvim_image_read: unexpected reply {other:?}"))
-                                    }
-                                    Err(e) => Err(e.to_string()),
-                                };
+                                let result = nxvim_view::images::image_read_reply(
+                                    rpc.request(
+                                        "nxvim_image_read",
+                                        vec![Value::from(path.as_str())],
+                                    )
+                                    .await,
+                                );
                                 let _ = proxy.send_event(UserEvent::ImageBytes {
                                     path,
                                     version,
@@ -484,8 +476,12 @@ pub fn run(
             let _ = proxy.send_event(UserEvent::Exit);
             let mut panicked = false;
             for handle in current_handle.into_iter().chain(retired) {
-                if handle.join().is_err() {
-                    panicked = true;
+                match handle.join() {
+                    Err(_) => panicked = true,
+                    // A server error (not a panic): report it like the old in-thread
+                    // eprintln did, but keep the exit clean.
+                    Ok(Err(e)) => eprintln!("nxvim-gui: server error: {e}"),
+                    Ok(Ok(())) => {}
                 }
             }
             panicked
@@ -548,161 +544,6 @@ fn report_session_error(rpc: &Rpc, label: &str, err: &anyhow::Error) {
         "nx_command",
         vec![Value::from(format!("echoerr '{escaped}'"))],
     );
-}
-
-/// An in-flight scroll slide, driven by the client clock. Mirrors the TUI's
-/// `Animation`, but the GUI keeps the offset fractional (no rounding) for
-/// sub-pixel smoothness. The band is **screen-row based**: `lines`/the overlay
-/// arrays are the over-scanned screen rows the slide reveals, and the slide is a
-/// screen-row offset (`from_row` → `to_row`) into them, so interleaved
-/// `virt_lines` slide with the text instead of snapping.
-pub struct ScrollAnim {
-    from_row: f32,
-    to_row: f32,
-    from_cursor_row: f32,
-    to_cursor_row: f32,
-    start: Instant,
-    duration: Duration,
-    lines: Vec<String>,
-    selection: Vec<Option<(u16, u16)>>,
-    /// Per band row, the secondary multi-cursors' selection spans, so they slide too.
-    secondary_selection: Vec<Vec<(u16, u16)>>,
-    /// Orientation of the sliding visual selection (see
-    /// [`ScrollData::sel_extends_down`]); drives the selection edge clip.
-    sel_extends_down: Option<bool>,
-    numbers: Vec<Option<usize>>,
-    /// Per band row, `true` on a soft-wrap continuation row, so the gutter blanks
-    /// the wrapped rows while the slide animates.
-    continuation: Vec<bool>,
-    highlights: Vec<Vec<HlSpan>>,
-    /// `hlsearch` / `incsearch` match spans for the band, so the search highlight
-    /// slides with the text instead of vanishing until the slide settles.
-    search: Vec<Vec<(u16, u16)>>,
-    incsearch: Vec<Option<(u16, u16)>>,
-    inlay_hints: Vec<Vec<InlayHint>>,
-    /// Extmark `virt_text` placements for the band, so they slide with the line
-    /// instead of flashing out and back when the slide settles.
-    virt_text: Vec<Vec<VirtPlacement>>,
-    /// Extmark `virt_lines` content per band row, so the interleaved virtual rows
-    /// slide with the text instead of only appearing once the slide settles.
-    virt_lines: Vec<Option<Vec<VirtChunk>>>,
-    /// Inline diagnostic virtual text per band row, sliding with the line.
-    diagnostics_virt: Vec<Option<DiagVirt>>,
-    /// Diagnostic underline spans / sign-column glyphs per band row, so the
-    /// squiggles and signs slide with the text instead of blanking for the slide.
-    diagnostics: Vec<Vec<DiagSpan>>,
-    diagnostics_signs: Vec<Option<DiagSign>>,
-    /// The line-background layer for the band as `(band_row, style)`, so a code
-    /// block's tint slides with the text instead of vanishing for the slide.
-    line_bg: Vec<(u16, Style)>,
-    styles: Vec<Style>,
-}
-
-impl ScrollAnim {
-    pub fn new(s: &ScrollData) -> Self {
-        Self {
-            from_row: s.from_row,
-            to_row: s.to_row,
-            from_cursor_row: s.from_cursor_row,
-            to_cursor_row: s.to_cursor_row,
-            start: Instant::now(),
-            duration: s.duration,
-            lines: s.lines.clone(),
-            selection: s.selection.clone(),
-            secondary_selection: s.secondary_selection.clone(),
-            sel_extends_down: s.sel_extends_down,
-            numbers: s.numbers.clone(),
-            continuation: s.continuation.clone(),
-            highlights: s.highlights.clone(),
-            search: s.search.clone(),
-            incsearch: s.incsearch.clone(),
-            inlay_hints: s.inlay_hints.clone(),
-            virt_text: s.virt_text.clone(),
-            virt_lines: s.virt_lines.clone(),
-            diagnostics_virt: s.diagnostics_virt.clone(),
-            diagnostics: s.diagnostics.clone(),
-            diagnostics_signs: s.diagnostics_signs.clone(),
-            line_bg: s.line_bg.clone(),
-            styles: s.styles.clone(),
-        }
-    }
-
-    fn done(&self) -> bool {
-        self.start.elapsed() >= self.duration
-    }
-
-    /// The interpolated frame at the current instant (ease-out cubic, matching
-    /// the TUI's feel).
-    pub fn frame(&self) -> ScrollFrame<'_> {
-        let raw = if self.duration.is_zero() {
-            1.0
-        } else {
-            (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0)
-        };
-        let t = 1.0 - (1.0 - raw).powi(3);
-        let lerp = |a: f32, b: f32| a + (b - a) * t;
-        ScrollFrame {
-            row_off: lerp(self.from_row, self.to_row),
-            cursor_row: lerp(self.from_cursor_row, self.to_cursor_row),
-            lines: &self.lines,
-            selection: &self.selection,
-            secondary_selection: &self.secondary_selection,
-            // The selection's moving edge tracks the interpolated cursor; the clip
-            // side follows the selection's orientation (anchor above ⇒ down), not
-            // the scroll direction, so it grows *and* shrinks smoothly either way.
-            sel_clip: self.sel_extends_down,
-            numbers: &self.numbers,
-            continuation: &self.continuation,
-            highlights: &self.highlights,
-            search: &self.search,
-            incsearch: &self.incsearch,
-            inlay_hints: &self.inlay_hints,
-            virt_text: &self.virt_text,
-            virt_lines: &self.virt_lines,
-            diagnostics_virt: &self.diagnostics_virt,
-            diagnostics: &self.diagnostics,
-            diagnostics_signs: &self.diagnostics_signs,
-            line_bg: &self.line_bg,
-            styles: &self.styles,
-        }
-    }
-}
-
-/// Decide the scroll slide to run after a `redraw`, given any slide already in
-/// flight — the GUI port of the TUI's `arm_animation`. A gesture (re)arms a fresh
-/// slide; a scroll-less redraw that merely repaints the slide's destination (a
-/// delayed highlight reply) lets it play out; any other scroll-less redraw is a
-/// real change and interrupts the slide.
-fn arm_scroll(view: &View, current: Option<ScrollAnim>) -> Option<ScrollAnim> {
-    if let Some(s) = view.focused().and_then(|w| w.scroll.as_ref()) {
-        // A zero-duration gesture has no slide; show the static destination.
-        if s.duration.is_zero() {
-            return None;
-        }
-        return Some(ScrollAnim::new(s));
-    }
-    current.filter(|a| repaints_destination(view, a))
-}
-
-/// Whether `view` merely repaints the destination `anim` is sliding toward (same
-/// first visible line and cursor line), so a delayed redraw must not abort it.
-fn repaints_destination(view: &View, anim: &ScrollAnim) -> bool {
-    // The destination viewport top / cursor buffer lines are read off the band at
-    // its settle offsets: `numbers` carries each band row's 1-based buffer line.
-    let dest_top = anim
-        .numbers
-        .get(anim.to_row.round() as usize)
-        .copied()
-        .flatten();
-    let dest_cursor = anim
-        .numbers
-        .get(anim.to_cursor_row.round() as usize)
-        .copied()
-        .flatten();
-    let Some(win) = view.focused() else {
-        return false;
-    };
-    win.numbers.first().copied().flatten() == dest_top && Some(win.cursor_line) == dest_cursor
 }
 
 /// The winit application: holds the window, the renderer, and the latest view.
@@ -1092,12 +933,10 @@ impl App {
         }
     }
 
-    /// The mouse wheel. A client-owned overlay under the pointer claims *vertical*
-    /// notches — the completion doc preview scrolls its docs client-side, the popup
-    /// list moves its selection, the message panel moves its cursor — mirroring the
-    /// TUI. Everything else (all horizontal notches, and any vertical notch not over
-    /// an overlay) is a text-area scroll the server hit-tests to the window under
-    /// the pointer. A trackpad's fractional pixels accumulate into whole lines.
+    /// The mouse wheel. Every notch is forwarded to the server, which hit-tests it
+    /// to the window — or the overlay (the completion popup, a picker) — under the
+    /// pointer; nothing scrolls client-side. A trackpad's fractional pixels
+    /// accumulate into whole lines.
     fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
         let Some(r) = self.renderer.as_ref() else {
             return;
@@ -1574,9 +1413,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
                     self.scroll = None;
                 }
-                let frame = self.scroll.as_ref().map(ScrollAnim::frame);
+                let frame = self.scroll.as_ref().map(ScrollFrame::of);
                 if let Some(r) = self.renderer.as_mut() {
-                    if let Err(e) = r.render(&self.view, frame.as_ref(), 0) {
+                    if let Err(e) = r.render(&self.view, frame.as_ref()) {
                         eprintln!("nxvim-gui: render error: {e}");
                     }
                 }

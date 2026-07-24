@@ -34,8 +34,9 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    Border, DiagSign, DiagSpan, DiagVirt, Geometry, InlayHint, ResizeCursor, StatusSegment, Style,
-    TabData, View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    elide_keep_tail, elide_middle, gutter_cell, pmenu_row, pmenu_start, Border, DiagSign, DiagSpan,
+    DiagVirt, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
+    VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -184,6 +185,42 @@ pub struct ScrollFrame<'a> {
     /// this the fenced-code background blinks out for the ~150ms animation).
     pub line_bg: &'a [(u16, Style)],
     pub styles: &'a [Style],
+}
+
+impl<'a> ScrollFrame<'a> {
+    /// Project the interpolated frame at the current instant out of an in-flight
+    /// [`ScrollAnim`]. The GUI keeps the offsets fractional (no rounding) for
+    /// sub-pixel smoothness; the eased progress comes from the shared
+    /// [`ScrollAnim::progress`], so the feel matches the TUI.
+    pub fn of(anim: &'a nxvim_view::ScrollAnim) -> Self {
+        let t = anim.progress();
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        let d = &anim.data;
+        ScrollFrame {
+            row_off: lerp(d.from_row, d.to_row),
+            cursor_row: lerp(d.from_cursor_row, d.to_cursor_row),
+            lines: &d.lines,
+            selection: &d.selection,
+            secondary_selection: &d.secondary_selection,
+            // The selection's moving edge tracks the interpolated cursor; the clip
+            // side follows the selection's orientation (anchor above ⇒ down), not
+            // the scroll direction, so it grows *and* shrinks smoothly either way.
+            sel_clip: d.sel_extends_down,
+            numbers: &d.numbers,
+            continuation: &d.continuation,
+            highlights: &d.highlights,
+            search: &d.search,
+            incsearch: &d.incsearch,
+            inlay_hints: &d.inlay_hints,
+            virt_text: &d.virt_text,
+            virt_lines: &d.virt_lines,
+            diagnostics_virt: &d.diagnostics_virt,
+            diagnostics: &d.diagnostics,
+            diagnostics_signs: &d.diagnostics_signs,
+            line_bg: &d.line_bg,
+            styles: &d.styles,
+        }
+    }
 }
 
 /// Intern a font-family name as a `&'static str`. cosmic-text's [`Fallback`] trait
@@ -620,12 +657,7 @@ impl Renderer {
     /// text slides at the interpolated offset (smooth scrolling). Returns `Err`
     /// only on an unrecoverable surface error; a transient `Lost`/`Outdated`
     /// reconfigures and skips.
-    pub fn render(
-        &mut self,
-        view: &View,
-        scroll: Option<&ScrollFrame>,
-        doc_scroll: u16,
-    ) -> anyhow::Result<()> {
+    pub fn render(&mut self, view: &View, scroll: Option<&ScrollFrame>) -> anyhow::Result<()> {
         // wgpu 29 replaced the `Result<SurfaceTexture, SurfaceError>` this used to
         // return with the `CurrentSurfaceTexture` enum. `Suboptimal` still hands back
         // a usable frame (draw it, don't drop it); `Lost`/`Outdated` reconfigure and
@@ -698,7 +730,6 @@ impl Renderer {
         self.build_frame(
             view,
             scroll,
-            doc_scroll,
             &mut quads,
             &mut items,
             &mut overlay_quads,
@@ -821,7 +852,6 @@ impl Renderer {
         &mut self,
         view: &View,
         scroll: Option<&ScrollFrame>,
-        doc_scroll: u16,
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
         overlay_quads: &mut Vec<Quad>,
@@ -1004,7 +1034,7 @@ impl Renderer {
             .focused()
             .map(|w| region_origin(w.region))
             .unwrap_or((main_x, mid_y));
-        self.build_pmenu(view, focus_origin, doc_scroll, overlay_quads, overlay_items);
+        self.build_pmenu(view, focus_origin, overlay_quads, overlay_items);
 
         // The floating selectable-list menu (`nx.ui.select`), in the same overlay
         // layer and anchored the same way (the focused window's region origin) — except
@@ -2431,13 +2461,11 @@ impl Renderer {
     /// a bordered box anchored under the completion word (past the gutter), each
     /// item on its own row with the selected one reverse-highlighted, and the
     /// selected item's docs in a preview box beside it. The GUI port of the TUI's
-    /// `render_pmenu`; the doc preview scrolls by `doc_scroll` (a client-side mouse
-    /// wheel gesture, like the TUI's).
+    /// `render_pmenu`.
     fn build_pmenu(
         &mut self,
         view: &View,
         origin: (u16, u16),
-        doc_scroll: u16,
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
@@ -2550,12 +2578,7 @@ impl Renderer {
                 border,
                 false,
             );
-            // Client-side vertical scroll (the box height is the client's to know,
-            // so the server has no notion of it): skip the scrolled-past lines,
-            // clamped so the wheel can't overscroll past the last screenful.
-            let max_scroll = pmenu.doc.len().saturating_sub(dch as usize);
-            let skip = (doc_scroll as usize).min(max_scroll);
-            for (r, line) in pmenu.doc.iter().skip(skip).take(dch as usize).enumerate() {
+            for (r, line) in pmenu.doc.iter().take(dch as usize).enumerate() {
                 let text: String = line.chars().take(dcw as usize).collect();
                 let pos = self.cell_px(dx + 1, by + 1 + r as u16);
                 self.push_plain(items, &text, pos, fg, full);
@@ -3375,7 +3398,7 @@ impl Renderer {
     ) {
         let (n, current_line) = lines;
         let text = gutter_cell(
-            n,
+            Some(n),
             current_line,
             win.number,
             win.relativenumber,
@@ -3698,115 +3721,10 @@ fn pad_rect(rect: (u16, u16, u16, u16), pad: nxvim_view::Padding) -> (u16, u16, 
     )
 }
 
-/// First visible completion-item index for a popup `rows` tall with `selected`
-/// highlighted: scroll the list to keep the selection in view, else start at the
-/// top. Mirrors the TUI's `pmenu_start`.
-fn pmenu_start(selected: Option<usize>, rows: usize) -> usize {
-    match selected {
-        Some(s) if rows > 0 && s >= rows => s + 1 - rows,
-        _ => 0,
-    }
-}
-
-/// One completion row padded to `width` cells: the `label` left-aligned and the
-/// Shorten `s` to at most `width` chars, keeping its head and tail and dropping the
-/// middle behind a single `…` when it won't fit — so a too-long preview path shows
-/// both its root and its filename instead of just the start. Mirrors the TUI's
-/// `elide_middle`.
-fn elide_middle(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
-        return s.to_string();
-    }
-    if width <= 1 {
-        return chars.iter().take(width).collect();
-    }
-    let keep = width - 1; // one column for the `…`
-    let front = keep / 2; // favour the tail (filename) with the larger half
-    let back = keep - front;
-    let head: String = chars[..front].iter().collect();
-    let tail: String = chars[chars.len() - back..].iter().collect();
-    format!("{head}…{tail}")
-}
-
-/// `detail` (a type/source hint) right-aligned when it fits after a one-cell gap;
-/// a too-long label is truncated. Mirrors the TUI's `pmenu_row`.
-fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
-    let label: String = label.chars().take(width).collect();
-    let label_w = label.chars().count();
-    let detail_w = detail.chars().count();
-    if !detail.is_empty() && label_w + 1 + detail_w <= width {
-        let pad = width - label_w - detail_w;
-        format!("{label}{}{detail}", " ".repeat(pad))
-    } else {
-        format!("{label:<width$}")
-    }
-}
-
-/// Truncate a picker row `label` to `width` columns while keeping the file name (the
-/// path tail) visible: when a path overflows the row, drop whole leading directory
-/// components behind a single `…` so the file name survives, instead of the plain
-/// head-cut that would hide the very thing you scan for. `spans` (matched-char char
-/// ranges into `label`) are remapped onto the returned string so highlights stay
-/// aligned. A row that fits — or a non-path row (no `/`) — is returned unchanged.
-/// Mirrors the TUI's `elide_keep_tail`.
-fn elide_keep_tail(label: &str, spans: &[(u16, u16)], width: usize) -> (String, Vec<(u16, u16)>) {
-    let chars: Vec<char> = label.chars().collect();
-    let n = chars.len();
-    if n <= width || width == 0 || !label.contains('/') {
-        return (label.to_string(), spans.to_vec());
-    }
-    // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
-    let drop = n - (width - 1);
-    // Prefer a clean cut just after a path separator — the smallest `/`-boundary at
-    // or past `drop` keeps the most directory context that still fits. None ⇒ raw cut.
-    let cut = (drop..n).find(|&i| chars[i - 1] == '/').unwrap_or(drop);
-    let mut out = String::with_capacity(width);
-    out.push('…');
-    out.extend(&chars[cut..]);
-    // Remap spans: original index `i` (≥ cut) renders at display index `i - cut + 1`
-    // (the `…` occupies index 0). A span wholly inside the dropped prefix vanishes.
-    let shift = cut as i64 - 1;
-    let remapped = spans
-        .iter()
-        .filter_map(|&(s, e)| {
-            let ns = (s as i64).max(cut as i64) - shift;
-            let ne = (e as i64).min(n as i64) - shift;
-            (ns < ne).then_some((ns as u16, ne as u16))
-        })
-        .collect();
-    (out, remapped)
-}
-
-/// One `width`-cell gutter cell for buffer line `n` (the cursor sits on
-/// `current_line`): absolute numbers (`number`), distance-from-cursor
-/// (`relativenumber`), or the hybrid — absolute on the cursor line, relative
-/// elsewhere. Numbers are right-aligned with a trailing space, except the hybrid
-/// cursor line whose absolute number is left-aligned. Mirrors the TUI's
-/// `gutter_cell`.
-fn gutter_cell(
-    n: usize,
-    current_line: usize,
-    number: bool,
-    relativenumber: bool,
-    width: usize,
-) -> String {
-    let is_current = n == current_line;
-    if number && relativenumber && is_current {
-        // Hybrid cursor line: absolute number, left-aligned.
-        format!("{n:<width$}")
-    } else {
-        let value = if !relativenumber {
-            n // number-only: absolute on every line
-        } else if is_current {
-            0 // relativenumber-only cursor line shows 0
-        } else {
-            n.abs_diff(current_line)
-        };
-        let field = width.saturating_sub(1); // reserve the trailing space
-        format!("{value:>field$} ")
-    }
-}
+// `pmenu_start` / `pmenu_row` / `elide_middle` / `elide_keep_tail` /
+// `gutter_cell` are the char-based fitting helpers shared with the TUI — they
+// live in [`nxvim_view::fit`] so the two clients' popup rows and click geometry
+// can't drift apart.
 
 /// The command-line caret's screen cell (cell 0 = the line's first cell): the
 /// leading prompt — the single-cell `:`/`/`/`?` prefix, or the multi-char
@@ -4530,7 +4448,9 @@ pub fn mask_segments(segments: &[Seg], bad: &[(usize, usize)]) -> Vec<Seg> {
 /// A sign glyph fitted to exactly `width` cells: truncated if too wide, then
 /// right-padded with spaces (so a 1-cell `E` fills the 2-cell column as `E `).
 /// Char count stands in for display width here, matching the renderer's
-/// ASCII-column simplification elsewhere (wide-char fidelity is deferred).
+/// ASCII-column simplification elsewhere (wide-char fidelity is deferred) — which
+/// is why this and `expand_tabs` are deliberately NOT shared with the TUI's
+/// display-width-based variants.
 fn pad_to_width(s: &str, width: usize) -> String {
     let mut out: String = s.chars().take(width).collect();
     let painted = out.chars().count();

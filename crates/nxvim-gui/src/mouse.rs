@@ -30,24 +30,12 @@ pub fn button_name(button: MouseButton) -> Option<&'static str> {
     }
 }
 
-/// The `nx_input_mouse` modifier string for the live modifier state — e.g.
-/// Ctrl+Shift → `"CS"`. The server's parser accepts the chars in any order with
-/// the `-` separator optional, so concatenation is enough. Mirrors the TUI's
-/// `mouse_modifier`; drives shift-click (extend the selection) and Ctrl/Alt
-/// gestures. (Shift is a real chord here, unlike key input where winit folds it
-/// into the character — a mouse event carries no character to fold it into.)
+/// The `nx_input_mouse` modifier string for the live modifier state — the shared
+/// [`nxvim_view::mouse_modifier`] over winit's flags. (Shift is a real chord
+/// here, unlike key input where winit folds it into the character — a mouse
+/// event carries no character to fold it into.)
 pub fn mouse_modifier(mods: ModifiersState) -> String {
-    let mut s = String::new();
-    if mods.control_key() {
-        s.push('C');
-    }
-    if mods.shift_key() {
-        s.push('S');
-    }
-    if mods.alt_key() {
-        s.push('A');
-    }
-    s
+    nxvim_view::mouse_modifier(mods.control_key(), mods.shift_key(), mods.alt_key())
 }
 
 /// The cell `(col, row)` a physical-pixel position falls in, for cell size

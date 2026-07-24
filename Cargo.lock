@@ -3002,6 +3002,7 @@ dependencies = [
 name = "nxvim-view"
 version = "0.1.0"
 dependencies = [
+ "image",
  "rmpv",
 ]
 

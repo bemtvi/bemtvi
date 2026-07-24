@@ -9,25 +9,17 @@
 //! server on a daemon), not the editor transport — see [`crate::run`]'s session loop.
 
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
 use nxvim_server::{
-    connect_daemon_reconnecting, connect_quic_reconnecting, run as run_server, ClipboardProvider,
-    ConfigSource, DaemonClient, ReconnectHandle, ReconnectPolicy, ReconnectSpec,
-    ReconnectTransport, ServerInit,
+    connect_daemon_respawning, connect_quic_reconnecting, daemon_log_stderr, env_daemon_command,
+    spawn_session_thread, ClipboardProvider, ConfigSource, DaemonClient, ReconnectHandle,
+    ReconnectPolicy, ReconnectSpec, ReconnectTransport, ServerInit, SessionGuard, DAEMON_CMD_ENV,
 };
 use tokio::io::DuplexStream;
 
 use crate::remote::{ssh_daemon_command, ConnectTarget};
-
-/// Env var naming the command to spawn as the daemon for a `--connect-daemon` startup.
-/// Run through `sh -c`, so a full command line works verbatim — e.g.
-/// `NXVIM_DAEMON_CMD="ssh host nxvim --daemon"`. Unset = spawn the sibling `nxvim`
-/// binary (`--daemon`) for a local two-process split over stdio pipes.
-const DAEMON_CMD_ENV: &str = "NXVIM_DAEMON_CMD";
 
 /// A live editor session: the GUI's in-process duplex to the local server, plus the
 /// server thread's [`JoinHandle`] kept for the session's lifetime. Dropping the duplex
@@ -39,8 +31,9 @@ pub struct Session {
     /// Whether this is an edit-host (daemon) session — buffers live on the daemon's fs.
     /// Drives the GUI's local-file-dialog suppression (see [`crate::dialog_action`]).
     pub remote: bool,
-    /// The server thread, joined at teardown (or after the swap that retired it).
-    pub handle: JoinHandle<()>,
+    /// The server thread, joined at teardown (or after the swap that retired it); its
+    /// `Err` is a server error the joiner reports.
+    pub handle: JoinHandle<Result<()>>,
 }
 
 /// Spawn the local server for `target` (`None` = embedded, local disk) on its own
@@ -65,29 +58,14 @@ pub fn spawn_session(
             None => Ok((None, None, no_guard())),
             Some(ConnectTarget::Ssh(spec)) => {
                 // `ssh … nxvim --daemon` over stdio: the child's stdout/stdin *is* the
-                // daemon wire. Use the RECONNECTING link so a dropped ssh hop (laptop
-                // sleep, network blip) re-spawns `ssh …` and rebinds the seams in place —
-                // the editor keeps its local buffers/undo. The factory re-runs the ssh
-                // command on each (re)dial and holds the current child (kill_on_drop reaps
-                // the previous one when the next dial replaces it).
-                let child_slot: DaemonChildSlot = Arc::new(Mutex::new(None));
-                let make = move || {
-                    let spec = spec.clone();
-                    let slot = child_slot.clone();
-                    async move {
-                        let mut child = ssh_daemon_command(&spec).spawn().map_err(|e| {
-                            anyhow!(e).context("spawning ssh (is it installed and on PATH?)")
-                        })?;
-                        let stdout = child.stdout.take().expect("ssh stdout piped");
-                        let stdin = child.stdin.take().expect("ssh stdin piped");
-                        // Replace (and so reap) the previous child, keeping this one alive
-                        // for the connection's lifetime on the link thread.
-                        *slot.lock().unwrap() = Some(child);
-                        Ok((stdout, stdin))
-                    }
-                };
-                let (client, handle) =
-                    connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+                // daemon wire. Use the RE-SPAWNING link so a dropped ssh hop (laptop
+                // sleep, network blip) re-runs `ssh …` and rebinds the seams in place —
+                // the editor keeps its local buffers/undo.
+                let (client, handle) = connect_daemon_respawning(
+                    "spawning ssh (is it installed and on PATH?)",
+                    move || Ok(ssh_daemon_command(&spec)),
+                    ReconnectPolicy::default(),
+                )?;
                 Ok((Some(client), Some(handle), no_guard()))
             }
             Some(ConnectTarget::Quic(uri)) => {
@@ -117,20 +95,13 @@ pub fn spawn_stdio_daemon_session(
     config_source: ConfigSource,
 ) -> Result<Session> {
     spawn_server(true, file, None, config_source, || async {
-        // Reconnecting like the ssh path: re-spawn the daemon command on each (re)dial and
-        // hold the current child on the link thread (kill_on_drop reaps the previous).
-        let child_slot: DaemonChildSlot = Arc::new(Mutex::new(None));
-        let make = move || {
-            let slot = child_slot.clone();
-            async move {
-                let mut child = spawn_stdio_daemon()?;
-                let stdout = child.stdout.take().expect("daemon stdout piped");
-                let stdin = child.stdin.take().expect("daemon stdin piped");
-                *slot.lock().unwrap() = Some(child);
-                Ok((stdout, stdin))
-            }
-        };
-        let (client, handle) = connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+        // Reconnecting like the ssh path: re-spawn the daemon command on each (re)dial,
+        // holding the current child on the link thread.
+        let (client, handle) = connect_daemon_respawning(
+            "spawning the daemon",
+            stdio_daemon_command,
+            ReconnectPolicy::default(),
+        )?;
         Ok((Some(client), Some(handle), no_guard()))
     })
 }
@@ -142,43 +113,23 @@ pub fn spawn_stdio_daemon_session(
 /// regardless. **Blocking** on the handshake, like every other builder, so a failed
 /// provision/spawn is an `Err` here and the *current* session is left intact.
 pub fn spawn_session_from_spec(spec: ReconnectSpec) -> Result<Session> {
-    if spec.keep_buffers {
-        // The swap always brings up a fresh session (buffers come from the new backend);
-        // carrying local buffers across is not implemented. Say so loudly rather than
-        // dropping them silently — the caller can decide whether to proceed.
-        return Err(anyhow!(
-            "nx.session.reconnect: keep_buffers = true is not supported yet"
-        ));
-    }
+    spec.reject_keep_buffers()?;
     let config_source = spec.config_source;
     match spec.transport {
         ReconnectTransport::Spawn { command } => {
             spawn_server(true, None, None, config_source, move || async move {
                 // Reconnecting, like `spawn_stdio_daemon_session`: re-launch the command on
-                // each (re)dial and hold the current child on the link thread (kill_on_drop
-                // reaps the previous). The daemon's stderr goes to a private log (it can't
-                // share the GUI's terminal).
-                let child_slot: DaemonChildSlot = Arc::new(Mutex::new(None));
-                let make = move || {
-                    let slot = child_slot.clone();
-                    let command = command.clone();
-                    async move {
-                        let mut child = command
-                            .to_command()
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(daemon_log_stderr())
-                            .kill_on_drop(true)
-                            .spawn()
-                            .map_err(|e| anyhow!(e).context("spawning the daemon"))?;
-                        let stdout = child.stdout.take().expect("daemon stdout piped");
-                        let stdin = child.stdin.take().expect("daemon stdin piped");
-                        *slot.lock().unwrap() = Some(child);
-                        Ok((stdout, stdin))
-                    }
-                };
-                let (client, handle) =
-                    connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+                // each (re)dial, holding the current child on the link thread. The daemon's
+                // stderr goes to a private log (it can't share the GUI's terminal).
+                let (client, handle) = connect_daemon_respawning(
+                    "spawning the daemon",
+                    move || {
+                        let mut c = command.to_command();
+                        c.stderr(daemon_log_stderr());
+                        Ok(c)
+                    },
+                    ReconnectPolicy::default(),
+                )?;
                 Ok((Some(client), Some(handle), no_guard()))
             })
         }
@@ -235,28 +186,19 @@ fn expand_tilde(dir: PathBuf) -> PathBuf {
     dir
 }
 
-/// A session guard: an opaque value kept alive on the server thread for the whole
-/// session. With the reconnecting daemon links, the ssh/stdio child lives on the **link
-/// thread** (the factory's [`DaemonChildSlot`]), so daemon sessions now use [`no_guard`]
-/// too — the type stays for symmetry and any future server-thread-scoped guard.
-type Guard = Box<dyn std::any::Any + Send>;
-
-/// The current daemon child the reconnecting factory holds alive on the link thread across a
-/// connection; each (re)dial replaces it, reaping the previous one via `kill_on_drop`.
-type DaemonChildSlot = Arc<Mutex<Option<tokio::process::Child>>>;
-
-/// The empty guard for a local / daemon / quic session (the daemon child, if any, lives on
-/// its own link thread, not the server thread).
-fn no_guard() -> Guard {
+/// The empty [`SessionGuard`] for a local / daemon / quic session (the daemon child, if
+/// any, lives on its own link thread — inside [`connect_daemon_respawning`] — not the
+/// server thread; the guard stays for any future server-thread-scoped resource).
+fn no_guard() -> SessionGuard {
     Box::new(())
 }
 
-/// The shared session-spawn scaffolding: run the editor server on its own thread with
-/// host seams from `connect`, joined to the window over an in-process duplex whose client
-/// end is returned. **Blocking** on the daemon handshake: `connect` runs first inside the
-/// server runtime, and its outcome is relayed back so a failed connect is an `Err` here
-/// (before any window/swap) rather than a dead session. `connect` yields the optional
-/// [`DaemonClient`] (`None` = local disk) plus a [`Guard`] kept alive for the session.
+/// The shared session-spawn scaffolding, on nxvim-server's [`spawn_session_thread`]:
+/// run the editor server on its own thread with host seams from `connect`, joined to the
+/// window over an in-process duplex. **Blocking** on the daemon handshake, so a failed
+/// connect (or config resolve) is an `Err` here — before any window/swap — rather than a
+/// dead session. `connect` yields the optional [`DaemonClient`] (`None` = local disk)
+/// plus a [`SessionGuard`] kept alive for the session.
 fn spawn_server<F, Fut>(
     remote: bool,
     file: Option<String>,
@@ -267,140 +209,49 @@ fn spawn_server<F, Fut>(
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<
-        Output = Result<(Option<DaemonClient>, Option<ReconnectHandle>, Guard)>,
+        Output = Result<(Option<DaemonClient>, Option<ReconnectHandle>, SessionGuard)>,
     >,
 {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    // `ready` carries only the handshake outcome back here; the server thread then owns
-    // the duplex's `server_end` and the daemon child for the session's lifetime.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
-    let handle = std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = ready_tx.send(Err(anyhow!(e).context("building the server runtime")));
-                return;
-            }
-        };
-        runtime.block_on(async move {
-            let (client, daemon_link, _guard) = match connect().await {
-                Ok(parts) => parts,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
-            // Build the server config — for a daemon session this fetches + materializes
-            // the remote's config/plugins, so a failure here is a setup failure the caller
-            // must see (before we report the handshake up).
-            let init = match server_init(file, client, daemon_link, workspace, config_source).await
-            {
-                Ok(init) => init,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
-            // The handshake is up and config is staged: unblock the caller.
-            if ready_tx.send(Ok(())).is_err() {
-                return; // caller gave up waiting; nothing to serve
-            }
-            // `_guard` (the daemon child, or nothing) lives until the editor quits.
-            if let Err(e) = run_server(server_end, init).await {
-                eprintln!("nxvim-gui: server error: {e}");
-            }
-        });
-    });
-
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Session {
-            stream: client_end,
-            remote,
-            handle,
-        }),
-        // The server thread reported a handshake/setup failure and exited; join it (it's
-        // already done) and surface the error instead of returning a dead session.
-        Ok(Err(e)) => {
-            let _ = handle.join();
-            Err(e)
-        }
-        Err(_) => {
-            let _ = handle.join();
-            Err(anyhow!("nxvim-gui: server thread exited before connecting"))
-        }
-    }
+    let (stream, handle) = spawn_session_thread(move || async move {
+        let (client, daemon_link, guard) = connect().await?;
+        // Build the server config — for a daemon session this fetches + materializes
+        // the remote's config/plugins, so a failure here is a setup failure the caller
+        // must see (it is relayed as the handshake outcome).
+        let init = server_init(file, client, daemon_link, workspace, config_source).await?;
+        Ok((init, guard))
+    })?;
+    Ok(Session {
+        stream,
+        remote,
+        handle,
+    })
 }
 
-/// Spawn the stdio daemon child for a `--connect-daemon` startup: `$NXVIM_DAEMON_CMD`
+/// Build the stdio daemon command for a `--connect-daemon` startup: `$NXVIM_DAEMON_CMD`
 /// through `sh -c`, else the sibling `nxvim --daemon`. (A `nx.session.reconnect` spawn
-/// transport uses [`SpawnCommand::to_command`] instead.) Must run inside a tokio runtime
-/// (the child's pipes bind to it).
-fn spawn_stdio_daemon() -> Result<tokio::process::Child> {
-    use tokio::process::Command;
-    // The daemon's stderr goes to a private log the user can `tail` to diagnose the
-    // daemon side; it can't share the GUI's terminal. See [`daemon_log_stderr`] for
-    // why the path is per-pid and symlink-safe rather than a fixed `/tmp` name.
-    let stderr = daemon_log_stderr();
-    let mut cmd = if let Some(cmd) = std::env::var_os(DAEMON_CMD_ENV) {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    } else {
-        let nxvim = std::env::current_exe()?.with_file_name(nxvim_bin_name());
-        if !nxvim.exists() {
-            return Err(anyhow!(
-                "no sibling `nxvim` daemon binary at {} — install nxvim alongside \
-                 nxvim-gui, or set {DAEMON_CMD_ENV} (e.g. \"ssh host nxvim --daemon\")",
-                nxvim.display()
-            ));
+/// transport uses [`SpawnCommand::to_command`] instead.) The daemon's stderr goes to a
+/// private log the user can `tail` to diagnose the daemon side; it can't share the
+/// GUI's terminal (see [`daemon_log_stderr`] for why the path is per-pid and
+/// symlink-safe rather than a fixed `/tmp` name).
+fn stdio_daemon_command() -> Result<tokio::process::Command> {
+    let mut cmd = match env_daemon_command() {
+        Some(c) => c,
+        None => {
+            let nxvim = std::env::current_exe()?.with_file_name(nxvim_bin_name());
+            if !nxvim.exists() {
+                return Err(anyhow!(
+                    "no sibling `nxvim` daemon binary at {} — install nxvim alongside \
+                     nxvim-gui, or set {DAEMON_CMD_ENV} (e.g. \"ssh host nxvim --daemon\")",
+                    nxvim.display()
+                ));
+            }
+            let mut c = tokio::process::Command::new(nxvim);
+            c.arg("--daemon");
+            c
         }
-        let mut c = Command::new(nxvim);
-        c.arg("--daemon");
-        c
     };
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(stderr)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| anyhow!(e).context("spawning the daemon"))
-}
-
-/// Open the daemon's stderr log — a private, symlink-safe temp file.
-///
-/// A fixed shared path (`$TMPDIR/nxvim-daemon.log`) opened with `File::create` is a
-/// classic `/tmp` symlink attack: on a multi-user host an attacker plants that name as
-/// a symlink to a victim-owned file and `File::create` follows it, truncating and then
-/// overwriting the target with daemon diagnostics. Mitigations, matching the TUI binary's
-/// `daemon_log_stderr`:
-/// - **Per-pid path**, so concurrent / repeat runs don't collide and `create_new` can
-///   succeed on a fresh name.
-/// - **`create_new` (`O_CREAT | O_EXCL`)**, which refuses to follow a symlink and refuses
-///   to truncate an existing file; a stale same-pid leftover (only ever *our own*) is
-///   removed first, and if the create still fails (an attacker re-planted the name under
-///   `/tmp`'s sticky bit) stderr is discarded rather than written through a hostile path.
-/// - **Mode `0600`** so daemon diagnostics (paths, errors) aren't exposed to other users
-///   of a shared temp dir.
-fn daemon_log_stderr() -> Stdio {
-    let path = std::env::temp_dir().join(format!("nxvim-daemon-{}.log", std::process::id()));
-    // Best-effort: clear a stale file from a prior same-pid run (only ever ours). If
-    // another user owns the name under the sticky bit this fails harmlessly — the
-    // `create_new` below then also fails and we fall back to discarding stderr.
-    let _ = std::fs::remove_file(&path);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(&path)
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
+    cmd.stderr(daemon_log_stderr());
+    Ok(cmd)
 }
 
 /// The sibling daemon binary's file name (`nxvim.exe` on Windows, `nxvim` elsewhere).
@@ -608,34 +459,6 @@ nx.user_command.create("workspace", function() end, {
 })
 "#;
 
-/// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces
-/// [`connect_quic`] needs: the `https://HOST:PORT` dial URL (WebTransport requires the
-/// `https` scheme), the bearer `TOKEN` (the path), and the TOFU cert `HASH` (the `cert`
-/// query). Fails loud on a malformed URI rather than dialing a half-specified target.
-pub fn parse_connect_uri(uri: &str) -> Result<(String, String, String)> {
-    let rest = uri
-        .strip_prefix("nxvim://")
-        .ok_or_else(|| anyhow!("daemon connect URI must start with nxvim:// : {uri:?}"))?;
-    let (authority, after) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow!("daemon connect URI is missing the /TOKEN path: {uri:?}"))?;
-    if authority.is_empty() {
-        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
-    }
-    let (token, query) = after
-        .split_once('?')
-        .ok_or_else(|| anyhow!("daemon connect URI is missing the ?cert=HASH query: {uri:?}"))?;
-    if token.is_empty() {
-        return Err(anyhow!("daemon connect URI has an empty TOKEN: {uri:?}"));
-    }
-    let cert_hash = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("cert="))
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow!("daemon connect URI is missing cert=HASH: {uri:?}"))?;
-    Ok((
-        format!("https://{authority}"),
-        cert_hash.to_owned(),
-        token.to_owned(),
-    ))
-}
+// `parse_connect_uri` is nxvim-server's (shared with the TUI binary); re-exported so
+// `nxvim_gui::parse_connect_uri` keeps working for the black-box tests.
+pub use nxvim_server::parse_connect_uri;

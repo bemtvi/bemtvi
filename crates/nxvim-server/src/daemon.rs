@@ -878,6 +878,44 @@ async fn maintain_link<D, DFut>(
     }
 }
 
+/// The URI scheme a QUIC daemon prints for clients to dial:
+/// `nxvim://HOST:PORT/TOKEN?cert=HASH`.
+pub const CONNECT_URI_SCHEME: &str = "nxvim://";
+
+/// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces a QUIC
+/// dial needs: the `https://HOST:PORT` dial URL (WebTransport requires the `https`
+/// scheme), the bearer `TOKEN` (the path), and the TOFU cert `HASH` (the `cert`
+/// query). Fails loud on a malformed URI rather than dialing a half-specified
+/// target. Shared by every dialing client (the TUI binary and the GUI).
+pub fn parse_connect_uri(uri: &str) -> anyhow::Result<(String, String, String)> {
+    use anyhow::anyhow;
+    let rest = uri.strip_prefix(CONNECT_URI_SCHEME).ok_or_else(|| {
+        anyhow!("daemon connect URI must start with {CONNECT_URI_SCHEME}: {uri:?}")
+    })?;
+    let (authority, after) = rest
+        .split_once('/')
+        .ok_or_else(|| anyhow!("daemon connect URI is missing the /TOKEN path: {uri:?}"))?;
+    if authority.is_empty() {
+        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
+    }
+    let (token, query) = after
+        .split_once('?')
+        .ok_or_else(|| anyhow!("daemon connect URI is missing the ?cert=HASH query: {uri:?}"))?;
+    if token.is_empty() {
+        return Err(anyhow!("daemon connect URI has an empty TOKEN: {uri:?}"));
+    }
+    let cert_hash = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("cert="))
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("daemon connect URI is missing cert=HASH: {uri:?}"))?;
+    Ok((
+        format!("https://{authority}"),
+        cert_hash.to_owned(),
+        token.to_owned(),
+    ))
+}
+
 /// Connect to a daemon over a **reconnectable** single-stream transport, driven on the
 /// *current* tokio runtime (no dedicated link thread). `make` produces a fresh
 /// reader/writer on each (re)dial — a duplex+daemon factory (tests), or a re-spawned ssh

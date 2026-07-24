@@ -84,6 +84,8 @@ mod reconnect;
 // it into emscripten's in-memory FS exactly as the native client stages it on disk).
 mod remote_config;
 #[cfg(feature = "native")]
+mod session_spawn;
+#[cfg(feature = "native")]
 mod shada;
 #[cfg(feature = "native")]
 mod treesitter;
@@ -122,13 +124,13 @@ pub use shada::{
 /// what one fetch resolves to.
 #[cfg(feature = "native")]
 pub use daemon::{
-    connect_daemon, connect_daemon_reconnecting, connect_daemon_reconnecting_on,
+    connect_daemon, connect_daemon_reconnecting, connect_daemon_reconnecting_on, parse_connect_uri,
     serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_dproc_daemon_on,
     serve_fs_daemon, serve_fs_daemon_on, serve_http_daemon, serve_http_daemon_on, serve_lsp_daemon,
     serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
     serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, DaemonStatus, FsRead, HostFsAsync,
     ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc,
-    RemoteHostTerm, RemoteHttp, RemoteLspTransport, WatchEvent,
+    RemoteHostTerm, RemoteHttp, RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
 };
 /// The parsed `nx_session_reconnect` spec (§B): the client-persistent session-swap request
 /// both native front ends decode and act on. See [`reconnect`].
@@ -145,6 +147,14 @@ pub use remote_config::materialize_remote_config;
 pub use remote_config::{
     decode_config_bundle, decode_config_bundle_bytes, materialize_remote_config_into,
     RemoteConfigBundle,
+};
+/// The client-side session-spawn scaffolding every UI binary shares: the blocking
+/// spawn-server-thread handshake, the re-spawning stdio-daemon link, and the
+/// private daemon stderr log.
+#[cfg(feature = "native")]
+pub use session_spawn::{
+    connect_daemon_respawning, daemon_log_stderr, env_daemon_command, spawn_session_thread,
+    SessionGuard, DAEMON_CMD_ENV,
 };
 
 /// Where the wasm edit-host stages a fetched [`RemoteConfigBundle`]: a fixed root in

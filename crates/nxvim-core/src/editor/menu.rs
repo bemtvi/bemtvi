@@ -1072,12 +1072,6 @@ impl Editor {
         });
     }
 
-    /// Open a **snippet-choice** dropdown: a [`MenuKind::Complete`] popup listing a
-    /// choice tabstop's alternatives (`${1|a,b,c|}`), anchored at the tabstop start
-    /// `anchor` so accepting a row replaces the whole current value `[anchor..cursor)`.
-    /// Preselects `active` (the alternative already in the buffer) so `<C-y>`/`<CR>`
-    /// accepts at once and `<C-n>`/`<C-p>` steps from it. Unlike the engine popup this
-    /// bypasses prefix fuzzy-ranking — every alternative is shown regardless of the
     /// Open a non-grabbing choice dropdown over the byte range `(sr,sc)..(er,ec)` — the
     /// Lua-facing entry (`nx.complete.choice`) behind a plugin snippet engine's choice
     /// tabstops. Enters Insert, parks the caret at the range end, and opens the
@@ -1106,6 +1100,12 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// Open a **snippet-choice** dropdown: a [`MenuKind::Complete`] popup listing a
+    /// choice tabstop's alternatives (`${1|a,b,c|}`), anchored at the tabstop start
+    /// `anchor` so accepting a row replaces the whole current value `[anchor..cursor)`.
+    /// Preselects `active` (the alternative already in the buffer) so `<C-y>`/`<CR>`
+    /// accepts at once and `<C-n>`/`<C-p>` steps from it. Unlike the engine popup this
+    /// bypasses prefix fuzzy-ranking — every alternative is shown regardless of the
     /// value already sitting in the tabstop — and carries no docs sidebar.
     pub(crate) fn open_snippet_choice_menu(
         &mut self,
@@ -1664,10 +1664,6 @@ impl Editor {
         }
     }
 
-    /// Project the open menu's **metadata** into [`MenuView`] — the highlighted row,
-    /// the total visible count, the optional query line, placement, and size. The
-    /// rows themselves are fetched windowed via [`Editor::menu_rows`] so a 100k-item
-    /// picker never clones its whole list into a frame. `None` when closed.
     /// Drop the one-shot preview-scroll gesture after a frame has consumed it (called
     /// from [`Editor::view`], alongside `pending_scroll`).
     pub(crate) fn clear_preview_scroll(&mut self) {
@@ -1676,6 +1672,10 @@ impl Editor {
         }
     }
 
+    /// Project the open menu's **metadata** into [`MenuView`] — the highlighted row,
+    /// the total visible count, the optional query line, placement, and size. The
+    /// rows themselves are fetched windowed via [`Editor::menu_rows`] so a 100k-item
+    /// picker never clones its whole list into a frame. `None` when closed.
     pub(crate) fn menu_view(&self) -> Option<MenuView> {
         self.menu.as_ref().map(|m| {
             let sel = m.selected_item();

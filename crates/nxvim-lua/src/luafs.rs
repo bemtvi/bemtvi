@@ -1,37 +1,24 @@
-//! The Lua-visible **filesystem** seam — the fs analogue of the [`BlockingSystem`]
-//! shell-out seam (`system.rs`).
+//! The **filesystem** seam behind the async `nx.fs` API — the only fs surface Lua
+//! has (there are no synchronous Lua fs builtins; blocking IO never runs on the
+//! editor thread).
 //!
-//! Plugins read the *project* through a handful of `vim.fn` builtins (`readblob`,
-//! `glob`, `filereadable`, `executable`, `getftime`, `isdirectory`, …) and the
-//! `nx._readdir` primitive. Those bind *directly* to `std::fs` today, which is
-//! correct for a local session but wrong in the edit-host / daemon split
-//! (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → *The full split*): there
-//! the editor + Lua VM run **locally** while the project files live on the remote
-//! **daemon**, so a `root_dir` detector or a file previewer touching the disk
-//! directly would see the *wrong* machine.
+//! Each `nx.fs` call becomes a whole high-level [`FsJob`] that the server runs
+//! **off the editor tick**, on the machine that actually holds the project files:
+//! a bare native session decomposes it via [`run_fs_job`] against [`StdLuaFs`] on
+//! the blocking pool, while a daemon session ships the job across the wire in one
+//! `luafs_op` request and it decomposes daemon-side — the same leg the wasm
+//! edit-host uses (see `nxvim-server`'s `FsBackend`; never a per-primitive wire
+//! round-trip). The [`LuaFs`] trait models the full libuv-shaped operation set so
+//! both worlds serve one surface; the plugin manager's clone/discover/source jobs
+//! run against the *local* backend even in a daemon session (plugins load into the
+//! local Lua VM).
 //!
-//! This module is the synchronous seam those project-facing fs calls route through.
-//! The default ([`StdLuaFs`]) is today's `std::fs` logic factored verbatim, so a bare
-//! local session is byte-for-byte unchanged. A daemon session injects a *blocking
-//! bridge* (`RemoteLuaFs`, in `nxvim-server`'s daemon wire) that runs each operation
-//! on the remote and parks the editor thread on the reply — the fs analogue of the
-//! `vim.system` blocking bridge. The seam is **synchronous** because a `vim.fn` fs
-//! builtin returns its value inline on the Lua tick. (The [`LuaFs`] trait still
-//! models the full libuv-shaped fs operation set so the daemon wire can serve it;
-//! the live Lua surface only exercises `stat`/`scandir`/`read_file`/`realpath`/`which`.)
-//!
-//! # The split-brain routing rule (decided up front, per the plan)
-//!
-//! **Routes through this seam** (project-facing — must reach the daemon): the `vim.fn`
-//! fs builtins `readblob`/`glob`/`filereadable`/`isdirectory`/`getftime`/`resolve`/
-//! `executable`/`exepath`; and the `nx._readdir` primitive `vim.fs.find` walks the
-//! project with.
-//!
-//! **Stays local** (config / plugin / VM state — never routed): raw Lua `io.*` /
-//! `os.*`, `require` / `package.path`, `nvim_get_runtime_file` (runtimepath = local
-//! plugins), `nx._read_file` (sources an `lsp/<name>.lua` *config* found on the
-//! runtimepath), and `stdpath` (local config/data/state dirs). These keep their
-//! direct `std::fs` calls — plugins and config live on the local machine by design.
+//! **Stays local, off this seam entirely** (config / plugin / VM state): raw Lua
+//! `io.*` / `os.*`, `require` / `package.path`, `nvim_get_runtime_file`
+//! (runtimepath = local plugins), `nx._read_file` (sources an `lsp/<name>.lua`
+//! *config* found on the runtimepath), and `stdpath` (local config/data/state
+//! dirs). These keep their direct `std::fs` calls — plugins and config live on
+//! the local machine by design.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

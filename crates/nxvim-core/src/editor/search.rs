@@ -251,9 +251,6 @@ impl Editor {
         self.run_search(&pattern, dir, SearchOffset::None, count.max(1), None);
     }
 
-    /// The keyword (alphanumerics + `_`) under the cursor, or the next one on the
-    /// line if the cursor sits on a non-word char; `None` if the line has none
-    /// from the cursor on. Drives `*`/`#`.
     /// The keyword (`[A-Za-z0-9_]`) the cursor sits on, or the next one to its
     /// right on the same line — vim's `<cword>`. Backs `*`/`#` search and the
     /// `<C-r><C-w>` register-insert pseudo-register. `None` when no keyword

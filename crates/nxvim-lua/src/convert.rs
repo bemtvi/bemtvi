@@ -3,7 +3,7 @@
 //! payloads); JSON flows back in (`vim.json.decode`, LSP replies). The two
 //! outbound table walkers share one classifier ([`classify_table`]) so the
 //! array-vs-map rule lives in a single place. Also the small opts-table readers
-//! the `nvim_set_hl` / `vim.system` bridges lean on.
+//! the `nvim_set_hl` / `nx.run` bridges lean on.
 
 use crate::ops::OptionValue;
 use mlua::{Lua, Table};
@@ -312,10 +312,10 @@ pub(crate) fn opt_table_to_json(t: Option<Table>) -> mlua::Result<Option<serde_j
     }
 }
 
-/// Flatten a `vim.system` `opts.env` table (`{ VAR = value }`) into the
+/// Flatten an `nx.run`-family `spec.env` table (`{ VAR = value }`) into the
 /// `(key, value)` pairs the event-loop actor layers onto the child's inherited
-/// environment — the async `nx._system_async` analogue of the inline loop in the
-/// blocking `nx._system`. An absent table yields no pairs.
+/// environment — shared by the `nx._system_async` bridge and its stream /
+/// process / local siblings. An absent table yields no pairs.
 pub(crate) fn env_pairs(env: Option<Table>) -> mlua::Result<Vec<(String, String)>> {
     let Some(env) = env else {
         return Ok(Vec::new());

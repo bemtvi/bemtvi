@@ -270,13 +270,6 @@ impl Editor {
         }
     }
 
-    /// Accept the highlighted command-line completion row: replace the command-name
-    /// token `[anchor .. cmdline_col)` with the chosen command and place the cursor at
-    /// its end (so further typing — an argument — appends past the accepted name).
-    /// Returns whether a row was accepted; `false` (a noselect popup, nothing
-    /// highlighted) leaves the line untouched so the caller runs it as typed. The
-    /// popup itself is closed by [`cmdline_complete_take_accept`] on success — the
-    /// caller closes any still-open noselect popup separately.
     /// Replace the current command-line **argument** token with `text`, keeping the
     /// command line open. This is the file-picker handoff's "paste the chosen path":
     /// `<Tab>` on `:e <arg>` opens the picker over the still-open line, and confirming
@@ -297,6 +290,13 @@ impl Editor {
         self.cmdline_col = anchor + text.len();
     }
 
+    /// Accept the highlighted command-line completion row: replace the command-name
+    /// token `[anchor .. cmdline_col)` with the chosen command and place the cursor at
+    /// its end (so further typing — an argument — appends past the accepted name).
+    /// Returns whether a row was accepted; `false` (a noselect popup, nothing
+    /// highlighted) leaves the line untouched so the caller runs it as typed. The
+    /// popup itself is closed by [`cmdline_complete_take_accept`] on success — the
+    /// caller closes any still-open noselect popup separately.
     pub(crate) fn cmdline_complete_accept(&mut self) -> bool {
         // Restore the originally-typed line (a preview may have rewritten it) so the
         // accepted row's `replace` span — indexed against that line — applies correctly.

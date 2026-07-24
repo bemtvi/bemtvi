@@ -366,8 +366,7 @@ impl EditHost {
     /// Project one window into its redraw sub-map: the rect and focus flag, the
     /// per-window text/cursor/gutter/status fields, and the window's own syntax
     /// highlights, diagnostic underlines, and scroll band (each resolving styles
-    /// into the shared per-frame `styles` palette).
-    /// Project one window to its redraw map, returning it paired with the
+    /// into the shared per-frame `styles` palette). Returned paired with the
     /// sign-column width (in cells) it reserved — the caller stashes that width
     /// back into core so the mouse hit-test skips the same gutter.
     fn window_value(
@@ -708,13 +707,6 @@ impl EditHost {
         )
     }
 
-    /// Run the `%`-format engine over one [`StatuslineCtx`] across `width` cells and
-    /// project the result as a `status` segment array (`{ text, style }` per
-    /// highlighted run). Shared by the per-window status line ([`Self::status_value`])
-    /// and the single global one (`laststatus=3`); both differ only in their context
-    /// and width. `statusline_fmt` empty ⇒ the built-in default look (rendered through
-    /// the same engine). Each segment's highlight group resolves to a style-palette
-    /// id, `Nil` when it has none / the colorscheme leaves it undefined.
     /// Resolve the effective `nx.statusline` segment layout for a window: its
     /// window-local override ([`WindowStatusline`](crate::WindowStatusline)) when
     /// set — `Segments` shows that layout, `Format` opts back to the `%`-format
@@ -728,6 +720,13 @@ impl EditHost {
         }
     }
 
+    /// Run the `%`-format engine over one [`StatuslineCtx`] across `width` cells and
+    /// project the result as a `status` segment array (`{ text, style }` per
+    /// highlighted run). Shared by the per-window status line ([`Self::status_value`])
+    /// and the single global one (`laststatus=3`); both differ only in their context
+    /// and width. `statusline_fmt` empty ⇒ the built-in default look (rendered through
+    /// the same engine). Each segment's highlight group resolves to a style-palette
+    /// id, `Nil` when it has none / the colorscheme leaves it undefined.
     #[allow(clippy::too_many_arguments)] // status-line render facts; bundling them
                                          // (window, layout, ctx, width, format, styles) would just hide the data flow.
     fn render_statusline(
@@ -1424,9 +1423,6 @@ fn chunk_runs_text(value: &Value) -> String {
     out
 }
 
-/// Encode a tab page as a `{ label, modified, window_count }` map for the redraw
-/// map's `tabline` array. The client formats the cell and highlights the active
-/// one (carried separately as `current_tab`).
 /// Word-wrap each of `lines` to at most `width` columns, breaking on whitespace and
 /// hard-breaking a single word longer than `width`. Blank lines are preserved (so a
 /// synopsis / blank / body layout keeps its paragraph break). Used by the cmdline
@@ -1516,6 +1512,9 @@ pub(crate) fn place_docs_beside(
     (docs_w >= MIN_DOCS_W.min(content_w)).then_some((docs_col, docs_w))
 }
 
+/// Encode a tab page as a `{ label, modified, window_count }` map for the redraw
+/// map's `tabline` array. The client formats the cell and highlights the active
+/// one (carried separately as `current_tab`).
 fn tab_value(tab: &TabView) -> Value {
     Value::Map(vec![
         (Value::from("label"), Value::from(tab.label.as_str())),
@@ -1590,10 +1589,6 @@ fn rect_value(rect: &ViewRect) -> Value {
     ])
 }
 
-/// The parallel per-row wire arrays a client decodes, unbundled from core's
-/// self-describing [`RenderRow`] layout. Shared by the settled window
-/// (`window_value`) and the scroll band (`project_band`) — the band is just a
-/// taller row set, so projecting it is identical work.
 /// One visible row's soft-wrap **segment**, for the per-row server overlay
 /// projections (treesitter highlights, diagnostics, inlay hints, extmark
 /// `virt_text`). They compute spans in **full-line** screen-column space, then
@@ -1643,6 +1638,10 @@ impl RowSeg {
     }
 }
 
+/// The parallel per-row wire arrays a client decodes, unbundled from core's
+/// self-describing [`RenderRow`] layout. Shared by the settled window
+/// (`window_value`) and the scroll band (`project_band`) — the band is just a
+/// taller row set, so projecting it is identical work.
 struct RowArrays<'a> {
     /// The per-row display text, borrowed from the source [`RenderRow`]s (the rows
     /// outlive this projection): the only consumers — [`display_lines_value`] and

@@ -992,13 +992,6 @@ impl Editor {
         None
     }
 
-    /// Every open region's absolute on-screen placement this frame, mirroring the
-    /// client `DockLayout` (`nxvim-tui` `render.rs`): where each region's window
-    /// tree paints, and — when its own tabline shows — that tabline's row and column
-    /// span. The inverse of the per-client band math (the core owns *which* cells,
-    /// the client owns *where*), shared by the mouse hit-tests so a global cell maps
-    /// back to the region the user sees. Geometry is read for `self.height`, which
-    /// is the windows-area height the client reports (cmdline excluded).
     /// The absolute screen row of the single global status bar (`'laststatus'`=3),
     /// or `None` when it isn't shown. It sits just below the middle band (main +
     /// side docks), above the bottom-dock band — the `mid_y + mid_h` row in
@@ -1030,6 +1023,13 @@ impl Editor {
         (mid_y, mid_h)
     }
 
+    /// Every open region's absolute on-screen placement this frame, mirroring the
+    /// client `DockLayout` (`nxvim-tui` `render.rs`): where each region's window
+    /// tree paints, and — when its own tabline shows — that tabline's row and column
+    /// span. The inverse of the per-client band math (the core owns *which* cells,
+    /// the client owns *where*), shared by the mouse hit-tests so a global cell maps
+    /// back to the region the user sees. Geometry is read for `self.height`, which
+    /// is the windows-area height the client reports (cmdline excluded).
     fn region_geoms(&self) -> Vec<RegionGeom> {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
@@ -1937,18 +1937,6 @@ impl Editor {
         Some((metrics, f.id, f.number_width))
     }
 
-    /// The completion **docs float**'s placement beside the popup box: its outer
-    /// top-left `(row, col)` and inner `(width, height)`, all in the focused window's
-    /// **region cells** (its layer's tree lays out at origin `0,0`; the client offsets
-    /// by the region's screen origin) — the space a `FloatRelative::Editor` float is
-    /// positioned in, so the float lands exactly where the server-projected popup
-    /// overlay does. `content_lines` (the rendered doc lines) sizes it: widest line ×
-    /// count, each clamped so a long doc scrolls rather than filling the screen. The
-    /// float butts against the popup — its content one cell past the popup's right
-    /// border, flipping to the left when that side has more room — and top-aligns its
-    /// content with the popup's first row, so the outer box (border included) sits one
-    /// row/col out. `None` when no completion popup is open, or neither side fits a
-    /// readable width. Region math mirrors the old `redraw.rs::project_complete_docs`.
     /// The open completion popup box's `menu_geom` col/row/width plus its window — the
     /// content-independent part of the docs float's placement, used as the signature
     /// that decides whether [`open_completion_docs_float`](Self::open_completion_docs_float)
@@ -1978,6 +1966,18 @@ impl Editor {
         Some((geom.row, geom.col, geom.width, geom.height, editor_w))
     }
 
+    /// The completion **docs float**'s placement beside the popup box: its outer
+    /// top-left `(row, col)` and inner `(width, height)`, all in the focused window's
+    /// **region cells** (its layer's tree lays out at origin `0,0`; the client offsets
+    /// by the region's screen origin) — the space a `FloatRelative::Editor` float is
+    /// positioned in, so the float lands exactly where the server-projected popup
+    /// overlay does. `content_lines` (the rendered doc lines) sizes it: widest line ×
+    /// count, each clamped so a long doc scrolls rather than filling the screen. The
+    /// float butts against the popup — its content one cell past the popup's right
+    /// border, flipping to the left when that side has more room — and top-aligns its
+    /// content with the popup's first row, so the outer box (border included) sits one
+    /// row/col out. `None` when no completion popup is open, or neither side fits a
+    /// readable width. Region math mirrors the old `redraw.rs::project_complete_docs`.
     pub(crate) fn complete_docs_geom(
         &self,
         content_lines: &[String],
@@ -2463,14 +2463,6 @@ impl Editor {
     }
 }
 
-/// Find the window in `tree` whose on-screen content area contains the
-/// **tree-relative** cell `(x, y)`, returning its id and the cell made
-/// **content-relative** (past a bordered float's border). Floats are tested first,
-/// top-most by z-order (`floats` is sorted bottom-to-top), then the tiled windows;
-/// this matches the paint order so the cell resolves to the window drawn on top.
-/// `None` when the cell is on a separator or outside every window. `tree` lays out
-/// at its own origin `(0, 0)`, so the caller subtracts the region's screen origin
-/// before calling (see [`Editor::region_at`]).
 /// The vim mouse-modifier string for a click — `'s'` (shift), `'c'` (ctrl),
 /// `'a'` (alt) in that order, empty when none are held. The form the status-line
 /// / tabline `%@` click regions carry.
@@ -2495,6 +2487,14 @@ fn rect_contains(x: usize, y: usize, w: usize, h: usize, col: usize, row: usize)
     (x..x.saturating_add(w)).contains(&col) && (y..y.saturating_add(h)).contains(&row)
 }
 
+/// Find the window in `tree` whose on-screen content area contains the
+/// **tree-relative** cell `(x, y)`, returning its id and the cell made
+/// **content-relative** (past a bordered float's border). Floats are tested first,
+/// top-most by z-order (`floats` is sorted bottom-to-top), then the tiled windows;
+/// this matches the paint order so the cell resolves to the window drawn on top.
+/// `None` when the cell is on a separator or outside every window. `tree` lays out
+/// at its own origin `(0, 0)`, so the caller subtracts the region's screen origin
+/// before calling (see [`Editor::region_at`]).
 fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usize, usize)> {
     let probe = |id: WindowId| -> Option<(WindowId, usize, usize)> {
         let w = tree.get(id);

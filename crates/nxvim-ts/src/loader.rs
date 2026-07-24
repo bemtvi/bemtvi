@@ -5,9 +5,12 @@
 //! nvim-treesitter `parser/` + `queries/` tree is drop-in usable:
 //!
 //! ```text
-//! <data>/parser/<lang>.{so,dylib,dll}    # exports tree_sitter_<lang>()
+//! <data>/parser/<lang>.{so,dylib,dll}     # exports tree_sitter_<lang>()
 //! <data>/queries/<lang>/highlights.scm
-//! <data>/queries/<lang>/indents.scm      # optional — treesitter indentation
+//! <data>/queries/<lang>/indents.scm       # optional — treesitter indentation
+//! <data>/queries/<lang>/injections.scm    # optional — embedded-language layers
+//! <data>/queries/<lang>/folds.scm         # optional — treesitter foldexpr
+//! <data>/queries/<lang>/textobjects.scm   # optional — vif/daf/… text objects
 //! ```
 
 use std::borrow::Cow;
@@ -39,11 +42,11 @@ pub enum LoadError {
 }
 
 /// A loaded grammar: the dynamic library (kept alive because `language` borrows
-/// code inside it), the `Language`, the compiled highlights `Query`, an optional
-/// compiled indents `Query` (treesitter indentation), and an optional compiled
-/// injections `Query` (the injection-query bridge — which patterns mark a node's
-/// text as another language). Both optionals are absent when the language ships no
-/// `indents.scm` / `injections.scm`.
+/// code inside it), the `Language`, the compiled highlights `Query`, and the
+/// optional compiled queries — indents (treesitter indentation), injections (the
+/// injection-query bridge — which patterns mark a node's text as another
+/// language), folds, and textobjects. Each optional is absent when the language
+/// ships no `<name>.scm` for it.
 pub struct Grammar {
     // Field order matters: every query field drops before `_lib`, so the loaded
     // code outlives anything pointing into it.

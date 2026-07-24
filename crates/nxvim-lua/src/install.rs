@@ -962,13 +962,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
-    // `nx._system_async(id, cmd, cwd, env)`: spawn `cmd` (an argv list) in the
-    // event-loop actor and run callback `id` with `{ code, stdout, stderr }` when
-    // it exits — the off-tick `vim.system`. Returns the child's OS pid immediately
-    // (the actor sends it back over a oneshot the bridge blocks on *briefly* — only
-    // until the spawn itself completes, not the run), so the `vim.system` handle
-    // carries a real pid while the wait stays async. A spawn failure surfaces as a
-    // `nil` pid (the `on_exit` still fires later with `code = -1`).
+    // `nx._system_async(id, cmd, cwd, env, stdin)`: spawn `cmd` (an argv list) in
+    // the event-loop actor and run callback `id` with `{ code, stdout, stderr }`
+    // when it exits — the transport under the one-shot `nx.run`. Returns the
+    // child's OS pid immediately (the actor sends it back over a oneshot the
+    // bridge blocks on *briefly* — only until the spawn itself completes, not the
+    // run), so the prelude's pid registry holds a real pid while the wait stays
+    // async. A spawn failure surfaces as a `nil` pid (the `on_exit` still fires
+    // later with `code = -1`).
     let sh = shared.clone();
     nx.set(
         "_system_async",
@@ -3620,9 +3621,9 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `nx._ui_opener()`: the OS file/URL opener argv prefix `vim.ui.open` spawns
-    // (via the async `vim.system`), chosen by platform — `open` on macOS,
-    // `xdg-open` elsewhere (Phase 8). The path is appended by the Lua wrapper.
+    // `nx._ui_opener()`: the OS file/URL opener argv prefix `nx.ui.open` spawns
+    // (via `nx.run`), chosen by platform — `open` on macOS, `explorer` on Windows,
+    // `xdg-open` elsewhere. The path is appended by the Lua wrapper.
     nx.set(
         "_ui_opener",
         lua.create_function(|_, ()| {

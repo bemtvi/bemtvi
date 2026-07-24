@@ -291,22 +291,6 @@ function nx.autocmd.del(id)
   nx._au_touch()
 end
 
--- Fire the registered autocmds for `event` whose pattern matches `pattern`,
--- with optional buffer context. Called from Rust (`LuaRuntime::fire_autocmd*`)
--- when the editor triggers an event, and from `nvim_exec_autocmds`. A function
--- handler runs with the callback args table `{id, event, match, buf, file}`; a
--- string `command` is queued as an ex-command. Match rules: event equals (or is
--- in) the registered event; pattern is nil/"*", equals `pattern`, or is in the
--- registered pattern list; a buffer-local autocmd only fires for its `buffer`.
--- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
--- case `file` falls back to `pattern` (the old behavior). `data` is the optional
--- `args.data` payload (`LspAttach`/`LspDetach` carry `{ client_id = … }`); nil otherwise.
--- An autocmd registered with `opts.once` (`:autocmd … ++once`) fires once and is
--- then dropped — collected during the pass and removed after it, so the live
--- iteration isn't mutated underneath `ipairs`.
--- Returns whether any autocmd actually ran — the `apply_autocmds()` boolean
--- neovim's `buf_check_timestamp` branches on (an autocmd ran → honor v:fcs_choice;
--- none → default warning). Callers that ignore the return value are unaffected.
 -- Does a single autocmd pattern `pat` match the event's `pattern` (the file path
 -- for file events, a filetype / id / mode-code for others)? Beyond an exact match
 -- and `*`, a `pat` holding a shell glob metacharacter (`*` `?` `[`) is matched as
@@ -359,6 +343,22 @@ local function au_pattern_matches(pat, pattern)
   return au_one_pattern_matches(pat, pattern)
 end
 
+-- Fire the registered autocmds for `event` whose pattern matches `pattern`,
+-- with optional buffer context. Called from Rust (`LuaRuntime::fire_autocmd*`)
+-- when the editor triggers an event, and from `nvim_exec_autocmds`. A function
+-- handler runs with the callback args table `{id, event, match, buf, file}`; a
+-- string `command` is queued as an ex-command. Match rules: event equals (or is
+-- in) the registered event; pattern is nil/"*", equals `pattern`, or is in the
+-- registered pattern list; a buffer-local autocmd only fires for its `buffer`.
+-- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
+-- case `file` falls back to `pattern` (the old behavior). `data` is the optional
+-- `args.data` payload (`LspAttach`/`LspDetach` carry `{ client_id = … }`); nil otherwise.
+-- An autocmd registered with `opts.once` (`:autocmd … ++once`) fires once and is
+-- then dropped — collected during the pass and removed after it, so the live
+-- iteration isn't mutated underneath `ipairs`.
+-- Returns whether any autocmd actually ran — the `apply_autocmds()` boolean
+-- neovim's `buf_check_timestamp` branches on (an autocmd ran → honor v:fcs_choice;
+-- none → default warning). Callers that ignore the return value are unaffected.
 function nx._fire(event, pattern, buf, file, data)
   local any = false
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)

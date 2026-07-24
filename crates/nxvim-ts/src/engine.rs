@@ -225,9 +225,9 @@ impl Engine {
     /// `(lang, name)` — the engine half of the query-resolution bridge. Lua has
     /// already merged `query.set` / `after/queries` / `;extends` into the final
     /// `text`; here the engine compiles + caches it, consulting it in place of the
-    /// on-disk query. Only the paint-relevant names ([`is_engine_query`] —
-    /// `highlights` / `indents` / `injections`) reach the engine; any other name is
-    /// a no-op (`folds` / `textobjects` stay Lua-side).
+    /// on-disk query. Only the engine-executed names ([`is_engine_query`] —
+    /// `highlights` / `indents` / `injections` / `folds` / `textobjects`) reach the
+    /// engine; any other name is a no-op here.
     ///
     /// If the grammar is already loaded, the affected query is recompiled **in
     /// place** against the live `Language` — never by evicting the grammar, whose

@@ -3577,6 +3577,11 @@ impl EditHost {
                 reconciled = true;
                 self.reconcile_file_change(buf);
             }
+            // A `:wqa` / `:xa` quit deferred this convergence: install its gate *before*
+            // the pre-write drain, so a synchronous commit below advances it against a
+            // live set (off-tick acks advance it later). Inside the loop so a `:wqa` run
+            // from a queued command / callback still installs its gate the same pass.
+            self.drain_pending_quit_all();
             // Async `BufWritePre` gates that settled since the last round: commit each
             // parked write now that its handler promises have all resolved. Ordered first
             // so the commit's completed-write (BufWritePost) is picked up by
@@ -3988,7 +3993,6 @@ impl EditHost {
         // (off-tick mode): writes (`:w`) and opens (`:edit`). No-ops when off-tick mode
         // is off or none ran.
         self.drain_pending_saves();
-        self.drain_pending_quit_all();
         self.drain_pending_opens();
         // Explicit `:wshada` / `:rshada` raised this convergence: flush / re-merge the
         // store. After the opens/saves drain so a `:rshada` sees the settled session.
@@ -4011,6 +4015,14 @@ impl EditHost {
         // gated: returns on the first line unless a plugin has actually mounted.
         #[cfg(feature = "native")]
         self.sync_http_listen_addr();
+        // A `:wqa` / `:xa` whose batch just completed (its gate emptied this convergence,
+        // via a synchronous commit above or an off-tick ack a prior tick): replay `:qa`
+        // now that the editor is clean across the batch. Deferred to here — not run where
+        // the gate was advanced — because that may be mid-fixpoint. `run_command` re-enters
+        // `run_pending`, whose tail then finds no replay pending (one-shot `take`).
+        if let Some(bang) = self.quit_all_replay.take() {
+            self.run_command(if bang { "qa!" } else { "qa" });
+        }
     }
 
     /// Re-render the custom `nx.statusline` segments whose cache is stale and fold

@@ -88,8 +88,8 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub(crate) use self::selection::{Range, Selections};
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
-    FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave, PreWrite,
-    WriteEvent,
+    CommitOutcome, FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
+    PreWrite, WriteEvent, WriteScope,
 };
 pub use self::marks::MarkMirrorEntry;
 pub use self::persist::{

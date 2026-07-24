@@ -2554,7 +2554,9 @@ impl Editor {
         // mutation (format / trim-on-save) is what gets serialized. `then_quit` rides
         // the intent so `:wq` / `:x` closes the window only after the write lands.
         let buffer = self.cur_buffer();
+        let seq = self.next_write_seq();
         self.pending_pre_writes.push(PreWrite {
+            seq,
             buffer,
             path,
             then_quit,
@@ -2972,103 +2974,88 @@ impl Editor {
         self.switch_buffer(id);
     }
 
-    /// `:wall` — write every modified buffer that has a file name. Returns the
-    /// [`PendingSave::seq`]s enqueued in off-tick mode (empty otherwise), so `:wqa`
-    /// can gate its quit on the whole batch; a bare `:wall` discards them.
+    /// `:wall` — write every modified buffer that has a file name. Records a [`PreWrite`]
+    /// per such buffer (instead of writing inline) and returns their [`PreWrite::seq`]s,
+    /// so `:wqa` can gate its quit on the whole batch's completion; a bare `:wall`
+    /// discards them. The server fires (and awaits) each buffer's `BufWritePre` — with
+    /// that buffer made current — before committing it, so a mutating format/trim handler
+    /// targets the right buffer, exactly as the single-buffer `:w` does. Same path for
+    /// local and off-tick (the commit picks the fs).
     ///
     /// A buffer whose file changed on disk since we read it is *not* clobbered
     /// (unless forced with `:wall!`): the safe buffers are still written, and the
     /// conflicting ones skipped. If any was skipped we then switch to the *first*
     /// such buffer and warn — the same way `:q` surfaces the buffer blocking a
     /// quit — so the user lands on the file at risk rather than silently losing
-    /// the outside edit.
+    /// the outside edit. The guard is skipped off-tick (no remote stat on the tick,
+    /// same as `ex_write`).
     fn ex_write_all(&mut self, bang: bool) -> Vec<u64> {
-        // Off-tick (daemon session): snapshot every modified file-backed buffer into a
-        // `PendingSave` the server pushes over the wire — the multi-buffer companion to
-        // the single-buffer `:w` (`ex_write`). The disk-change/conflict guard is skipped
-        // here for the same reason `ex_write` skips it off-tick: it needs a remote stat
-        // we've sworn off the editor tick (a `HostWatch`-driven check is a later slice).
-        // Each save acks independently with its own `written` echo; per-buffer ordering
-        // and failure handling are the server's (the buffers are distinct, so they all
-        // dispatch concurrently). No summary echo — the per-ack echoes carry it.
-        if self.host_fs_offtick {
-            let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
-            let mut seqs = Vec::new();
-            for id in ids {
-                let buf = &self.buffers.get(id).buffer;
-                if let (true, Some(path)) = (buf.modified, buf.path.clone()) {
-                    // A buffer that can't be encoded to its `'fileencoding'` is skipped
-                    // (the error is echoed inside `enqueue_save_of`); the rest still save.
-                    // `:wall` enqueues directly (no pre-write drain), so the ack still
-                    // fires `BufWritePre` before `BufWritePost` (`fire_pre = true`).
-                    if let Some(seq) = self.enqueue_save_of(id, path, None, true) {
-                        seqs.push(seq);
-                    }
-                }
-            }
-            return seqs;
-        }
         let ids: Vec<BufferId> = self.buffers.map.keys().copied().collect();
-        let fs = self.host_fs.clone();
-        let mut written = 0;
+        // The disk-change/conflict guard is local-only (off-tick can't stat remotely).
+        let fs = (!self.host_fs_offtick).then(|| self.host_fs.clone());
+        let mut seqs = Vec::new();
+        let mut queued = 0;
         let mut conflict = None;
         for id in ids {
-            let ob = self.buffers.get_mut(id);
-            if !(ob.buffer.modified && ob.buffer.path.is_some()) {
+            let (modified_backed, changed) = {
+                let buf = &self.buffers.get(id).buffer;
+                let backed = buf.modified && buf.path.is_some();
+                let changed = fs
+                    .as_ref()
+                    .is_some_and(|fs| backed && !bang && buf.disk_changed(&**fs));
+                (backed, changed)
+            };
+            if !modified_backed {
                 continue;
             }
-            if !bang && ob.buffer.disk_changed(&*fs) {
+            if changed {
                 // Don't clobber an outside edit; remember the first such buffer (ids
                 // ascend, so this is the lowest-numbered conflict) to surface below.
                 conflict.get_or_insert(id);
                 continue;
             }
-            if self.buffers.get_mut(id).buffer.write(None, &*fs).is_ok() {
-                // The written state is now the saved node (carries a save number).
-                self.mark_undo_saved(id);
-                written += 1;
-                // Fire `BufWritePre`/`BufWritePost` for each buffer that landed (it's
-                // modified and file-backed, so it has a path). `:wall` still writes
-                // inline and fires both events *after* the bytes (`fire_pre = true`) —
-                // the pre-before-write split lands with the multi-buffer/async phase.
-                if let Some(path) = self.buffers.get(id).buffer.path.clone() {
-                    self.record_write(id, path, true);
-                }
-            }
+            // Write its own bound path (`None`); the batch quit is gated server-side, so
+            // no per-buffer `then_quit`; `:wall` prints its own summary, so `report=false`.
+            let seq = self.next_write_seq();
+            self.pending_pre_writes.push(PreWrite {
+                seq,
+                buffer: id,
+                path: None,
+                then_quit: None,
+                report: false,
+            });
+            seqs.push(seq);
+            queued += 1;
         }
         if let Some(id) = conflict {
-            // Surface the first at-risk buffer and warn (the switch clears the
-            // message, so set it afterwards); the safe buffers are already saved.
+            // Surface the first at-risk buffer and warn (the switch clears the message, so
+            // set it afterwards); the safe buffers' pre-writes still commit in the drain.
             self.switch_buffer(id);
             self.echo(
                 "WARNING: The file has changed on disk since editing started (add ! to override)",
             );
-        } else {
-            self.echo(format!("{written} buffer(s) written"));
+        } else if !self.host_fs_offtick {
+            // Local `:wall` echoes a summary of the buffers it will write; off-tick stays
+            // quiet, since each ack carries its own `written` echo.
+            self.echo(format!("{queued} buffer(s) written"));
         }
-        Vec::new()
+        seqs
     }
 
     /// `:wqa` / `:xa` — write every modified buffer, then quit the editor.
     ///
-    /// Locally this is just `:wall` followed by `:qall` (the writes are synchronous, so
-    /// the buffers are clean by the time the quit runs). In a daemon session the writes
-    /// go *off-tick* over the wire, so the quit can't fire inline — the buffers are still
-    /// `[+]` until their acks land. Instead core hands the server a [`PendingQuitAll`]
-    /// naming the batch's writes; the server replays `:qa` only once every one has acked,
-    /// and **cancels** the quit if any fails (the multi-buffer form of `:wq`'s deferred,
-    /// ack-gated, failure-cancels quit). A `:wqa` with nothing to save still quits
-    /// immediately — there's no write to wait on — exactly as `:qa` would.
+    /// The writes are now *deferred* (each buffer's `BufWritePre` fires — and may await an
+    /// async handler — before its bytes), so the quit can't fire inline: the buffers are
+    /// still `[+]` until their writes complete. Core hands the server a [`PendingQuitAll`]
+    /// naming the batch's [`PreWrite::seq`]s; the server replays `:qa` only once every one
+    /// has completed — a synchronous commit or (off-tick) an ack — and **cancels** the
+    /// quit if any fails (the multi-buffer form of `:wq`'s deferred, gated, failure-cancels
+    /// quit). A `:wqa` with nothing to save still quits immediately — there's no write to
+    /// wait on — exactly as `:qa` would (a modified *no-name* buffer then makes `:qa`
+    /// report E37, as in vim).
     fn ex_write_quit_all(&mut self, bang: bool) {
         let seqs = self.ex_write_all(bang);
-        if !self.host_fs_offtick {
-            self.ex_quit_all(bang);
-            return;
-        }
         if seqs.is_empty() {
-            // Off-tick, but no modified file-backed buffer was enqueued: nothing to wait
-            // on, so quit now (a modified *no-name* buffer makes `:qa` report E37, as in
-            // vim — the gate would never let us, since it watches no writes).
             self.ex_quit_all(bang);
         } else {
             self.pending_quit_all = Some(PendingQuitAll { bang, seqs });

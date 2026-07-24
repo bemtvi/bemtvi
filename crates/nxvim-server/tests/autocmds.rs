@@ -10,7 +10,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_test_harness::{
-    command, exec_lua, message, redraw_after, start_with_config, start_with_file_and_config,
+    command, exec_lua, feed, message, redraw_after, start_with_config, start_with_file_and_config,
     temp_dir,
 };
 use rmpv::Value;
@@ -949,6 +949,83 @@ async fn rejecting_async_bufwritepre_still_writes() {
         on_disk, "hello world\n",
         "a rejecting async BufWritePre handler must not block the write"
     );
+}
+
+#[tokio::test]
+async fn wall_fires_bufwritepre_before_bytes_per_buffer() {
+    // `:wall` must fire `BufWritePre` before each buffer's bytes — and with that buffer
+    // made current, so a mutating handler targets the *right* buffer (vim's aucmd_prepbuf).
+    // Two modified buffers; the handler appends `X` to every line. Both files must land
+    // mutated: if the pre fired after the bytes, neither `X` reaches disk; if the handler
+    // ran against the current buffer twice, the non-current buffer's `X` would be missing.
+    let dir = temp_dir("au_wall_pre");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "a\n").expect("seed a");
+    std::fs::write(&b, "b\n").expect("seed b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function() vim.cmd([[%s/$/X/]]) end })\n",
+    )
+    .await;
+    // Modify buffer a, open + modify buffer b (leaving b current), so both are dirty.
+    redraw_after(&rpc, &mut incoming, "A1<Esc>").await;
+    redraw_after(&rpc, &mut incoming, &format!(":e {}<CR>", b.display())).await;
+    redraw_after(&rpc, &mut incoming, "A2<Esc>").await;
+    redraw_after(&rpc, &mut incoming, ":wall<CR>").await;
+    assert_eq!(
+        std::fs::read_to_string(&a).expect("read a"),
+        "a1X\n",
+        "the non-current buffer's BufWritePre mutation must reach its own file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&b).expect("read b"),
+        "b2X\n",
+        "the current buffer's BufWritePre mutation must reach its file"
+    );
+}
+
+#[tokio::test]
+async fn wqa_writes_all_with_bufwritepre_then_quits() {
+    // `:wqa` writes every modified buffer — each firing its BufWritePre (mutation
+    // reaching disk) — and only then quits. Proves the local quit gate waits for the
+    // whole batch's writes to commit before replaying `:qa`.
+    let dir = temp_dir("au_wqa");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "a\n").expect("seed a");
+    std::fs::write(&b, "b\n").expect("seed b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function() vim.cmd([[%s/$/X/]]) end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "A1<Esc>").await;
+    redraw_after(&rpc, &mut incoming, &format!(":e {}<CR>", b.display())).await;
+    redraw_after(&rpc, &mut incoming, "A2<Esc>").await;
+    // Fire-and-forget the quit (the connection tears down as it exits).
+    feed(&rpc, ":wqa<CR>");
+    // Wait for exit (an `nxvim_exit` notification or the closed channel).
+    let quit = {
+        let timeout = std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(timeout, incoming.recv()).await {
+                Ok(None) => break true,
+                Ok(Some(Incoming::Notification { method, .. })) if method == "nxvim_exit" => {
+                    break true
+                }
+                Ok(Some(_)) => continue,
+                Err(_) => break false,
+            }
+        }
+    };
+    assert!(quit, "`:wqa` quits once every write has committed");
+    assert_eq!(std::fs::read_to_string(&a).expect("read a"), "a1X\n");
+    assert_eq!(std::fs::read_to_string(&b).expect("read b"), "b2X\n");
 }
 
 #[tokio::test]

@@ -9,7 +9,8 @@ use crate::{EditHost, WindowRect};
 #[cfg(feature = "native")]
 use crate::{FsRead, WatchEvent, INTERNAL_WATCH_BASE};
 use nxvim_core::{
-    BufferId, DirEntry, FileChangeAction, FileChangeReason, FileStat, TabId, WindowId,
+    BufferId, CommitOutcome, DirEntry, FileChangeAction, FileChangeReason, FileStat, TabId,
+    WindowId,
 };
 use std::collections::HashMap;
 use std::io;
@@ -1349,22 +1350,11 @@ impl EditHost {
         self.push_buf_mirror();
     }
 
-    /// Fire `BufWritePre` (its `BufWrite` synonym is canonicalized to this at
-    /// registration) for `buf`, with the written buffer as context (`<afile>` = `path`).
-    /// Driven from [`EditHost::drain_write_events`] for a write whose pre wasn't fired
-    /// before the bytes (an off-tick `:wall` ack). The awaited, pre-before-bytes fire is
-    /// [`fire_buf_write_pre_gated`](Self::fire_buf_write_pre_gated).
-    pub(crate) fn fire_buf_write_pre(&mut self, buf: BufferId, path: &str) {
-        self.set_write_snapshot(buf, path);
-        let r = self.lua.fire_autocmd_buf("BufWritePre", path, buf.0, path);
-        self.report_autocmd_err("BufWritePre", r);
-        self.apply_lua_effects();
-    }
-
-    /// Fire `BufWritePre` as an **awaited gate**, *before* the bytes are serialized: like
-    /// [`fire_buf_write_pre`](Self::fire_buf_write_pre) but a handler may return a promise
-    /// the write must wait on (an async format/trim-on-save). Returns `true` when every
-    /// handler settled **synchronously** — the caller commits the write now; `false` when
+    /// Fire `BufWritePre` as an **awaited gate**, *before* the bytes are serialized: a
+    /// handler may return a promise the write must wait on (an async format/trim-on-save),
+    /// and may mutate the buffer (which the caller has made current). Returns `true` when
+    /// every handler settled **synchronously** — the caller commits the write now; `false`
+    /// when
     /// an async handler is still pending — the caller parks the write under `gate_id` and
     /// commits it when `nx._au_gate_done(gate_id)` settles (`drain_au_gate_done`). A
     /// handler that throws is reported and treated as settled (the write still proceeds,
@@ -1414,14 +1404,17 @@ impl EditHost {
     /// Drain the pre-write intents recorded this convergence (core's
     /// [`Editor::take_pending_pre_writes`]): fire each buffer's `BufWritePre` **before**
     /// committing its write, so a handler's buffer mutation (format / trim-on-save) is
-    /// what gets serialized. `BufWritePre` is *awaited*: a handler may return a promise
-    /// (an async format), and the write commits only once every handler settles. A write
-    /// whose handlers all settle synchronously commits inline (the common case, no timing
-    /// change); one with a pending async handler is parked in `pending_gated_writes` under
-    /// its `gate_id` and committed later by [`drain_au_gate_done`](Self::drain_au_gate_done)
-    /// when the gate settles. Called inside [`run_pending`](EditHost::run_pending)'s
-    /// fixpoint so a write driven from a keystroke, `vim.cmd('w')`, or a user command
-    /// drives in the same convergence.
+    /// what gets serialized. The written buffer is made current for the fire (vim's
+    /// `aucmd_prepbuf`, via [`Editor::begin_write_scope`]) so a mutating handler targets
+    /// *it* — the `:wall` non-current-buffer case — then restored. `BufWritePre` is
+    /// *awaited*: a handler may return a promise (an async format), and the write commits
+    /// only once every handler settles. A write whose handlers all settle synchronously
+    /// commits inline (the common case, no timing change); one with a pending async
+    /// handler is parked in `pending_gated_writes` under its `gate_id` and committed later
+    /// by [`drain_au_gate_done`](Self::drain_au_gate_done). Each committed (or failed)
+    /// write advances (or cancels) a `:wqa` quit gate. Called inside
+    /// [`run_pending`](EditHost::run_pending)'s fixpoint so a write driven from a
+    /// keystroke, `vim.cmd('w')`, or a user command drives in the same convergence.
     pub(crate) fn drain_pre_writes(&mut self) {
         let pre_writes = self.editor.take_pending_pre_writes();
         if pre_writes.is_empty() {
@@ -1439,12 +1432,21 @@ impl EditHost {
                 .unwrap_or_default();
             let gate_id = self.next_gate_id;
             self.next_gate_id += 1;
-            if self.fire_buf_write_pre_gated(pw.buffer, &path, gate_id) {
-                self.editor.commit_pre_write(pw);
+            // Make the written buffer current so a mutating BufWritePre handler targets
+            // it (a no-op for the already-current single-`:w` buffer). The handler's sync
+            // mutation lands inside `fire_buf_write_pre_gated`'s `apply_lua_effects`.
+            let scope = self.editor.begin_write_scope(pw.buffer);
+            let settled = self.fire_buf_write_pre_gated(pw.buffer, &path, gate_id);
+            if settled {
+                let outcome = self.editor.commit_pre_write(pw);
+                self.editor.end_write_scope(scope);
+                self.apply_commit_outcome(outcome);
                 committed_any = true;
             } else {
-                // An async `BufWritePre` handler is still settling — park the write; the
-                // gate-done drain commits it (and fires `BufWritePost`) once it settles.
+                // An async `BufWritePre` handler is still settling: its sync portion ran
+                // in-scope; restore now (the buffer can't stay current across ticks) and
+                // park the write. `drain_au_gate_done` commits it when the gate settles.
+                self.editor.end_write_scope(scope);
                 self.pending_gated_writes.insert(gate_id, pw);
             }
         }
@@ -1457,9 +1459,11 @@ impl EditHost {
     /// tail of [`drain_pre_writes`](Self::drain_pre_writes). Lua's
     /// `nx.promise.all_settled(...):next(…)` called `nx._au_gate_done(gate_id)` once every
     /// handler promise settled, landing the id in `au_gate_done`; here we pop the parked
-    /// [`PreWrite`](nxvim_core::PreWrite) and commit it, from which `BufWritePost` fires
-    /// (via [`drain_write_events`](Self::drain_write_events), ordered after this in the
-    /// fixpoint). Drained inside [`run_pending`](EditHost::run_pending), which
+    /// [`PreWrite`](nxvim_core::PreWrite) and commit it (writing by id, so no buffer scope
+    /// is needed — only the fire's sync mutation did), from which `BufWritePost` fires (via
+    /// [`drain_write_events`](Self::drain_write_events), ordered after this in the
+    /// fixpoint), and advance/cancel a `:wqa` gate. Drained inside
+    /// [`run_pending`](EditHost::run_pending), which
     /// [`settle_events`](EditHost::settle_events) runs after every async settle.
     pub(crate) fn drain_au_gate_done(&mut self) {
         if self.au_gate_done.is_empty() {
@@ -1468,7 +1472,8 @@ impl EditHost {
         let mut committed_any = false;
         for id in std::mem::take(&mut self.au_gate_done) {
             if let Some(pw) = self.pending_gated_writes.remove(&id) {
-                self.editor.commit_pre_write(pw);
+                let outcome = self.editor.commit_pre_write(pw);
+                self.apply_commit_outcome(outcome);
                 committed_any = true;
             }
         }
@@ -1477,12 +1482,22 @@ impl EditHost {
         }
     }
 
+    /// Route a [`CommitOutcome`] to the `:wqa` quit gate: a synchronous commit advances
+    /// it, a synchronous failure cancels it, an off-tick enqueue leaves it to the ack.
+    fn apply_commit_outcome(&mut self, outcome: CommitOutcome) {
+        match outcome {
+            CommitOutcome::Committed(seq) => self.advance_quit_all_gate(seq),
+            CommitOutcome::Failed(seq) => self.cancel_quit_all_gate(seq),
+            CommitOutcome::Deferred => {}
+        }
+    }
+
     /// Drain the writes completed this convergence (core's
-    /// [`Editor::take_write_events`]) and fire each one's `BufWritePost` — plus
-    /// `BufWritePre` first for a write whose pre wasn't already fired (an off-tick save
-    /// ack, which enqueued before the pre-write split reached it). Called inside
-    /// [`run_pending`](EditHost::run_pending)'s fixpoint so a daemon save ack fires its
-    /// events in the same convergence.
+    /// [`Editor::take_write_events`]) and fire each one's `BufWritePost`. `BufWritePre`
+    /// already fired before the bytes (the pre-write drain, or off-tick pre-enqueue), so
+    /// only `BufWritePost` remains. Called inside
+    /// [`run_pending`](EditHost::run_pending)'s fixpoint so a committed `:w` / `:wall` or
+    /// a daemon save ack fires its `BufWritePost` in the same convergence.
     pub(crate) fn drain_write_events(&mut self) {
         let writes = self.editor.take_write_events();
         if writes.is_empty() {
@@ -1490,9 +1505,6 @@ impl EditHost {
         }
         for we in writes {
             let path = we.path.display().to_string();
-            if we.fire_pre {
-                self.fire_buf_write_pre(we.buffer, &path);
-            }
             self.fire_buf_write_post(we.buffer, &path);
         }
         self.reseed_cur_snapshot();

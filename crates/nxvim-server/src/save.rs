@@ -91,11 +91,12 @@ impl EditHost {
     }
 
     /// Record this tick's deferred `:wqa` / `:xa` quit (core's `take_pending_quit_all`)
-    /// as the server-side [`QuitAllGate`]. Called right after `drain_pending_saves`, so
-    /// the gate's seqs name writes already dispatched this tick; the save ack handler
-    /// then drains the gate. A no-op when no batch quit ran. (Core only sets the batch
-    /// quit when at least one write was enqueued — an empty `:wqa` quits inline — so the
-    /// gate's `waiting` is never empty at birth; it fires only as acks land.)
+    /// as the server-side [`QuitAllGate`]. Called inside `run_pending`, **before** the
+    /// pre-write drain, so a synchronous commit that lands the same convergence can
+    /// advance the gate against a live set; off-tick acks advance it later. A no-op when
+    /// no batch quit ran. (Core only sets the batch quit when at least one write is
+    /// pending — an empty `:wqa` quits inline — so `waiting` is never empty at birth; it
+    /// fires only as writes complete.)
     pub(crate) fn drain_pending_quit_all(&mut self) {
         if let Some(pqa) = self.editor.take_pending_quit_all() {
             self.quit_all_gate = Some(QuitAllGate {
@@ -137,7 +138,7 @@ impl EditHost {
         match result {
             Ok(stat) => {
                 self.editor
-                    .finalize_save(save.buffer, save.path.clone(), stat, save.fire_pre);
+                    .finalize_save(save.buffer, save.path.clone(), stat);
                 self.editor.echo(format!(
                     "\"{}\" {}L, {}B written",
                     save.path.display(),
@@ -185,11 +186,14 @@ impl EditHost {
         }
     }
 
-    /// Tick a successfully-acked write's `seq` off the `:wqa` quit gate (if it belongs to
-    /// one). When the gate's set drains to empty, every write of the batch has landed and
-    /// the editor is clean across it, so replay `:qa` / `:qa!`. A no-op when no batch quit
-    /// is pending or this seq isn't part of it (a plain `:w` / `:wq`).
-    fn advance_quit_all_gate(&mut self, seq: u64) {
+    /// Tick a completed write's `seq` off the `:wqa` quit gate (if it belongs to one) —
+    /// a synchronous commit ([`drain_pre_writes`](Self::drain_pre_writes)) or an off-tick
+    /// ack ([`apply_save_done`](Self::apply_save_done)). When the gate's set drains to
+    /// empty, every write of the batch has landed and the editor is clean across it, so
+    /// arm the `:qa` / `:qa!` replay — deferred to `run_pending`'s tail via
+    /// `quit_all_replay`, since the advance may be mid-fixpoint (a synchronous commit).
+    /// A no-op when no batch quit is pending or this seq isn't part of it (a `:w` / `:wq`).
+    pub(crate) fn advance_quit_all_gate(&mut self, seq: u64) {
         let Some(gate) = self.quit_all_gate.as_mut() else {
             return;
         };
@@ -198,14 +202,14 @@ impl EditHost {
         }
         let bang = gate.bang;
         self.quit_all_gate = None;
-        self.run_command(if bang { "qa!" } else { "qa" });
+        self.quit_all_replay = Some(bang);
     }
 
     /// Cancel a pending `:wqa` quit because one of its batch's writes failed — drop the
     /// gate so the editor stays up with the unsaved buffer intact (the failure itself is
     /// already surfaced loudly by the caller). A no-op when this seq isn't part of a
     /// pending batch quit.
-    fn cancel_quit_all_gate(&mut self, seq: u64) {
+    pub(crate) fn cancel_quit_all_gate(&mut self, seq: u64) {
         if self
             .quit_all_gate
             .as_ref()

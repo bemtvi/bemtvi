@@ -188,19 +188,28 @@ formatter via a `BufWritePre` promise; verified end-to-end with a throwaway harn
 test, then removed per the examples convention). `docs/autocmd-events.md` documents the
 async-handler contract and the awaited `BufWritePre`.
 
-**Deferred — `:wall`/`:wqa` pre-before-bytes (a genuinely separate, larger piece).**
-The blocker is *not* the quit-gating (that could ride the existing `PendingQuitAll`
-seq-gate). It is that a *mutating* `BufWritePre` handler (`vim.cmd` `%s`, `nx.lsp.buf.format`)
-operates on the **current** buffer, so firing `BufWritePre` for a *non-current* `:wall`
-buffer would target the wrong buffer. Doing it correctly needs neovim's `aucmd_prepbuf`:
-temporarily make each written buffer current (saving/restoring the window's buffer **and**
-the editor-global cursor) without firing spurious `BufEnter`/`BufLeave`. `set_cur_buffer`
-swaps the window's buffer but not the cursor, and `switch_buffer` fires the full autocmd
-chain — neither is the lightweight swap this needs. An *ordering-only* conversion (fire
-before bytes without making the buffer current) would be **worse** than today: a mutating
-handler would corrupt the current buffer. So `:wall`/`:wqa` keep firing `BufWritePre`
-after the bytes (notifications work; buffer-mutating format-on-save via `:wall` does not) —
-tracked as the remaining gap. The overwhelmingly common trigger, `:w`, is fully correct.
+**Done — `:wall`/`:wqa` pre-before-bytes (mutation-correct).** `:wall`/`:wqa` now route
+through the same `PreWrite` path as `:w`. Two pieces made it work:
+- **`aucmd_prepbuf`-class buffer scope** (`Editor::begin_write_scope`/`end_write_scope`): a
+  *lightweight* transient "make buffer B current" — swaps the focused window's buffer +
+  the editor cursor/top/leftcol, touching **no** alternate / jumplist / `"` mark /
+  home-layer, and restores exactly. The server wraps each pre-write's `BufWritePre` fire
+  in it, so a mutating handler (`vim.cmd` `%s`) targets the buffer being written even when
+  it isn't the user's current one. Restore happens before `run_pending`'s batch-boundary
+  `emit_lifecycle_events` diff, so no spurious `BufEnter`/`BufLeave` (net-zero swap).
+- **Unified quit gate**: every `PreWrite` carries a `seq` (shared with `PendingSave::seq`).
+  `commit_pre_write` returns a `CommitOutcome` (`Committed(seq)` / `Failed(seq)` /
+  `Deferred`); the server advances (or cancels) the `:wqa` `PendingQuitAll` gate on it —
+  a synchronous commit or an off-tick ack, uniformly. The `:qa` replay is deferred to
+  `run_pending`'s tail (via `quit_all_replay`) since the gate may empty mid-fixpoint.
+  `drain_pending_quit_all` moved *into* the loop (before `drain_pre_writes`) so a sync
+  commit advances a live gate. Local `:wqa` no longer quits inline — it waits for the
+  batch, exactly as the off-tick path always did.
+
+Residual (documented, not a regression): an *async* `BufWritePre` handler on a *non-current*
+`:wall` buffer runs its promise's `:next` mutation out-of-scope (the buffer can't stay
+current across ticks), so that async mutation targets the current buffer. Sync `:wall`
+mutation and async `:w` mutation are both correct; neovim supports neither async case.
 
 **Not a bug — a syntax mismatch (learning recorded in CLAUDE.md):** `'regexsyntax'`
 defaults to **PCRE**, so `%s/\s\+$//` does not trim trailing whitespace — `\+` is a

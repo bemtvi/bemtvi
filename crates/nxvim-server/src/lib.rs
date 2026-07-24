@@ -1203,6 +1203,11 @@ pub struct EditHost {
     /// the parked [`PreWrite`]. Kept on the loop's break condition so a settle that lands
     /// mid-convergence commits and fires `BufWritePost` in the same pass.
     au_gate_done: Vec<u64>,
+    /// A `:wqa` / `:xa` whose write batch has fully completed and now wants its `:qa`
+    /// replayed (`Some(bang)`), deferred to `run_pending`'s tail rather than run where the
+    /// gate is advanced — which may be mid-fixpoint (a synchronous commit) where a nested
+    /// `run_command("qa")` shouldn't run. Set by `advance_quit_all_gate`, taken at the tail.
+    quit_all_replay: Option<bool>,
     /// The picker preview pane's read cache (Phase 3): the file last read for the
     /// preview, so moving the selection within the results — or simply re-projecting
     /// every frame — re-reads only when the selected row's target *path* changes.
@@ -1513,6 +1518,7 @@ impl EditHost {
             pending_gated_writes: HashMap::new(),
             next_gate_id: 0,
             au_gate_done: Vec::new(),
+            quit_all_replay: None,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
             preview_scroll: 0,

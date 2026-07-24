@@ -302,6 +302,33 @@ async fn offtick_async_bufwritepre_settles_before_the_wire_write() {
     await_daemon_content(&fake, "/virtual/n.txt", "HELLO\n").await;
 }
 
+/// Over the wire, `:wall` fires each buffer's `BufWritePre` before its bytes — with that
+/// buffer made current — so a mutating handler targets the *right* buffer even though
+/// only one is current. Both daemon files receive their own mutated bytes.
+#[tokio::test]
+async fn offtick_wall_fires_bufwritepre_per_buffer() {
+    let dir = temp_dir("daemon_wall_pre");
+    let fake = DaemonFs::with_files(&[("/virtual/a.txt", "aaa\n"), ("/virtual/b.txt", "bbb\n")]);
+    let mut init = config_init(
+        &dir,
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function() vim.cmd([[%s/$/X/]]) end })\n",
+    );
+    init.file = Some("/virtual/a.txt".to_string());
+    let (rpc, _incoming) = spawn_with_daemon_fs_init(fake.clone(), init).await;
+    await_lines(&rpc, &["aaa"]).await;
+    // Dirty a, open + dirty b (leaving b current), then write all.
+    feed(&rpc, "A1<Esc>");
+    feed(&rpc, ":edit /virtual/b.txt<CR>");
+    await_lines(&rpc, &["bbb"]).await;
+    feed(&rpc, "A2<Esc>");
+    feed(&rpc, ":wall<CR>");
+    // Each file crosses the wire with its own buffer's `BufWritePre` mutation — so the
+    // non-current buffer (a) was made current for its fire, not left targeting b.
+    await_daemon_content(&fake, "/virtual/a.txt", "aaa1X\n").await;
+    await_daemon_content(&fake, "/virtual/b.txt", "bbb2X\n").await;
+}
+
 /// `:wq` defers its quit until the write acks, then exits — and the daemon has the
 /// bytes (so the quit really did wait for the save to land, not race ahead of it).
 #[tokio::test]

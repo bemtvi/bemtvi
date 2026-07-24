@@ -882,6 +882,15 @@ impl Editor {
     /// Whether `id` is a **new file** — a file-backed buffer (it has a path) whose file
     /// did not exist on disk when it was opened (no disk snapshot). The server fires
     /// `BufNewFile` instead of `BufReadPost` for these, matching `vim file-that-does-not-exist`.
+    /// Buffer `id`'s effective `'fileencoding'` as its vim-style label (`"utf-8"`,
+    /// `"latin1"`, `"utf-16le"`, …) — what the statusline and `:set fenc?` show. The
+    /// server diffs this per buffer to fire `EncodingChanged` when it changes. `None`
+    /// for a gone buffer.
+    pub fn buffer_fileencoding(&self, id: BufferId) -> Option<String> {
+        self.buffer_of(id)
+            .map(|b| b.options.fileencoding.to_string())
+    }
+
     /// A scratch / `[No Name]` buffer (no path) is not a new file; nor is one read from an
     /// existing file (it has a disk snapshot).
     pub fn buffer_is_new_file(&self, id: BufferId) -> bool {

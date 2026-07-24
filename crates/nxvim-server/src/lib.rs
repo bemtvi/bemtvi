@@ -1003,10 +1003,24 @@ pub struct EditHost {
     /// file → a directory), which keeps the same buffer id and so stays "announced".
     /// That re-fire is what installs the explorer / quickfix buffer-local maps.
     fired_filetype: HashMap<BufferId, Option<String>>,
-    /// Every buffer id present at the last lifecycle diff. Ids gone since (a
-    /// `:bdelete` / `nvim_buf_delete`) have their Lua-side buffer-local state
+    /// Each buffer's `'fileencoding'` label as of the last lifecycle diff. Diffed to
+    /// fire `EncodingChanged` (neovim alias `FileEncoding`) when a buffer's encoding
+    /// is changed *in place* (`:set fileencoding=…`). A (re)read — opening the file or
+    /// an `:e ++enc=…` reload — clears the entry so the next diff reseeds the baseline
+    /// silently: reading a file at its detected encoding is not a *change* (like
+    /// neovim, whose global `encoding` stays fixed, which fires nothing on read).
+    fired_encoding: HashMap<BufferId, String>,
+    /// Every buffer id present at the last lifecycle diff. Ids added since fire
+    /// `BufAdd` (neovim alias `BufCreate`); ids gone since (a `:bdelete` /
+    /// `nvim_buf_delete`) fire `BufDelete` and have their Lua-side buffer-local state
     /// (commands, keymaps) purged so a reused bufnr can't inherit it.
     known_buffers: Vec<BufferId>,
+    /// Set once the startup buffer baseline (`known_buffers`) has been seeded — after
+    /// config sourcing and any session/view restore. Until then `BufAdd` is suppressed
+    /// so a config-time `emit_lifecycle_events` doesn't fire it for the startup buffer
+    /// (which is baseline, not newly added — the buffer twin of `WinNew`/`TabNew`
+    /// skipping the initial window/tab).
+    startup_bufs_seeded: bool,
     /// The editor mode at the last lifecycle diff. A transition *into* insert
     /// (from a non-insert mode) fires `InsertEnter`; tracked here so the per-key
     /// diff can spot the edge without touching the core's insert chokepoints.
@@ -1405,7 +1419,9 @@ impl EditHost {
             last_buffer_id: None,
             announced: HashSet::new(),
             fired_filetype: HashMap::new(),
+            fired_encoding: HashMap::new(),
             known_buffers: Vec::new(),
+            startup_bufs_seeded: false,
             last_mode: Mode::Normal,
             last_window_id: None,
             known_windows: Vec::new(),
@@ -1522,6 +1538,7 @@ impl EditHost {
         self.last_window_rects = Some(self.window_rects_snapshot());
         self.known_tabs = self.editor.tab_ids();
         self.known_buffers = self.editor.buffer_ids();
+        self.startup_bufs_seeded = true;
     }
 
     /// Serverless startup, phase 2: fire the startup lifecycle events and mark
@@ -2017,6 +2034,9 @@ impl EditHost {
         self.apply_pending_replica_edit(buffer);
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
+        // The landed bytes re-detect the encoding; drop the baseline so the post-load
+        // emit re-seeds it silently instead of firing `EncodingChanged` for the read.
+        self.fired_encoding.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
@@ -3518,8 +3538,10 @@ where
     // still fires the first `TabEnter`/`TabLeave` pair.
     host.known_tabs = host.editor.tab_ids();
     // Seed the buffer set too, so the startup buffer isn't seen as "newly gone"
-    // and a never-deleted buffer never triggers a spurious cleanup.
+    // and a never-deleted buffer never triggers a spurious cleanup. Arm `BufAdd`
+    // from here on: the startup buffer is now baseline, so only later additions fire.
     host.known_buffers = host.editor.buffer_ids();
+    host.startup_bufs_seeded = true;
     host.emit_lifecycle_events();
     host.run_pending();
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a

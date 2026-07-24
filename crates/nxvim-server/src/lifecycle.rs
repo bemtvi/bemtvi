@@ -120,6 +120,8 @@ impl EditHost {
         self.apply_pending_replica_edit(buffer);
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
+        // A fresh read re-seeds the encoding baseline silently (no `EncodingChanged`).
+        self.fired_encoding.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
@@ -164,6 +166,8 @@ impl EditHost {
             .set_buffer_option_str(buffer, "filetype", "nxdir");
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
+        // A fresh read re-seeds the encoding baseline silently (no `EncodingChanged`).
+        self.fired_encoding.remove(&buffer);
         let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "nxdir");
         self.push_buf_mirror();
         self.emit_lifecycle_events();
@@ -312,6 +316,9 @@ impl EditHost {
         for buf in self.editor.take_loaded_in_place() {
             self.announced.remove(&buf);
             self.fired_filetype.remove(&buf);
+            // A re-read re-detects the encoding; drop the baseline so it re-seeds
+            // silently rather than firing `EncodingChanged` for the fresh read.
+            self.fired_encoding.remove(&buf);
         }
 
         let buf = self.editor.current_buffer_id();
@@ -346,6 +353,13 @@ impl EditHost {
         // `announced` (which gates the once-only `BufReadPost`).
         let cur_ft = self.editor.buffer_filetype(buf);
         let ft_changed = self.fired_filetype.get(&buf) != Some(&cur_ft);
+        // `EncodingChanged` (alias `FileEncoding`) fires when the current buffer's
+        // `'fileencoding'` *changes* — but NOT on the first sighting: opening a file
+        // at its detected encoding is not a change (neovim's global `encoding` stays
+        // fixed, so it fires nothing there either). So `enc_changed` requires a prior
+        // recorded value that differs; the baseline is seeded silently below.
+        let cur_enc = self.editor.buffer_fileencoding(buf).unwrap_or_default();
+        let enc_changed = matches!(self.fired_encoding.get(&buf), Some(prev) if prev != &cur_enc);
         let entered = self.last_buffer_id != Some(buf);
         // A transition *into* insert (or replace — neovim fires InsertEnter for
         // both), measured against the last diff so staying in insert won't re-fire.
@@ -469,6 +483,18 @@ impl EditHost {
             .copied()
             .filter(|b| !live_bufs.contains(b))
             .collect();
+        // Buffers added to the list since the last emit fire `BufAdd` (neovim alias
+        // `BufCreate`) — the symmetric twin of `closed_bufs`/`BufDelete`. The fire is
+        // gated on `startup_bufs_seeded` below so the startup buffer never fires it
+        // (like `WinNew`/`TabNew` skip the initial window/tab); only buffers created
+        // *after* startup do. A file open into a fresh bufnr fires `BufAdd` before its
+        // `BufReadPost`; a `:e` that reuses the throwaway `[No Name]` id fires no
+        // `BufAdd` (no new id).
+        let new_bufs: Vec<BufferId> = live_bufs
+            .iter()
+            .copied()
+            .filter(|b| !self.known_buffers.contains(b))
+            .collect();
 
         let cur_tab = self.editor.current_tab_id();
         let tabs = self.editor.tab_ids();
@@ -487,6 +513,8 @@ impl EditHost {
 
         if !unannounced
             && !ft_changed
+            && !enc_changed
+            && new_bufs.is_empty()
             && !entered
             && !entered_insert
             && !left_insert
@@ -546,6 +574,24 @@ impl EditHost {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let file_backed = !name.is_empty();
 
+        // ----- BufAdd: a buffer newly added to the list -----
+        // Fires before the buffer's `BufReadPost` (a file open into a fresh bufnr
+        // adds the buffer, then reads it), matching neovim's order. Each fires with
+        // its *own* name/context, not the current buffer's, so a `:badd file` that
+        // adds without entering still carries the added buffer as `<afile>`.
+        // Gated on the startup baseline having been seeded: config sourcing can
+        // trigger an early `emit_lifecycle_events` (a `run_pending` at the end of a
+        // config that queued work) *before* `known_buffers` is seeded, which would
+        // otherwise see the startup buffer as "new" and fire a spurious `BufAdd` for
+        // it. The seed (post-config, after any session/view restore churn — hence it
+        // can't move earlier) sets `startup_bufs_seeded`, so only buffers added after
+        // startup fire `BufAdd`, matching how `WinNew`/`TabNew` skip the initial ones.
+        if self.startup_bufs_seeded {
+            for b in &new_bufs {
+                self.fire_buf_add(*b);
+            }
+        }
+
         // Fire-once per buffer (gated by `announced`): file-backed only, a
         // `[No Name]`/scratch buffer was never read. A buffer whose file does not
         // exist on disk fires `BufNewFile` *instead of* `BufReadPost` (matching
@@ -576,6 +622,18 @@ impl EditHost {
                 self.fire_lifecycle("FileType", ft, buf, &name);
             }
             self.fired_filetype.insert(buf, cur_ft);
+        }
+
+        // `EncodingChanged` (alias `FileEncoding`) on a real change to the current
+        // buffer's `'fileencoding'`; the first sighting only seeds the baseline (no
+        // fire). The `<amatch>` is the new encoding label, like neovim. Held back for
+        // a pending open (the encoding isn't final until the bytes land), then seeded
+        // silently when they do — so opening a file at its own encoding fires nothing.
+        if !pending_open {
+            if enc_changed {
+                self.fire_lifecycle("EncodingChanged", &cur_enc, buf, &name);
+            }
+            self.fired_encoding.insert(buf, cur_enc);
         }
 
         // Fire-every on entry: `BufLeave` for the buffer we're leaving, then
@@ -743,6 +801,7 @@ impl EditHost {
             }
             self.announced.remove(b);
             self.fired_filetype.remove(b);
+            self.fired_encoding.remove(b);
         }
         self.known_buffers = live_bufs;
 
@@ -1200,6 +1259,21 @@ impl EditHost {
             .lua
             .fire_autocmd_buf("BufWinEnter", &name, buf.0, &name);
         self.report_autocmd_err("BufWinEnter", r);
+        self.apply_lua_effects();
+    }
+
+    /// Fire `BufAdd` (neovim alias `BufCreate`) for a buffer just added to the list.
+    /// Uses the added buffer's own name / filetype as context (`<afile>`), so a
+    /// `:badd` that never enters the buffer still carries it — mirroring
+    /// [`fire_buf_win_enter`](Self::fire_buf_win_enter). A `[No Name]` buffer fires it
+    /// with an empty name, matching neovim (`BufAdd` fires for scratch buffers too).
+    pub(crate) fn fire_buf_add(&mut self, buf: BufferId) {
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
+        let _ = self.lua.set_buf_snapshot(buf.0, &name, &ft);
+        self.push_buf_mirror();
+        let r = self.lua.fire_autocmd_buf("BufAdd", &name, buf.0, &name);
+        self.report_autocmd_err("BufAdd", r);
         self.apply_lua_effects();
     }
 

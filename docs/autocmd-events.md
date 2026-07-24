@@ -20,13 +20,14 @@ exact compare — so a `FileType rust` autocmd never glob-matches a path.
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
+| `BufAdd` | A buffer is added to the buffer list — before its `BufReadPost` (a file open into a fresh buffer adds it, then reads it). | Fires with the *added* buffer as `<afile>` (`buf` / `file`), so a `:badd` that never enters the buffer still carries it. The startup buffer never fires it (it is the baseline, like `WinNew`/`TabNew` skip the initial window/tab); only buffers created **after** startup do. `BufCreate` is an accepted alias (see [Event aliases](#event-aliases)). |
 | `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). `buf` / `file` set. `BufRead` is an accepted alias (see [Event aliases](#event-aliases)). |
 | `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
 | `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. |
 | `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. |
 | `BufDelete` | Just before a buffer is deleted (`:bdelete`), while its state still exists. | `buf` / `file` set. |
 
-Ordering on opening a file is `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter`.
+Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter`.
 
 ## Writing
 
@@ -82,6 +83,7 @@ no autocmd listens for them they cost nothing.
 | `FileChangedShell` | A loaded file changed on disk (the watch/`checktime` reconcile). | A handler may set `vim.v.fcs_choice` to `"reload"` / `"edit"` / `"ask"`. |
 | `FileChangedShellPost` | After the file-change reconcile completes. | |
 | `DirChanged` | The working directory changes (`:cd` / `:lcd` / `:tcd`). | `file` is the new cwd; `match` is the scope. |
+| `EncodingChanged` | The current buffer's `'fileencoding'` is changed in place (`:set fileencoding=…`). | `match` is the new encoding label (e.g. `"latin1"`); `buf` / `file` set. **Reading** a file (opening it, or an `:e ++enc=…` reload) only (re)seeds the baseline from the detected encoding — that is not a *change*, so it fires nothing (neovim, whose global `encoding` is fixed, likewise fires nothing on read). `FileEncoding` is an accepted alias (see [Event aliases](#event-aliases)). |
 | `ColorScheme` | A colorscheme finishes loading. | `match` is the colorscheme name. This is what colorscheme plugins hook. |
 
 ## Startup
@@ -112,8 +114,9 @@ the canonical name. Aliases are accepted anywhere an event name is (`create`,
 | --- | --- |
 | `BufRead` | `BufReadPost` |
 | `BufWrite` | `BufWritePre` |
+| `BufCreate` | `BufAdd` |
+| `FileEncoding` | `EncodingChanged` |
 
-Only aliases whose target nxvim actually emits are supported; neovim's
-`BufCreate` (→ `BufAdd`) and `FileEncoding` (→ `EncodingChanged`) are omitted
-because those target events don't fire here yet (a "no silent no-ops" choice —
-registering on an unsupported name is better left visible than quietly accepted).
+Every alias's target event is one nxvim actually emits — registering on an alias
+whose target never fired would be a silent no-op, so we don't add one until the
+target exists.

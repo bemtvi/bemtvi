@@ -65,12 +65,12 @@ end
 -- or clearing by an alias behaves exactly as if the canonical name were used, so a
 -- config that does `autocmd BufRead` (muscle memory for `BufReadPost`) still fires.
 -- Limited to aliases whose target nxvim emits — an alias pointing at an unemitted
--- event would just be a silent no-op, so we don't pretend to support it. (neovim's
--- `BufCreate`→`BufAdd` and `FileEncoding`→`EncodingChanged` are omitted for that
--- reason; add them here if/when those events start firing.)
+-- event would just be a silent no-op, so we don't pretend to support it.
 local EVENT_ALIASES = {
   BufRead = "BufReadPost",
   BufWrite = "BufWritePre",
+  BufCreate = "BufAdd",
+  FileEncoding = "EncodingChanged",
 }
 
 -- Canonicalize an event name (string) or list of names: each alias maps to its
@@ -247,7 +247,8 @@ end
 -- `"BufEnter"`, …) or a list of names to share one handler — see the
 -- [autocommand events](../plugins/autocmd-events.md) reference for the events
 -- nxvim emits and what each carries. neovim aliases (`"BufRead"` -> `BufReadPost`,
--- `"BufWrite"` -> `BufWritePre`) are accepted and canonicalized to the real event.
+-- `"BufWrite"` -> `BufWritePre`, `"BufCreate"` -> `BufAdd`, `"FileEncoding"` ->
+-- `EncodingChanged`) are accepted and canonicalized to the real event.
 --
 -- `opts` fields:
 --   * `callback` — a function run when the event fires; OR `command` — an

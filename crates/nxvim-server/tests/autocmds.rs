@@ -352,6 +352,118 @@ async fn exec_autocmds_accepts_event_alias() {
 }
 
 #[tokio::test]
+async fn bufadd_fires_for_a_buffer_added_after_startup() {
+    // `BufAdd` fires when a buffer is added to the list, before its `BufReadPost`,
+    // with the added buffer as `<afile>`. The startup buffer's id is pre-seeded, so
+    // it fires *only* for the second file opened here — not the first — mirroring
+    // how `WinNew`/`TabNew` skip the initial window/tab.
+    let dir = temp_dir("au_bufadd");
+    let first = dir.join("first.rs");
+    let second = dir.join("second.rs");
+    std::fs::write(&first, "fn a() {}\n").expect("write first");
+    std::fs::write(&second, "fn b() {}\n").expect("write second");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        first.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufAdd', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = a.event .. ':' .. a.file end })\n",
+    )
+    .await;
+    command(&rpc, &format!("e {}", second.display())).await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, '|'))").await;
+    assert_eq!(msg, format!("BufAdd:{}", second.display()));
+}
+
+#[tokio::test]
+async fn bufcreate_alias_fires_as_bufadd() {
+    // `BufCreate` is neovim's alias for `BufAdd`; a handler registered on it fires
+    // on the add, reported under the canonical name.
+    let dir = temp_dir("au_bufcreate_alias");
+    let first = dir.join("first.rs");
+    let second = dir.join("second.rs");
+    std::fs::write(&first, "fn a() {}\n").expect("write first");
+    std::fs::write(&second, "fn b() {}\n").expect("write second");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        first.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufCreate', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = a.event end })\n",
+    )
+    .await;
+    command(&rpc, &format!("e {}", second.display())).await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "BufAdd");
+}
+
+#[tokio::test]
+async fn encodingchanged_fires_on_fileencoding_change() {
+    // Changing the current buffer's `'fileencoding'` fires `EncodingChanged`, whose
+    // `<amatch>` is the new encoding label. Opening the file at utf-8 only seeds the
+    // baseline (see the next test), so the single log entry is the latin1 change.
+    let dir = temp_dir("au_encchange");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('EncodingChanged', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = a.event .. ':' .. a.match end })\n",
+    )
+    .await;
+    command(&rpc, "set fileencoding=latin1").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, '|'))").await;
+    assert_eq!(msg, "EncodingChanged:latin1");
+}
+
+#[tokio::test]
+async fn opening_a_file_does_not_fire_encodingchanged() {
+    // A file opened at its detected encoding is not a *change* — the baseline is
+    // seeded silently, so `EncodingChanged` fires nothing on open (neovim, whose
+    // global `encoding` is fixed, fires nothing there either).
+    let dir = temp_dir("au_enc_noopen");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('EncodingChanged', {\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'fired' end })\n",
+    )
+    .await;
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "print('[' .. table.concat(_G.log, ',') .. ']')",
+    )
+    .await;
+    assert_eq!(msg, "[]");
+}
+
+#[tokio::test]
+async fn fileencoding_alias_fires_as_encodingchanged() {
+    // `FileEncoding` is neovim's deprecated alias for `EncodingChanged`; a handler
+    // on it fires on the change, reported under the canonical name.
+    let dir = temp_dir("au_fenc_alias");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('FileEncoding', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = a.event end })\n",
+    )
+    .await;
+    command(&rpc, "set fileencoding=latin1").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "EncodingChanged");
+}
+
+#[tokio::test]
 async fn switching_buffers_fires_bufenter_but_not_refire_filetype() {
     // Opening a second file announces it (FileType fires once); switching back to
     // the first, already-announced buffer fires BufEnter only — no FileType re-fire.

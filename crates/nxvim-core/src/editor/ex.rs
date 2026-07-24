@@ -334,6 +334,41 @@ fn apply_file_mods(fname: &str, mods: &[char]) -> String {
     fname
 }
 
+/// Parse the leading `++opt` read options of an `:edit` argument, returning
+/// `(forced_encoding, rest)` where `rest` is the remaining file argument (trimmed).
+///
+/// The only option supported is `++enc=<encoding>` / `++encoding=<encoding>` — vim's
+/// forced-encoding read option, which decodes the file with `<encoding>` instead of
+/// running `'fileencodings'` detection. `<encoding>` is validated against the same
+/// label set `:set fileencoding=` accepts ([`crate::encoding::Encoding::from_label`], so
+/// the `replacement` codec and the `ucs-bom` detection pseudo-entry are rejected too); an
+/// unknown option name or encoding is a loud `E474`. As in vim the options must precede
+/// the filename (`:e ++enc=shift_jis file`), so parsing stops at the first non-`++` token.
+fn parse_edit_plusplus(args: &str) -> Result<(Option<String>, String), String> {
+    let mut enc: Option<String> = None;
+    let mut rest = args.trim_start();
+    while let Some(after) = rest.strip_prefix("++") {
+        let (tok, tail) = match after.find(char::is_whitespace) {
+            Some(i) => (&after[..i], after[i..].trim_start()),
+            None => (after, ""),
+        };
+        let (key, val) = tok
+            .split_once('=')
+            .ok_or_else(|| format!("E474: Invalid argument: ++{tok}"))?;
+        match key {
+            "enc" | "encoding" => {
+                if crate::encoding::Encoding::from_label(val).is_none() {
+                    return Err(format!("E474: Invalid argument: ++enc={val}"));
+                }
+                enc = Some(val.to_string());
+            }
+            _ => return Err(format!("E474: Invalid argument: ++{tok}")),
+        }
+        rest = tail;
+    }
+    Ok((enc, rest.trim().to_string()))
+}
+
 /// Trim an ex-command argument string: drop all leading ASCII whitespace, and
 /// drop trailing ASCII whitespace *unless the last whitespace char is escaped by
 /// an odd number of preceding backslashes* (a `\ `-protected trailing space, which
@@ -2727,7 +2762,45 @@ impl Editor {
         self.ex_edit(path, false);
     }
 
+    /// `:e[dit][!] [++enc=<encoding>] [file]` — parse any leading `++opt` read options
+    /// (currently just `++enc`/`++encoding`, vim's forced-encoding read option) off the
+    /// front, then hand the remaining file argument to [`ex_edit_file`](Self::ex_edit_file)
+    /// with the forced encoding armed for that one read.
+    ///
+    /// `:e ++enc=<encoding>` with no filename re-edits the *current* file — the
+    /// "I opened this and it decoded wrong" fix, forcing a specific encoding instead of
+    /// reordering `'fileencodings'`. A bogus encoding fails loud (`E474`).
     fn ex_edit(&mut self, args: &str, bang: bool) {
+        let (forced_enc, file) = match parse_edit_plusplus(args) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.echo(e);
+                return;
+            }
+        };
+
+        // An empty filename after the options re-edits the current file when an encoding
+        // was forced (`:e ++enc=…`); with no options at all it's the usual E32.
+        let file = if file.is_empty() && forced_enc.is_some() {
+            match self.current_file_name() {
+                Some(name) => name,
+                None => {
+                    self.echo("E32: No file name");
+                    return;
+                }
+            }
+        } else {
+            file
+        };
+
+        // Arm the override for the reads `ex_edit_file` drives (synchronous, or copied
+        // onto a deferred `PendingOpen`), then clear it so no later read inherits it.
+        self.forced_read_encoding = forced_enc;
+        self.ex_edit_file(&file, bang);
+        self.forced_read_encoding = None;
+    }
+
+    fn ex_edit_file(&mut self, args: &str, bang: bool) {
         if args.is_empty() {
             self.echo("E32: No file name");
             return;

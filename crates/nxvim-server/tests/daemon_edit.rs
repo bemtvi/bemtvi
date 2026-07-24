@@ -224,6 +224,50 @@ async fn nonutf8_file_decodes_over_the_wire_like_local() {
     );
 }
 
+/// `:e ++enc=<encoding>` forces the decode of a **remote** file too. The decode runs
+/// core-side (`load_bytes_into`) on the bytes the daemon ships, so the forced encoding
+/// only has to reach that call — it rides the deferred open through the edit-host's
+/// in-flight-fetch bookkeeping (`forced_fetch_enc`). A Shift_JIS file mis-detects as
+/// latin1 under the default `'fileencodings'`; `:e ++enc=shift_jis` over the wire fixes
+/// it to 日本語 with `fileencoding=shift_jis`, exactly as the local `encoding` suite proves.
+#[tokio::test]
+async fn edit_plusplus_enc_forces_the_decode_over_the_wire() {
+    let fake = DaemonFs::default();
+    fake.set_bytes("/virtual/sjis.txt", b"\x93\xfa\x96\x7b\x8c\xea\n"); // 日本語\n in Shift_JIS
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/sjis.txt").await;
+
+    // Wait for the initial (default-detected) open to land over the wire...
+    for _ in 0..100 {
+        let l = buf_lines(&rpc, 0).await;
+        if !l.is_empty() && l != vec![""] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // ...which mis-decodes it as latin1 — NOT the Japanese text.
+    assert_ne!(
+        buf_lines(&rpc, 0).await,
+        vec!["日本語"],
+        "default 'fileencodings' detection should garble the shift_jis file"
+    );
+
+    // Force the decode over the wire (the current file, so an explicit path reloads it).
+    feed(&rpc, ":edit ++enc=shift_jis /virtual/sjis.txt<CR>");
+    assert_eq!(
+        await_lines(&rpc, &["日本語"]).await,
+        vec!["日本語"],
+        "++enc must force the shift_jis decode of the remote file over the wire"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.fileencoding")
+            .await
+            .as_str()
+            .unwrap_or_default(),
+        "shift_jis",
+        "the forced encoding is recorded on the remote replica, so `:w` round-trips it"
+    );
+}
+
 /// `:e /virtual/fresh.txt` on a path the daemon doesn't have opens an empty new-file
 /// buffer (not an error), with its name bound for a later `:w`.
 #[tokio::test]

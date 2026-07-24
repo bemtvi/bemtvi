@@ -76,6 +76,11 @@ pub struct PendingOpen {
     pub buffer: BufferId,
     /// The file to fetch — the `:edit {path}` argument (or the reloaded buffer's path).
     pub path: PathBuf,
+    /// A `:e ++enc=<encoding>` override to decode this read with, bypassing
+    /// `'fileencodings'` detection. `None` for an ordinary open. Carried here because a
+    /// deferred open is filled on a later tick, after the editor's transient
+    /// [`forced_read_encoding`](super::Editor) field has been cleared.
+    pub force_encoding: Option<String>,
 }
 
 /// Why a file-backed buffer's on-disk state changed, as reported to a
@@ -720,11 +725,20 @@ impl Editor {
     /// echoed, leaving the (empty) buffer in place. A no-op if the buffer was closed
     /// before the drain.
     pub fn load_pending_open(&mut self, open: PendingOpen) {
-        let PendingOpen { buffer, path } = open;
+        let PendingOpen {
+            buffer,
+            path,
+            force_encoding,
+        } = open;
         if !self.buffers.map.contains_key(&buffer) {
             return;
         }
-        match self.read_buffer(&path) {
+        // Restore a `:e ++enc=` override for this one read (the transient field was
+        // cleared when `ex_edit` returned), then drop it so no later read inherits it.
+        self.forced_read_encoding = force_encoding;
+        let read = self.read_buffer(&path);
+        self.forced_read_encoding = None;
+        match read {
             Ok(buf) => {
                 let ob = self.buffers.get_mut(buffer);
                 ob.buffer = buf;
@@ -966,7 +980,17 @@ impl Editor {
             }
             return;
         }
-        self.pending_opens.push(PendingOpen { buffer, path });
+        // Carry any `:e ++enc=` override onto the deferred open: it is filled on a later
+        // tick (once the BufReadCmd fire declines / the fetch lands), after `ex_edit` has
+        // cleared the transient field. `.clone()` (not `.take()`) so a single `ex_edit`
+        // that enqueues more than one read still forces each; `ex_edit` clears the field
+        // when it returns. Ordinary opens (no `++enc`) carry `None`.
+        let force_encoding = self.forced_read_encoding.clone();
+        self.pending_opens.push(PendingOpen {
+            buffer,
+            path,
+            force_encoding,
+        });
     }
 
     /// Load `contents` into `buffer` as a freshly-read replica of the file named
@@ -1030,8 +1054,26 @@ impl Editor {
     /// fetch landed. `load_str_into` is kept for genuinely-already-text callers (scratch
     /// buffers, in-editor swaps).
     pub fn load_bytes_into(&mut self, buffer: BufferId, name: Option<String>, bytes: &[u8]) {
-        let (text, fileencoding, bomb) =
-            crate::encoding::decode_to_rope(bytes, &self.options.fileencodings);
+        self.load_bytes_into_enc(buffer, name, bytes, None);
+    }
+
+    /// [`load_bytes_into`](Self::load_bytes_into) with a `:e ++enc=<encoding>` override:
+    /// when `force_enc` is `Some`, that single encoding is used *in place of*
+    /// `'fileencodings'` for the decode (still with the built-in latin1 terminal fallback,
+    /// so a wrong guess never errors), and `'fileencoding'` records it for `:w`. This is
+    /// the off-tick (daemon / wasm) counterpart of the synchronous
+    /// [`read_buffer`](Self::read_buffer) override — the server threads the forced encoding
+    /// from the deferred [`PendingOpen`] through its in-flight-fetch bookkeeping to here,
+    /// so `++enc` works identically on a remote file. `None` is the ordinary read.
+    pub fn load_bytes_into_enc(
+        &mut self,
+        buffer: BufferId,
+        name: Option<String>,
+        bytes: &[u8],
+        force_enc: Option<&str>,
+    ) {
+        let fileencodings = force_enc.unwrap_or(&self.options.fileencodings);
+        let (text, fileencoding, bomb) = crate::encoding::decode_to_rope(bytes, fileencodings);
         self.load_str_into(buffer, name, &text);
         // `load_str_into` no-ops on a closed buffer; mirror its guard before stamping
         // the encoding so a late fetch onto a gone buffer doesn't panic.
@@ -1204,12 +1246,21 @@ impl Editor {
     /// on, otherwise as ordinary text ([`Buffer::from_file`]). The shared local-FS
     /// load seam every synchronous open path funnels through. (Off-tick / daemon
     /// opens fetch over the wire and don't preview yet.)
+    ///
+    /// When a `:e ++enc=<encoding>` set [`forced_read_encoding`](super::Editor), that
+    /// single encoding is used *in place of* `'fileencodings'` — so the decode is forced
+    /// (still with the built-in latin1 terminal fallback, so a wrong guess never errors)
+    /// and `'fileencoding'` records the forced value for `:w`.
     fn read_buffer(&self, path: &Path) -> anyhow::Result<Buffer> {
         let fs = self.host_fs.clone();
         if self.options.imagepreview && super::is_image_path(Some(path)) {
             Buffer::from_image_file(path, &*fs)
         } else {
-            Buffer::from_file(path, &*fs, &self.options.fileencodings)
+            let fileencodings = self
+                .forced_read_encoding
+                .as_deref()
+                .unwrap_or(&self.options.fileencodings);
+            Buffer::from_file(path, &*fs, fileencodings)
         }
     }
 

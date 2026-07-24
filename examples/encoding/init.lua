@@ -60,6 +60,22 @@
 -- `:w` reproduces the original multibyte sequences byte-for-byte. vim's muscle-memory
 -- codepage spellings work as aliases — `cp932` (Shift_JIS), `cp936`/`euc-cn` (GBK),
 -- `cp949` (EUC-KR), `cp950` (Big5) — and read back as their canonical names.
+--
+-- Forcing the encoding for ONE read — `:e ++enc=<encoding>`. Reordering
+-- `'fileencodings'` before every open is fiddly, and it doesn't help once a file is
+-- already open and garbled (the default detection landed on latin1). `:e ++enc=` reloads
+-- a file decoding it with an explicit encoding, bypassing detection entirely:
+--
+--     :e shift_jis.txt         -- opens garbled (mis-detected as latin1)
+--     :e ++enc=shift_jis       -- reload the CURRENT file forced as Shift_JIS → fixed
+--
+-- With no filename it re-edits the current file (the exact "I opened this and it's
+-- garbled" fix); with a filename it opens that file forced:
+--
+--     :e ++enc=cp932 shift_jis.txt   -- open a named file forced (cp932 → shift_jis)
+--
+-- The forced encoding is recorded as `'fileencoding'`, so a following `:w` writes the
+-- file back in that same encoding. A bogus `++enc=` value fails loud with `E474`.
 
 -- Nothing to configure here — the defaults already do the right thing. This block
 -- just makes the active detection list visible at startup.

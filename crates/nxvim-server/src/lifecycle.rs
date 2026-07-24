@@ -62,6 +62,8 @@ impl EditHost {
             Ok(FsRead::Dir { path: dir, entries }) => {
                 // A reload can't resolve to a directory; drop a stale post marker.
                 self.reload_posts.remove(&buffer);
+                // A directory has no text encoding; drop any stashed `++enc` override.
+                self.forced_fetch_enc.remove(&buffer);
                 // A workspace edit never targets a directory; drop any stranded stash.
                 self.pending_replica_edits.remove(&buffer);
                 self.load_dir_listing(buffer, dir, entries);
@@ -71,6 +73,8 @@ impl EditHost {
                 // so no FileChangedShellPost (the buffer is untouched). A workspace edit
                 // that was waiting on this file can't apply — drop its stash and report.
                 self.reload_posts.remove(&buffer);
+                // The forced-encoding reload never landed; drop its stash too.
+                self.forced_fetch_enc.remove(&buffer);
                 if self.pending_replica_edits.remove(&buffer).is_some() {
                     self.editor.echo(format!(
                         "apply_workspace_edit: could not open {path} over the daemon: {e}"
@@ -108,8 +112,11 @@ impl EditHost {
         existed: bool,
         stat: Option<nxvim_core::FileStat>,
     ) {
+        // A `:e ++enc=` override the drain stashed for this in-flight fetch forces the
+        // decode; ordinary opens have no entry and decode through `'fileencodings'`.
+        let force_enc = self.forced_fetch_enc.remove(&buffer);
         self.editor
-            .load_bytes_into(buffer, Some(path.clone()), bytes);
+            .load_bytes_into_enc(buffer, Some(path.clone()), bytes, force_enc.as_deref());
         if existed {
             self.editor.mark_replica_read_from_disk(buffer, stat);
         }
@@ -282,6 +289,11 @@ impl EditHost {
             } else {
                 open.path.display().to_string()
             };
+            // A `:e ++enc=` override can't ride the async fetch (it lands keyed only by
+            // buffer); stash it so the landing decodes with the forced encoding.
+            if let Some(enc) = open.force_encoding {
+                self.forced_fetch_enc.insert(open.buffer, enc);
+            }
             self.fx.fs_fetch(open.buffer, path);
         }
     }

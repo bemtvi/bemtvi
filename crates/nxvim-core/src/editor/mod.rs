@@ -1571,6 +1571,15 @@ pub struct Editor {
     /// already-created (empty) buffer the server fills once the fetch lands. Always
     /// empty when off-tick mode is off.
     pending_opens: Vec<PendingOpen>,
+    /// The encoding a `:e ++enc=<encoding>` forces for the *next* read, overriding
+    /// `'fileencodings'` detection for that one open (vim's `++enc` read option). A
+    /// transient the [`ex_edit`](Editor::ex_edit) read path sets and clears within its
+    /// own dispatch: the synchronous read ([`read_buffer`](Editor::read_buffer))
+    /// consults it, and a *deferred* local open ([`enqueue_open`](Editor::enqueue_open))
+    /// copies it onto its [`PendingOpen`] so the later
+    /// [`load_pending_open`](Editor::load_pending_open) can restore it. `None` for every
+    /// ordinary read (autoreload, workspace edits, initial open).
+    forced_read_encoding: Option<String>,
     /// A jump target `(buffer, line, byte-col)` waiting for a **deferred** open to land
     /// — a located navigation (LSP go-to, a picker `<C-t>`/`<C-x>`, `:e +N`) onto a
     /// buffer whose content hasn't been read yet (every local open now defers behind the
@@ -1973,6 +1982,7 @@ impl Editor {
             pending_saves: Vec::new(),
             next_save_seq: 0,
             pending_opens: Vec::new(),
+            forced_read_encoding: None,
             pending_open_cursor: None,
             loaded_in_place: Vec::new(),
             pending_quit_all: None,

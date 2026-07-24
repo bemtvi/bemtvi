@@ -1231,6 +1231,16 @@ pub struct EditHost {
     /// remote reload can't be synchronous (it crosses the wire), so the post event is
     /// deferred to the fetch's completion rather than fired inline like the local path.
     reload_posts: HashSet<BufferId>,
+    /// A `:e ++enc=<encoding>` override for an **off-tick** open whose fetch is in flight,
+    /// keyed by the target buffer. A deferred [`PendingOpen`](nxvim_core::PendingOpen)
+    /// carries the forced encoding, but the remote read is async: the drain
+    /// ([`drain_pending_opens`](Self::drain_pending_opens)) fires the fetch and the bytes
+    /// land later in [`apply_open`](Self::apply_open) / the wasm read reply, keyed only by
+    /// buffer. This bridges that gap — the drain stashes the encoding here and the landing
+    /// (`load_replica_bytes` / `load_replica_wasm`) removes it and passes it to
+    /// [`Editor::load_bytes_into_enc`](nxvim_core::Editor), so `++enc` decodes a remote
+    /// file exactly as it does a local one. Empty for ordinary opens and local sessions.
+    forced_fetch_enc: HashMap<BufferId, String>,
     /// Per-terminal-buffer vt100 emulators, keyed by buffer id. Created when a
     /// `:terminal` opens, fed the child's raw PTY bytes (decoding escape sequences
     /// into a screen grid), and projected back into the buffer's mirrored lines +
@@ -1462,6 +1472,7 @@ impl EditHost {
             buf_watches: HashMap::new(),
             remote_watches: HashSet::new(),
             reload_posts: HashSet::new(),
+            forced_fetch_enc: HashMap::new(),
             terminals: HashMap::new(),
             terminal_frozen: HashMap::new(),
             dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
@@ -2019,8 +2030,11 @@ impl EditHost {
         existed: bool,
         stat: Option<FileStat>,
     ) {
+        // A `:e ++enc=` override the drain stashed for this in-flight OPFS/daemon fetch
+        // forces the decode; ordinary opens have no entry and use `'fileencodings'`.
+        let force_enc = self.forced_fetch_enc.remove(&buffer);
         self.editor
-            .load_bytes_into(buffer, Some(path.clone()), bytes);
+            .load_bytes_into_enc(buffer, Some(path.clone()), bytes, force_enc.as_deref());
         if existed {
             // Stamp the read-from-disk baseline so the read fires `BufReadPost`, not
             // `BufNewFile`. A *daemon* read carries the remote's real stat (threaded here from

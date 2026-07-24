@@ -565,6 +565,93 @@ async fn vim_cjk_aliases_resolve_to_canonical_names() {
     }
 }
 
+// ===== `:e ++enc=<encoding>` — one-shot forced-encoding reload =================
+//
+// Reordering `'fileencodings'` then reloading (the tests above) works but is
+// fiddly. `:e ++enc=<encoding>` forces a single read to decode with an explicit
+// encoding, bypassing detection entirely — vim's `++enc` read option. With no
+// filename it re-edits the *current* file (the "I opened this and it's garbled"
+// fix); with a filename it opens that file forced.
+
+#[tokio::test]
+async fn edit_plusplus_enc_reloads_current_file_in_forced_encoding() {
+    // The reported scenario: a Shift_JIS file opened under the default
+    // 'fileencodings' mis-detects as latin1 (garbled). `:e ++enc=shift_jis` (no
+    // filename) reloads the *current* file forcing that encoding, so 日本語 now
+    // decodes, the buffer carries fileencoding=shift_jis, and `:w` round-trips
+    // byte-identical.
+    let path = temp_path("enc_pp_reload");
+    let original: &[u8] = b"\x93\xfa\x96\x7b\x8c\xea\n"; // 日本語\n in Shift_JIS
+    std::fs::write(&path, original).expect("write shift_jis file");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    // Default detection lands on the latin1 terminal fallback: garbled.
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=latin1"),
+        "without ++enc a shift_jis file mis-detects as latin1"
+    );
+
+    // Force the reload. Empty filename → re-edit the current file.
+    feed(&rpc, ":e ++enc=shift_jis<CR>");
+    assert_eq!(lines(&rpc).await, vec!["日本語"]);
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=shift_jis"),
+        "++enc forces the decode regardless of 'fileencodings'"
+    );
+
+    // The forced encoding sticks, so `:w` reproduces the original bytes exactly.
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    assert_eq!(
+        std::fs::read(&path).expect("re-read"),
+        original,
+        "a ++enc reload records the encoding so `:w` round-trips byte-identical"
+    );
+}
+
+#[tokio::test]
+async fn edit_plusplus_enc_opens_a_named_file_with_a_vim_alias() {
+    // `:e ++enc=<enc> <path>` opens a *named* file forced (first open, not a
+    // reload), and accepts vim's `cp932` spelling (→ shift_jis).
+    let path = temp_path("enc_pp_named");
+    let original: &[u8] = b"\x93\xfa\x96\x7b\x8c\xea\n"; // 日本語\n in Shift_JIS
+    std::fs::write(&path, original).expect("write shift_jis file");
+    let (rpc, mut incoming) = start(None).await; // fresh [No Name]
+
+    feed(
+        &rpc,
+        &format!(":e ++enc=cp932 {}<CR>", path.to_string_lossy()),
+    );
+    assert_eq!(lines(&rpc).await, vec!["日本語"]);
+    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("fileencoding=shift_jis"),
+        "cp932 resolves to shift_jis and forces the decode of the named file"
+    );
+}
+
+#[tokio::test]
+async fn edit_plusplus_enc_rejects_an_unknown_encoding() {
+    // A bogus `++enc` value fails loud (E474) and leaves the buffer untouched —
+    // never a silent no-op reload.
+    let path = temp_path("enc_pp_bad");
+    std::fs::write(&path, b"hello\n").expect("write");
+    let (rpc, mut incoming) = open_file(&path).await;
+
+    let map = redraw_after(&rpc, &mut incoming, ":e ++enc=no-such-charset<CR>").await;
+    let msg = field(&map, "message").and_then(Value::as_str).unwrap_or("");
+    assert!(msg.contains("E474"), "expected a loud E474, got {msg:?}");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "a rejected ++enc reload leaves the buffer as it was"
+    );
+}
+
 #[tokio::test]
 async fn replacement_encoding_is_rejected() {
     // `encoding_rs` resolves the WHATWG `replacement` label, but that codec decodes

@@ -2570,6 +2570,14 @@ impl EditHost {
                 };
                 self.fx.loop_command(LoopCommand::Fs { id, job, local })
             }
+            // `nx.git.*` — hand the whole job to the actor (`nxvim_git::run_git_job` on the
+            // blocking pool). No path rebase like `nx.fs`: the plugin callers pass absolute
+            // paths (`nx.buf.name`), and the daemon-routed variant (which would need one)
+            // lands in slice 1d. The result returns on `loop_events` as a `GitResult`.
+            #[cfg(feature = "native")]
+            LoopOp::Git { id, job, local } => {
+                self.fx.loop_command(LoopCommand::Git { id, job, local })
+            }
             // `nx.http.fetch` — hand the whole request to the actor (a local `ureq`
             // round-trip, or the daemon `http_op` leg). No rebase like `nx.fs`: the URL is
             // absolute, nothing is resolved against the cwd. `local` (`nx.http.fetch_local`)
@@ -2992,6 +3000,19 @@ impl EditHost {
                 {
                     self.editor
                         .echo(format!("E5108: Error in nx.fs handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::GitResult { id, result } => {
+                // An off-tick `nx.git` op settled: resolve / reject its promise on this
+                // thread (marshalled to Lua in `run_callback`), then drain the reaction —
+                // the `FsResult` shape.
+                if let Err(e) = self
+                    .lua
+                    .run_callback(id, false, CallbackArgs::GitResult { result })
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.git handler: {e}"));
                 }
                 self.apply_lua_effects();
             }

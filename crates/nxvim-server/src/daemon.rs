@@ -1503,6 +1503,7 @@ pub async fn serve_proc_daemon_on(
                 LoopEvent::Timer { .. }
                 | LoopEvent::FsEvent { .. }
                 | LoopEvent::FsResult { .. }
+                | LoopEvent::GitResult { .. }
                 | LoopEvent::HttpResult { .. }
                 | LoopEvent::HttpMountResult { .. }
                 | LoopEvent::HttpServerRequest { .. }

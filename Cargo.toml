@@ -9,6 +9,7 @@ members = [
     "crates/nxvim-tui",
     "crates/nxvim-gui",
     "crates/nxvim-ts",
+    "crates/nxvim-git",
     "crates/nxvim-lsp",
     "crates/nxvim-view",
     "crates/nxvim-regex",
@@ -29,7 +30,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["David Rios <david.rios.gomes@gmail.com>"]
 repository = "https://github.com/davidrios/nxvim"
-rust-version = "1.80"
+rust-version = "1.85"
 
 [workspace.dependencies]
 nxvim-core = { path = "crates/nxvim-core" }
@@ -40,6 +41,7 @@ nxvim-rpc = { path = "crates/nxvim-rpc" }
 # the mlua note below; PUC lua54 is baked into the shared mlua dep.)
 nxvim-server = { path = "crates/nxvim-server", default-features = false }
 nxvim-lua = { path = "crates/nxvim-lua" }
+nxvim-git = { path = "crates/nxvim-git" }
 nxvim-tui = { path = "crates/nxvim-tui" }
 nxvim-gui = { path = "crates/nxvim-gui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
@@ -183,6 +185,9 @@ vt100 = "=0.16.2"
 tree-sitter = "=0.26.10"
 streaming-iterator = "=0.1.9"
 libloading = "=0.9.0"
+# In-process git (nxvim-git, native-only). Feature set is chosen per crate;
+# default-features off keeps the network/tls tree opt-in.
+gix = { version = "=0.86.0", default-features = false }
 # Dev-only: real grammars compiled into a test fixture (never linked into the
 # editor — nxvim loads grammars dynamically at runtime). `tree-sitter-md` is a host
 # grammar that injects (markdown fenced code blocks → the fence's language), so the

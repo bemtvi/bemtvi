@@ -646,7 +646,7 @@ impl Editor {
         }
         self.push_undo();
         self.buffer_mut().remove(lo..hi);
-        let repl: String = std::iter::repeat(c).take(count).collect();
+        let repl: String = std::iter::repeat_n(c, count).collect();
         self.buffer_mut().insert(lo, &repl);
         self.buffer_mut().modified = true;
         self.cursor.col =

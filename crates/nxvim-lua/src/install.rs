@@ -21,12 +21,12 @@ use crate::convert::{
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish,
-    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest,
-    HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush,
-    PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind,
-    StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq,
-    TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData, VirtDecorData,
-    WindowOp, WorkspaceOptionOp,
+    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GitJob, GlobalOptionOp, HlSet,
+    HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq,
+    PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
+    StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp,
+    TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
+    VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -1703,6 +1703,45 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut().loop_ops.push(LoopOp::Fs {
                 id: cb_id,
                 job: fs_job,
+                local: true,
+            });
+            Ok(())
+        })?,
+    )?;
+    // ===== nx.git ========================================================
+    // `nx._git_op(job, cb_id)` queues an `nx.git.*` op OFF the editor tick: it pushes a
+    // [`LoopOp::Git`] carrying the typed [`GitJob`] and the promise's callback id, and
+    // returns immediately (the `nx.git.*` wrapper's promise is still pending). The
+    // event-loop actor runs the op on its blocking pool through `nxvim_git::run_git_job`
+    // (native) — or the daemon `git_op` leg runs it daemon-side (daemon / wasm; git runs
+    // where the files are) — and the result returns inbound as a `CallbackArgs::GitResult`,
+    // which fires `nx._run_cb(cb_id, false, err, value)` to settle the promise. An unknown
+    // op or a missing field fails loud here at the scripting boundary.
+    let sh = shared.clone();
+    nx.set(
+        "_git_op",
+        lua.create_function(move |_, (job, cb_id): (Table, u64)| {
+            let git_job = git_job_from_table(&job)?;
+            sh.borrow_mut().loop_ops.push(LoopOp::Git {
+                id: cb_id,
+                job: git_job,
+                local: false,
+            });
+            Ok(())
+        })?,
+    )?;
+    // `nx._local_git_op(job, cb_id)` — the LOCAL-always twin of `nx._git_op` (backs
+    // `nx.git_local.*`): the op runs against the local git engine even when the session's
+    // `nx.git` routes to a daemon. Used by the `nx.plugins` manager, whose repos live on
+    // the local disk that its plugins load from — the git twin of `nx._local_fs_op`.
+    let sh = shared.clone();
+    nx.set(
+        "_local_git_op",
+        lua.create_function(move |_, (job, cb_id): (Table, u64)| {
+            let git_job = git_job_from_table(&job)?;
+            sh.borrow_mut().loop_ops.push(LoopOp::Git {
+                id: cb_id,
+                job: git_job,
                 local: true,
             });
             Ok(())
@@ -4026,6 +4065,38 @@ fn fs_job_from_table(job: &Table) -> mlua::Result<FsJob> {
         other => {
             return Err(mlua::Error::runtime(format!(
                 "nx._fs_op: unknown fs op '{other}'"
+            )))
+        }
+    })
+}
+
+/// Parse a `nx._git_op` / `nx._local_git_op` job table `{ op = "<name>", … }` into a
+/// typed [`GitJob`]. An unknown `op`, or a required field missing / the wrong type,
+/// fails loud here (the scripting boundary) rather than queuing a malformed op — the
+/// git twin of [`fs_job_from_table`].
+fn git_job_from_table(job: &Table) -> mlua::Result<GitJob> {
+    let op: String = job.get("op")?;
+    Ok(match op.as_str() {
+        "discover" => GitJob::Discover {
+            path: job.get("path")?,
+        },
+        "head" => GitJob::Head {
+            path: job.get("path")?,
+        },
+        "show" => GitJob::Show {
+            file: job.get("file")?,
+            rev: job.get("rev")?,
+        },
+        "diff_file" => GitJob::DiffFile {
+            path: job.get("path")?,
+            file: job.get("file")?,
+        },
+        "status" => GitJob::Status {
+            path: job.get("path")?,
+        },
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "nx._git_op: unknown git op '{other}'"
             )))
         }
     })

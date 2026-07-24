@@ -546,6 +546,114 @@ pub struct FsError {
     pub message: String,
 }
 
+/// One whole high-level `nx.git.*` operation, as plain data (no `gix` types — this
+/// stays in the wasm-safe crate so the Lua bridge can build it and it can cross the
+/// daemon wire). The actual work runs through `nxvim_git::run_git_job` against the
+/// [`gix`] engine off the editor tick, so it is identical for a local repo and a
+/// daemon-side one. `path` is any path *inside* the repo (a file or dir); the
+/// executor discovers the repo from it — matching how the shelled-out `git -C <dir>`
+/// / `cwd` calls worked. Mutation / network verbs (clone / checkout / pull /
+/// submodule) are Phase 2 and not here yet.
+#[derive(Clone, Debug)]
+pub enum GitJob {
+    /// `nx.git.discover(path)` — the repo `root` (worktree toplevel), `git_dir`, and
+    /// `prefix` (the repo-root→`path`-dir relative path). Replaces `rev-parse
+    /// --show-toplevel / --absolute-git-dir / --show-prefix`. Rejects if `path` is
+    /// not inside a repository.
+    Discover { path: String },
+    /// `nx.git.head(path)` — the current `HEAD`: `{ branch, detached, sha }`. Replaces
+    /// `rev-parse --abbrev-ref HEAD`. `branch` is nil on a detached HEAD (`detached`
+    /// then true); `sha` is the full resolved commit oid.
+    Head { path: String },
+    /// `nx.git.show(file, rev)` — the raw bytes of `file` (an absolute path) as it
+    /// was at `rev`. Replaces `git show HEAD:<rel>`, but the caller passes the plain
+    /// file path: the executor discovers the repo and computes the repo-relative path
+    /// itself (the canonical-layer fix — plugins no longer do `--show-prefix` math,
+    /// which broke on symlinked dirs). Rejects if the file has no version at `rev`
+    /// (new / untracked file, empty repo).
+    Show { file: String, rev: String },
+    /// `nx.git.diff_file(path, file)` — `file`'s working tree vs its `HEAD` blob:
+    /// `{ added, changed, removed, hunks }`. Replaces `git diff -U0 -- <file>` plus
+    /// the plugins' hunk-count parsing. `file` is any path form the executor can
+    /// resolve against the repo.
+    DiffFile { path: String, file: String },
+    /// `nx.git.status(path)` — the repo's working-tree status: `{ dirty, entries }`,
+    /// each entry a `{ path, index, worktree }` porcelain-`XY`-style pair. A canonical
+    /// working-tree signal so plugins stop re-deriving one from `diff` output.
+    Status { path: String },
+}
+
+/// One line of [`GitValue::Status`]: a changed path and its porcelain `XY` state.
+/// `index` is the staged (index-vs-HEAD) letter, `worktree` the unstaged
+/// (worktree-vs-index) letter — each one of `M`/`A`/`D`/`R`/`C`/`?`/`U`/`" "`
+/// (unmodified in that column), matching `git status --porcelain`.
+#[derive(Clone, Debug)]
+pub struct GitStatusEntry {
+    pub path: String,
+    pub index: String,
+    pub worktree: String,
+}
+
+/// One hunk of a [`GitValue::Diff`], in `@@ -old_start,old_count +new_start,new_count @@`
+/// terms (the unified-diff header the plugins parsed by hand). `added`/`changed`/
+/// `removed` on the parent [`GitValue::Diff`] are the folded counts.
+#[derive(Clone, Debug)]
+pub struct GitHunk {
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+}
+
+/// The typed value a [`GitJob`] resolves with — the union of every `nx.git` read
+/// verb's success payload, marshalled into the Lua value the promise resolves with by
+/// [`run_callback`](crate::LuaRuntime), so the per-verb conversion happens once
+/// regardless of native / daemon origin. `Bytes` is `show`'s raw blob; the structured
+/// variants carry each verb's fields.
+#[derive(Clone, Debug)]
+pub enum GitValue {
+    /// A unit result (reserved for the Phase-2 mutation verbs).
+    Nil,
+    /// `nx.git.show` — the blob's raw bytes at the requested revision.
+    Bytes(Vec<u8>),
+    /// `nx.git.discover` — the repo layout paths (all absolute except `prefix`, which
+    /// is repo-relative and `""` when `path`'s dir is the repo root).
+    Discover {
+        root: String,
+        git_dir: String,
+        prefix: String,
+    },
+    /// `nx.git.head` — the current HEAD. `branch` is `None` on a detached HEAD.
+    Head {
+        branch: Option<String>,
+        detached: bool,
+        sha: String,
+    },
+    /// `nx.git.diff_file` — the folded line counts plus the raw hunks.
+    Diff {
+        added: u32,
+        changed: u32,
+        removed: u32,
+        hunks: Vec<GitHunk>,
+    },
+    /// `nx.git.status` — `dirty` (any tracked change; untracked-only is still dirty
+    /// here since an entry is emitted) and the per-path porcelain entries.
+    Status {
+        dirty: bool,
+        entries: Vec<GitStatusEntry>,
+    },
+}
+
+/// The error a [`GitJob`] rejects with — the `{ code, message }` table the `nx.git`
+/// promise rejects with. `code` is a short stable hint (`ENOREPO` / `ENOENT` /
+/// `EGIT` / …) the caller can branch on; `message` is the human string. Shaped from
+/// `gix` errors by `nxvim_git`; the same struct crosses the daemon wire.
+#[derive(Clone, Debug)]
+pub struct GitError {
+    pub code: String,
+    pub message: String,
+}
+
 /// One `nx.http.fetch` request, as plain data — the descriptor the `nx._http_fetch`
 /// bridge queues off-tick (carried by [`LoopOp::Http`] natively, the wasm
 /// `HostEffects::http_op` path on the browser). The actual round-trip runs off the
@@ -858,6 +966,20 @@ pub enum LoopOp {
     /// local), so it must see the local disk, not the remote's. See
     /// `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
     Fs { id: u64, job: FsJob, local: bool },
+    /// An `nx.git.*` one-shot op (`nx._git_op`) — run `job` off the editor tick and
+    /// resolve / reject the promise registered under `id` when it settles. Native:
+    /// forwarded to the event-loop actor ([`LoopCommand::Git`](../../nxvim_server), run
+    /// on `spawn_blocking` through `nxvim_git::run_git_job`); the result returns inbound
+    /// as [`LoopEvent::GitResult`](../../nxvim_server) → a [`CallbackArgs::GitResult`].
+    /// Daemon / wasm: forwarded to the daemon `git_op` leg (git runs daemon-side, where
+    /// the files are); a serverless session with no daemon rejects it loud (there is no
+    /// in-browser git engine and no OPFS-git — the tier-1 boundary for this feature).
+    ///
+    /// `local` forces the op onto the **local** git engine even in a daemon session
+    /// (`nx._local_git_op` → `nx.git_local.*`), the git twin of the [`Fs`](LoopOp::Fs)
+    /// `local` flag: the plugin manager operates on the client's on-disk plugin repos
+    /// (which load into the local Lua VM), so it must see local disk, not the remote's.
+    Git { id: u64, job: GitJob, local: bool },
     /// An `nx.http.fetch` request (`nx._http_fetch`) — run the round-trip off the editor
     /// tick and resolve / reject the promise registered under `id` when it settles.
     /// `local` forces it onto the **local** network (the actor's `ureq`, or the browser's
@@ -1476,6 +1598,17 @@ pub enum CallbackArgs {
         /// The op's outcome: `Ok` resolves the promise with the marshalled value,
         /// `Err` rejects it with the `{ code, message }` table.
         result: Result<FsValue, FsError>,
+    },
+    /// The settled result of an off-tick [`GitJob`] (`nx.git.*`): run as
+    /// `nx._run_cb(id, false, err, value)` — `err` the `{ code, message }` table (with
+    /// `value` nil) on a reject, or `err` nil with `value` the resolved Lua value. The
+    /// typed [`GitValue`] / [`GitError`] → Lua marshalling happens once in
+    /// [`run_callback`](crate::LuaRuntime::run_callback), identical whether the op ran
+    /// on the native actor or the daemon `git_op` leg.
+    GitResult {
+        /// `Ok` resolves the promise with the marshalled value, `Err` rejects it with
+        /// the `{ code, message }` table.
+        result: Result<GitValue, GitError>,
     },
     /// The settled result of an `nx.http.fetch` request ([`LoopOp::Http`]): the callback
     /// is run as `nx._run_cb(id, false, err, response)` — `err` the `{ message }` table

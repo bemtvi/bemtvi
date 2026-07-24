@@ -43,11 +43,12 @@ pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     build_server_request, mount_root_redirect, split_mount_path, BufOp, CallbackArgs, ConfirmReq,
     DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsError, FsJob,
-    FsValue, GlobalOptionOp, HlSet, HttpError, HttpMountError, HttpRequest, HttpResponse,
-    HttpServerReply, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp,
-    LspServerCapabilities, NamedListOp, OpenTarget, OptionValue, PanelOp, QfItem, QfSetOp,
-    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp,
-    TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
+    FsValue, GitError, GitHunk, GitJob, GitStatusEntry, GitValue, GlobalOptionOp, HlSet, HttpError,
+    HttpMountError, HttpRequest, HttpResponse, HttpServerReply, HttpServerRequest,
+    InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspServerCapabilities, NamedListOp,
+    OpenTarget, OptionValue, PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
+    SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq,
+    ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
     extract_prelude, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete, ExtmarkMirror,

@@ -37,6 +37,7 @@ native = [
     # surface (the tokio + async-lsp manager/transport) for the desktop build.
     "nxvim-lsp/native",
     "dep:nxvim-ts",
+    "dep:nxvim-git",
     "dep:portable-pty",
     "dep:ureq",
     "dep:axum",
@@ -89,6 +90,12 @@ nxvim-lsp.workspace = true
 # — it shells out to a C compiler at `:TSInstall` and `dlopen`s the grammar, neither
 # of which exists in the browser (wasm highlighting is JS-side, in `nxvim-edithost`).
 nxvim-ts = { workspace = true, optional = true }
+# In-process git via gix: the executor behind `nx.git.*`, run off the editor tick on
+# the actor's blocking pool (`nxvim_git::run_git_job`). Native only — gix needs a real
+# filesystem (and pulls a TLS/network tree for Phase-2 clone), neither of which exists
+# in the browser; a serverless-web git op rejects loud, a daemon-web one runs
+# daemon-side. Gated under `native` alongside the rest of the off-tick tree.
+nxvim-git = { workspace = true, optional = true }
 # The blocking HTTP client backing `nx.http.fetch` (native / daemon). Runs on the
 # event-loop actor's `spawn_blocking` pool — off the editor tick — over its bundled
 # rustls TLS (the same client `nxvim-ts` uses for `:TSInstall`). Native-only: the

@@ -426,7 +426,7 @@ impl EditHost {
         let mut positions: Vec<(usize, usize)> = self
             .current_diagnostics_merged()
             .into_iter()
-            .filter(|(d, _)| severity.map_or(true, |s| severity_code(d.severity) == s))
+            .filter(|(d, _)| severity.is_none_or(|s| severity_code(d.severity) == s))
             .map(|(d, encoding)| {
                 let row = d.range.start.line as usize;
                 let line = self.editor.buffer().line(row);

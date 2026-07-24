@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use nxvim_lua::{
-    run_fs_job, FsError, FsJob, FsValue, HttpError, HttpRequest, HttpResponse, HttpServerReply,
-    HttpServerRequest, LuaFs,
+    run_fs_job, FsError, FsJob, FsValue, GitError, GitJob, GitValue, HttpError, HttpRequest,
+    HttpResponse, HttpServerReply, HttpServerRequest, LuaFs,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -114,6 +114,13 @@ pub enum LoopCommand {
     /// — the `nx.plugins` manager's clone / discover / source ops, which must see the local
     /// disk (plugins load into the local Lua VM). `false` for `nx.fs.*` (session routing).
     Fs { id: u64, job: FsJob, local: bool },
+    /// Run an off-tick `nx.git.*` op (`nx._git_op`) through the actor's [`GitBackend`] —
+    /// `nxvim_git::run_git_job` on the blocking pool locally, or the daemon's `git_op` leg
+    /// — and send the typed result back as [`LoopEvent::GitResult`] for callback `id`. Off
+    /// the editor tick, so a slow op (a big repo's status, a daemon round-trip) never janks
+    /// the editor. `local` runs it against the actor's **local** git backend (the
+    /// `nx.git_local` twin the plugin manager uses); `false` follows the session routing.
+    Git { id: u64, job: GitJob, local: bool },
     /// Run an off-tick `nx.http.fetch` request (`nx._http_fetch`) through the actor's
     /// [`HttpBackend`] — a local `ureq` round-trip on the blocking pool, or the daemon's
     /// `http_op` leg — and send the typed result back as [`LoopEvent::HttpResult`] for
@@ -231,6 +238,13 @@ pub enum LoopEvent {
         id: u64,
         result: Result<FsValue, FsError>,
     },
+    /// An off-tick `nx.git.*` op ([`LoopCommand::Git`]) settled: the typed result the
+    /// promise registered under `id` resolves / rejects with. The server runs the matching
+    /// `nx._run_cb` on its one thread (the marshalling to Lua happens there).
+    GitResult {
+        id: u64,
+        result: Result<GitValue, GitError>,
+    },
     /// An off-tick `nx.http.fetch` request ([`LoopCommand::Http`]) settled: the typed
     /// result the promise registered under `id` resolves / rejects with. The server runs
     /// the matching `nx._run_cb` on its one thread (the marshalling to Lua happens there).
@@ -289,6 +303,19 @@ pub enum LoopEvent {
 pub enum FsBackend {
     Local(Arc<dyn LuaFs + Send + Sync>),
     Remote(crate::daemon::RemoteFsJobs),
+}
+
+/// Where the actor runs off-tick `nx.git.*` ops. The git sibling of [`FsBackend`],
+/// but simpler: [`run_git_job`](nxvim_git::run_git_job) discovers the repo from the
+/// job's path itself, so the local variant carries no per-op state.
+/// - [`Local`](GitBackend::Local) — native-bare / the `nx.git_local` twin: run the job
+///   on the blocking pool against the local disk's gix engine.
+///
+/// A `Remote` variant (the daemon `git_op` leg — git runs where the files are) is added
+/// with the daemon leg (slice 1d); until then a daemon session runs git on the client.
+#[derive(Clone)]
+pub enum GitBackend {
+    Local,
 }
 
 /// Where the actor runs off-tick `nx.http.fetch` requests. The HTTP sibling of
@@ -352,6 +379,11 @@ pub struct EventLoop {
     /// See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
     local_host_proc: Arc<dyn HostProc>,
     local_fs: FsBackend,
+    /// Where off-tick `nx.git.*` ops run (see [`GitBackend`]). `git` follows the session
+    /// routing; `local_git` is the `nx.git_local` twin (the plugin manager's repos, always
+    /// on local disk). Cloned into the actor when it starts.
+    git: GitBackend,
+    local_git: GitBackend,
     started: bool,
 }
 
@@ -376,6 +408,10 @@ impl EventLoop {
             http,
             local_host_proc,
             local_fs,
+            // Local-only until the daemon leg (slice 1d) threads a `Remote` backend in
+            // from `ServerInit`; `run_git_job` needs no per-op state, so this carries none.
+            git: GitBackend::Local,
+            local_git: GitBackend::Local,
             started: false,
         };
         (evloop, event_rx)
@@ -395,6 +431,8 @@ impl EventLoop {
                 self.http.clone(),
                 self.local_host_proc.clone(),
                 self.local_fs.clone(),
+                self.git.clone(),
+                self.local_git.clone(),
             ));
             self.started = true;
         }
@@ -413,6 +451,9 @@ impl EventLoop {
 /// timer / process is a child `tokio::spawn`ed task keyed by callback id so it can
 /// be cancelled; finished one-shot handles are pruned opportunistically so the
 /// maps don't grow with every fired `defer_fn` (the no-leak guarantee).
+// One parameter per off-tick backend the actor owns (proc / fs / http / git, each with
+// its local twin); grouping them into a struct would only rename the same fields.
+#[allow(clippy::too_many_arguments)]
 async fn run_evloop(
     mut cmd_rx: UnboundedReceiver<LoopCommand>,
     event_tx: UnboundedSender<LoopEvent>,
@@ -421,6 +462,8 @@ async fn run_evloop(
     http: HttpBackend,
     local_host_proc: Arc<dyn HostProc>,
     local_fs: FsBackend,
+    git: GitBackend,
+    local_git: GitBackend,
 ) {
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
@@ -642,6 +685,34 @@ async fn run_evloop(
                         tokio::spawn(async move {
                             let result = remote.run(job).await;
                             let _ = event_tx.send(LoopEvent::FsResult { id, result });
+                        });
+                    }
+                }
+            }
+            LoopCommand::Git { id, job, local } => {
+                // The git sibling of the `Fs` arm — spawned so concurrent ops don't
+                // serialize, run off-tick, result sent back for the server to settle on
+                // its one thread. `run_git_job` discovers the repo from the job's path, so
+                // the local backend needs no per-op state; a `local`-flagged op (the
+                // `nx.git_local` twin) always takes the local backend. The daemon `Remote`
+                // path lands in slice 1d.
+                let event_tx = event_tx.clone();
+                let backend = if local { &local_git } else { &git };
+                match backend {
+                    GitBackend::Local => {
+                        tokio::spawn(async move {
+                            let result =
+                                tokio::task::spawn_blocking(move || nxvim_git::run_git_job(&job))
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        // The blocking task panicked (gix should never panic, but
+                                        // never silently swallow it).
+                                        Err(GitError {
+                                            code: "EIO".to_string(),
+                                            message: format!("nx.git op task failed: {e}"),
+                                        })
+                                    });
+                            let _ = event_tx.send(LoopEvent::GitResult { id, result });
                         });
                     }
                 }

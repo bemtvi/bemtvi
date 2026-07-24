@@ -18,7 +18,7 @@ use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
     BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish,
-    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet,
+    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue, GitValue, GlobalOptionOp, HlSet,
     HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, NamedListOp,
     PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
     SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
@@ -544,6 +544,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.fs: promise-always filesystem API over the nx._fs_* bridge. After
     // promise.lua (every op returns a promise).
     ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
+    // nx.git: promise-always git API (discover/head/show/diff_file/status) over the
+    // nx._git_op bridge, plus the nx.git_local twin. After promise.lua (every op
+    // returns a promise); modeled on fs.lua.
+    ("nxvim:prelude/git", include_str!("prelude/git.lua")),
     // nx.http: promise-always HTTP client (fetch-modeled) over the nx._http_fetch
     // bridge. After promise.lua (returns a promise) and stdlib.lua (uses nx.json for
     // JSON bodies / `res:json()`).
@@ -1142,6 +1146,79 @@ fn fs_value_to_lua(lua: &Lua, value: FsValue) -> mlua::Result<mlua::Value> {
                 list.push(t)?;
             }
             mlua::Value::Table(list)
+        }
+    })
+}
+
+/// Marshal a settled [`GitValue`] (the success payload of an off-tick `nx.git` op)
+/// into the Lua value the promise resolves with. One place, so a native-actor result
+/// and a daemon-leg result reach Lua identically. `show`'s bytes stay a raw Lua
+/// byte-string; the structured verbs become `{ … }` tables shaped like the docs.
+fn git_value_to_lua(lua: &Lua, value: GitValue) -> mlua::Result<mlua::Value> {
+    Ok(match value {
+        GitValue::Nil => mlua::Value::Nil,
+        GitValue::Bytes(b) => mlua::Value::String(lua.create_string(b)?),
+        GitValue::Discover {
+            root,
+            git_dir,
+            prefix,
+        } => {
+            let t = lua.create_table()?;
+            t.set("root", root)?;
+            t.set("git_dir", git_dir)?;
+            t.set("prefix", prefix)?;
+            mlua::Value::Table(t)
+        }
+        GitValue::Head {
+            branch,
+            detached,
+            sha,
+        } => {
+            let t = lua.create_table()?;
+            // `branch` is nil on a detached HEAD (we simply omit the key, so Lua reads
+            // `head.branch == nil` the neovim way).
+            if let Some(b) = branch {
+                t.set("branch", b)?;
+            }
+            t.set("detached", detached)?;
+            t.set("sha", sha)?;
+            mlua::Value::Table(t)
+        }
+        GitValue::Diff {
+            added,
+            changed,
+            removed,
+            hunks,
+        } => {
+            let t = lua.create_table()?;
+            t.set("added", added)?;
+            t.set("changed", changed)?;
+            t.set("removed", removed)?;
+            let list = lua.create_table()?;
+            for h in hunks {
+                let ht = lua.create_table()?;
+                ht.set("old_start", h.old_start)?;
+                ht.set("old_count", h.old_count)?;
+                ht.set("new_start", h.new_start)?;
+                ht.set("new_count", h.new_count)?;
+                list.push(ht)?;
+            }
+            t.set("hunks", list)?;
+            mlua::Value::Table(t)
+        }
+        GitValue::Status { dirty, entries } => {
+            let t = lua.create_table()?;
+            t.set("dirty", dirty)?;
+            let list = lua.create_table()?;
+            for e in entries {
+                let et = lua.create_table()?;
+                et.set("path", e.path)?;
+                et.set("index", e.index)?;
+                et.set("worktree", e.worktree)?;
+                list.push(et)?;
+            }
+            t.set("entries", list)?;
+            mlua::Value::Table(t)
         }
     })
 }
@@ -2370,6 +2447,25 @@ impl LuaRuntime {
                 match result {
                     Ok(value) => {
                         let value = fs_value_to_lua(&self.lua, value)?;
+                        run.call::<()>((id, keep, mlua::Value::Nil, value))
+                    }
+                    Err(e) => {
+                        let err = self.lua.create_table()?;
+                        err.set("code", e.code)?;
+                        err.set("message", e.message)?;
+                        run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
+                    }
+                }
+            }
+            CallbackArgs::GitResult { result } => {
+                // `nx.git.*` settle: fire `nx._run_cb(id, false, err, value)` — the git
+                // twin of the `FsResult` arm. On reject `err` is the `{ code, message }`
+                // table (value nil); on resolve `err` is nil and `value` the marshalled
+                // Lua value. Marshalling happens here once, identical for the native
+                // actor and the daemon `git_op` leg.
+                match result {
+                    Ok(value) => {
+                        let value = git_value_to_lua(&self.lua, value)?;
                         run.call::<()>((id, keep, mlua::Value::Nil, value))
                     }
                     Err(e) => {

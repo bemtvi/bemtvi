@@ -207,6 +207,36 @@ async fn status_reports_a_modified_file() {
     );
 }
 
+/// `show` of a file that is *inside* a repo but has no HEAD version — including a path
+/// that doesn't exist on disk yet (a buffer `:edit`ed for a not-yet-created file) —
+/// rejects with `ENOENT` ("no HEAD version"), NOT `ENOREPO`. This is the canonical
+/// behavior nxvim-diff relies on: `open()` discovers from the parent dir when the path
+/// isn't a directory, so a non-existent file still resolves its repo.
+#[tokio::test]
+async fn show_uncommitted_file_rejects_enoent_not_enorepo() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_uncommitted");
+    // A path INSIDE the repo that was never created on disk or committed.
+    let ghost = repo.join("never-existed.txt");
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.code = nil\n\
+             nx.git.show({ghost:?}, 'HEAD'):next(function() _G.code = 'RESOLVED' end, function(e) _G.code = e.code end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.code").await.as_str(),
+        Some("ENOENT")
+    );
+}
+
 /// A non-repo path rejects loud with `ENOREPO` (never a silent empty result).
 #[tokio::test]
 async fn discover_rejects_outside_a_repo() {

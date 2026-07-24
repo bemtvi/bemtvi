@@ -51,14 +51,19 @@ fn egit(context: &str, e: impl std::fmt::Display) -> GitError {
 
 /// Open the repository that contains `path` (a file or directory inside a worktree),
 /// rejecting with `ENOREPO` when there is none — the discovery `git -C <dir> rev-parse`
-/// did before. `gix::discover` walks up from a *directory*, so when `path` is a file we
-/// discover from its parent (a plugin passes the buffer's file path).
+/// did before. `gix::discover` walks up from an existing *directory*, so we discover from
+/// `path` only when it is a directory; for a file — or a path that doesn't exist yet (a
+/// buffer `:edit`ed for a file not on disk, still inside the repo) — we discover from its
+/// parent. This keeps `nx.git.show`/`diff_file` reporting `ENOENT` ("no HEAD version") for
+/// an uncommitted new file rather than `ENOREPO`.
 fn open(path: &str) -> Result<gix::Repository, GitError> {
     let p = Path::new(path);
-    let from = if p.is_file() {
-        p.parent().unwrap_or(p)
-    } else {
+    let from = if p.is_dir() {
         p
+    } else {
+        p.parent()
+            .filter(|par| !par.as_os_str().is_empty())
+            .unwrap_or(p)
     };
     gix::discover(from).map_err(|e| err("ENOREPO", format!("not a git repository ({path}): {e}")))
 }

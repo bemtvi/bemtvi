@@ -88,7 +88,8 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub(crate) use self::selection::{Range, Selections};
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
-    FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
+    FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave, PreWrite,
+    WriteEvent,
 };
 pub use self::marks::MarkMirrorEntry;
 pub use self::persist::{
@@ -1613,13 +1614,21 @@ pub struct Editor {
     /// whole set, so core records it here and the server gates the `:qa` on all of them.
     /// `None` unless a `:wqa` with at least one modified file-backed buffer just ran.
     pending_quit_all: Option<PendingQuitAll>,
-    /// Buffers written this tick (a successful `:w` / `:wall`, or a finalized off-tick
-    /// save), drained by the server with [`Editor::take_write_events`]. Each is a
-    /// `(buffer, path)` the server fires `BufWritePre`/`BufWritePost` for — Lua autocmds
-    /// the pure core can't drive itself. Recording the *completed* write here (rather
-    /// than firing inline) keeps `nxvim-core` free of event types, exactly as the
-    /// buffer-lifecycle diff does for `BufEnter`/`FileType`.
-    write_events: Vec<(BufferId, PathBuf)>,
+    /// Writes the editor **intends** to make this tick but has not committed — the
+    /// pre-write intents `:w` / `:wall` record instead of writing inline, drained by the
+    /// server with [`Editor::take_pending_pre_writes`]. The server fires `BufWritePre`,
+    /// waits for its handlers to settle, then calls [`Editor::commit_pre_write`] on each,
+    /// so a handler's buffer mutation (format/trim-on-save) is what gets serialized —
+    /// vim's pre-write contract, which the pure core can't drive itself (it can't
+    /// re-enter Lua). See [`PreWrite`].
+    pending_pre_writes: Vec<PreWrite>,
+    /// Completed writes this tick (a committed `:w` / `:wall`, or a finalized off-tick
+    /// save), drained by the server with [`Editor::take_write_events`]. Each carries
+    /// whether `BufWritePre` still needs firing (a synchronous commit already fired it
+    /// from the pre-write drain; an off-tick ack has not). Recording the *completed*
+    /// write here (rather than firing inline) keeps `nxvim-core` free of event types,
+    /// exactly as the buffer-lifecycle diff does for `BufEnter`/`FileType`.
+    write_events: Vec<WriteEvent>,
     /// File-backed buffers awaiting a `:checktime` reconcile this tick, drained by the
     /// server with [`Editor::take_pending_checktime`]. The reconcile fires the
     /// `FileChangedShell` autocmd (a Lua round-trip the pure core can't drive itself)
@@ -1989,6 +1998,7 @@ impl Editor {
             session_captures_layout: false,
             bufreadcmd_active: false,
             pending_saves: Vec::new(),
+            pending_pre_writes: Vec::new(),
             next_save_seq: 0,
             pending_opens: Vec::new(),
             forced_read_encoding: None,

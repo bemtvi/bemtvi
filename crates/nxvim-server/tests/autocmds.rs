@@ -861,6 +861,30 @@ async fn writing_a_file_fires_bufwritepre_then_bufwritepost() {
 }
 
 #[tokio::test]
+async fn bufwritepre_mutation_reaches_disk() {
+    // vim's `BufWritePre` fires *before* the buffer is serialized, so a handler
+    // that mutates the buffer (format-on-save, trim trailing whitespace) changes
+    // what lands on disk. Here the handler upcases the line via `:%s`; after `:w`
+    // the on-disk bytes must be the mutated text, not the pre-mutation text.
+    let dir = temp_dir("au_write_pre_mutates");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function() vim.cmd([[%s/hello/HELLO/]]) end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    let on_disk = std::fs::read_to_string(&file).expect("read back");
+    assert_eq!(
+        on_disk, "HELLO\n",
+        "a BufWritePre handler's buffer mutation must be written to disk"
+    );
+}
+
+#[tokio::test]
 async fn bufwritepost_sees_the_written_buffer_as_unmodified() {
     // After a `:w`, the BufWritePost callback resolves the saved buffer via the
     // snapshot and `vim.bo.modified` reads the now-cleared `[+]` flag.

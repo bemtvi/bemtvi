@@ -1339,31 +1339,36 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
-    /// Fire the write autocmds for `buf` (written to `path`): `BufWritePre`, its
-    /// synonym `BufWrite`, then `BufWritePost`, each with the written buffer as
-    /// context (`<afile>` = its path). Driven from [`EditHost::drain_write_events`]
-    /// after a successful `:w` / `:wall` or a finalized off-tick save, so a write
-    /// fires the same events however it reached disk. The filetype is resolved from
-    /// the *written* buffer's own path (so a `:wall` of a non-current buffer carries
-    /// the right `vim.bo.filetype`), unlike the generic [`fire_lifecycle`] which keys
-    /// off the current buffer.
-    ///
-    /// NOTE on timing: nxvim's editing core writes synchronously and Lua autocmds
-    /// fire at convergence (the server can't re-enter Lua mid-write), so `BufWritePre`
-    /// fires just *before* `BufWritePost` but *after* the bytes are on disk. A
-    /// `BufWritePre` handler cannot transform what is written — but nxvim has no
-    /// synchronous buffer-mutation Lua API either, so that is not reachable regardless;
-    /// the firing order (`Pre` → `Post`) and buffer context match neovim.
-    pub(crate) fn fire_buf_write(&mut self, buf: BufferId, path: &str) {
+    /// Point the Lua snapshot / mirror at the *written* buffer before firing a write
+    /// autocmd, so `vim.bo.filetype` / `nx._bufs` read the written buffer even when it's
+    /// not the current one (a `:wall` of a non-current buffer), unlike the generic
+    /// [`fire_lifecycle`] which keys off the current buffer.
+    fn set_write_snapshot(&mut self, buf: BufferId, path: &str) {
         let ft = filetype_of(Some(Path::new(path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, path, ft);
         self.push_buf_mirror();
-        // `BufWrite` is a neovim alias for `BufWritePre` (canonicalized at
-        // registration in `autocmd.lua`), so we fire only the two canonical events.
-        for event in ["BufWritePre", "BufWritePost"] {
-            let r = self.lua.fire_autocmd_buf(event, path, buf.0, path);
-            self.report_autocmd_err(event, r);
-        }
+    }
+
+    /// Fire `BufWritePre` (its `BufWrite` synonym is canonicalized to this at
+    /// registration) for `buf`, with the written buffer as context (`<afile>` = `path`).
+    /// Driven from [`EditHost::drain_pre_writes`] **before** the bytes are serialized
+    /// (matching vim), so a handler's buffer mutation (format / trim-on-save) is what
+    /// gets written — the whole point of the pre-write split.
+    pub(crate) fn fire_buf_write_pre(&mut self, buf: BufferId, path: &str) {
+        self.set_write_snapshot(buf, path);
+        let r = self.lua.fire_autocmd_buf("BufWritePre", path, buf.0, path);
+        self.report_autocmd_err("BufWritePre", r);
+        self.apply_lua_effects();
+    }
+
+    /// Fire `BufWritePost` for `buf` (written to `path`) — the "reload affected tools"
+    /// hook, fired after the bytes are on disk. Driven from
+    /// [`EditHost::drain_write_events`] after a committed `:w` / `:wall` or a finalized
+    /// off-tick save.
+    pub(crate) fn fire_buf_write_post(&mut self, buf: BufferId, path: &str) {
+        self.set_write_snapshot(buf, path);
+        let r = self.lua.fire_autocmd_buf("BufWritePost", path, buf.0, path);
+        self.report_autocmd_err("BufWritePost", r);
         self.apply_lua_effects();
     }
 
@@ -1378,25 +1383,61 @@ impl EditHost {
         self.fire_and_drain("BufDelete", &pattern, buf.0, "");
     }
 
-    /// Drain the buffers written this convergence (core's [`Editor::take_write_events`])
-    /// and fire each one's `BufWritePre`/`BufWritePost` ([`fire_buf_write`]). Called
-    /// inside [`run_pending`](EditHost::run_pending)'s fixpoint so a write driven from a
-    /// keystroke, `vim.cmd('w')`, a user command, or a daemon save ack fires its events
-    /// in the same convergence — and a handler that itself queues work (`vim.cmd`) has
-    /// that work drained by the surrounding loop.
+    /// Drain the pre-write intents recorded this convergence (core's
+    /// [`Editor::take_pending_pre_writes`]): fire each buffer's `BufWritePre` **before**
+    /// committing its write, so a handler's buffer mutation (format / trim-on-save) is
+    /// what gets serialized. In this phase `BufWritePre` is awaited only *synchronously*
+    /// — the handler's queued `vim.cmd` / effects are drained by `fire_buf_write_pre`'s
+    /// `apply_lua_effects` before [`Editor::commit_pre_write`] serializes the buffer;
+    /// awaiting an *async* handler promise is the next phase. Called inside
+    /// [`run_pending`](EditHost::run_pending)'s fixpoint so a write driven from a
+    /// keystroke, `vim.cmd('w')`, or a user command drives in the same convergence.
+    pub(crate) fn drain_pre_writes(&mut self) {
+        let pre_writes = self.editor.take_pending_pre_writes();
+        if pre_writes.is_empty() {
+            return;
+        }
+        for pw in pre_writes {
+            // The autocmd's `<afile>` is the explicit `:w {name}` target, else the
+            // buffer's own bound path.
+            let path = pw
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .or_else(|| self.editor.buffer_name(pw.buffer))
+                .unwrap_or_default();
+            self.fire_buf_write_pre(pw.buffer, &path);
+            self.editor.commit_pre_write(pw);
+        }
+        self.reseed_cur_snapshot();
+    }
+
+    /// Drain the writes completed this convergence (core's
+    /// [`Editor::take_write_events`]) and fire each one's `BufWritePost` — plus
+    /// `BufWritePre` first for a write whose pre wasn't already fired (an off-tick save
+    /// ack, which enqueued before the pre-write split reached it). Called inside
+    /// [`run_pending`](EditHost::run_pending)'s fixpoint so a daemon save ack fires its
+    /// events in the same convergence.
     pub(crate) fn drain_write_events(&mut self) {
         let writes = self.editor.take_write_events();
         if writes.is_empty() {
             return;
         }
-        for (buf, path) in writes {
-            let path = path.display().to_string();
-            self.fire_buf_write(buf, &path);
+        for we in writes {
+            let path = we.path.display().to_string();
+            if we.fire_pre {
+                self.fire_buf_write_pre(we.buffer, &path);
+            }
+            self.fire_buf_write_post(we.buffer, &path);
         }
-        // `fire_buf_write` points the Lua snapshot (`nx._cur_buf`) at the *written*
-        // buffer, which for a `:wall` may not be the current one — re-seed it to the
-        // editor's actual current buffer so a later `expand('%')` / `nvim_buf_get_name(0)`
-        // isn't left reading the last-written buffer.
+        self.reseed_cur_snapshot();
+    }
+
+    /// Re-seed the Lua snapshot (`nx._cur_buf`) at the editor's *current* buffer after a
+    /// write drain: firing a write autocmd points the snapshot at the written buffer,
+    /// which for a `:wall` may not be the current one, so a later `expand('%')` /
+    /// `nvim_buf_get_name(0)` would otherwise read the last-written buffer.
+    fn reseed_cur_snapshot(&mut self) {
         let cur = self.editor.current_buffer_id();
         let name = self.editor.buffer_name(cur).unwrap_or_default();
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");

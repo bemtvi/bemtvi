@@ -35,7 +35,7 @@ Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a 
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
-| `BufWritePre` | At a write's autocmd point (`:w`, `:wall`, and finalized off-tick saves), just before `BufWritePost` — but **after** the bytes are already on disk: the core writes synchronously and Lua fires at convergence, so a handler cannot transform what is written. | `match` / `file` is the path; glob-matchable (`*.rs`). The firing order (`Pre` → `Post`) and buffer context match neovim; only the relation to the disk write differs. |
+| `BufWritePre` | **Before** the buffer is serialized to disk, on a `:w` / `:wq` / `:x`. A handler may mutate the buffer (format-on-save, trim trailing whitespace) and the mutation is what gets written — vim's pre-write contract. | `match` / `file` is the path; glob-matchable (`*.rs`). The buffer is still `modified` here (it is clean by `BufWritePost`). Firing order is `Pre` → *write* → `Post`. Caveat: `:wall` and finalized off-tick (daemon/web) saves still fire `BufWritePre` *after* the bytes for now — the multi-buffer/remote pre-write split is in progress. |
 | `BufWrite` | Same point as `BufWritePre` — the bare-name spelling. | An alias for `BufWritePre` (see [Event aliases](#event-aliases)); handlers on both spellings fire once. |
 | `BufWritePost` | After a successful write. | The hook "reload affected tools" plugins use. |
 

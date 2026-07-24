@@ -19,7 +19,10 @@
 use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
-use nxvim_test_harness::{await_lines, exec_lua, feed, message_of, spawn_with_daemon_fs, DaemonFs};
+use nxvim_test_harness::{
+    await_lines, config_init, exec_lua, feed, message_of, spawn_with_daemon_fs,
+    spawn_with_daemon_fs_init, temp_dir, DaemonFs,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Whether the current buffer reports `modified` (the mirrored `vim.bo.modified`).
@@ -242,6 +245,36 @@ async fn write_pushes_edited_bytes_over_the_wire_and_clears_modified_on_ack() {
     assert!(
         !modified(&rpc).await,
         "the modified flag clears only after the daemon acks the write"
+    );
+}
+
+/// Over the wire, `:w` fires `BufWritePre` **once**, *before* the bytes are pushed — so
+/// a handler's buffer mutation is what the daemon receives (tier-1 remote parity with
+/// the local path), and the ack does **not** re-fire `BufWritePre`.
+#[tokio::test]
+async fn offtick_bufwritepre_fires_once_before_the_wire_write() {
+    let dir = temp_dir("daemon_bufwritepre");
+    let fake = DaemonFs::with("/virtual/n.txt", "hello\n");
+    let mut init = config_init(
+        &dir,
+        "_G.pre = 0\n\
+         vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function() _G.pre = _G.pre + 1; vim.cmd([[%s/hello/HELLO/]]) end })\n",
+    );
+    init.file = Some("/virtual/n.txt".to_string());
+    let (rpc, _incoming) = spawn_with_daemon_fs_init(fake.clone(), init).await;
+    await_lines(&rpc, &["hello"]).await;
+
+    feed(&rpc, ":w<CR>");
+
+    // The daemon receives the *mutated* bytes — proof `BufWritePre` ran before the wire
+    // write, not after (a stub can't invent "HELLO", and `/virtual/...` isn't local disk).
+    await_daemon_content(&fake, "/virtual/n.txt", "HELLO\n").await;
+    // …and it fired exactly once (the ack path did not fire a second `BufWritePre`).
+    assert_eq!(
+        exec_lua(&rpc, "return _G.pre").await.as_i64(),
+        Some(1),
+        "BufWritePre fires once per off-tick `:w`, before the bytes cross the wire"
     );
 }
 

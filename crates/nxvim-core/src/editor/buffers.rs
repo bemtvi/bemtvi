@@ -42,6 +42,53 @@ pub struct PendingSave {
     /// bytes are safely on the remote — an unflushed write is never silently
     /// abandoned by an exiting editor.
     pub then_quit: Option<bool>,
+    /// Whether the ack still needs to fire `BufWritePre` (before `BufWritePost`).
+    /// `false` for a single-buffer `:w` / `:wq`, whose `BufWritePre` already fired
+    /// synchronously *before* the enqueue (via the pre-write drain), so the buffer the
+    /// daemon received is already post-`BufWritePre` — matching the local path. `true`
+    /// for the multi-buffer `:wall`, which enqueues directly and has not fired it yet.
+    pub fire_pre: bool,
+}
+
+/// A write the editor recorded but has **not yet committed** — the pre-write intent
+/// that lets `BufWritePre` fire (and, in the async model, settle) *before* the bytes
+/// are serialized, matching vim's contract. `:w` / `:wq` / `:wall` push one of these
+/// per buffer instead of writing inline; the server fires `BufWritePre`, waits for its
+/// handlers, then calls [`Editor::commit_pre_write`], which performs the actual disk
+/// write (or off-tick [`enqueue_save_of`](Editor::enqueue_save_of)) and records the
+/// completed write for `BufWritePost`. Drained by the server with
+/// [`Editor::take_pending_pre_writes`].
+pub struct PreWrite {
+    /// The buffer to write. Targeted by id so a `:wall` of a non-current buffer commits
+    /// the right one even if focus moved between the intent and the commit.
+    pub buffer: BufferId,
+    /// The resolved `:w {name}` target, or `None` to write the buffer's own bound path.
+    pub path: Option<PathBuf>,
+    /// A quit to run once the write commits: `Some(bang)` for `:wq` / `:x` (run
+    /// `:q` / `:q!`), `None` for a plain `:w`. Deferred to the commit so the window
+    /// closes only after the (possibly `BufWritePre`-delayed) write lands.
+    pub then_quit: Option<bool>,
+    /// Whether the per-file `"{name}" {lines}L, {bytes}B written` echo fires on commit.
+    /// `:w` reports; `:wall` suppresses it (it prints its own `N buffer(s) written`
+    /// summary), matching vim. A *failed* write always echoes its error regardless.
+    pub report: bool,
+}
+
+/// A completed write the server fires the write autocmds for. Recording the finished
+/// write (rather than firing inline) keeps `nxvim-core` free of event types, exactly as
+/// the buffer-lifecycle diff does for `BufEnter`/`FileType`. `fire_pre` distinguishes
+/// the two producers: a synchronous commit already fired `BufWritePre` from the
+/// pre-write drain (so only `BufWritePost` remains), whereas the off-tick save ack
+/// ([`Editor::finalize_save`]) has not, so it still fires both.
+pub struct WriteEvent {
+    /// The buffer that was written (resolves `vim.bo.filetype` / the snapshot for the
+    /// autocmd, and `<abuf>`).
+    pub buffer: BufferId,
+    /// The path written — the autocmd's `<afile>` / `match` (glob-matchable, `*.rs`).
+    pub path: PathBuf,
+    /// Fire `BufWritePre` before `BufWritePost` for this write. `false` once the
+    /// pre-write drain already fired (and settled) `BufWritePre`.
+    pub fire_pre: bool,
 }
 
 /// A `:wqa` / `:xa` quit the editor **deferred** until every write of a multi-buffer
@@ -780,29 +827,23 @@ impl Editor {
         std::mem::take(&mut self.pending_saves)
     }
 
-    /// Snapshot the current buffer for an off-tick write to `path` (the `:w` target,
-    /// already resolved) and enqueue it. The saved-state is **not** touched here —
-    /// `modified`, `save_tick`, and the `disk` baseline change only on the ack
-    /// ([`Editor::finalize_save`]), so a write that fails or never acks leaves the
-    /// buffer honestly dirty. `then_quit` carries a deferred `:wq` / `:x`. Returns the
-    /// minted [`PendingSave::seq`] so a multi-buffer `:wqa` can gate its quit on the
-    /// whole batch (the single-buffer `:w` caller ignores it). `None` when the buffer's
-    /// text can't be encoded to its `'fileencoding'`: the failure is echoed and nothing
-    /// is enqueued (so a `:wq`'s deferred quit never fires — the file is untouched and
-    /// the buffer stays honestly dirty), matching the synchronous `:w` fail-loud path.
-    pub(crate) fn enqueue_save(&mut self, path: PathBuf, then_quit: Option<bool>) -> Option<u64> {
-        self.enqueue_save_of(self.cur_buffer(), path, then_quit)
-    }
-
-    /// Snapshot a *specific* buffer for an off-tick write (the multi-buffer `:wall` path,
-    /// which writes every modified buffer, not just the current one). The single-buffer
-    /// [`Editor::enqueue_save`] is this for `cur_buffer()`. `None` (with the error echoed)
-    /// when the buffer can't be encoded to its `'fileencoding'`.
+    /// Snapshot a *specific* buffer for an off-tick write and enqueue it. The saved-state
+    /// is **not** touched here — `modified`, `save_tick`, and the `disk` baseline change
+    /// only on the ack ([`Editor::finalize_save`]), so a write that fails or never acks
+    /// leaves the buffer honestly dirty. `then_quit` carries a deferred `:wq` / `:x`.
+    /// Returns the minted [`PendingSave::seq`] so a multi-buffer `:wqa` can gate its quit
+    /// on the whole batch (the single-buffer `:w` caller ignores it). `None` (with the
+    /// error echoed) when the buffer can't be encoded to its `'fileencoding'`: nothing is
+    /// enqueued (so a `:wq`'s deferred quit never fires — the file is untouched and the
+    /// buffer stays honestly dirty), matching the synchronous `:w` fail-loud path. The
+    /// single-buffer `:w` / `:wq` reaches this via [`Editor::commit_pre_write`] (after its
+    /// `BufWritePre` fires); the multi-buffer `:wall` calls it per modified buffer.
     pub(crate) fn enqueue_save_of(
         &mut self,
         buffer: BufferId,
         path: PathBuf,
         then_quit: Option<bool>,
+        fire_pre: bool,
     ) -> Option<u64> {
         // Encode at snapshot time so an unrepresentable character fails loud *here*,
         // before anything is enqueued — never a silently-mangled write off the tick.
@@ -826,6 +867,7 @@ impl Editor {
             bytes,
             lines,
             then_quit,
+            fire_pre,
         });
         Some(seq)
     }
@@ -843,7 +885,16 @@ impl Editor {
     /// only once the bytes are confirmed on the remote. A no-op if the buffer was
     /// closed while the write was in flight (nothing to finalize). The server emits
     /// the `written` echo and replays any deferred quit; this only touches core state.
-    pub fn finalize_save(&mut self, buffer: BufferId, path: PathBuf, stat: Option<FileStat>) {
+    /// `fire_pre` (from the acked [`PendingSave`]) asks the server to fire `BufWritePre`
+    /// before `BufWritePost`: `false` for a single-buffer `:w` / `:wq` that fired it
+    /// before enqueuing, `true` for a `:wall` that has not.
+    pub fn finalize_save(
+        &mut self,
+        buffer: BufferId,
+        path: PathBuf,
+        stat: Option<FileStat>,
+        fire_pre: bool,
+    ) {
         if !self.buffers.map.contains_key(&buffer) {
             return;
         }
@@ -852,9 +903,83 @@ impl Editor {
             .buffer
             .mark_written(path.clone(), stat);
         self.mark_undo_saved(buffer);
-        // Record the (now-acked) write so the server fires `BufWritePre`/`BufWritePost`,
-        // exactly as the synchronous `:w` path does — a daemon save fires the same events.
-        self.record_write(buffer, path);
+        // Record the (now-acked) write so the server fires the write autocmds. A
+        // single-buffer `:w` / `:wq` already fired `BufWritePre` before enqueuing
+        // (`fire_pre = false` — only `BufWritePost` remains); a `:wall` did not, so it
+        // still fires both here.
+        self.record_write(buffer, path, fire_pre);
+    }
+
+    /// Drain the pre-write intents recorded this tick (`:w` / `:wall`), each a
+    /// [`PreWrite`] the server fires (and awaits) `BufWritePre` for before calling
+    /// [`commit_pre_write`](Self::commit_pre_write). Empty (a cheap no-op) when no write
+    /// was requested.
+    pub fn take_pending_pre_writes(&mut self) -> Vec<PreWrite> {
+        std::mem::take(&mut self.pending_pre_writes)
+    }
+
+    /// Whether any pre-write intent is queued — the server's fixpoint loop checks this so
+    /// a `:w` driven from an autocmd / user command still drives its write in the same
+    /// convergence.
+    pub fn has_pending_pre_writes(&self) -> bool {
+        !self.pending_pre_writes.is_empty()
+    }
+
+    /// Commit a [`PreWrite`] the server has already fired (and settled) `BufWritePre`
+    /// for: serialize the buffer to disk (or, off-tick, snapshot + enqueue it), record
+    /// the completed write for `BufWritePost` (`fire_pre = false` — the pre already
+    /// fired), and run any deferred `:wq` / `:x` quit. This is the second half of a
+    /// write, split from the `:w` command so a `BufWritePre` handler's buffer mutation
+    /// (format / trim-on-save) lands in what gets written.
+    pub fn commit_pre_write(&mut self, pw: PreWrite) {
+        let PreWrite {
+            buffer,
+            path,
+            then_quit,
+            report,
+        } = pw;
+        // Off-tick (daemon session): snapshot + enqueue rather than touch the fs. The
+        // server echoes the `written` message and finalizes the saved-state on the ack.
+        if self.host_fs_offtick {
+            match path.or_else(|| self.buffers.get(buffer).buffer.path.clone()) {
+                // `BufWritePre` already fired (before this commit), so the ack fires only
+                // `BufWritePost` (`fire_pre = false`) — the same pre→bytes→post order as
+                // the local path, carried over the wire.
+                Some(target) => {
+                    self.enqueue_save_of(buffer, target, then_quit, false);
+                }
+                None => self.echo("E32: No file name"),
+            }
+            return;
+        }
+        let fs = self.host_fs.clone();
+        match self.buffers.get_mut(buffer).buffer.write(path, &*fs) {
+            Ok((bytes, lines)) => {
+                // The current state is now what's on disk — undoing/redoing back to it
+                // should read as clean, and the saved node carries a save number.
+                self.mark_undo_saved(buffer);
+                let written_path = self.buffers.get(buffer).buffer.path.clone();
+                if report {
+                    let name = written_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
+                }
+                // Record the completed write so the server fires `BufWritePost` (the
+                // pre-write drain already fired `BufWritePre`).
+                if let Some(p) = written_path {
+                    self.record_write(buffer, p, false);
+                }
+            }
+            Err(e) => self.echo(e.to_string()),
+        }
+        // The deferred companion to `:wq` / `:x`: close the window (or quit) right after
+        // the write lands. A failed write leaves the buffer modified, so a last-window
+        // quit reports E37 — same as the old inline path.
+        if let Some(bang) = then_quit {
+            self.ex_quit(bang);
+        }
     }
 
     /// Drain the opens the editor deferred this tick (off-tick mode — `:edit` over the
@@ -885,20 +1010,25 @@ impl Editor {
         std::mem::take(&mut self.loaded_in_place)
     }
 
-    /// Record a completed write of `buffer` to `path` for the server to fire
-    /// `BufWritePre` / `BufWritePost` on (the pure core can't drive a Lua autocmd).
-    /// Called from the synchronous `:w` / `:wall` write path and from the off-tick
-    /// [`Editor::finalize_save`] ack, so a write fires the same events however it
-    /// reached disk. A path-less buffer never writes, so this is only ever called
-    /// with a real target.
-    pub(crate) fn record_write(&mut self, buffer: BufferId, path: PathBuf) {
-        self.write_events.push((buffer, path));
+    /// Record a completed write of `buffer` to `path` for the server to fire the write
+    /// autocmds on (the pure core can't drive a Lua autocmd). `fire_pre` asks the server
+    /// to fire `BufWritePre` before `BufWritePost`: `false` for a synchronous commit
+    /// ([`commit_pre_write`](Self::commit_pre_write)), which already fired `BufWritePre`
+    /// from the pre-write drain; `true` for the off-tick [`Editor::finalize_save`] ack,
+    /// which has not. A path-less buffer never writes, so this is only ever called with
+    /// a real target.
+    pub(crate) fn record_write(&mut self, buffer: BufferId, path: PathBuf, fire_pre: bool) {
+        self.write_events.push(WriteEvent {
+            buffer,
+            path,
+            fire_pre,
+        });
     }
 
-    /// Drain the buffers written this tick (a successful `:w` / `:wall` or a finalized
-    /// off-tick save), each a `(buffer, path)` the server fires `BufWritePre` /
-    /// `BufWritePost` for. Empty (a cheap no-op) when nothing was written.
-    pub fn take_write_events(&mut self) -> Vec<(BufferId, PathBuf)> {
+    /// Drain the writes completed this tick (a committed `:w` / `:wall` or a finalized
+    /// off-tick save), each a [`WriteEvent`] the server fires the write autocmds for.
+    /// Empty (a cheap no-op) when nothing was written.
+    pub fn take_write_events(&mut self) -> Vec<WriteEvent> {
         std::mem::take(&mut self.write_events)
     }
 

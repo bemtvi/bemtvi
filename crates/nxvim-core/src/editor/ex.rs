@@ -2521,64 +2521,45 @@ impl Editor {
         } else {
             Some(PathBuf::from(args))
         };
-        // Off-tick save (daemon session): resolve the target (arg, else bound path),
-        // snapshot, and enqueue — the disk-change guard and the actual write happen
-        // off the editor tick. The guard can't run here anyway: it needs a remote
-        // stat, which we've sworn off on the tick (a `HostWatch`-driven check is a
-        // later slice); a deferred quit rides the pending save until its ack.
+        // Off-tick save (daemon session): the disk-change guard can't run here — it
+        // needs a remote stat we've sworn off the tick (a `HostWatch`-driven check is a
+        // later slice) — so we only reject a path-less write up front. The actual
+        // snapshot + enqueue happens in `commit_pre_write`, after `BufWritePre`.
         if self.host_fs_offtick {
-            match path.or_else(|| self.buffer().path.clone()) {
-                Some(target) => {
-                    self.enqueue_save(target, then_quit);
-                }
-                None => self.echo("E32: No file name"),
+            if path.is_none() && self.buffer().path.is_none() {
+                self.echo("E32: No file name");
+                return;
             }
-            return;
+        } else {
+            // Refuse to overwrite a file that changed on disk since we read or last
+            // saved it, unless forced with `:w!`. The guard only applies to a write to
+            // the buffer's *own* file — `:w other-name` targets a different file the
+            // buffer's disk snapshot says nothing about (that's E13 territory, not
+            // handled here). `:w!` skips the check and clobbers, as in vim. A refused
+            // write records no intent, so it fires no `BufWritePre`/`BufWritePost`.
+            let writes_own_file = match &path {
+                None => true,
+                Some(p) => self.buffer().path.as_deref() == Some(p.as_path()),
+            };
+            let fs = self.host_fs.clone();
+            if !bang && writes_own_file && self.buffer().disk_changed(&*fs) {
+                self.echo(
+                    "WARNING: The file has changed on disk since editing started (add ! to override)",
+                );
+                return;
+            }
         }
-        // Refuse to overwrite a file that changed on disk since we read or last
-        // saved it, unless forced with `:w!`. The guard only applies to a write to
-        // the buffer's *own* file — `:w other-name` targets a different file the
-        // buffer's disk snapshot says nothing about (that's E13 territory, not
-        // handled here). `:w!` skips the check and clobbers, as in vim.
-        let writes_own_file = match &path {
-            None => true,
-            Some(p) => self.buffer().path.as_deref() == Some(p.as_path()),
-        };
-        let fs = self.host_fs.clone();
-        if !bang && writes_own_file && self.buffer().disk_changed(&*fs) {
-            self.echo(
-                "WARNING: The file has changed on disk since editing started (add ! to override)",
-            );
-            return;
-        }
+        // Record the write instead of performing it: the server fires (and awaits)
+        // `BufWritePre`, then commits via `commit_pre_write` — so a handler's buffer
+        // mutation (format / trim-on-save) is what gets serialized. `then_quit` rides
+        // the intent so `:wq` / `:x` closes the window only after the write lands.
         let buffer = self.cur_buffer();
-        match self.buffer_mut().write(path, &*fs) {
-            Ok((bytes, lines)) => {
-                // The current state is now what's on disk — undoing/redoing back
-                // to it should read as clean, and the saved node carries a save
-                // number for `vim.fn.undotree()`.
-                self.mark_undo_saved(buffer);
-                let written_path = self.buffer().path.clone();
-                let name = written_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
-                // Record the write so the server fires `BufWritePre`/`BufWritePost`
-                // (a path-less buffer can't reach a successful `write`).
-                if let Some(p) = written_path {
-                    self.record_write(buffer, p);
-                }
-            }
-            Err(e) => self.echo(e.to_string()),
-        }
-        // The synchronous companion to a deferred quit: `:wq` / `:x` close the
-        // window (or quit) right after the write, exactly as the old call site did.
-        // (A failed write leaves the buffer modified, so a last-window quit reports
-        // E37 — same as before.)
-        if let Some(bang) = then_quit {
-            self.ex_quit(bang);
-        }
+        self.pending_pre_writes.push(PreWrite {
+            buffer,
+            path,
+            then_quit,
+            report: true,
+        });
     }
 
     /// `:q` / `<C-w>q` — close the focused window. Closing a float, or an ordinary
@@ -3018,7 +2999,9 @@ impl Editor {
                 if let (true, Some(path)) = (buf.modified, buf.path.clone()) {
                     // A buffer that can't be encoded to its `'fileencoding'` is skipped
                     // (the error is echoed inside `enqueue_save_of`); the rest still save.
-                    if let Some(seq) = self.enqueue_save_of(id, path, None) {
+                    // `:wall` enqueues directly (no pre-write drain), so the ack still
+                    // fires `BufWritePre` before `BufWritePost` (`fire_pre = true`).
+                    if let Some(seq) = self.enqueue_save_of(id, path, None, true) {
                         seqs.push(seq);
                     }
                 }
@@ -3044,10 +3027,12 @@ impl Editor {
                 // The written state is now the saved node (carries a save number).
                 self.mark_undo_saved(id);
                 written += 1;
-                // Fire `BufWritePre`/`BufWritePost` for each buffer that landed
-                // (it's modified and file-backed, so it has a path).
+                // Fire `BufWritePre`/`BufWritePost` for each buffer that landed (it's
+                // modified and file-backed, so it has a path). `:wall` still writes
+                // inline and fires both events *after* the bytes (`fire_pre = true`) —
+                // the pre-before-write split lands with the multi-buffer/async phase.
                 if let Some(path) = self.buffers.get(id).buffer.path.clone() {
-                    self.record_write(id, path);
+                    self.record_write(id, path, true);
                 }
             }
         }

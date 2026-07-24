@@ -3498,11 +3498,17 @@ impl EditHost {
                 reconciled = true;
                 self.reconcile_file_change(buf);
             }
-            // Buffers written this convergence (`:w` / `:wall`, or a finalized off-tick
-            // save): fire each one's `BufWritePre`/`BufWritePost`. Inside the fixpoint
-            // so a handler's queued `vim.cmd`/`:lua` drains in the same convergence, and
-            // a handler that itself writes (`vim.cmd('w')`) keeps the loop going via the
-            // `has_write_events` break check below.
+            // Pre-write intents recorded this convergence (`:w` / `:wq`): fire (and
+            // synchronously settle) `BufWritePre` before committing each write, so a
+            // handler's buffer mutation is what lands on disk. Ordered *before*
+            // `drain_write_events` so a commit's `BufWritePost` fires this same round.
+            self.drain_pre_writes();
+            // Writes completed this convergence (a committed `:w` / `:wall`, or a
+            // finalized off-tick save): fire each one's `BufWritePost` (and `BufWritePre`
+            // for the not-yet-fired off-tick ack). Inside the fixpoint so a handler's
+            // queued `vim.cmd`/`:lua` drains in the same convergence, and a handler that
+            // itself writes (`vim.cmd('w')`) keeps the loop going via the
+            // `has_pending_pre_writes`/`has_write_events` break checks below.
             self.drain_write_events();
             // `<C-w>d` / `<C-w><C-d>` (neovim's built-in "show diagnostics under the
             // cursor"): core recorded the chord on the keystroke; open the float here
@@ -3842,6 +3848,7 @@ impl EditHost {
                 && self.editor.complete_query_changes.is_empty()
                 && self.scheduled.is_empty()
                 && !self.editor.has_pending_checktime()
+                && !self.editor.has_pending_pre_writes()
                 && !self.editor.has_write_events()
             {
                 break;
@@ -3860,6 +3867,7 @@ impl EditHost {
                 self.editor.picker_query_changes.clear();
                 self.editor.complete_query_changes.clear();
                 self.editor.take_pending_checktime();
+                self.editor.take_pending_pre_writes();
                 self.editor.take_write_events();
                 self.scheduled.clear();
                 self.editor

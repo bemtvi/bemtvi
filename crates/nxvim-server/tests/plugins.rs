@@ -428,110 +428,101 @@ async fn init_accepts_an_async_function() {
     );
 }
 
-// ----- git is spawned non-interactively --------------------------------------
+// ----- a failed clone fails loud (never hangs) -------------------------------
 
-// A git that prompts for a password writes to /dev/tty and reads from it, which
-// corrupts the TUI and hangs the editor. The manager must run git non-interactively
-// so it never touches the terminal: it fails fast with a captured error instead.
-// Here a fake `git` records whether GIT_TERMINAL_PROMPT was passed; the manager must
-// set it to "0".
-#[cfg(unix)]
+// The manager runs git in-process via `nx.git_local` (gix — no `git` binary, so no
+// child process that could open /dev/tty and hang the editor on a credential prompt).
+// The invariant that guards is: an unreachable / invalid repo REJECTS loud with a
+// captured error, fast — never a silent success, never a hang. Here an install of a
+// bogus `file://` path must reject and surface its message.
 #[tokio::test]
-async fn git_runs_noninteractive_with_terminal_prompt_disabled() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn install_of_unreachable_repo_rejects_loud() {
     let (rpc, _i) = start().await;
-    let dir = temp_dir("plug_noninteractive");
-    let marker = dir.join("git_env.log");
-    let fake = dir.join("fakegit.sh");
-    // Record GIT_TERMINAL_PROMPT for every invocation; on `clone`, create the
-    // destination dir (the last argv) so the manager's later steps don't error.
-    std::fs::write(
-        &fake,
-        format!(
-            "#!/bin/sh\n\
-             printf '%s\\n' \"${{GIT_TERMINAL_PROMPT-UNSET}}\" >> \"{marker}\"\n\
-             if [ \"$1\" = clone ]; then for a in \"$@\"; do dest=\"$a\"; done; mkdir -p \"$dest\"; fi\n\
-             exit 0\n",
-            marker = q(&marker)
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+    let dir = temp_dir("plug_bad_clone");
     let root = dir.join("install");
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\", git = \"{git}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
              nx.plugins {{ {{ \"file:///no/such/repo\", name = \"zeta\" }} }}\n\
-             nx.plugins.install():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+             nx.plugins.install():next(\n\
+               function() _G.err = false end,\n\
+               function(e) _G.err = tostring(e and e.message or e) end)",
             root = q(&root),
-            git = q(&fake)
         ),
     )
     .await;
 
-    for _ in 0..200 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let logged = std::fs::read_to_string(&marker).unwrap_or_default();
     assert!(
-        logged.lines().any(|l| l == "0"),
-        "git must be spawned with GIT_TERMINAL_PROMPT=0 so it never prompts on the \
-         terminal (recorded values: {logged:?})"
+        poll_true(&rpc, "return type(_G.err) == 'string'").await,
+        "install of an unreachable repo must reject loud; _G.err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    // The rejection carries a git-failure message (not a silent empty resolve).
+    let msg = exec_lua(&rpc, "return _G.err").await;
+    assert!(
+        msg.as_str()
+            .map(|s| s.contains("clone failed"))
+            .unwrap_or(false),
+        "the reject should name the failed clone; got {msg:?}"
     );
 }
 
-// ----- submodules are initialised on install and update ----------------------
+// ----- submodules are initialised on install --------------------------------
 
-// A plugin may vendor its dependencies as git submodules. The manager clones with
-// `--recurse-submodules` and, on update, runs `git submodule update --init
-// --recursive`, so a submodule-bearing plugin lands complete (never a half-cloned
-// checkout missing its vendored deps). It is DEFAULT ON; `submodules = false` opts a
-// plugin out (skipping the extra git work for one you know has none). A fake `git`
-// logs each invocation's argv so we can assert on the exact commands the manager ran
-// — and, crucially, that the opt-out plugin's clone omits the recurse flag.
-#[cfg(unix)]
+// Build a plugin repo at `<base>/<name>.git-src` that vendors `sub` as a git submodule
+// at `vendored/`. Returns its path. (`-c protocol.file.allow=always` lets `git
+// submodule add` use the local sub path; the manager's own gix clone is unaffected.)
+fn make_repo_with_submodule(base: &Path, name: &str, sub: &Path) -> PathBuf {
+    let repo = make_repo(base, name);
+    git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &sub.to_string_lossy(),
+            "vendored",
+        ],
+    );
+    git(&repo, &["commit", "-q", "-m", "add submodule"]);
+    repo
+}
+
+// A plugin may vendor its dependencies as git submodules. On install the manager runs
+// the equivalent of `git submodule update --init --recursive`, so a submodule-bearing
+// plugin lands COMPLETE (its vendored files really on disk). It is DEFAULT ON;
+// `submodules = false` opts a plugin out — its submodule dir then stays empty. This is
+// a real behavior test (gix in-process, no argv to inspect): assert the vendored file's
+// presence, and its absence for the opted-out plugin.
 #[tokio::test]
-async fn submodules_are_recursed_on_install_and_update() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn submodules_are_initialised_on_install() {
     let (rpc, _i) = start().await;
-    let dir = temp_dir("plug_submodules");
-    let log = dir.join("git_argv.log");
-    let fake = dir.join("fakegit.sh");
-    // Log every invocation's argv (space-joined), and on `clone` create the
-    // destination dir (the last argv) so the manager's later steps don't error.
-    std::fs::write(
-        &fake,
-        format!(
-            "#!/bin/sh\n\
-             printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [ \"$1\" = clone ]; then for a in \"$@\"; do dest=\"$a\"; done; mkdir -p \"$dest\"; fi\n\
-             exit 0\n",
-            log = q(&log)
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let base = temp_dir("plug_submodules");
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
 
-    let root = dir.join("install");
-    // One default (submodules on) plugin and one that opts out.
+    // A standalone sub-repo with a vendored file, embedded in two plugin repos.
+    let sub = make_repo(&src, "vendored_dep");
+    let withsub = make_repo_with_submodule(&src, "withsub", &sub);
+    let nosub = make_repo_with_submodule(&src, "nosub", &sub);
+
+    let root = base.join("install");
+    let root_s = root.to_string_lossy().to_string();
+    // Default (submodules on) vs opted-out.
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\", git = \"{git}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
              nx.plugins {{\n\
-               {{ \"file:///no/such/withsub\", name = \"withsub\" }},\n\
-               {{ \"file:///no/such/nosub\", name = \"nosub\", submodules = false }} }}\n\
+               {{ \"file://{withsub}\", name = \"withsub\" }},\n\
+               {{ \"file://{nosub}\", name = \"nosub\", submodules = false }} }}\n\
              nx.plugins.sync():next(function() _G.synced = true end)\n\
                :catch(function(e) _G.err = tostring(e and e.message or e) end)",
             root = q(&root),
-            git = q(&fake)
+            withsub = q(&withsub),
+            nosub = q(&nosub),
         ),
     )
     .await;
@@ -542,37 +533,27 @@ async fn submodules_are_recursed_on_install_and_update() {
         exec_lua(&rpc, "return _G.err").await
     );
 
-    let logged = std::fs::read_to_string(&log).unwrap_or_default();
-    let clone_line = |name: &str| -> String {
-        logged
-            .lines()
-            .find(|l| l.starts_with("clone ") && l.ends_with(&format!("/{name}")))
-            .unwrap_or_else(|| panic!("no clone line for {name} in {logged:?}"))
-            .to_string()
-    };
-
-    // The default plugin clones WITH --recurse-submodules and, on the update pass,
-    // runs a recursive submodule update.
+    // The default plugin's submodule was initialised — its vendored file is present.
+    let withsub_dep = Path::new(&root_s)
+        .join("withsub")
+        .join("vendored")
+        .join("lua")
+        .join("vendored_dep")
+        .join("init.lua");
     assert!(
-        clone_line("withsub").contains("--recurse-submodules"),
-        "a default plugin must clone with --recurse-submodules (got: {:?})",
-        clone_line("withsub")
+        withsub_dep.exists(),
+        "a default plugin must have its submodule checked out at {withsub_dep:?}"
     );
-    let submodule_updates = logged
-        .lines()
-        .filter(|l| l == &"submodule update --init --recursive")
-        .count();
-    assert_eq!(
-        submodule_updates, 1,
-        "exactly the one default plugin's update runs `submodule update --init \
-         --recursive` (the opted-out plugin must not); log: {logged:?}"
-    );
-
-    // The opted-out plugin's clone omits the flag entirely.
+    // The opted-out plugin's submodule stayed empty (no submodule_update ran).
+    let nosub_dep = Path::new(&root_s)
+        .join("nosub")
+        .join("vendored")
+        .join("lua")
+        .join("vendored_dep")
+        .join("init.lua");
     assert!(
-        !clone_line("nosub").contains("--recurse-submodules"),
-        "submodules = false must omit --recurse-submodules (got: {:?})",
-        clone_line("nosub")
+        !nosub_dep.exists(),
+        "submodules = false must leave the submodule un-initialised (found {nosub_dep:?})"
     );
 }
 

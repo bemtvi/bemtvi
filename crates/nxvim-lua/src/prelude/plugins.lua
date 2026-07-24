@@ -3,7 +3,8 @@
 -- The extensibility half of ADR 0002 / docs/specs/2026-06-11-native-plugin-api.md:
 -- there is no third-party plugin-manager layer because the manager is BUILT IN.
 -- You DECLARE a set of plugins in init.lua; the manager clones/updates them over
--- the async runtime (`nx.run` driving real `git`) and LOADS each one — adds its
+-- the async runtime (`nx.git_local.*` — first-party gix, no `git` binary) and LOADS
+-- each one — adds its
 -- directory to the runtimepath (`nx._add_rtp`, so `require` and the plugin's
 -- `colors/` / `queries/` / `lsp/` resolve without a restart), sources its
 -- `plugin/` + `after/plugin/` scripts, and runs its `config` — either EAGERLY at
@@ -11,13 +12,13 @@
 --
 -- Nothing blocks (ADR 0002 rule 3): every install/source step is a promise, so the
 -- UI paints before plugins finish loading. Loaded LAST in the prelude — it builds
--- on nx.run / nx.fs / nx.promise / nx.async / nx.command / nx.keymap / nx.on /
+-- on nx.git / nx.fs / nx.promise / nx.async / nx.command / nx.keymap / nx.on /
 -- nx.notify, all installed above.
 --
 -- Management runs on the LOCAL disk even in a daemon / remote-config session (plugins
 -- load into the local Lua VM via the local runtimepath): the clone / discover / source
--- ops go through the local-always seams (`lfs` / `local_run` below), NOT the session's
--- `nx.fs` / `nx.run`. See docs/plans/2026-07-03-remote-aware-plugin-manager.md.
+-- ops go through the local-always seams (`lfs` / `lgit` below), NOT the session's
+-- `nx.fs` / `nx.git`. See docs/plans/2026-07-03-remote-aware-plugin-manager.md.
 
 nx.plugins = nx.plugins or {}
 local M = nx.plugins
@@ -62,14 +63,14 @@ M._watchers = M._watchers or {} -- on_change callbacks, fired on any state trans
 -- Runtime plugin code is untouched: a loaded plugin's own `nx.fs` / `nx.run` still route to
 -- the session (remote), because it edits the remote's files. See
 -- docs/plans/2026-07-03-remote-aware-plugin-manager.md.
--- The manager's fs + proc use the public LOCAL-ALWAYS seam (prelude/localseam.lua):
--- `nx.fs_local` / `nx.run_local`, the twins of `nx.fs` / `nx.run` forced onto the client
--- disk. A plugin loads into THIS (local) Lua VM via the local runtimepath, so the manager
--- must clone / discover / source locally even in a daemon session (the session's `nx.fs` /
--- `nx.run` route to the *remote*, where the plugin would be cloned but never loaded). Runtime
--- plugin code that edits the remote's files still uses the session-routed `nx.fs` / `nx.run`.
+-- The manager's fs + git use the public LOCAL-ALWAYS seams: `nx.fs_local` and
+-- `nx.git_local`, the twins of `nx.fs` / `nx.git` forced onto the client disk. A plugin
+-- loads into THIS (local) Lua VM via the local runtimepath, so the manager must clone /
+-- discover / source locally even in a daemon session (the session's `nx.fs` / `nx.git`
+-- route to the *remote*, where the plugin would be cloned but never loaded). Runtime
+-- plugin code that edits the remote's files still uses the session-routed `nx.fs`.
 local lfs = nx.fs_local
-local local_run = nx.run_local
+local lgit = nx.git_local
 
 -- Fire every change watcher (a load completing, a task transitioning). Wrapped in
 -- pcall so one bad observer can't break the manager. The UI uses this to re-render.
@@ -107,30 +108,7 @@ M._opts = M._opts
     root = nil, -- resolved lazily (stdpath("data")/plugins) on first use
     -- "owner/repo" shorthand expands through this. `%s` is the shorthand.
     github = "https://github.com/%s.git",
-    -- The git executable. Configurable so a test can point it at a fake, and a
-    -- user can pin a specific git.
-    git = "git",
   }
-
--- The environment EVERY git invocation runs with — forced non-interactive so git
--- can never block the editor or scribble its credential prompt onto the terminal.
---
--- A child process shares the editor's controlling terminal, so a git that wants a
--- password would open `/dev/tty` directly (bypassing the stdout/stderr pipes we
--- capture), corrupting the TUI and hanging on a read that never comes. These knobs
--- make git fail FAST with a message on stderr — which we capture and surface
--- through `nx.notify` — instead:
---   * GIT_TERMINAL_PROMPT=0  — never prompt for credentials on the terminal.
---   * GIT_SSH_COMMAND=…BatchMode=yes — ssh never prompts for a password/passphrase
---     or an unknown-host confirmation; it errors instead.
---   * GCM_INTERACTIVE=never  — the Git Credential Manager stays silent.
--- (Env is MERGED onto the inherited environment by the spawn seam, so PATH etc.
--- are untouched.)
-local GIT_ENV = {
-  GIT_TERMINAL_PROMPT = "0",
-  GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10",
-  GCM_INTERACTIVE = "never",
-}
 
 -- The install root, resolved lazily so a test can override it via setup_manager{}
 -- before first use without depending on the host's data dir.
@@ -635,8 +613,30 @@ end
 
 -- ----- git operations ---------------------------------------------------------
 
-local function git(args, cwd)
-  return local_run({ cmd = M._opts.git, args = args, cwd = cwd, env = GIT_ENV })
+-- Await one `nx.git_local.*` promise for plugin `name`'s `op` task (`verb` names the
+-- git action for the message). On a reject — every git verb rejects with a `{ code,
+-- message }` — mark the task errored and re-raise loud (a failed step must never look
+-- like a half-installed success). Returns the resolved value on success.
+local function git_step(name, op, verb, promise)
+  local ok, res = pcall(nx.await, promise)
+  if not ok then
+    local msg = (type(res) == "table" and res.message) or tostring(res)
+    set_task(name, op, "error", msg)
+    error("nx.plugins: git " .. verb .. " failed for " .. name .. ": " .. msg, 0)
+  end
+  return res
+end
+
+-- Init + recursively check out `name`'s submodules to the commits its tree pins (like
+-- `git submodule update --init --recursive`). gix's clone does NOT recurse submodules,
+-- so this is a distinct step — a no-op for a plugin with none.
+local function update_submodules(name, op, dir)
+  git_step(
+    name,
+    op,
+    "submodule update",
+    lgit.submodule_update(dir, { init = true, recursive = true })
+  )
 end
 
 -- Clone `name` if missing. Resolves a status string: "local" (a `dir` dev plugin,
@@ -653,57 +653,33 @@ function M._install(name)
     end
     set_task(name, "install", "running", "cloning")
     nx.await(lfs.mkdir(root(), { recursive = true }))
-    local args = { "clone", "--filter=blob:none" }
-    local ref = spec.branch or spec.tag
-    if ref then
-      args[#args + 1] = "--branch"
-      args[#args + 1] = ref
+    -- Shallow (depth 1) unless we must reach an arbitrary pinned commit, which a
+    -- shallow clone may not contain; a branch/tag pins the ref to check out. (git's
+    -- `--filter=blob:none` has no gix analog — the shallow depth gives the same win.)
+    local opts = { branch = spec.branch or spec.tag }
+    if not spec.commit then
+      opts.depth = 1
+    end
+    git_step(name, "install", "clone", lgit.clone(spec.url, spec._dir, opts))
+    if spec.commit then
+      -- Detach onto the pinned commit (the full clone above guarantees it's present).
+      git_step(
+        name,
+        "install",
+        "checkout " .. spec.commit,
+        lgit.checkout(spec._dir, spec.commit, { detach = true })
+      )
     end
     if spec.submodules then
-      -- Fetch + check out the plugin's submodules as part of the clone, so a
-      -- submodule-bearing plugin lands complete. (A no-op for a plugin with none.)
-      args[#args + 1] = "--recurse-submodules"
-    end
-    if not spec.commit then
-      -- Shallow unless we must reach an arbitrary commit (which a shallow clone
-      -- may not contain).
-      args[#args + 1] = "--depth"
-      args[#args + 1] = "1"
-    end
-    args[#args + 1] = spec.url
-    args[#args + 1] = spec._dir
-    local res = nx.await(git(args))
-    if res.code ~= 0 then
-      set_task(name, "install", "error", res.stderr)
-      error("nx.plugins: git clone failed for " .. name .. ": " .. res.stderr, 0)
-    end
-    if spec.commit then
-      local co = nx.await(git({ "checkout", "--detach", spec.commit }, spec._dir))
-      if co.code ~= 0 then
-        set_task(name, "install", "error", co.stderr)
-        error(
-          "nx.plugins: git checkout " .. spec.commit .. " failed for " .. name .. ": " .. co.stderr,
-          0
-        )
-      end
-      if spec.submodules then
-        -- The clone's `--recurse-submodules` synced submodules to the clone's
-        -- default HEAD; after detaching onto an arbitrary commit they must be
-        -- re-synced to THAT commit's gitlinks.
-        local sm = nx.await(git({ "submodule", "update", "--init", "--recursive" }, spec._dir))
-        if sm.code ~= 0 then
-          set_task(name, "install", "error", sm.stderr)
-          error("nx.plugins: git submodule update failed for " .. name .. ": " .. sm.stderr, 0)
-        end
-      end
+      update_submodules(name, "install", spec._dir)
     end
     set_task(name, "install", "done", "installed")
     return "installed"
   end)()
 end
 
--- Fast-forward `name` to its remote. Resolves "local"/"pinned"/"missing"/"updated".
--- A pinned (commit/tag) or dev (`dir`) plugin is never moved.
+-- Fast-forward `name` to its remote. Resolves "local"/"pinned"/"missing"/"updated"/
+-- "uptodate". A pinned (commit/tag) or dev (`dir`) plugin is never moved.
 function M._update(name)
   local spec = M._specs[name]
   return nx.async(function()
@@ -717,27 +693,18 @@ function M._update(name)
       return "missing"
     end
     set_task(name, "update", "running", "pulling")
-    local res = nx.await(git({ "pull", "--ff-only" }, spec._dir))
-    if res.code ~= 0 then
-      set_task(name, "update", "error", res.stderr)
-      error("nx.plugins: git pull failed for " .. name .. ": " .. res.stderr, 0)
+    -- `pull` is fast-forward-only (rejects `ENOTFF` on a divergence) and resolves
+    -- `{ updated, sha }` — `updated` is false when the branch was already current.
+    local res = git_step(name, "update", "pull", lgit.pull(spec._dir))
+    if spec.submodules and res.updated then
+      -- Pick up any submodule bumps the fast-forward brought in; skipped when the pull
+      -- moved nothing (the gitlinks then can't have changed).
+      update_submodules(name, "update", spec._dir)
     end
-    if spec.submodules then
-      -- Pick up any submodule bumps the fast-forward brought in (a no-op when the
-      -- pull moved nothing, or the plugin has no submodules).
-      local sm = nx.await(git({ "submodule", "update", "--init", "--recursive" }, spec._dir))
-      if sm.code ~= 0 then
-        set_task(name, "update", "error", sm.stderr)
-        error("nx.plugins: git submodule update failed for " .. name .. ": " .. sm.stderr, 0)
-      end
-    end
-    -- "Already up to date." means no movement; show the calmer word so the UI does
-    -- not imply a change that did not happen.
-    local moved = not res.stdout:find("up to date", 1, true)
-    set_task(name, "update", "done", moved and "updated" or "up to date")
-    -- Only report a real fast-forward as "updated"; an already-current pull must
-    -- not inflate M.update()'s "updated N plugin(s)" count.
-    return moved and "updated" or "uptodate"
+    set_task(name, "update", "done", res.updated and "updated" or "up to date")
+    -- Only a real fast-forward counts as "updated" (so M.update()'s "updated N" count
+    -- stays honest); an already-current pull reports "uptodate".
+    return res.updated and "updated" or "uptodate"
   end)()
 end
 
@@ -896,16 +863,14 @@ local function clone_into_system(name, url, dir, target)
     if nx.await(lfs.exists(target)) then
       return
     end
-    local args
-    if dir ~= nil then
-      -- A dev checkout: a plain local clone captures its current state into the tier.
-      args = { "clone", dir, target }
-    else
-      args = { "clone", "--filter=blob:none", "--depth", "1", url, target }
-    end
-    local res = nx.await(git(args))
-    if res.code ~= 0 then
-      error("nx.plugins.system: git clone failed for " .. name .. ": " .. res.stderr, 0)
+    -- A dev `dir` checkout is captured in full (a plain local clone of its current
+    -- committed state); a managed `url` is a shallow clone (depth 1).
+    local source = dir or url
+    local opts = dir ~= nil and {} or { depth = 1 }
+    local ok, err = pcall(nx.await, lgit.clone(source, target, opts))
+    if not ok then
+      local msg = (type(err) == "table" and err.message) or tostring(err)
+      error("nx.plugins.system: git clone failed for " .. name .. ": " .. msg, 0)
     end
   end)()
 end

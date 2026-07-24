@@ -1865,8 +1865,20 @@ impl Editor {
             return;
         }
         self.push_undo_for(id);
-        // Highest start first: applying a later edit can't shift an earlier one.
-        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        // Highest start first: applying a later edit can't shift an earlier one. For
+        // edits that SHARE a start byte, apply them in REVERSE input order: the LSP
+        // spec lets several edits share a start (any number of inserts, then at most
+        // one remove/replace) and says their ARRAY order defines the resulting text.
+        // Each edit here is applied at its fixed original byte, so a second edit at the
+        // same byte lands BEFORE the first — reversing input order for the tie
+        // reproduces the array order. (A stable ascending-index tie, the naive choice,
+        // silently reverses N inserts at one point — e.g. a formatter's line-diff, two
+        // reformatted lines inserted at the same position, comes out with the lines
+        // swapped.)
+        let mut indexed: Vec<(usize, (std::ops::Range<usize>, String))> =
+            std::mem::take(&mut edits).into_iter().enumerate().collect();
+        indexed.sort_by(|(ia, (ra, _)), (ib, (rb, _))| rb.start.cmp(&ra.start).then(ib.cmp(ia)));
+        edits = indexed.into_iter().map(|(_, e)| e).collect();
         // Carry the live cursor through the edits the way neovim's `apply_text_edits`
         // does: an edit that ends *at or before* the cursor shifts it by the row/column
         // delta the replacement introduces, while an edit the cursor sits *inside* — or

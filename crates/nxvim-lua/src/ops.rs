@@ -246,6 +246,25 @@ pub enum LspOp {
         /// capabilities at `initialize` (Phase 2). `None` when the config adds none.
         capabilities: Option<serde_json::Value>,
     },
+    /// `nx.lsp.restart(name)` — tear down and respawn every running server with this
+    /// config `name`, so the fresh process picks up a config that changed since it
+    /// started (each bound buffer re-`didOpen`s under the new server). A no-op for a
+    /// name with nothing running. Used by config-driving plugins (e.g. efm-langserver,
+    /// whose language map is read only at spawn) to apply a grown config to an
+    /// already-live server. The current resolved config payloads ride along so the
+    /// respawn uses the config in force NOW — not a spawn cached before the change,
+    /// which an async root resolution may not have refreshed yet.
+    Restart {
+        /// The `nx.lsp.config('<name>', …)` name whose servers to restart.
+        name: String,
+        /// The config's `init_options` now (or `None` to keep the cached ones).
+        init_options: Option<serde_json::Value>,
+        /// The config's `settings` now (or `None` to keep the cached ones). This is
+        /// the field that typically grew — e.g. efm's `languages` map.
+        settings: Option<serde_json::Value>,
+        /// The config's `capabilities` now (or `None` to keep the cached ones).
+        capabilities: Option<serde_json::Value>,
+    },
     /// A `nx.lsp.*` language-feature request (definition, references,
     /// hover, …) on the current buffer. `kind` is `LspReqKind::as_u16` — the same
     /// int that rides the request token — so the wire stays one number; the server

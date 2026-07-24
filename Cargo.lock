@@ -2940,6 +2940,7 @@ dependencies = [
  "rmp-serde",
  "rmpv",
  "serde",
+ "serde_json",
  "tokio",
  "ureq",
  "vt100",

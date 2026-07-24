@@ -1908,6 +1908,32 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._lsp_restart(name, init_options, settings, capabilities)`: queue an
+    // [`LspOp::Restart`] — respawn every running server with this config name, using
+    // the config in force now, so it picks up a change made since it started (backs
+    // `nx.lsp.restart`).
+    let sh = shared.clone();
+    nx.set(
+        "_lsp_restart",
+        lua.create_function(
+            move |_,
+                  (name, init_options, settings, capabilities): (
+                String,
+                Option<Table>,
+                Option<Table>,
+                Option<Table>,
+            )| {
+                sh.borrow_mut().lsp_ops.push(LspOp::Restart {
+                    name,
+                    init_options: opt_table_to_json(init_options)?,
+                    settings: opt_table_to_json(settings)?,
+                    capabilities: opt_table_to_json(capabilities)?,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
     // `nx._feedkeys(keys, remap, insert)`: queue a [`FeedKeysOp`] for the server
     // to drain into its typeahead after the chunk. The Lua-facing
     // `nvim_feedkeys` (prelude) parses the mode flags into `remap`/`insert`.

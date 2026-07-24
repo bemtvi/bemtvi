@@ -24,6 +24,15 @@ impl EditHost {
             // `nx.lsp.*` verbs route into the existing native request paths. No
             // cursor threading: `request_lsp` reads `self.editor.cursor` here, on
             // the same input tick the Lua keymap RHS fired.
+            LspOp::Restart {
+                name,
+                init_options,
+                settings,
+                capabilities,
+            } => {
+                self.restart_lsp_servers(&name, init_options, settings, capabilities);
+                return;
+            }
             LspOp::BufRequest { kind } => {
                 if let Some(kind) = LspReqKind::from_u16(kind) {
                     self.request_lsp(kind);
@@ -237,10 +246,12 @@ impl EditHost {
         spawn.init_options = init_options;
         spawn.settings = settings;
         spawn.capabilities = capabilities;
+        // Always remember the LATEST spawn for this key — the daemon-reconnect resync
+        // and `nx.lsp.restart` both re-`ensure` from it, so it must reflect the config
+        // in force now (which may have grown since the server first started), not the
+        // one captured at first start.
+        self.lsp_spawns.insert(key.clone(), spawn.clone());
         if !self.lsp_ensured.contains(&key) {
-            // Remember the spawn so the daemon reconnect resync can re-`ensure` a fresh
-            // server against the new connection (the remote child died with the link).
-            self.lsp_spawns.insert(key.clone(), spawn.clone());
             self.fx.lsp_ensure(key.clone(), spawn);
             self.lsp_ensured.insert(key.clone());
         }
@@ -291,6 +302,61 @@ impl EditHost {
         // Force a fresh `didOpen` for every bound buffer once its server re-initializes.
         for state in self.lsp_states.values_mut() {
             if state.server.is_some() {
+                state.opened = false;
+                state.version = 0;
+            }
+        }
+        self.lsp_dirty = true;
+    }
+
+    /// Restart every running server whose config `name` matches (`nx.lsp.restart`).
+    /// Reuses the reconnect teardown → re-`ensure` path, scoped to one config name.
+    /// The caller passes the config's payloads *as they are now* (resolved in Lua):
+    /// they overwrite the remembered spawn's before it respawns, so the fresh process
+    /// runs the config in force NOW rather than one cached before the change (a config
+    /// grown after start does not otherwise reach the cache until an async
+    /// FileType/root-resolution fires a fresh `Start`, which races this op). A server
+    /// that reads its whole config only at startup — efm-langserver's `languages` map
+    /// is the motivating case — thus picks it up. Every bound buffer re-`didOpen`s
+    /// under the fresh process. A no-op when nothing with `name` is running; each
+    /// payload that is `None` keeps the cached value.
+    pub(crate) fn restart_lsp_servers(
+        &mut self,
+        name: &str,
+        init_options: Option<serde_json::Value>,
+        settings: Option<serde_json::Value>,
+        capabilities: Option<serde_json::Value>,
+    ) {
+        let keys: Vec<ServerKey> = self
+            .lsp_ensured
+            .iter()
+            .filter(|k| k.name == name)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.fx.lsp_shutdown(key.clone());
+            self.lsp_ensured.remove(&key);
+            self.lsp_servers.remove(&key);
+            if let Some(mut spawn) = self.lsp_spawns.get(&key).cloned() {
+                // Refresh the config payloads to what is in force now (the cmd stays as
+                // cached — restart applies config changes, not a new command).
+                if init_options.is_some() {
+                    spawn.init_options = init_options.clone();
+                }
+                if settings.is_some() {
+                    spawn.settings = settings.clone();
+                }
+                if capabilities.is_some() {
+                    spawn.capabilities = capabilities.clone();
+                }
+                self.lsp_spawns.insert(key.clone(), spawn.clone());
+                self.fx.lsp_ensure(key.clone(), spawn);
+                self.lsp_ensured.insert(key);
+            }
+        }
+        // Re-open every buffer bound to a restarted server under the fresh process.
+        for state in self.lsp_states.values_mut() {
+            if state.server.as_ref().is_some_and(|k| k.name == name) {
                 state.opened = false;
                 state.version = 0;
             }

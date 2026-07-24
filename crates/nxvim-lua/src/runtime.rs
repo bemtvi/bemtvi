@@ -1045,6 +1045,19 @@ impl LuaRuntime {
         // plugin/colorscheme code that compiles chunks at runtime (e.g. a colorscheme
         // caching itself via `loadstring` + `string.dump`) keeps working.
         lua.load("loadstring = loadstring or load").exec()?;
+        // GOTCHA — `require` returns TWO values under 5.4. PUC Lua 5.4 added a second
+        // return to `require`: the searcher's *loader data*, which for the file
+        // searcher is the resolved FILE PATH (`.../lua/foo.lua`). LuaJIT / 5.1 (the old
+        // nxvim backend) returned only the module, so this bites 5.1-era plugin code.
+        // Crucially it appears ONLY on the *first* (uncached) load — `ll_require`
+        // `return 1`s a cached module but `return 2`s a freshly-loaded one — so it is
+        // load-order dependent and easy to miss. In an assignment the extra value is
+        // discarded (`local m = require(x)` is fine), but in a multi-value position it
+        // splices in: `{ require("a"), require("b") }` becomes `{ a, b, "<path-b>" }`
+        // (the LAST item expands to all results), and `f(require(x))` passes the path
+        // as a second argument. Wrap in parens — `(require(x))` — to truncate to one
+        // value, or have the consumer tolerate a stray string. See the plugin-side
+        // handling in nxvim-efmls-configs `load()`.
         let shared = Rc::new(RefCell::new(Shared::default()));
         let runtimepath = Rc::new(RefCell::new(runtimepath));
         install_vim(&lua, &shared)?;

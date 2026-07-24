@@ -417,6 +417,29 @@ function nx.lsp.disable(names)
   end
 end
 
+-- `nx.lsp.restart(name)`: tear down and respawn every running server with config
+-- `name`, re-starting it from the config in force NOW. A server that reads its whole
+-- configuration only at startup (efm-langserver's `languages` map is the canonical
+-- case) does not see a `nx.lsp.config` change applied to an already-running instance;
+-- restarting it makes the grown config take effect. Each buffer bound to the server
+-- re-attaches to the fresh process. A no-op when nothing named `name` is running.
+function nx.lsp.restart(name)
+  if type(name) ~= "string" or name == "" then
+    error("nx.lsp.restart: name must be a non-empty string", 2)
+  end
+  -- Pass the config in force NOW (init_options/settings/capabilities), resolved from
+  -- the registry, so the respawn applies a config changed since the server started —
+  -- without depending on an async FileType/root-resolution having refreshed the
+  -- server-side spawn cache first.
+  local cfg = resolve(name)
+  nx._lsp_restart(
+    name,
+    nonempty(cfg.init_options),
+    nonempty(cfg.settings),
+    nonempty(cfg.capabilities)
+  )
+end
+
 -- `nx.lsp.start(cfg, opts)`: the low-level, un-merged direct start (the raw
 -- `LspOp::Start`) for advanced/manual use — bypasses the registry. `cfg` is a
 -- resolved config (`{ name, cmd, root_dir, filetypes, settings, … }`); `opts.bufnr`

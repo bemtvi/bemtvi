@@ -506,6 +506,52 @@ async fn format_applies_the_servers_text_edits() {
     assert!(formatted, "formatting should rewrite the first line");
 }
 
+/// Formatting edits that SHARE a start position (a line-diff formatter like
+/// efm-langserver deletes the changed lines and emits several zero-width inserts at
+/// one point) must land in ARRAY order. Regression: they were applied so each insert
+/// prepended before the previous, silently swapping adjacent reformatted lines.
+#[tokio::test]
+async fn format_edits_sharing_a_position_keep_array_order() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_fmt_order");
+    // Delete lines 1 and 2, then insert NEW_A and NEW_B (in that order) at line 3 —
+    // the shape efm emits for a two-line reformat (inserts at the end of the deleted
+    // block). The two inserts share the start position, so their order is the test.
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 2, "character": 0 } }, "newText": "" },
+                { "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 3, "character": 0 } }, "newText": "" },
+                { "range": { "start": { "line": 3, "character": 0 }, "end": { "line": 3, "character": 0 } }, "newText": "NEW_A\n" },
+                { "range": { "start": { "line": 3, "character": 0 }, "end": { "line": 3, "character": 0 } }, "newText": "NEW_B\n" }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "keep0\nDELME1\nDELME2\nkeep3\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    let want = vec!["keep0", "NEW_A", "NEW_B", "keep3"];
+    let mut ok = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.format()").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await == want {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        ok,
+        "same-position inserts must keep array order (NEW_A before NEW_B); got {:?}",
+        lines(&rpc).await
+    );
+}
+
 /// `rename(name)` applies the server's `WorkspaceEdit` across the buffer.
 #[tokio::test]
 async fn rename_applies_the_workspace_edit() {

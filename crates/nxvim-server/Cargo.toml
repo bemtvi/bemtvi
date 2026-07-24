@@ -46,6 +46,8 @@ native = [
 [dependencies]
 anyhow.workspace = true
 rmpv.workspace = true
+# JSON values for LSP config payloads (the `serde_json::Value` carried by `LspOp`).
+serde_json.workspace = true
 # The terminal-job emulator (`:terminal`): decodes a child's raw PTY bytes into a
 # screen grid the editor mirrors as buffer lines + per-cell colors. Pure Rust (no
 # C, no I/O), so it compiles to wasm and stays a *non-optional* dep shared by both

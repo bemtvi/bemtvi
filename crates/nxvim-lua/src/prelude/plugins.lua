@@ -827,6 +827,32 @@ function M._system_dirs()
   return dirs
 end
 
+-- Every dir the manager ITSELF sources (via `source_runtime` in `M.load`) — the system
+-- tier PLUS every managed plugin spec. The server's post-`init.lua` `source_plugins` pass
+-- skips these so a manager-owned plugin's `plugin/` scripts never run twice: once by the
+-- manager, once by that native runtimepath pass. This matters for an EAGER local-`dir`
+-- plugin, whose runtimepath entry is added SYNCHRONOUSLY in `init.lua` (before the pass),
+-- so both would otherwise source it. A git-cloned plugin's rtp entry is added after an
+-- async `await`, so the pass usually misses it — but skipping it here is correct either way
+-- (the manager owns its sourcing). An unloaded lazy plugin isn't on the runtimepath yet, so
+-- skipping its dir is a harmless no-op until it loads (and the manager sources it then).
+function M._manager_owned_dirs()
+  local seen, out = {}, {}
+  local function add(d)
+    if d and not seen[d] then
+      seen[d] = true
+      out[#out + 1] = d
+    end
+  end
+  for _, s in pairs(M._system) do
+    add(s.dir)
+  end
+  for _, spec in pairs(M._specs) do
+    add(spec._dir)
+  end
+  return out
+end
+
 -- A synchronous snapshot of the system tier: `{ { name=, dir= }, … }`, sorted by name.
 function M.list_system()
   local out = {}

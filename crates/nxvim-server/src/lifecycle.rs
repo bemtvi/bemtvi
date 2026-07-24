@@ -1480,17 +1480,19 @@ impl EditHost {
         // Clone the paths so the immutable runtimepath borrow doesn't outlive the
         // mutable `self` use while sourcing.
         let runtimepath: Vec<PathBuf> = self.lua.runtimepath().to_vec();
-        // Skip the system-plugin tier: those dirs were sourced in the dedicated
-        // pre-`init.lua` phase (native `run`) — or, for a plugin promoted at runtime via
-        // `nx.plugins.system{}`/`promote`, are sourced by the manager's own
-        // `source_runtime` — so re-sourcing them here would run their `plugin/` scripts
-        // twice. The live tier registry is the source of truth (it covers both boot and
-        // runtime promotion); an empty/absent registry (the wasm remote-config path,
-        // tests) skips nothing.
-        let system_dirs = self.system_plugin_dirs();
+        // Skip every dir the `nx.plugins` manager sources itself (via `source_runtime`):
+        // the system-plugin tier AND every managed plugin spec. Re-sourcing them here would
+        // run their `plugin/` scripts TWICE — once by the manager, once by this pass. The
+        // system tier alone was skipped before, which missed EAGER local-`dir` plugins:
+        // their runtimepath entry is added synchronously in `init.lua` (before this pass
+        // runs), so both sourced them (a real double for any `plugin/` side effect — e.g. a
+        // one-shot prompt or a non-idempotent registration). The manager registry is the
+        // source of truth; an empty/absent registry (wasm remote-config, tests) skips
+        // nothing, so unmanaged `pack/*/start` plugins are still sourced here as before.
+        let manager_dirs = self.manager_owned_plugin_dirs();
         for sub in ["plugin", "after/plugin"] {
             for rt in &runtimepath {
-                if system_dirs.contains(rt) {
+                if manager_dirs.contains(rt) {
                     continue;
                 }
                 for file in collect_lua_scripts(&rt.join(sub)) {
@@ -1536,13 +1538,14 @@ impl EditHost {
         self.run_pending();
     }
 
-    /// The live system-plugin tier dirs, read from the `nx.plugins` registry — the set
-    /// [`source_plugins`](Self::source_plugins) skips so a system plugin is never sourced
-    /// twice. Covers both boot-declared and runtime-promoted (`nx.plugins.system`) system
-    /// plugins. Empty when the registry is absent (wasm remote-config, tests with no tier).
-    fn system_plugin_dirs(&self) -> Vec<PathBuf> {
+    /// Every dir the `nx.plugins` manager sources itself — the system tier PLUS every
+    /// managed plugin spec — read from the registry. The set
+    /// [`source_plugins`](Self::source_plugins) skips so a manager-owned plugin's `plugin/`
+    /// scripts are never sourced twice (once by the manager's `source_runtime`, once by that
+    /// pass). Empty when the registry is absent (wasm remote-config, tests with no manager).
+    fn manager_owned_plugin_dirs(&self) -> Vec<PathBuf> {
         let value = match self.lua.eval_to_value(
-            "return nx.plugins and nx.plugins._system_dirs and nx.plugins._system_dirs() or {}",
+            "return nx.plugins and nx.plugins._manager_owned_dirs and nx.plugins._manager_owned_dirs() or {}",
         ) {
             Ok(v) => v,
             Err(_) => return Vec::new(),

@@ -1572,3 +1572,63 @@ async fn nx_plugins_promote_moves_a_managed_plugin_into_the_tier() {
         "promote of an unknown plugin must reject",
     );
 }
+
+/// An EAGER, local-`dir` plugin declared in `init.lua` must have its `plugin/` script
+/// sourced EXACTLY ONCE — not twice. Its runtimepath entry is added synchronously in
+/// `init.lua` (before the boot `source_plugins` pass), so without the manager-owned skip
+/// both the manager's `source_runtime` AND that native pass would source it (a real double
+/// for any `plugin/` side effect). Regression guard for that footgun.
+#[tokio::test]
+async fn eager_local_dir_plugin_sources_plugin_scripts_once() {
+    let base = temp_dir("plugin_double_source");
+
+    // A local plugin dir with a COUNTING plugin/ script (a bool couldn't detect a double).
+    let plugin_dir = base.join("delta");
+    std::fs::create_dir_all(plugin_dir.join("lua").join("delta")).unwrap();
+    std::fs::create_dir_all(plugin_dir.join("plugin")).unwrap();
+    std::fs::write(
+        plugin_dir.join("lua").join("delta").join("init.lua"),
+        "return {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin_dir.join("plugin").join("delta.lua"),
+        "_G.delta_plugin_count = (_G.delta_plugin_count or 0) + 1\n",
+    )
+    .unwrap();
+
+    // A config dir whose init.lua eagerly declares the plugin, so it is on the runtimepath
+    // BEFORE the boot `source_plugins` pass runs.
+    let config = base.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("init.lua"),
+        format!(
+            "nx.plugins {{ {{ name = \"delta\", dir = \"{}\" }} }}\n",
+            q(&plugin_dir)
+        ),
+    )
+    .unwrap();
+
+    let init = ServerInit {
+        config_dir: Some(config.clone()),
+        runtimepath: vec![config.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+
+    // Wait for the eager load to settle (its module require-loads + plugin/ sources).
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded.delta == true").await,
+        "the eager local-dir plugin should load at startup",
+    );
+
+    // The plugin/ script ran exactly once — not twice.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.delta_plugin_count")
+            .await
+            .as_i64(),
+        Some(1),
+        "an eager local-dir plugin's plugin/ script must be sourced exactly once",
+    );
+}

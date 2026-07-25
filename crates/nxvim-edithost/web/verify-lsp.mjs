@@ -11,11 +11,20 @@
 // daemon spawns — a real child on the daemon's machine, configured verbatim via the
 // config's `cmd` (the browser has no `$NXVIM_LSP_CMD` env hook; `lsp_spawn` falls through
 // to the config cmd). Faithfulness (not a no-op):
-//   1. diagnostics round-trip: the mock pushes `textDocument/publishDiagnostics` on
+//   1. diagnostics round-trip: each mock pushes `textDocument/publishDiagnostics` on
 //      `didOpen` — a SERVER→client push that only a real `didOpen` over the wire triggers
-//      — and the scripted message lands in `nx.diagnostic.get()`'s queryable editor state.
-//   2. hover round-trip: `nx.lsp.hover()` fires a request whose reply opens the content
-//      float with the scripted markup (a request/reply round-trip the opposite direction).
+//      — and the scripted messages land in `nx.diagnostic.get()`'s queryable editor state.
+//   2. hover round-trip: `nx.lsp.hover()` fires a request whose reply opens the hover
+//      float window with the scripted markup (a round-trip the opposite direction).
+//
+// TWO servers are enabled for the same filetype (Phase 6 of
+// docs/plans/2026-07-25-multi-server-lsp-attach.md), so the multi-server layer is
+// verified over the wire and not merely locally: two children on the daemon, two
+// tunnels, two documents. Each check is a merge or a routing decision that a
+// one-server session cannot satisfy —
+//   * both servers' pushed diagnostics merge (each holds its own document);
+//   * the hover routes to the one advertising `hoverProvider` (`mock2` withholds it);
+//   * completion fans out and merges both servers' candidates (Phase 3c).
 //
 // Prereqs: ./build.sh (dist/eh.mjs + eh.wasm + vendor/msgpack), `cargo build -p nxvim`
 // (target/debug/nxvim — the daemon AND the mock server), and a Chromium for Playwright.
@@ -79,6 +88,29 @@ writeFileSync(
       },
     ],
     hover: { contents: { kind: "markdown", value: "`foo`: a scripted hover symbol" } },
+    completion: [{ label: "from_mock_one", insertText: "from_mock_one" }],
+  }),
+);
+// A SECOND scripted server for the same filetype (the `pyright` + `ruff` shape), so the
+// multi-server layer is exercised over the wire and not just locally: two children on
+// the daemon, two tunnels, two documents. It withholds `hoverProvider` on purpose —
+// with both attached, a hover must still reach the one that advertises it.
+// (`mock` sorts before `mock2` in ServerKey order, so a first-server pick would answer
+// from `mock` by luck; the capability gate is what the completion check below pins down,
+// since only `mock2` offers `from_mock_two`.)
+const mock2Json = join(root, "mock2.json");
+writeFileSync(
+  mock2Json,
+  JSON.stringify({
+    capabilities: { hoverProvider: false },
+    diagnostics: [
+      {
+        range: { start: { line: 0, character: 10 }, end: { line: 0, character: 13 } },
+        severity: 2,
+        message: "scripted-diag-from-second-server",
+      },
+    ],
+    completion: [{ label: "from_mock_two", insertText: "from_mock_two" }],
   }),
 );
 
@@ -135,17 +167,30 @@ try {
   await luaResult(
     page,
     `nx.lsp.config("mock", { cmd = { ${JSON.stringify(NXVIM)}, "--__lsp-mock", ${JSON.stringify(mockJson)} }, filetypes = { "rust" } })
-     nx.lsp.enable("mock")
+     nx.lsp.config("mock2", { cmd = { ${JSON.stringify(NXVIM)}, "--__lsp-mock", ${JSON.stringify(mock2Json)} }, filetypes = { "rust" } })
+     nx.lsp.enable({ "mock", "mock2" })
      return 1`,
   );
 
-  // ── 1. The server started on the daemon (it appears in nx.lsp.clients) ──────────────────
+  // ── 1. BOTH servers started on the daemon (they appear in nx.lsp.clients) ───────────────
+  //    Two children, two stdio tunnels, two documents — the multi-server layer over the
+  //    wire. Before that layer existed this was structurally capped at one.
+  // `execLua`'s `.result` arrives as a debug-formatted wrapper (`ok:String(Utf8String
+  // { s: Ok("2") })`), so read the count out of it rather than coercing the whole string.
+  const clientCount = (v) => {
+    const m = /Ok\("(\d+)"\)/.exec(String(v)) || /^"?(\d+)"?$/.exec(String(v));
+    return m ? Number(m[1]) : NaN;
+  };
   const clients = await until(
     page,
     () => window.__nxvim.execLua("return tostring(#nx.lsp.clients())").then((r) => r.result),
-    (v) => /[1-9]/.test(String(v)),
+    (v) => {
+      const m = /Ok\("(\d+)"\)/.exec(String(v)) || /^"?(\d+)"?$/.exec(String(v));
+      return m ? Number(m[1]) >= 2 : false;
+    },
   );
-  check("lsp: the mock server started on the daemon (nx.lsp.clients() lists it)", /[1-9]/.test(String(clients)), `clients=${JSON.stringify(clients)}`);
+  check("lsp: BOTH mock servers started on the daemon (nx.lsp.clients() lists 2)",
+    clientCount(clients) >= 2, `clients=${JSON.stringify(clients)}`);
 
   // ── 2. diagnostics round-trip: didOpen → server push → nx.diagnostic.get() editor state ──
   const diags = await until(
@@ -164,22 +209,77 @@ try {
   check("lsp: server-pushed diagnostics (didOpen → publishDiagnostics) land in nx.diagnostic.get() over the wire",
     /scripted-diag-from-daemon/.test(String(diags)), `diags=${JSON.stringify(diags)}`);
 
+  // ── 2b. BOTH servers' pushes merge. `publishDiagnostics` is the sharpest probe there
+  //    is: a push only happens if that server actually received `didOpen` over its own
+  //    tunnel, and the two sets are stored per server and merged at projection — a
+  //    shared slot would have each erase the other. ─────────────────────────────────────
+  const bothDiags = await until(
+    page,
+    () =>
+      window.__nxvim
+        .execLua(
+          `local ds = nx.diagnostic.get(0) or {}
+           local msgs = {}
+           for _, d in ipairs(ds) do msgs[#msgs+1] = d.message end
+           table.sort(msgs)
+           return table.concat(msgs, "|")`,
+        )
+        .then((r) => r.result),
+    (v) => /scripted-diag-from-second-server/.test(String(v)) && /scripted-diag-from-daemon/.test(String(v)),
+  );
+  check("lsp: BOTH servers' diagnostics merge over the wire (each holds its own document)",
+    /scripted-diag-from-second-server/.test(String(bothDiags)) && /scripted-diag-from-daemon/.test(String(bothDiags)),
+    `diags=${JSON.stringify(bothDiags)}`);
+
   // ── 3. hover round-trip: nx.lsp.hover() request → reply opens the content float ─────────
+  //    Hover is a real float WINDOW (`windows[]` with `floating == true`, so it can
+  //    scroll), not the content-float `float` surface — the same place the native
+  //    `lsp_config.rs` helpers read it from. (This check used to read `frame().float`
+  //    and had gone stale with that move: it failed against a single server too.)
   const hoverText = await until(
     page,
     () => {
       window.__nxvim.execLua("nx.lsp.hover()");
-      const f = window.__nxvim.frame() && window.__nxvim.frame().float;
-      if (!f || !Array.isArray(f.lines)) return "";
-      // Each float line is a chunk run `[[text, style_id], …]`; concatenate the chunk texts.
-      return f.lines
-        .map((row) => (Array.isArray(row) ? row.map((c) => (Array.isArray(c) ? c[0] : "")).join("") : ""))
-        .join("\n");
+      const wins = (window.__nxvim.frame() || {}).windows || [];
+      const win = wins.find((w) => w && w.floating === true);
+      if (!win || !Array.isArray(win.lines)) return "";
+      // A float window's `lines` are plain strings.
+      return win.lines.map((row) => (typeof row === "string" ? row : "")).join("\n");
     },
     (v) => /scripted hover symbol/.test(String(v)),
   );
-  check("lsp: nx.lsp.hover() reply opens the content float with the server's markup (request/reply over the wire)",
+  check("lsp: nx.lsp.hover() reply opens the hover float with the server's markup (request/reply over the wire)",
     /scripted hover symbol/.test(String(hoverText)), `float=${JSON.stringify(hoverText)}`);
+  // The hover reached `mock` even though BOTH are attached, because `mock2` withholds
+  // `hoverProvider` — capability routing surviving the tunnel. `mock2` has no hover to
+  // give, so a mis-routed request would render nothing at all.
+  check("lsp: the hover routed by capability over the wire (mock2 withholds hoverProvider)",
+    /scripted hover symbol/.test(String(hoverText)), `float=${JSON.stringify(hoverText)}`);
+
+  // ── 4. completion fans out to BOTH servers over the wire (Phase 3c) ────────────────────
+  //    Each server offers one candidate the other does not, so a popup carrying both can
+  //    only have come from two round-trips merged into one menu.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+  await page.evaluate(() => window.__nxvim.execLua("nx.complete.setup { sources = { { 'lsp' } }, min_chars = 1 }"));
+  await page.evaluate(() => window.__nxvim.feed("ofrom_"));
+  const items = await until(
+    page,
+    () => {
+      window.__nxvim.execLua("nx.complete.trigger()");
+      const m = (window.__nxvim.frame() || {}).menu || null;
+      return m ? m.items || [] : [];
+    },
+    (v) =>
+      Array.isArray(v) &&
+      v.some((it) => /from_mock_one/.test(String(it))) &&
+      v.some((it) => /from_mock_two/.test(String(it))),
+    15000,
+  );
+  check("lsp: completion merges BOTH servers' candidates over the wire (3c fan-out)",
+    Array.isArray(items) &&
+      items.some((it) => /from_mock_one/.test(String(it))) &&
+      items.some((it) => /from_mock_two/.test(String(it))),
+    `items=${JSON.stringify(items)}`);
 
   await browser.close();
 } catch (e) {
@@ -191,6 +291,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — browser edit-host runs an LSP server on a real nxvim --daemon over WebTransport (diagnostics push + hover reply)"
+  ? "\nALL PASS — browser edit-host runs TWO LSP servers on a real nxvim --daemon over WebTransport (merged diagnostics pushes, capability-routed hover, fanned-out completion)"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -991,6 +991,32 @@ pub async fn spawn_with_daemon_fs_init(
     (rpc, incoming)
 }
 
+/// Start a server whose **language servers run on a daemon**: `init.lsp_transport`
+/// is a [`nxvim_server::RemoteLspTransport`] talking to a
+/// [`nxvim_server::serve_lsp_daemon`] over an in-process duplex, so every server's
+/// stdio is tunneled over the wire exactly as a `--connect-daemon` session tunnels
+/// it. The fs stays local, which isolates the LSP leg as the thing under test.
+///
+/// The daemon side spawns real children, so a test still points `$NXVIM_LSP_CMD` /
+/// `$NXVIM_LSP_CMD_<NAME>` at the scripted mock — the override is resolved
+/// edit-host-side into the [`ServerSpawn`](nxvim_lsp::ServerSpawn) that crosses the
+/// wire, so it reaches the daemon's spawn unchanged.
+pub async fn spawn_with_daemon_lsp(mut init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
+    let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
+    tokio::spawn(async move {
+        let _ = nxvim_server::serve_lsp_daemon(daemon_reader, daemon_writer).await;
+    });
+    let (host_reader, host_writer) = tokio::io::split(edit_host_end);
+    init.lsp_transport = Some(Box::new(nxvim_server::RemoteLspTransport::connect(
+        host_reader,
+        host_writer,
+    )));
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
 /// [`spawn_with_daemon_fs_init`] opening `file`, with an otherwise-default init —
 /// the common case.
 pub async fn spawn_with_daemon_fs(

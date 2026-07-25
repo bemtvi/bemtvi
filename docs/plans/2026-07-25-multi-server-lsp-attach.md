@@ -299,10 +299,44 @@ encoding fails the assertion rather than passing by luck.
   pyright also advertises formatting.
 - `docs/architecture.md` needed no change: it never claimed one server per buffer.
 
-### Phase 6 — remote + wasm verification
+### Phase 6 — remote + wasm verification (done)
 
-`daemon_*` LSP tests with two servers; `--no-default-features` build; the
-`verify-lsp.mjs` browser check extended to a second server.
+The multi-server layer is *plausible* remotely by construction — it all lives in
+`EditHost`, and both transports are already keyed by `ServerKey` — but "the design
+says it should" is not a verification, so both legs are now driven with two servers.
+
+**Native daemon** (`crates/nxvim/tests/daemon_lsp.rs`). A new harness helper,
+`spawn_with_daemon_lsp`, injects a `RemoteLspTransport` talking to a
+`serve_lsp_daemon` over an in-process duplex, so each mock server is a real child on
+the daemon side with its stdio tunneled. Two tests: both servers attach and *both*
+publish (`publishDiagnostics` is the sharpest probe available — a server→client push
+only happens if that server actually received `didOpen` down its own tunnel, so two
+messages prove two documents, not two spawned processes); and a hover routes by
+capability across the tunnel. Mutation-checked by stopping the daemon side from
+serving — both tests then fail, so the wire is load-bearing rather than a local
+fallback.
+
+**Browser / wasm** (`crates/nxvim-edithost/web/verify-lsp.mjs`). Extended from one
+mock server to two for the same filetype. Each of the three added checks is a merge
+or a routing decision a one-server session cannot satisfy: both servers' diagnostics
+merge, the hover reaches the one advertising `hoverProvider` (`mock2` withholds it),
+and completion fans out and merges both servers' candidates (Phase 3c over the wire).
+Mutation-checked by enabling only `mock` — all three then fail.
+
+Two pre-existing breaks surfaced and were fixed to get there, neither caused by this
+work (both reproduce with the multi-server changes stashed):
+
+- `nxvim-edithost` did not compile to wasm at all: `GitJob::Fetch` had no arm in the
+  browser git-job encoder (added by the gix work, whose decoder side already handled
+  `"fetch"`). The wasm build is a tier-1 target, so this was a silent hole — nothing
+  in `cargo test --workspace` builds that crate for wasm.
+- `verify-lsp.mjs`'s hover check had gone stale: it read the content-float surface
+  (`frame().float`), but hover became a real float **window** (`windows[]` with
+  `floating == true`) — the same place the native `lsp_config.rs` helpers read. It was
+  failing against a *single* server before this phase touched it.
+
+`--no-default-features` compiles (`cargo check -p nxvim-server --no-default-features`),
+which is the other half of the wasm-eligible build.
 
 ## Testing
 

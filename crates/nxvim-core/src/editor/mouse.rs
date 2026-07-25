@@ -2114,37 +2114,36 @@ impl Editor {
     }
 
     /// Scroll window `win` vertically by `delta` lines (negative = toward the top
-    /// of the buffer), clamped so the first line can't pass the top row. The cursor
-    /// stays on its buffer line while that line is still visible; once the scroll
-    /// would push it off, it is pulled to the nearest visible edge (vim's wheel
-    /// with `scrolloff` 0). The focused window moves its live viewport and emits the
-    /// smooth-scroll gesture; an inactive window updates its stashed scroll — the
-    /// wheel famously scrolls a window you are not focused in. Pulling the cursor
-    /// onto a visible line on the focused window is load-bearing, not cosmetic: the
-    /// per-redraw `ensure_visible` would otherwise snap `top` straight back.
+    /// of the buffer), clamped so the first line can't pass the top row and — going
+    /// down — so the last line keeps its `'scrolloff'` rows above it (the wheel stops
+    /// there; see [`max_scroll_top`](Editor::max_scroll_top)). The cursor stays on its
+    /// buffer line while that line is still visible; once the scroll brings it within
+    /// the margin of an edge it is pulled to the margin boundary and rides along with
+    /// the view (vim's wheel). The focused window moves its live viewport and emits
+    /// the smooth-scroll gesture; an inactive window updates its stashed scroll — the
+    /// wheel famously scrolls a window you are not focused in.
+    ///
+    /// Both margin rules are load-bearing, not cosmetic: `ensure_visible` runs per
+    /// redraw and enforces the same margin, so a cursor parked merely on the *visible
+    /// edge* — or a `top` scrolled past what the buffer's end can justify — snaps
+    /// straight back, and the window stops scrolling while visibly bouncing every
+    /// notch. The stashed branch keeps both for the same reason, one focus-change
+    /// later.
     fn wheel_scroll_vertical(&mut self, win: WindowId, delta: i64) {
         let last = self.window_last_line(win);
         let th = self.window_text_height(win);
         if win == self.current_window_id() {
             let old_top = self.top;
-            let new_top = (old_top as i64 + delta).clamp(0, last as i64) as usize;
+            // A down-notch never steps back *up*: from a `top` already past the limit
+            // (a `zt` at the buffer's end, say) the scroll just stops.
+            let limit = self.max_scroll_top(th).max(old_top) as i64;
+            let new_top = (old_top as i64 + delta).clamp(0, limit) as usize;
             if new_top == old_top {
                 return;
             }
             self.scroll_from = Some((old_top, self.cursor.line));
             self.top = new_top;
-            let bottom = self.top.saturating_add(th.saturating_sub(1));
-            if self.cursor.line < self.top {
-                self.cursor.line = self.top;
-            } else if self.cursor.line > bottom {
-                self.cursor.line = bottom.min(last);
-            } else {
-                // Cursor still visible — leave it (and its `curswant`) untouched.
-                self.finalize_scroll_gesture();
-                return;
-            }
-            self.settle_desired_col(false);
-            self.preserve_desired = true;
+            self.keep_cursor_in_scroll_margin(th);
             self.finalize_scroll_gesture();
         } else {
             // An inactive window (a split in another layer, or a non-focused dock)
@@ -2153,15 +2152,18 @@ impl Editor {
                 return;
             };
             let w = tree.get_mut(win);
+            let so = super::cursor::scroll_margin(w.options.scrolloff, th);
             let old_top = w.saved_top;
-            let new_top = (old_top as i64 + delta).clamp(0, last as i64) as usize;
+            let limit = last.saturating_sub(so).max(old_top) as i64;
+            let new_top = (old_top as i64 + delta).clamp(0, limit) as usize;
             if new_top == old_top {
                 return;
             }
-            let bottom = new_top.saturating_add(th.saturating_sub(1));
+            let top_edge = new_top + so;
+            let bottom = (new_top + th).saturating_sub(1).saturating_sub(so);
             w.saved_top = new_top;
-            if w.saved_cursor.line < new_top {
-                w.saved_cursor.line = new_top;
+            if w.saved_cursor.line < top_edge {
+                w.saved_cursor.line = top_edge.min(last);
             } else if w.saved_cursor.line > bottom {
                 w.saved_cursor.line = bottom.min(last);
             }

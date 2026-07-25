@@ -138,3 +138,50 @@ async fn ctrl_e_respects_scrolloff() {
         "cursor rests exactly on the margin boundary",
     );
 }
+
+#[tokio::test]
+async fn ctrl_e_stops_at_the_scrolloff_margin_past_the_last_line() {
+    // Scrolling toward the end of the buffer carries the cursor down with the view
+    // until it is pinned to the last line — and then *stops*, with the last line
+    // still `scrolloff` rows below the top edge. It must neither walk the last line
+    // all the way to the top row (the margin is the point) nor keep accepting the
+    // keypress only for the viewport clamp to drag `top` back a margin's worth every
+    // time (a bounce that never advances).
+    let path = write_n_lines("soeofscroll", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    command(&rpc, "set scrolloff=5").await;
+    // `G` pins line 100 to the bottom row → top is line 77 (24-row viewport).
+    let map = redraw_after(&rpc, &mut incoming, "G").await;
+    assert_eq!(first_visible_line(&map), "line77");
+
+    // Each `<C-e>` moves the top down one line, up to line 95 on top — where line 100
+    // sits exactly 5 rows down, on the margin boundary.
+    for (n, expected) in (78..=95).map(|l| (l - 77, format!("line{l}"))) {
+        let map = redraw_after(&rpc, &mut incoming, "<C-e>").await;
+        assert_eq!(
+            first_visible_line(&map),
+            expected,
+            "<C-e> #{n} advanced the viewport"
+        );
+    }
+    assert_eq!(
+        cursor(&rpc).await,
+        (100, 0),
+        "cursor rode down to the last line"
+    );
+    // Further presses are no-ops — the view rests there rather than bouncing.
+    for n in 1..=3 {
+        let map = redraw_after(&rpc, &mut incoming, "<C-e>").await;
+        assert_eq!(
+            first_visible_line(&map),
+            "line95",
+            "<C-e> #{n} past the limit left the viewport alone"
+        );
+        assert_eq!(
+            view_u64(&map, "cursor_row"),
+            5,
+            "the last line rests on the margin boundary, 5 rows in from the top"
+        );
+    }
+}

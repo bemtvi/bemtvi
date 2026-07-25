@@ -4,6 +4,16 @@
 use super::*;
 use crate::unicode;
 
+/// The effective `'scrolloff'` margin for a `th`-row text area: the option clamped
+/// to half the height so a top *and* a bottom margin can both fit (vim clamps the
+/// same way). `0` (the default) reduces every caller to the historical no-margin
+/// behavior. Shared by the viewport math and every scroll that has to leave the
+/// cursor where [`Editor::ensure_visible`] will accept it, so the two never disagree
+/// about where the band is.
+pub(crate) fn scroll_margin(scrolloff: usize, th: usize) -> usize {
+    scrolloff.min(th.saturating_sub(1) / 2)
+}
+
 impl Editor {
     pub(crate) fn text_height(&self) -> usize {
         // The window's own rows minus a bordered float's one-cell inset (top and
@@ -281,11 +291,18 @@ impl Editor {
 
     /// Move the viewport one line — `<C-e>` (down) / `<C-y>` (up) — *without*
     /// touching the cursor, returning whether `top` actually moved. `<C-e>` can
-    /// scroll until the last buffer line reaches the top row; `<C-y>` stops at the
-    /// first. The pure-viewport primitive behind [`Self::scroll_line`].
+    /// scroll until the last buffer line reaches its `'scrolloff'` margin from the
+    /// top row ([`max_scroll_top`](Self::max_scroll_top) — the last row itself when
+    /// the margin is off); `<C-y>` stops at the first. The pure-viewport primitive
+    /// behind [`Self::scroll_line`].
     fn scroll_view_line(&mut self, down: bool) -> bool {
         let new_top = if down {
-            (self.top + 1).min(self.last_line())
+            // At (or past) the limit the scroll simply stops — never step *back* up,
+            // which is what a bare `.min(limit)` would do from a deeper `top`.
+            if self.top >= self.max_scroll_top(self.text_height()) {
+                return false;
+            }
+            self.top + 1
         } else {
             self.top.saturating_sub(1)
         };
@@ -298,10 +315,8 @@ impl Editor {
 
     /// `<C-e>` / `<C-y>`: scroll the viewport one line, keeping the cursor on its
     /// buffer line unless the scroll pushes it within the `'scrolloff'` margin of the
-    /// edge — then pull it back to the margin boundary (`scrolloff` lines in from the
-    /// visible edge), at its remembered desired column. Placing it at the boundary
-    /// (rather than the edge) keeps the following [`ensure_visible`](Self::ensure_visible)
-    /// — which enforces the same margin — from fighting the scroll. Unlike
+    /// edge — then pull it back to the margin boundary
+    /// ([`keep_cursor_in_scroll_margin`](Self::keep_cursor_in_scroll_margin)). Unlike
     /// [`Self::scroll_by`] (`<C-d>`/`<C-f>`), the cursor does *not* travel with the
     /// view while it stays outside the margin.
     pub(crate) fn scroll_line(&mut self, down: bool) {
@@ -309,12 +324,24 @@ impl Editor {
             return;
         }
         let th = self.text_height();
-        let so = self
-            .windows
-            .cur()
-            .options
-            .scrolloff
-            .min(th.saturating_sub(1) / 2);
+        self.keep_cursor_in_scroll_margin(th);
+    }
+
+    /// Pull the cursor into the focused window's `'scrolloff'` band after a
+    /// viewport-only scroll moved `top` under it (`<C-e>`/`<C-y>`, the mouse wheel):
+    /// a cursor left inside the margin — or scrolled off-screen entirely — is parked
+    /// exactly `scrolloff` rows in from the edge it drifted toward, at its remembered
+    /// desired column. A no-op while the cursor is still outside the margin, which
+    /// leaves it (and its `curswant`) put.
+    ///
+    /// Parking it on the *margin boundary* rather than the visible edge is
+    /// load-bearing, not cosmetic: the per-redraw
+    /// [`ensure_visible`](Self::ensure_visible) enforces the same margin, so a cursor
+    /// left inside it snaps `top` straight back — the viewport visibly bounces and
+    /// the window stops scrolling altogether once the cursor is within `scrolloff`
+    /// rows of the edge.
+    pub(crate) fn keep_cursor_in_scroll_margin(&mut self, th: usize) {
+        let so = scroll_margin(self.windows.cur().options.scrolloff, th);
         let top_edge = self.top + so;
         let bottom = (self.top + th).saturating_sub(1).saturating_sub(so);
         if self.cursor.line < top_edge {
@@ -383,15 +410,7 @@ impl Editor {
     pub(crate) fn ensure_visible(&mut self) {
         let th = self.text_height();
         // `'scrolloff'`: keep at least this many text rows above and below the cursor.
-        // Clamped to half the text height so a top *and* bottom margin can both fit
-        // (vim clamps the same way); `0` (the default) reduces every step below to the
-        // historical no-margin behavior.
-        let so = self
-            .windows
-            .cur()
-            .options
-            .scrolloff
-            .min(th.saturating_sub(1) / 2);
+        let so = scroll_margin(self.windows.cur().options.scrolloff, th);
 
         // The largest useful `top`: the last buffer line resting on the bottom text
         // row. The bottom scrolloff margin is only honored while real content sits
@@ -582,10 +601,20 @@ impl Editor {
     /// With `above == 0` it returns `target` (the cursor on the top text row, no
     /// margin) so a zero `scrolloff` leaves the historical behavior untouched.
     fn scroll_top_for_row_above(&self, target: usize, above: usize) -> usize {
+        // The cursor sits on `target`, so the wrap segments preceding it already
+        // count toward the margin.
+        self.scroll_top_for_row_above_seg(target, above, self.cursor_wrap_seg())
+    }
+
+    /// [`scroll_top_for_row_above`](Self::scroll_top_for_row_above) measured from the
+    /// `seg`-th display row of `target` rather than the cursor's own row — `seg = 0`
+    /// asks for the margin above the *line's first* row, which is what a scroll limit
+    /// (as opposed to a cursor-visibility bound) wants.
+    fn scroll_top_for_row_above_seg(&self, target: usize, above: usize, seg: usize) -> usize {
         let virt = self.buffer().virt_lines_by_line();
-        // Rows already above the cursor within its own line: its `virt_lines_above`
-        // and the wrap segments preceding the cursor's segment.
-        let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg();
+        // Rows already above the row within its own line: the line's `virt_lines_above`
+        // and the wrap segments preceding `seg`.
+        let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + seg;
         let mut top = target;
         while rows < above && top > 0 {
             let (p, prev_top) = self.rows_of_line_above(top, &virt);
@@ -593,6 +622,23 @@ impl Editor {
             top = prev_top;
         }
         top
+    }
+
+    /// The deepest `top` an explicit viewport scroll (`<C-e>`, the mouse wheel) may
+    /// reach in the focused window: far enough down that the **last** buffer line
+    /// still keeps its `'scrolloff'` rows above it. Scrolling stops there rather than
+    /// walking the last line up to the top row — past this point the cursor is pinned
+    /// to the last line with no room left to carry it down, so
+    /// [`ensure_visible`](Self::ensure_visible) would enforce the same margin and drag
+    /// `top` straight back, turning every further notch into a bounce.
+    ///
+    /// Measured from the last line's first display row (`seg = 0`), so it is never
+    /// deeper than the bound `ensure_visible` computes from the cursor's actual wrap
+    /// segment. With `scrolloff` 0 it is the last line itself — vim's `<C-e>` walking
+    /// the buffer's end to the top row, unchanged.
+    pub(crate) fn max_scroll_top(&self, th: usize) -> usize {
+        let so = scroll_margin(self.windows.cur().options.scrolloff, th);
+        self.scroll_top_for_row_above_seg(self.last_line(), so, 0)
     }
 
     /// Keep the cursor's screen column within the focused window's text area by

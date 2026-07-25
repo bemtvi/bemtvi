@@ -863,6 +863,126 @@ async fn wheel_outside_any_window_is_ignored() {
     assert_eq!(win_topline(&rpc, win).await, top0, "no window scrolled");
 }
 
+/// Under a non-zero `'scrolloff'` the wheel keeps scrolling the **focused** window:
+/// each notch drags the cursor along so it stays `scrolloff` rows in from the top
+/// edge. Pulling it only to the visible edge would leave it inside the margin, and
+/// the per-redraw `ensure_visible` would snap `top` straight back — the viewport
+/// bounces and the buffer stops scrolling after the first notch or two.
+#[tokio::test]
+async fn wheel_down_keeps_scrolling_under_scrolloff() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "gg"); // cursor on line 1, top line 1
+    for notch in 1..=4u64 {
+        feed_mouse(&rpc, "wheel", "down", 5, 10);
+        assert_eq!(
+            win_topline(&rpc, win).await,
+            1 + 3 * notch,
+            "notch {notch} scrolled another three lines"
+        );
+    }
+    assert_eq!(
+        cursor(&rpc).await.0,
+        13 + 8,
+        "the cursor rode down with the view, parked on the scrolloff boundary"
+    );
+}
+
+/// The mirror image: wheeling **up** with the cursor near the bottom of the
+/// viewport keeps scrolling, pushing the cursor up so it stays `scrolloff` rows in
+/// from the bottom edge.
+#[tokio::test]
+async fn wheel_up_keeps_scrolling_under_scrolloff() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "60G");
+    let top0 = win_topline(&rpc, win).await;
+    for notch in 1..=4u64 {
+        feed_mouse(&rpc, "wheel", "up", 5, 10);
+        assert_eq!(
+            win_topline(&rpc, win).await,
+            top0 - 3 * notch,
+            "notch {notch} scrolled another three lines up"
+        );
+    }
+    let height = win_height(&rpc, win).await;
+    assert_eq!(
+        cursor(&rpc).await.0 as u64,
+        top0 - 12 + height - 1 - 8,
+        "the cursor rode up with the view, parked on the scrolloff boundary"
+    );
+}
+
+/// Toward the end of the buffer the wheel scrolls until the last line reaches its
+/// `'scrolloff'` margin from the top edge, then **stops** there — it neither walks
+/// the last line up to the top row nor keeps taking notches the viewport clamp
+/// immediately undoes (a bounce that never advances, since the cursor is pinned to
+/// the last line with no room left to carry it down).
+#[tokio::test]
+async fn wheel_down_at_end_of_buffer_stops_at_the_scrolloff_margin() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "G"); // last line pinned to the bottom row
+
+    // The deepest legal top: line 100 sitting 8 rows in from the top edge.
+    let limit = 100 - 8;
+    let mut expected = win_topline(&rpc, win).await;
+    for notch in 1..=12u64 {
+        feed_mouse(&rpc, "wheel", "down", 5, 10);
+        expected = (expected + 3).min(limit);
+        assert_eq!(
+            win_topline(&rpc, win).await,
+            expected,
+            "notch {notch} advanced the viewport (or rested at the margin)"
+        );
+    }
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        limit,
+        "the view came to rest with the last line on the margin boundary"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0,
+        100,
+        "the cursor rode down to the last line"
+    );
+}
+
+/// An **unfocused** window scrolled by the wheel keeps its scroll when it is later
+/// focused: its stashed cursor is pulled to the same `'scrolloff'` boundary, so the
+/// `ensure_visible` that runs once it becomes current leaves `top` alone.
+#[tokio::test]
+async fn wheel_over_unfocused_split_survives_refocus_under_scrolloff() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    command(&rpc, "set scrolloff=8").await;
+    command(&rpc, "vsplit").await;
+    let left = current_win(&rpc).await;
+    // `:vsplit` focuses the new left window, so the unfocused split is the right
+    // one — under col 60. Scroll it, then focus it and check the scroll stuck.
+    let other = all_wins(&rpc)
+        .await
+        .into_iter()
+        .find(|w| *w != left)
+        .expect("a second split");
+    let other_top0 = win_topline(&rpc, other).await;
+    feed_mouse(&rpc, "wheel", "down", 5, 60);
+    assert_eq!(
+        win_topline(&rpc, other).await,
+        other_top0 + 3,
+        "the unfocused split scrolled"
+    );
+    feed(&rpc, "<C-w>w");
+    assert_eq!(current_win(&rpc).await, other, "focus crossed to the split");
+    assert_eq!(
+        win_topline(&rpc, other).await,
+        other_top0 + 3,
+        "focusing it did not snap the viewport back"
+    );
+}
+
 // ===== Phase 4b: drag past the window edge auto-scrolls the buffer ==========
 
 /// Window `win`'s top-left position row in the windows area (`nvim_win_get_position`

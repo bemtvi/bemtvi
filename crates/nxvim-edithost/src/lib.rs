@@ -2088,6 +2088,11 @@ fn git_job_to_json(id: u64, job: &nxvim_lua::GitJob, local: bool) -> serde_json:
             put("rev", rev.clone().into());
             put("detach", serde_json::json!(detach));
         }
+        GitJob::Fetch { dir, unshallow } => {
+            put("op", "fetch".into());
+            put("dir", dir.clone().into());
+            put("unshallow", serde_json::json!(unshallow));
+        }
         GitJob::Pull { dir } => {
             put("op", "pull".into());
             put("dir", dir.clone().into());

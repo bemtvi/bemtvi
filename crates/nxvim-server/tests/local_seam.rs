@@ -161,3 +161,47 @@ async fn fs_local_rename_moves_on_the_client_disk() {
         "fs_local.rename moved the temp file over the target on the real filesystem",
     );
 }
+
+#[tokio::test]
+async fn fs_local_read_text_honors_the_encoding_option() {
+    // The local twin took the same `{ encoding = … }` opts table as `nx.fs.read_text`
+    // and dropped it, so a latin1 file came back decoded as UTF-8 (or rejected as
+    // invalid) with nothing to say the request was ignored.
+    let dir = temp_dir("fsl_read_enc");
+    let path = dir.join("latin1.txt");
+    // 0xE9 is `é` in latin1 and an invalid UTF-8 lead byte on its own.
+    fs::write(&path, [b'c', b'a', b'f', 0xE9, b'\n']).expect("write");
+    let (rpc, _incoming) = start().await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.enc = nil\n\
+             _G.bare = nil\n\
+             nx.async(function()\n\
+             \x20 _G.enc = nx.await(nx.fs_local.read_text('{p}', {{ encoding = 'latin1' }}))\n\
+             end)()\n\
+             nx.async(function()\n\
+             \x20 -- no encoding = the utf-8 default, which REJECTS these bytes; catching it\n\
+             \x20 -- proves the option above changed the outcome rather than coinciding with it.\n\
+             \x20 local ok = pcall(nx.await, nx.fs_local.read_text('{p}'))\n\
+             \x20 _G.bare = ok and 'decoded' or 'rejected'\n\
+             end)()",
+            p = path.display()
+        ),
+    )
+    .await;
+
+    let v = poll_settled(&rpc, "return _G.enc").await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "café\n",
+        "the encoding reached the decoder, exactly as nx.fs.read_text would"
+    );
+    let bare = poll_settled(&rpc, "return _G.bare").await;
+    assert_eq!(
+        bare.as_str().unwrap_or("<nil>"),
+        "rejected",
+        "and the utf-8 default still rejects them"
+    );
+}

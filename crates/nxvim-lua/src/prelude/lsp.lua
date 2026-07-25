@@ -957,7 +957,25 @@ vim.lsp.buf.implementation = nx.lsp.implementation
 vim.lsp.buf.references = nx.lsp.references
 vim.lsp.buf.hover = nx.lsp.hover
 vim.lsp.buf.signature_help = nx.lsp.signature_help
-vim.lsp.buf.format = function(_opts)
+-- `opts` is checked, not swallowed. nxvim formats the CURRENT buffer with the one
+-- server attached to it, so neovim's `name` (pick among several attached servers),
+-- `bufnr`, `range` and `filter` have nothing to act on here — dropping `name` in
+-- particular would format with a different server than the config asked for, which
+-- looks like it worked. They are rejected, the way `code_action` rejects `filter`.
+-- `async` IS satisfiable and accepted: nxvim never blocks, and the returned promise
+-- is what orders a follow-up — a gated `BufWritePre` awaits it, so `async = false`'s
+-- intent (the edits land before the write) holds.
+vim.lsp.buf.format = function(opts)
+  if opts ~= nil then
+    if type(opts) ~= "table" then
+      error("vim.lsp.buf.format: opts must be a table, got " .. type(opts), 2)
+    end
+    for k in pairs(opts) do
+      if k ~= "async" then
+        error("vim.lsp.buf.format: unsupported option '" .. tostring(k) .. "'", 2)
+      end
+    end
+  end
   return nx.lsp.format()
 end
 -- The alias forwards `opts` — `context.only` / `apply` / `range` are modeled (see
@@ -967,7 +985,19 @@ end
 vim.lsp.buf.code_action = function(opts)
   return nx.lsp.code_action(opts)
 end
-vim.lsp.buf.rename = function(name, _opts)
+-- As with `format`: `nx.lsp.rename` renames the symbol under the cursor through the
+-- current buffer's server, so neovim's `filter` / `name` / `bufnr` have nothing to
+-- select and are rejected rather than quietly ignored.
+vim.lsp.buf.rename = function(name, opts)
+  if opts ~= nil then
+    if type(opts) ~= "table" then
+      error("vim.lsp.buf.rename: opts must be a table, got " .. type(opts), 2)
+    end
+    local k = next(opts)
+    if k ~= nil then
+      error("vim.lsp.buf.rename: unsupported option '" .. tostring(k) .. "'", 2)
+    end
+  end
   return nx.lsp.rename(name)
 end
 vim.lsp.buf.document_symbol = nx.lsp.document_symbol

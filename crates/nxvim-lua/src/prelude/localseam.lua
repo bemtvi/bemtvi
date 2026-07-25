@@ -74,9 +74,11 @@ nx.fs_local = {
   readdir = function(path)
     return local_fs_op({ op = "readdir", path = path })
   end,
-  -- `nx.fs_local.read_text(path)` -> promise of the file's contents as a string.
-  read_text = function(path)
-    return local_fs_op({ op = "read_text", path = path })
+  -- `nx.fs_local.read_text(path[, { encoding = "utf-8" }])` -> promise of the decoded
+  -- text. `encoding` selects the decoder exactly as in `nx.fs.read_text` (which
+  -- REJECTS on invalid input rather than substituting replacement characters).
+  read_text = function(path, opts)
+    return local_fs_op({ op = "read_text", path = path, encoding = opts and opts.encoding })
   end,
   -- `nx.fs_local.write(path, data)` -> promise; writes `data`, replacing the file.
   write = function(path, data)

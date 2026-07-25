@@ -224,9 +224,33 @@ end
 -- diagnostics in full (the multi-line messages with source/code that the inline
 -- virtual text truncates). The server reads the cursor at apply time and routes
 -- through the float surface (the bottom panel hover uses); a clean line opens
--- nothing. `opts` (scope/severity filters, formatting) is not yet honored — the
--- default cursor-line scope is what nxvim shows.
-function nx.diagnostic.open_float(_opts)
+-- nothing.
+--
+-- What nxvim shows is exactly neovim's DEFAULT `scope = "line"`, so that value is
+-- accepted. Everything else neovim models — `scope` of `"cursor"`/`"buffer"`, the
+-- `severity` filter, `bufnr`/`pos`, and the presentation options (`border`,
+-- `header`, `source`, `format`) — is **rejected loudly** rather than dropped: a
+-- silently-ignored `scope = "buffer"` would show one line's diagnostics while the
+-- caller believed it asked for the whole buffer's.
+function nx.diagnostic.open_float(opts)
+  if opts ~= nil then
+    if type(opts) ~= "table" then
+      error("nx.diagnostic.open_float: opts must be a table, got " .. type(opts), 2)
+    end
+    for k, v in pairs(opts) do
+      if k ~= "scope" then
+        error("nx.diagnostic.open_float: unsupported option '" .. tostring(k) .. "'", 2)
+      end
+      if v ~= "line" then
+        error(
+          "nx.diagnostic.open_float: unsupported scope '"
+            .. tostring(v)
+            .. "' (nxvim shows the cursor line, neovim's default scope='line')",
+          2
+        )
+      end
+    end
+  end
   nx._diagnostic_open_float()
 end
 

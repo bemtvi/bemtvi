@@ -1670,8 +1670,32 @@ local resolve_win = nx._resolve_win
 -- else the current buffer). The wired options reach the core; everything else
 -- lands in the observable per-scope store. (The scoped tables `nx.o` / `nx.bo` / `nx.wo`
 -- are the primary option API; this is the by-name funnel plugins reach for.)
+--
+-- `opts.scope` is neovim's local/global selector: `"global"` reads and writes the
+-- editor-wide value (`nx.go`'s home) instead of the window/buffer one, `"local"` is
+-- the default described above. Any other value fails loud.
+-- Validate `opts.scope` and report whether it asks for the GLOBAL value. neovim's
+-- scope is `"local"` (the default — the window/buffer value) or `"global"` (the
+-- editor-wide one, `nx.go`'s home). An unrecognized value fails loud instead of
+-- being dropped: silently treating `scope = "gloabl"` as local reads the wrong
+-- number, and looks like it worked.
+local function opt_scope_is_global(opts, where)
+  local scope = opts.scope
+  if scope == nil or scope == "local" then
+    return false
+  end
+  if scope == "global" then
+    return true
+  end
+  error(where .. ": invalid scope '" .. tostring(scope) .. "' (expected 'local' or 'global')", 2)
+end
+
 function nx.option.set(name, value, opts)
   opts = opts or {}
+  if opt_scope_is_global(opts, "nvim_set_option_value") then
+    nx.go[name] = value
+    return
+  end
   if opts.win or nx._win_opt_canon[name] then
     vim.wo[opts.win and resolve_win(opts.win) or resolve_win(0)][name] = value
     return
@@ -1685,6 +1709,9 @@ end
 -- core's current value (default until set).
 function nx.option.get(name, opts)
   opts = opts or {}
+  if opt_scope_is_global(opts, "nvim_get_option_value") then
+    return nx.go[name]
+  end
   if opts.win or nx._win_opt_canon[name] then
     return vim.wo[opts.win and resolve_win(opts.win) or resolve_win(0)][name]
   end

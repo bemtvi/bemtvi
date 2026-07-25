@@ -1151,3 +1151,152 @@ async fn bufnr_prefers_an_exact_name_over_a_suffix_match() {
         "bufnr('init.lua') must resolve to the exactly-named buffer, not the sub/init.lua suffix match"
     );
 }
+
+// ----- neovim-shaped options: modeled, or rejected loudly -------------------
+// The compat surface's contract is that an option nxvim doesn't model FAILS —
+// never gets quietly dropped, which would make it look honored while doing
+// something else (`nx.lsp.code_action` is the worked example). These pin the
+// shims that used to swallow their whole `opts` table.
+
+/// Every `opts` key a compat shim rejects, as a `k=ok` list, so one call proves
+/// the whole set in one round trip.
+async fn reject_report(rpc: &Rpc, call: &str, keys: &[&str]) -> String {
+    let arms: Vec<String> = keys.iter().map(|k| format!("{{ {k} = probe }}")).collect();
+    let chunk = format!(
+        "local probe = 'x'\n\
+         local names = {{ '{}' }}\n\
+         local opts = {{ {} }}\n\
+         local out = {{}}\n\
+         for i, o in ipairs(opts) do\n\
+         \x20 local ok = pcall(function() return {call} end)\n\
+         \x20 out[#out+1] = names[i] .. '=' .. tostring(ok)\n\
+         end\n\
+         return table.concat(out, ' ')",
+        keys.join("','"),
+        arms.join(", ")
+    );
+    exec_lua(rpc, &chunk)
+        .await
+        .as_str()
+        .unwrap_or("<nil>")
+        .to_string()
+}
+
+#[tokio::test]
+async fn lsp_format_rejects_options_it_cannot_honor() {
+    // nxvim attaches ONE server per buffer and formats the current one, so
+    // `name`/`bufnr`/`range`/`filter` have no meaning here — silently dropping
+    // `name` would format with a different server than the config asked for.
+    let (rpc, _incoming) = start().await;
+    let got = reject_report(
+        &rpc,
+        "vim.lsp.buf.format(o)",
+        &["name", "bufnr", "range", "filter"],
+    )
+    .await;
+    assert_eq!(
+        got, "name=false bufnr=false range=false filter=false",
+        "each unmodeled format option raises"
+    );
+}
+
+#[tokio::test]
+async fn lsp_format_accepts_async_and_a_bare_call() {
+    // `async` is the one neovim option nxvim satisfies: it is always async, and the
+    // returned promise is what orders the follow-up (a gated BufWritePre awaits it).
+    let (rpc, _incoming) = start().await;
+    let v = exec_lua(
+        &rpc,
+        "local a = pcall(vim.lsp.buf.format)\n\
+         local b = pcall(vim.lsp.buf.format, {})\n\
+         local c = pcall(vim.lsp.buf.format, { async = true })\n\
+         local d = pcall(vim.lsp.buf.format, { async = false })\n\
+         return tostring(a) .. tostring(b) .. tostring(c) .. tostring(d)",
+    )
+    .await;
+    assert_eq!(v.as_str().unwrap_or("<nil>"), "truetruetruetrue");
+}
+
+#[tokio::test]
+async fn lsp_rename_rejects_options_it_cannot_honor() {
+    let (rpc, _incoming) = start().await;
+    let got = reject_report(
+        &rpc,
+        "vim.lsp.buf.rename('NewName', o)",
+        &["filter", "bufnr", "name"],
+    )
+    .await;
+    assert_eq!(got, "filter=false bufnr=false name=false");
+    let ok = exec_lua(
+        &rpc,
+        "return tostring(pcall(vim.lsp.buf.rename, 'NewName')) ..\n\
+         \x20 tostring(pcall(vim.lsp.buf.rename, 'NewName', {}))",
+    )
+    .await;
+    assert_eq!(
+        ok.as_str().unwrap_or("<nil>"),
+        "truetrue",
+        "the plain forms still work"
+    );
+}
+
+#[tokio::test]
+async fn diagnostic_open_float_rejects_unmodeled_opts_but_takes_its_own_scope() {
+    // nxvim shows the cursor LINE's diagnostics, which is exactly neovim's default
+    // `scope = "line"` — so that value is honored and the ones it can't do fail.
+    let (rpc, _incoming) = start().await;
+    let v = exec_lua(
+        &rpc,
+        "local line = pcall(vim.diagnostic.open_float, { scope = 'line' })\n\
+         local bare = pcall(vim.diagnostic.open_float)\n\
+         local cursor = pcall(vim.diagnostic.open_float, { scope = 'cursor' })\n\
+         local buffer = pcall(vim.diagnostic.open_float, { scope = 'buffer' })\n\
+         local sev = pcall(vim.diagnostic.open_float, { severity = 1 })\n\
+         return table.concat({ tostring(line), tostring(bare), tostring(cursor),\n\
+         \x20 tostring(buffer), tostring(sev) }, ' ')",
+    )
+    .await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "true true false false false",
+        "scope=line (the default nxvim implements) works; the rest raise"
+    );
+}
+
+#[tokio::test]
+async fn option_value_honors_scope_global_vs_local() {
+    // `nvim_get_option_value(name, { scope = 'global' })` must read the GLOBAL value,
+    // not the buffer-local one — silently ignoring `scope` returns the wrong number.
+    let (rpc, _incoming) = start().await;
+    let v = exec_lua(
+        &rpc,
+        "vim.go.tabstop = 8\n\
+         vim.api.nvim_set_option_value('tabstop', 2, { scope = 'local' })\n\
+         local l = vim.api.nvim_get_option_value('tabstop', { scope = 'local' })\n\
+         local g = vim.api.nvim_get_option_value('tabstop', { scope = 'global' })\n\
+         return tostring(l) .. '|' .. tostring(g)",
+    )
+    .await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "2|8",
+        "local sees the buffer value, global sees the editor-wide one"
+    );
+}
+
+#[tokio::test]
+async fn option_value_rejects_an_unknown_scope() {
+    let (rpc, _incoming) = start().await;
+    let v = exec_lua(
+        &rpc,
+        "local ok, e = pcall(vim.api.nvim_get_option_value, 'tabstop', { scope = 'bogus' })\n\
+         return tostring(ok) .. '|' .. tostring(e)",
+    )
+    .await;
+    let s = v.as_str().unwrap_or("<nil>");
+    assert!(
+        s.starts_with("false|"),
+        "an invalid scope raises, got {s:?}"
+    );
+    assert!(s.contains("bogus"), "the error names it, got {s:?}");
+}

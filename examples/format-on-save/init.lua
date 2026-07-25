@@ -9,7 +9,7 @@
 -- may mutate the buffer and the mutation is what gets saved. nxvim honors that —
 -- and goes one step further: a `BufWritePre` handler may be **async** (return a
 -- promise), and the write *waits* for it to settle before serializing. That makes
--- an async formatter (e.g. `nx.lsp.buf.format()`) usable for format-on-save.
+-- an async formatter (e.g. `nx.lsp.format()`) usable for format-on-save.
 --
 -- Buffer text is mutated the vim way — `vim.cmd` running an ex-command — since the
 -- Lua `nvim_*` surface is read-only. Two nxvim details to note:
@@ -63,7 +63,7 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 --
 -- The handler returns a promise; nxvim holds the write until it settles, so an
 -- async formatter's edits still make it into the saved file. Here we simulate a
--- formatter that takes ~50ms (a real one would be `nx.lsp.buf.format()`): after the
+-- formatter that takes ~50ms (a real one would be `nx.lsp.format()`): after the
 -- delay it rewrites `FIXME` to `TODO`.
 --
 -- The point: `:w` does not write the un-formatted bytes and format afterwards — it

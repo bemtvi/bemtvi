@@ -9,9 +9,18 @@ from the code:
      canonical doc updates the book).
 
   2. nx.* API reference — extracts every PUBLIC declaration from the Lua prelude
-     (function nx.NS.name(args) / nx.NS.name = function(args); nx._private
-     excluded) together with the doc-comment block above it, one page per
-     top-level namespace.
+     together with the doc-comment block above it, one page per top-level
+     namespace (nx._private excluded). The prelude declares functions in four
+     shapes, one collector each:
+       * `function nx.NS.name(args)` / `nx.NS.name = function(args)`  (DECL_RE)
+       * `nx.NS = { name = function(args) … }` table literals   (collect_table_literals)
+       * a factory installing one verb table onto twin surfaces  (collect_surface_factories)
+         — `nx.git` / `nx.git_local`
+       * a module-local alias, `local M = nx.NS` + `function M.name()`
+                                                          (collect_module_aliases)
+     A COVERAGE GUARD then fails the build if any namespace the prelude creates
+     produced no page, so a fifth shape cannot silently drop a whole module the
+     way the alias shape hid `nx.plugins` and `nx.editorconfig`.
 
 Finally it renders src/SUMMARY.md from src/SUMMARY.template.md, replacing the
 {{API_REFERENCE}} marker with the generated namespace list.
@@ -183,6 +192,26 @@ LOCAL_FACTORY_RE = re.compile(r"^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\
 SURFACE_METHOD_RE = re.compile(
     r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]+)\s*\(([^)]*)\)"
 )
+# A module-local ALIAS for a namespace: `local M = nx.plugins` at the top level, after
+# which the file writes `function M.lock()` instead of `function nx.plugins.lock()`.
+# Purely a spelling choice, but it hides the whole module from `DECL_RE` — which is how
+# `nx.plugins` (28 public fns) and `nx.editorconfig` went undocumented for their entire
+# existence. Only a bare `nx.<NS>` right-hand side counts (`local M = {}` is a plain
+# table, not a namespace).
+MODULE_ALIAS_RE = re.compile(r"^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(nx\.[A-Za-z0-9_]+)\s*$")
+ALIAS_ASSIGN_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]+)\s*=\s*function\s*\(([^)]*)\)"
+)
+# Namespaces the prelude creates that legitimately expose NO functions, so the
+# "every namespace is documented" guard below must not flag them. Keep this list tiny and
+# justified — an entry here is a claim that the namespace is pure data.
+NO_PUBLIC_API = {
+    # `nx.g` is the global-variable table (the `vim.g` alias) — values, not functions.
+    "g",
+    # `nx.cmdline` holds only `nx.cmdline.actions[name] = fn`, a registry written by
+    # callers (keymap.lua); it declares no functions of its own.
+    "cmdline",
+}
 SEP_RE = re.compile(r"^\s*--+\s*-{3,}")  # `-- ----- section -----` separators
 CODE_SPAN_RE = re.compile(r"(`+)(.*?)\1", re.DOTALL)
 
@@ -315,12 +344,51 @@ def collect_surface_factories(lines):
             yield ("%s.%s" % (surface, name), args, i)
 
 
+def collect_module_aliases(lines):
+    """Yield (name, args, decl_idx) for functions written through a module-local alias.
+
+    A file may alias its namespace once (`local M = nx.plugins`) and then declare every
+    public function as `function M.lock()`. That is invisible to `DECL_RE`, which only
+    matches a literal `nx.`-prefixed holder — so the whole module silently produces no
+    page. Resolve the alias and emit under the real namespace.
+    """
+    aliases = {}
+    for line in lines:
+        m = MODULE_ALIAS_RE.match(line)
+        if m:
+            aliases[m.group(1)] = m.group(2)
+    if not aliases:
+        return
+    for i, line in enumerate(lines):
+        m = SURFACE_METHOD_RE.match(line) or ALIAS_ASSIGN_RE.match(line)
+        if not m:
+            continue
+        ns = aliases.get(m.group(1))
+        if ns:
+            yield ("%s.%s" % (ns, m.group(2)), m.group(3), i)
+
+
+def collect_created_namespaces(lines):
+    """The `nx.<NS>` namespaces a file creates via the `nx.X = nx.X or {}` idiom.
+
+    Backs the coverage guard: a namespace that exists at runtime but produces no page is
+    either undocumented or (rarely) data-only, and the two must be told apart explicitly.
+    """
+    out = set()
+    for line in lines:
+        m = re.match(r"^nx\.([A-Za-z0-9_]+)\s*=\s*nx\.\1\s+or\s+\{\}\s*$", line)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
 def extract_api():
     if not os.path.isdir(PRELUDE_DIR):
         die("prelude dir not found: %s" % PRELUDE_DIR)
     # namespace -> list of (name, args, doc); insertion order preserved.
     namespaces = {}
     seen = set()
+    created = set()  # every `nx.X = nx.X or {}` namespace, for the coverage guard
     files = sorted(f for f in os.listdir(PRELUDE_DIR) if f.endswith(".lua"))
     for fname in files:
         with open(os.path.join(PRELUDE_DIR, fname), encoding="utf-8") as f:
@@ -330,6 +398,7 @@ def extract_api():
         # literals, and twin-surface factories. Sort by source line so a page's
         # entries stay in file order regardless of which collector found them.
         decls = []
+        created |= collect_created_namespaces(lines)
         for i, line in enumerate(lines):
             m = DECL_RE.match(line)
             if m:
@@ -339,6 +408,8 @@ def extract_api():
         for name, args, i in collect_table_literals(lines):
             decls.append((i, name, args))
         for name, args, i in collect_surface_factories(lines):
+            decls.append((i, name, args))
+        for name, args, i in collect_module_aliases(lines):
             decls.append((i, name, args))
         decls.sort(key=lambda d: d[0])
 
@@ -353,6 +424,24 @@ def extract_api():
 
     if not namespaces:
         die("extracted zero nx.* declarations — extraction is broken")
+
+    # COVERAGE GUARD. The check above only catches total failure; it cannot notice a single
+    # module going missing, which is exactly what happened — `nx.plugins` (28 public
+    # functions) and `nx.editorconfig` were absent for their whole existence because they
+    # alias their namespace (`local M = nx.plugins`) and no collector resolved that. A
+    # namespace that exists at runtime must either produce a page or be declared data-only,
+    # so the next module written in an unrecognized style fails the build instead of
+    # quietly vanishing.
+    undocumented = sorted(
+        ns for ns in created if not ns.startswith("_") and ns not in namespaces and ns not in NO_PUBLIC_API
+    )
+    if undocumented:
+        die(
+            "these nx.* namespaces exist in the prelude but produced no API page: %s\n"
+            "       Either their functions are declared in a form no collector in this file\n"
+            "       recognizes (add a collector), or they are genuinely data-only (add them\n"
+            "       to NO_PUBLIC_API with a comment saying why)." % ", ".join(undocumented)
+        )
 
     total = sum(len(v) for v in namespaces.values())
     # Order: the top-level `nx` page first, then namespaces alphabetically.

@@ -998,7 +998,7 @@ end
 -- A commit that cannot be reached even after unshallowing lands in `failed` and the
 -- checkout is left exactly as it was — a partial rollback that CLAIMED success would be
 -- worse than none, since the user would stop looking for the real problem. The promise
--- still resolves (so the other plugins' outcomes survive) and the command below reports
+-- still resolves (so the other plugins' outcomes survive) and `:PluginRestore` reports
 -- the failures loud.
 function M.restore()
   return nx.async(function()
@@ -1487,7 +1487,7 @@ end
 -- floating checklist (prelude/plugins_ui.lua → `M.ui.welcome`) explaining that nxvim
 -- ships minimal and offering the recommended set pre-ticked, each item untickable.
 -- The chosen subset is written to the user's config and installed; an empty / skipped
--- choice does nothing. Returns a promise. Wired to `VimEnter` below, and callable
+-- choice does nothing. Returns a promise. Wired to `VimEnter`, and callable
 -- directly. Re-entrant-safe (`_prompting` guard) and asks only once (the marker,
 -- written before showing the view so a cancel still never nags again).
 function M.bootstrap()

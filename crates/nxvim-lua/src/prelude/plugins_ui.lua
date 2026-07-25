@@ -10,7 +10,7 @@
 --   * the MANAGER (`:Plugins` / `M.ui.open`) — the dashboard: every declared plugin
 --     grouped by load state, with LIVE per-plugin progress (a spinner while a clone /
 --     pull runs, a ✓/✗ on finish) wired through `M.on_change` + `M._tasks`, and the
---     verb keymaps (I install · U update · S sync · X clean).
+--     verb keymaps (I install · U update · S sync · R restore · X clean).
 --
 -- Loaded AFTER prelude/plugins.lua: it reads the manager's `M.list` / `M.status` /
 -- `M._tasks` / `M._specs` and subscribes via `M.on_change`, and it builds on
@@ -283,11 +283,15 @@ local Manager = nx.view.component({
     local function refresh_status()
       nx.async(function()
         local rows = nx.await(M.status())
-        local map = {}
+        local map, drift = {}, {}
         for _, r in ipairs(rows) do
           map[r.name] = r.installed
+          drift[r.name] = r.drifted
         end
         state.status = map
+        -- Drift (the checkout is at a different commit than the lockfile records) rides
+        -- the same off-tick status pass, so the row suffix can show it without its own read.
+        state.drift = drift
       end)():catch(function(e)
         nx.notify("nx.plugins.ui: " .. tostring(e and e.message or e), 4)
       end)
@@ -375,6 +379,11 @@ local Manager = nx.view.component({
     ctx.keymap_set("n", "X", function()
       run(M.clean())
     end, { desc = "Clean undeclared" })
+    ctx.keymap_set("n", "R", function()
+      -- Same reporting as `:PluginRestore` (per-plugin failures loud, then a summary) —
+      -- shared rather than re-worded here so the two surfaces can't drift apart.
+      run(M.restore():next(M._restore_notify))
+    end, { desc = "Restore to the lockfile" })
     ctx.keymap_set("n", "r", function()
       refresh_status()
       state.tick = state.tick + 1
@@ -513,6 +522,9 @@ local Manager = nx.view.component({
         if p.pinned then
           bits[#bits + 1] = "pinned"
         end
+        if (st.drift or {})[p.name] then
+          bits[#bits + 1] = "drifted"
+        end
         local suffix = table.concat(bits, " ")
         local word
         if task then
@@ -557,7 +569,7 @@ local Manager = nx.view.component({
     section("Missing", missing, "○", "NxPluginsMissing")
 
     add(
-      "I install · U update · S sync · X clean · r refresh · <CR> details · q quit",
+      "I install · U update · S sync · R restore · X clean · r refresh · <CR> details · q quit",
       "NxPluginsDim"
     )
     return { lines = lines, decor = decor }

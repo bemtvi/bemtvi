@@ -1128,3 +1128,273 @@ async fn status_keeps_the_rename_source_when_folding_a_later_edit() {
         "the rename source survives the fold with the worktree edit"
     );
 }
+
+// ----- checkout (attach) + fetch ---------------------------------------------
+//
+// Two gaps the plugin lockfile ran into: `checkout` implemented only the DETACHING
+// mode, so nothing could re-attach a detached checkout to its branch; and there was no
+// `fetch`, so a shallow clone could never be deepened to reach an older commit. See
+// docs/plans/2026-07-25-plugin-lockfile.md.
+
+/// `checkout(dir, branch)` (no `detach`) attaches HEAD to a branch: HEAD becomes
+/// symbolic again and the worktree matches that branch's tip. The inverse of the
+/// detaching mode, and what makes a lock-pinned checkout movable again.
+#[tokio::test]
+async fn checkout_attaches_head_to_a_branch() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let src = make_repo("git_attach_src");
+    let first = git_out(&src, &["rev-parse", "HEAD"]);
+    commit_file(&src, "added.txt", "second\n", "add another file");
+    let tip = git_out(&src, &["rev-parse", "HEAD"]);
+
+    let dest = temp_dir("git_attach_dest").join("cloned");
+    let dest_s = dest.to_string_lossy().to_string();
+    // Full clone, detach onto the older commit, then re-attach to `main`.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.done, _G.err = nil, nil\n\
+             nx.async(function()\n\
+               nx.await(nx.git_local.clone({src:?}, {dest:?}))\n\
+               nx.await(nx.git_local.checkout({dest:?}, {first:?}, {{ detach = true }}))\n\
+               nx.await(nx.git_local.checkout({dest:?}, \"main\"))\n\
+               _G.done = true\n\
+             end)():catch(function(e) _G.err = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err and _G.err.message")
+            .await
+            .as_str(),
+        None,
+        "attach flow rejected"
+    );
+
+    // HEAD is on the branch again (not detached) at its tip, and the worktree came along.
+    exec_lua(
+        &rpc,
+        &format!("_G.h = nil\nnx.git.head({dest:?}):next(function(r) _G.h = r end)"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.h and _G.h.detached")
+            .await
+            .as_bool(),
+        Some(false),
+        "HEAD should be attached to a branch"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.h and _G.h.branch").await.as_str(),
+        Some("main")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.h and _G.h.sha").await.as_str(),
+        Some(tip.as_str())
+    );
+    assert!(
+        Path::new(&dest_s).join("added.txt").exists(),
+        "attaching to the branch tip must bring the worktree along"
+    );
+    // The git oracle agrees HEAD is symbolic.
+    assert_eq!(
+        git_out(Path::new(&dest_s), &["symbolic-ref", "HEAD"]),
+        "refs/heads/main"
+    );
+}
+
+/// Attaching to a branch that exists only on the remote (a fresh clone tracks just the
+/// default branch) creates the local branch from its remote-tracking ref, like
+/// `git checkout <branch>` does.
+#[tokio::test]
+async fn checkout_attaches_to_a_remote_only_branch() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let src = make_repo("git_remotebr_src");
+    git(&src, &["checkout", "-q", "-b", "side"]);
+    commit_file(&src, "side.txt", "on the side\n", "side commit");
+    git(&src, &["checkout", "-q", "main"]);
+
+    let dest = temp_dir("git_remotebr_dest").join("cloned");
+    let dest_s = dest.to_string_lossy().to_string();
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.done, _G.err = nil, nil\n\
+             nx.async(function()\n\
+               nx.await(nx.git_local.clone({src:?}, {dest:?}))\n\
+               nx.await(nx.git_local.checkout({dest:?}, \"side\"))\n\
+               _G.done = true\n\
+             end)():catch(function(e) _G.err = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err and _G.err.message")
+            .await
+            .as_str(),
+        None,
+        "attach-to-remote-branch rejected"
+    );
+    assert_eq!(
+        git_out(Path::new(&dest_s), &["symbolic-ref", "HEAD"]),
+        "refs/heads/side"
+    );
+    assert!(Path::new(&dest_s).join("side.txt").exists());
+}
+
+/// Attaching to a ref that is nowhere (no local branch, no remote-tracking ref) fails
+/// loud rather than silently leaving HEAD where it was.
+#[tokio::test]
+async fn checkout_attach_rejects_an_unknown_branch() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let src = make_repo("git_nobr_src");
+    let dest = temp_dir("git_nobr_dest").join("cloned");
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.err = nil\n\
+             nx.async(function()\n\
+               nx.await(nx.git_local.clone({src:?}, {dest:?}))\n\
+               nx.await(nx.git_local.checkout({dest:?}, \"no-such-branch\"))\n\
+             end)():catch(function(e) _G.err = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let msg = exec_lua(&rpc, "return _G.err and _G.err.message").await;
+    let msg = msg.as_str().unwrap_or("");
+    assert!(
+        msg.contains("no-such-branch"),
+        "must name the missing branch: {msg}"
+    );
+}
+
+/// `fetch(dir, { unshallow = true })` removes a shallow clone's boundary, so an older
+/// commit the `depth = 1` clone could not contain becomes reachable. This is what lets a
+/// lockfile restore an earlier revision in place instead of re-cloning.
+#[tokio::test]
+async fn fetch_unshallow_makes_older_history_reachable() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let src = make_repo("git_unshallow_src");
+    let first = git_out(&src, &["rev-parse", "HEAD"]);
+    commit_file(&src, "added.txt", "second\n", "second commit");
+
+    let dest = temp_dir("git_unshallow_dest").join("cloned");
+    let dest_s = dest.to_string_lossy().to_string();
+    // A depth-1 clone cannot contain `first` — checking it out must fail...
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.err1, _G.ok2 = nil, nil\n\
+             nx.async(function()\n\
+               nx.await(nx.git_local.clone({src:?}, {dest:?}, {{ depth = 1 }}))\n\
+               local ok, e = pcall(nx.await, nx.git_local.checkout({dest:?}, {first:?}, {{ detach = true }}))\n\
+               if not ok then _G.err1 = tostring(e and e.message or e) end\n\
+               -- ...until the clone is unshallowed, after which it succeeds.\n\
+               nx.await(nx.git_local.fetch({dest:?}, {{ unshallow = true }}))\n\
+               nx.await(nx.git_local.checkout({dest:?}, {first:?}, {{ detach = true }}))\n\
+               _G.ok2 = true\n\
+             end)():catch(function(e) _G.err2 = tostring(e and e.message or e) end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(
+        exec_lua(&rpc, "return _G.err1").await.as_str().is_some(),
+        "a depth-1 clone should not be able to reach the parent commit"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.ok2").await.as_bool(),
+        Some(true),
+        "after unshallow the older commit must be reachable; err2={:?}",
+        exec_lua(&rpc, "return _G.err2").await
+    );
+    assert_eq!(
+        git_out(Path::new(&dest_s), &["rev-parse", "HEAD"]),
+        first,
+        "HEAD should sit on the previously-unreachable commit"
+    );
+    // The shallow marker is gone — the oracle agrees it is a full repo now.
+    assert!(
+        !Path::new(&dest_s).join(".git").join("shallow").exists(),
+        "unshallow should remove .git/shallow"
+    );
+}
+
+/// A plain `fetch(dir)` updates remote-tracking refs without touching the worktree or
+/// the shallow boundary.
+#[tokio::test]
+async fn fetch_updates_tracking_refs_without_touching_the_worktree() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let src = make_repo("git_fetch_src");
+    let dest = temp_dir("git_fetch_dest").join("cloned");
+    let dest_s = dest.to_string_lossy().to_string();
+    exec_lua(
+        &rpc,
+        &format!("nx.async(function() nx.await(nx.git_local.clone({src:?}, {dest:?})) end)()"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = git_out(Path::new(&dest_s), &["rev-parse", "HEAD"]);
+
+    // The remote moves on; a fetch brings the tracking ref forward but leaves HEAD and
+    // the worktree exactly where they were (that is `pull`'s job, not `fetch`'s).
+    commit_file(&src, "added.txt", "second\n", "second commit");
+    let tip = git_out(&src, &["rev-parse", "HEAD"]);
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.done, _G.err = nil, nil\n\
+             nx.git_local.fetch({dest:?}):next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.done").await.as_bool(),
+        Some(true),
+        "fetch rejected: {:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        git_out(Path::new(&dest_s), &["rev-parse", "HEAD"]),
+        before,
+        "fetch must not move HEAD"
+    );
+    assert!(
+        !Path::new(&dest_s).join("added.txt").exists(),
+        "fetch must not touch the worktree"
+    );
+    assert_eq!(
+        git_out(
+            Path::new(&dest_s),
+            &["rev-parse", "refs/remotes/origin/main"]
+        ),
+        tip,
+        "fetch must advance the remote-tracking ref"
+    );
+}

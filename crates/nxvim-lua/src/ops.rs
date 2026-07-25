@@ -597,14 +597,24 @@ pub enum GitJob {
         branch: Option<String>,
     },
     /// `nx.git_local.checkout(dir, rev, opts)` — check out `rev` in the repo at `dir`,
-    /// updating the worktree and index to match its tree. `detach` (the only mode we
-    /// need — the plugin pins arbitrary commits) points HEAD straight at the resolved
-    /// commit rather than moving a branch. Replaces `git checkout --detach <sha>`.
+    /// updating the worktree and index to match its tree. `detach` points HEAD straight at
+    /// the resolved commit (`git checkout --detach <sha>` — how an exact pin is applied);
+    /// without it `rev` names a BRANCH and HEAD is left symbolic on it (`git checkout
+    /// <branch>`), creating the local branch from its remote-tracking ref when only that
+    /// exists. Attaching is what makes a commit-pinned checkout movable again, since
+    /// [`GitJob::Pull`] fast-forwards the current *branch* and refuses a detached HEAD.
     Checkout {
         dir: String,
         rev: String,
         detach: bool,
     },
+    /// `nx.git_local.fetch(dir, opts)` — fetch the repo's remote, updating remote-tracking
+    /// refs while leaving HEAD and the worktree untouched (unlike [`GitJob::Pull`], which
+    /// also fast-forwards the branch). `unshallow` drops a shallow clone's boundary
+    /// (`git fetch --unshallow`), making history a `depth = 1` clone omitted reachable —
+    /// the prerequisite for checking out an arbitrary older revision in place rather than
+    /// re-cloning. Resolves nil.
+    Fetch { dir: String, unshallow: bool },
     /// `nx.git_local.pull(dir)` — fetch the repo's remote and **fast-forward only** the
     /// current branch to its upstream, updating the worktree. Rejects (never merges)
     /// when the update is not a fast-forward, matching `git pull --ff-only`. Resolves

@@ -12,10 +12,16 @@
 //! runs in a serverless-web session — that rejects loud upstream (no in-browser git).
 //!
 //! The read verbs are `discover`/`head`/`show`/`diff_file`/`status`; the mutation /
-//! network verbs are `clone`/`checkout`/`pull`/`submodule_update` — the plugin-manager
-//! backing. gix has no one-call `clone --filter` (partial clone — shallow `depth`
-//! substitutes), `submodule update`, or `reset --hard`, so those are hand-rolled here
-//! over gix's fetch / worktree-state / reference primitives; see each `fn`.
+//! network verbs are `clone`/`checkout`/`fetch`/`pull`/`submodule_update` — the
+//! plugin-manager backing. gix has no one-call `clone --filter` (partial clone — shallow
+//! `depth` substitutes), `submodule update`, or `reset --hard`, so those are hand-rolled
+//! here over gix's fetch / worktree-state / reference primitives; see each `fn`.
+//!
+//! `checkout` has two modes and both matter: DETACHING pins an exact commit, ATTACHING
+//! puts HEAD back on a branch so `pull` (which fast-forwards the current *branch*) can run
+//! again. `fetch` is `pull`'s half that touches no working state, and its `unshallow` drops
+//! a shallow clone's boundary — the two together are what let a lockfile check out an
+//! arbitrary recorded revision in place and later move off it.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -41,6 +47,7 @@ pub fn run_git_job(job: &GitJob) -> Result<GitValue, GitError> {
             branch,
         } => clone(url, dir, *depth, branch.as_deref()),
         GitJob::Checkout { dir, rev, detach } => checkout(dir, rev, *detach),
+        GitJob::Fetch { dir, unshallow } => fetch(dir, *unshallow),
         GitJob::Pull { dir } => pull(dir),
         GitJob::SubmoduleUpdate {
             dir,
@@ -114,6 +121,96 @@ fn detach_head(repo: &gix::Repository, id: gix::ObjectId) -> Result<(), GitError
     })
     .map_err(|e| egit("detach HEAD", e))?;
     Ok(())
+}
+
+/// Point `repo`'s HEAD *symbolically* at `branch_ref` — the state `git checkout <branch>`
+/// leaves behind, and the inverse of [`detach_head`]. Attaching is what makes a detached
+/// checkout movable again: `pull` fast-forwards the current *branch*, so it rejects
+/// outright while HEAD names a bare commit.
+fn attach_head(repo: &gix::Repository, branch_ref: &gix::refs::FullName) -> Result<(), GitError> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    use gix::refs::Target;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("checkout: moving to {}", branch_ref.as_bstr()).into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch_ref.clone()),
+        },
+        name: "HEAD".try_into().expect("HEAD is a valid ref name"),
+        deref: false,
+    })
+    .map_err(|e| egit("attach HEAD", e))?;
+    Ok(())
+}
+
+/// Resolve `name` to a LOCAL branch ref, creating it from its remote-tracking counterpart
+/// when only that exists. A fresh clone materializes just the default branch locally —
+/// every other branch arrives as `refs/remotes/<remote>/<name>` — so without this,
+/// attaching to any non-default branch would fail on a normally-cloned repo, exactly where
+/// `git checkout <branch>` succeeds by creating the tracking branch on demand.
+fn resolve_local_branch(
+    repo: &gix::Repository,
+    name: &str,
+) -> Result<(gix::refs::FullName, gix::ObjectId), GitError> {
+    let local: gix::refs::FullName = format!("refs/heads/{name}")
+        .try_into()
+        .map_err(|e| err("EGIT", format!("invalid branch name '{name}': {e}")))?;
+    if let Ok(mut r) = repo.find_reference(local.as_ref()) {
+        let id = r
+            .peel_to_id()
+            .map_err(|e| egit("resolve branch", e))?
+            .detach();
+        return Ok((local, id));
+    }
+    // No local branch: look for exactly one remote-tracking ref with this name and branch
+    // from it. Ambiguity across remotes is an error rather than a guess.
+    let mut found: Option<gix::ObjectId> = None;
+    let platform = repo.references().map_err(|e| egit("iterate refs", e))?;
+    let iter = platform
+        .prefixed("refs/remotes/")
+        .map_err(|e| egit("iterate remote refs", e))?;
+    for r in iter {
+        let mut r = r.map_err(|e| egit("read ref", e))?;
+        let full = r.name().as_bstr().to_string();
+        // `refs/remotes/<remote>/<name>` — match on the trailing component(s).
+        if full.strip_prefix("refs/remotes/").and_then(|rest| {
+            rest.split_once('/')
+                .map(|(_remote, br)| br)
+                .filter(|br| *br == name)
+        }) != Some(name)
+        {
+            continue;
+        }
+        let id = r
+            .peel_to_id()
+            .map_err(|e| egit("resolve remote branch", e))?
+            .detach();
+        if found.is_some_and(|prev| prev != id) {
+            return Err(err(
+                "EGIT",
+                format!("branch '{name}' is ambiguous across remotes"),
+            ));
+        }
+        found = Some(id);
+    }
+    let id = found.ok_or_else(|| {
+        err(
+            "ENOENT",
+            format!("no such branch '{name}' (no local ref and no remote-tracking ref)"),
+        )
+    })?;
+    repo.reference(
+        local.as_ref(),
+        id,
+        gix::refs::transaction::PreviousValue::MustNotExist,
+        format!("branch: created from remote-tracking ref at {id}"),
+    )
+    .map_err(|e| egit("create local branch", e))?;
+    Ok((local, id))
 }
 
 /// Hand-rolled `reset --hard`: make `repo`'s worktree and index match `tree_id`. gix has
@@ -374,10 +471,21 @@ fn clone_at(
 /// behaving like `--detach`.
 fn checkout(dir: &str, rev: &str, detach: bool) -> Result<GitValue, GitError> {
     if !detach {
-        return Err(err(
-            "EGIT",
-            "checkout without detach is not implemented (the plugin manager only pins commits)",
-        ));
+        // ATTACH mode: `rev` names a branch, and HEAD ends up symbolic on it with the
+        // worktree at its tip — `git checkout <branch>`. This is the mode that makes a
+        // detached (commit-pinned) checkout movable again, since `pull` fast-forwards the
+        // current *branch* and refuses to run on a bare commit.
+        let repo = open(dir)?;
+        let (branch_ref, id) = resolve_local_branch(&repo, rev)?;
+        let tree_id = repo
+            .find_object(id)
+            .map_err(|e| egit("read commit", e))?
+            .peel_to_tree()
+            .map_err(|e| egit("peel to tree", e))?
+            .id;
+        reset_worktree_to_tree(&repo, tree_id)?;
+        attach_head(&repo, &branch_ref)?;
+        return Ok(GitValue::Nil);
     }
     let repo = open(dir)?;
     let id = repo
@@ -409,6 +517,36 @@ fn checkout(dir: &str, rev: &str, detach: bool) -> Result<GitValue, GitError> {
 /// fetch → read the branch's remote-tracking tip → require the local tip is its
 /// ancestor (the ff check via `merge_base`) → move the branch ref and reset the
 /// worktree to the new tree.
+/// `nx.git_local.fetch` — fetch the repo's remote, updating remote-tracking refs but
+/// touching neither HEAD nor the worktree (that is `pull`'s job). `unshallow` drops a
+/// shallow clone's boundary (`git fetch --unshallow`), which is what makes an older commit
+/// a `depth = 1` clone could not contain reachable — the prerequisite for checking out an
+/// arbitrary pinned/locked revision in place instead of re-cloning.
+fn fetch(dir: &str, unshallow: bool) -> Result<GitValue, GitError> {
+    use gix::remote::Direction;
+
+    let repo = open(dir)?;
+    let remote = repo
+        .find_fetch_remote(None)
+        .map_err(|e| egit("find remote", e))?;
+    let interrupt = AtomicBool::new(false);
+    let connection = remote
+        .connect(Direction::Fetch)
+        .map_err(|e| egit("connect", e))?;
+    let mut prepared = connection
+        .prepare_fetch(gix::progress::Discard, Default::default())
+        .map_err(|e| egit("prepare fetch", e))?;
+    if unshallow {
+        // `Shallow::undo()` extends the boundary past every limit — gix's spelling of
+        // `--unshallow`. It is a no-op on a repo that was never shallow.
+        prepared = prepared.with_shallow(gix::remote::fetch::Shallow::undo());
+    }
+    prepared
+        .receive(gix::progress::Discard, &interrupt)
+        .map_err(|e| egit("fetch", e))?;
+    Ok(GitValue::Nil)
+}
+
 fn pull(dir: &str) -> Result<GitValue, GitError> {
     use gix::remote::Direction;
 

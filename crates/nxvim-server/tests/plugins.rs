@@ -235,7 +235,8 @@ async fn lazy_cmd_defers_load_until_invoked() {
         &format!(
             "nx.plugins {{ {{ \"file://{repo}\", name = \"beta\", cmd = \"Beta\",\n\
                config = function() require(\"beta\").setup() end }} }}\n\
-             nx.plugins.install():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+             nx.plugins.install():next(function() _G.done = true end)
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
             repo = q(&repo)
         ),
     )
@@ -1015,7 +1016,8 @@ async fn install_records_task_state_and_fires_on_change() {
         &rpc,
         &format!(
             "nx.plugins {{ {{ \"file://{repo}\", name = \"tau\" }} }}\n\
-             nx.plugins.install():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+             nx.plugins.install():next(function() _G.done = true end)
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
             repo = q(&repo)
         ),
     )
@@ -1695,5 +1697,973 @@ async fn plugin_loaded_event_fires_per_plugin_including_lazy() {
     assert!(
         poll_true(&rpc, "return _G.omega_evt == \"omega\"").await,
         "PluginLoaded should fire carrying the plugin name when the lazy plugin loads"
+    );
+}
+
+// ----- the lockfile (Phase 1: record + read) ---------------------------------
+//
+// The manager supports pinning but never RECORDED what an unpinned plugin resolved to,
+// so an install was whatever `HEAD` happened to be and an update could not be undone.
+// Phase 1 writes `<config>/nxvim-lock.json` after every install/update/sync. See
+// docs/plans/2026-07-25-plugin-lockfile.md.
+
+/// `git rev-parse HEAD` in `dir`, trimmed — the SHA the lockfile must agree with.
+fn head_sha(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("spawn git rev-parse");
+    assert!(out.status.success(), "git rev-parse failed in {dir:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[tokio::test]
+async fn sync_writes_a_lockfile_recording_the_cloned_commit() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_lock_src");
+    let repo = make_repo(&src, "alpha");
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_lock").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.sync():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+
+    let lock = cfg.join("nxvim-lock.json");
+    assert!(
+        poll_true(&rpc, "return nx.plugins.locked().alpha ~= nil").await,
+        "sync should record the plugin in the lock; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(lock.exists(), "sync should write {lock:?}");
+
+    // The recorded commit is the one actually checked out — in the file AND in memory.
+    let want = head_sha(&root.join("alpha"));
+    let text = std::fs::read_to_string(&lock).unwrap();
+    assert!(
+        text.contains(&want),
+        "lockfile must record the checked-out SHA {want}; file={text}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.plugins.locked().alpha.commit")
+            .await
+            .as_str(),
+        Some(want.as_str())
+    );
+}
+
+#[tokio::test]
+async fn the_lockfile_is_pretty_printed_with_sorted_keys() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_locksort_src");
+    let a = make_repo(&src, "zeta");
+    let b = make_repo(&src, "alpha");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_locksort").await;
+
+    // Declared zeta-first, so a sorted file proves the ORDER comes from the encoder and
+    // not from declaration order — that is what keeps the committed file's diffs clean.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{a}\", name = \"zeta\" }}, {{ \"file://{b}\", name = \"alpha\" }} }}\n\
+             nx.plugins.sync():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            a = q(&a),
+            b = q(&b)
+        ),
+    )
+    .await;
+
+    assert!(
+        poll_true(
+            &rpc,
+            "return nx.plugins.locked().zeta ~= nil and nx.plugins.locked().alpha ~= nil"
+        )
+        .await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        text.find("\"alpha\"") < text.find("\"zeta\""),
+        "keys must be sorted, not in declaration order: {text}"
+    );
+    assert!(
+        text.contains("\n  \""),
+        "must be pretty-printed (2-space indent), not a one-liner: {text}"
+    );
+    assert!(text.ends_with('\n'), "must end with a newline: {text:?}");
+}
+
+#[tokio::test]
+async fn a_dev_dir_plugin_is_never_locked() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_lockdev_src");
+    let repo = make_repo(&src, "alpha");
+    let devdir = make_repo(&src, "devplug");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_lockdev").await;
+
+    // A `dir` plugin is a working checkout the manager never clones — locking it would
+    // record a SHA nothing can reproduce, so it must be absent from the lockfile.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }}, {{ dir = \"{dev}\", name = \"devplug\" }} }}\n\
+             nx.plugins.sync():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo),
+            dev = q(&devdir)
+        ),
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, "return nx.plugins.locked().alpha ~= nil").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(cfg.join("nxvim-lock.json").exists());
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "return nx.plugins.locked().alpha ~= nil and nx.plugins.locked().devplug == nil"
+        )
+        .await,
+        Some(true),
+        "the managed plugin is locked, the dev `dir` plugin is not"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_lockfile_fails_loud() {
+    let (rpc, _i) = start().await;
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_lockbad").await;
+    // A corrupt lock must never be silently treated as "nothing pinned" — that would
+    // quietly drop every pin the user committed.
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("nxvim-lock.json"), "{ this is not json").unwrap();
+
+    exec_lua(
+        &rpc,
+        "nx.plugins._read_lock()\n  :next(function() _G.ok = true end)\n  \
+         :catch(function(e) _G.lock_err = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.lock_err ~= nil").await,
+        "a malformed lockfile must reject, not resolve empty; ok={:?}",
+        exec_lua(&rpc, "return _G.ok").await
+    );
+    let msg = exec_lua(&rpc, "return _G.lock_err").await;
+    let msg = msg.as_str().unwrap_or("");
+    assert!(
+        msg.contains("nxvim-lock.json"),
+        "the error must name the file: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn plugin_lock_command_is_wired() {
+    let (rpc, _i) = start().await;
+    assert_eq!(
+        lua_bool(&rpc, "return nx.user_command.get().PluginLock ~= nil").await,
+        Some(true)
+    );
+}
+
+// ----- the lockfile (Phase 2: install reproduces it) -------------------------
+
+/// Add a second commit to a source repo and return its SHA — so a test can prove an
+/// install landed on the LOCKED commit rather than on the remote's current tip.
+fn add_commit(repo: &Path, marker: &str) -> String {
+    std::fs::write(repo.join("SECOND.md"), format!("{marker}\n")).unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", marker]);
+    head_sha(repo)
+}
+
+#[tokio::test]
+async fn install_reproduces_the_locked_commit_not_the_remote_tip() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_repro_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+
+    // Machine 1: install at the repo's current tip and let it lock.
+    let base = temp_dir("plug_repro");
+    let cfg = base.join("config");
+    let root_a = base.join("install-a");
+    let root_b = base.join("install-b");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let declare = format!(
+        "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+         nx.plugins.sync():next(function() _G.done = true end)\n\
+           :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+        repo = q(&repo)
+    );
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{}\", config = \"{}\" }})",
+            q(&root_a),
+            q(&cfg)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, &declare).await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "machine 1 should install; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(head_sha(&root_a.join("alpha")), first);
+
+    // The remote moves on. The lockfile still names `first`.
+    let second = add_commit(&repo, "moved-on");
+    assert_ne!(second, first);
+
+    // Machine 2: same config + same lockfile, a fresh install root. It must land on the
+    // LOCKED commit, not the remote's new tip — that is the whole point of the lockfile.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.err, _G.done = nil, nil\nnx.plugins.setup_manager({{ root = \"{}\", config = \"{}\" }})",
+            q(&root_b),
+            q(&cfg)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, &declare).await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "machine 2 should install; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root_b.join("alpha")),
+        first,
+        "a locked install must reproduce the locked commit, not the remote tip {second}"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_spec_commit_outranks_the_lockfile() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_specpin_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let second = add_commit(&repo, "the-explicitly-pinned-one");
+
+    let base = temp_dir("plug_specpin");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // A lockfile naming `first` on disk...
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    // ...but the spec explicitly pins `second`. A hand-written pin is an instruction;
+    // the lock is only a record, so the spec must win.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\", commit = \"{second}\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        second,
+        "an explicit spec commit must outrank the lockfile entry"
+    );
+}
+
+#[tokio::test]
+async fn an_unlocked_install_stays_shallow() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_shallow_src");
+    let repo = make_repo(&src, "alpha");
+    add_commit(&repo, "second");
+    let (root, _cfg) = setup_root_and_config(&rpc, "plug_shallow").await;
+
+    // With nothing locked, the clone must stay `depth = 1` — reaching a locked commit is
+    // the ONLY reason to pay for a full clone, so an unlocked install keeps the speed-up.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(
+        root.join("alpha").join(".git").join("shallow").exists(),
+        "an unlocked clone should be shallow (.git/shallow present)"
+    );
+}
+
+#[tokio::test]
+async fn a_locked_install_is_deep_enough_to_reach_the_commit() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_deep_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    add_commit(&repo, "second");
+
+    let base = temp_dir("plug_deep");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // `first` is the PARENT of the tip, so a depth-1 clone could not contain it: this
+    // proves the locked path clones deep enough rather than just asking for a checkout.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(head_sha(&root.join("alpha")), first);
+}
+
+#[tokio::test]
+async fn a_lockfile_naming_an_unreachable_commit_fails_loud() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_badpin_src");
+    let repo = make_repo(&src, "alpha");
+
+    let base = temp_dir("plug_badpin");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // A commit that does not exist (a force-pushed-away revision). Installing must FAIL
+    // and say the pin came from the lockfile — silently falling back to the remote tip
+    // would hand back a different plugin tree than the lockfile promises.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        "{\n  \"alpha\": { \"commit\": \"0123456789abcdef0123456789abcdef01234567\" }\n}\n",
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.err ~= nil").await,
+        "an unreachable locked commit must reject, not silently install the tip"
+    );
+    let msg = exec_lua(&rpc, "return _G.err").await;
+    let msg = msg.as_str().unwrap_or("");
+    // The message must be actionable: which plugin, that the pin came from the lock, and
+    // the file to edit. Without the path the user has no way to find the stale entry.
+    assert!(msg.contains("alpha"), "must name the plugin: {msg}");
+    assert!(msg.contains("is locked at"), "must say it is locked: {msg}");
+    assert!(
+        msg.contains("nxvim-lock.json"),
+        "must name the lockfile to fix: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sync_reproduces_the_lock_while_update_advances_past_it() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_advance_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let tip = add_commit(&repo, "second");
+
+    let base = temp_dir("plug_advance");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    // `sync` = install + update. The install lands on the locked commit; the update pass
+    // must NOT then advance past it, or the lockfile would be honoured only for the
+    // instant between the two halves. (It also must not fail: the locked checkout is
+    // detached, and `pull` rejects a detached HEAD.)
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.sync():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "sync must succeed over a lock-installed (detached) plugin; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        first,
+        "sync must reproduce the locked commit, not advance past it"
+    );
+
+    // `_update` reports it as `locked` rather than pretending it is up to date.
+    exec_lua(
+        &rpc,
+        "_G.status = nil\nnx.plugins._update('alpha'):next(function(s) _G.status = s end)",
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.status ~= nil").await);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.status").await.as_str(),
+        Some("locked")
+    );
+
+    // The tracked branch survived the detaching install, so update knows where to reattach.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.plugins.locked().alpha.branch")
+            .await
+            .as_str(),
+        Some("main")
+    );
+
+    // The explicit update verb DOES advance: it re-attaches to the branch, fast-forwards,
+    // and re-records the lock. Without this a lock pin would be a permanent freeze.
+    exec_lua(
+        &rpc,
+        "_G.upd, _G.uerr = nil, nil\n\
+         nx.plugins.update():next(function(n) _G.upd = n end)\n\
+           :catch(function(e) _G.uerr = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.upd ~= nil").await,
+        "update should resolve; uerr={:?}",
+        exec_lua(&rpc, "return _G.uerr").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        tip,
+        "an explicit update must advance past the lock to the branch tip"
+    );
+    // HEAD is attached again, and the lockfile now records the new commit.
+    assert!(
+        poll_true(
+            &rpc,
+            &format!("return nx.plugins.locked().alpha.commit == \"{tip}\"")
+        )
+        .await,
+        "update must re-record the lock at the advanced commit"
+    );
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        text.contains(&tip),
+        "lockfile on disk should hold {tip}: {text}"
+    );
+}
+
+#[tokio::test]
+async fn update_of_a_detached_plugin_with_no_recorded_branch_fails_loud() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_nobranch_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    add_commit(&repo, "second");
+
+    let base = temp_dir("plug_nobranch");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // A lock entry with NO branch (hand-written, or from an older nxvim): there is then no
+    // way to know where to re-attach. Guessing a branch could move the plugin somewhere the
+    // user never asked for, so it must fail loud and name the fix.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function()\n\
+               nx.plugins._update('alpha', {{ advance = true }}):next(function(s) _G.status = s end)\n\
+                 :catch(function(e) _G.uerr = tostring(e and e.message or e) end)\n\
+             end):catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.uerr ~= nil or _G.status ~= nil").await,
+        "update should settle; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    let msg = exec_lua(&rpc, "return _G.uerr").await;
+    let msg = msg.as_str().unwrap_or("");
+    assert!(
+        msg.contains("detached") && msg.contains("branch"),
+        "must explain that there is no branch to reattach to: {msg} (status={:?})",
+        exec_lua(&rpc, "return _G.status").await
+    );
+}
+
+// ----- the lockfile (Phase 3: restore + drift) --------------------------------
+
+#[tokio::test]
+async fn restore_moves_a_checkout_back_to_the_locked_commit() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_restore_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let tip = add_commit(&repo, "second");
+
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_restore").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+
+    // Install unpinned: a SHALLOW clone at the tip, and the lock records the tip.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(head_sha(&root.join("alpha")), tip);
+    assert!(
+        root.join("alpha").join(".git").join("shallow").exists(),
+        "precondition: the unpinned clone is shallow"
+    );
+
+    // The user checks out an OLDER lockfile from their config repo (naming `first`, a
+    // commit the shallow clone does not contain) and restores.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+    exec_lua(
+        &rpc,
+        "_G.res, _G.rerr = nil, nil\n\
+         nx.plugins.restore():next(function(r) _G.res = r end)\n\
+           :catch(function(e) _G.rerr = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.res ~= nil").await,
+        "restore should resolve; rerr={:?}",
+        exec_lua(&rpc, "return _G.rerr").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        first,
+        "restore must move the checkout to the locked commit, deepening the shallow clone \
+         to reach it"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.res.restored").await.as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.res.failed").await.as_u64(),
+        Some(0)
+    );
+
+    // Restoring again is a no-op: already at the locked commit, nothing re-checked-out.
+    exec_lua(
+        &rpc,
+        "_G.res2 = nil\nnx.plugins.restore():next(function(r) _G.res2 = r end)",
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.res2 ~= nil").await);
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.res2.restored").await.as_u64(),
+        Some(0),
+        "an already-restored plugin must not be re-checked-out"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.res2.current").await.as_u64(),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn restore_fails_loud_for_a_commit_that_no_longer_exists() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_restorebad_src");
+    let repo = make_repo(&src, "alpha");
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_restorebad").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.done == true").await);
+    let before = head_sha(&root.join("alpha"));
+
+    // A commit the remote does not have — even unshallowing cannot produce it.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        "{\n  \"alpha\": { \"commit\": \"0123456789abcdef0123456789abcdef01234567\" }\n}\n",
+    )
+    .unwrap();
+    exec_lua(
+        &rpc,
+        "_G.res, _G.rerr = nil, nil\n\
+         nx.plugins.restore():next(function(r) _G.res = r end)\n\
+           :catch(function(e) _G.rerr = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.res ~= nil or _G.rerr ~= nil").await,
+        "restore should settle"
+    );
+    // It must report the failure, not claim a successful rollback.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.res and #_G.res.failed")
+            .await
+            .as_u64(),
+        Some(1),
+        "an unreachable commit must be reported as failed; rerr={:?}",
+        exec_lua(&rpc, "return _G.rerr").await
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.res and #_G.res.restored")
+            .await
+            .as_u64(),
+        Some(0),
+        "nothing was actually restored, so nothing may be counted as restored"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.res.failed[1].name")
+            .await
+            .as_str(),
+        Some("alpha")
+    );
+    // The checkout is untouched — a failed restore leaves the tree as it was.
+    assert_eq!(head_sha(&root.join("alpha")), before);
+}
+
+#[tokio::test]
+async fn status_reports_drift_against_the_lockfile() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_drift_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let tip = add_commit(&repo, "second");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_drift").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.done == true").await);
+
+    // Freshly installed and locked: the checkout matches the lock, so no drift.
+    exec_lua(
+        &rpc,
+        "_G.rows = nil\nnx.plugins.status():next(function(r) _G.rows = r end)",
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.rows ~= nil").await);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rows[1].drifted").await.as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rows[1].locked").await.as_str(),
+        Some(tip.as_str())
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rows[1].head").await.as_str(),
+        Some(tip.as_str())
+    );
+
+    // Point the lockfile at a different commit: the checkout now DRIFTS from it.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+    exec_lua(
+        &rpc,
+        "_G.rows2 = nil\nnx.plugins.status():next(function(r) _G.rows2 = r end)",
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.rows2 ~= nil").await);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rows2[1].drifted").await.as_bool(),
+        Some(true),
+        "a checkout that differs from the lockfile must report drift"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rows2[1].locked").await.as_str(),
+        Some(first.as_str())
+    );
+}
+
+#[tokio::test]
+async fn restore_leaves_a_dev_dir_plugin_alone() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_restoredev_src");
+    let devdir = make_repo(&src, "devplug");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_restoredev").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    // Even a hand-written entry for a dev plugin must not move the user's own checkout —
+    // restore is for the manager's clones, never for a working tree it does not own.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        "{\n  \"devplug\": { \"commit\": \"0123456789abcdef0123456789abcdef01234567\" }\n}\n",
+    )
+    .unwrap();
+    let before = head_sha(&devdir);
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ dir = \"{dev}\", name = \"devplug\" }} }}\n\
+             _G.res = nil\n\
+             nx.plugins.restore():next(function(r) _G.res = r end)\n\
+               :catch(function(e) _G.rerr = tostring(e and e.message or e) end)",
+            dev = q(&devdir)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.res ~= nil").await,
+        "rerr={:?}",
+        exec_lua(&rpc, "return _G.rerr").await
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.res.restored").await.as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.res.failed").await.as_u64(),
+        Some(0),
+        "a dev plugin is skipped, not reported as a failure"
+    );
+    assert_eq!(head_sha(&devdir), before, "the dev checkout must not move");
+}
+
+#[tokio::test]
+async fn plugin_restore_command_is_wired() {
+    let (rpc, _i) = start().await;
+    assert_eq!(
+        lua_bool(&rpc, "return nx.user_command.get().PluginRestore ~= nil").await,
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn the_dashboard_offers_restore_and_reaches_it() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_uirestore_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let tip = add_commit(&repo, "second");
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_uirestore").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.done == true").await);
+    assert_eq!(head_sha(&root.join("alpha")), tip);
+
+    // Point the lock back at the older commit, then open the dashboard: it must advertise
+    // the restore verb and show the plugin as drifted.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+    assert!(
+        poll_true(&rpc, "return vim.bo.filetype == 'nxplugins'").await,
+        ":Plugins should open the dashboard"
+    );
+    // The hint line is real buffer text, so it is assertable here. The per-row `drifted`
+    // flag is an end-of-line virt_text decoration (not buffer text) and there is no test
+    // seam for the dashboard's decor list; the DATA behind it is covered directly by
+    // `status_reports_drift_against_the_lockfile`.
+    let mut saw_verb = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.join("\n").contains("R restore") {
+            saw_verb = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(saw_verb, "the dashboard should advertise the restore verb");
+    // Drift really is what the dashboard's status pass sees for this plugin. (`status()` is
+    // a promise, so the flag has to be parked on a global and polled — reading it in the
+    // same chunk would always see the pre-resolution value.)
+    exec_lua(
+        &rpc,
+        "_G.__drift = nil\n\
+         nx.plugins.status():next(function(r)\n\
+           for _, row in ipairs(r) do\n\
+             if row.name == 'alpha' then _G.__drift = row.drifted end\n\
+           end\n\
+         end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.__drift == true").await,
+        "the plugin should read as drifted while the checkout differs from the lock"
+    );
+
+    // Pressing R restores — the same path `:PluginRestore` takes.
+    feed(&rpc, "R");
+    let mut back = false;
+    for _ in 0..250 {
+        if head_sha(&root.join("alpha")) == first {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(back, "R should restore the checkout to the locked commit");
+}
+
+/// A lockfile entry for a plugin no longer declared must not linger. `resolve_lock`
+/// rebuilds the table from the DECLARED set, so the next lock write drops it — otherwise
+/// a config that dropped a plugin would keep pinning it forever and `:PluginClean` would
+/// leave a stale pin behind that a future re-add would silently resurrect.
+#[tokio::test]
+async fn a_lockfile_entry_for_an_undeclared_plugin_is_pruned() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_prune_src");
+    let repo = make_repo(&src, "alpha");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_prune").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    // A lockfile carrying an entry for a plugin the config does not declare.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        "{\n  \"ghost\": { \"commit\": \"0123456789abcdef0123456789abcdef01234567\" }\n}\n",
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "return nx.plugins.locked().alpha ~= nil and nx.plugins.locked().ghost == nil"
+        )
+        .await,
+        Some(true),
+        "the undeclared plugin's entry should be gone from the lock"
+    );
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        !text.contains("ghost"),
+        "the stale entry should be gone from the FILE too: {text}"
     );
 }

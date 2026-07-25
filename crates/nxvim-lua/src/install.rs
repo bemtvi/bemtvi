@@ -4108,6 +4108,10 @@ fn git_job_from_table(job: &Table) -> mlua::Result<GitJob> {
             rev: job.get("rev")?,
             detach: job.get::<Option<bool>>("detach")?.unwrap_or(false),
         },
+        "fetch" => GitJob::Fetch {
+            dir: job.get("dir")?,
+            unshallow: job.get::<Option<bool>>("unshallow")?.unwrap_or(false),
+        },
         "pull" => GitJob::Pull {
             dir: job.get("dir")?,
         },

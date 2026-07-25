@@ -118,12 +118,40 @@ local function define(surface, bridge)
     })
   end
 
-  -- `checkout(dir, rev, opts)` -> promise resolving nil. Checks out `rev` (a sha, tag,
-  -- or ref) in the repo at `dir`, updating the worktree. `opts.detach` (the supported
-  -- mode) detaches HEAD onto the commit. Replaces `git checkout --detach <sha>`.
+  -- `checkout(dir, rev, opts)` -> promise resolving nil. Checks out `rev` in the repo at
+  -- `dir`, updating the worktree to match. Two modes:
+  --
+  -- ```lua
+  -- nx.git.checkout(dir, sha, { detach = true })  -- git checkout --detach <sha>
+  -- nx.git.checkout(dir, "main")                  -- git checkout main
+  -- ```
+  --
+  -- With `opts.detach` the `rev` is any revision (a sha, tag, or ref) and HEAD is left
+  -- pointing straight at that commit — how an exact pin is applied. Without it, `rev`
+  -- names a BRANCH and HEAD stays symbolic on it; a branch that exists only as a
+  -- remote-tracking ref (the usual case for anything but the default branch of a fresh
+  -- clone) is created locally from it first, as `git checkout <branch>` does.
+  --
+  -- Attaching is what makes a detached checkout movable again: `pull` fast-forwards the
+  -- current *branch*, so it rejects outright while HEAD names a bare commit. Rejects
+  -- (`ENOENT`) when an attach target is neither a local nor a remote-tracking branch.
   function surface.checkout(dir, rev, opts)
     opts = opts or {}
     return run_git(bridge, { op = "checkout", dir = dir, rev = rev, detach = opts.detach })
+  end
+
+  -- `fetch(dir, opts)` -> promise resolving nil. Fetches the repo's remote, updating the
+  -- remote-tracking refs and leaving HEAD and the worktree alone — the half of `pull`
+  -- that touches no working state. Replaces `git fetch`.
+  --
+  -- `opts.unshallow` drops a shallow clone's boundary (`git fetch --unshallow`), so
+  -- history a `depth = 1` clone omitted becomes reachable. That is the prerequisite for
+  -- checking out an arbitrary older revision *in place* — without it, a shallow clone
+  -- simply does not contain the commit and the checkout rejects. A no-op on a repo that
+  -- was never shallow.
+  function surface.fetch(dir, opts)
+    opts = opts or {}
+    return run_git(bridge, { op = "fetch", dir = dir, unshallow = opts.unshallow })
   end
 
   -- `pull(dir)` -> promise of { updated, sha }. Fetches the repo's remote and

@@ -20,7 +20,8 @@
 //! **Request (read)** — `{ op = "discover", path }`, `{ op = "head", path }`, `{ op =
 //! "show", file, rev }`, `{ op = "diff_file", path, file }`, `{ op = "status", path }`.
 //! **Request (mutation)** — `{ op = "clone", url, dir, depth?, branch? }`, `{ op =
-//! "checkout", dir, rev, detach }`, `{ op = "pull", dir }`, `{ op = "submodule_update",
+//! "checkout", dir, rev, detach }`, `{ op = "fetch", dir, unshallow }`, `{ op = "pull",
+//! dir }`, `{ op = "submodule_update",
 //! dir, init, recursive }`.
 //!
 //! **Reply** — `["ok", <git-value>]` on success, `["err", code, message]` on a reject.
@@ -76,6 +77,10 @@ pub fn git_job_from_value(v: &Value) -> Result<GitJob, String> {
             dir: str_field("dir")?,
             rev: str_field("rev")?,
             detach: get("detach").and_then(Value::as_bool).unwrap_or(false),
+        },
+        "fetch" => GitJob::Fetch {
+            dir: str_field("dir")?,
+            unshallow: get("unshallow").and_then(Value::as_bool).unwrap_or(false),
         },
         "pull" => GitJob::Pull {
             dir: str_field("dir")?,
@@ -147,6 +152,11 @@ pub fn git_job_to_value(job: &GitJob) -> Value {
             ("dir", dir.as_str().into()),
             ("rev", rev.as_str().into()),
             ("detach", Value::from(*detach)),
+        ]),
+        GitJob::Fetch { dir, unshallow } => m(vec![
+            ("op", "fetch".into()),
+            ("dir", dir.as_str().into()),
+            ("unshallow", Value::from(*unshallow)),
         ]),
         GitJob::Pull { dir } => m(vec![("op", "pull".into()), ("dir", dir.as_str().into())]),
         GitJob::SubmoduleUpdate {

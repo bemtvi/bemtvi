@@ -2,9 +2,9 @@
 --
 -- There is no third-party plugin-manager layer in nxvim; the manager is built in
 -- (ADR 0002 / docs/specs/2026-06-11-native-plugin-api.md). You DECLARE the set you
--- want, and the manager clones/updates them with real `git` (over the async
--- runtime, never blocking the editor) and loads each one — eagerly at startup or
--- lazily on a trigger.
+-- want, and the manager clones/updates them via `nx.git_local` (first-party gix, no
+-- `git` binary, over the async runtime — never blocking the editor) and loads each
+-- one — eagerly at startup or lazily on a trigger.
 --
 -- IMPORTANT: nxvim is its OWN editor, not a neovim build, and claims no neovim
 -- compatibility. Plugins are written against the `nx.*` API (see the spec's worked
@@ -19,12 +19,22 @@
 --   NXVIM_CONFIG=examples/plugins cargo run -p nxvim
 --   :Plugins        -- the lazy-style dashboard: every plugin grouped by load state,
 --                      LIVE clone/pull progress, and the action keys —
---                      I install · U update · S sync · X clean · <CR> details · q quit
+--                      I install · U update · S sync · R restore · X clean ·
+--                      <CR> details · q quit
 --   :PluginsWelcome -- re-open the first-run recommended-set checklist on demand
---   :PluginSync     -- clone everything declared below (needs network + git)
---   :PluginList     -- show install / load state (text dump)
---   :PluginUpdate   -- fast-forward the unpinned ones
+--   :PluginSync     -- clone what's missing, at the LOCKED commits (needs network)
+--   :PluginList     -- show install / load state, incl. DRIFTED (text dump)
+--   :PluginUpdate   -- fast-forward the unpinned ones, ADVANCING past the lockfile
+--   :PluginRestore  -- check every plugin out at the commit the lockfile records
+--   :PluginLock     -- (re)record the installed commits to the lockfile
 --   :PluginClean    -- remove clones no spec declares
+--
+-- THE LOCKFILE. After the first `:PluginSync` you'll find `nxvim-lock.json` in this
+-- example dir (the config dir) recording the exact commit each plugin resolved to.
+-- Commit that next to your init.lua and another machine reproduces the same tree.
+-- Try it: `:PluginUpdate` (advances + re-records), then `:PluginRestore` (back to
+-- what the file says). `:PluginList` marks a plugin `DRIFTED` while its checkout
+-- differs from the lockfile.
 --
 -- Clones land under stdpath("data")/plugins (overridable with
 -- nx.plugins.setup_manager).

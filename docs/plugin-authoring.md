@@ -73,9 +73,17 @@ nx.plugins({
 })
 ```
 
-Then `:PluginSync` (clone missing + update), `:PluginInstall`, `:PluginUpdate`,
-`:PluginClean`, `:PluginList`, or the `:Plugins` dashboard. Cloned plugins live under
-`stdpath("data")/plugins/<name>`. A spec with `cmd`/`event`/`ft`/`keys` (or
+Then `:PluginSync` (realize the declared + locked state), `:PluginInstall`,
+`:PluginUpdate` (fast-forward, advancing past the lockfile), `:PluginRestore`
+(check out the locked commits), `:PluginLock`, `:PluginClean`, `:PluginList`, or the
+`:Plugins` dashboard. Cloned plugins live under `stdpath("data")/plugins/<name>`.
+
+Every install/update records each plugin's resolved commit in
+`<config>/nxvim-lock.json`, and installing reproduces those commits — so a config plus
+its lockfile pins the exact plugin tree. `:PluginSync` therefore does *not* move a
+plugin the lockfile pins; advancing past it is `:PluginUpdate`'s job, and
+`:PluginRestore` goes back. See
+[Configuration → the lockfile](../book/src/guide/configuration.md) for the full rules. A spec with `cmd`/`event`/`ft`/`keys` (or
 `lazy = true`) loads on first use; `config` runs after the plugin is on the
 runtimepath, `init` runs at startup regardless.
 

@@ -218,3 +218,66 @@ async fn nx_git_discover_rejects_outside_a_repo_over_the_wire() {
         exec_lua(&rpc, "return tostring(_G.__e)").await.as_str(),
     );
 }
+
+/// The new verbs ride the same `git_op` leg: `fetch` (with `unshallow`) and the ATTACHING
+/// `checkout` both cross the wire and take effect on the daemon's disk. Without this the
+/// lockfile's restore path would work locally and silently not over a remote session — the
+/// tier-1 rule ("the remote session is not a degraded mode") applied to a new git verb.
+#[tokio::test]
+async fn nx_git_fetch_and_attach_checkout_run_on_the_daemon_over_the_wire() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let src = make_repo("daemon_git_fetch_src");
+    let first = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&src)
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // A second commit, so `first` is unreachable from a depth-1 clone.
+    std::fs::write(src.join("second.txt"), "second\n").unwrap();
+    git(&src, &["add", "-A"]);
+    git(&src, &["commit", "-q", "-m", "second"]);
+
+    let src_str = src.to_string_lossy().replace('\\', "\\\\");
+    let dest = temp_dir("daemon_git_fetch_dest").join("cloned");
+    let dest_str = dest.to_string_lossy().replace('\\', "\\\\");
+    let (rpc, _incoming) = spawn_with_daemon_git().await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"_G.__f = nil
+               nx.async(function()
+                 nx.await(nx.git_local.clone("{src_str}", "{dest_str}", {{ depth = 1 }}))
+                 -- unshallow, then reach the commit the shallow clone could not contain
+                 nx.await(nx.git_local.fetch("{dest_str}", {{ unshallow = true }}))
+                 nx.await(nx.git_local.checkout("{dest_str}", "{first}", {{ detach = true }}))
+                 -- ...and re-attach to the branch (the mode that was unimplemented)
+                 nx.await(nx.git_local.checkout("{dest_str}", "main"))
+                 local h = nx.await(nx.git.head("{dest_str}"))
+                 _G.__f = (h.detached == false) and ("ok:" .. tostring(h.branch)) or "detached"
+               end)():catch(function(e) _G.__f = "err:" .. tostring(e and e.message or e) end)
+               return 1"#,
+        ),
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "_G.__f", "ok:main").await,
+        "fetch+attach should resolve over the wire; got {:?}",
+        exec_lua(&rpc, "return tostring(_G.__f)").await.as_str(),
+    );
+    // The daemon really unshallowed the clone on disk.
+    assert!(
+        !dest.join(".git").join("shallow").exists(),
+        "unshallow should have removed .git/shallow on the daemon's disk"
+    );
+}

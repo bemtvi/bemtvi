@@ -221,6 +221,10 @@ pub enum UserEvent {
     },
     /// The server asked the UI to exit (`nxvim_exit`), or the connection closed.
     Exit,
+    /// A fatal signal (`kill`, SIGHUP, SIGINT) asked the process to stop. Delivered
+    /// from [`nxvim_view::signals`]' watchdog thread through the event-loop proxy, so
+    /// the shutdown runs on the UI thread like any other quit.
+    Shutdown,
 }
 
 /// Run the GUI client until the window closes or the server disconnects, rendering with
@@ -244,6 +248,22 @@ pub fn run(
 ) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+
+    // Be killable without losing the session. There is no terminal to hand back here
+    // — a window is not a tty — so this client takes only the *graceful* half: a
+    // `kill` / SIGHUP / SIGINT wakes the UI thread through the proxy and the editor
+    // quits itself properly (see `UserEvent::Shutdown`), with the watchdog in
+    // `nxvim_view::signals` still guaranteeing the process dies if that goes nowhere.
+    {
+        let proxy = proxy.clone();
+        nxvim_view::signals::install(nxvim_view::signals::Config {
+            restore_sequence: Vec::new(),
+            restore_termios: false,
+            on_shutdown: Box::new(move || {
+                let _ = proxy.send_event(UserEvent::Shutdown);
+            }),
+        });
+    }
 
     // Shutdown signal: when the event loop exits — the window's close button, or a
     // server-sent `nxvim_exit` — the main thread notifies the IO thread so it drops the
@@ -527,6 +547,11 @@ pub fn run(
         eprintln!("nxvim-gui: a server thread panicked");
         std::process::exit(101);
     }
+    // If we are only here because the process was killed, the shutdown is now
+    // complete — the editor ran its exit sequence and the server flushed its shada.
+    // Die of that signal so whoever sent it (a shell, a session manager logging the
+    // user out) sees the kill it asked for, not a clean exit 0.
+    nxvim_view::signals::exit_as_signal_if_killed();
     Ok(())
 }
 
@@ -1204,6 +1229,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Exit => event_loop.exit(),
+            // Killed. Quit the session the way `:qall!` does rather than letting the
+            // process be torn down mid-tick: the exit sequence runs
+            // (QuitPre/ExitPre/VimLeavePre/VimLeave, so plugins persist their state)
+            // and the server's clean-exit shada flush lands. The bang is deliberate —
+            // nobody is there to answer an E37 prompt — and so is the missing `w`:
+            // writing files the user never asked to write would be worse than losing
+            // the edits. The server answers with `nxvim_exit`, which arrives back here
+            // as `UserEvent::Exit` and ends the loop; `run`'s tail then re-raises the
+            // signal so the kill still looks like a kill.
+            UserEvent::Shutdown => {
+                self.rpc.notify("nx_command", vec![Value::from("qall!")]);
+            }
         }
     }
 

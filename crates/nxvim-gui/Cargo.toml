@@ -61,3 +61,8 @@ rfd.workspace = true
 # the embed rather than failing.
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true
+
+# `kill(2)` in the signal e2e test: the killed binary must still run its exit
+# sequence (`tests/signal_exit.rs`).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

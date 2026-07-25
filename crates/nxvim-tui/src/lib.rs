@@ -24,9 +24,11 @@
 mod images;
 mod keys;
 mod render;
+mod signals;
 
 pub use keys::encode_key;
 pub use render::{cursor_style, paint, paint_with_cursor, ScrollHarness};
+pub use signals::{exit_as_signal_if_killed, install as install_signal_restore, ShutdownSignal};
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
@@ -273,11 +275,17 @@ enum Outcome<S> {
 /// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic hook that
 /// restores the terminal), so the user's shell is never left broken. Mouse capture is ours
 /// to manage — a [`MouseCapture`] guard disables it on drop so even a panic in the event
-/// loop can't leave mouse reporting on.
+/// loop can't leave mouse reporting on. All of that covers *unwinding* exits only, so
+/// [`signals::install`] covers the rest: a `kill` (SIGTERM) or a closed window (SIGHUP)
+/// runs no destructor at all, and instead winds the session down through the event loop's
+/// `shutdown` arm — or, if that can't be reached, restores the terminal from the signal
+/// handler itself.
 pub async fn run<S>(initial: S, build: SessionBuilder<S>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Before raw mode goes on, so the termios the handler restores is the user's own.
+    let mut shutdown = signals::install();
     let mut terminal = ratatui::init();
     // Clear the screen once on entry (neovim emits `ESC[H ESC[J` here). ratatui
     // renders by diffing against its *own* previous buffer, which assumes the
@@ -322,6 +330,7 @@ where
             build.clone(),
             keyboard.is_some(),
             truecolor,
+            &mut shutdown,
         )
         .await
         {
@@ -345,6 +354,7 @@ async fn event_loop<S>(
     build: SessionBuilder<S>,
     keyboard_protocol: bool,
     truecolor: bool,
+    shutdown: &mut ShutdownSignal,
 ) -> Result<Outcome<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -413,9 +423,25 @@ where
     // drag when the pointer actually moves). `Some(cell)` holds the cell to repeat;
     // cleared on release or when the pointer leaves the edge band.
     let mut autoscroll: Option<(u16, u16)> = None;
+    // Set once we've asked the editor to quit because we were killed, so the request
+    // goes out exactly once (and the `shutdown` arm stops competing for the loop).
+    // Checked eagerly too: the signal may have landed while we were attaching, or
+    // during a session swap, in which case the wake-up was consumed by the loop we
+    // just left and only this flag remembers it.
+    let mut winding_down = signals::shutdown_requested();
+    if winding_down {
+        request_graceful_quit(&rpc);
+    }
 
     loop {
         tokio::select! {
+            // A fatal signal (`kill`, a closed terminal window) asked us to stop.
+            // Quit the way the user would, so the exit sequence runs and this
+            // session's state is written — see `signals`.
+            () = shutdown.recv(), if !winding_down => {
+                winding_down = true;
+                request_graceful_quit(&rpc);
+            },
             term_event = term_events.next() => match term_event {
                 Some(Ok(Event::Key(key))) => {
                     if key.kind != KeyEventKind::Release {
@@ -618,6 +644,19 @@ where
             },
         }
     }
+}
+
+/// Ask the server to quit as `:qall!` does, the client's half of a graceful shutdown.
+///
+/// The bang is deliberate and so is the missing `w`: this must not stop at an E37
+/// ("no write since last change") prompt nobody is there to answer, and it must not
+/// write files the user never asked to write. What it *does* buy over dying on the
+/// spot is the real exit sequence — `QuitPre`/`ExitPre`/`VimLeavePre`/`VimLeave`
+/// autocmds, so plugins can persist their own state, and the server's clean-exit
+/// shada flush (marks, registers, histories, the exit cursor). The server answers
+/// with `nxvim_exit` when it has finished, which is what actually ends the loop.
+fn request_graceful_quit(rpc: &Rpc) {
+    rpc.notify("nx_command", vec![Value::from("qall!")]);
 }
 
 /// Text-area height = terminal height minus the chrome rows we render ourselves.

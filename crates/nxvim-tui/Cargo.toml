@@ -26,3 +26,8 @@ nxvim-view.workspace = true
 # a query reply without consuming (or leaking a reader on) stdin is unix-specific.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# A real pty for `tests/signal_restore.rs`: the fatal-signal terminal restore can
+# only be observed from outside, on the tty the killed process leaves behind.
+[dev-dependencies]
+portable-pty.workspace = true

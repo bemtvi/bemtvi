@@ -44,3 +44,8 @@ nxvim-view.workspace = true
 rmpv.workspace = true
 # Shared black-box test harness (backend threaded via this crate's features).
 nxvim-test-harness.workspace = true
+
+# `kill(2)` / `tcgetattr(3)` in the PTY e2e tests: killing the editor and then
+# inspecting the tty it left behind (`killing_the_editor_leaves_a_usable_terminal`).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

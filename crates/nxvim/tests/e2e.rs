@@ -412,6 +412,218 @@ fn an_edit_host_connect_failure_exits_nonzero() {
 #[test]
 #[cfg(unix)]
 #[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn killing_the_editor_leaves_a_usable_terminal() {
+    // `kill <pid>` runs no destructor: the RAII guards and `ratatui::restore()` only
+    // fire on an unwinding exit, so before the fatal-signal handler the tty kept the
+    // editor's own settings after the process was gone — raw mode above all, which is
+    // a *termios* setting on the terminal itself and therefore outlives the process.
+    // The user's shell was then left with no echo and no line editing (plus mouse
+    // reporting spraying escape codes on every pointer move), unrecoverable without
+    // knowing to blind-type `reset`. The client-side mechanism is covered hermetically
+    // in `nxvim-tui/tests/signal_restore.rs`; this asserts the real binary wires it up
+    // — before raw mode goes on, so the termios it restores is the user's own.
+    let mut s = Session::spawn(&[], 80, 24);
+    let fd = s._master.as_raw_fd().expect("pty master fd");
+    assert!(
+        s.wait_until(Duration::from_secs(10), |scr| scr
+            .contents()
+            .contains("NORMAL")),
+        "editor never painted:\n{}",
+        s.screen_text()
+    );
+    assert!(
+        !echo_on(fd),
+        "precondition: a running editor puts the tty in raw mode"
+    );
+
+    let pid = s._child.process_id().expect("the spawned nxvim has a pid");
+    // SAFETY: plain `kill(2)` on a child we spawned — what the user typed.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0, "kill");
+
+    let status = s
+        .wait_exit(Duration::from_secs(10))
+        .expect("nxvim should die promptly on SIGTERM");
+    // A caught-and-cleaned-up SIGTERM must still look like a SIGTERM from outside: the
+    // client winds the session down gracefully and *then* re-raises, so a shell or a
+    // supervisor sees the kill it asked for rather than a clean exit 0.
+    assert_eq!(
+        status.signal(),
+        Some(signal_name(libc::SIGTERM).as_str()),
+        "a SIGTERM'd editor must still report the signal that killed it"
+    );
+    assert!(
+        echo_on(fd),
+        "the tty was left in raw mode after the editor was killed — the shell that \
+         inherits it gets no echo and no line editing"
+    );
+    assert!(
+        canonical_on(fd),
+        "the tty was left in non-canonical mode after the editor was killed"
+    );
+    // The alternate screen must be gone too, or the shell writes into a screen whose
+    // scrollback the user can't get back to.
+    assert!(
+        !s.parser.lock().unwrap().screen().alternate_screen(),
+        "the terminal was left on the alternate screen after the editor was killed"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn killing_the_editor_runs_the_exit_sequence() {
+    // A killed editor doesn't just have to leave the *terminal* intact — it should
+    // leave the *session* intact too. SIGTERM is "please stop", so the client asks the
+    // server to quit as `:qall!` would instead of dying mid-tick: the exit sequence
+    // runs (QuitPre/ExitPre/VimLeavePre/VimLeave, so plugins get to persist their own
+    // state) and the server's clean-exit shada flush lands. Proven here with a
+    // `VimLeave` autocmd that writes the buffer to a marker path: the file exists, with
+    // the typed text in it, only if the sequence really ran before the process died.
+    let dir = empty_config_dir();
+    let marker = dir.join("vimleave-marker.txt");
+    std::fs::write(
+        dir.join("init.lua"),
+        format!(
+            "nx.autocmd.create(\"VimLeave\", {{\n  callback = function()\n    \
+             nx.cmd(\"write! {}\")\n  end,\n}})\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let mut s = Session::spawn_with_env(&[], &[("NXVIM_CONFIG", dir.to_str().unwrap())], 80, 24);
+    assert!(
+        s.wait_until(Duration::from_secs(10), |scr| scr
+            .contents()
+            .contains("NORMAL")),
+        "editor never painted:\n{}",
+        s.screen_text()
+    );
+    s.send(b"igraceful\x1b");
+    assert!(
+        s.wait_until(Duration::from_secs(10), |scr| scr
+            .contents()
+            .contains("graceful")),
+        "typed text never appeared:\n{}",
+        s.screen_text()
+    );
+
+    let pid = s._child.process_id().expect("the spawned nxvim has a pid");
+    // SAFETY: plain `kill(2)` on a child we spawned — what the user typed.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0, "kill");
+    s.wait_exit(Duration::from_secs(15))
+        .expect("nxvim should exit promptly on SIGTERM");
+
+    let written = std::fs::read_to_string(&marker).unwrap_or_else(|e| {
+        panic!(
+            "VimLeave never ran on the way out ({}): {e}",
+            marker.display()
+        )
+    });
+    assert!(
+        written.contains("graceful"),
+        "the exit sequence ran but wrote the wrong buffer: {written:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn a_killed_session_is_still_there_on_the_next_launch() {
+    // The other half of what the exit sequence buys: the *clean-exit* shada flush.
+    // `'0` — where the cursor sat when the editor last exited cleanly — is written
+    // only by that flush, never by the debounced live checkpoint, so it is the sharp
+    // test. Kill a session sitting on a known line, then launch a fresh one against
+    // the same store and jump to `'0`: the file reopens at that line. After a kill
+    // that skipped the exit sequence there is no `'0` at all and nothing opens.
+    let state = empty_config_dir(); // a scratch XDG_STATE_HOME, not a config
+    let path = std::env::temp_dir().join(format!("nxvim_e2e_shada_{}.txt", std::process::id()));
+    std::fs::write(&path, "one\ntwo\nSURVIVES-THE-KILL\nfour\n").unwrap();
+    let state_env: &[(&str, &str)] = &[("XDG_STATE_HOME", state.to_str().unwrap())];
+
+    let mut first = Session::spawn_with_env(&[path.to_str().unwrap()], state_env, 80, 24);
+    assert!(
+        first.wait_until(Duration::from_secs(10), |scr| scr
+            .contents()
+            .contains("SURVIVES-THE-KILL")),
+        "editor never showed the file:\n{}",
+        first.screen_text()
+    );
+    // Park the cursor on line 3 and let the move land before killing.
+    first.send(b"3G");
+    assert!(
+        first.wait_until(Duration::from_secs(10), |scr| scr.cursor_position().0 == 2),
+        "cursor never reached line 3:\n{}",
+        first.screen_text()
+    );
+
+    let pid = first._child.process_id().expect("pid");
+    // SAFETY: plain `kill(2)` on a child we spawned.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0, "kill");
+    first
+        .wait_exit(Duration::from_secs(15))
+        .expect("nxvim should exit promptly on SIGTERM");
+
+    // A brand-new session against the same store: `'0` must lead back.
+    let mut second = Session::spawn_with_env(&[], state_env, 80, 24);
+    assert!(
+        second.wait_until(Duration::from_secs(10), |scr| scr
+            .contents()
+            .contains("NORMAL")),
+        "second editor never painted:\n{}",
+        second.screen_text()
+    );
+    second.send(b"'0");
+    let reopened = second.wait_until(Duration::from_secs(10), |scr| {
+        scr.contents().contains("SURVIVES-THE-KILL")
+    });
+    let screen = second.screen_text();
+    second.send(b":q!\r");
+    assert!(
+        reopened,
+        "the killed session left no exit cursor — its shada was never flushed:\n{screen}"
+    );
+
+    std::fs::remove_file(&path).ok();
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// The platform's name for `sig`, in the form portable-pty reports it (`strsignal`),
+/// so the comparison doesn't hard-code a locale's wording.
+#[cfg(unix)]
+fn signal_name(sig: libc::c_int) -> String {
+    // SAFETY: `strsignal` returns a static string for a known signal number.
+    unsafe { std::ffi::CStr::from_ptr(libc::strsignal(sig)) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn termios_of(fd: std::os::fd::RawFd) -> libc::termios {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `fd` is the open pty master; `termios` is a valid out-pointer. On
+    // Linux the master and slave share one termios, so this reads what the killed
+    // child left behind on the tty.
+    let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+    assert_eq!(rc, 0, "tcgetattr on the pty master");
+    // SAFETY: initialized by the successful `tcgetattr` above.
+    unsafe { termios.assume_init() }
+}
+
+#[cfg(unix)]
+fn echo_on(fd: std::os::fd::RawFd) -> bool {
+    termios_of(fd).c_lflag & libc::ECHO != 0
+}
+
+#[cfg(unix)]
+fn canonical_on(fd: std::os::fd::RawFd) -> bool {
+    termios_of(fd).c_lflag & libc::ICANON != 0
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
 fn daemon_stderr_log_is_private_and_per_pid() {
     // The `--connect-daemon` edit-host redirects the daemon child's stderr to a log
     // under the temp dir. It must be a *private* (owner-only, `0600`) file at a

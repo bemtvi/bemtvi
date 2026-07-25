@@ -21,6 +21,7 @@ mod hit_test;
 pub mod images;
 mod keys;
 mod parse;
+pub mod signals;
 mod style;
 mod view;
 

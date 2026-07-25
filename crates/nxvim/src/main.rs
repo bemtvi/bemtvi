@@ -826,6 +826,11 @@ fn drive_tui_with_swaps(
             Ok(Ok(())) => {}
         }
     }
+    // If we are only here because the process was killed, the shutdown is now
+    // complete — the editor ran its exit sequence, the server flushed its shada, the
+    // terminal is restored. Die of that signal so the shell (or whatever sent it)
+    // still sees a `kill`, not a clean exit 0. Returns normally otherwise.
+    nxvim_tui::exit_as_signal_if_killed();
     result
 }
 

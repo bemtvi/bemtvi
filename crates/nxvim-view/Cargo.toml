@@ -13,3 +13,8 @@ rmpv.workspace = true
 # Decode + bound 'imagepreview' pictures (the shared half of each client's image
 # rendering; see src/images.rs).
 image.workspace = true
+
+# Fatal-signal handling for the clients (`src/signals.rs`): a killed editor still
+# has to run its exit sequence and hand the terminal back.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

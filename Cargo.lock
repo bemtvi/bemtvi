@@ -3977,6 +3977,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "nxvim-lsp",
  "nxvim-lua",
  "nxvim-rpc",
@@ -4030,6 +4031,7 @@ dependencies = [
  "cosmic-text",
  "glyphon",
  "image",
+ "libc",
  "nxvim-rpc",
  "nxvim-server",
  "nxvim-view",
@@ -4170,6 +4172,7 @@ dependencies = [
  "libc",
  "nxvim-rpc",
  "nxvim-view",
+ "portable-pty",
  "ratatui",
  "ratatui-image",
  "rmpv",
@@ -4182,6 +4185,7 @@ name = "nxvim-view"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "rmpv",
 ]
 

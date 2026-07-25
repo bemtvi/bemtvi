@@ -2711,6 +2711,10 @@ pub(crate) fn install_runtime_api(
                         severity: d.get("severity").unwrap_or(1),
                         message: d.get("message").unwrap_or_default(),
                         source: d.get("source").ok(),
+                        // `vim.diagnostic.set` has no server behind it; the round
+                        // trip back out reports it as client-set, not as some
+                        // server's.
+                        client_id: None,
                     })
                 })
                 .collect::<mlua::Result<Vec<_>>>()?;

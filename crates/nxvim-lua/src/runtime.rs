@@ -1448,6 +1448,12 @@ impl LuaRuntime {
             if let Some(src) = &d.source {
                 t.set("source", src.clone())?;
             }
+            // Absent (rather than nil-valued) for a client-set diagnostic, which has
+            // no server behind it — `d.client_id and get_client_by_id(...)` then
+            // short-circuits the same way for both spellings.
+            if let Some(id) = d.client_id {
+                t.set("client_id", id)?;
+            }
             list.set(i + 1, t)?;
         }
         set.call((bufnr, list))
@@ -1549,6 +1555,8 @@ impl LuaRuntime {
         caps.set("codeActionProvider", c.code_action)?;
         caps.set("semanticTokensProvider", c.semantic_tokens)?;
         caps.set("inlayHintProvider", c.inlay_hints)?;
+        caps.set("documentSymbolProvider", c.document_symbol)?;
+        caps.set("workspaceSymbolProvider", c.workspace_symbol)?;
         set.call((client.id, client.name.clone(), caps))
     }
 

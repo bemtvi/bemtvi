@@ -472,6 +472,40 @@ async fn enable_alpha_beta(rpc: &Rpc) {
     );
 }
 
+/// Fire `nx.lsp.code_action()` until the chooser menu carries at least `want` rows,
+/// and return its titles. The request is a fan-out round, so the menu only opens
+/// once every capable server has answered.
+async fn code_action_rows(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: usize,
+) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        exec_lua(rpc, "nx.lsp.code_action()").await;
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            map_get(m, "menu").map(|v| !matches!(v, Value::Nil)) == Some(true)
+        }) {
+            if let Some(items) = map_get(&map, "menu").and_then(|m| {
+                m.as_map()
+                    .and_then(|mm| map_get(mm, "items"))
+                    .and_then(|i| i.as_array().cloned())
+            }) {
+                rows = items
+                    .iter()
+                    .map(|i| i.as_str().unwrap_or_default().to_string())
+                    .collect();
+                if rows.len() >= want {
+                    return rows;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    rows
+}
+
 #[tokio::test]
 async fn two_servers_attach_to_one_buffer() {
     let _guard = serial_lock().lock().await;
@@ -634,29 +668,7 @@ async fn code_actions_merge_from_every_capable_server() {
     );
 
     // The chooser lists both servers' actions.
-    let mut rows: Vec<String> = Vec::new();
-    for _ in 0..200 {
-        exec_lua(&rpc, "nx.lsp.code_action()").await;
-        nxvim_test_harness::barrier(&rpc).await;
-        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| {
-            map_get(m, "menu").map(|v| !matches!(v, Value::Nil)) == Some(true)
-        }) {
-            if let Some(items) = map_get(&map, "menu").and_then(|m| {
-                m.as_map()
-                    .and_then(|mm| map_get(mm, "items"))
-                    .and_then(|i| i.as_array().cloned())
-            }) {
-                rows = items
-                    .iter()
-                    .map(|i| i.as_str().unwrap_or_default().to_string())
-                    .collect();
-                if rows.len() >= 2 {
-                    break;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let rows = code_action_rows(&rpc, &mut incoming, 2).await;
 
     std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
     std::env::remove_var("NXVIM_LSP_CMD_BETA");
@@ -898,5 +910,584 @@ async fn a_named_formatter_applies_edits_at_its_own_encoding() {
         "the edit must convert at beta's utf-16, not alpha's utf-8 (got {:?}; \
          `let Xö = 1` is the utf-8 misread)",
         line.as_str()
+    );
+}
+
+// ----- Phase 7: the surfaces that still resolved "the" server by position -----
+// Everything below is one failure mode: a path that answered "which server?" with
+// the buffer's FIRST attached one instead of the one that is actually involved —
+// the same class the phases above fixed for sync, requests and decorations, left
+// standing in the request *context*, the merged results, and the apply/dispatch
+// follow-ups.
+
+/// The `file://` URI of the buffer [`open_rust_with`] / [`open_rust`] opens, for a
+/// mock script that must name the document it is answering about.
+fn file_uri(dir: &Path) -> String {
+    format!("file://{}", dir.join("a.rs").display())
+}
+
+#[tokio::test]
+async fn merged_diagnostics_carry_the_client_that_published_each() {
+    // `vim.diagnostic.get` returns ONE flat list per buffer, merged across every
+    // attached server — so without a tag there is no way to tell the type-checker's
+    // errors from the linter's, which is the first question anyone asks of a
+    // two-server buffer. The semantic-token and inlay-hint mirrors are tagged with
+    // their producing `client_id` for exactly this reason; the diagnostics mirror,
+    // built by the same merge, was not.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-diag-clientid");
+    let diag = |line: u32, msg: &str| {
+        format!(
+            r#"{{ "diagnostics": [ {{ "range": {{ "start": {{ "line": {line}, "character": 0 }},
+                 "end": {{ "line": {line}, "character": 3 }} }},
+                 "severity": 1, "message": "{msg}" }} ] }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &diag(0, "FROM-ALPHA"));
+    arm_mock_named(dir.as_path(), "beta", &diag(1, "FROM-BETA"));
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), "one\ntwo\n").await;
+    enable_alpha_beta(&rpc).await;
+
+    let tagged = await_lua_eq(
+        &rpc,
+        "(function()\n\
+         \x20 local out = {}\n\
+         \x20 for _, d in ipairs(vim.diagnostic.get(0)) do\n\
+         \x20   local c = d.client_id and vim.lsp.get_client_by_id(d.client_id)\n\
+         \x20   out[#out+1] = (c and c.name or '?') .. ':' .. d.message\n\
+         \x20 end\n\
+         \x20 table.sort(out)\n\
+         \x20 return table.concat(out, ',')\n\
+         end)()",
+        "alpha:FROM-ALPHA,beta:FROM-BETA",
+    )
+    .await;
+    let got = exec_lua(
+        &rpc,
+        "return tostring(#vim.diagnostic.get(0)) .. '/' .. \
+         tostring(vim.diagnostic.get(0)[1] and vim.diagnostic.get(0)[1].client_id)",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        tagged,
+        "each merged diagnostic names the client that published it (count/first \
+         client_id was {:?})",
+        got.as_str()
+    );
+}
+
+#[tokio::test]
+async fn a_code_action_request_carries_each_servers_own_diagnostics() {
+    // `context.diagnostics` is what a linter gates its quick-fixes on: ruff offers
+    // "fix unused import" only when the request carries ruff's own diagnostic. The
+    // fan-out asked every server but handed them all ONE list, harvested from the
+    // buffer's first server — so the second server was asked about diagnostics it
+    // never published, and its quick-fixes were silently never offered. Which is
+    // the exact failure the code-action fan-out exists to prevent.
+    //
+    // Both mocks echo the request's `context.diagnostics` count back as the action
+    // title (`code_action_echo_range`), so the chooser shows what each server was
+    // actually sent. Only beta publishes a diagnostic, so a correct request gives
+    // beta `diags=1` and alpha `diags=0`; the shared-list bug gives both `diags=0`.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-ca-context");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "code_action_echo_range": true }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "code_action_echo_range": true,
+             "diagnostics": [ { "range": { "start": { "line": 0, "character": 0 },
+                                           "end":   { "line": 0, "character": 15 } },
+                                "severity": 2, "message": "BETA-DIAG" } ] }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+    // The publish rides `didOpen`, so wait for it to land before asking.
+    assert!(
+        await_lua_eq(&rpc, "#vim.diagnostic.get(0)", "1").await,
+        "beta's diagnostic reached the editor"
+    );
+
+    let rows = code_action_rows(&rpc, &mut incoming, 2).await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    let joined = rows.join(" | ");
+    assert!(
+        joined.contains("diags=1"),
+        "the server that published the diagnostic must be asked WITH it, got {joined:?}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("diags=0")).count(),
+        1,
+        "and the server that published none must be asked with none — its \
+         diagnostics are not the other server's to send, got {joined:?}"
+    );
+}
+
+#[tokio::test]
+async fn references_merge_deduplicate_and_decode_at_each_servers_encoding() {
+    // The two halves of a merged location list, in one buffer:
+    //
+    //  * every location is converted with the encoding of the server that REPORTED
+    //    it. `apply_lsp_locations` re-derived it from the buffer's first server, so
+    //    a utf-16 server's columns were read as utf-8 bytes.
+    //  * the same reference reported by both servers is shown ONCE. The old
+    //    `Vec::dedup_by` collapses only *adjacent* duplicates, and a merged list is
+    //    alpha's block followed by beta's — never adjacent, so it never collapsed
+    //    anything.
+    //
+    // On `let föö = 1`, byte 10 (the `=`) is utf-8 character 10 and utf-16 unit 8.
+    // Both servers report it; beta additionally reports byte 4. Correct: two rows,
+    // 1-based columns 5 and 11. Reading beta at utf-8 puts its `=` at byte 8 —
+    // a third, phantom row at column 9.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-refs-merge");
+    let uri = file_uri(dir.as_path());
+    let loc = |c: u32| {
+        format!(
+            r#"{{ "uri": "{uri}", "range": {{ "start": {{ "line": 0, "character": {c} }},
+                 "end": {{ "line": 0, "character": {} }} }} }}"#,
+            c + 1
+        )
+    };
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        &format!(r#"{{ "references": [ {} ] }}"#, loc(10)),
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        &format!(
+            r#"{{ "position_encoding": "utf-16", "references": [ {}, {} ] }}"#,
+            loc(8),
+            loc(4)
+        ),
+    );
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), MULTIBYTE_LINE).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "_G.cols = nil\n\
+         nx.lsp.references():next(function(items)\n\
+         \x20 local c = {}\n\
+         \x20 for _, it in ipairs(items or {}) do c[#c+1] = it.col end\n\
+         \x20 table.sort(c)\n\
+         \x20 _G.cols = table.concat(c, ',')\n\
+         end)",
+    )
+    .await;
+    let merged = await_lua_eq(&rpc, "_G.cols", "5,11").await;
+    let got = exec_lua(&rpc, "return tostring(_G.cols)").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        merged,
+        "both servers' references merge, each decoded at its own encoding, with the \
+         shared one shown once (got {:?}; `5,9,11` is the utf-8 misread plus the \
+         duplicate that never collapsed)",
+        got.as_str()
+    );
+}
+
+#[tokio::test]
+async fn a_rename_applies_its_edits_at_the_answering_servers_encoding() {
+    // The twin of `a_named_formatter_applies_edits_at_its_own_encoding`, for the
+    // path that got missed: formatting applies through `apply_formatting_edits`
+    // (which takes the producing server's encoding), but a rename's `WorkspaceEdit`
+    // goes through `apply_workspace_edit`, which re-derived the encoding from each
+    // TARGET buffer's first server — overriding the origin it had been handed.
+    //
+    // alpha sorts first and withholds `renameProvider`, so the rename routes to
+    // beta (utf-16), whose columns 4..7 are bytes 4..9 — the whole of `föö`.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-rename-encoding");
+    let uri = file_uri(dir.as_path());
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "capabilities": { "renameProvider": false } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        &format!(
+            r#"{{ "position_encoding": "utf-16",
+                  "rename": {{ "changes": {{ "{uri}": [
+                    {{ "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                   "end":   {{ "line": 0, "character": 7 }} }},
+                       "newText": "X" }} ] }} }} }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), MULTIBYTE_LINE).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(&rpc, "nx.lsp.rename('X')").await;
+    let renamed = await_lua_eq(&rpc, "nx.buf.lines(0, 0, 1)[1]", "let X = 1").await;
+    let line = exec_lua(&rpc, "return nx.buf.lines(0, 0, 1)[1]").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        renamed,
+        "the workspace edit must convert at the ANSWERING server's utf-16, not the \
+         buffer's first server's utf-8 (got {:?}; `let Xö = 1` is the misread)",
+        line.as_str()
+    );
+}
+
+#[tokio::test]
+async fn a_code_actions_command_runs_on_the_server_that_offered_it() {
+    // A code action may carry a `command` instead of (or besides) an edit, which is
+    // finished with a `workspace/executeCommand`. Its name and arguments are the
+    // issuing server's own vocabulary — ruff's `source.fixAll` command means nothing
+    // to pyright — so it must go back to the server that offered the action.
+    //
+    // The merged chooser already tracked each action's origin for `codeAction/resolve`
+    // and then dropped it for the command, which went to the buffer's first server.
+    // Only beta offers an action; each mock records what it receives, so the record
+    // files say which server was actually asked to execute.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-ca-command");
+    let rec = |name: &str| dir.join(format!("rec-{name}.jsonl"));
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        &format!(
+            r#"{{ "record": "{}", "code_action": [] }}"#,
+            rec("alpha").display()
+        ),
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        &format!(
+            r#"{{ "record": "{}",
+                  "code_action": [ {{ "title": "BETA-CMD", "kind": "quickfix",
+                    "command": {{ "title": "run", "command": "beta.doIt" }} }} ] }}"#,
+            rec("beta").display()
+        ),
+    );
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    // Exactly one action survives, so `apply` makes it a one-shot: no chooser to
+    // drive, the command dispatches straight away.
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let executed = |name: &str| {
+        std::fs::read_to_string(rec(name))
+            .unwrap_or_default()
+            .contains("workspace/executeCommand")
+    };
+    let mut on_beta = false;
+    for _ in 0..200 {
+        if executed("beta") {
+            on_beta = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let on_alpha = executed("alpha");
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        on_beta,
+        "the command must execute on the server that offered the action"
+    );
+    assert!(
+        !on_alpha,
+        "and not on the buffer's first server, which never offered it"
+    );
+}
+
+#[tokio::test]
+async fn a_registered_command_handler_wins_over_the_server_round_trip() {
+    // The other half of `nx.lsp.commands`: some code-action commands are defined to
+    // run *client*-side — the server has no way to open a file or start a rename
+    // itself — so a registered handler must pre-empt `workspace/executeCommand`. It
+    // is handed the offering client's id, because one command name can mean
+    // different things to two servers on the same buffer.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-ca-handler");
+    let rec = dir.join("rec-beta.jsonl");
+    arm_mock_named(dir.as_path(), "alpha", r#"{ "code_action": [] }"#);
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        &format!(
+            r#"{{ "record": "{}",
+                  "code_action": [ {{ "title": "BETA-CMD", "kind": "quickfix",
+                    "command": {{ "title": "run", "command": "beta.doIt",
+                                  "arguments": [ "ARG-ONE" ] }} }} ] }}"#,
+            rec.display()
+        ),
+    );
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "_G.ran = nil\n\
+         nx.lsp.commands['beta.doIt'] = function(command, ctx)\n\
+         \x20 local client = nx.lsp._clients[ctx.client_id]\n\
+         \x20 _G.ran = (client and client.name or '?') .. '/' .. tostring(command.arguments[1])\n\
+         end\n\
+         nx.lsp.code_action({ apply = true })",
+    )
+    .await;
+    let handled = await_lua_eq(&rpc, "_G.ran", "beta/ARG-ONE").await;
+    // Give a stray round trip time to show up in the record before asserting on it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let executed = std::fs::read_to_string(&rec)
+        .unwrap_or_default()
+        .contains("workspace/executeCommand");
+
+    // Registered on a shared table, so the next test in this process would inherit it.
+    exec_lua(&rpc, "nx.lsp.commands['beta.doIt'] = nil").await;
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        handled,
+        "the registered handler runs, with the OFFERING client's id and the \
+         command's arguments"
+    );
+    assert!(
+        !executed,
+        "and the server round trip is skipped — a client-side command is the \
+         editor's to run"
+    );
+}
+
+#[tokio::test]
+async fn the_signature_autotrigger_fires_for_the_server_that_advertises_it() {
+    // The auto-trigger's per-buffer gate asked "does THIS buffer's server advertise
+    // trigger characters", resolving the server by position rather than by
+    // capability — so on a buffer whose first server has no signature help (eslint
+    // ahead of ts_ls), every typed `(` was swallowed even though the second server
+    // offers it. The editor-wide trigger set is a union across servers, so core
+    // raised the request correctly and the gate then dropped it on the floor.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-sig-autotrigger");
+    // `null`, not `false`: lsp-types models `signatureHelpProvider` as an options
+    // object (no `OneOf<bool, …>`), so a bare `false` fails to deserialize the whole
+    // `initialize` result and the server never comes up at all.
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "capabilities": { "signatureHelpProvider": null } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "signature_help": { "signatures": [ { "label": "FROM-BETA(x)" } ],
+                                 "activeSignature": 0 } }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+    exec_lua(&rpc, "nx.lsp.signature_help_autotrigger(true)").await;
+
+    // Typing the server's trigger character is the whole input — no Lua verb.
+    feed(&rpc, "A(");
+    let mut shown = Vec::new();
+    let mut found = false;
+    for _ in 0..200 {
+        if let Some(lines) = poll_float_lines(&rpc, &mut incoming).await {
+            if lines.iter().any(|l| l.contains("FROM-BETA")) {
+                found = true;
+                break;
+            }
+            if !lines.is_empty() {
+                shown = lines;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        found,
+        "the `(` must reach the server that advertises signature help, not be \
+         dropped because the buffer's first server does not (last float: {shown:?})"
+    );
+}
+
+#[tokio::test]
+async fn document_symbols_only_ask_the_servers_that_advertise_them() {
+    // `documentSymbol` fans out, but `ProviderCaps` modelled no provider flag for
+    // it — so the routing predicate returned "not capability-gated" and failed
+    // OPEN, asking every attached server including the ones that never advertised
+    // it. A linter that answers the unsupported method with an error contributed a
+    // wasted round trip per invocation; one that answers with junk contributed junk.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-docsym-gate");
+    let uri = file_uri(dir.as_path());
+    let sym = |name: &str| {
+        format!(
+            r#"[ {{ "name": "{name}", "kind": 12, "location": {{ "uri": "{uri}",
+                 "range": {{ "start": {{ "line": 0, "character": 0 }},
+                             "end": {{ "line": 0, "character": 3 }} }} }} }} ]"#
+        )
+    };
+    // alpha withholds the provider but would still answer if asked — so a symbol
+    // named ALPHA-SYM in the result proves the editor asked a server that said no.
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        &format!(
+            r#"{{ "capabilities": {{ "documentSymbolProvider": false }},
+                  "document_symbols": {} }}"#,
+            sym("ALPHA-SYM")
+        ),
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        &format!(r#"{{ "document_symbols": {} }}"#, sym("BETA-SYM")),
+    );
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "_G.syms = nil\n\
+         nx.lsp.document_symbol():next(function(items)\n\
+         \x20 local n = {}\n\
+         \x20 for _, it in ipairs(items or {}) do n[#n+1] = it.text end\n\
+         \x20 table.sort(n)\n\
+         \x20 _G.syms = table.concat(n, ' | ')\n\
+         end)",
+    )
+    .await;
+    let only_beta = await_lua_eq(
+        &rpc,
+        "tostring(_G.syms ~= nil and _G.syms:find('BETA-SYM', 1, true) ~= nil \
+         and _G.syms:find('ALPHA-SYM', 1, true) == nil)",
+        "true",
+    )
+    .await;
+    let got = exec_lua(&rpc, "return tostring(_G.syms)").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        only_beta,
+        "only the server advertising documentSymbolProvider is asked, got {:?}",
+        got.as_str()
+    );
+}
+
+#[tokio::test]
+async fn workspace_symbols_merge_from_every_capable_server() {
+    // `workspace/symbol` was the one list-shaped kind left on the single-target
+    // path, answered by the buffer's first server alone — although merging its
+    // results is exactly as well-defined as merging `documentSymbol`'s, which
+    // fans out. Two servers indexing one project each know symbols the other
+    // doesn't; asking one silently halves the picker.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-wssym-merge");
+    let uri = file_uri(dir.as_path());
+    let sym = |name: &str| {
+        format!(
+            r#"{{ "workspace_symbols": [ {{ "name": "{name}", "kind": 12,
+                 "location": {{ "uri": "{uri}",
+                   "range": {{ "start": {{ "line": 0, "character": 0 }},
+                               "end": {{ "line": 0, "character": 3 }} }} }} }} ] }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &sym("ALPHA-WS"));
+    arm_mock_named(dir.as_path(), "beta", &sym("BETA-WS"));
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "_G.ws = nil\n\
+         nx.lsp.workspace_symbol('x'):next(function(items)\n\
+         \x20 local n = {}\n\
+         \x20 for _, it in ipairs(items or {}) do n[#n+1] = it.text end\n\
+         \x20 table.sort(n)\n\
+         \x20 _G.ws = table.concat(n, ' | ')\n\
+         end)",
+    )
+    .await;
+    let both = await_lua_eq(
+        &rpc,
+        "tostring(_G.ws ~= nil and _G.ws:find('ALPHA-WS', 1, true) ~= nil \
+         and _G.ws:find('BETA-WS', 1, true) ~= nil)",
+        "true",
+    )
+    .await;
+    let got = exec_lua(&rpc, "return tostring(_G.ws)").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        both,
+        "both servers' workspace symbols merge into one list, got {:?}",
+        got.as_str()
+    );
+}
+
+#[tokio::test]
+async fn lsp_info_reports_every_server_on_the_buffer() {
+    // `:LspInfo` is the introspection surface for exactly the thing that became
+    // plural, and its "Current buffer" block still described one server — the
+    // first — so the encoding, sync kind, document version and diagnostic count it
+    // showed were half the story, with no hint that a second server was attached.
+    // ("Running servers" listed both all along, which is what made the header's
+    // silence misleading rather than merely incomplete.)
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-info-servers");
+    arm_mock_named(dir.as_path(), "alpha", "{}");
+    arm_mock_named(dir.as_path(), "beta", "{}");
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(&rpc, "nx.cmd('LspInfo')").await;
+    // Only the block above "Running servers" — that section names both regardless.
+    let listed = await_lua_eq(
+        &rpc,
+        "(function()\n\
+         \x20 local head = {}\n\
+         \x20 for _, l in ipairs(nx.buf.lines(0, 0, -1)) do\n\
+         \x20   if l == 'Running servers' then break end\n\
+         \x20   head[#head+1] = l\n\
+         \x20 end\n\
+         \x20 local s = table.concat(head, '\\n')\n\
+         \x20 return (s:find('alpha', 1, true) and 'a' or '') ..\n\
+         \x20        (s:find('beta', 1, true) and 'b' or '')\n\
+         end)()",
+        "ab",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        listed,
+        "the current-buffer block names every attached server, not just the first"
     );
 }

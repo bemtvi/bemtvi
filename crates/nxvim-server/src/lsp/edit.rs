@@ -126,9 +126,8 @@ impl EditHost {
     /// rename reaches files you haven't visited — the edit lands in memory (the buffer
     /// left modified, saved with `:wa`), exactly as neovim's `apply_text_edits` does
     /// rather than writing straight to disk. Each URI's edits convert to bytes against
-    /// *its* buffer (a freshly-loaded buffer has no negotiated encoding, so it falls
-    /// back to the originating — current — server's), apply as one undo step, and
-    /// re-sync.
+    /// *its* buffer, at the originating server's encoding, apply as one undo step,
+    /// and re-sync.
     ///
     /// Loading an unopened file differs by session:
     /// - **Local** ([`Editor::ensure_buffer_loaded`]): the file is read synchronously
@@ -204,7 +203,16 @@ impl EditHost {
                     }
                 }
             };
-            let encoding = self.buffer_encoding(id).unwrap_or(origin_encoding);
+            // Always the ORIGIN's encoding, never the target buffer's own server's:
+            // one `WorkspaceEdit` is authored end to end by the server that produced
+            // it, so every position in it — including those for files served by
+            // someone else, or by nobody — is in that one encoding. Re-deriving it
+            // per target buffer (which is what this did) picks the target's *first*
+            // server, so a rename answered by a utf-16 server shifted every edit on
+            // a line with a multi-byte character whenever the buffer's first server
+            // was utf-8. It is the same misread `apply_formatting_edits` was fixed
+            // for; the rename path applies through here instead.
+            let encoding = origin_encoding;
             let Some(buffer) = self.editor.buffer_of(id) else {
                 continue;
             };
@@ -259,37 +267,25 @@ impl EditHost {
         self.sync_lsp_buffer(buffer);
     }
 
-    /// Offer a code-action reply's titles in the **select menu** (neovim's
+    /// Offer a code-action round's titles in the **select menu** (neovim's
     /// `vim.ui.select` model) and stash the actions so confirming applies the chosen
-    /// one (`pending_code_action`, keyed by the chosen index). An empty reply shows a
+    /// one (`pending_code_action`, keyed by the chosen index). An empty round shows a
     /// brief message instead of an empty menu.
+    ///
+    /// The list is merged across servers: `servers[i]` produced `actions[i]`, so a
+    /// lazy action resolves — and a `command` executes — against the server that
+    /// understands its `data`.
+    ///
     /// `cb_id` (`0` = fire-and-forget) is the async `code_action` promise: it is
     /// *stashed* onto the chooser (settled later on the confirm/cancel path), or
-    /// settled `nil` now on an empty reply.
+    /// settled `nil` now on an empty round.
     ///
     /// `opts` is the caller's `nx.lsp.code_action{ context = { only = … }, apply = … }`:
-    /// the reply is filtered by `only` here as well as at the server (honoring
+    /// the round is filtered by `only` here as well as at the server (honoring
     /// `context.only` is a protocol *should*, so a non-compliant server must not turn a
     /// one-shot into a chooser), and `apply` distinguishes the **one-shot** case from
     /// the one with **options** — a single survivor is applied straight away, two or
     /// more still open the chooser because there is a genuine choice to make.
-    pub(crate) fn show_code_actions(
-        &mut self,
-        actions: Vec<CodeActionData>,
-        cb_id: u64,
-        opts: CodeActionOpts,
-    ) {
-        // Single-server path: every action came from the buffer's chosen server.
-        let servers = self
-            .lsp_target_for(self.editor.current_buffer_id(), LspReqKind::CodeAction)
-            .map(|(key, _, _)| vec![key; actions.len()])
-            .unwrap_or_default();
-        self.show_code_actions_from(actions, servers, cb_id, opts);
-    }
-
-    /// [`show_code_actions`](Self::show_code_actions) for a list merged from several
-    /// servers: `servers[i]` produced `actions[i]`, so a lazy action resolves against
-    /// the server that understands its `data`.
     pub(crate) fn show_code_actions_from(
         &mut self,
         actions: Vec<CodeActionData>,
@@ -387,9 +383,12 @@ impl EditHost {
         // An action may carry a `command` alongside (or instead of) its edit:
         // neovim applies the edit first, then runs the command. Dispatch it through
         // Lua so a client-side `vim.lsp.commands` handler wins over the server's
-        // `workspace/executeCommand` (Phase 8).
+        // `workspace/executeCommand` (Phase 8) — at the ORIGIN server, for the same
+        // reason its `codeAction/resolve` goes there: the command's name and
+        // arguments are that server's own vocabulary, so running ruff's
+        // `source.fixAll` on pyright is a wrong request, not a degraded one.
         if let Some(command) = action.command {
-            self.dispatch_lsp_command(command);
+            self.dispatch_lsp_command(command, origin.as_ref());
             // Edit applied + command dispatched — the action's effect is done.
             self.settle_lsp_promise(cb, serde_json::Value::Null);
         } else if !has_edit {
@@ -412,10 +411,21 @@ impl EditHost {
     /// Dispatch an LSP code-action `command` (Phase 8): route it through Lua's
     /// `vim.lsp._dispatch_command`, which runs a registered client-side
     /// `vim.lsp.commands[name]` handler, else issues a `workspace/executeCommand`
-    /// to the current buffer's server (via the Phase-5 `client:request` path). The
-    /// queued request drains immediately so it leaves on this tick.
-    pub(crate) fn dispatch_lsp_command(&mut self, command: nxvim_lsp::lsp_types::Command) {
-        let Some(client_id) = self.current_lsp_client_id() else {
+    /// to `origin`'s server (via the Phase-5 `client:request` path). The queued
+    /// request drains immediately so it leaves on this tick.
+    ///
+    /// `origin` is the server that offered the action carrying this command — the
+    /// only one that can execute it. `None` (or an origin that has since exited)
+    /// falls back to the buffer's code-action server.
+    pub(crate) fn dispatch_lsp_command(
+        &mut self,
+        command: nxvim_lsp::lsp_types::Command,
+        origin: Option<&ServerKey>,
+    ) {
+        let client_id = origin
+            .and_then(|key| self.lsp_client_id_of(key))
+            .or_else(|| self.current_lsp_client_id());
+        let Some(client_id) = client_id else {
             self.editor.echo("No language server attached");
             return;
         };

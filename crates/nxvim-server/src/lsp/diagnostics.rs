@@ -15,23 +15,19 @@ use crate::redraw::StyleTable;
 use crate::EditHost;
 
 impl EditHost {
-    /// The current buffer's cached diagnostics together with its server's
-    /// negotiated position encoding, or `None` when the buffer has no attached
-    /// server (so callers project nothing). Both borrows are released before any
-    /// `&mut self` use.
-    pub(crate) fn current_diagnostics(&self) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
-        self.diagnostics_of(self.editor.current_buffer_id())
-    }
-
-    /// Buffer-addressed form of [`EditHost::current_diagnostics`], for projecting a
-    /// non-focused window's own buffer. Same `(diagnostics, encoding)` or `None`
-    /// when that buffer has no attached server.
-    pub(crate) fn diagnostics_of(
-        &self,
-        buffer: nxvim_core::BufferId,
-    ) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
-        let (key, doc) = self.lsp_states.get(&buffer)?.primary()?;
-        let encoding = self.lsp_servers.get(key)?.encoding;
+    /// The diagnostics **`server`** published for the current buffer, with the
+    /// encoding it negotiated — the shape a request that has to *quote* diagnostics
+    /// back to one specific server needs (`textDocument/codeAction`'s
+    /// `context.diagnostics`).
+    ///
+    /// Per server rather than per buffer because a diagnostic is not portable
+    /// between them: its columns are in its publisher's encoding, and its `code` /
+    /// `data` are that server's own handles on the problem. Sending one server's
+    /// diagnostics to another is a wrong request, not a generous one.
+    fn diagnostics_from(&self, server: &ServerKey) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
+        let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
+        let doc = state.doc(server)?;
+        let encoding = self.lsp_servers.get(server)?.encoding;
         Some((&doc.diagnostics, encoding))
     }
 
@@ -486,18 +482,22 @@ impl EditHost {
         }
     }
 
-    /// The cached diagnostics **overlapping** the 0-based, end-exclusive buffer range
-    /// `(start_row, start_col, end_row, end_col)` — the `context.diagnostics` a
-    /// code-action request carries, so a quickfix action offered over a selection is
-    /// given the very diagnostics that selection covers. An empty range (a point at
-    /// the cursor) reads as one byte wide, which is what makes the cursor case
-    /// "the diagnostics under the cursor"; a zero-width *diagnostic* is likewise
-    /// treated as one byte wide, so it can still be hit.
-    pub(crate) fn diagnostics_in_range(
+    /// The diagnostics `server` published that **overlap** the 0-based,
+    /// end-exclusive buffer range `(start_row, start_col, end_row, end_col)` — the
+    /// `context.diagnostics` its code-action request carries, so a quickfix action
+    /// offered over a selection is given the very diagnostics that selection covers.
+    /// An empty range (a point at the cursor) reads as one byte wide, which is what
+    /// makes the cursor case "the diagnostics under the cursor"; a zero-width
+    /// *diagnostic* is likewise treated as one byte wide, so it can still be hit.
+    ///
+    /// Scoped to one server ([`diagnostics_from`](Self::diagnostics_from)): the
+    /// request quotes them straight back, so they must be that server's own.
+    pub(crate) fn diagnostics_in_range_from(
         &self,
+        server: &ServerKey,
         (s_row, s_col, e_row, e_col): (usize, usize, usize, usize),
     ) -> Vec<Diagnostic> {
-        let Some((diags, encoding)) = self.current_diagnostics() else {
+        let Some((diags, encoding)) = self.diagnostics_from(server) else {
             return Vec::new();
         };
         let buffer = self.editor.buffer();

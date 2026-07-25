@@ -1741,6 +1741,16 @@ pub struct DiagnosticData {
     pub message: String,
     /// The reporting source (server/linter name), if any.
     pub source: Option<String>,
+    /// The LSP client that **published** this diagnostic, or `None` for a
+    /// client-set one (`vim.diagnostic.set`), which has no server behind it.
+    ///
+    /// The mirror is one flat list per buffer, merged across every attached
+    /// server, so without this there is no way to tell a type-checker's errors
+    /// from a linter's on a `pyright` + `ruff` buffer — the first question anyone
+    /// asks of a two-server buffer. The `source` field is close but is *server*
+    /// text (a linter name, `"compiler"`, or absent), not a handle: it cannot be
+    /// resolved back to a client, and two servers can spell it the same.
+    pub client_id: Option<u64>,
 }
 
 /// One decoded semantic token mirrored into `nx._semantic_tokens[bufnr]` so the
@@ -1822,6 +1832,8 @@ pub struct LspServerCapabilities {
     pub code_action: bool,
     pub semantic_tokens: bool,
     pub inlay_hints: bool,
+    pub document_symbol: bool,
+    pub workspace_symbol: bool,
 }
 
 /// One `vim.keymap.set` entry, read back from `nx._keymaps` as plain data for

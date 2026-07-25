@@ -793,22 +793,32 @@ impl EditHost {
                 // Per-server is mandatory once a buffer can carry two: `publishDiagnostics`
                 // is a push, so both servers publish independently, and a shared slot
                 // would have each one's set erase the other's on every publish.
-                let mirror = self
+                let buffer = self
                     .lsp_states
                     .iter_mut()
                     .find(|(_, s)| s.uri.as_ref() == Some(&uri))
                     .and_then(|(id, state)| {
                         let doc = state.doc_mut(&key)?;
                         doc.diagnostics = diagnostics;
-                        // The Lua mirror is the buffer's WHOLE set, so it merges across
-                        // servers — otherwise `vim.diagnostic.get` would report only
-                        // whichever server published last.
-                        let all: Vec<_> = state
-                            .servers()
-                            .flat_map(|(_, d)| d.diagnostics.iter().cloned())
-                            .collect();
-                        Some((id.0, diagnostic_mirror_data(&all)))
+                        Some(*id)
                     });
+                // The Lua mirror is the buffer's WHOLE set, so it merges across
+                // servers — otherwise `vim.diagnostic.get` would report only
+                // whichever server published last. Each server's set is projected
+                // with ITS OWN `client_id`, so a reader can tell the type-checker's
+                // errors from the linter's; the merged list is otherwise
+                // indistinguishable from one server publishing everything.
+                let mirror = buffer.and_then(|id| {
+                    let state = self.lsp_states.get(&id)?;
+                    let all: Vec<DiagnosticData> = state
+                        .servers()
+                        .flat_map(|(k, d)| {
+                            let client_id = self.lsp_servers.get(k).map(|rt| rt.client_id);
+                            diagnostic_mirror_data(&d.diagnostics, client_id)
+                        })
+                        .collect();
+                    Some((id.0, all))
+                });
                 if let Some((bufnr, data)) = mirror {
                     self.lsp_dirty = true;
                     // Mirror into `nx._diagnostics[bufnr]` so the synchronous
@@ -953,37 +963,50 @@ impl EditHost {
         let current = self.editor.current_buffer_id();
 
         lines.push("Current buffer".to_string());
-        match self.lsp_states.get(&current).and_then(|s| s.primary()) {
-            Some((key, doc)) => {
-                let runtime = self.lsp_servers.get(key);
-                lines.push(format!(
-                    "  server:      {} ({})",
-                    key.name,
-                    key.root.display()
-                ));
-                lines.push(format!(
-                    "  status:      {}",
-                    if !self.lsp_ensured.contains(key) {
-                        "not started"
-                    } else if runtime.is_none() {
-                        "starting (awaiting initialize)"
-                    } else if doc.opened {
-                        "attached"
-                    } else {
-                        "initialized (didOpen pending)"
-                    }
-                ));
-                if let Some(runtime) = runtime {
-                    lines.push(format!(
-                        "  encoding:    {}    sync: {}",
-                        encoding_label(runtime.encoding),
-                        sync_label(runtime.sync_kind),
-                    ));
-                }
-                lines.push(format!("  version:     {}", doc.version));
-                lines.push(format!("  diagnostics: {}", doc.diagnostics.len()));
+        // EVERY attached server, in key order — a buffer routinely carries several
+        // (`pyright` + `ruff`), each with its own negotiated encoding, sync kind,
+        // document version and diagnostics. Reporting only the first described half
+        // the state with no hint that the rest existed, which is worse than
+        // incomplete on the surface whose whole job is to say what is attached.
+        let servers: Vec<(&ServerKey, &LspServerDoc)> = self
+            .lsp_states
+            .get(&current)
+            .map(|s| s.servers().collect())
+            .unwrap_or_default();
+        if servers.is_empty() {
+            lines.push("  (no language server for this buffer)".to_string());
+        }
+        for (i, (key, doc)) in servers.iter().enumerate() {
+            if i > 0 {
+                lines.push(String::new());
             }
-            None => lines.push("  (no language server for this buffer)".to_string()),
+            let runtime = self.lsp_servers.get(*key);
+            lines.push(format!(
+                "  server:      {} ({})",
+                key.name,
+                key.root.display()
+            ));
+            lines.push(format!(
+                "  status:      {}",
+                if !self.lsp_ensured.contains(*key) {
+                    "not started"
+                } else if runtime.is_none() {
+                    "starting (awaiting initialize)"
+                } else if doc.opened {
+                    "attached"
+                } else {
+                    "initialized (didOpen pending)"
+                }
+            ));
+            if let Some(runtime) = runtime {
+                lines.push(format!(
+                    "  encoding:    {}    sync: {}",
+                    encoding_label(runtime.encoding),
+                    sync_label(runtime.sync_kind),
+                ));
+            }
+            lines.push(format!("  version:     {}", doc.version));
+            lines.push(format!("  diagnostics: {}", doc.diagnostics.len()));
         }
 
         lines.push(String::new());

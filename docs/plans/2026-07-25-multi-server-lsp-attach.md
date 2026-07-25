@@ -338,6 +338,86 @@ work (both reproduce with the multi-server changes stashed):
 `--no-default-features` compiles (`cargo check -p nxvim-server --no-default-features`),
 which is the other half of the wasm-eligible build.
 
+### Phase 7 — the surfaces that still resolved "the" server by position (done)
+
+A review of the finished feature found the same failure mode surviving in six more
+places: a path answering "which server?" with the buffer's **first** attached one
+instead of the one actually involved. Phases 1–6 fixed it for sync, request routing
+and the decorations; these are the request *context*, the merged results, and the
+apply/dispatch follow-ups. Each is covered by a test confirmed failing first, in
+`crates/nxvim/tests/lsp_config.rs`.
+
+- **`context.diagnostics` is per server.** The code-action fan-out asked every
+  server but handed them all one list harvested from the first. A linter gates its
+  quick-fixes on *its own* diagnostic being quoted back, so the second server was
+  asked about problems it never published and its fixes were silently never offered
+  — the exact hole the fan-out exists to close. Each server is now sent the
+  diagnostics it published over the range, in its own encoding. (Client-set
+  `vim.diagnostic.set` entries stay out, as in neovim: they carry no server's
+  `data`, so no server can act on them.)
+  `a_code_action_request_carries_each_servers_own_diagnostics`.
+- **Merged locations and symbols decode at their reporting server's encoding**, and
+  duplicates actually collapse. `apply_lsp_locations` / `apply_lsp_symbols` derived
+  one encoding from the buffer's first server, and the dedup was `Vec::dedup_by` —
+  which only collapses *adjacent* duplicates, so a merged list of alpha's block then
+  beta's never collapsed anything. `LspFanout` now pairs every location/symbol with
+  its producer's encoding, and the duplicate check runs on the **converted**
+  `(path, row, byte)`: two servers at different encodings spell one position
+  differently, so comparing raw LSP ranges fails for precisely the case the merge
+  creates. `references_merge_deduplicate_and_decode_at_each_servers_encoding`.
+- **A rename applies at the answering server's encoding.** Phase 4 fixed this for
+  `apply_formatting_edits` and missed `apply_workspace_edit`, which re-derived the
+  encoding *per target buffer* from that buffer's first server — overriding the
+  origin it had just been handed. `a_rename_applies_its_edits_at_the_answering_servers_encoding`.
+- **A code action's `command` runs on the server that offered it.** The merged
+  chooser tracked each action's origin for `codeAction/resolve` and then dropped it
+  for the command. Found while testing it: `nx.lsp._dispatch_command` **did not
+  exist** — the neovim-compat removal took `vim.lsp.commands` with it, so every
+  command-carrying action had been failing with an `E5108` since. Implemented for
+  real (a `nx.lsp.commands[name]` client-side registry, else
+  `workspace/executeCommand` on the origin client), with `vim.lsp.commands` aliased
+  to the same table. `a_code_actions_command_runs_on_the_server_that_offered_it`.
+- **The signature-help auto-trigger gates by capability.** Core's trigger set is a
+  union across servers, so it raised the request correctly; the per-buffer gate then
+  resolved to the buffer's *first* server and dropped it. On `eslint` + `ts_ls`
+  every typed `(` was swallowed. `the_signature_autotrigger_fires_for_the_server_that_advertises_it`.
+- **`documentSymbol` / `workspaceSymbol` are modelled in `ProviderCaps`.** Both were
+  unmodelled, so the routing predicate failed *open* and the documentSymbol fan-out
+  asked every attached server including ones that never advertised it. Both flags
+  are now probed at `initialize` and mirrored to `server_capabilities`.
+  `document_symbols_only_ask_the_servers_that_advertise_them`.
+- **`workspace/symbol` fans out.** It was the last list-shaped kind still answered by
+  one server, though merging it is as well defined as `documentSymbol`'s — two
+  indexers each know symbols the other does not.
+  `workspace_symbols_merge_from_every_capable_server`.
+- **`:LspInfo` reports every attached server**, not just the first — the
+  introspection surface for exactly the thing that became plural. Its "Running
+  servers" section listed both all along, which made the header's silence misleading
+  rather than merely incomplete. `lsp_info_reports_every_server_on_the_buffer`.
+- **Merged diagnostics carry the `client_id` that published them.**
+  `vim.diagnostic.get` returns one flat list per buffer, merged across servers, so
+  without a tag there is no way to tell a type-checker's errors from a linter's —
+  the first question anyone asks of a two-server buffer. The semantic-token and
+  inlay-hint mirrors were tagged in Phase 4 for exactly this reason; the diagnostics
+  mirror, built by the same merge, was not. (`source` is close but is *server* text —
+  a linter name, `"compiler"`, or absent — not a handle that resolves back to a
+  client.) `None` for a client-set `vim.diagnostic.set` entry, which has no server
+  behind it. `merged_diagnostics_carry_the_client_that_published_each`.
+
+Fallout the above made possible: `LspDocState::primary` is gone and `primary_key`
+survives only as `reply_encoding`'s last-resort fallback for an edit with no
+producing server (one built in Lua). `request_lsp` now rejects a non-cursor kind by
+name instead of falling through to a request of a *different* kind — a raw
+`nx._lsp_buf(10)` used to issue `documentSymbol` for a code-action ask — and the
+single-slot `PendingLspReq.code_action` field went with the dead single-target
+code-action reply arm (code actions always fan out).
+
+The encoding rule this phase generalizes, for anything added later: **a reply's
+positions belong to the server that sent it.** Carry the producing server from the
+request to the reply and convert with *its* encoding; never re-derive one from the
+buffer. The buffer's first server is the right answer only when there is no
+producing server at all.
+
 ## Testing
 
 Per repo convention every phase is black-box through the running server. The mock

@@ -21,6 +21,39 @@ impl EditHost {
     /// it. No-op (with a brief message) if the current buffer has no server that
     /// has finished `initialize`, since the negotiated encoding isn't known yet.
     pub(crate) fn request_lsp(&mut self, kind: LspReqKind, cb_id: u64) {
+        // Kinds that don't have the uniform `{uri, position}` shape have their own
+        // issue functions — because they carry an argument the cursor can't supply
+        // (a new name, a query), or they are whole-buffer background refreshes. A
+        // raw `nx._lsp_buf(<kind>)` can name one anyway, so reject it by name rather
+        // than falling through to a request of a *different* kind, and settle the
+        // promise so the caller isn't left waiting on a reply that never went.
+        match kind {
+            // Code actions do fan out, but with a range, a context and options the
+            // generic path has no way to build — hand them to their own issuer.
+            LspReqKind::CodeAction => {
+                self.request_lsp_code_action(cb_id, CodeActionOpts::default(), None);
+                return;
+            }
+            LspReqKind::Formatting => {
+                self.request_lsp_format(cb_id, None);
+                return;
+            }
+            LspReqKind::Rename
+            | LspReqKind::WorkspaceSymbol
+            | LspReqKind::Completion
+            | LspReqKind::CompletionResolve
+            | LspReqKind::ResolveCodeAction
+            | LspReqKind::SemanticTokens
+            | LspReqKind::InlayHints
+            | LspReqKind::ResolveInlayHint
+            | LspReqKind::FoldingRange => {
+                self.editor
+                    .echo(format!("nx.lsp: {kind:?} is not a cursor request"));
+                self.settle_lsp_promise(cb_id, serde_json::Value::Null);
+                return;
+            }
+            _ => {}
+        }
         // Flush any pending document edits as a `didChange` *before* the request,
         // so the server computes against the current buffer text. Requests are
         // fired during input — ahead of `redraw`'s own `sync_lsp` — so without
@@ -52,7 +85,13 @@ impl EditHost {
                             position,
                             include_declaration: false,
                         },
-                        _ => LspRequest::DocumentSymbol { uri },
+                        LspReqKind::DocumentSymbol => LspRequest::DocumentSymbol { uri },
+                        // The other fan-out kinds are routed away above: code
+                        // actions to their own issuer, workspace symbols rejected
+                        // (they need a query). Falling back to *some* request here
+                        // is how a mis-routed kind used to become a silently wrong
+                        // one — a code-action ask issuing `documentSymbol`.
+                        other => unreachable!("{other:?} does not ride the cursor fan-out"),
                     }
                 });
             if asked.is_empty() {
@@ -86,34 +125,10 @@ impl EditHost {
             },
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
-            // Document symbols are whole-document (position-less), but ride the
-            // cursor-tick request path like the goto family.
-            LspReqKind::DocumentSymbol => LspRequest::DocumentSymbol { uri },
-            // Workspace symbols carry a query, not the cursor — issued by
-            // `request_lsp_workspace_symbol` below, never here.
-            LspReqKind::WorkspaceSymbol => return,
-            // Completion goes to EVERY capable server, each at its own encoding, and
-            // its shares stream into the open menu — `request_lsp_completion` owns
-            // that round, so it never rides this single-target path.
-            LspReqKind::Completion
-            // Formatting/rename/codeAction(+resolve) and completion-resolve don't
-            // share the uniform {uri, position} shape and have their own issue
-            // functions below (resolve is fired from the menu, not the cursor).
-            | LspReqKind::Formatting
-            | LspReqKind::Rename
-            | LspReqKind::CodeAction
-            | LspReqKind::ResolveCodeAction
-            | LspReqKind::CompletionResolve
-            // Semantic tokens and inlay hints are whole-buffer, issued by
-            // `request_semantic_tokens` / `request_inlay_hints` on open/change/enable
-            // rather than at the cursor; inlay-hint resolve is fired per lazy hint
-            // from `issue_inlay_resolves`, never at the cursor.
-            | LspReqKind::SemanticTokens
-            | LspReqKind::InlayHints
-            // Folding ranges are whole-buffer too, issued by `request_folding_range`
-            // on open/change while the buffer wants LSP folds, never at the cursor.
-            | LspReqKind::FoldingRange
-            | LspReqKind::ResolveInlayHint => return,
+            // `documentSymbol` and `references` fan out and were handled above; every
+            // remaining kind was routed to its own issuer — or rejected by name — by
+            // the guard at the top of this function, so nothing else can arrive here.
+            other => unreachable!("{other:?} is not a single-target cursor request"),
         };
         self.fx.lsp_request(key, token, req);
     }
@@ -158,10 +173,18 @@ impl EditHost {
         }
     }
 
-    /// Whether the current buffer's (initialized) server advertises signature-help
-    /// trigger characters — the per-buffer gate for the auto-trigger drain.
+    /// Whether the current buffer has an (initialized) server advertising
+    /// signature-help trigger characters — the per-buffer gate for the auto-trigger
+    /// drain.
+    ///
+    /// Selected by **capability**, not by position: core's trigger set is the union
+    /// across every started server, so it raises the request whenever any of them
+    /// wants the typed character. Resolving the gate to the buffer's *first* server
+    /// then dropped it on every buffer whose first server has no signature help —
+    /// `eslint` ahead of `ts_ls` — swallowing every `(` the second server would have
+    /// answered.
     fn current_buffer_has_signature_trigger(&self) -> bool {
-        self.current_lsp_target()
+        self.lsp_target_for(self.editor.current_buffer_id(), LspReqKind::SignatureHelp)
             .and_then(|(key, _, _)| self.lsp_servers.get(&key))
             .is_some_and(|rt| !rt.signature_trigger_chars.is_empty())
     }
@@ -173,33 +196,13 @@ impl EditHost {
     /// request of the same `kind` **supersedes** the one it replaces, so that
     /// pending's still-live promise is settled `nil` (a benign no-op) here rather
     /// than left to hang — its reply, if it ever lands, is dropped on the
-    /// generation mismatch.
-    pub(crate) fn register_lsp_request(&mut self, kind: LspReqKind, cb_id: u64) -> ReqToken {
-        self.register_lsp_request_with(kind, cb_id, CodeActionOpts::default())
-    }
-
-    /// [`register_lsp_request`](Self::register_lsp_request), recording which server
-    /// the request went to so the reply is decoded against *that* server.
+    /// generation mismatch. `server` is the one the request is going to, so the
+    /// reply is decoded against *that* server's encoding rather than re-derived.
     pub(crate) fn register_lsp_request_to(
         &mut self,
         kind: LspReqKind,
         cb_id: u64,
         server: &ServerKey,
-    ) -> ReqToken {
-        let token = self.register_lsp_request_with(kind, cb_id, CodeActionOpts::default());
-        if let Some(pending) = self.lsp_requests.get_mut(&kind) {
-            pending.server = Some(server.clone());
-        }
-        token
-    }
-
-    /// [`register_lsp_request`](Self::register_lsp_request) carrying the code-action
-    /// options (`only` / `apply`) the reply needs; every other kind uses the default.
-    pub(crate) fn register_lsp_request_with(
-        &mut self,
-        kind: LspReqKind,
-        cb_id: u64,
-        code_action: CodeActionOpts,
     ) -> ReqToken {
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
@@ -211,8 +214,7 @@ impl EditHost {
                 cursor: (self.editor.cursor.line, self.editor.cursor.col),
                 tick: self.editor.buffer().changedtick,
                 cb_id,
-                code_action,
-                server: None,
+                server: Some(server.clone()),
             },
         ) {
             self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
@@ -454,19 +456,28 @@ impl EditHost {
     /// `nx.lsp.workspace_symbol(query)` — request `workspace/symbol` for `query`.
     /// Unlike the cursor-anchored requests it carries the user's fuzzy query, not a
     /// position; on reply the matching symbols open in the picker (`apply_lsp_symbols`).
+    ///
+    /// Fans out to every server advertising `workspaceSymbolProvider` and merges,
+    /// like `documentSymbol`: two servers indexing one project each know symbols the
+    /// other does not (a type-checker's definitions, a linter's rule ids), so asking
+    /// only the first silently halves the picker. Merging is as well defined here as
+    /// for document symbols — the result is a *list*, and duplicates collapse on
+    /// their resolved position.
     pub(crate) fn request_lsp_workspace_symbol(&mut self, query: &str, cb_id: u64) {
-        let Some((key, _uri, _encoding)) = self.lsp_target_or_echo() else {
-            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-            return;
-        };
-        let token = self.register_lsp_request(LspReqKind::WorkspaceSymbol, cb_id);
-        self.fx.lsp_request(
-            key,
-            token,
-            LspRequest::WorkspaceSymbol {
-                query: query.to_string(),
+        self.sync_lsp();
+        let query = query.to_string();
+        let asked = self.open_lsp_fanout(
+            LspReqKind::WorkspaceSymbol,
+            cb_id,
+            CodeActionOpts::default(),
+            |_, _uri, _enc| LspRequest::WorkspaceSymbol {
+                query: query.clone(),
             },
         );
+        if asked.is_empty() {
+            self.editor.echo("No language server attached");
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
+        }
     }
 
     /// `:LspRename {newname}` — request `textDocument/rename` at the cursor with
@@ -531,7 +542,26 @@ impl EditHost {
             let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
             (row, col, row, col)
         });
-        let diagnostics = self.diagnostics_in_range(extent);
+        // `context.diagnostics` per server: each is sent the diagnostics **it**
+        // published over this range, in its own encoding.
+        //
+        // This is what a linter gates its quick-fixes on — ruff offers "remove the
+        // unused import" only when the request carries ruff's own diagnostic — so
+        // handing every server one list harvested from the buffer's first server
+        // means the second one is asked about diagnostics it never published, and
+        // its fixes are silently never offered. Which is precisely the hole the
+        // code-action fan-out exists to close. (A server's diagnostics also carry
+        // its own `data`/`code` and its own columns, so they are not another
+        // server's to forward even when the two agree on the problem.)
+        let buffer = self.editor.current_buffer_id();
+        let diagnostics: HashMap<ServerKey, Vec<nxvim_lsp::lsp_types::Diagnostic>> = self
+            .lsp_capable_servers(buffer, LspReqKind::CodeAction)
+            .into_iter()
+            .map(|(key, _)| {
+                let diags = self.diagnostics_in_range_from(&key, extent);
+                (key, diags)
+            })
+            .collect();
         let only = opts.only.clone();
         // The request range in each encoding a server might use — resolved before the
         // fan-out borrows `self` (see `request_lsp`).
@@ -557,7 +587,7 @@ impl EditHost {
         // chooser — this is the fan-out that matters most in practice: a linter's
         // quick-fixes and a type-checker's refactors are both things you want offered,
         // and asking only one server silently hides half the menu.
-        let asked = self.open_lsp_fanout(LspReqKind::CodeAction, cb_id, opts, |_, uri, enc| {
+        let asked = self.open_lsp_fanout(LspReqKind::CodeAction, cb_id, opts, |key, uri, enc| {
             let range = ranges
                 .iter()
                 .find(|(e, _)| *e == enc)
@@ -566,7 +596,7 @@ impl EditHost {
             LspRequest::CodeAction {
                 uri,
                 range,
-                diagnostics: diagnostics.clone(),
+                diagnostics: diagnostics.get(key).cloned().unwrap_or_default(),
                 only: only.clone(),
             }
         });
@@ -574,30 +604,6 @@ impl EditHost {
             self.editor.echo("No language server attached");
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
         }
-    }
-
-    /// Flush pending document edits ([`sync_lsp`](EditHost::sync_lsp)) and resolve the
-    /// current buffer's [`current_lsp_target`](Self::current_lsp_target), echoing the
-    /// standard "No language server attached" message on `None`. The shared preamble
-    /// every cursor/buffer LSP issue function opens with.
-    pub(crate) fn lsp_target_or_echo(&mut self) -> Option<(ServerKey, Url, PositionEncoding)> {
-        self.sync_lsp();
-        let target = self.current_lsp_target();
-        if target.is_none() {
-            self.editor.echo("No language server attached");
-        }
-        target
-    }
-
-    /// The current buffer's `(server, uri, encoding)` once its server finished
-    /// `initialize` (so the negotiated encoding is known) — the precondition for
-    /// any position-based request. `None` otherwise.
-    pub(crate) fn current_lsp_target(&self) -> Option<(ServerKey, Url, PositionEncoding)> {
-        let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
-        let key = state.primary_key().cloned()?;
-        let uri = state.uri.clone()?;
-        let encoding = self.lsp_servers.get(&key)?.encoding;
-        Some((key, uri, encoding))
     }
 
     /// The server on `buffer` that should answer a request of `kind`: the **first**
@@ -718,12 +724,25 @@ impl EditHost {
             return false;
         };
         let Some(server) = round.outstanding.remove(&token.generation) else {
-            // Not part of the open round — a straggler from a superseded one.
-            return self.lsp_fanouts.contains_key(&kind) && LspFanout::is_fanout(kind);
+            // Not part of the open round — a straggler from a superseded one. It is
+            // still this kind's reply, so swallow it rather than letting the
+            // single-target path try to match it.
+            return true;
+        };
+        // Every position in this reply is authored in the encoding the ANSWERING
+        // server negotiated, so it is captured here — at the one point the server is
+        // still known — rather than re-derived when the merged list is presented.
+        let encoding = self.reply_encoding(Some(&server));
+        let Some(round) = self.lsp_fanouts.get_mut(&kind) else {
+            return true; // `reply_encoding` released the borrow; re-take it
         };
         match reply {
-            LspReply::Locations(locations) => round.locations.extend(locations.iter().cloned()),
-            LspReply::Symbols(symbols) => round.symbols.extend(symbols.iter().cloned()),
+            LspReply::Locations(locations) => round
+                .locations
+                .extend(locations.iter().map(|l| (l.clone(), encoding))),
+            LspReply::Symbols(symbols) => round
+                .symbols
+                .extend(symbols.iter().map(|s| (s.clone(), encoding))),
             LspReply::CodeActions(actions) => round
                 .actions
                 .extend(actions.iter().map(|a| (server.clone(), a.clone()))),
@@ -753,14 +772,18 @@ impl EditHost {
                     self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
                     return;
                 }
-                // Two servers can report the same reference; show it once.
-                let mut locations = round.locations;
-                locations.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
-                let result = self.apply_lsp_locations(kind, locations);
+                // Two servers reporting the same reference show it once —
+                // `apply_lsp_locations` drops the duplicate *after* converting each
+                // to a byte column, which is the only place the two spellings of one
+                // position (utf-8 vs utf-16 `character`) are comparable.
+                let result = self.apply_lsp_locations(kind, round.locations);
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(round.cb_id, result);
             }
-            LspReqKind::DocumentSymbol => {
+            // A symbol list is browsed rather than anchored to the cursor, so only a
+            // buffer switch retires it. `workspace/symbol` merges the same way: its
+            // results are the union of what each indexer knows.
+            LspReqKind::DocumentSymbol | LspReqKind::WorkspaceSymbol => {
                 if buffer_changed {
                     self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
                     return;
@@ -844,9 +867,6 @@ impl EditHost {
         // `register_lsp_request`, and a second reply for a handled kind has no live
         // promise. `code_action` stays fire-and-forget until Phase 2 (`cb_id == 0`).
         let cb_id = pending.cb_id;
-        // The code-action request's `only`/`apply` options, needed to filter this reply
-        // and to decide chooser-vs-one-shot. Default (and unused) for every other kind.
-        let code_action = pending.code_action.clone();
         // The encoding the ANSWERING server's positions are in — an apply reply
         // (formatting / rename / resolved code action) carries ranges that must be
         // converted with it, and on a multi-server buffer that is not the first
@@ -866,7 +886,11 @@ impl EditHost {
                     self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                let result = self.apply_lsp_locations(kind, locations);
+                // At the ANSWERING server's encoding: a goto routes by capability,
+                // so on a two-server buffer the server that replied need not be the
+                // first one listed.
+                let located = locations.into_iter().map(|l| (l, reply_encoding)).collect();
+                let result = self.apply_lsp_locations(kind, located);
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(cb_id, result);
             }
@@ -878,7 +902,8 @@ impl EditHost {
                     self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                let result = self.apply_lsp_symbols(kind, symbols);
+                let found = symbols.into_iter().map(|s| (s, reply_encoding)).collect();
+                let result = self.apply_lsp_symbols(kind, found);
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(cb_id, result);
             }
@@ -922,18 +947,13 @@ impl EditHost {
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             }
-            LspReply::CodeActions(actions) => {
-                if buffer_changed || tick_changed {
-                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-                    return;
-                }
-                // The reply only opens the chooser; `show_code_actions` takes over the
-                // promise (stashes `cb_id` onto the menu, or settles `nil` on an empty
-                // reply), so it is NOT settled here. It resolves on the confirm/cancel
-                // path (Phase 2) — or right away when the request's `apply` option and a
-                // single surviving action make it a one-shot.
-                self.show_code_actions(actions, cb_id, code_action);
-                self.lsp_dirty = true;
+            // Code actions always fan out (every `codeActionProvider` is asked and
+            // the chooser merges them), so their replies fold into a round in
+            // `absorb_fanout_reply` and never reach the single-slot kind path — a
+            // reply that finds no open round is a straggler the round already
+            // swallowed.
+            LspReply::CodeActions(_) => {
+                unreachable!("code-action replies are routed in absorb_fanout_reply")
             }
             LspReply::ResolvedCodeAction(edit) => {
                 if buffer_changed || tick_changed {
@@ -1068,9 +1088,20 @@ impl EditHost {
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;
     /// references (or multiple goto results) open a select-enabled panel location
-    /// list; an empty result shows a brief message. The encoding is captured from
-    /// the *source* buffer before any jump switches buffers — a server reports
-    /// target positions in its own negotiated encoding.
+    /// list; an empty result shows a brief message.
+    ///
+    /// Each location carries the position encoding of the server that **reported**
+    /// it, rather than one derived from the buffer here. On a buffer with two
+    /// servers the reporting server is not necessarily the first one listed — a
+    /// goto routes by capability, and a references round merges every capable
+    /// server — so a single derived encoding is right only by luck, and reading a
+    /// utf-16 server's columns as utf-8 bytes shifts every result past a line's
+    /// first multi-byte glyph.
+    ///
+    /// Locations that resolve to the **same** place are shown once. The comparison
+    /// is on the converted `(path, row, byte)`, not on the raw LSP position: two
+    /// servers at different encodings spell one position differently, so raw ranges
+    /// would compare unequal for the very case the merge creates.
     ///
     /// Returns the resolved locations as the `{ text, path, row, col }` item list
     /// (JSON) an async `nx.lsp.*` verb resolves its promise with — a 1-element list
@@ -1078,34 +1109,45 @@ impl EditHost {
     pub(crate) fn apply_lsp_locations(
         &mut self,
         kind: LspReqKind,
-        locations: Vec<Location>,
+        locations: Vec<(Location, PositionEncoding)>,
     ) -> serde_json::Value {
         if locations.is_empty() {
             self.editor.echo(kind.empty_message());
             return serde_json::Value::Null;
         }
-        let encoding = self
-            .current_lsp_target()
-            .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
         // Build the `path:line:col` items once — they feed both the picker and the
-        // promise's resolved value.
+        // promise's resolved value. The first surviving location is kept whole so a
+        // lone goto result can be jumped to.
         let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(locations.len());
-        for loc in &locations {
+        let mut seen: std::collections::HashSet<(PathBuf, usize, usize)> =
+            std::collections::HashSet::new();
+        let mut first: Option<(Location, PositionEncoding)> = None;
+        for (loc, encoding) in &locations {
             let Some(path) = uri_to_path(&loc.uri) else {
                 continue;
             };
             let row = loc.range.start.line as usize;
             let character = loc.range.start.character as usize;
-            let byte = self.location_byte_col(&path, row, character, encoding);
+            let byte = self.location_byte_col(&path, row, character, *encoding);
+            if !seen.insert((path.clone(), row, byte)) {
+                continue; // the same place, reported by another server too
+            }
+            if first.is_none() {
+                first = Some((loc.clone(), *encoding));
+            }
             let nav = path.to_string_lossy().into_owned();
             let shown = super::display_path(&path);
             let text = format!("{shown}:{}:{}", row + 1, byte + 1);
             items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
         }
-        if !kind.is_list() && locations.len() == 1 {
-            self.jump_to_lsp_location(&locations[0], encoding);
-        } else {
-            self.present_lsp_picker(kind, items.clone(), "location");
+        match first {
+            // A goto whose result is one place — after dedup, so two servers
+            // agreeing on a definition still jumps rather than opening a
+            // two-row picker of the same line.
+            Some((loc, encoding)) if !kind.is_list() && items.len() == 1 => {
+                self.jump_to_lsp_location(&loc, encoding)
+            }
+            _ => self.present_lsp_picker(kind, items.clone(), "location"),
         }
         location_items_to_json(&items)
     }
@@ -1135,8 +1177,13 @@ impl EditHost {
 
     /// Open `nx.picker` over a document/workspace symbol reply — each row is
     /// `name  [Kind]  path:line`, jumping to the symbol's location on confirm. Like
-    /// the location picker this dogfreeds the shared engine; the symbol's `name` and
+    /// the location picker this dogfoods the shared engine; the symbol's `name` and
     /// `kind` make the rows readable (a bare `path:line` would not).
+    ///
+    /// Each symbol carries its reporting server's position encoding, and an
+    /// identical symbol reported by two servers is listed once — see
+    /// [`apply_lsp_locations`](Self::apply_lsp_locations) for why both are keyed off
+    /// the *converted* position.
     ///
     /// Returns the symbol `{ text, path, row, col }` item list (JSON) an async
     /// `document_symbol` / `workspace_symbol` promise resolves with; `Null` when
@@ -1144,23 +1191,25 @@ impl EditHost {
     pub(crate) fn apply_lsp_symbols(
         &mut self,
         kind: LspReqKind,
-        symbols: Vec<SymbolData>,
+        symbols: Vec<(SymbolData, PositionEncoding)>,
     ) -> serde_json::Value {
         if symbols.is_empty() {
             self.editor.echo(kind.empty_message());
             return serde_json::Value::Null;
         }
-        let encoding = self
-            .current_lsp_target()
-            .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
         let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(symbols.len());
-        for sym in &symbols {
+        let mut seen: std::collections::HashSet<(String, PathBuf, usize, usize)> =
+            std::collections::HashSet::new();
+        for (sym, encoding) in &symbols {
             let Some(path) = uri_to_path(&sym.location.uri) else {
                 continue;
             };
             let row = sym.location.range.start.line as usize;
             let character = sym.location.range.start.character as usize;
-            let byte = self.location_byte_col(&path, row, character, encoding);
+            let byte = self.location_byte_col(&path, row, character, *encoding);
+            if !seen.insert((sym.name.clone(), path.clone(), row, byte)) {
+                continue; // the same symbol, reported by another server too
+            }
             // The row text shows a cwd-relative path; the navigation field keeps
             // the full path (reused cwd-aware on jump).
             let nav = path.to_string_lossy().into_owned();
@@ -1212,13 +1261,19 @@ impl EditHost {
         }
     }
 
-    /// The Lua `client_id` of the current buffer's language server (the reverse of
-    /// the [`ServerKey`] resolved by [`Self::current_lsp_target`]), or `None` when
-    /// no server is attached / initialized. Used to route a code-action command to
-    /// the right client.
+    /// The Lua `client_id` assigned to `key`'s server (the reverse of the id handed
+    /// out at `Initialized`), or `None` once it has exited.
+    pub(crate) fn lsp_client_id_of(&self, key: &ServerKey) -> Option<u64> {
+        self.lsp_servers.get(key).map(|r| r.client_id)
+    }
+
+    /// The Lua `client_id` of the server that would answer a code action on the
+    /// current buffer — the fallback for dispatching a command whose originating
+    /// server is no longer known.
     pub(crate) fn current_lsp_client_id(&self) -> Option<u64> {
-        let (key, _, _) = self.current_lsp_target()?;
-        self.lsp_servers.get(&key).map(|r| r.client_id)
+        let (key, _, _) =
+            self.lsp_target_for(self.editor.current_buffer_id(), LspReqKind::CodeAction)?;
+        self.lsp_client_id_of(&key)
     }
 }
 

@@ -1,0 +1,25 @@
+# Deliberately left with `govet` ON, even though gopls already runs the `go vet`
+# analyzers — so line 13 is reported by BOTH servers. That overlap is the normal
+# state of a real type-checker + linter pairing, not an edge case, and the example
+# would be dishonest if it configured it away: see step 3 in `init.lua` for what
+# nxvim does with it.
+#
+# The real-world remedy, once you have seen it, is to stop the linter duplicating
+# what the language server already does:
+#
+#     linters:
+#       disable:
+#         - govet
+#
+# Uncomment that and line 13 drops to a single diagnostic, from gopls alone.
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - ineffassign
+    - govet
+
+issues:
+  # golangci-lint's stock exclusion list drops `os.Mkdir`-class errcheck findings
+  # (EXC0001). This example wants to see one.
+  exclude-use-default: false

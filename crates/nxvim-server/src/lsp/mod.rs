@@ -133,22 +133,16 @@ impl LspDocState {
         self.semantic_enabled.unwrap_or(true)
     }
 
-    /// The buffer's first attached server and its document state — the lowest
-    /// [`ServerKey`], so the choice is stable across runs rather than hash-ordered.
+    /// The buffer's first attached server — the lowest [`ServerKey`], so the choice
+    /// is stable across runs rather than hash-ordered.
     ///
-    /// The *provisional* answer to "which server serves this buffer", left for the
-    /// few surfaces that still want a single one: the `:LspInfo` header, the
-    /// fallback encoding when no producing server is known, and the legacy
-    /// single-encoding diagnostics accessor. Every path where the choice can be
-    /// wrong now selects by capability ([`EditHost::lsp_target_for`]) or asks them
-    /// all ([`EditHost::lsp_capable_servers`]) — document sync, diagnostics,
-    /// requests, semantic tokens and inlay hints all iterate
-    /// [`servers`](Self::servers).
-    pub(crate) fn primary(&self) -> Option<(&ServerKey, &LspServerDoc)> {
-        self.servers.iter().next()
-    }
-
-    /// The key half of [`primary`](Self::primary).
+    /// The **last-resort** answer to "which server serves this buffer", and the only
+    /// remaining caller is [`EditHost::reply_encoding`]'s fallback for an edit with
+    /// no producing server at all (one built in Lua). Every path where the choice
+    /// can be wrong selects by capability ([`EditHost::lsp_target_for`]), asks them
+    /// all ([`EditHost::lsp_capable_servers`]), or carries the answering server on
+    /// the reply — document sync, diagnostics, requests, decorations, merged results
+    /// and the apply/dispatch follow-ups all do one of those.
     pub(crate) fn primary_key(&self) -> Option<&ServerKey> {
         self.servers.keys().next()
     }
@@ -358,14 +352,13 @@ impl LspReqKind {
             LspReqKind::SemanticTokens => caps.semantic_tokens,
             LspReqKind::InlayHints => caps.inlay_hints,
             LspReqKind::FoldingRange => caps.folding_range,
+            LspReqKind::DocumentSymbol => caps.document_symbol,
+            LspReqKind::WorkspaceSymbol => caps.workspace_symbol,
             // Resolve follow-ups belong to the server that produced the item being
             // resolved, so they are routed by that item, never selected here.
             LspReqKind::ResolveCodeAction
             | LspReqKind::CompletionResolve
             | LspReqKind::ResolveInlayHint => return None,
-            // `documentSymbol` / `workspace/symbol` have provider flags nxvim does
-            // not distil into `ProviderCaps` yet.
-            LspReqKind::DocumentSymbol | LspReqKind::WorkspaceSymbol => return None,
         })
     }
 
@@ -504,11 +497,6 @@ pub(crate) struct PendingLspReq {
     /// the same `kind` can settle the promise it replaces (resolve `nil`), and the
     /// reply can settle it on apply. Mirrors [`ReqToken::cb_id`].
     pub(crate) cb_id: u64,
-    /// The caller's `nx.lsp.code_action{ context = { only = … }, apply = … }` options,
-    /// needed at *reply* time (which actions survive the filter, and whether a single
-    /// survivor is applied without the chooser). Default (no filter, no auto-apply) for
-    /// every other kind.
-    pub(crate) code_action: CodeActionOpts,
     /// The server this request was actually sent to.
     ///
     /// Recorded because the answering server is no longer implied: once a buffer
@@ -522,9 +510,9 @@ pub(crate) struct PendingLspReq {
 /// One **fan-out round**: a single logical request issued to every capable server,
 /// whose replies merge into one presentation.
 ///
-/// Only the kinds where merging is well defined fan out (references, document
-/// symbols, code actions) — a hover or a goto has one answer, so merging them would
-/// be noise rather than completeness. See the routing table in
+/// Only the kinds where merging is well defined fan out (references, document and
+/// workspace symbols, code actions) — a hover or a goto has one answer, so merging
+/// them would be noise rather than completeness. See the routing table in
 /// `docs/plans/2026-07-25-multi-server-lsp-attach.md`.
 ///
 /// The round completes when every asked server has replied **or dropped out** (its
@@ -543,10 +531,21 @@ pub(crate) struct LspFanout {
     /// The `only` / `apply` filter, applied to the MERGED list so a `source.fixAll`
     /// request still auto-applies when exactly one server offers a match.
     pub(crate) code_action: CodeActionOpts,
-    /// Accumulated locations (references).
-    pub(crate) locations: Vec<Location>,
-    /// Accumulated symbols (document symbols).
-    pub(crate) symbols: Vec<SymbolData>,
+    /// Accumulated locations (references), each with the position encoding of the
+    /// server that reported it.
+    ///
+    /// The pairing is load-bearing for the same reason the diagnostics store's is:
+    /// two servers on one buffer may have negotiated different encodings, so a
+    /// location's `character` is only meaningful against the encoding of the server
+    /// that produced it. Converting the merged list at one encoding puts every
+    /// column from the other server past the line's first multi-byte glyph in the
+    /// wrong place — and, because the two spellings of one position then differ,
+    /// silently defeats the duplicate check as well.
+    pub(crate) locations: Vec<(Location, PositionEncoding)>,
+    /// Accumulated symbols (document / workspace symbols), paired with their
+    /// producing server's encoding for the same reason as
+    /// [`locations`](Self::locations).
+    pub(crate) symbols: Vec<(SymbolData, PositionEncoding)>,
     /// Accumulated code actions, each tagged with the server that produced it.
     ///
     /// The tag is load-bearing: a lazy action is finished with `codeAction/resolve`,
@@ -562,7 +561,10 @@ impl LspFanout {
     pub(crate) fn is_fanout(kind: LspReqKind) -> bool {
         matches!(
             kind,
-            LspReqKind::References | LspReqKind::DocumentSymbol | LspReqKind::CodeAction
+            LspReqKind::References
+                | LspReqKind::DocumentSymbol
+                | LspReqKind::WorkspaceSymbol
+                | LspReqKind::CodeAction
         )
     }
 }
@@ -876,6 +878,8 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
         code_action: p.code_action,
         semantic_tokens: p.semantic_tokens,
         inlay_hints: p.inlay_hints,
+        document_symbol: p.document_symbol,
+        workspace_symbol: p.workspace_symbol,
     }
 }
 
@@ -884,10 +888,18 @@ pub(crate) fn provider_caps_to_lua(p: &ProviderCaps) -> LspServerCapabilities {
 /// the raw 0-based LSP coordinates; `col`/`end_col` are byte offsets under the
 /// UTF-8 encoding nxvim advertises first (the negotiated default), matching
 /// neovim's byte-column `get` shape for the common case.
-pub(crate) fn diagnostic_mirror_data(diags: &[Diagnostic]) -> Vec<DiagnosticData> {
+///
+/// `client_id` tags every entry with the server that published it — the mirror is
+/// one flat list per buffer merged across servers, so the caller projects each
+/// server's set separately and concatenates.
+pub(crate) fn diagnostic_mirror_data(
+    diags: &[Diagnostic],
+    client_id: Option<u64>,
+) -> Vec<DiagnosticData> {
     diags
         .iter()
         .map(|d| DiagnosticData {
+            client_id,
             lnum: d.range.start.line as i64,
             col: d.range.start.character as i64,
             end_lnum: d.range.end.line as i64,

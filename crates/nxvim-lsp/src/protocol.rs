@@ -117,6 +117,13 @@ pub struct ProviderCaps {
     pub semantic_tokens: bool,
     pub inlay_hints: bool,
     pub folding_range: bool,
+    /// `textDocument/documentSymbol` and `workspace/symbol`. Both are **fan-out**
+    /// kinds — every capable server on the buffer is asked and the results merge —
+    /// which is exactly why they need a flag: an unmodelled provider makes the
+    /// routing predicate fail *open*, so a server that never advertised the method
+    /// is asked anyway, once per invocation, and whatever it answers joins the list.
+    pub document_symbol: bool,
+    pub workspace_symbol: bool,
 }
 
 /// A fire-and-forget document-sync notification, already in LSP coordinates. The

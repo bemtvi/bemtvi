@@ -773,6 +773,73 @@ function nx.lsp.notify(method, params, bufnr)
   client:notify(method, params)
 end
 
+-- ----- code-action commands --------------------------------------------------
+
+-- `nx.lsp.commands[name] = function(command, ctx)`: client-side handlers for the
+-- code-action `command`s a server asks the *editor* to run.
+--
+-- A code action can carry a `command` instead of (or besides) an edit. Most are
+-- executed by the server through `workspace/executeCommand`, but some are defined
+-- to run client-side — the server has no way to do them itself (`editor.action.*`
+-- style commands that open a file, start a rename, or reveal a location). A
+-- handler registered here wins over the round trip; anything unregistered goes to
+-- the server that offered the action.
+--
+-- `command` is the raw LSP `Command` (`{ title, command, arguments }`) and `ctx`
+-- carries `{ client_id }` — the server that offered it, since the same command
+-- name can mean different things to two servers on one buffer.
+--
+-- ```lua
+-- nx.lsp.commands["rust-analyzer.gotoLocation"] = function(command, ctx)
+--   local loc = command.arguments and command.arguments[1]
+--   if loc then vim.lsp.util.show_document(loc) end
+-- end
+-- ```
+nx.lsp.commands = nx.lsp.commands or {}
+
+-- Run a code action's `command` (called by the engine when an action is applied):
+-- a registered `nx.lsp.commands` handler if there is one, else
+-- `workspace/executeCommand` on the client that OFFERED the action.
+--
+-- `client_id` is the offering server, not the buffer's first: a command's name and
+-- arguments are that server's own vocabulary, so executing ruff's `source.fixAll`
+-- on pyright is a wrong request rather than a degraded one.
+--
+-- Every failure path is loud (an unknown client, a handler that errors, a server
+-- that rejects the command): a code action that silently does nothing looks like
+-- one that worked.
+function nx.lsp._dispatch_command(client_id, command)
+  local name = type(command) == "table" and command.command or nil
+  if type(name) ~= "string" then
+    nx.notify("nx.lsp: code action carried a malformed command", vim.log.levels.ERROR)
+    return
+  end
+  local handler = nx.lsp.commands[name]
+  if handler then
+    local ok, err = pcall(handler, command, { client_id = client_id })
+    if not ok then
+      nx.notify("nx.lsp.commands['" .. name .. "']: " .. tostring(err), vim.log.levels.ERROR)
+    end
+    return
+  end
+  local client = nx.lsp._clients[client_id]
+  if not client then
+    nx.notify(
+      "nx.lsp: no client to execute '" .. name .. "' (its server is gone)",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+  client:request("workspace/executeCommand", {
+    command = name,
+    arguments = command.arguments,
+  }, function(err)
+    if err then
+      nx.notify("nx.lsp: '" .. name .. "' failed: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end)
+end
+
 -- ----- engine -> Lua mirror hooks (called by nxvim-server) -------------------
 -- The server drives these once per client lifecycle event (runtime.rs:
 -- set_lsp_client / run_lsp_on_init / run_lsp_on_exit / remove_lsp_client). They
@@ -1078,3 +1145,6 @@ function nx.lsp.foldexpr(_lnum)
   )
 end
 vim.lsp.foldexpr = nx.lsp.foldexpr
+-- The same table, not a copy: a config that registers through either spelling must
+-- be seen by the dispatcher, which reads `nx.lsp.commands`.
+vim.lsp.commands = nx.lsp.commands

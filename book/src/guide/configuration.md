@@ -82,7 +82,7 @@ ex-commands:
 
 | Command | Action |
 | --- | --- |
-| `:PluginSync` | Realize the declared + locked state: install missing, fast-forward what the lockfile doesn't pin |
+| `:PluginSync` | Realize the declared + locked state: install missing, check out what the lockfile pins, fast-forward the rest |
 | `:PluginInstall` | Clone any declared plugin not yet on disk |
 | `:PluginUpdate` | Fast-forward every unpinned plugin, **advancing past** the lockfile |
 | `:PluginClean` | Remove cloned dirs no spec declares |
@@ -106,17 +106,22 @@ be that day.
 ```json
 {
   "catppuccin": { "branch": "main", "commit": "0b0a9a1…" },
-  "nxvim-line": { "commit": "ada94b5…" }
+  "nxvim-line": { "commit": "ada94b5…", "tag": "v2.1.0" }
 }
 ```
 
 It is generated, so treat it as output: a flat map keyed by plugin name, encoded with
-sorted keys and 2-space indentation so a diff is one line per plugin that moved. A dev
-`dir` plugin is never recorded (a working checkout is not a reproducible artifact), and
-neither is a plugin that isn't installed yet. `nx.plugins.lock()` writes it on demand
-(`:PluginLock`) and `nx.plugins.locked()` returns the current contents; a **malformed**
-lockfile is a hard error naming the file rather than being treated as "nothing pinned".
-Relocate it with `nx.plugins.setup_manager{ lockfile = … }`.
+sorted keys and 2-space indentation so a diff is one line per plugin that moved. An entry
+records the commit *and* the declaration it resolved — the `branch` the plugin tracks, the
+`tag` it was pinned to — which is what lets a changed spec invalidate it (below). A dev
+`dir` plugin never contributes a commit (a working checkout is not a reproducible
+artifact), and neither does one that isn't installed yet — but neither *loses* an entry
+another machine wrote for it, since the file you commit must not be strip-mined by whichever
+machine happens to sync. Only a plugin your config no longer declares is dropped.
+`nx.plugins.lock()` writes it on demand (`:PluginLock`) and `nx.plugins.locked()` returns
+the current contents; a **malformed** lockfile — including an entry with no commit — is a
+hard error naming the file rather than being treated as "nothing pinned". Relocate it with
+`nx.plugins.setup_manager{ lockfile = … }`.
 
 **Which revision wins.** Highest first:
 
@@ -127,6 +132,12 @@ Relocate it with `nx.plugins.setup_manager{ lockfile = … }`.
 3. `tag` / `version`, then `branch`.
 4. the remote's default branch.
 
+…but only while the entry still records what your spec *asks for*. Bump `tag = "v1"` to
+`"v2"`, or point `branch` somewhere else, and the entry describes a resolution of a
+question you are no longer asking: it is discarded and the new ref re-resolved, the way
+`Cargo.lock` gives way to a changed `Cargo.toml`. Otherwise a record would outrank the
+config that produced it, and your edit would be silently ignored forever.
+
 A plugin with no lock entry and no pin still gets a fast `depth = 1` clone; reaching a
 locked commit is the only reason to pay for a full one. If the lockfile names a commit the
 remote no longer has (force-pushed away), the install **fails loud** and names the file to
@@ -136,19 +147,22 @@ of having one.
 **Reproduce vs advance** — the two verbs mean different things, like `cargo build` and
 `cargo update`:
 
-- **`:PluginSync`** (and `:PluginInstall`) *reproduce* the lockfile. Missing plugins are
-  installed at their locked commits; a plugin the lockfile pins is left exactly where it
-  is. Realizing your declared state never silently moves a plugin past the recorded
-  revision.
+- **`:PluginSync`** *reproduces* the lockfile. Missing plugins are installed at their
+  locked commits, and a plugin whose checkout has drifted from what the file records is
+  moved back onto it — so pulling a colleague's newer `nxvim-lock.json` and syncing gets
+  you the tree it names. Realizing your declared state never moves a plugin *past* the
+  recorded revision. (`:PluginInstall` only clones what is missing; it never moves an
+  existing checkout, and records only the clones it made.)
 - **`:PluginUpdate`** *advances past* it: each unpinned plugin is fast-forwarded to its
   branch tip and the lockfile is re-recorded. A plugin sitting on a locked (detached)
   commit is re-attached to the branch it tracks first, so a lock is never a permanent
   freeze.
 
-A spec `commit` / `tag` pin is still never moved by either verb — that is what an explicit
-pin means. And if a plugin is detached with no branch recorded anywhere (a hand-written
-lock entry with only a `commit`), `:PluginUpdate` fails loud rather than guessing a branch:
-add `branch = "…"` to its spec.
+Neither verb moves a plugin past an explicit `commit` / `tag` pin — that is what pinning
+means — but both *realize* one: change the pin and the next sync checks the plugin out at
+it. And if a plugin is detached with no branch recorded anywhere (a hand-written lock entry
+with only a `commit`), `:PluginUpdate` fails loud rather than guessing a branch: add
+`branch = "…"` to its spec.
 
 **Going back.** `:PluginRestore` (or `R` in the dashboard) checks every plugin out at the
 commit the lockfile records — the "that update broke my editor" verb, and the reason

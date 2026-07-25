@@ -1398,3 +1398,74 @@ async fn fetch_updates_tracking_refs_without_touching_the_worktree() {
         "fetch must advance the remote-tracking ref"
     );
 }
+
+/// Attaching to a branch that exists only as a remote-tracking ref must set that branch
+/// up to track its remote, exactly as `git checkout <branch>` does — otherwise the very
+/// thing attaching exists for (making `pull` runnable again on a commit-pinned checkout)
+/// fails on the next call with "branch has no upstream to pull from".
+#[tokio::test]
+async fn attaching_to_a_remote_only_branch_tracks_its_upstream_so_pull_works() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let src = make_repo("git_track_src");
+    git(&src, &["checkout", "-q", "-b", "side"]);
+    commit_file(&src, "side.txt", "on the side\n", "side commit");
+    git(&src, &["checkout", "-q", "main"]);
+
+    let dest = temp_dir("git_track_dest").join("cloned");
+    let dest_s = dest.to_string_lossy().to_string();
+    // Clone (HEAD lands on main, so `side` arrives only as refs/remotes/origin/side),
+    // then attach to `side`.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.attached, _G.aerr = nil, nil\n\
+             nx.async(function()\n\
+               nx.await(nx.git_local.clone({src:?}, {dest:?}))\n\
+               nx.await(nx.git_local.checkout({dest:?}, \"side\"))\n\
+               _G.attached = true\n\
+             end)():catch(function(e) _G.aerr = tostring(e and e.message or e) end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.attached").await.as_bool(),
+        Some(true),
+        "attach failed: {:?}",
+        exec_lua(&rpc, "return _G.aerr").await
+    );
+
+    // The remote's `side` moves on, and a pull must fast-forward onto it. This is the
+    // assertion that fails without the tracking config: `pull` resolves the upstream
+    // through `branch.<name>.merge` / `.remote`, which a hand-created ref does not have.
+    git(&src, &["checkout", "-q", "side"]);
+    commit_file(&src, "side2.txt", "more\n", "second side commit");
+    let tip = git_out(&src, &["rev-parse", "HEAD"]);
+    git(&src, &["checkout", "-q", "main"]);
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.pulled, _G.perr = nil, nil\n\
+             nx.git_local.pull({dest:?}):next(function(r) _G.pulled = r.updated end)\n\
+               :catch(function(e) _G.perr = tostring(e and e.message or e) end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.pulled").await.as_bool(),
+        Some(true),
+        "pull after attach must fast-forward, not reject: {:?}",
+        exec_lua(&rpc, "return _G.perr").await
+    );
+    assert_eq!(
+        git_out(Path::new(&dest_s), &["rev-parse", "HEAD"]),
+        tip,
+        "the attached branch should have advanced to the remote tip"
+    );
+}

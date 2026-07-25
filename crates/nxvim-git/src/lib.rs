@@ -147,13 +147,53 @@ fn attach_head(repo: &gix::Repository, branch_ref: &gix::refs::FullName) -> Resu
     Ok(())
 }
 
+/// Record that the local branch `short` tracks `remote`, by writing the `branch.<short>.
+/// remote` / `.merge` pair `git checkout <branch>` writes when it creates a branch from a
+/// remote-tracking ref. This is not cosmetic: [`pull`] resolves the upstream tip through
+/// exactly that config (gix's `branch_remote_tracking_ref_name` reads `branch.<n>.merge`),
+/// so a branch materialized without it attaches fine and then rejects every pull with "no
+/// upstream to pull from" — leaving a commit-pinned checkout as stuck as it was before
+/// attaching existed.
+///
+/// The local sections are written straight back to the repository's own `config` file, the
+/// way gix's clone does it for the branch it checks out.
+fn set_branch_tracking(
+    repo: &mut gix::Repository,
+    short: &str,
+    full: &gix::refs::FullName,
+    remote: &str,
+) -> Result<(), GitError> {
+    let path = repo.common_dir().join("config");
+    let mut snapshot = repo.config_snapshot_mut();
+    {
+        let mut section = snapshot
+            .new_section("branch", Some(gix::bstr::BString::from(short)))
+            .map_err(|e| egit("branch config section", e))?;
+        section
+            .push("remote", Some(gix::bstr::BStr::new(remote)))
+            .map_err(|e| egit("write branch.remote", e))?;
+        section
+            .push("merge", Some(full.as_bstr()))
+            .map_err(|e| egit("write branch.merge", e))?;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    snapshot
+        .write_to_filter(&mut out, |s| s.meta().source == gix::config::Source::Local)
+        .map_err(|e| egit("serialize config", e))?;
+    std::fs::write(&path, out).map_err(|e| egit("write config", e))?;
+    snapshot.commit().map_err(|e| egit("apply config", e))?;
+    Ok(())
+}
+
 /// Resolve `name` to a LOCAL branch ref, creating it from its remote-tracking counterpart
 /// when only that exists. A fresh clone materializes just the default branch locally —
 /// every other branch arrives as `refs/remotes/<remote>/<name>` — so without this,
 /// attaching to any non-default branch would fail on a normally-cloned repo, exactly where
-/// `git checkout <branch>` succeeds by creating the tracking branch on demand.
+/// `git checkout <branch>` succeeds by creating the tracking branch on demand. A branch
+/// created here is also set up to TRACK the remote it came from ([`set_branch_tracking`]),
+/// without which the pull that attaching exists to enable would still reject.
 fn resolve_local_branch(
-    repo: &gix::Repository,
+    repo: &mut gix::Repository,
     name: &str,
 ) -> Result<(gix::refs::FullName, gix::ObjectId), GitError> {
     let local: gix::refs::FullName = format!("refs/heads/{name}")
@@ -168,7 +208,7 @@ fn resolve_local_branch(
     }
     // No local branch: look for exactly one remote-tracking ref with this name and branch
     // from it. Ambiguity across remotes is an error rather than a guess.
-    let mut found: Option<gix::ObjectId> = None;
+    let mut found: Option<(gix::ObjectId, String)> = None;
     let platform = repo.references().map_err(|e| egit("iterate refs", e))?;
     let iter = platform
         .prefixed("refs/remotes/")
@@ -177,32 +217,32 @@ fn resolve_local_branch(
         let mut r = r.map_err(|e| egit("read ref", e))?;
         let full = r.name().as_bstr().to_string();
         // `refs/remotes/<remote>/<name>` — match on the trailing component(s).
-        if full.strip_prefix("refs/remotes/").and_then(|rest| {
+        let Some(remote) = full.strip_prefix("refs/remotes/").and_then(|rest| {
             rest.split_once('/')
-                .map(|(_remote, br)| br)
-                .filter(|br| *br == name)
-        }) != Some(name)
-        {
+                .filter(|(_remote, br)| *br == name)
+                .map(|(remote, _br)| remote.to_string())
+        }) else {
             continue;
-        }
+        };
         let id = r
             .peel_to_id()
             .map_err(|e| egit("resolve remote branch", e))?
             .detach();
-        if found.is_some_and(|prev| prev != id) {
+        if found.as_ref().is_some_and(|(prev, _)| *prev != id) {
             return Err(err(
                 "EGIT",
                 format!("branch '{name}' is ambiguous across remotes"),
             ));
         }
-        found = Some(id);
+        found = Some((id, remote));
     }
-    let id = found.ok_or_else(|| {
+    let (id, remote) = found.ok_or_else(|| {
         err(
             "ENOENT",
             format!("no such branch '{name}' (no local ref and no remote-tracking ref)"),
         )
     })?;
+    drop(platform);
     repo.reference(
         local.as_ref(),
         id,
@@ -210,6 +250,7 @@ fn resolve_local_branch(
         format!("branch: created from remote-tracking ref at {id}"),
     )
     .map_err(|e| egit("create local branch", e))?;
+    set_branch_tracking(repo, name, &local, &remote)?;
     Ok((local, id))
 }
 
@@ -464,19 +505,21 @@ fn clone_at(
     Ok(repo)
 }
 
-/// `nx.git_local.checkout` — point the repo at `rev` and make the worktree match it.
-/// `detach` (the only mode the plugin manager uses — it pins arbitrary commits) writes
-/// HEAD straight at the resolved commit; the non-detach path would move the current
-/// branch there, which we don't need yet, so it rejects loud rather than silently
-/// behaving like `--detach`.
+/// `nx.git_local.checkout` — point the repo at `rev` and make the worktree match it, in
+/// one of two modes. DETACHING (`detach`) writes HEAD straight at the resolved commit —
+/// how an exact pin is applied. ATTACHING (`!detach`) takes `rev` as a BRANCH and leaves
+/// HEAD symbolic on it, creating (and setting up to track) the local branch when only a
+/// remote-tracking ref exists, as `git checkout <branch>` does. Attaching is what makes a
+/// commit-pinned checkout movable again, since [`pull`] fast-forwards the current *branch*
+/// and refuses a detached HEAD.
 fn checkout(dir: &str, rev: &str, detach: bool) -> Result<GitValue, GitError> {
     if !detach {
         // ATTACH mode: `rev` names a branch, and HEAD ends up symbolic on it with the
         // worktree at its tip — `git checkout <branch>`. This is the mode that makes a
         // detached (commit-pinned) checkout movable again, since `pull` fast-forwards the
         // current *branch* and refuses to run on a bare commit.
-        let repo = open(dir)?;
-        let (branch_ref, id) = resolve_local_branch(&repo, rev)?;
+        let mut repo = open(dir)?;
+        let (branch_ref, id) = resolve_local_branch(&mut repo, rev)?;
         let tree_id = repo
             .find_object(id)
             .map_err(|e| egit("read commit", e))?
@@ -508,15 +551,6 @@ fn checkout(dir: &str, rev: &str, detach: bool) -> Result<GitValue, GitError> {
     Ok(GitValue::Nil)
 }
 
-/// `nx.git_local.pull` — fetch the repo's remote and **fast-forward only** the current
-/// branch, updating the worktree. Rejects (never merges) when the remote diverged,
-/// matching `git pull --ff-only`. Resolves `{ updated, sha }` — `updated` false when the
-/// branch was already at the upstream tip.
-///
-/// gix has no `pull`; this is the hand-rolled fetch + ref-advance the plan flagged:
-/// fetch → read the branch's remote-tracking tip → require the local tip is its
-/// ancestor (the ff check via `merge_base`) → move the branch ref and reset the
-/// worktree to the new tree.
 /// `nx.git_local.fetch` — fetch the repo's remote, updating remote-tracking refs but
 /// touching neither HEAD nor the worktree (that is `pull`'s job). `unshallow` drops a
 /// shallow clone's boundary (`git fetch --unshallow`), which is what makes an older commit
@@ -547,6 +581,15 @@ fn fetch(dir: &str, unshallow: bool) -> Result<GitValue, GitError> {
     Ok(GitValue::Nil)
 }
 
+/// `nx.git_local.pull` — fetch the repo's remote and **fast-forward only** the current
+/// branch, updating the worktree. Rejects (never merges) when the remote diverged,
+/// matching `git pull --ff-only`. Resolves `{ updated, sha }` — `updated` false when the
+/// branch was already at the upstream tip.
+///
+/// gix has no `pull`; this is the hand-rolled fetch + ref-advance the plan flagged:
+/// fetch → read the branch's remote-tracking tip → require the local tip is its
+/// ancestor (the ff check via `merge_base`) → move the branch ref and reset the
+/// worktree to the new tree.
 fn pull(dir: &str) -> Result<GitValue, GitError> {
     use gix::remote::Direction;
 

@@ -624,6 +624,11 @@ end
 
 -- ----- git operations ---------------------------------------------------------
 
+-- Forward declarations — the lockfile helpers below are defined further down (with the
+-- rest of the lockfile machinery, which reads better as one block) but are referenced by
+-- the install / update verbs just below, so they must be in lexical scope as locals here.
+local lock_applies, checkout_deep
+
 -- Await one `nx.git_local.*` promise for plugin `name`'s `op` task (`verb` names the
 -- git action for the message). On a reject — every git verb rejects with a `{ code,
 -- message }` — mark the task errored and re-raise loud (a failed step must never look
@@ -669,7 +674,9 @@ function M._install(name)
     --
     --   1. `spec.commit`  — a hand-written pin is an INSTRUCTION.
     --   2. the lockfile   — a recorded commit, which outranks the floating refs below
-    --                       precisely because pinning a floating ref is what it is for.
+    --                       precisely because pinning a floating ref is what it is for —
+    --                       but only while it still records what the spec ASKS for, see
+    --                       `lock_applies`.
     --   3. `spec.tag` / `spec.version`, then `spec.branch` — checked out as a ref by the
     --      clone itself (`opts.branch`), not resolved to a commit here.
     --   4. the remote's default branch.
@@ -678,7 +685,8 @@ function M._install(name)
     -- on the path that is about to do a network clone, and keeps a direct `_install` call
     -- as correct as one driven by `install()` — no "did someone load the lock first?"
     -- ordering to get wrong.
-    local locked = (nx.await(M._read_lock())[name] or {}).commit
+    local entry = nx.await(M._read_lock())[name]
+    local locked = lock_applies(spec, entry) and entry.commit or nil
     local pin = spec.commit or locked
 
     -- Shallow (depth 1) unless we must reach an arbitrary pinned commit, which a
@@ -731,18 +739,108 @@ function M._install(name)
   end)()
 end
 
--- Fast-forward `name` to its remote. Resolves "local"/"pinned"/"locked"/"missing"/
--- "updated"/"uptodate". A pinned (commit/tag) or dev (`dir`) plugin is never moved.
+-- Realize a spec's explicit `commit` / `tag` pin — check the plugin out at it unless the
+-- checkout is already there. A pin is an INSTRUCTION, so it has to reach the tree even
+-- when the declaration changed under an existing install: a `tag = "v2"` bump that never
+-- moved the checkout leaves the config saying one thing and the editor running another,
+-- silently and with nothing to show it (head and lock agree, so not even `drifted`).
+--
+-- A `commit` is compared against the checked-out sha directly. A `tag` cannot be — there
+-- is no rev-parse verb, and resolving one means moving the checkout — so the lock entry's
+-- recorded `tag` stands in as the record of which pin THIS checkout was made under, the
+-- same record `lock_applies` invalidates a stale entry against.
+local function converge_pin(name, spec, entry)
+  return nx.async(function()
+    local target, at_it
+    if spec.commit then
+      local head = git_step(name, "update", "head", lgit.head(spec._dir))
+      target, at_it = spec.commit, head.sha == spec.commit
+    else
+      target, at_it = spec.tag, entry ~= nil and entry.tag == spec.tag
+    end
+    if at_it then
+      return "pinned"
+    end
+    set_task(name, "update", "running", "checking out " .. target)
+    if not nx.await(checkout_deep(name, "update", spec._dir, target)) then
+      set_task(name, "update", "error", "cannot reach " .. target)
+      local e = {
+        code = "EPIN",
+        message = "nx.plugins: "
+          .. name
+          .. " is pinned at "
+          .. target
+          .. " but that revision is unreachable (gone from the remote?).",
+      }
+      error(e, 0)
+    end
+    if spec.submodules then
+      update_submodules(name, "update", spec._dir)
+    end
+    set_task(name, "update", "done", "repinned")
+    return "repinned"
+  end)()
+end
+
+-- Realize the lockfile's commit for `name` — the `cargo build` half. An install that is
+-- already there is left alone; one that has drifted (a colleague's newer lockfile, a local
+-- `:PluginUpdate` being rolled back by re-syncing) is moved onto it, deepening a shallow
+-- clone if the commit isn't present. Reproducing the lock only for clones that happen to
+-- be MISSING would make `:PluginSync` honour the file by accident of what is on disk.
+local function converge_lock(name, spec, entry)
+  return nx.async(function()
+    local head = git_step(name, "update", "head", lgit.head(spec._dir))
+    if head.sha == entry.commit then
+      return "locked"
+    end
+    set_task(name, "update", "running", "restoring " .. entry.commit:sub(1, 7))
+    if not nx.await(checkout_deep(name, "update", spec._dir, entry.commit)) then
+      set_task(name, "update", "error", "cannot reach " .. entry.commit:sub(1, 7))
+      local e = {
+        code = "ELOCK",
+        message = "nx.plugins: "
+          .. name
+          .. " is locked at "
+          .. entry.commit
+          .. " but that commit is unreachable (gone from the remote?). Remove its entry from "
+          .. lockfile_path()
+          .. " (or re-lock) to move it.",
+      }
+      error(e, 0)
+    end
+    if spec.submodules then
+      update_submodules(name, "update", spec._dir)
+    end
+    set_task(name, "update", "done", "relocked")
+    return "relocked"
+  end)()
+end
+
+-- Bring `name` in line with what its spec and the lockfile ask for. Resolves a status word:
+--
+-- ```
+-- "local"     a dev `dir` plugin — never touched
+-- "missing"   not installed
+-- "pinned"    already at the spec's commit/tag
+-- "repinned"  MOVED onto the spec's commit/tag (the declaration changed under it)
+-- "locked"    already at the commit the lockfile records
+-- "relocked"  MOVED onto the commit the lockfile records
+-- "updated"   fast-forwarded
+-- "uptodate"  already at its branch tip
+-- ```
+--
+-- The three MOVED words are the ones the verbs count.
 --
 -- `opts.advance` decides what a LOCKFILE entry means, which is the whole install-vs-update
 -- split (the `cargo build` / `cargo update` distinction):
 --
---   * without it, a locked plugin resolves `"locked"` and is left exactly where the
---     lockfile put it — this is what `sync` uses, so realizing the declared state never
---     silently moves a plugin past the revision the lockfile records;
+--   * without it, a locked plugin is put (or left) exactly where the lockfile says — this
+--     is what `sync` uses, so realizing the declared state never silently moves a plugin
+--     past the revision the lockfile records;
 --   * with it (the explicit `:PluginUpdate`), the lock is deliberately advanced past.
 --
--- Otherwise a lock would be a permanent freeze with no in-editor way out.
+-- Otherwise a lock would be a permanent freeze with no in-editor way out. A spec `commit`
+-- or `tag` pin outranks both modes — neither verb moves a plugin past what it names.
 function M._update(name, opts)
   local spec = M._specs[name]
   local advance = opts ~= nil and opts.advance == true
@@ -750,14 +848,15 @@ function M._update(name, opts)
     if spec.dir ~= nil then
       return "local"
     end
-    if spec.commit or spec.tag then
-      return "pinned"
-    end
     if not nx.await(lfs.exists(spec._dir)) then
       return "missing"
     end
-    if not advance and (nx.await(M._read_lock())[name] or {}).commit then
-      return "locked"
+    local entry = nx.await(M._read_lock())[name]
+    if spec.commit or spec.tag then
+      return nx.await(converge_pin(name, spec, entry))
+    end
+    if not advance and lock_applies(spec, entry) then
+      return nx.await(converge_lock(name, spec, entry))
     end
     -- A plugin installed FROM THE LOCKFILE sits on a detached commit, and `pull`
     -- fast-forwards the current *branch* — on a detached HEAD it rejects outright. So
@@ -770,8 +869,9 @@ function M._update(name, opts)
     -- With neither we cannot know, so fail loud naming the fix rather than guessing a
     -- branch name and silently moving the plugin somewhere unintended.
     local head = git_step(name, "update", "head", lgit.head(spec._dir))
+    local before = head.sha
     if head.detached then
-      local branch = spec.branch or (nx.await(M._read_lock())[name] or {}).branch
+      local branch = spec.branch or (entry or {}).branch
       if not branch then
         set_task(name, "update", "error", "detached, no branch to reattach to")
         local e = {
@@ -792,15 +892,19 @@ function M._update(name, opts)
     -- `pull` is fast-forward-only (rejects `ENOTFF` on a divergence) and resolves
     -- `{ updated, sha }` — `updated` is false when the branch was already current.
     local res = git_step(name, "update", "pull", lgit.pull(spec._dir))
-    if spec.submodules and res.updated then
-      -- Pick up any submodule bumps the fast-forward brought in; skipped when the pull
-      -- moved nothing (the gitlinks then can't have changed).
+    -- What makes this an update is whether the CHECKOUT moved, not whether the pull did.
+    -- Advancing past a lock happens in the re-attach above — which puts the worktree on the
+    -- branch tip — leaving the pull that follows a no-op. Trusting `res.updated` therefore
+    -- reported "updated 0 plugin(s)" for a run that moved the plugin off its locked commit
+    -- and rewrote the lockfile, and told the dashboard the plugin was "up to date".
+    local moved = res.sha ~= before
+    if spec.submodules and moved then
+      -- Pick up any submodule bumps the move brought in; skipped when nothing moved (the
+      -- gitlinks then can't have changed).
       update_submodules(name, "update", spec._dir)
     end
-    set_task(name, "update", "done", res.updated and "updated" or "up to date")
-    -- Only a real fast-forward counts as "updated" (so M.update()'s "updated N" count
-    -- stays honest); an already-current pull reports "uptodate".
-    return res.updated and "updated" or "uptodate"
+    set_task(name, "update", "done", moved and "updated" or "up to date")
+    return moved and "updated" or "uptodate"
   end)()
 end
 
@@ -816,9 +920,15 @@ end
 -- ```json
 -- {
 --   "catppuccin": { "branch": "main", "commit": "0b0a9a1…" },
---   "nxvim-line": { "commit": "ada94b5…" }
+--   "nxvim-line": { "commit": "ada94b5…", "tag": "v2.1.0" }
 -- }
 -- ```
+--
+-- An entry records the commit AND the declaration it resolved — the `branch` the plugin
+-- tracks, the `tag` it was pinned to. That second half is what makes the record
+-- invalidatable (`lock_applies`): a lockfile describes a past resolution, so like
+-- `Cargo.lock` against its manifest it stops applying the moment the spec that produced it
+-- changes. Without it, bumping `tag = "v1"` to `"v2"` would resolve to v1 forever.
 --
 -- A flat map keyed by plugin name, encoded via `nx.json` with `pretty = true` — which
 -- emits 2-space indentation AND sorted object keys, so the committed file's diffs stay
@@ -839,9 +949,34 @@ M._lock = M._lock or {}
 function M.locked()
   local out = {}
   for name, entry in pairs(M._lock) do
-    out[name] = { commit = entry.commit, branch = entry.branch }
+    out[name] = { commit = entry.commit, branch = entry.branch, tag = entry.tag }
   end
   return out
+end
+
+-- Whether lock `entry` still records what `spec` ASKS for — the invalidation rule that
+-- keeps a record from outranking the declaration it was derived from. A lockfile pins the
+-- resolution of a floating ref; the moment the spec names a different ref, the entry
+-- describes a question nobody is asking any more and must be re-resolved (`Cargo.lock`
+-- against a changed `Cargo.toml`). Without this a `tag = "v2"` bump installs v1 forever:
+-- silently, with no drift to see (head and lock agree) and no verb able to move it.
+--
+-- A `tag` must match exactly — including "the spec has one and the entry doesn't", which
+-- is how an entry written before the pin was added gets re-resolved. A `branch` only
+-- invalidates when BOTH sides name one and they differ: an entry with no branch (a
+-- hand-written pin) says nothing about which branch produced it, so it is not evidence of
+-- a change.
+lock_applies = function(spec, entry)
+  if not entry or not entry.commit then
+    return false
+  end
+  if (spec.tag or false) ~= (entry.tag or false) then
+    return false
+  end
+  if spec.branch and entry.branch and spec.branch ~= entry.branch then
+    return false
+  end
+  return true
 end
 
 -- `nx.plugins._read_lock()` — load the lockfile into `M._lock`, resolving it. A missing
@@ -871,15 +1006,29 @@ function M._read_lock()
       error(e, 0)
     end
     -- Keep only the fields we understand: the file is generated, so an entry from a newer
-    -- nxvim is read for its commit and rewritten in this version's shape.
+    -- nxvim is read for the fields this version knows and rewritten in this version's
+    -- shape. An entry with no usable COMMIT, though, is corruption rather than a version
+    -- difference — the commit is the whole content of an entry — and dropping it quietly
+    -- would reinstall that plugin at the remote tip, which is exactly the unreproducible
+    -- install the file exists to prevent. So it fails loud, naming the entry.
     local lock = {}
     for name, entry in pairs(decoded) do
-      if type(entry) == "table" and type(entry.commit) == "string" and entry.commit ~= "" then
-        lock[name] = {
-          commit = entry.commit,
-          branch = type(entry.branch) == "string" and entry.branch or nil,
+      if type(entry) ~= "table" or type(entry.commit) ~= "string" or entry.commit == "" then
+        local e = {
+          code = "ELOCK",
+          message = "nx.plugins: malformed lockfile "
+            .. path
+            .. ": entry '"
+            .. tostring(name)
+            .. "' has no commit",
         }
+        error(e, 0)
       end
+      lock[name] = {
+        commit = entry.commit,
+        branch = type(entry.branch) == "string" and entry.branch or nil,
+        tag = type(entry.tag) == "string" and entry.tag or nil,
+      }
     end
     M._lock = lock
     return M._lock
@@ -887,30 +1036,65 @@ function M._read_lock()
 end
 
 -- Resolve the currently-checked-out commit of every managed, installed plugin into a fresh
--- lock table. Skips a dev `dir` plugin (a working checkout, not a reproducible artifact —
--- recording its SHA would pin something no other machine can fetch) and a plugin whose
--- clone is missing (nothing to record yet). A repo with an unborn HEAD reports an empty
--- sha; it is skipped rather than written as a blank pin.
-local function resolve_lock(prev)
+-- lock table, over the entries `prev` already records.
+--
+-- What is NOT recorded is as load-bearing as what is. A dev `dir` plugin never contributes
+-- a sha (a working checkout is not a reproducible artifact — recording it would pin
+-- something no other machine can fetch), and neither does a plugin whose clone is missing
+-- or whose HEAD is unborn (nothing resolved yet; a blank pin is worse than none).
+--
+-- But "not recorded" must not mean "deleted". A plugin that is DECLARED and simply not
+-- installed *here* — `enabled = false`, a platform-conditional `enabled` predicate, a
+-- local `dir` override, a clone not yet synced — keeps whatever the lockfile already says
+-- about it. The lockfile is the file the user COMMITS, so rebuilding it from only what
+-- happens to be on this machine's disk quietly strips the pins the other machines need,
+-- and the stripped copy is what travels back to them. Only a name nothing declares any
+-- more is dropped: that is a real answer to "is this entry still wanted?", where an
+-- uninstalled-here plugin is no answer at all.
+--
+-- `realized` (a name set, or nil for "all") is the other half of that: it names the
+-- plugins this run actually put where the spec and lockfile say they belong. A plugin
+-- OUTSIDE it is carried over untouched rather than re-recorded from its checkout, because
+-- its checkout is not yet evidence of anything — the classic case being `sync`'s install
+-- pass, which touches nothing but would otherwise overwrite an incoming lockfile with the
+-- commits the tree happens to sit on, one step before the update pass was going to realize
+-- it. `nil` (an explicit `:PluginLock`) means "make the file describe the tree", and then
+-- the `tag` is carried instead: HEAD is whatever the user left there, so we cannot attest
+-- that the spec's current tag produced it.
+local function resolve_lock(prev, realized)
   prev = prev or {}
   return nx.async(function()
     local lock = {}
     for _, name in ipairs(M._order) do
       local spec = M._specs[name]
-      if spec.dir == nil and nx.await(lfs.exists(spec._dir)) then
+      local resolved = nil
+      local record = realized == nil or realized[name] == true
+      if record and spec.dir == nil and nx.await(lfs.exists(spec._dir)) then
         local ok, head = pcall(nx.await, lgit.head(spec._dir))
         if ok and type(head.sha) == "string" and head.sha ~= "" then
+          -- Which pin produced this commit. Attested from the spec when this run realized
+          -- it (`realized`), carried otherwise. Spelled as a statement rather than an
+          -- `and`/`or` chain because the attested value is legitimately nil — a spec that
+          -- DROPPED its tag must clear the record, not fall through to the old one.
+          local tag
+          if realized ~= nil then
+            tag = spec.tag
+          else
+            tag = (prev[name] or {}).tag
+          end
           -- A plugin installed FROM the lock sits on a detached HEAD, so `head.branch` is
           -- nil. Carry over the branch the plugin TRACKS (the spec's, else whatever the
           -- lockfile already recorded) instead of erasing it: the branch is a property of
           -- the spec, not of the commit currently checked out, and the first locked
           -- install would otherwise drop the only record of it.
-          lock[name] = {
+          resolved = {
             commit = head.sha,
             branch = head.branch or spec.branch or (prev[name] or {}).branch,
+            tag = tag,
           }
         end
       end
+      lock[name] = resolved or prev[name]
     end
     return lock
   end)()
@@ -921,7 +1105,12 @@ end
 local function lock_eq(a, b)
   for name, entry in pairs(a) do
     local other = b[name]
-    if not other or other.commit ~= entry.commit or other.branch ~= entry.branch then
+    if
+      not other
+      or other.commit ~= entry.commit
+      or other.branch ~= entry.branch
+      or other.tag ~= entry.tag
+    then
       return false
     end
   end
@@ -937,13 +1126,25 @@ end
 -- lockfile. Resolves the written table. Writes only when the resolved set differs from
 -- what is already on disk, so a no-op sync leaves the file (and the user's git status)
 -- untouched.
-function M.lock()
+--
+-- `opts.realized` (internal) narrows the re-record to the plugins a verb just put in
+-- place, carrying every other entry over verbatim — see `resolve_lock`. The public call
+-- takes no options and re-records everything installed, which is `:PluginLock`'s job.
+function M.lock(opts)
+  local realized = opts ~= nil and opts.realized or nil
   return nx.async(function()
     -- Read the FILE first, not `M._lock`, so an externally-edited lockfile is reconciled
     -- rather than assumed to match our last write — and so `resolve_lock` can carry over
     -- the tracked branch of a plugin now sitting on a detached (lock-installed) HEAD.
     local on_disk = nx.await(M._read_lock())
-    local resolved = nx.await(resolve_lock(on_disk))
+    -- Nothing declared: the declared set is the only thing that says which entries are
+    -- still wanted, and an empty one says nothing — so it must never be read as "drop
+    -- everything". (A session that declares no plugins is ordinary: a `--clean`-ish start,
+    -- a config whose plugin file failed to load, `:PluginLock` typed early.)
+    if #M._order == 0 and next(on_disk) ~= nil then
+      return on_disk
+    end
+    local resolved = nx.await(resolve_lock(on_disk, realized))
     if lock_eq(resolved, on_disk) then
       M._lock = resolved
       return resolved
@@ -953,7 +1154,11 @@ function M.lock()
     if dir and dir ~= "" then
       nx.await(lfs.mkdir(dir, { recursive = true }))
     end
-    nx.await(lfs.write(path, nx.json.encode(resolved, { pretty = true }) .. "\n"))
+    -- An empty Lua table is ambiguous in JSON and `nx.json` picks the ARRAY form, so an
+    -- emptied lockfile would be written as `[]` — not the name-keyed object this file is
+    -- documented as and re-read as. Spell the empty object out.
+    local body = next(resolved) == nil and "{}" or nx.json.encode(resolved, { pretty = true })
+    nx.await(lfs.write(path, body .. "\n"))
     M._lock = resolved
     notify_change()
     return resolved
@@ -966,7 +1171,7 @@ end
 -- objects. `fetch{ unshallow = true }` drops the shallow boundary and the retry succeeds.
 -- Only ever ONE unshallow attempt: if the commit is still unreachable it is genuinely gone
 -- from the remote (force-pushed away), and no amount of fetching will conjure it.
-local function checkout_deep(name, op, dir, commit)
+checkout_deep = function(name, op, dir, commit)
   return nx.async(function()
     local ok = pcall(nx.await, lgit.checkout(dir, commit, { detach = true }))
     if ok then
@@ -1032,8 +1237,8 @@ end
 -- Record the lock after a verb that may have moved a checkout. Never fails the verb: a
 -- lockfile that couldn't be written is reported (loud on the message line) but must not
 -- make a successful install/update look like a failure.
-local function lock_after(op)
-  return M.lock():catch(function(err)
+local function lock_after(op, realized)
+  return M.lock({ realized = realized }):catch(function(err)
     nx.notify(
       "nx.plugins: could not write lockfile ("
         .. op
@@ -1046,20 +1251,42 @@ end
 
 -- ----- the verbs --------------------------------------------------------------
 
+-- The `M._update` statuses that mean the CHECKOUT MOVED — what the verbs below count, and
+-- what makes recording the lock afterwards necessary rather than merely tidy.
+local MOVED = { updated = true, relocked = true, repinned = true }
+
 -- Install every declared, enabled plugin that is missing. Returns a promise of the
 -- count installed; activates any newly-present eager plugins as it finishes.
+--
+-- A failure aborts the run LOUD (a half-installed tree must never look complete), but the
+-- lockfile is recorded either way: the plugins that did land are on disk, and a lockfile
+-- that no longer describes the tree is precisely the silent disagreement it exists to
+-- prevent. The rejection is re-raised after the record is written.
+--
+-- Only the FRESH clones are recorded (they land exactly on their pin / lock entry, so
+-- their HEAD is evidence). A plugin that was already present is left as the lockfile has
+-- it: install does not check where it sits, so overwriting its entry from the checkout
+-- would throw away a lockfile the user just pulled in — the very thing the next `sync`
+-- pass is about to realize.
 function M.install()
   return nx.async(function()
     local n = 0
-    for _, name in ipairs(M._order) do
-      if enabled(M._specs[name]) then
-        if nx.await(M._install(name)) == "installed" then
-          n = n + 1
+    local installed = {}
+    local ok, failure = pcall(function()
+      for _, name in ipairs(M._order) do
+        if enabled(M._specs[name]) then
+          if nx.await(M._install(name)) == "installed" then
+            n = n + 1
+            installed[name] = true
+          end
         end
       end
-    end
+    end)
     activate_eager()
-    nx.await(lock_after("install"))
+    nx.await(lock_after("install", installed))
+    if not ok then
+      error(failure, 0)
+    end
     nx.notify("nx.plugins: installed " .. n .. " plugin(s)", n > 0 and 2 or 3)
     return n
   end)()
@@ -1067,21 +1294,32 @@ end
 
 -- Fast-forward every installed, unpinned plugin, ADVANCING past the lockfile (and
 -- re-recording it) — the `cargo update` half. `opts.advance = false` instead reproduces
--- the lock, leaving a locked plugin where it is; that is what `sync` passes.
--- Returns a promise of the count actually updated.
+-- the lock, moving a locked plugin onto (or leaving it at) the recorded commit; that is
+-- what `sync` passes. Returns a promise of the count of plugins whose checkout MOVED.
+-- Records the lock even when a plugin fails, for the reason `install` does.
 function M.update(opts)
   local advance = not (opts ~= nil and opts.advance == false)
   return nx.async(function()
     local n = 0
-    for _, name in ipairs(M._order) do
-      if
-        enabled(M._specs[name])
-        and nx.await(M._update(name, { advance = advance })) == "updated"
-      then
-        n = n + 1
+    -- Every plugin this pass settles is realized: it was moved onto its pin / lock / branch
+    -- tip, or found already there. Only "missing" and "local" (a dev `dir`) are not, and
+    -- neither is recordable anyway.
+    local realized = {}
+    local ok, failure = pcall(function()
+      for _, name in ipairs(M._order) do
+        if enabled(M._specs[name]) then
+          local status = nx.await(M._update(name, { advance = advance }))
+          realized[name] = status ~= "missing" and status ~= "local"
+          if MOVED[status] then
+            n = n + 1
+          end
+        end
       end
+    end)
+    nx.await(lock_after("update", realized))
+    if not ok then
+      error(failure, 0)
     end
-    nx.await(lock_after("update"))
     nx.notify("nx.plugins: updated " .. n .. " plugin(s)", 2)
     return n
   end)()
@@ -1091,12 +1329,15 @@ end
 -- my declarations". Returns a promise of the count NEWLY INSTALLED (so a UI can tell
 -- whether a fresh clone landed and prompt to restart).
 -- A lockfile makes this the "realize my declared state" verb, NOT an update: it installs
--- what is missing (at the locked commits) and fast-forwards only what the lockfile does
--- not pin. Advancing past the lock is `:PluginUpdate`'s job — if sync advanced, the
--- lockfile would be honoured for the instant between the install and the update pass and
--- then thrown away, which is no lockfile at all.
--- (Locking is inherited from the two halves — `install` and `update` each record it, and
--- the second pass no-ops when nothing moved. No third write here.)
+-- what is missing at the locked commits, MOVES an existing checkout onto them when it has
+-- drifted (pull a colleague's newer lockfile and sync, and you get the tree it names —
+-- reproducing the lock only for clones that happen to be missing would honour the file by
+-- accident of what is on disk), realizes any `commit`/`tag` pin the spec has changed, and
+-- fast-forwards only what nothing pins. Advancing PAST the lock is `:PluginUpdate`'s job —
+-- if sync advanced, the lockfile would be honoured for the instant between the install and
+-- the update pass and then thrown away, which is no lockfile at all.
+-- (Locking is inherited from the two halves — `install` records the fresh clones and
+-- `update` records the rest, after convergence. No third write here.)
 function M.sync()
   return nx.async(function()
     local installed = nx.await(M.install())
@@ -1596,7 +1837,7 @@ end
 nx.command("PluginSync", function()
   report(M.sync())
 end, {
-  desc = "Realize the declared + locked state: install missing, fast-forward unlocked (nx.plugins.sync).",
+  desc = "Realize the declared + locked state: install missing, check out what the lockfile pins, fast-forward the rest (nx.plugins.sync).",
 })
 nx.command("PluginInstall", function()
   report(M.install())

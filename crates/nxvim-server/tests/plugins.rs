@@ -2667,3 +2667,539 @@ async fn a_lockfile_entry_for_an_undeclared_plugin_is_pruned() {
         "the stale entry should be gone from the FILE too: {text}"
     );
 }
+
+// ----- the lockfile: invalidation, carry-over, and honest reporting -----------
+//
+// A lockfile is a RECORD of a resolution, so (like `Cargo.lock` against its manifest) it
+// stops applying the moment the declaration that produced it changes, it never quietly
+// loses an entry it was not asked to drop, and the verbs never claim more or less than
+// they did. Each test below pins one of those.
+
+/// Tag a repo's current commit. Test plumbing only.
+fn tag_head(repo: &Path, name: &str) {
+    git(repo, &["tag", name]);
+}
+
+/// A `tag = "v2"` bump in the spec must beat a lock entry recorded under `v1`: the
+/// lockfile records what the OLD declaration resolved to, and a stale record must never
+/// outrank the config the user just edited. Without invalidation the install silently
+/// lands on v1 — the config says one thing and the editor runs another, with no error and
+/// no drift flag (head and lock agree), and no verb able to move it.
+#[tokio::test]
+async fn a_tag_bump_invalidates_the_lock_entry() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_tagbump_src");
+    let repo = make_repo(&src, "alpha");
+    let v1 = head_sha(&repo);
+    tag_head(&repo, "v1");
+    let v2 = add_commit(&repo, "second");
+    tag_head(&repo, "v2");
+
+    let base = temp_dir("plug_tagbump");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // A lockfile recorded when the spec still said `tag = "v1"`.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"commit\": \"{v1}\", \"tag\": \"v1\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\", tag = \"v2\" }} }}\n\
+             nx.plugins.sync():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "sync should succeed; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        v2,
+        "the spec's tag must win over a lock entry recorded under the old tag ({v1})"
+    );
+    // And the lock is re-recorded under the tag that actually produced this checkout, so
+    // the next sync is a no-op instead of fighting the spec again.
+    assert!(
+        poll_true(
+            &rpc,
+            &format!(
+                "local e = nx.plugins.locked().alpha\n\
+                 return e ~= nil and e.commit == \"{v2}\" and e.tag == \"v2\""
+            )
+        )
+        .await,
+        "the lock should now record v2: {:?}",
+        exec_lua(&rpc, "return nx.json.encode(nx.plugins.locked())").await
+    );
+}
+
+/// The same bump on an ALREADY-INSTALLED plugin: a pin is an instruction, so realizing the
+/// declared state moves the checkout onto it. (`:PluginUpdate` still never advances a pin
+/// past what it names — that is what pinning means.)
+#[tokio::test]
+async fn a_tag_bump_moves_an_existing_install() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_tagmove_src");
+    let repo = make_repo(&src, "alpha");
+    let v1 = head_sha(&repo);
+    tag_head(&repo, "v1");
+    let v2 = add_commit(&repo, "second");
+    tag_head(&repo, "v2");
+
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_tagmove").await;
+    let declare = |tag: &str| {
+        format!(
+            "_G.done, _G.err = nil, nil\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\", tag = \"{tag}\" }} }}\n\
+             nx.plugins.sync():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        )
+    };
+    exec_lua(&rpc, &declare("v1")).await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(head_sha(&root.join("alpha")), v1);
+
+    // The user edits the spec: tag = "v2". A sync must realize it.
+    exec_lua(&rpc, &declare("v2")).await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        v2,
+        "a sync must move an existing install onto the tag the spec now names"
+    );
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(text.contains(&v2), "the lock should follow: {text}");
+}
+
+/// A `branch` change invalidates the entry for the same reason a tag bump does.
+#[tokio::test]
+async fn a_branch_change_invalidates_the_lock_entry() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_brchange_src");
+    let repo = make_repo(&src, "alpha");
+    let on_main = head_sha(&repo);
+    git(&repo, &["checkout", "-q", "-b", "side"]);
+    let on_side = add_commit(&repo, "side-only");
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let base = temp_dir("plug_brchange");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{on_main}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\", branch = \"side\" }} }}\n\
+             nx.plugins.sync():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "sync should succeed; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        on_side,
+        "the spec's branch must win over an entry recorded on the old branch"
+    );
+}
+
+/// A plugin that is DECLARED but not installed on this machine — `enabled = false`, a
+/// platform-conditional `enabled` predicate, a clone not yet synced — must keep its
+/// recorded pin. Rebuilding the lock from only what is installed silently strips those
+/// entries, and since the lockfile is the file the user COMMITS, the stripped copy is what
+/// travels back to the machine that did need the pin.
+#[tokio::test]
+async fn a_disabled_plugins_lock_entry_survives_a_sync() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_keepdisabled_src");
+    let alpha = make_repo(&src, "alpha");
+    let beta = make_repo(&src, "beta");
+    let beta_sha = head_sha(&beta);
+
+    let base = temp_dir("plug_keepdisabled");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"beta\": {{ \"branch\": \"main\", \"commit\": \"{beta_sha}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{\n\
+               {{ \"file://{alpha}\", name = \"alpha\" }},\n\
+               {{ \"file://{beta}\", name = \"beta\", enabled = false }},\n\
+             }}\n\
+             nx.plugins.sync():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            alpha = q(&alpha),
+            beta = q(&beta)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "sync should succeed; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        text.contains(&beta_sha),
+        "the disabled plugin's pin must survive: {text}"
+    );
+    assert!(
+        text.contains("alpha"),
+        "and the installed one must be recorded: {text}"
+    );
+}
+
+/// A local dev `dir` override is a property of THIS machine; it must not delete the entry
+/// the shared lockfile carries for that plugin. (Its own SHA is still never recorded — a
+/// working checkout is not a reproducible artifact.)
+#[tokio::test]
+async fn a_dev_dir_override_keeps_the_recorded_entry() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_devkeep_src");
+    let repo = make_repo(&src, "alpha");
+    let recorded = "0123456789abcdef0123456789abcdef01234567";
+
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_devkeep").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{recorded}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://x/alpha\", name = \"alpha\", dir = \"{dir}\" }} }}\n\
+             nx.plugins.lock():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "lock should succeed; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        text.contains(recorded),
+        "a dev override must not erase the shared entry: {text}"
+    );
+}
+
+/// A session that declares no plugins at all must never overwrite a populated lockfile
+/// with an empty one — the declared set is the only thing that says which entries are
+/// still wanted, and an empty set says nothing.
+#[tokio::test]
+async fn a_session_with_no_declared_plugins_leaves_the_lockfile_alone() {
+    let (rpc, _i) = start().await;
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_nodecl").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    let before =
+        "{\n  \"ghost\": { \"commit\": \"0123456789abcdef0123456789abcdef01234567\" }\n}\n";
+    std::fs::write(cfg.join("nxvim-lock.json"), before).unwrap();
+
+    exec_lua(
+        &rpc,
+        "nx.plugins.lock():next(function() _G.done = true end)\n\
+           :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "lock should resolve; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap(),
+        before,
+        "an empty declared set must leave the file untouched"
+    );
+}
+
+/// `:PluginUpdate` must count the plugin it moved. Advancing past the lock happens in the
+/// RE-ATTACH (which puts the worktree on the branch tip), so the pull that follows is
+/// often a no-op — trusting it reports "updated 0 plugin(s)" for a run that moved the
+/// plugin and rewrote the lockfile.
+#[tokio::test]
+async fn update_counts_the_plugin_it_advanced_past_the_lock() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_count_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let tip = add_commit(&repo, "second");
+
+    let base = temp_dir("plug_count");
+    let cfg = base.join("config");
+    let root = base.join("install");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.install():next(function()\n\
+               nx.plugins.update():next(function(n) _G.upd = n end)\n\
+                 :catch(function(e) _G.uerr = tostring(e and e.message or e) end)\n\
+             end):catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.upd ~= nil or _G.uerr ~= nil").await,
+        "update should settle; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        tip,
+        "update should have advanced past the lock"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.upd").await.as_u64(),
+        Some(1),
+        "the count must include the plugin it actually moved (uerr={:?})",
+        exec_lua(&rpc, "return _G.uerr").await
+    );
+}
+
+/// `:PluginSync` REPRODUCES the lockfile, which has to mean an existing checkout too —
+/// pulling a teammate's updated `nxvim-lock.json` and syncing must land you on the commits
+/// it names, not leave you drifted with the file only honoured for clones that happen to
+/// be missing.
+#[tokio::test]
+async fn sync_moves_a_drifted_checkout_back_onto_the_lock() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_converge_src");
+    let repo = make_repo(&src, "alpha");
+    let first = head_sha(&repo);
+    let tip = add_commit(&repo, "second");
+
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_converge").await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"alpha\" }} }}\n\
+             nx.plugins.sync():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(head_sha(&root.join("alpha")), tip);
+
+    // A colleague's lockfile arrives naming the earlier commit.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        format!("{{\n  \"alpha\": {{ \"branch\": \"main\", \"commit\": \"{first}\" }}\n}}\n"),
+    )
+    .unwrap();
+    exec_lua(
+        &rpc,
+        "_G.done, _G.err = nil, nil\n\
+         nx.plugins.sync():next(function() _G.done = true end)\n\
+           :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        first,
+        "sync must realize the lockfile it was handed, not leave the checkout drifted"
+    );
+}
+
+/// A lockfile that ends up with no entries is still a JSON OBJECT. Lua cannot tell an
+/// empty map from an empty list, and `nx.json` picks the list form — writing `[]` into a
+/// file documented (and re-read) as a name-keyed object.
+#[tokio::test]
+async fn an_emptied_lockfile_is_written_as_a_json_object() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_emptylock_src");
+    let repo = make_repo(&src, "alpha");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_emptylock").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    // One entry, for a plugin the config does not declare — so the next write resolves to
+    // nothing at all.
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        "{\n  \"ghost\": { \"commit\": \"0123456789abcdef0123456789abcdef01234567\" }\n}\n",
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://x/alpha\", name = \"alpha\", dir = \"{dir}\" }} }}\n\
+             nx.plugins.lock():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert_eq!(
+        text.trim(),
+        "{}",
+        "an empty lockfile must be `{{}}`: {text}"
+    );
+}
+
+/// One plugin failing must not lose the record of the ones that already moved: the verb
+/// aborts loud, but a lockfile that no longer describes the tree is exactly the silent
+/// disagreement the file exists to prevent.
+#[tokio::test]
+async fn a_failed_update_still_records_the_plugins_that_moved() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_partial_src");
+    let alpha = make_repo(&src, "alpha");
+    let beta = make_repo(&src, "beta");
+
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_partial").await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{\n\
+               {{ \"file://{alpha}\", name = \"alpha\" }},\n\
+               {{ \"file://{beta}\", name = \"beta\" }},\n\
+             }}\n\
+             nx.plugins.install():next(function() _G.done = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            alpha = q(&alpha),
+            beta = q(&beta)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+
+    // alpha gains a commit to fast-forward onto; beta's remote disappears, so its pull
+    // fails and aborts the run after alpha has already moved.
+    let moved = add_commit(&alpha, "second");
+    std::fs::remove_dir_all(&beta).unwrap();
+
+    exec_lua(
+        &rpc,
+        "_G.upd, _G.uerr = nil, nil\n\
+         nx.plugins.update():next(function(n) _G.upd = n end)\n\
+           :catch(function(e) _G.uerr = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.uerr ~= nil or _G.upd ~= nil").await,
+        "update should settle"
+    );
+    assert!(
+        exec_lua(&rpc, "return _G.uerr").await.as_str().is_some(),
+        "beta's failure must be reported loud, not swallowed"
+    );
+    assert_eq!(head_sha(&root.join("alpha")), moved);
+    let text = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        text.contains(&moved),
+        "alpha moved, so the lockfile must say so even though beta failed: {text}"
+    );
+}
+
+/// An entry that is present but carries no usable commit is a corrupt lockfile, not
+/// "nothing pinned for that plugin": dropping it silently reinstalls at the remote tip,
+/// which is precisely the un-reproducible install the file exists to prevent.
+#[tokio::test]
+async fn a_lock_entry_with_no_commit_fails_loud() {
+    let (rpc, _i) = start().await;
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_badentry").await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("nxvim-lock.json"),
+        "{\n  \"alpha\": { \"branch\": \"main\" }\n}\n",
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        "_G.err = nil\n\
+         nx.plugins._read_lock():next(function() _G.ok = true end)\n\
+           :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+    )
+    .await;
+    assert!(poll_true(&rpc, "return _G.err ~= nil or _G.ok ~= nil").await);
+    let msg = exec_lua(&rpc, "return _G.err").await;
+    let msg = msg.as_str().unwrap_or("");
+    assert!(
+        msg.contains("alpha") && msg.contains("nxvim-lock.json"),
+        "must name the bad entry and the file: {msg}"
+    );
+}

@@ -1974,6 +1974,7 @@ impl EditHost {
                 bufnr: id.0,
                 lines,
                 name,
+                changedtick: tick,
                 focused: focused_bufs.contains(&id),
             });
         }

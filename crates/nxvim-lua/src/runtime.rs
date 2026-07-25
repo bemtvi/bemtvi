@@ -308,6 +308,13 @@ pub struct BufMirror {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<Vec<String>>,
     pub name: String,
+    /// The buffer's `changedtick` — the monotonic counter the core bumps on every
+    /// text change. Backs `nx.buf.changedtick` (neovim's `nvim_buf_get_changedtick`),
+    /// the canonical "did this buffer's text change" signal a plugin caches derived
+    /// state against (an enumerated match list, a parse, a computed count) instead of
+    /// recomputing it on every event. Always carried — it is one integer, and it is
+    /// precisely the field a consumer needs on the ticks where `lines` is *omitted*.
+    pub changedtick: u64,
     /// Whether this buffer belongs to the **focused** window layer (the main area
     /// or whichever dock currently holds focus). Backs `nx.buf.list{ focused = true }`,
     /// the per-region buffer list — the buffer list is scoped per layer (see

@@ -127,3 +127,85 @@ async fn no_callback_fails_loud() {
     let ok = exec_lua(&rpc, "return (pcall(nx.buf.attach, 0, {}))").await;
     assert_eq!(ok.as_bool(), Some(false));
 }
+
+// ----- nx.buf.changedtick ----------------------------------------------------
+
+// `nx.buf.changedtick` is the *pull* half of the same change signal `on_bytes`
+// pushes: the canonical value a plugin memoizes derived state against, so it must
+// move on every text change and stay put otherwise (a cursor move, a mode flip, an
+// unrelated buffer's edit). Without the "stays put" half a memo keyed on it would
+// recompute every tick and the field would be worthless.
+
+#[tokio::test]
+async fn changedtick_advances_on_an_edit_and_holds_still_otherwise() {
+    let (rpc, _inc) = open("alpha\nbeta\ngamma\n").await;
+
+    let tick0 = read(&rpc, "tostring(nx.buf.changedtick(0))").await;
+
+    // A pure cursor move changes no text — the tick must not budge, or a memo keyed
+    // on it would recompute on every CursorMoved (the case this field exists for).
+    feed(&rpc, "j");
+    feed(&rpc, "l");
+    assert_eq!(
+        read(&rpc, "tostring(nx.buf.changedtick(0))").await,
+        tick0,
+        "a cursor move leaves changedtick alone"
+    );
+
+    // An edit advances it.
+    feed(&rpc, "ix");
+    feed(&rpc, "<Esc>");
+    let tick1 = read(&rpc, "tostring(nx.buf.changedtick(0))").await;
+    assert_ne!(tick1, tick0, "an insert advances changedtick");
+
+    // Undo is a text change too, so it advances again (it does not rewind to tick0).
+    feed(&rpc, "u");
+    let tick2 = read(&rpc, "tostring(nx.buf.changedtick(0))").await;
+    assert_ne!(tick2, tick1, "undo advances changedtick");
+
+    // An unknown buffer reports 0 rather than erroring.
+    assert_eq!(
+        read(&rpc, "tostring(nx.buf.changedtick(99999))").await,
+        "0",
+        "an unknown buffer reports 0"
+    );
+}
+
+#[tokio::test]
+async fn changedtick_is_per_buffer_and_matches_getbufinfo() {
+    let (rpc, _inc) = open("one\n").await;
+    // A second buffer; editing it must not move the first buffer's tick.
+    exec_lua(&rpc, "nx.cmd('enew')").await;
+    let other = read(&rpc, "tostring(nx.buf.current())").await;
+    exec_lua(&rpc, &format!("_G.__first = {other} - 1")).await;
+
+    let before = read(&rpc, "tostring(nx.buf.changedtick(_G.__first))").await;
+    feed(&rpc, "iedit-the-new-one");
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        read(&rpc, "tostring(nx.buf.changedtick(_G.__first))").await,
+        before,
+        "editing one buffer leaves another buffer's changedtick alone"
+    );
+
+    // `getbufinfo()` reports the same value (it used to hard-code 0 — a fake).
+    let cur = read(&rpc, "tostring(nx.buf.changedtick(0))").await;
+    assert_eq!(
+        read(
+            &rpc,
+            "tostring(vim.fn.getbufinfo(nx.buf.current())[1].changedtick)"
+        )
+        .await,
+        cur,
+        "getbufinfo reports the real changedtick"
+    );
+    assert_eq!(
+        read(
+            &rpc,
+            "tostring(vim.fn.getbufinfo(nx.buf.current())[1].changed)"
+        )
+        .await,
+        "1",
+        "getbufinfo reports the real modified flag"
+    );
+}

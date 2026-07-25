@@ -321,6 +321,33 @@ function nx.buf.is_valid(bufnr)
   return nx._bufs[nx._resolve_bufnr(bufnr)] ~= nil
 end
 
+-- `nx.buf.changedtick(bufnr)` -> integer [alias `nvim_buf_get_changedtick`]: the
+-- buffer's change counter (0/nil = current buffer), bumped by the core on every text
+-- change and never otherwise. `0` for an unknown buffer.
+--
+-- This is the canonical "did this buffer's text change" signal: cache derived state
+-- against it and recompute only when it moves, instead of redoing the work on every
+-- event. A statusline component that enumerates matches, a plugin that parses the
+-- buffer, any per-buffer memo — key it on `(bufnr, changedtick)`:
+--
+-- ```lua
+-- local memo = {}
+-- local function matches(buf)
+--   local tick = nx.buf.changedtick(buf)
+--   local m = memo[buf]
+--   if m and m.tick == tick then
+--     return m.value
+--   end
+--   local value = expensive_scan(buf)
+--   memo[buf] = { tick = tick, value = value }
+--   return value
+-- end
+-- ```
+function nx.buf.changedtick(bufnr)
+  local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
+  return (buf and buf.changedtick) or 0
+end
+
 -- `nx.buf.line_count(bufnr)` -> integer [alias `nvim_buf_line_count`]: the number of
 -- lines in `bufnr` (0/nil = current); `0` for an unknown buffer.
 function nx.buf.line_count(bufnr)
@@ -1669,8 +1696,9 @@ vim.fn.screenpos = nx.screen.pos
 
 -- `nx.bufinfo.get([arg])` [alias `vim.fn.getbufinfo`]: per-buffer info dicts. `arg` is a
 -- bufnr (one buffer), an opts table ({buflisted=1, bufloaded=1, …} — filters), or
--- absent (all buffers). nxvim's core models neither buflisted nor a changed flag
--- yet, so every buffer reports listed/loaded and unchanged; the filters narrow.
+-- absent (all buffers). nxvim's core doesn't model `buflisted`, so every buffer
+-- reports listed/loaded and the filters only narrow; `changed` / `changedtick` are
+-- real (the buffer's modified flag and its change counter).
 nx.bufinfo = nx.bufinfo or {}
 function nx.bufinfo.get(arg)
   local function info(id, buf)
@@ -1678,8 +1706,8 @@ function nx.bufinfo.get(arg)
     return {
       bufnr = id,
       name = buf.name or "",
-      changed = 0,
-      changedtick = 0,
+      changed = nx.bo[id].modified and 1 or 0,
+      changedtick = buf.changedtick or 0,
       hidden = #windows == 0 and 1 or 0,
       listed = 1,
       loaded = 1,

@@ -1184,9 +1184,12 @@ async fn reject_report(rpc: &Rpc, call: &str, keys: &[&str]) -> String {
 
 #[tokio::test]
 async fn lsp_format_rejects_options_it_cannot_honor() {
-    // nxvim attaches ONE server per buffer and formats the current one, so
-    // `name`/`bufnr`/`range`/`filter` have no meaning here — silently dropping
-    // `name` would format with a different server than the config asked for.
+    // `name` was rejected while nxvim modelled one server per buffer — there was
+    // nothing to select. Now a buffer attaches every enabled server, so `name` is
+    // MODELLED (it picks the formatter) and only the options nxvim still cannot
+    // honor raise: it formats the current buffer whole, so `bufnr`/`range` would
+    // need a core change and `filter` has no equivalent. Silently ignoring those
+    // would format the wrong thing.
     let (rpc, _incoming) = start().await;
     let got = reject_report(
         &rpc,
@@ -1195,8 +1198,8 @@ async fn lsp_format_rejects_options_it_cannot_honor() {
     )
     .await;
     assert_eq!(
-        got, "name=false bufnr=false range=false filter=false",
-        "each unmodeled format option raises"
+        got, "name=true bufnr=false range=false filter=false",
+        "name is now selected on; the rest still raise"
     );
 }
 

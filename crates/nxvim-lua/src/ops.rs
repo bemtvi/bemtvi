@@ -278,11 +278,17 @@ pub enum LspOp {
         /// [`CallbackArgs::LspReply`].
         cb_id: u64,
     },
-    /// `nx.lsp.format()` — request `textDocument/formatting`.
+    /// `nx.lsp.format(opts)` — request `textDocument/formatting`.
     Format {
         /// The `nx._cb_fns` id that settles the promise once the edits apply (`0` =
         /// fire-and-forget).
         cb_id: u64,
+        /// `opts.name`: format with THIS server rather than the first one advertising
+        /// `documentFormatting`. Meaningful because a buffer can carry several — the
+        /// canonical case being a type-checker plus a formatting linter, where the
+        /// default pick is not necessarily the formatter you want. `None` = the
+        /// capability-ordered default.
+        name: Option<String>,
     },
     /// `nx.lsp.rename(name)` — request `textDocument/rename` with `new_name`.
     Rename {

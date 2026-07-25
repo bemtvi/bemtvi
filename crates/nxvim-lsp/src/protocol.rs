@@ -18,7 +18,12 @@ use lsp_types::{
 /// `name` is the user-chosen LSP config name (the `nx.lsp` control surface in the
 /// lua crate), arbitrary rather than a fixed filetype. nxvim runs at most one child
 /// per key and routes a buffer to its server by it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `Ord` is derived so a buffer's servers can live in a `BTreeMap` and iterate in a
+/// stable, human-meaningful order — by config `name`, then root. That ordering is
+/// load-bearing: it is what makes "the first server that advertises this feature"
+/// a deterministic choice rather than a hash-order coin flip.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServerKey {
     pub name: String,
     pub root: PathBuf,

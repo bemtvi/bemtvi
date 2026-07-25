@@ -2541,14 +2541,15 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_buf_format(cb_id)`: queue [`LspOp::Format`]. Kept distinct from
+    // `nx._lsp_buf_format(cb_id, name)`: queue [`LspOp::Format`]. Kept distinct from
     // `_lsp_buf` because formatting has no `{uri, position}` shape (it routes to
-    // `request_lsp_format`, not `request_lsp`).
+    // `request_lsp_format`, not `request_lsp`). `name` (nil = default) picks which
+    // attached server formats.
     let sh = shared.clone();
     nx.set(
         "_lsp_buf_format",
-        lua.create_function(move |_, cb_id: u64| {
-            sh.borrow_mut().lsp_ops.push(LspOp::Format { cb_id });
+        lua.create_function(move |_, (cb_id, name): (u64, Option<String>)| {
+            sh.borrow_mut().lsp_ops.push(LspOp::Format { cb_id, name });
             Ok(())
         })?,
     )?;

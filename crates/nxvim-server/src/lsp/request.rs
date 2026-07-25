@@ -26,8 +26,46 @@ impl EditHost {
         // fired during input — ahead of `redraw`'s own `sync_lsp` — so without
         // this the server would answer a stale document (e.g. completion ranges
         // computed against text the user already changed).
-        let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
-            // No server: the request never goes, so settle the promise now
+        // Kinds whose answers MERGE go to every capable server at once.
+        if LspFanout::is_fanout(kind) {
+            self.sync_lsp();
+            let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+            // The cursor in each encoding a server might have negotiated, resolved up
+            // front: the closure below cannot borrow the buffer while the fan-out
+            // borrows `self`, and there are only three.
+            let buf = self.editor.buffer();
+            let (p8, p16, p32) = (
+                lsp_position_in(buf, PositionEncoding::Utf8, row, col),
+                lsp_position_in(buf, PositionEncoding::Utf16, row, col),
+                lsp_position_in(buf, PositionEncoding::Utf32, row, col),
+            );
+            let asked =
+                self.open_lsp_fanout(kind, cb_id, CodeActionOpts::default(), |_, uri, enc| {
+                    let position = match enc {
+                        PositionEncoding::Utf8 => p8,
+                        PositionEncoding::Utf16 => p16,
+                        PositionEncoding::Utf32 => p32,
+                    };
+                    match kind {
+                        LspReqKind::References => LspRequest::References {
+                            uri,
+                            position,
+                            include_declaration: false,
+                        },
+                        _ => LspRequest::DocumentSymbol { uri },
+                    }
+                });
+            if asked.is_empty() {
+                self.editor.echo("No language server attached");
+                self.settle_lsp_promise(cb_id, serde_json::Value::Null);
+            }
+            return;
+        }
+        // Routed by capability: the first attached server, in key order, that
+        // advertises this feature. On a `pyright` + `ruff` buffer a hover must reach
+        // pyright, not whichever name happens to sort first.
+        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(kind) else {
+            // No capable server: the request never goes, so settle the promise now
             // (resolve `nil`) rather than leave it hanging for a reply that
             // won't come.
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
@@ -35,7 +73,7 @@ impl EditHost {
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
-        let token = self.register_lsp_request(kind, cb_id);
+        let token = self.register_lsp_request_to(kind, cb_id, &key);
         let req = match kind {
             LspReqKind::Definition => LspRequest::Definition { uri, position },
             LspReqKind::Declaration => LspRequest::Declaration { uri, position },
@@ -137,6 +175,21 @@ impl EditHost {
         self.register_lsp_request_with(kind, cb_id, CodeActionOpts::default())
     }
 
+    /// [`register_lsp_request`](Self::register_lsp_request), recording which server
+    /// the request went to so the reply is decoded against *that* server.
+    pub(crate) fn register_lsp_request_to(
+        &mut self,
+        kind: LspReqKind,
+        cb_id: u64,
+        server: &ServerKey,
+    ) -> ReqToken {
+        let token = self.register_lsp_request_with(kind, cb_id, CodeActionOpts::default());
+        if let Some(pending) = self.lsp_requests.get_mut(&kind) {
+            pending.server = Some(server.clone());
+        }
+        token
+    }
+
     /// [`register_lsp_request`](Self::register_lsp_request) carrying the code-action
     /// options (`only` / `apply`) the reply needs; every other kind uses the default.
     pub(crate) fn register_lsp_request_with(
@@ -156,6 +209,7 @@ impl EditHost {
                 tick: self.editor.buffer().changedtick,
                 cb_id,
                 code_action,
+                server: None,
             },
         ) {
             self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
@@ -181,6 +235,7 @@ impl EditHost {
         &mut self,
         kind: LspReqKind,
         buffer: BufferId,
+        server: &ServerKey,
     ) -> ReqToken {
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
@@ -194,6 +249,7 @@ impl EditHost {
                 tick,
                 cb_id: 0,
                 code_action: CodeActionOpts::default(),
+                server: Some(server.clone()),
             },
         );
         ReqToken {
@@ -288,12 +344,41 @@ impl EditHost {
     /// `:LspFormat` — request `textDocument/formatting` for the current buffer.
     /// On reply, the `TextEdit[]` is applied iff the buffer hasn't changed since
     /// (the content-version guard in [`EditHost::on_lsp_reply`]).
-    pub(crate) fn request_lsp_format(&mut self, cb_id: u64) {
-        let Some((key, uri, _encoding)) = self.lsp_target_or_echo() else {
+    /// `name` picks the formatting server by config name; `None` takes the first that
+    /// advertises `documentFormatting` — so a buffer served by a type-checker that
+    /// can't format and a linter that can reaches the one that can.
+    ///
+    /// A `name` not attached to this buffer is reported by name rather than quietly
+    /// formatting with someone else: asking for ruff and silently getting pyright's
+    /// formatting is exactly the failure this option exists to prevent.
+    pub(crate) fn request_lsp_format(&mut self, cb_id: u64, name: Option<String>) {
+        let target = match &name {
+            Some(want) => {
+                self.sync_lsp();
+                let buffer = self.editor.current_buffer_id();
+                let found = self
+                    .lsp_states
+                    .get(&buffer)
+                    .and_then(|s| s.servers().find(|(k, _)| &k.name == want).map(|(k, _)| k))
+                    .cloned()
+                    .and_then(|key| {
+                        let uri = self.lsp_states.get(&buffer)?.uri.clone()?;
+                        let encoding = self.lsp_servers.get(&key)?.encoding;
+                        Some((key, uri, encoding))
+                    });
+                if found.is_none() {
+                    self.editor
+                        .echo(format!("No LSP client named '{want}' on this buffer"));
+                }
+                found
+            }
+            None => self.lsp_target_for_or_echo(LspReqKind::Formatting),
+        };
+        let Some((key, uri, _encoding)) = target else {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::Formatting, cb_id);
+        let token = self.register_lsp_request_to(LspReqKind::Formatting, cb_id, &key);
         self.fx.lsp_request(
             key,
             token,
@@ -334,13 +419,13 @@ impl EditHost {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         }
-        let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
+        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(LspReqKind::Rename) else {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
-        let token = self.register_lsp_request(LspReqKind::Rename, cb_id);
+        let token = self.register_lsp_request_to(LspReqKind::Rename, cb_id, &key);
         self.fx.lsp_request(
             key,
             token,
@@ -376,10 +461,7 @@ impl EditHost {
         opts: CodeActionOpts,
         range: Option<(usize, usize, usize, usize)>,
     ) {
-        let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
-            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-            return;
-        };
+        self.sync_lsp();
         let selection = range.or_else(|| self.editor.selection_extent());
         // A selection that fed the request is consumed here, *before* the reply's edit
         // can land on it (`leave_selection` is a no-op when the range came from `opts`).
@@ -388,23 +470,49 @@ impl EditHost {
             let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
             (row, col, row, col)
         });
-        let range = Range {
-            start: self.lsp_position(encoding, extent.0, extent.1),
-            end: self.lsp_position(encoding, extent.2, extent.3),
-        };
         let diagnostics = self.diagnostics_in_range(extent);
         let only = opts.only.clone();
-        let token = self.register_lsp_request_with(LspReqKind::CodeAction, cb_id, opts);
-        self.fx.lsp_request(
-            key,
-            token,
+        // The request range in each encoding a server might use — resolved before the
+        // fan-out borrows `self` (see `request_lsp`).
+        let buf = self.editor.buffer();
+        let ranges: Vec<(PositionEncoding, Range)> = [
+            PositionEncoding::Utf8,
+            PositionEncoding::Utf16,
+            PositionEncoding::Utf32,
+        ]
+        .into_iter()
+        .map(|enc| {
+            (
+                enc,
+                Range {
+                    start: lsp_position_in(buf, enc, extent.0, extent.1),
+                    end: lsp_position_in(buf, enc, extent.2, extent.3),
+                },
+            )
+        })
+        .collect();
+
+        // Every `codeActionProvider` is asked and their actions merge into one
+        // chooser — this is the fan-out that matters most in practice: a linter's
+        // quick-fixes and a type-checker's refactors are both things you want offered,
+        // and asking only one server silently hides half the menu.
+        let asked = self.open_lsp_fanout(LspReqKind::CodeAction, cb_id, opts, |_, uri, enc| {
+            let range = ranges
+                .iter()
+                .find(|(e, _)| *e == enc)
+                .map(|(_, r)| *r)
+                .unwrap_or_default();
             LspRequest::CodeAction {
                 uri,
                 range,
-                diagnostics,
-                only,
-            },
-        );
+                diagnostics: diagnostics.clone(),
+                only: only.clone(),
+            }
+        });
+        if asked.is_empty() {
+            self.editor.echo("No language server attached");
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
+        }
     }
 
     /// Flush pending document edits ([`sync_lsp`](EditHost::sync_lsp)) and resolve the
@@ -425,10 +533,219 @@ impl EditHost {
     /// any position-based request. `None` otherwise.
     pub(crate) fn current_lsp_target(&self) -> Option<(ServerKey, Url, PositionEncoding)> {
         let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
-        let key = state.server.clone()?;
+        let key = state.primary_key().cloned()?;
         let uri = state.uri.clone()?;
         let encoding = self.lsp_servers.get(&key)?.encoding;
         Some((key, uri, encoding))
+    }
+
+    /// The server on `buffer` that should answer a request of `kind`: the **first**
+    /// attached one, in [`ServerKey`] order, that has finished `initialize` and
+    /// advertises the matching provider.
+    ///
+    /// This is what makes a two-server buffer behave. With `pyright` + `ruff`, a
+    /// hover must go to pyright because ruff advertises none — picking by position
+    /// in the map (as every path did before) would send it to whichever name sorts
+    /// first and get nothing back. Ordering by key rather than by hash keeps the
+    /// choice stable, so a config that works once works every time.
+    ///
+    /// Kinds with no modelled provider flag ([`LspReqKind::provider`] → `None`) fall
+    /// back to the first initialized server: failing open beats answering nothing.
+    pub(crate) fn lsp_target_for(
+        &self,
+        buffer: BufferId,
+        kind: LspReqKind,
+    ) -> Option<(ServerKey, Url, PositionEncoding)> {
+        let state = self.lsp_states.get(&buffer)?;
+        let uri = state.uri.clone()?;
+        let (key, encoding) = state.servers().find_map(|(key, _)| {
+            let rt = self.lsp_servers.get(key)?;
+            match kind.provider(&rt.providers) {
+                Some(true) | None => Some((key.clone(), rt.encoding)),
+                Some(false) => None,
+            }
+        })?;
+        Some((key, uri, encoding))
+    }
+
+    /// [`lsp_target_for`](Self::lsp_target_for) on the current buffer, echoing the
+    /// same "no server" message [`lsp_target_or_echo`](Self::lsp_target_or_echo)
+    /// does when nothing can answer.
+    pub(crate) fn lsp_target_for_or_echo(
+        &mut self,
+        kind: LspReqKind,
+    ) -> Option<(ServerKey, Url, PositionEncoding)> {
+        self.sync_lsp();
+        let target = self.lsp_target_for(self.editor.current_buffer_id(), kind);
+        if target.is_none() {
+            self.editor.echo("No language server attached");
+        }
+        target
+    }
+
+    /// Open a fan-out round for `kind`: issue `make` to **every** attached server
+    /// that advertises the capability, and register the round so their replies merge.
+    ///
+    /// Returns the servers asked (empty when none can answer, in which case the
+    /// caller settles its promise — no silent nothing). Any round already open for
+    /// this kind is superseded: its promise settles `nil` rather than hanging, and
+    /// its still-outstanding replies are dropped on arrival (their generations are
+    /// gone from the new round).
+    pub(crate) fn open_lsp_fanout(
+        &mut self,
+        kind: LspReqKind,
+        cb_id: u64,
+        code_action: CodeActionOpts,
+        make: impl Fn(&ServerKey, Url, PositionEncoding) -> LspRequest,
+    ) -> Vec<ServerKey> {
+        let buffer = self.editor.current_buffer_id();
+        let Some(state) = self.lsp_states.get(&buffer) else {
+            return Vec::new();
+        };
+        let Some(uri) = state.uri.clone() else {
+            return Vec::new();
+        };
+        let targets: Vec<(ServerKey, PositionEncoding)> = state
+            .servers()
+            .filter_map(|(key, _)| {
+                let rt = self.lsp_servers.get(key)?;
+                match kind.provider(&rt.providers) {
+                    Some(true) | None => Some((key.clone(), rt.encoding)),
+                    Some(false) => None,
+                }
+            })
+            .collect();
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        // Supersede any open round for this kind before issuing the new one.
+        if let Some(prev) = self.lsp_fanouts.remove(&kind) {
+            if prev.cb_id != 0 {
+                self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
+            }
+        }
+        let mut round = LspFanout {
+            outstanding: HashMap::new(),
+            cb_id,
+            buffer,
+            cursor: (self.editor.cursor.line, self.editor.cursor.col),
+            tick: self.editor.buffer().changedtick,
+            code_action,
+            locations: Vec::new(),
+            symbols: Vec::new(),
+            actions: Vec::new(),
+        };
+        let mut asked = Vec::new();
+        for (key, encoding) in targets {
+            self.lsp_req_gen += 1;
+            let generation = self.lsp_req_gen;
+            round.outstanding.insert(generation, key.clone());
+            let token = ReqToken {
+                kind: kind.as_u16(),
+                generation,
+                cb_id: 0,
+            };
+            let req = make(&key, uri.clone(), encoding);
+            self.fx.lsp_request(key.clone(), token, req);
+            asked.push(key);
+        }
+        self.lsp_fanouts.insert(kind, round);
+        asked
+    }
+
+    /// Fold one reply into its fan-out round, presenting the merged result once the
+    /// last outstanding server has answered. Returns whether `token` belonged to a
+    /// round (so the single-target reply path skips it).
+    fn absorb_fanout_reply(
+        &mut self,
+        kind: LspReqKind,
+        token: &ReqToken,
+        reply: &LspReply,
+    ) -> bool {
+        let Some(round) = self.lsp_fanouts.get_mut(&kind) else {
+            return false;
+        };
+        let Some(server) = round.outstanding.remove(&token.generation) else {
+            // Not part of the open round — a straggler from a superseded one.
+            return self.lsp_fanouts.contains_key(&kind) && LspFanout::is_fanout(kind);
+        };
+        match reply {
+            LspReply::Locations(locations) => round.locations.extend(locations.iter().cloned()),
+            LspReply::Symbols(symbols) => round.symbols.extend(symbols.iter().cloned()),
+            LspReply::CodeActions(actions) => round
+                .actions
+                .extend(actions.iter().map(|a| (server.clone(), a.clone()))),
+            // A kind that fans out can only reply with one of the above; anything
+            // else means the server answered off-protocol. Drop its slot (already
+            // removed) and let the round finish on the others.
+            _ => {}
+        }
+        if !round.outstanding.is_empty() {
+            return true; // still waiting on other servers
+        }
+        let round = self.lsp_fanouts.remove(&kind).expect("just borrowed");
+        self.present_fanout(kind, round);
+        true
+    }
+
+    /// Present a completed fan-out round: the merged payload goes through the same
+    /// surface a single-server reply would, so ordering, dedup and the promise
+    /// contract are unchanged.
+    fn present_fanout(&mut self, kind: LspReqKind, round: LspFanout) {
+        let buffer_changed = round.buffer != self.editor.current_buffer_id();
+        let cursor_moved = round.cursor != (self.editor.cursor.line, self.editor.cursor.col);
+        let tick_changed = round.tick != self.editor.buffer().changedtick;
+        match kind {
+            LspReqKind::References => {
+                if buffer_changed || cursor_moved {
+                    self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
+                    return;
+                }
+                // Two servers can report the same reference; show it once.
+                let mut locations = round.locations;
+                locations.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
+                let result = self.apply_lsp_locations(kind, locations);
+                self.lsp_dirty = true;
+                self.settle_lsp_promise(round.cb_id, result);
+            }
+            LspReqKind::DocumentSymbol => {
+                if buffer_changed {
+                    self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
+                    return;
+                }
+                let result = self.apply_lsp_symbols(kind, round.symbols);
+                self.lsp_dirty = true;
+                self.settle_lsp_promise(round.cb_id, result);
+            }
+            LspReqKind::CodeAction => {
+                if buffer_changed || tick_changed {
+                    self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
+                    return;
+                }
+                let (servers, actions): (Vec<ServerKey>, Vec<CodeActionData>) =
+                    round.actions.into_iter().unzip();
+                self.show_code_actions_from(actions, servers, round.cb_id, round.code_action);
+                self.lsp_dirty = true;
+            }
+            _ => self.settle_lsp_promise(round.cb_id, serde_json::Value::Null),
+        }
+    }
+
+    /// Retire every fan-out slot belonging to `key` — its server exited, so its reply
+    /// is never coming and the round must not wait on it forever. A round left with
+    /// no outstanding servers presents what the others returned.
+    pub(crate) fn drop_fanout_server(&mut self, key: &ServerKey) {
+        let kinds: Vec<LspReqKind> = self.lsp_fanouts.keys().copied().collect();
+        for kind in kinds {
+            let Some(round) = self.lsp_fanouts.get_mut(&kind) else {
+                continue;
+            };
+            round.outstanding.retain(|_, k| k != key);
+            if round.outstanding.is_empty() {
+                let round = self.lsp_fanouts.remove(&kind).expect("just borrowed");
+                self.present_fanout(kind, round);
+            }
+        }
     }
 
     /// Handle one [`LspEvent::Reply`]: match it to its pending request by token
@@ -442,6 +759,11 @@ impl EditHost {
         let Some(kind) = LspReqKind::from_u16(token.kind) else {
             return;
         };
+        // A fan-out kind's replies are folded into their round instead of matching a
+        // single pending — several are in flight for one user action.
+        if LspFanout::is_fanout(kind) && self.absorb_fanout_reply(kind, &token, &reply) {
+            return;
+        }
         let Some(pending) = self.lsp_requests.get(&kind) else {
             return;
         };

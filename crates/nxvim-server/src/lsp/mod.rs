@@ -17,13 +17,16 @@ use std::path::{Path, PathBuf};
 
 use nxvim_core::unicode;
 use nxvim_core::{Buffer, BufferEdit, BufferId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nxvim_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, Position, Range, SemanticToken, TextDocumentContentChangeEvent,
-    TextDocumentSyncKind, TextEdit, Url,
+    Diagnostic, DiagnosticSeverity, Location, Position, Range, SemanticToken,
+    TextDocumentContentChangeEvent, TextDocumentSyncKind, TextEdit, Url,
 };
-use nxvim_lsp::{PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn};
+use nxvim_lsp::{
+    CodeActionData, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn,
+    SymbolData,
+};
 use nxvim_lua::{DiagnosticData, LspServerCapabilities};
 
 /// A workspace edit's edits for a file whose bytes are still being fetched **off-tick**
@@ -48,50 +51,72 @@ mod request;
 mod semantic;
 mod sync;
 
-/// Per-buffer LSP document-sync bookkeeping, mirroring `SyntaxState`. One per
-/// open buffer that mapped to a configured server, keyed by [`BufferId`] in
-/// [`EditHost::lsp_states`].
+/// Per-**(buffer, server)** document-sync state: everything that is negotiated
+/// with, or tracked against, one specific server.
+///
+/// None of this can be shared between two servers attached to the same buffer.
+/// They negotiate independent position encodings and sync kinds, so `shadow` (the
+/// text *that* server holds) and `version` advance on separate clocks, and each
+/// publishes its own diagnostics / semantic tokens / inlay hints. Splitting it out
+/// is what lets a buffer carry N servers; see
+/// `docs/plans/2026-07-25-multi-server-lsp-attach.md`.
 #[derive(Default)]
-pub(crate) struct LspDocState {
-    /// Which server owns this buffer (`None` until a `vim.lsp.start` binds one).
-    server: Option<ServerKey>,
-    /// The LSP `languageId` for `didOpen` — the buffer's filetype, set when the
-    /// `vim.lsp.enable` dispatcher binds the buffer (no longer re-derived in sync).
-    language_id: String,
-    /// The document URI, kept so `didClose` can be sent after the buffer is gone.
-    uri: Option<Url>,
+pub(crate) struct LspServerDoc {
     /// Has `didOpen` been sent for the current server instance?
     opened: bool,
     /// LSP document version (monotonic, bumped per `didChange`).
     version: i32,
     /// `changedtick` of the last sync we sent (drives `didChange`).
     last_tick: u64,
+    /// `save_tick` of the last sync, mirrored to fire `didSave` exactly when the
+    /// buffer is written (`save_tick` bumps only on a successful `:w`).
+    last_save_tick: u64,
     /// The document text the server currently holds — what we last sent it (full at
     /// `didOpen`, then advanced by each `didChange`). Incremental syncs replay the
     /// journaled edits over this to compute correct per-encoding positions, then it
     /// matches the buffer again; a full/resync push resets it to the whole text.
     /// (neovim's `prev_lines`.) See [`incremental_changes_against`].
     shadow: String,
-    /// `save_tick` of the last sync, mirrored to fire `didSave` exactly when the
-    /// buffer is written (`save_tick` bumps only on a successful `:w`).
-    last_save_tick: u64,
-    /// Latest `publishDiagnostics` for this buffer, projected into the redraw
-    /// (`diagnostics_for`) and the under-cursor message line.
+    /// Latest `publishDiagnostics` from this server for this buffer, projected into
+    /// the redraw (`diagnostics_for`) and the under-cursor message line.
     diagnostics: Vec<Diagnostic>,
-    /// Latest `semanticTokens/full` result for this buffer, decoded into the
-    /// per-line highlight spans `highlights_for` merges over the treesitter floor
-    /// (ADR 0001 bridge #2). Empty until the first reply lands.
+    /// Latest `semanticTokens/full` result, decoded into the per-line highlight
+    /// spans `highlights_for` merges over the treesitter floor (ADR 0001 bridge #2).
+    /// Empty until the first reply lands.
     semantic: SemanticTokensCache,
+    /// Latest `textDocument/inlayHint` result, decoded into the per-line inline
+    /// hints `inlay_hints_for` projects over the buffer text. Empty until the first
+    /// reply lands (and while inlay hints are disabled).
+    inlay: InlayHintsCache,
+}
+
+/// Per-buffer LSP bookkeeping, mirroring `SyntaxState`. One per open buffer that
+/// mapped to a configured server, keyed by [`BufferId`] in
+/// [`EditHost::lsp_states`]. Holds only what is genuinely buffer-wide — the URI,
+/// the `languageId`, and the user's per-buffer feature toggles — plus the map of
+/// attached servers, each with its own [`LspServerDoc`].
+///
+/// A buffer may carry **several** servers (`pyright` + `ruff`, `ts_ls` + `eslint`):
+/// each syncs its own document and publishes its own diagnostics. Requests are
+/// routed by capability ([`EditHost::lsp_target_for`]), and the kinds whose answers
+/// merge fan out to every capable server ([`LspFanout`]).
+#[derive(Default)]
+pub(crate) struct LspDocState {
+    /// The LSP `languageId` for `didOpen` — the buffer's filetype, set when the
+    /// `vim.lsp.enable` dispatcher binds the buffer (no longer re-derived in sync).
+    language_id: String,
+    /// The document URI, kept so `didClose` can be sent after the buffer is gone.
+    uri: Option<Url>,
+    /// The servers attached to this buffer, ordered by [`ServerKey`] (config name,
+    /// then root) so iteration — and therefore "the first capable server" — is
+    /// deterministic rather than hash-ordered.
+    servers: BTreeMap<ServerKey, LspServerDoc>,
     /// Per-buffer semantic-token override (Phase 3): `None` is the auto default
     /// (enabled when the server advertises a legend); `Some(false)` is an explicit
     /// `vim.lsp.semantic_tokens.stop` (hide the paint, skip refreshes);
     /// `Some(true)` an explicit `start`. The cache survives a stop, so a later
     /// `start` repaints from it without a round-trip.
     semantic_enabled: Option<bool>,
-    /// Latest `textDocument/inlayHint` result for this buffer, decoded into the
-    /// per-line inline hints `inlay_hints_for` projects over the buffer text. Empty
-    /// until the first reply lands (and while inlay hints are disabled).
-    inlay: InlayHintsCache,
     /// Whether inlay hints are enabled for this buffer — **off by default** (unlike
     /// semantic tokens, neovim's inlay hints are opt-in via
     /// `vim.lsp.inlay_hint.enable`). The projection and the refresh request both
@@ -106,6 +131,69 @@ impl LspDocState {
     /// separately by the projection.
     pub(crate) fn semantic_on(&self) -> bool {
         self.semantic_enabled.unwrap_or(true)
+    }
+
+    /// The buffer's first attached server and its document state — the lowest
+    /// [`ServerKey`], so the choice is stable across runs rather than hash-ordered.
+    ///
+    /// This is the *provisional* answer to "which server serves this buffer" for the
+    /// paths that still assume one: language requests, semantic tokens, inlay hints.
+    /// Phase 3 replaces those with capability-aware selection (and fan-out where
+    /// merging is well defined); document sync and diagnostics already iterate
+    /// [`servers`](Self::servers).
+    pub(crate) fn primary(&self) -> Option<(&ServerKey, &LspServerDoc)> {
+        self.servers.iter().next()
+    }
+
+    /// The key half of [`primary`](Self::primary).
+    pub(crate) fn primary_key(&self) -> Option<&ServerKey> {
+        self.servers.keys().next()
+    }
+
+    /// The first attached server's document state.
+    pub(crate) fn primary_doc_mut(&mut self) -> Option<&mut LspServerDoc> {
+        self.servers.values_mut().next()
+    }
+
+    /// Is `key` among this buffer's servers?
+    pub(crate) fn bound_to(&self, key: &ServerKey) -> bool {
+        self.servers.contains_key(key)
+    }
+
+    /// Has this buffer sent `didOpen` to `key` — i.e. is it *attached* to that
+    /// server, as opposed to merely bound and waiting for `initialize`?
+    pub(crate) fn is_opened_under(&self, key: &ServerKey) -> bool {
+        self.servers.get(key).is_some_and(|d| d.opened)
+    }
+
+    /// This buffer's state for `key`, if attached.
+    pub(crate) fn doc(&self, key: &ServerKey) -> Option<&LspServerDoc> {
+        self.servers.get(key)
+    }
+
+    /// Mutable [`doc`](Self::doc).
+    pub(crate) fn doc_mut(&mut self, key: &ServerKey) -> Option<&mut LspServerDoc> {
+        self.servers.get_mut(key)
+    }
+
+    /// Every attached server, in key order.
+    pub(crate) fn servers(&self) -> impl Iterator<Item = (&ServerKey, &LspServerDoc)> {
+        self.servers.iter()
+    }
+
+    /// Mutable [`servers`](Self::servers).
+    pub(crate) fn servers_mut(&mut self) -> impl Iterator<Item = (&ServerKey, &mut LspServerDoc)> {
+        self.servers.iter_mut()
+    }
+
+    /// Attach `key` to this buffer, returning its document state — creating a fresh
+    /// (unopened, version 0) one the first time, so the next sync sends its `didOpen`.
+    ///
+    /// **Additive**: a buffer whose filetype enables two servers ends up bound to
+    /// both, each syncing on its own clock. An already-attached key is returned
+    /// untouched, so this is idempotent and safe to call every sync.
+    pub(crate) fn attach(&mut self, key: ServerKey) -> &mut LspServerDoc {
+        self.servers.entry(key).or_default()
     }
 }
 
@@ -215,6 +303,41 @@ pub(crate) enum LspReqKind {
 }
 
 impl LspReqKind {
+    /// Whether `caps` advertises the provider that answers this request kind — the
+    /// predicate [`EditHost::lsp_target_for`] selects a server with.
+    ///
+    /// `None` means "not capability-gated": either the LSP spec has no provider flag
+    /// for it (the `*/resolve` follow-ups, which are only ever sent back to the
+    /// server that produced the item), or nxvim doesn't model one. Those fall back
+    /// to the buffer's first server rather than filtering everything out — failing
+    /// open, because a wrongly-empty selection would silently answer nothing.
+    pub(crate) fn provider(self, caps: &ProviderCaps) -> Option<bool> {
+        Some(match self {
+            LspReqKind::Definition => caps.definition,
+            LspReqKind::Declaration => caps.declaration,
+            LspReqKind::TypeDefinition => caps.type_definition,
+            LspReqKind::Implementation => caps.implementation,
+            LspReqKind::References => caps.references,
+            LspReqKind::Hover => caps.hover,
+            LspReqKind::SignatureHelp => caps.signature_help,
+            LspReqKind::Completion => caps.completion,
+            LspReqKind::Formatting => caps.document_formatting,
+            LspReqKind::Rename => caps.rename,
+            LspReqKind::CodeAction => caps.code_action,
+            LspReqKind::SemanticTokens => caps.semantic_tokens,
+            LspReqKind::InlayHints => caps.inlay_hints,
+            LspReqKind::FoldingRange => caps.folding_range,
+            // Resolve follow-ups belong to the server that produced the item being
+            // resolved, so they are routed by that item, never selected here.
+            LspReqKind::ResolveCodeAction
+            | LspReqKind::CompletionResolve
+            | LspReqKind::ResolveInlayHint => return None,
+            // `documentSymbol` / `workspace/symbol` have provider flags nxvim does
+            // not distil into `ProviderCaps` yet.
+            LspReqKind::DocumentSymbol | LspReqKind::WorkspaceSymbol => return None,
+        })
+    }
+
     pub(crate) fn as_u16(self) -> u16 {
         match self {
             LspReqKind::Definition => 0,
@@ -336,6 +459,62 @@ pub(crate) struct PendingLspReq {
     /// survivor is applied without the chooser). Default (no filter, no auto-apply) for
     /// every other kind.
     pub(crate) code_action: CodeActionOpts,
+    /// The server this request was actually sent to.
+    ///
+    /// Recorded because the answering server is no longer implied: once a buffer
+    /// carries several, a reply must be decoded against the encoding and legend of
+    /// the server that *produced* it, not the buffer's first. Re-deriving it at
+    /// reply time is exactly the bug this prevents — semantic tokens decoded with
+    /// another server's legend paint plausible nonsense.
+    pub(crate) server: Option<ServerKey>,
+}
+
+/// One **fan-out round**: a single logical request issued to every capable server,
+/// whose replies merge into one presentation.
+///
+/// Only the kinds where merging is well defined fan out (references, document
+/// symbols, code actions) — a hover or a goto has one answer, so merging them would
+/// be noise rather than completeness. See the routing table in
+/// `docs/plans/2026-07-25-multi-server-lsp-attach.md`.
+///
+/// The round completes when every asked server has replied **or dropped out** (its
+/// process exited). A server that neither replies nor exits holds the round open —
+/// the same exposure a single hung server has always had, and the next request of
+/// that kind supersedes it. It is why `outstanding` is keyed by server: an exit can
+/// then retire its slot instead of stranding the round.
+pub(crate) struct LspFanout {
+    /// Generation → the server it was sent to, for every reply still outstanding.
+    pub(crate) outstanding: HashMap<u64, ServerKey>,
+    /// The issuing verb's promise, settled once when the merged result presents.
+    pub(crate) cb_id: u64,
+    pub(crate) buffer: BufferId,
+    pub(crate) cursor: (usize, usize),
+    pub(crate) tick: u64,
+    /// The `only` / `apply` filter, applied to the MERGED list so a `source.fixAll`
+    /// request still auto-applies when exactly one server offers a match.
+    pub(crate) code_action: CodeActionOpts,
+    /// Accumulated locations (references).
+    pub(crate) locations: Vec<Location>,
+    /// Accumulated symbols (document symbols).
+    pub(crate) symbols: Vec<SymbolData>,
+    /// Accumulated code actions, each tagged with the server that produced it.
+    ///
+    /// The tag is load-bearing: a lazy action is finished with `codeAction/resolve`,
+    /// and its `data` blob is meaningful only to the server that issued it.
+    /// Resolving ruff's action against pyright is not a degraded result, it is a
+    /// wrong request.
+    pub(crate) actions: Vec<(ServerKey, CodeActionData)>,
+}
+
+impl LspFanout {
+    /// Whether `kind`'s replies merge across servers rather than being answered by
+    /// one — the routing table, in code.
+    pub(crate) fn is_fanout(kind: LspReqKind) -> bool {
+        matches!(
+            kind,
+            LspReqKind::References | LspReqKind::DocumentSymbol | LspReqKind::CodeAction
+        )
+    }
 }
 
 /// The options a `nx.lsp.code_action(opts)` call carries from Lua to the reply:
@@ -382,14 +561,14 @@ pub(crate) struct ServerRuntime {
     /// semantic-tokens refresh re-requests the whole `full` set rather than a diff
     /// (sending `full/delta` to a server that didn't advertise it would error).
     semantic_tokens_delta: bool,
-    /// Whether the server advertised `inlayHintProvider`. A buffer requests inlay
-    /// hints only from a server that offers them (and only while enabled), so this
-    /// gates the refresh request the same way `legend` gates semantic tokens.
-    inlay_hints: bool,
-    /// Whether the server advertised `foldingRangeProvider`. A buffer whose
-    /// `foldmethod=expr` resolves to the LSP foldexpr requests folding ranges only
-    /// from a server that offers them, so this gates the request like `inlay_hints`.
-    folding_range: bool,
+    /// Everything this server advertised at `initialize`, per feature.
+    ///
+    /// Kept whole (rather than distilled to the two or three bools the request
+    /// paths used to need) because it is now the **routing** input: with several
+    /// servers on a buffer, "which server answers a hover" is "the first one, in
+    /// key order, whose `providers.hover` is true". See
+    /// [`EditHost::lsp_target_for`].
+    providers: ProviderCaps,
     /// The server's advertised `signatureHelpProvider.{trigger,retrigger}Characters`
     /// (usually `(` / `,`), pre-reduced to `char`s. Pushed into core as the
     /// auto-trigger set when this server attaches and the user opted in; empty when the
@@ -797,8 +976,27 @@ pub(crate) fn sync_label(kind: TextDocumentSyncKind) -> &'static str {
 /// `$NXVIM_LSP_CMD` overrides the whole command (the mock hook, the LSP analogue
 /// of `NXVIM_TS_WORKER`), else the config's `cmd` is used verbatim. `None` when no
 /// program can be determined (an empty `cmd` and no override).
-pub(crate) fn lsp_spawn(cmd: &[String]) -> Option<ServerSpawn> {
-    if let Ok(override_cmd) = std::env::var("NXVIM_LSP_CMD") {
+///
+/// `$NXVIM_LSP_CMD_<name>` overrides just the server named `name`, and wins over the
+/// blanket `$NXVIM_LSP_CMD`. Without it a test cannot stand up **two** distinct mock
+/// servers — the blanket override would point both at the same script, so nothing
+/// could tell which server answered, and a multi-server assertion would prove
+/// nothing. (`name` is upper-cased and non-alphanumerics become `_`, so a config
+/// named `ts_ls` reads `$NXVIM_LSP_CMD_TS_LS`.)
+pub(crate) fn lsp_spawn(name: &str, cmd: &[String]) -> Option<ServerSpawn> {
+    let per_server: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let override_cmd = std::env::var(format!("NXVIM_LSP_CMD_{per_server}"))
+        .or_else(|_| std::env::var("NXVIM_LSP_CMD"));
+    if let Ok(override_cmd) = override_cmd {
         let mut parts = override_cmd.split_whitespace().map(str::to_string);
         let program = parts.next()?;
         return Some(ServerSpawn {

@@ -1,0 +1,241 @@
+# Multiple LSP servers attached to one buffer
+
+Date: 2026-07-25
+
+## Problem
+
+Enabling two servers for one filetype — the canonical `pyright` + `ruff` Python
+setup, or `ts_ls` + `eslint` — **spawns both and attaches one**. The other process
+runs, initializes, and then sits idle forever: it never receives `didOpen`, never
+answers a request, never publishes a diagnostic.
+
+Worse, *which* one wins is nondeterministic. Measured over three identical runs
+(two mock servers, both `filetypes = { "rust" }`):
+
+```
+spawned=[alpha,beta]  attached_to_buffer=[beta]
+spawned=[alpha,beta]  attached_to_buffer=[beta]
+spawned=[alpha,beta]  attached_to_buffer=[alpha]
+```
+
+`nx.lsp._on_filetype` iterates `pairs(nx.lsp._enabled)` — unspecified hash order —
+and queues an `LspOp::Start` per matching server. Each `Start` overwrites a single
+slot:
+
+```rust
+// lsp/sync.rs, apply_lsp_start
+if state.server.as_ref() != Some(&key) { state.opened = false; state.version = 0; }
+state.server = Some(key);
+```
+
+`LspDocState.server` is `Option<ServerKey>` — *"Which server owns this buffer"* —
+and every downstream surface keys off it (24 read sites): document sync, all
+requests, `publishDiagnostics`, semantic tokens, inlay hints, folding.
+
+### What this already invalidates
+
+- `nxvim-workspaces`' README claims each enabled server "attaches when you open a
+  matching file", and its shipped example enables `pyright` **and** `ruff` for
+  Python. That example cannot work as documented.
+- `vim.lsp.buf.format({ name = … })` was just made to *reject* `name` (`f516cbe3`)
+  on the grounds that there is nothing to select. Once this lands, `name` becomes
+  meaningful and must be **modeled** instead — the rejection is a placeholder.
+- `vim.lsp.get_clients({ bufnr })` can return at most one client, so any config
+  branching on "is eslint attached?" silently sees the wrong answer.
+
+## What is already multi-server ready
+
+Both transports drive N servers keyed by `ServerKey` and need **no change**:
+
+- native `LspManager` — `lsp_servers: HashMap<ServerKey, ServerRuntime>`;
+- wasm `SyncLspClient` — `servers: HashMap<ServerKey, ServerState>` (`sync_client.rs`).
+
+The Lua mirror is also already a set: `nx.lsp._attached[buf][client_id] = true`,
+and `nx.lsp.clients{bufnr}` iterates it with `pairs`. It reports one client today
+only because the core fires one `LspAttach`.
+
+So the work is confined to **`EditHost`'s per-buffer document/request layer**. That
+is the good news and the reason this is tractable.
+
+## Constraints
+
+- **Per-server document state.** Most of `LspDocState` is per-server, not
+  per-buffer: `opened`, `version`, `last_tick`, `shadow`, `last_save_tick`,
+  `diagnostics`, `semantic`, `inlay`. Two servers negotiate *different* position
+  encodings and *different* sync kinds, so `shadow` and the version counter cannot
+  be shared. Only `uri` and `language_id` are genuinely per-buffer.
+- **`lsp_requests` is keyed by `LspReqKind` alone.** `register_lsp_request` inserts
+  by kind and settles the displaced promise as `nil`. With two hover-capable
+  servers, issuing to both means the second request cancels the first — so the
+  pending map must key by `(kind, server)`, and `ReqToken` must carry the server.
+- **Capability gating already exists per server** (`ServerRuntime.legend`,
+  `inlay_hints`, `folding_range`), which is exactly the selector a fan-out needs:
+  ask only the servers that advertise the feature.
+- **Diagnostics must merge, not clobber.** `publishDiagnostics` is per-server, and
+  each arrives in *its own* negotiated encoding. `diagnostics_merged` already
+  carries `(diagnostic, encoding)` pairs precisely because client-set diagnostics
+  differ in encoding from LSP ones — the same shape extends to N servers for free.
+- **The editor must never freeze.** Fan-out multiplies requests per keystroke
+  (completion, signature help). Per-server generation gating must drop stale
+  replies without waiting on slow servers.
+- **Tier-1 remote.** Every phase must work identically native and over a daemon,
+  and be verified in both builds (`--test daemon_*`, plus `--no-default-features`).
+- **No silent stubs.** A server that can't answer a kind is skipped explicitly; a
+  request with no capable server settles its promise rather than hanging.
+
+## Design
+
+`LspDocState` splits in two:
+
+```rust
+struct LspDocState {              // per BUFFER
+    uri: Option<Url>,
+    language_id: String,
+    servers: BTreeMap<ServerKey, LspServerDoc>,   // ordered => deterministic
+    inlay_enabled: bool,          // buffer-level user toggles stay here
+    semantic_enabled: Option<bool>,
+}
+
+struct LspServerDoc {             // per (BUFFER, SERVER)
+    opened: bool,
+    version: i32,
+    last_tick: u64,
+    last_save_tick: u64,
+    shadow: String,
+    diagnostics: Vec<Diagnostic>,
+    semantic: SemanticTokensCache,
+    inlay: InlayHintsCache,
+}
+```
+
+`BTreeMap` (not `HashMap`) so iteration order is the server name — deterministic
+output, which is the direct fix for the nondeterminism above.
+
+**Request routing** gets an explicit policy per kind, because "ask everyone" is
+wrong for some:
+
+| kind | policy | why |
+| --- | --- | --- |
+| hover, signatureHelp | first capable, in name order | one popup; merging prose is noise |
+| definition, declaration, typeDefinition, implementation | first capable | a jump has one destination |
+| references, documentSymbol, codeAction | **fan out + merge** | genuinely additive across servers |
+| completion | fan out + merge | the whole point of a second server |
+| formatting | single, **selected** | `format({name=})` picks; else first capable |
+| rename | first capable | a rename is one workspace edit |
+| diagnostics (push) | per-server, merged at projection | already the shape |
+
+The policy table is the reviewable artifact — it is where the judgment lives, and
+it is deliberately conservative (fan out only where merging is well-defined).
+
+## Phases
+
+Each phase is committed separately and pauses for review.
+
+### Phase 1 — split the state, keep exactly one server bound
+
+Introduce `LspServerDoc` and the `servers` map. **Behavior does not change**: the
+dispatcher still binds one server per buffer, so all 24 read sites move to
+`state.primary()` (the single entry). Pure refactor with the full suite green.
+
+*Why first:* it isolates the mechanical churn (24 sites) from any behavior change,
+so the phase that follows has a reviewable diff.
+
+Done when: suite green, no observable difference, `state.server` gone.
+
+### Phase 2 — attach N, sync N
+
+`apply_lsp_start` inserts into `servers` instead of overwriting. `sync_lsp` loops
+the map, sending `didOpen`/`didChange`/`didSave`/`didClose` per server at its own
+encoding and sync kind. `LspAttach` fires once per server; `LspDetach` likewise.
+
+Done when: two mock servers both receive `didOpen` for one buffer, and
+`vim.lsp.get_clients({ bufnr = 0 })` reports both, deterministically ordered.
+
+### Phase 3 — per-server requests
+
+Split in two once the work started, because the halves need different machinery
+and only the second needs new state.
+
+**3a — capability-aware selection (done).** Every request picks the first attached
+server, in key order, that advertises the matching provider (`LspReqKind::provider`
+→ `ProviderCaps`), instead of the buffer's first server. No new machinery:
+`lsp_requests` stays keyed by kind because exactly one server is asked per request.
+`PendingLspReq` records which server was asked, so a reply is decoded against the
+encoding/legend of the server that *produced* it — re-deriving it would decode one
+server's semantic tokens with another's legend, which paints plausible nonsense
+rather than failing visibly. The semantic/inlay projections read across servers for
+the same reason: the cache now lives under whichever server advertised the feature.
+
+**3b — fan-out and merge (done, except completion).** References, document symbols
+and code actions issue to every capable server; their replies fold into an
+`LspFanout` round and present once. The round lives in its own map rather than
+re-keying `lsp_requests` by `(kind, ServerKey)`: fan-out kinds have N replies in
+flight for one user action, which the single-slot map cannot express, and keeping
+them separate leaves the single-target path untouched.
+
+Merged code actions carry the server that produced each one. That is not
+bookkeeping: a lazy action is finished with `codeAction/resolve`, whose `data` blob
+only its own server understands, so resolving ruff's action against pyright is a
+wrong request rather than a degraded one.
+
+A round completes when every asked server replies **or exits** (`drop_fanout_server`
+retires a dead server's slot). A server that neither replies nor exits holds its
+round open until the next request supersedes it — the same exposure a single hung
+server has always had, not a new one.
+
+**Completion is deliberately still single-target.** It re-requests per keystroke, so
+fanning it out is exactly where the request-amplification risk below bites, and the
+popup path (`on_completion_reply`, incremental filtering, `is_incomplete`) needs its
+own design rather than this round mechanism. Tracked as 3c.
+
+Done when: two servers with overlapping capabilities both contribute references,
+and a slow server cannot stall the other's reply.
+
+### Phase 4 — diagnostics, semantic tokens, inlay hints per server
+
+`publishDiagnostics` stores under its own server; `diagnostics_merged` concatenates
+across servers, each with its own encoding (the pair shape already supports it).
+Semantic tokens and inlay hints request only from advertising servers and merge
+their spans.
+
+Done when: two servers publishing diagnostics for one buffer both render, with
+correct columns under differing negotiated encodings.
+
+### Phase 5 — the Lua/compat surface catches up (done)
+
+- `nx.lsp.format{ name = … }` / `vim.lsp.buf.format{ name = … }` **modeled** —
+  replacing the `f516cbe3` rejection. `LspOp::Format` carries the name, and
+  `:LspFormat [server]` is the ex twin. A name not attached to the buffer reports
+  so and resolves `nil`; it never silently falls back to a different server, which
+  is the failure the option exists to prevent. `bufnr`/`range`/`filter` stay
+  rejected (nxvim formats the current buffer whole).
+- `nx.lsp.clients{bufnr}` documented as returning N, with the warning not to index
+  `[1]` expecting "the" server.
+- `nxvim-workspaces` README/example corrected — multi-server is now described as
+  the normal case, and the Python example names `ruff` as its formatter because
+  pyright also advertises formatting.
+- `docs/architecture.md` needed no change: it never claimed one server per buffer.
+
+### Phase 6 — remote + wasm verification
+
+`daemon_*` LSP tests with two servers; `--no-default-features` build; the
+`verify-lsp.mjs` browser check extended to a second server.
+
+## Testing
+
+Per repo convention every phase is black-box through the running server. The mock
+(`nxvim --__lsp-mock`) already answers from real document state; multi-server tests
+need it spawnable **twice with different scripts**, which today is blocked by
+`$NXVIM_LSP_CMD` overriding the argv globally. Phase 2 therefore also introduces a
+per-server mock override (`$NXVIM_LSP_CMD_<name>`), or the tests cannot distinguish
+which server answered — a prerequisite, not an afterthought.
+
+## Risks
+
+- **Request amplification.** Completion fan-out doubles per-keystroke traffic.
+  Mitigated by capability gating and per-server generation drops; guarded by a
+  flood test in the spirit of `terminal.rs`.
+- **Encoding bugs.** Two servers on one buffer at utf-8 and utf-16 is exactly where
+  column math breaks. Phase 4 tests must use *differing* encodings deliberately.
+- **Phase 1 churn.** 24 mechanical sites; the risk is a silent behavior change
+  smuggled in. Mitigated by requiring the suite green with zero test edits.

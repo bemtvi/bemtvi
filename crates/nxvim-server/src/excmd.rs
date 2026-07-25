@@ -113,7 +113,13 @@ impl EditHost {
             // argument; rename reads the new name the dispatcher split off — or,
             // with no name, prompts for it through `vim.lsp.buf.rename()`
             // (`vim.ui.input`, Phase 8) instead of erroring.
-            "LspFormat" => self.request_lsp_format(0),
+            // `:LspFormat [server]` — the optional argument picks which attached
+            // server formats (the ex twin of `nx.lsp.format{ name = … }`).
+            "LspFormat" => {
+                let name = args.trim();
+                let name = (!name.is_empty()).then(|| name.to_string());
+                self.request_lsp_format(0, name)
+            }
             "LspRename" if args.trim().is_empty() => {
                 if let Err(e) = self.lua.exec("vim.lsp.buf.rename()") {
                     self.editor

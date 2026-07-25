@@ -261,10 +261,32 @@ impl EditHost {
         cb_id: u64,
         opts: CodeActionOpts,
     ) {
-        let actions: Vec<CodeActionData> = actions
+        // Single-server path: every action came from the buffer's chosen server.
+        let servers = self
+            .lsp_target_for(self.editor.current_buffer_id(), LspReqKind::CodeAction)
+            .map(|(key, _, _)| vec![key; actions.len()])
+            .unwrap_or_default();
+        self.show_code_actions_from(actions, servers, cb_id, opts);
+    }
+
+    /// [`show_code_actions`](Self::show_code_actions) for a list merged from several
+    /// servers: `servers[i]` produced `actions[i]`, so a lazy action resolves against
+    /// the server that understands its `data`.
+    pub(crate) fn show_code_actions_from(
+        &mut self,
+        actions: Vec<CodeActionData>,
+        servers: Vec<ServerKey>,
+        cb_id: u64,
+        opts: CodeActionOpts,
+    ) {
+        // Filter the merged list, keeping each action paired with its origin.
+        let (actions, servers): (Vec<CodeActionData>, Vec<ServerKey>) = actions
             .into_iter()
-            .filter(|a| opts.matches(a.kind.as_deref()))
-            .collect();
+            .zip(servers.into_iter().map(Some).chain(std::iter::repeat(None)))
+            .filter(|(a, _)| opts.matches(a.kind.as_deref()))
+            .filter_map(|(a, s)| s.map(|s| (a, s)))
+            .unzip();
+        self.lsp_code_action_servers = servers;
         if actions.is_empty() {
             self.editor.echo(LspReqKind::CodeAction.empty_message());
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
@@ -325,7 +347,12 @@ impl EditHost {
         // branch, which hands it to `resolve_code_action` to settle when its reply lands.
         let cb = std::mem::take(&mut self.code_action_cb);
         let action = self.lsp_code_actions.get(index).cloned();
+        // The server that produced THIS action, captured before the stash is cleared —
+        // a lazy action's `codeAction/resolve` must go back to it, not to whichever
+        // server the buffer happens to list first.
+        let origin = self.lsp_code_action_servers.get(index).cloned();
         self.lsp_code_actions.clear();
+        self.lsp_code_action_servers.clear();
         let Some(action) = action else {
             self.settle_lsp_promise(cb, serde_json::Value::Null);
             return;
@@ -348,7 +375,7 @@ impl EditHost {
                 // A lazy action: ask the server to fill in its edit, then apply
                 // when the reply lands (reply-as-event, like format/rename). The
                 // promise rides the resolve request and settles on that reply.
-                self.resolve_code_action(raw, cb);
+                self.resolve_code_action(raw, cb, origin);
             } else {
                 self.editor.echo("Code action has no edit");
                 self.lsp_dirty = true;
@@ -390,12 +417,21 @@ impl EditHost {
     /// edit is applied in [`EditHost::on_lsp_reply`]. `cb_id` (`0` = fire-and-forget)
     /// is the async `code_action` promise, carried on the request so the resolve reply
     /// settles it once the edit applies (no server ⇒ settle `nil` now).
+    /// `origin` is the server that produced the action (from the merged list); it is
+    /// the only server whose `codeAction/resolve` can make sense of the action's
+    /// `data`. `None` falls back to the buffer's code-action server.
     pub(crate) fn resolve_code_action(
         &mut self,
         action: Box<nxvim_lsp::lsp_types::CodeAction>,
         cb_id: u64,
+        origin: Option<ServerKey>,
     ) {
-        let Some((key, _uri, _encoding)) = self.lsp_target_or_echo() else {
+        let key = origin.or_else(|| {
+            self.lsp_target_for(self.editor.current_buffer_id(), LspReqKind::CodeAction)
+                .map(|(key, _, _)| key)
+        });
+        let Some(key) = key else {
+            self.editor.echo("No language server attached");
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };

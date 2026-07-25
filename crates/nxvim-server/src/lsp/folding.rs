@@ -31,19 +31,15 @@ impl EditHost {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return;
         };
-        let Some(key) = state.server.clone() else {
+        // Selected by capability, so a second server providing folds is used even
+        // when the buffer's first one doesn't.
+        let Some((key, _uri, _enc)) = self.lsp_target_for(buffer, LspReqKind::FoldingRange) else {
             return;
         };
         let Some(uri) = state.uri.clone() else {
             return;
         };
-        let Some(rt) = self.lsp_servers.get(&key) else {
-            return;
-        };
-        if !rt.folding_range {
-            return;
-        }
-        let token = self.register_buffer_scoped_request(LspReqKind::FoldingRange, buffer);
+        let token = self.register_buffer_scoped_request(LspReqKind::FoldingRange, buffer, &key);
         self.fx
             .lsp_request(key, token, nxvim_lsp::LspRequest::FoldingRange { uri });
     }

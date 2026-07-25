@@ -71,14 +71,20 @@ impl EditHost {
         if !state.semantic_on() {
             return;
         }
-        let Some(key) = state.server.clone() else {
+        // The server must have finished initialize (so its legend is known) and
+        // actually advertise semantic tokens — with several attached, that is a
+        // *selection*, not a check on the first one.
+        let Some((key, _uri, _enc)) = self.lsp_target_for(buffer, LspReqKind::SemanticTokens)
+        else {
             return;
         };
+        let Some(doc) = state.doc(&key) else {
+            return;
+        };
+        let cached_result_id = doc.semantic.result_id.clone();
         let Some(uri) = state.uri.clone() else {
             return;
         };
-        // The server must have finished initialize (so its legend is known) and
-        // actually advertise semantic tokens; otherwise there is nothing to ask.
         let Some(rt) = self.lsp_servers.get(&key) else {
             return;
         };
@@ -88,7 +94,7 @@ impl EditHost {
         let supports_delta = rt.semantic_tokens_delta;
         // Send `full/delta` only once we have a cached `result_id` *and* the server
         // advertised delta support; otherwise re-request the whole `full` set.
-        let request = match state.semantic.result_id.clone() {
+        let request = match cached_result_id {
             Some(previous_result_id) if supports_delta => {
                 nxvim_lsp::LspRequest::SemanticTokensDelta {
                     uri,
@@ -97,7 +103,7 @@ impl EditHost {
             }
             _ => nxvim_lsp::LspRequest::SemanticTokensFull { uri },
         };
-        let token = self.register_buffer_scoped_request(LspReqKind::SemanticTokens, buffer);
+        let token = self.register_buffer_scoped_request(LspReqKind::SemanticTokens, buffer, &key);
         self.fx.lsp_request(key, token, request);
     }
 
@@ -129,10 +135,22 @@ impl EditHost {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return;
         };
-        let Some(key) = state.server.as_ref() else {
+        // Decode against the server that ANSWERED, recorded when the request was
+        // issued. Re-deriving it from the buffer would decode one server's tokens
+        // with another's legend — the indices are per-legend, so the result is
+        // plausible-looking nonsense rather than an obvious failure.
+        let Some(key) = self
+            .lsp_requests
+            .get(&LspReqKind::SemanticTokens)
+            .and_then(|p| p.server.clone())
+            .or_else(|| state.primary_key().cloned())
+        else {
             return;
         };
-        let Some(rt) = self.lsp_servers.get(key) else {
+        let Some(doc) = state.doc(&key) else {
+            return;
+        };
+        let Some(rt) = self.lsp_servers.get(&key) else {
             return;
         };
         let Some(legend) = rt.legend.as_ref() else {
@@ -144,13 +162,15 @@ impl EditHost {
         let (result_id, tokens) = match data {
             SemanticTokensData::Full { result_id, tokens } => (result_id, tokens),
             SemanticTokensData::Delta { result_id, edits } => {
-                let base = &state.semantic.tokens;
+                let base = &doc.semantic.tokens;
                 // The request quoted a `result_id`, so the cache should hold its
                 // base. If it doesn't (no base to patch), the delta is unusable:
                 // clear and re-request a full set rather than splice into nothing.
                 if base.is_empty() && !edits.is_empty() {
                     let state = self.lsp_states.get_mut(&buffer).expect("checked above");
-                    state.semantic = Default::default();
+                    if let Some(doc) = state.primary_doc_mut() {
+                        doc.semantic = Default::default();
+                    }
                     self.lsp_dirty = true;
                     self.request_semantic_tokens(buffer);
                     return;
@@ -165,9 +185,11 @@ impl EditHost {
         // Lua (the diagnostics-mirror analogue), then cache the spans for the paint.
         let mirror = semantic_mirror(&spans, client_id);
         let state = self.lsp_states.get_mut(&buffer).expect("checked above");
-        state.semantic.result_id = result_id;
-        state.semantic.tokens = tokens;
-        state.semantic.spans = spans;
+        if let Some(doc) = state.doc_mut(&key) {
+            doc.semantic.result_id = result_id;
+            doc.semantic.tokens = tokens;
+            doc.semantic.spans = spans;
+        }
         let _ = self.lua.set_semantic_tokens(buffer.0, &mirror);
         self.lsp_dirty = true;
     }
@@ -199,9 +221,18 @@ impl EditHost {
         if !state.semantic_on() {
             return Vec::new();
         }
-        let Some(spans) = state.semantic.spans.get(&line_idx) else {
+        // Read across every attached server, not just the first: the tokens are
+        // cached under whichever server ADVERTISED semantic tokens, which need not be
+        // the buffer's first. (In practice one server provides them; the flat_map is
+        // what makes "which one" irrelevant here.)
+        let spans: Vec<&SemanticSpan> = state
+            .servers()
+            .filter_map(|(_, d)| d.semantic.spans.get(&line_idx))
+            .flatten()
+            .collect();
+        if spans.is_empty() {
             return Vec::new();
-        };
+        }
         spans
             .iter()
             .enumerate()

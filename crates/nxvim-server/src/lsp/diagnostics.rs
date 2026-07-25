@@ -30,10 +30,32 @@ impl EditHost {
         &self,
         buffer: nxvim_core::BufferId,
     ) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
-        let state = self.lsp_states.get(&buffer)?;
-        let key = state.server.as_ref()?;
+        let (key, doc) = self.lsp_states.get(&buffer)?.primary()?;
         let encoding = self.lsp_servers.get(key)?.encoding;
-        Some((&state.diagnostics, encoding))
+        Some((&doc.diagnostics, encoding))
+    }
+
+    /// Every attached server's diagnostics for `buffer`, each paired with **that
+    /// server's** negotiated encoding.
+    ///
+    /// The pairing is the point: two servers on one buffer may have negotiated
+    /// different encodings, so their `character` columns are not comparable and can
+    /// only be converted per source. Callers must not flatten this into one encoding.
+    pub(crate) fn lsp_diagnostics_of(
+        &self,
+        buffer: nxvim_core::BufferId,
+    ) -> Vec<(&Diagnostic, PositionEncoding)> {
+        let Some(state) = self.lsp_states.get(&buffer) else {
+            return Vec::new();
+        };
+        state
+            .servers()
+            .filter_map(|(key, doc)| {
+                let encoding = self.lsp_servers.get(key)?.encoding;
+                Some(doc.diagnostics.iter().map(move |d| (d, encoding)))
+            })
+            .flatten()
+            .collect()
     }
 
     /// Every diagnostic to project for `buffer`, each paired with the position
@@ -49,10 +71,7 @@ impl EditHost {
         &self,
         buffer: nxvim_core::BufferId,
     ) -> Vec<(&Diagnostic, PositionEncoding)> {
-        let mut out = Vec::new();
-        if let Some((diags, encoding)) = self.diagnostics_of(buffer) {
-            out.extend(diags.iter().map(|d| (d, encoding)));
-        }
+        let mut out = self.lsp_diagnostics_of(buffer);
         if let Some(diags) = self.client_diagnostics.get(&buffer) {
             out.extend(diags.iter().map(|d| (d, PositionEncoding::Utf8)));
         }

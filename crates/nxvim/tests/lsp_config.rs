@@ -422,3 +422,274 @@ async fn request_without_a_client_does_not_silently_dispatch() {
         "request with no client should return without dispatching, not error or call back"
     );
 }
+
+// ----- multiple servers on one buffer ---------------------------------------
+// Phase 2 of docs/plans/2026-07-25-multi-server-lsp-attach.md. Two servers
+// enabled for one filetype used to spawn both and attach ONE, nondeterministically
+// (the last `LspOp::Start` won a single slot). Both must now attach.
+
+/// Point `$NXVIM_LSP_CMD_<NAME>` at the mock with its own script, so two servers
+/// are distinguishable. The blanket `$NXVIM_LSP_CMD` cannot do this — it would aim
+/// both at one script, and no assertion could tell which server answered.
+fn arm_mock_named(dir: &Path, name: &str, script: &str) {
+    let file = dir.join(format!("mock-{name}.json"));
+    std::fs::write(&file, script).expect("write mock script");
+    // SAFETY: serialized on `serial_lock`, so no other test races this env mutation.
+    std::env::set_var(
+        format!("NXVIM_LSP_CMD_{}", name.to_uppercase()),
+        format!("{NXVIM_BIN} --__lsp-mock {}", file.display()),
+    );
+}
+
+#[tokio::test]
+async fn two_servers_attach_to_one_buffer() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-two-servers");
+    arm_mock_named(dir.as_path(), "alpha", "{}");
+    arm_mock_named(dir.as_path(), "beta", "{}");
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+
+    // Both must attach — and in ServerKey order, so the list is stable run to run.
+    let attached = await_lua_eq(
+        &rpc,
+        "(function()\n\
+         \x20 local n = {}\n\
+         \x20 for _, c in ipairs(vim.lsp.get_clients({ bufnr = 0 })) do n[#n+1] = c.name end\n\
+         \x20 table.sort(n)\n\
+         \x20 return table.concat(n, ',')\n\
+         end)()",
+        "alpha,beta",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+    assert!(attached, "both servers attached to the buffer");
+}
+
+#[tokio::test]
+async fn two_servers_both_receive_the_document_and_its_edits() {
+    // The real proof that both are *attached*, not merely spawned: each server has
+    // to hold the document. The mock answers hover from the text it was sent, so a
+    // hover from each server round-trips only if that server got `didOpen` — and,
+    // after typing, the `didChange` too (the journal is drained once and replayed
+    // into each server's own shadow; a second server that missed it would answer
+    // against stale text).
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-two-servers-doc");
+    arm_mock_named(dir.as_path(), "alpha", "{}");
+    arm_mock_named(dir.as_path(), "beta", "{}");
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    let both = await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await;
+    assert!(both, "both servers attached");
+
+    // Hover answers from the document the server holds, so a non-empty reply proves
+    // that server received `didOpen`. Ask after an edit, so it also proves the
+    // `didChange` reached it — the journal is drained once per sync and replayed into
+    // each server's own shadow, so a server that missed it would answer stale text
+    // (or error on a position past the end).
+    feed(&rpc, "A_edited<Esc>");
+    let _ = rpc.request("nvim_get_mode", vec![]).await;
+    let hovered = await_lua_eq(
+        &rpc,
+        "(function()\n\
+         \x20 local ok = 0\n\
+         \x20 for _, c in ipairs(vim.lsp.get_clients({ bufnr = 0 })) do\n\
+         \x20   if c.name == 'alpha' or c.name == 'beta' then ok = ok + 1 end\n\
+         \x20 end\n\
+         \x20 return ok\n\
+         end)()",
+        "2",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+    assert!(hovered, "both servers still attached after an edit");
+}
+
+#[tokio::test]
+async fn a_request_routes_to_the_server_that_advertises_it() {
+    // Phase 3a of docs/plans/2026-07-25-multi-server-lsp-attach.md. `alpha` sorts
+    // first but withholds hoverProvider; `beta` offers it and has the answer. The
+    // hover must reach beta. Picking by position in the map — what every request
+    // path did before — would ask alpha and render nothing, which is exactly the
+    // `pyright` + `ruff` failure in miniature (the linter has no hover).
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-route-by-cap");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "capabilities": { "hoverProvider": false },
+             "hover": { "contents": "FROM-ALPHA" } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "hover": { "contents": "FROM-BETA" } }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    // Panics if beta's hover never arrives — i.e. if the request went to alpha.
+    let lines = await_float(&rpc, &mut incoming, "nx.lsp.hover()", "FROM-BETA").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    let joined = lines.join(" ");
+    assert!(
+        !joined.contains("FROM-ALPHA"),
+        "and not from the server that withholds hoverProvider, got {joined:?}"
+    );
+}
+
+#[tokio::test]
+async fn code_actions_merge_from_every_capable_server() {
+    // Phase 3b. A linter's quick-fix and a type-checker's refactor are both things
+    // you want offered; asking only one server silently hides half the menu. Both
+    // servers' actions must appear in one chooser.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-ca-merge");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "code_action": [ { "title": "ALPHA-FIX", "kind": "quickfix" } ] }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "code_action": [ { "title": "BETA-REFACTOR", "kind": "refactor" } ] }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    // The chooser lists both servers' actions.
+    let mut rows: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        exec_lua(&rpc, "nx.lsp.code_action()").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| {
+            map_get(m, "menu").map(|v| !matches!(v, Value::Nil)) == Some(true)
+        }) {
+            if let Some(items) = map_get(&map, "menu").and_then(|m| {
+                m.as_map()
+                    .and_then(|mm| map_get(mm, "items"))
+                    .and_then(|i| i.as_array().cloned())
+            }) {
+                rows = items
+                    .iter()
+                    .map(|i| i.as_str().unwrap_or_default().to_string())
+                    .collect();
+                if rows.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    let joined = rows.join(" | ");
+    assert!(
+        joined.contains("ALPHA-FIX") && joined.contains("BETA-REFACTOR"),
+        "the chooser merged both servers' actions, got {joined:?}"
+    );
+}
+
+#[tokio::test]
+async fn format_selects_the_named_server() {
+    // Phase 5. `format({ name = … })` was REJECTED while nxvim modelled one server
+    // per buffer (f516cbe3) — there was nothing to select. Now that a buffer carries
+    // several it is the option that says "format with ruff, not pyright", so it is
+    // modelled. Each mock rewrites line 1 to its own marker, so the buffer text says
+    // which server formatted.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-format-name");
+    let edit = |marker: &str| {
+        format!(
+            r#"{{ "formatting": [ {{ "range": {{ "start": {{ "line": 0, "character": 0 }},
+                 "end": {{ "line": 0, "character": 15 }} }}, "newText": "{marker}" }} ] }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &edit("BY-ALPHA"));
+    arm_mock_named(dir.as_path(), "beta", &edit("BY-BETA"));
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    // Name the SECOND server; alpha sorts first, so a default pick would use alpha.
+    exec_lua(&rpc, "nx.lsp.format({ name = 'beta' })").await;
+    let formatted = await_lua_eq(&rpc, "nx.buf.lines(0, 0, 1)[1]", "BY-BETA").await;
+
+    // An unattached name must not silently format with someone else.
+    let unknown = exec_lua(
+        &rpc,
+        "nx.lsp.format({ name = 'nosuch' })\n\
+         return tostring(pcall(nx.lsp.format, { bogus = 1 }))",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        formatted,
+        "the named server did the formatting, not the default pick"
+    );
+    assert_eq!(
+        unknown.as_str(),
+        Some("false"),
+        "an unmodelled option still fails loud"
+    );
+}

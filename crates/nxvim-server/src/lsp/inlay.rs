@@ -63,18 +63,15 @@ impl EditHost {
         if !state.inlay_enabled {
             return;
         }
-        let Some(key) = state.server.clone() else {
+        // Selected, not assumed: the first attached server advertising
+        // `inlayHintProvider` answers, so a second server providing hints is used
+        // even when the buffer's first one doesn't.
+        let Some((key, _uri, _enc)) = self.lsp_target_for(buffer, LspReqKind::InlayHints) else {
             return;
         };
         let Some(uri) = state.uri.clone() else {
             return;
         };
-        let Some(rt) = self.lsp_servers.get(&key) else {
-            return;
-        };
-        if !rt.inlay_hints {
-            return;
-        }
         // Whole-buffer range: `(0,0)` .. `(line_count, 0)`. A viewport-scoped range
         // is a Phase-2 follow-up (recorded as an approximation).
         let line_count = self.editor.buffer_of(buffer).map_or(0, |b| b.line_count());
@@ -88,7 +85,7 @@ impl EditHost {
                 character: 0,
             },
         };
-        let token = self.register_buffer_scoped_request(LspReqKind::InlayHints, buffer);
+        let token = self.register_buffer_scoped_request(LspReqKind::InlayHints, buffer, &key);
         self.fx
             .lsp_request(key, token, nxvim_lsp::LspRequest::InlayHint { uri, range });
     }
@@ -113,10 +110,18 @@ impl EditHost {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return;
         };
-        let Some(key) = state.server.as_ref() else {
+        // The server that answered, recorded at issue time — its encoding is what the
+        // hints' `character` columns are authored in, and two attached servers can
+        // have negotiated different ones.
+        let Some(key) = self
+            .lsp_requests
+            .get(&LspReqKind::InlayHints)
+            .and_then(|p| p.server.clone())
+            .or_else(|| state.primary_key().cloned())
+        else {
             return;
         };
-        let Some(rt) = self.lsp_servers.get(key) else {
+        let Some(rt) = self.lsp_servers.get(&key) else {
             return;
         };
         let encoding = rt.encoding;
@@ -153,10 +158,13 @@ impl EditHost {
         }
 
         let state = self.lsp_states.get_mut(&buffer).expect("checked above");
-        state.inlay.hints = by_line;
+        let Some(doc) = state.doc_mut(&server_key) else {
+            return;
+        };
+        doc.inlay.hints = by_line;
         // Push the read mirror (`nx._inlay_hints`) and then resolve any lazy
         // placeholders; a resolve reply refreshes the mirror again as it fills in.
-        let mirror = inlay_mirror(&state.inlay, client_id);
+        let mirror = inlay_mirror(&doc.inlay, client_id);
         let _ = self.lua.set_inlay_hints(buffer.0, &mirror);
         self.issue_inlay_resolves(buffer, &server_key, req_tick);
         self.lsp_dirty = true;
@@ -171,8 +179,8 @@ impl EditHost {
         // Collect (line, idx, hint-json) for every placeholder first — issuing
         // borrows `self.fx` mutably, so the cache read must finish beforehand.
         let mut jobs: Vec<(usize, usize, nxvim_lsp::serde_json::Value)> = Vec::new();
-        if let Some(state) = self.lsp_states.get(&buffer) {
-            for (&line, spans) in &state.inlay.hints {
+        if let Some(doc) = self.lsp_states.get(&buffer).and_then(|s| s.doc(server_key)) {
+            for (&line, spans) in &doc.inlay.hints {
                 for (idx, span) in spans.iter().enumerate() {
                     if let Some(data) = &span.resolve_data {
                         jobs.push((line, idx, data.clone()));
@@ -228,8 +236,7 @@ impl EditHost {
             return;
         };
         let client_id = state
-            .server
-            .as_ref()
+            .primary_key()
             .and_then(|k| self.lsp_servers.get(k))
             .map(|rt| rt.client_id);
         let Some(client_id) = client_id else {
@@ -239,7 +246,10 @@ impl EditHost {
             .lsp_states
             .get_mut(&target.buffer)
             .expect("checked above");
-        let Some(span) = state
+        let Some(doc) = state.primary_doc_mut() else {
+            return;
+        };
+        let Some(span) = doc
             .inlay
             .hints
             .get_mut(&target.line)
@@ -249,7 +259,7 @@ impl EditHost {
         };
         span.text = sanitize_label(&label);
         span.resolve_data = None;
-        let mirror = inlay_mirror(&state.inlay, client_id);
+        let mirror = inlay_mirror(&doc.inlay, client_id);
         let _ = self.lua.set_inlay_hints(target.buffer.0, &mirror);
         self.lsp_dirty = true;
     }
@@ -295,9 +305,16 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
-                let Some(spans) = state.inlay.hints.get(&line_idx) else {
+                // Across every attached server — the hints are cached under whichever
+                // one advertised `inlayHintProvider`, not necessarily the first.
+                let spans: Vec<&InlayHintSpan> = state
+                    .servers()
+                    .filter_map(|(_, d)| d.inlay.hints.get(&line_idx))
+                    .flatten()
+                    .collect();
+                if spans.is_empty() {
                     return Value::Array(Vec::new());
-                };
+                }
                 let Some(text) = buf.map(|b| b.line(line_idx)) else {
                     return Value::Array(Vec::new());
                 };

@@ -189,8 +189,8 @@ use edithost::NativeEffects;
 use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::Keymaps;
 use lsp::{
-    DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspReqKind, PendingLspReq,
-    ServerRuntime,
+    DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspFanout, LspReqKind,
+    PendingLspReq, ServerRuntime,
 };
 use nxvim_core::{
     BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, PluginEntry, PluginNamespace,
@@ -924,6 +924,12 @@ pub struct EditHost {
     /// The in-flight language-feature request per kind (definition, references,
     /// …), used to match a reply to its intent and drop stale ones.
     lsp_requests: HashMap<LspReqKind, PendingLspReq>,
+    /// The in-flight **fan-out** round per kind (references / document symbols /
+    /// code actions): one logical request issued to every capable server, merging
+    /// their replies into a single presentation. Separate from `lsp_requests`
+    /// because those kinds have N replies in flight for one user action, which the
+    /// single-slot map cannot express — see [`LspFanout`].
+    lsp_fanouts: HashMap<LspReqKind, LspFanout>,
     /// In-flight `inlayHint/resolve`s, keyed by the `cb_id` their token carries.
     /// Unlike the single-slot `lsp_requests`, many lazy hints can resolve at once,
     /// so each gets a distinct `cb_id` (from `inlay_resolve_seq`) and routes back
@@ -970,6 +976,11 @@ pub struct EditHost {
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
     lsp_code_actions: Vec<CodeActionData>,
+    /// The server that produced each entry of `lsp_code_actions`, same indices.
+    /// A lazy action is finished with `codeAction/resolve`, whose `data` blob only
+    /// its own server understands — so a merged list must remember where each came
+    /// from, or the resolve goes to the wrong server.
+    lsp_code_action_servers: Vec<ServerKey>,
     /// The `vim.diagnostic.config` keys with a backing surface — the underline
     /// spans and the inline virtual text — toggled by `vim.diagnostic.config`.
     diag_config: DiagnosticConfig,
@@ -1490,6 +1501,7 @@ impl EditHost {
             lsp_dirty: false,
             lsp_req_gen: 0,
             lsp_requests: HashMap::new(),
+            lsp_fanouts: HashMap::new(),
             inlay_resolves: HashMap::new(),
             inlay_resolve_seq: 0,
             complete_lsp_active: false,
@@ -1500,6 +1512,7 @@ impl EditHost {
             complete_resolve_docs: std::collections::HashMap::new(),
             complete_resolve_inflight: None,
             lsp_code_actions: Vec::new(),
+            lsp_code_action_servers: Vec::new(),
             diag_config: DiagnosticConfig::default(),
             client_diagnostics: HashMap::new(),
             semantic_tokens_enabled: true,

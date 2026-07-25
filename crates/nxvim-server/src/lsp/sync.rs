@@ -42,8 +42,8 @@ impl EditHost {
                 }
                 return;
             }
-            LspOp::Format { cb_id } => {
-                self.request_lsp_format(cb_id);
+            LspOp::Format { cb_id, name } => {
+                self.request_lsp_format(cb_id, name);
                 return;
             }
             LspOp::Rename { new_name, cb_id } => {
@@ -159,8 +159,12 @@ impl EditHost {
                 let buffer = BufferId(bufnr);
                 // Drop the delta cursor so the refresh re-requests the whole `full`
                 // set (neovim's `force_refresh` discards the prior result).
-                if let Some(state) = self.lsp_states.get_mut(&buffer) {
-                    state.semantic.result_id = None;
+                if let Some(doc) = self
+                    .lsp_states
+                    .get_mut(&buffer)
+                    .and_then(|s| s.primary_doc_mut())
+                {
+                    doc.semantic.result_id = None;
                 }
                 self.request_semantic_tokens(buffer);
                 return;
@@ -174,10 +178,14 @@ impl EditHost {
                     // paints it. (No-op unless the server advertises the provider.)
                     self.request_inlay_hints(buffer);
                 } else {
-                    if let Some(state) = self.lsp_states.get_mut(&buffer) {
+                    if let Some(doc) = self
+                        .lsp_states
+                        .get_mut(&buffer)
+                        .and_then(|s| s.primary_doc_mut())
+                    {
                         // Disabling clears the cache — no surviving paint (neovim drops
                         // the hints on disable; they re-fetch on the next enable).
-                        state.inlay = Default::default();
+                        doc.inlay = Default::default();
                     }
                     // Clear the read mirror too, so `vim.lsp.inlay_hint.get` returns
                     // nothing for a disabled buffer.
@@ -248,7 +256,7 @@ impl EditHost {
         // empty command can't start a server. The resolved config's
         // settings/init_options/capabilities ride along so the manager forwards
         // them at `initialize` (Phase 2).
-        let Some(mut spawn) = lsp_spawn(&cmd) else {
+        let Some(mut spawn) = lsp_spawn(&key.name, &cmd) else {
             return;
         };
         spawn.init_options = init_options;
@@ -264,12 +272,11 @@ impl EditHost {
             self.lsp_ensured.insert(key.clone());
         }
         let state = self.lsp_states.entry(buffer).or_default();
-        // Rebinding to a different server re-opens the document under it.
-        if state.server.as_ref() != Some(&key) {
-            state.opened = false;
-            state.version = 0;
-        }
-        state.server = Some(key);
+        // ADDITIVE: a filetype that enables two servers binds the buffer to both, and
+        // each gets its own `didOpen` on the next sync. Re-binding an already-attached
+        // server leaves its document state alone (idempotent), so the repeated
+        // `FileType` dispatch a `nx.lsp.enable` does can't reset a live document.
+        state.attach(key);
         state.language_id = filetype;
         state.uri = Some(uri);
         // Wake a sync so the bound buffer opens as soon as the server initializes.
@@ -292,7 +299,7 @@ impl EditHost {
         let keys: std::collections::HashSet<ServerKey> = self
             .lsp_states
             .values()
-            .filter_map(|s| s.server.clone())
+            .flat_map(|s| s.servers().map(|(k, _)| k.clone()).collect::<Vec<_>>())
             .chain(self.lsp_servers.keys().cloned())
             .collect();
         for key in keys {
@@ -309,9 +316,9 @@ impl EditHost {
         }
         // Force a fresh `didOpen` for every bound buffer once its server re-initializes.
         for state in self.lsp_states.values_mut() {
-            if state.server.is_some() {
-                state.opened = false;
-                state.version = 0;
+            for (_, doc) in state.servers_mut() {
+                doc.opened = false;
+                doc.version = 0;
             }
         }
         self.lsp_dirty = true;
@@ -364,9 +371,11 @@ impl EditHost {
         }
         // Re-open every buffer bound to a restarted server under the fresh process.
         for state in self.lsp_states.values_mut() {
-            if state.server.as_ref().is_some_and(|k| k.name == name) {
-                state.opened = false;
-                state.version = 0;
+            for (key, doc) in state.servers_mut() {
+                if key.name == name {
+                    doc.opened = false;
+                    doc.version = 0;
+                }
             }
         }
         self.lsp_dirty = true;
@@ -382,10 +391,15 @@ impl EditHost {
 
         let buffer = self.editor.current_buffer_id();
         // Only buffers a `nx.lsp.start` bound to a server are synced — there is no
-        // auto-start (Phase 7a: LSP startup is 100% user Lua).
-        let Some(key) = self.lsp_states.get(&buffer).and_then(|s| s.server.clone()) else {
-            return;
+        // auto-start (Phase 7a: LSP startup is 100% user Lua). Every attached server
+        // syncs, each on its own clock, in key order.
+        let keys: Vec<ServerKey> = match self.lsp_states.get(&buffer) {
+            Some(state) => state.servers().map(|(k, _)| k.clone()).collect(),
+            None => return,
         };
+        if keys.is_empty() {
+            return;
+        }
         let Some(path) = self.editor.buffer().path.clone() else {
             return;
         };
@@ -393,114 +407,133 @@ impl EditHost {
             return;
         };
 
-        // The encoding/sync kind aren't known until the server's `initialize`
-        // reply lands (the `Initialized` event). Until then, just remember the
-        // intended URI so the buffer opens as soon as it's ready.
-        let Some(&ServerRuntime {
-            encoding,
-            sync_kind,
-            client_id,
-            ..
-        }) = self.lsp_servers.get(&key)
-        else {
-            let state = self.lsp_states.entry(buffer).or_default();
-            state.uri = Some(uri);
-            return;
-        };
-
         let cur_tick = self.editor.buffer().changedtick;
         let cur_save_tick = self.editor.buffer().save_tick;
 
+        // The edit journal is drained ONCE for the whole buffer, then replayed into
+        // each server's own shadow. Draining per server would hand the first server
+        // the deltas and every later one an empty batch — they would silently diverge
+        // from the buffer, which incremental sync can never recover from.
+        //
+        // It is taken only when at least one attached server actually wants deltas
+        // (opened, initialized, changed, and not sync-NONE); otherwise the journal is
+        // left intact for a later sync.
+        let mut batch: Option<nxvim_core::EditBatch> = None;
+
         let mut state = self.lsp_states.remove(&buffer).unwrap_or_default();
-        state.server = Some(key.clone());
         state.uri = Some(uri.clone());
+        let language_id = state.language_id.clone();
 
-        // A text change since the last sync (only meaningful once opened).
-        let tick_changed = state.opened && cur_tick != state.last_tick;
-
-        // Set when this sync is the buffer's first `didOpen` under the server: the
-        // attach moment, so `LspAttach` fires once the state is re-inserted below.
-        let mut just_attached = false;
-
-        // Set when this sync pushed new content to the server (open or change), so
-        // a `semanticTokens/full` refresh is requested once the state is back in
-        // the map (the request reads it). Gated server-side on the server actually
-        // advertising semantic tokens, so this is free for servers without them.
+        // Servers that sent their first `didOpen` this sync — their attach moment, so
+        // `LspAttach` fires once per server after the state is back in the map.
+        let mut attached: Vec<u64> = Vec::new();
+        // Set when any server saw new content, so the whole-buffer semantic-token and
+        // inlay refreshes are re-issued once below.
         let mut content_synced = false;
 
-        if !state.opened {
-            // First open (or re-open after a respawn): full text supersedes any
-            // journaled deltas, so drop the LSP journal (the treesitter journal is
-            // drained independently when the editor queries highlights).
-            let _ = self.editor.buffer_mut().take_lsp_edits();
-            let text = self.editor.buffer().text.to_string();
-            // Seed the sync shadow: this is exactly the text the server now holds, so
-            // later incremental `didChange`s replay their deltas over it.
-            state.shadow.clone_from(&text);
-            state.version = 1;
-            let language_id = state.language_id.clone();
-            self.fx.lsp_notify(
-                key.clone(),
-                LspNotify::DidOpen {
-                    uri: uri.clone(),
-                    language_id,
-                    version: state.version,
-                    text,
-                },
-            );
-            state.opened = true;
-            state.last_tick = cur_tick;
-            // The freshly-opened content is the on-disk state, so don't fire a
-            // spurious `didSave` for saves that predate the open.
-            state.last_save_tick = cur_save_tick;
-            just_attached = true;
-            content_synced = true;
-        } else if tick_changed && sync_kind != TextDocumentSyncKind::NONE {
-            let batch = self.editor.buffer_mut().take_lsp_edits();
-            state.version += 1;
-            let changes = Self::did_change_content(
-                self.editor.buffer(),
-                &mut state.shadow,
-                &batch,
-                sync_kind,
+        for key in &keys {
+            // The encoding/sync kind aren't known until this server's `initialize`
+            // reply lands (the `Initialized` event). Until then it just waits — the
+            // URI is already recorded, so it opens as soon as it is ready.
+            let Some(&ServerRuntime {
                 encoding,
-            );
-            self.fx.lsp_notify(
-                key.clone(),
-                LspNotify::DidChange {
-                    uri: uri.clone(),
-                    version: state.version,
-                    changes,
-                },
-            );
-            state.last_tick = cur_tick;
-            content_synced = true;
+                sync_kind,
+                client_id,
+                ..
+            }) = self.lsp_servers.get(key)
+            else {
+                continue;
+            };
+            let Some(doc) = state.doc_mut(key) else {
+                continue;
+            };
+
+            if !doc.opened {
+                // First open (or re-open after a respawn): full text supersedes any
+                // journaled deltas. The journal is dropped only once, by the first
+                // such server; a *second* server opening later must not discard
+                // deltas the first one still needs, so the drop is guarded on the
+                // batch not having been taken for a `didChange` this sync.
+                let text = self.editor.buffer().text.to_string();
+                // Seed the sync shadow: this is exactly the text the server now
+                // holds, so later incremental `didChange`s replay their deltas over it.
+                doc.shadow.clone_from(&text);
+                doc.version = 1;
+                self.fx.lsp_notify(
+                    key.clone(),
+                    LspNotify::DidOpen {
+                        uri: uri.clone(),
+                        language_id: language_id.clone(),
+                        version: doc.version,
+                        text,
+                    },
+                );
+                doc.opened = true;
+                doc.last_tick = cur_tick;
+                // The freshly-opened content is the on-disk state, so don't fire a
+                // spurious `didSave` for saves that predate the open.
+                doc.last_save_tick = cur_save_tick;
+                attached.push(client_id);
+                content_synced = true;
+            } else if cur_tick != doc.last_tick && sync_kind != TextDocumentSyncKind::NONE {
+                let batch = batch.get_or_insert_with(|| self.editor.buffer_mut().take_lsp_edits());
+                doc.version += 1;
+                let changes = Self::did_change_content(
+                    self.editor.buffer(),
+                    &mut doc.shadow,
+                    batch,
+                    sync_kind,
+                    encoding,
+                );
+                self.fx.lsp_notify(
+                    key.clone(),
+                    LspNotify::DidChange {
+                        uri: uri.clone(),
+                        version: doc.version,
+                        changes,
+                    },
+                );
+                doc.last_tick = cur_tick;
+                content_synced = true;
+            }
+
+            // Save: the buffer's write counter advanced since the last sync, so a `:w`
+            // landed bytes on disk (a real hook, not a `modified`-flag heuristic).
+            if doc.opened && cur_save_tick != doc.last_save_tick {
+                self.fx.lsp_notify(
+                    key.clone(),
+                    LspNotify::DidSave {
+                        uri: uri.clone(),
+                        text: None,
+                    },
+                );
+                doc.last_save_tick = cur_save_tick;
+            }
         }
 
-        // Save: the buffer's write counter advanced since the last sync, so a `:w`
-        // landed bytes on disk (a real hook, not a `modified`-flag heuristic).
-        if state.opened && cur_save_tick != state.last_save_tick {
-            self.fx
-                .lsp_notify(key, LspNotify::DidSave { uri, text: None });
-            state.last_save_tick = cur_save_tick;
+        // Every attached server saw this tick's deltas (or opened fresh at it), so the
+        // journal has served its purpose and must not replay on the next sync.
+        if batch.is_none() && content_synced {
+            let _ = self.editor.buffer_mut().take_lsp_edits();
         }
 
         self.lsp_states.insert(buffer, state);
 
-        // The attach hook fires after the state is back in the map (so an
-        // `on_attach` that re-enters the LSP paths sees a consistent state): the
-        // buffer just sent its first `didOpen` under an initialized server — the
-        // attach moment. `sync_lsp` only ever syncs the current buffer, so the
-        // snapshot the autocmd reads is this buffer.
-        if just_attached {
+        // The attach hooks fire after the state is back in the map (so an `on_attach`
+        // that re-enters the LSP paths sees a consistent state) — once per server that
+        // just sent its first `didOpen`. `sync_lsp` only ever syncs the current buffer,
+        // so the snapshot each autocmd reads is this buffer.
+        if !attached.is_empty() {
             let file = path.to_string_lossy().into_owned();
-            self.fire_lsp_attach(buffer, &file, client_id);
+            for client_id in attached {
+                self.fire_lsp_attach(buffer, &file, client_id);
+            }
         }
 
-        // Refresh semantic tokens and inlay hints whenever the server saw new
-        // content (each request no-ops unless the server advertised the feature and,
-        // for inlay hints, the buffer enabled it). After the attach hook, so an
-        // `on_attach` that toggles either feature is already in effect.
+        // Refresh semantic tokens and inlay hints whenever any server saw new content
+        // (each request no-ops unless the server advertised the feature and, for inlay
+        // hints, the buffer enabled it). After the attach hooks, so an `on_attach` that
+        // toggles either feature is already in effect.
         if content_synced {
             self.request_semantic_tokens(buffer);
             self.request_inlay_hints(buffer);
@@ -522,22 +555,26 @@ impl EditHost {
         let Some(state) = self.lsp_states.get(&id) else {
             return;
         };
-        if !state.opened {
+        let Some(uri) = state.uri.clone() else {
+            return;
+        };
+        // Every server that has this document open and wants deltas. Collected first
+        // so the single journal drain below is shared by all of them.
+        let targets: Vec<(ServerKey, PositionEncoding, TextDocumentSyncKind)> = state
+            .servers()
+            .filter(|(_, doc)| doc.opened)
+            .filter_map(|(key, _)| {
+                let rt = self.lsp_servers.get(key)?;
+                (rt.sync_kind != TextDocumentSyncKind::NONE)
+                    .then(|| (key.clone(), rt.encoding, rt.sync_kind))
+            })
+            .collect();
+        if targets.is_empty() {
             return;
         }
-        let (Some(key), Some(uri)) = (state.server.clone(), state.uri.clone()) else {
-            return;
-        };
-        let Some(&ServerRuntime {
-            encoding,
-            sync_kind,
-            ..
-        }) = self.lsp_servers.get(&key)
-        else {
-            return;
-        };
+        // Drained once and replayed into each server's own shadow — see `sync_lsp`.
         let batch = self.editor.take_lsp_edits_of(id).unwrap_or_default();
-        if sync_kind == TextDocumentSyncKind::NONE || batch.is_empty() {
+        if batch.is_empty() {
             return;
         }
         let cur_tick = self
@@ -545,23 +582,25 @@ impl EditHost {
             .buffer_of(id)
             .map(|b| b.changedtick)
             .unwrap_or(0);
-        let buffer = self.editor.buffer_of(id).unwrap();
-        let shadow = &mut self.lsp_states.get_mut(&id).unwrap().shadow;
-        let changes = Self::did_change_content(buffer, shadow, &batch, sync_kind, encoding);
-        let version = {
-            let state = self.lsp_states.get_mut(&id).unwrap();
-            state.version += 1;
-            state.last_tick = cur_tick;
-            state.version
-        };
-        self.fx.lsp_notify(
-            key,
-            LspNotify::DidChange {
-                uri,
-                version,
-                changes,
-            },
-        );
+        for (key, encoding, sync_kind) in targets {
+            let buffer = self.editor.buffer_of(id).unwrap();
+            let Some(doc) = self.lsp_states.get_mut(&id).and_then(|s| s.doc_mut(&key)) else {
+                continue;
+            };
+            let changes =
+                Self::did_change_content(buffer, &mut doc.shadow, &batch, sync_kind, encoding);
+            doc.version += 1;
+            doc.last_tick = cur_tick;
+            let version = doc.version;
+            self.fx.lsp_notify(
+                key,
+                LspNotify::DidChange {
+                    uri: uri.clone(),
+                    version,
+                    changes,
+                },
+            );
+        }
     }
 
     /// The `didChange` content for a drained `batch` against `buffer`: incremental
@@ -644,17 +683,27 @@ impl EditHost {
             .collect();
         for id in dead {
             if let Some(state) = self.lsp_states.remove(&id) {
-                if let (true, Some(key), Some(uri)) = (state.opened, state.server, state.uri) {
-                    // Fire `LspDetach` (symmetric with attach-on-`didOpen`) before
-                    // the close goes out, while the runtime — and so the client id —
-                    // is still around.
+                // Every server this buffer had open gets its own `didClose` and its own
+                // `LspDetach` — symmetric with the per-server attach-on-`didOpen`.
+                let opened: Vec<ServerKey> = state
+                    .servers()
+                    .filter(|(_, doc)| doc.opened)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                let Some(uri) = state.uri else {
+                    continue;
+                };
+                for key in opened {
+                    // Fire `LspDetach` before the close goes out, while the runtime —
+                    // and so the client id — is still around.
                     if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
                         let file = uri_to_path(&uri)
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         self.fire_lsp_detach(id, &file, client_id);
                     }
-                    self.fx.lsp_notify(key, LspNotify::DidClose { uri });
+                    self.fx
+                        .lsp_notify(key, LspNotify::DidClose { uri: uri.clone() });
                 }
             }
         }
@@ -692,8 +741,7 @@ impl EditHost {
                         client_id,
                         legend: caps.legend.clone(),
                         semantic_tokens_delta: caps.semantic_tokens_delta,
-                        inlay_hints: caps.providers.inlay_hints,
-                        folding_range: caps.providers.folding_range,
+                        providers: caps.providers.clone(),
                         // Flatten the advertised trigger/retrigger strings to `char`s
                         // (each is a single character in practice); the auto-trigger
                         // matches a typed key against these.
@@ -723,9 +771,9 @@ impl EditHost {
                 // buffer bound to it on the next sync. This doubles as the restart
                 // handler.
                 for state in self.lsp_states.values_mut() {
-                    if state.server.as_ref() == Some(&key) {
-                        state.opened = false;
-                        state.version = 0;
+                    if let Some(doc) = state.doc_mut(&key) {
+                        doc.opened = false;
+                        doc.version = 0;
                     }
                 }
                 self.lsp_dirty = true;
@@ -734,19 +782,34 @@ impl EditHost {
                 self.refresh_signature_autotrigger();
             }
             LspEvent::Diagnostics {
-                uri, diagnostics, ..
+                key,
+                uri,
+                diagnostics,
+                ..
             } => {
-                // Cache the latest publish for the matching buffer; the redraw
-                // projects whichever buffer is current (route by `uri`, dropping
-                // a publish for a buffer closed while it was in flight). Mark dirty
-                // so the coalesced repaint paints the new squiggles.
+                // Cache the latest publish under the SERVER that sent it; the redraw
+                // projects whichever buffer is current (route by `uri`, dropping a
+                // publish for a buffer closed while it was in flight). Mark dirty so
+                // the coalesced repaint paints the new squiggles.
+                //
+                // Per-server is mandatory once a buffer can carry two: `publishDiagnostics`
+                // is a push, so both servers publish independently, and a shared slot
+                // would have each one's set erase the other's on every publish.
                 let mirror = self
                     .lsp_states
                     .iter_mut()
                     .find(|(_, s)| s.uri.as_ref() == Some(&uri))
-                    .map(|(id, state)| {
-                        state.diagnostics = diagnostics;
-                        (id.0, diagnostic_mirror_data(&state.diagnostics))
+                    .and_then(|(id, state)| {
+                        let doc = state.doc_mut(&key)?;
+                        doc.diagnostics = diagnostics;
+                        // The Lua mirror is the buffer's WHOLE set, so it merges across
+                        // servers — otherwise `vim.diagnostic.get` would report only
+                        // whichever server published last.
+                        let all: Vec<_> = state
+                            .servers()
+                            .flat_map(|(_, d)| d.diagnostics.iter().cloned())
+                            .collect();
+                        Some((id.0, diagnostic_mirror_data(&all)))
                     });
                 if let Some((bufnr, data)) = mirror {
                     self.lsp_dirty = true;
@@ -793,6 +856,10 @@ impl EditHost {
                 // died before `Initialized` never registered in `lsp_servers`, and
                 // it especially must stay re-startable.
                 self.lsp_ensured.remove(&key);
+                // Retire this server's slot in any open fan-out round: its reply is
+                // never coming, and without this the round would wait on it forever
+                // (the merged result would simply never present).
+                self.drop_fanout_server(&key);
                 if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
                     // Buffers attached to this server, with a display name for the
                     // event's `args.file`. Clear `opened` so a later `:bdelete`
@@ -800,10 +867,12 @@ impl EditHost {
                     let detaching: Vec<(BufferId, String)> = self
                         .lsp_states
                         .iter_mut()
-                        .filter(|(_, s)| s.opened && s.server.as_ref() == Some(&key))
+                        .filter(|(_, s): &(&BufferId, &mut LspDocState)| s.is_opened_under(&key))
                         .map(|(id, s)| {
-                            s.opened = false;
-                            s.version = 0;
+                            if let Some(doc) = s.doc_mut(&key) {
+                                doc.opened = false;
+                                doc.version = 0;
+                            }
                             let file = s
                                 .uri
                                 .as_ref()
@@ -845,7 +914,7 @@ impl EditHost {
         let buffers: Vec<BufferId> = self
             .lsp_states
             .iter()
-            .filter(|(_, s)| s.server.as_ref() == Some(&key))
+            .filter(|(_, s)| s.bound_to(&key))
             .map(|(id, _)| *id)
             .collect();
         for buffer in buffers {
@@ -854,8 +923,12 @@ impl EditHost {
                 RefreshKind::SemanticTokens => {
                     // A refresh means "recompute"; drop the delta cursor so the
                     // re-request fetches the whole `full` set (like force_refresh).
-                    if let Some(state) = self.lsp_states.get_mut(&buffer) {
-                        state.semantic.result_id = None;
+                    if let Some(doc) = self
+                        .lsp_states
+                        .get_mut(&buffer)
+                        .and_then(|s| s.primary_doc_mut())
+                    {
+                        doc.semantic.result_id = None;
                     }
                     self.request_semantic_tokens(buffer);
                 }
@@ -872,9 +945,8 @@ impl EditHost {
         let current = self.editor.current_buffer_id();
 
         lines.push("Current buffer".to_string());
-        match self.lsp_states.get(&current).filter(|s| s.server.is_some()) {
-            Some(state) => {
-                let key = state.server.as_ref().unwrap();
+        match self.lsp_states.get(&current).and_then(|s| s.primary()) {
+            Some((key, doc)) => {
                 let runtime = self.lsp_servers.get(key);
                 lines.push(format!(
                     "  server:      {} ({})",
@@ -887,7 +959,7 @@ impl EditHost {
                         "not started"
                     } else if runtime.is_none() {
                         "starting (awaiting initialize)"
-                    } else if state.opened {
+                    } else if doc.opened {
                         "attached"
                     } else {
                         "initialized (didOpen pending)"
@@ -900,8 +972,8 @@ impl EditHost {
                         sync_label(runtime.sync_kind),
                     ));
                 }
-                lines.push(format!("  version:     {}", state.version));
-                lines.push(format!("  diagnostics: {}", state.diagnostics.len()));
+                lines.push(format!("  version:     {}", doc.version));
+                lines.push(format!("  diagnostics: {}", doc.diagnostics.len()));
             }
             None => lines.push("  (no language server for this buffer)".to_string()),
         }
@@ -917,7 +989,7 @@ impl EditHost {
                 let attached = self
                     .lsp_states
                     .values()
-                    .filter(|s| s.opened && s.server.as_ref() == Some(key))
+                    .filter(|s| s.is_opened_under(key))
                     .count();
                 lines.push(format!(
                     "  {} @ {} — {}, {}, {attached} buffer(s)",
@@ -966,7 +1038,7 @@ impl EditHost {
     /// The negotiated position encoding of buffer `id`'s attached server, or
     /// `None` if the buffer has no server that finished `initialize`.
     pub(crate) fn buffer_encoding(&self, id: BufferId) -> Option<PositionEncoding> {
-        let key = self.lsp_states.get(&id)?.server.as_ref()?;
+        let key = self.lsp_states.get(&id)?.primary_key()?;
         Some(self.lsp_servers.get(key)?.encoding)
     }
 }

@@ -501,10 +501,37 @@ end
 function nx.lsp.signature_help_autotrigger(enable)
   nx._signature_autotrigger(enable ~= false)
 end
--- `nx.lsp.format()`: format the buffer, resolving `nil` once the edits apply.
-function nx.lsp.format()
+-- `nx.lsp.format([opts])`: format the buffer, resolving `nil` once the edits apply.
+--
+-- ```lua
+-- opts.name   format with the attached server of this config name, instead of the
+--             first one advertising `documentFormatting`. Meaningful when a buffer
+--             carries several servers — `pyright` + `ruff`, `ts_ls` + `eslint` —
+--             where the default pick is not necessarily the formatter you want.
+-- ```
+--
+-- A `name` that is not attached to the buffer reports so on the message line and
+-- resolves `nil`; it never falls back to formatting with a different server, since
+-- silently using the wrong formatter is the failure the option exists to prevent.
+-- Any other key is rejected loudly (as in `nx.lsp.code_action`).
+function nx.lsp.format(opts)
+  local name
+  if opts ~= nil then
+    if type(opts) ~= "table" then
+      error("nx.lsp.format: opts must be a table, got " .. type(opts), 2)
+    end
+    for k in pairs(opts) do
+      if k ~= "name" then
+        error("nx.lsp.format: unsupported option '" .. tostring(k) .. "'", 2)
+      end
+    end
+    if opts.name ~= nil and type(opts.name) ~= "string" then
+      error("nx.lsp.format: opts.name must be a server-name string", 2)
+    end
+    name = opts.name
+  end
   return lsp_promise(function(id)
-    nx._lsp_buf_format(id)
+    nx._lsp_buf_format(id, name)
   end)
 end
 -- `nx.lsp.code_action(opts)`: run a code action at the cursor. Bare, it is
@@ -700,6 +727,11 @@ end
 -- `nx.lsp.clients(filter)`: a snapshot list of active clients, narrowable by
 -- `filter.bufnr` (the clients attached to that buffer; `0`/nil = current) and/or
 -- `filter.name` (the config name). Reads the mirror — no request is issued.
+--
+-- A buffer can have **several** clients attached (`pyright` + `ruff`, `ts_ls` +
+-- `eslint`): every server enabled for its filetype attaches, so a `bufnr` filter
+-- may return more than one. Don't index `[1]` expecting "the" server — filter by
+-- `name`, or by what the client advertises in `server_capabilities`.
 function nx.lsp.clients(filter)
   filter = filter or {}
   local out = {}
@@ -957,26 +989,27 @@ vim.lsp.buf.implementation = nx.lsp.implementation
 vim.lsp.buf.references = nx.lsp.references
 vim.lsp.buf.hover = nx.lsp.hover
 vim.lsp.buf.signature_help = nx.lsp.signature_help
--- `opts` is checked, not swallowed. nxvim formats the CURRENT buffer with the one
--- server attached to it, so neovim's `name` (pick among several attached servers),
--- `bufnr`, `range` and `filter` have nothing to act on here — dropping `name` in
--- particular would format with a different server than the config asked for, which
--- looks like it worked. They are rejected, the way `code_action` rejects `filter`.
--- `async` IS satisfiable and accepted: nxvim never blocks, and the returned promise
--- is what orders a follow-up — a gated `BufWritePre` awaits it, so `async = false`'s
--- intent (the edits land before the write) holds.
+-- `opts` is checked, not swallowed. `name` is **modeled** — it selects which of the
+-- buffer's attached servers formats, which is meaningful now that a buffer can carry
+-- several. `async` is accepted: nxvim never blocks, and the returned promise is what
+-- orders a follow-up — a gated `BufWritePre` awaits it, so `async = false`'s intent
+-- (the edits land before the write) holds. `bufnr` / `range` / `filter` are still
+-- rejected: nxvim formats the current buffer whole, so honoring them would take a
+-- core change, and silently ignoring them would format the wrong thing.
 vim.lsp.buf.format = function(opts)
+  local name
   if opts ~= nil then
     if type(opts) ~= "table" then
       error("vim.lsp.buf.format: opts must be a table, got " .. type(opts), 2)
     end
     for k in pairs(opts) do
-      if k ~= "async" then
+      if k ~= "async" and k ~= "name" then
         error("vim.lsp.buf.format: unsupported option '" .. tostring(k) .. "'", 2)
       end
     end
+    name = opts.name
   end
-  return nx.lsp.format()
+  return nx.lsp.format(name and { name = name } or nil)
 end
 -- The alias forwards `opts` — `context.only` / `apply` / `range` are modeled (see
 -- `nx.lsp.code_action`, whose `range` is nxvim's own 0-based end-exclusive shape, NOT

@@ -17,6 +17,7 @@
 //! substitutes), `submodule update`, or `reset --hard`, so those are hand-rolled here
 //! over gix's fetch / worktree-state / reference primitives; see each `fn`.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -256,17 +257,56 @@ fn diff_file(path: &str, file: &str) -> Result<GitValue, GitError> {
     Ok(diff_counts(&old, &new))
 }
 
+/// `nx.git.status` — the working-tree status as ONE porcelain-`XY` entry PER PATH.
+///
+/// gix reports a path's staged half (`TreeIndex`) and unstaged half (`IndexWorktree`)
+/// as separate items, so a file that is staged and then edited again arrives twice,
+/// each carrying one filled column. Those are folded here rather than left to the
+/// caller: the fold is lossless (the two item kinds can never set the same column),
+/// every consumer would otherwise have to repeat it, and a consumer that forgets
+/// silently reports "staged, clean worktree" for a file with unstaged edits.
+///
+/// Worktree rename detection is off by default in gix (git has no config for it
+/// either), which makes a renamed-but-unstaged file look like an untracked new path.
+/// It is enabled here so a rename reads as `R` on its destination.
 fn status(path: &str) -> Result<GitValue, GitError> {
     let repo = open(path)?;
     let platform = repo
         .status(gix::progress::Discard)
-        .map_err(|e| egit("status", e))?;
+        .map_err(|e| egit("status", e))?
+        .index_worktree_rewrites(Some(gix::diff::Rewrites::default()));
     let iter = platform.into_iter(None).map_err(|e| egit("status", e))?;
-    let mut entries = Vec::new();
+
+    // Fold by path, preserving first-seen order (`at[path]` indexes into `entries`).
+    let mut entries: Vec<GitStatusEntry> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
     for item in iter {
         let item = item.map_err(|e| egit("status", e))?;
-        if let Some(entry) = status_entry(&item) {
-            entries.push(entry);
+        let Some(entry) = status_entry(&item) else {
+            continue;
+        };
+        match at.get(&entry.path) {
+            Some(&i) => {
+                // Merge: a field is only meaningful when set, so an unmodified `" "`
+                // column (or an empty `orig_path`) from this item never overwrites
+                // what the other half recorded. Order-independent by construction —
+                // a staged rename that is then edited in the worktree keeps its
+                // source whichever item gix yields first.
+                let slot: &mut GitStatusEntry = &mut entries[i];
+                if entry.index != " " {
+                    slot.index = entry.index;
+                }
+                if entry.worktree != " " {
+                    slot.worktree = entry.worktree;
+                }
+                if !entry.orig_path.is_empty() {
+                    slot.orig_path = entry.orig_path;
+                }
+            }
+            None => {
+                at.insert(entry.path.clone(), entries.len());
+                entries.push(entry);
+            }
         }
     }
     Ok(GitValue::Status {
@@ -659,33 +699,46 @@ fn diff_counts(old: &[u8], new: &[u8]) -> GitValue {
 }
 
 /// Turn one gix status item into a porcelain-`XY` [`GitStatusEntry`], or `None` for an
-/// item that carries no path change we model.
+/// item that carries no path change we model. Each item fills at most one column (the
+/// other stays `" "`, unmodified) — except an untracked path, which porcelain spells
+/// `??` in BOTH columns; [`status`] folds the two halves of a path back together.
 fn status_entry(item: &gix::status::Item) -> Option<GitStatusEntry> {
     use gix::status::Item;
     match item {
         // A worktree change (unstaged / untracked): the second (`worktree`) column.
         Item::IndexWorktree(change) => {
-            let (path, worktree) = index_worktree_change(change)?;
+            let (path, worktree, orig_path) = index_worktree_change(change)?;
             Some(GitStatusEntry {
                 path,
-                index: " ".into(),
+                // Untracked is porcelain's `??` — both columns, not a lone worktree
+                // `?`, which is neither `??` nor a status letter any consumer can read.
+                index: if worktree == "?" {
+                    "?".into()
+                } else {
+                    " ".into()
+                },
                 worktree,
+                orig_path,
             })
         }
         // A staged change (index vs HEAD): the first (`index`) column.
         Item::TreeIndex(change) => {
-            let (path, index) = tree_index_change(change)?;
+            let (path, index, orig_path) = tree_index_change(change)?;
             Some(GitStatusEntry {
                 path,
                 index,
                 worktree: " ".into(),
+                orig_path,
             })
         }
     }
 }
 
-/// The path + worktree-column letter for an unstaged / untracked change.
-fn index_worktree_change(change: &gix::status::index_worktree::Item) -> Option<(String, String)> {
+/// The `(path, worktree-column letter, orig_path)` for an unstaged / untracked change.
+/// `orig_path` is empty unless the change is a rewrite (rename / copy).
+fn index_worktree_change(
+    change: &gix::status::index_worktree::Item,
+) -> Option<(String, String, String)> {
     use gix::status::index_worktree::Item;
     use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
     match change {
@@ -701,21 +754,52 @@ fn index_worktree_change(change: &gix::status::index_worktree::Item) -> Option<(
                 EntryStatus::IntentToAdd => "A",
                 EntryStatus::NeedsUpdate(_) => return None,
             };
-            Some((rela_path.to_string(), letter.into()))
+            Some((rela_path.to_string(), letter.into(), String::new()))
         }
-        Item::DirectoryContents { entry, .. } => Some((entry.rela_path.to_string(), "?".into())),
-        Item::Rewrite { .. } => None,
+        Item::DirectoryContents { entry, .. } => {
+            Some((entry.rela_path.to_string(), "?".into(), String::new()))
+        }
+        // A rewrite is reported against its DESTINATION (`dirwalk_entry.rela_path` is
+        // where the content now lives), carrying the source as `orig_path`. Detection
+        // is enabled by `index_worktree_rewrites` in [`status`]; without it gix cannot
+        // tell a rename from an untracked file, so this arm never fired and a renamed
+        // file read as an untracked one.
+        Item::Rewrite {
+            source,
+            dirwalk_entry,
+            copy,
+            ..
+        } => Some((
+            dirwalk_entry.rela_path.to_string(),
+            if *copy { "C".into() } else { "R".into() },
+            source.rela_path().to_string(),
+        )),
     }
 }
 
-/// The path + index-column letter for a staged change (index vs HEAD tree).
-fn tree_index_change(change: &gix::diff::index::Change) -> Option<(String, String)> {
+/// The `(path, index-column letter, orig_path)` for a staged change (index vs HEAD
+/// tree). `orig_path` is empty unless the change is a rewrite (rename / copy).
+fn tree_index_change(change: &gix::diff::index::Change) -> Option<(String, String, String)> {
     use gix::diff::index::Change;
-    let (location, letter) = match change {
-        Change::Addition { location, .. } => (location, "A"),
-        Change::Deletion { location, .. } => (location, "D"),
-        Change::Modification { location, .. } => (location, "M"),
-        Change::Rewrite { location, .. } => (location, "R"),
-    };
-    Some((location.to_string(), letter.into()))
+    match change {
+        Change::Addition { location, .. } => {
+            Some((location.to_string(), "A".into(), String::new()))
+        }
+        Change::Deletion { location, .. } => {
+            Some((location.to_string(), "D".into(), String::new()))
+        }
+        Change::Modification { location, .. } => {
+            Some((location.to_string(), "M".into(), String::new()))
+        }
+        Change::Rewrite {
+            location,
+            source_location,
+            copy,
+            ..
+        } => Some((
+            location.to_string(),
+            if *copy { "C".into() } else { "R".into() },
+            source_location.to_string(),
+        )),
+    }
 }

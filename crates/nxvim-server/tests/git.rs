@@ -897,3 +897,234 @@ async fn discover_rejects_outside_a_repo() {
         Some("ENOREPO")
     );
 }
+
+/// A file that is BOTH staged and then modified again is ONE entry carrying both
+/// porcelain columns (`M` / `M`), not two half-filled ones. gix reports the staged
+/// half (`TreeIndex`) and the unstaged half (`IndexWorktree`) as separate items; the
+/// engine folds them per path, because otherwise every consumer must fold them
+/// identically and a consumer that doesn't silently reports "staged, clean worktree"
+/// for a file with unstaged edits.
+#[tokio::test]
+async fn status_folds_a_staged_and_modified_file_into_one_entry() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_fold");
+    // Stage a change, then dirty the worktree again on top of it.
+    std::fs::write(repo.join("file.txt"), "a\nb\nc\nstaged\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    std::fs::write(repo.join("file.txt"), "a\nb\nc\nstaged\nunstaged\n").unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st = nil\n\
+             nx.git.status({repo:?}):next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st and #_G.st.entries").await,
+        rmpv::Value::from(1),
+        "one path, one entry"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].index")
+            .await
+            .as_str(),
+        Some("M"),
+        "the staged column survives the fold"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].worktree")
+            .await
+            .as_str(),
+        Some("M"),
+        "the unstaged column survives the fold"
+    );
+}
+
+/// An untracked file is porcelain's `??` — BOTH columns, not a bare worktree `?`.
+/// Read literally, a lone `?` is neither `??` nor a known status letter, so every
+/// consumer has to special-case it back into porcelain's spelling.
+#[tokio::test]
+async fn status_spells_untracked_as_both_columns() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_untracked");
+    std::fs::write(repo.join("new.txt"), "fresh\n").unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st = nil\n\
+             nx.git.status({repo:?}):next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st and _G.st.entries[1].path")
+            .await
+            .as_str(),
+        Some("new.txt")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].index")
+            .await
+            .as_str(),
+        Some("?")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].worktree")
+            .await
+            .as_str(),
+        Some("?")
+    );
+}
+
+/// A file renamed in the WORKTREE (not staged) is reported, as `R` on the worktree
+/// column against its new path. gix surfaces this as an `index_worktree::Item::Rewrite`,
+/// which the engine used to drop on the floor — so a rename showed no status at all.
+#[tokio::test]
+async fn status_reports_an_unstaged_rename() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_rename");
+    // Rename on disk only — nothing staged, so gix must detect it as a worktree rewrite.
+    std::fs::rename(repo.join("file.txt"), repo.join("renamed.txt")).unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st = nil\n\
+             nx.git.status({repo:?}):next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // One entry: the destination, marked `R` on the worktree column, carrying the path
+    // it came from. (git's own porcelain does not detect unstaged renames — it prints
+    // ` D file.txt` + `?? renamed.txt` — so this is deliberately more informative.)
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st and #_G.st.entries").await,
+        rmpv::Value::from(1)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].path")
+            .await
+            .as_str(),
+        Some("renamed.txt")
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return _G.st.entries[1].index .. _G.st.entries[1].worktree"
+        )
+        .await
+        .as_str(),
+        Some(" R")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].orig_path")
+            .await
+            .as_str(),
+        Some("file.txt"),
+        "a rename carries the path it came from — porcelain's `R old -> new`"
+    );
+}
+
+/// A non-rename entry's `orig_path` is empty, not nil — so a consumer can read the
+/// field unconditionally.
+#[tokio::test]
+async fn status_leaves_orig_path_empty_for_a_plain_change() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_origpath");
+    std::fs::write(repo.join("file.txt"), "a\nb\nc\nd\n").unwrap();
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st = nil\n\
+             nx.git.status({repo:?}):next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st and _G.st.entries[1].orig_path")
+            .await
+            .as_str(),
+        Some("")
+    );
+}
+
+/// A file renamed AND staged, then edited again in the worktree, folds into one `RM`
+/// entry that still knows where it came from. The rename source arrives on the
+/// `TreeIndex` half and the modification on the `IndexWorktree` half, so a fold that
+/// only merged the two columns would drop `orig_path` whenever gix happened to yield
+/// the worktree half first.
+#[tokio::test]
+async fn status_keeps_the_rename_source_when_folding_a_later_edit() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_rename_edit");
+    git(&repo, &["mv", "file.txt", "moved.txt"]);
+    std::fs::write(repo.join("moved.txt"), "a\nb\nc\nedited\n").unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st = nil\n\
+             nx.git.status({repo:?}):next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st and #_G.st.entries").await,
+        rmpv::Value::from(1),
+        "the staged rename and the later edit are one path, one entry"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].path")
+            .await
+            .as_str(),
+        Some("moved.txt")
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return _G.st.entries[1].index .. _G.st.entries[1].worktree"
+        )
+        .await
+        .as_str(),
+        Some("RM")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].orig_path")
+            .await
+            .as_str(),
+        Some("file.txt"),
+        "the rename source survives the fold with the worktree edit"
+    );
+}

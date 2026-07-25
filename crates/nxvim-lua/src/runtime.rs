@@ -1222,6 +1222,7 @@ fn git_value_to_lua(lua: &Lua, value: GitValue) -> mlua::Result<mlua::Value> {
                 et.set("path", e.path)?;
                 et.set("index", e.index)?;
                 et.set("worktree", e.worktree)?;
+                et.set("orig_path", e.orig_path)?;
                 list.push(et)?;
             }
             t.set("entries", list)?;

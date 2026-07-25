@@ -80,7 +80,7 @@ nx.git.discover(path)        -> { root=<toplevel abs>, git_dir=<abs>, prefix=<re
 nx.git.head(path)            -> { branch=<name|nil>, detached=<bool>, sha=<full oid> }
 nx.git.show(path, rev, rel)  -> <blob bytes at `rev`:`rel`>   (rel is repo-relative; backs `git show HEAD:rel`)
 nx.git.diff_file(path, file) -> { added=<n>, changed=<n>, removed=<n>, hunks={ {old_start,old_count,new_start,new_count}, … } }
-nx.git.status(path)          -> { entries={ { path=, index=<XY-ish>, worktree=, kind= }, … }, dirty=<bool> }
+nx.git.status(path)          -> { entries={ { path=, index=<X>, worktree=<Y>, orig_path= }, … }, dirty=<bool> }   (ONE entry per path)
 ```
 
 `path` is any path *inside* the repo (a file or dir); the executor discovers the
@@ -89,6 +89,14 @@ repo from it. `nx.git.discover` replaces `rev-parse --show-toplevel /
 `show` replaces `git show HEAD:<rel>`; `diff_file` replaces `git diff -U0 -- <file>`
 + the plugin's `_parse_diff`. `status` is new (gives the two plugins and future
 ones a canonical working-tree signal instead of re-deriving one).
+
+`status` returns exactly ONE entry per path, both porcelain columns filled — gix
+reports a path's staged (`TreeIndex`) and unstaged (`IndexWorktree`) halves as
+separate items, and folding them is the engine's job, not each consumer's (an
+unfolded read silently reports "staged, clean worktree" for a file with unstaged
+edits). Untracked is porcelain's `??` in both columns. Worktree rename detection is
+enabled, so an unstaged rename reads `R` on its destination with `orig_path` set —
+more than git's own porcelain reports (it prints a deletion plus an untracked file).
 
 Mutation / network verbs (Phase 2) — plugin-manager backing, promise-always:
 

@@ -78,9 +78,24 @@ local function define(surface, bridge)
     return run_git(bridge, { op = "diff_file", path = path, file = file })
   end
 
-  -- `status(path)` -> promise of { dirty, entries }, each entry `{ path, index,
-  -- worktree }` in `git status --porcelain` XY terms (`index` the staged column,
-  -- `worktree` the unstaged column; each a single letter, `" "` when unmodified).
+  -- `status(path)` -> promise of `{ dirty, entries }` in `git status --porcelain`
+  -- XY terms. Each entry is `{ path, index, worktree, orig_path }`:
+  --
+  -- ```
+  -- path       repo-relative path of the changed file
+  -- index      the staged (index-vs-HEAD) column, one letter
+  -- worktree   the unstaged (worktree-vs-index) column, one letter
+  -- orig_path  where the content came from, for a rename/copy; "" otherwise
+  -- ```
+  --
+  -- A column is `" "` when the file is unmodified in it. There is exactly ONE entry
+  -- per path: a file that is staged and then edited again arrives once with both
+  -- columns set (porcelain's `MM`), never as two entries carrying one column each.
+  -- An untracked file is porcelain's `??` — both columns.
+  --
+  -- Unlike `git status`, an unstaged rename IS detected: it reads `R` on the
+  -- destination with `orig_path` set, where git prints a deletion plus an untracked
+  -- file.
   function surface.status(path)
     return run_git(bridge, { op = "status", path = path })
   end

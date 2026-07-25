@@ -578,7 +578,8 @@ pub enum GitJob {
     /// resolve against the repo.
     DiffFile { path: String, file: String },
     /// `nx.git.status(path)` — the repo's working-tree status: `{ dirty, entries }`,
-    /// each entry a `{ path, index, worktree }` porcelain-`XY`-style pair. A canonical
+    /// each entry a `{ path, index, worktree, orig_path }` porcelain-`XY` record, ONE
+    /// per path (the staged and unstaged halves are folded together). A canonical
     /// working-tree signal so plugins stop re-deriving one from `diff` output.
     Status { path: String },
 
@@ -626,11 +627,19 @@ pub enum GitJob {
 /// `index` is the staged (index-vs-HEAD) letter, `worktree` the unstaged
 /// (worktree-vs-index) letter — each one of `M`/`A`/`D`/`R`/`C`/`?`/`U`/`" "`
 /// (unmodified in that column), matching `git status --porcelain`.
+///
+/// Exactly ONE entry per path: the engine folds a path's staged and unstaged halves
+/// together, so a file that is staged and then edited again reads `MM`, as porcelain
+/// spells it — never two entries with one column each.
+///
+/// `orig_path` is where the content came from when this is a rename or copy (`R`/`C`
+/// in either column) — porcelain's `R  old -> new` written as fields. Empty otherwise.
 #[derive(Clone, Debug)]
 pub struct GitStatusEntry {
     pub path: String,
     pub index: String,
     pub worktree: String,
+    pub orig_path: String,
 }
 
 /// One hunk of a [`GitValue::Diff`], in `@@ -old_start,old_count +new_start,new_count @@`
@@ -683,7 +692,8 @@ pub enum GitValue {
         hunks: Vec<GitHunk>,
     },
     /// `nx.git.status` — `dirty` (any tracked change; untracked-only is still dirty
-    /// here since an entry is emitted) and the per-path porcelain entries.
+    /// here since an entry is emitted) and the per-path porcelain entries: exactly one
+    /// [`GitStatusEntry`] per changed path, both columns filled.
     Status {
         dirty: bool,
         entries: Vec<GitStatusEntry>,

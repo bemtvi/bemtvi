@@ -28,7 +28,7 @@
 //! updated, sha]` / `["bytes", <bin>]` / `["discover", root, git_dir, prefix]` /
 //! `["head", branch|nil, detached, sha]` / `["diff", added, changed, removed,
 //! [[o_start,o_count,n_start,n_count], …]]` / `["status", dirty, [[path, index,
-//! worktree], …]]`.
+//! worktree, orig_path], …]]`.
 
 use crate::ops::{GitError, GitHunk, GitJob, GitStatusEntry, GitValue};
 use rmpv::Value;
@@ -272,6 +272,7 @@ fn git_value_to_value(value: &GitValue) -> Value {
                         Value::from(e.path.as_str()),
                         Value::from(e.index.as_str()),
                         Value::from(e.worktree.as_str()),
+                        Value::from(e.orig_path.as_str()),
                     ])
                 })
                 .collect();
@@ -349,7 +350,8 @@ fn decode_hunks(v: Option<&Value>) -> Vec<GitHunk> {
         .unwrap_or_default()
 }
 
-/// Decode the `[[path, index, worktree], …]` status list (skipping a malformed row).
+/// Decode the `[[path, index, worktree, orig_path], …]` status list (skipping a
+/// malformed row). `orig_path` is absent for a non-rename and defaults to empty.
 fn decode_status_entries(v: Option<&Value>) -> Vec<GitStatusEntry> {
     v.and_then(Value::as_array)
         .map(|rows| {
@@ -360,6 +362,7 @@ fn decode_status_entries(v: Option<&Value>) -> Vec<GitStatusEntry> {
                         path: a.first()?.as_str()?.to_string(),
                         index: a.get(1).and_then(Value::as_str).unwrap_or(" ").to_string(),
                         worktree: a.get(2).and_then(Value::as_str).unwrap_or(" ").to_string(),
+                        orig_path: a.get(3).and_then(Value::as_str).unwrap_or("").to_string(),
                     })
                 })
                 .collect()

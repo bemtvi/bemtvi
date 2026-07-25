@@ -863,7 +863,7 @@ impl EditHost {
                 // coming, and both maps are keyed per (buffer, server) rather than
                 // being single slots, so a dead server's entries would otherwise
                 // accumulate one per buffer it served.
-                self.lsp_buf_requests.retain(|_, p| p.server != key);
+                self.lsp_multi_requests.retain(|_, p| p.server != key);
                 self.inlay_resolves.retain(|_, t| t.server != key);
                 if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
                     // Buffers attached to this server, with a display name for the

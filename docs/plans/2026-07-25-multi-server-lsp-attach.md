@@ -119,7 +119,7 @@ wrong for some:
 | hover, signatureHelp | first capable, in name order | one popup; merging prose is noise |
 | definition, declaration, typeDefinition, implementation | first capable | a jump has one destination |
 | references, documentSymbol, codeAction | **fan out + merge** | genuinely additive across servers |
-| completion | fan out + merge | the whole point of a second server |
+| completion | fan out, **streamed** (no barrier) | the whole point of a second server; the popup is already open, so shares append as they land |
 | formatting | single, **selected** | `format({name=})` picks; else first capable |
 | rename | first capable | a rename is one workspace edit |
 | diagnostics (push) | per-server, merged at projection | already the shape |
@@ -183,13 +183,63 @@ retires a dead server's slot). A server that neither replies nor exits holds its
 round open until the next request supersedes it — the same exposure a single hung
 server has always had, not a new one.
 
-**Completion is deliberately still single-target.** It re-requests per keystroke, so
-fanning it out is exactly where the request-amplification risk below bites, and the
-popup path (`on_completion_reply`, incremental filtering, `is_incomplete`) needs its
-own design rather than this round mechanism. Tracked as 3c.
+**3c — completion (done).** Deferred out of 3b because it re-requests per keystroke
+and its popup path needed its own design rather than the `LspFanout` round. It got
+one: completion **streams** instead of merging at a barrier.
+
+A round asks every `completionProvider` at once and each server's share appends to
+the open menu the moment it lands, so a slow server delays only its own candidates
+rather than holding the fast one's behind a barrier — the opposite of `LspFanout`,
+which is right there (one merged list presents once) and wrong here (the popup is
+already open and the user is still typing).
+
+The requests ride the per-server pending map Phase 4 introduced, which is the same
+shape completion needs — N in flight for one buffer, each reply decoded against its
+own server — so the map was widened rather than a third one added
+(`lsp_buf_requests` → `lsp_multi_requests`, `LspReqKind::per_server_pending`).
+
+What the streaming model forced:
+
+- **The round resets on ISSUE, not on first reply.** The merged cache is emptied when
+  the requests go out, so every reply is a plain append. That is what keeps a row's
+  `key` stable while the round is still filling — a lazy `completionItem/resolve`
+  issued against row 3 of the first server's share still addresses row 3 after the
+  second server's share arrives. Resetting on first reply would renumber under it.
+- **The whole buffer's in-flight completion requests are retired at round start**, not
+  just the per-server supersede. Otherwise a server this round does *not* ask (it
+  stopped advertising completion, or detached) could still land its previous share in
+  this round's cache.
+- **Each item records its origin server.** The accept converts its `textEdit` at that
+  server's negotiated encoding, and its `completionItem/resolve` goes back to it — the
+  `data` blob is that server's own handle on the item, so resolving ruff's candidate
+  against pyright is a wrong request. Both were reading the buffer's *first* server.
+- **Priority steps down by the server's position in key order.** The engine's blended
+  sort is stable, so equal-scoring rows keep *streamed* order — which is reply-arrival
+  order, i.e. nondeterministic. One point per server makes cross-server ties break in
+  key order instead, and keeps every LSP row far above the buffer-word tier (the `lsp`
+  bias is 8 against 0).
+- **An identical offer from a second server is dropped** (same label, kind, snippet
+  flag and effective insert text): the two rows are indistinguishable in the popup and
+  accept to the same text. Anything that differs is kept — accepting it does something
+  different.
+- **`isIncomplete` is OR-ed** across the servers that replied: if any narrowed its list
+  to the old prefix, a prefix edit must re-request rather than re-serve the cache.
+- **A trigger with no capable server is silent.** It fires per keystroke, so the
+  single-target path's "No language server attached" echo would shout once per typed
+  character (the same reason the signature-help auto-trigger drops quietly).
 
 Done when: two servers with overlapping capabilities both contribute references,
 and a slow server cannot stall the other's reply.
+
+3c is covered by `completion_merges_candidates_from_every_capable_server`,
+`accepting_a_candidate_applies_its_own_server_encoding`,
+`a_lazy_docs_resolve_goes_back_to_the_items_own_server` and
+`a_completion_burst_does_not_accumulate_candidates` in
+`crates/nxvim/tests/lsp_complete.rs`. The last is the amplification guard the risk
+section asks for: a 12-keystroke burst inside one word must leave exactly one row per
+server, so a cache that accumulated per keystroke fails rather than merely looking
+busy. The encoding and resolve-routing tests were both mutation-checked — restoring
+the "buffer's first server" derivation fails them.
 
 ### Phase 4 — diagnostics, semantic tokens, inlay hints per server (done)
 
@@ -267,7 +317,11 @@ which server answered — a prerequisite, not an afterthought.
 
 - **Request amplification.** Completion fan-out doubles per-keystroke traffic.
   Mitigated by capability gating and per-server generation drops; guarded by a
-  flood test in the spirit of `terminal.rs`.
+  flood test in the spirit of `terminal.rs`. *(3c: traffic is linear in attached
+  servers, and the per-round reset keeps the merged cache from growing with the
+  keystroke count — `a_completion_burst_does_not_accumulate_candidates` holds that
+  line. The remaining exposure is the wire itself: N servers answering per keystroke,
+  which is what enabling N servers asks for.)*
 - **Encoding bugs.** Two servers on one buffer at utf-8 and utf-16 is exactly where
   column math breaks. Phase 4 tests must use *differing* encodings deliberately.
 - **Phase 1 churn.** 24 mechanical sites; the risk is a silent behavior change

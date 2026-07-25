@@ -408,3 +408,246 @@ async fn lsp_completion_projects_item_kind_labels() {
 
     std::env::remove_var("NXVIM_LSP_CMD");
 }
+
+// ----- Phase 3c: completion across every capable server ----------------------
+// docs/plans/2026-07-25-multi-server-lsp-attach.md. Completion was the last
+// single-target kind: only the first server advertising `completionProvider` was
+// asked, so a `pyright` + `ruff` buffer showed half the candidates and accepted
+// them all at the first server's encoding.
+
+/// Point `$NXVIM_LSP_CMD_<NAME>` at the mock with its own script, so two servers
+/// answer differently (the blanket `$NXVIM_LSP_CMD` would aim both at one script).
+fn arm_completion_mock(dir: &Path, name: &str, script: &str) {
+    let file = dir.join(format!("mock-{name}.json"));
+    std::fs::write(&file, script).expect("write mock script");
+    // SAFETY: serialized on `serial_lock`, so no other test races this env mutation.
+    std::env::set_var(
+        format!("NXVIM_LSP_CMD_{}", name.to_uppercase()),
+        format!("{NXVIM_BIN} --__lsp-mock {}", file.display()),
+    );
+}
+
+fn disarm_completion_mocks() {
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+}
+
+/// Poll `expr` until it equals `want`; returns whether it matched.
+async fn await_lua_eq(rpc: &Rpc, expr: &str, want: &str) -> bool {
+    let code = format!("return tostring({expr})");
+    for _ in 0..200 {
+        if exec_lua(rpc, &code).await.as_str() == Some(want) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Open `body` in a `.rs` buffer with BOTH mock servers enabled for `rust`, wait for
+/// them to attach, enable the `lsp` completion source, then run `keys` (which enters
+/// insert mode and types the prefix).
+async fn start_two_servers(
+    dir: &Path,
+    body: &str,
+    keys: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let file_path = dir.join("a.rs");
+    std::fs::write(&file_path, body).expect("write test file");
+    let init = ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both completion servers attached"
+    );
+    exec_lua(
+        &rpc,
+        "nx.complete.setup { sources = { { 'lsp' } }, min_chars = 1 }",
+    )
+    .await;
+    feed(&rpc, keys);
+    (rpc, incoming)
+}
+
+#[tokio::test]
+async fn completion_merges_candidates_from_every_capable_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_two_servers");
+    arm_completion_mock(
+        dir.as_path(),
+        "alpha",
+        r#"{ "completion": [ { "label": "pr_alpha", "insertText": "pr_alpha" } ] }"#,
+    );
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "completion": [ { "label": "pr_beta", "insertText": "pr_beta" } ] }"#,
+    );
+    let (rpc, mut incoming) = start_two_servers(dir.as_path(), "", "ipr").await;
+
+    // Both servers' candidates in one popup. Only alpha's showed before this phase —
+    // it is the first `completionProvider` in key order, and it alone was asked.
+    let mut merged = Vec::new();
+    for _ in 0..200 {
+        exec_lua(&rpc, "nx.complete.trigger()").await;
+        if let Some(items) = poll_menu_items(&rpc, &mut incoming).await {
+            if items.iter().any(|i| i == "pr_alpha") && items.iter().any(|i| i == "pr_beta") {
+                merged = items;
+                break;
+            }
+            if !items.is_empty() {
+                merged = items;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    disarm_completion_mocks();
+    assert!(
+        merged.contains(&"pr_alpha".to_string()) && merged.contains(&"pr_beta".to_string()),
+        "both servers' candidates merge into one popup, got {merged:?}"
+    );
+}
+
+#[tokio::test]
+async fn accepting_a_candidate_applies_its_own_server_encoding() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_two_enc");
+    // `föö.` is bytes 0..6 but utf-16 units 0..4 — the two servers disagree about
+    // every column after the first multi-byte glyph.
+    arm_completion_mock(dir.as_path(), "alpha", r#"{ "completion": [] }"#);
+    // beta replaces utf-16 units 3..6 (`.pr`) with `.print()`. Read at alpha's utf-8
+    // that range is bytes 3..6 — the second `ö` and the dot — so a mis-encoded accept
+    // eats a glyph and yields `fö.print()`.
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "position_encoding": "utf-16",
+             "completion": [ {
+               "label": "print",
+               "textEdit": { "range": { "start": { "line": 0, "character": 3 },
+                                        "end":   { "line": 0, "character": 6 } },
+                             "newText": ".print()" } } ] }"#,
+    );
+    let (rpc, mut incoming) = start_two_servers(dir.as_path(), "föö.\n", "Apr").await;
+
+    await_items(&rpc, &mut incoming, "print").await;
+    feed(&rpc, "<C-y>");
+    let line = lines(&rpc).await.first().cloned().unwrap_or_default();
+
+    disarm_completion_mocks();
+    assert_eq!(
+        line, "föö.print()",
+        "the accept converts the textEdit at BETA's utf-16, not the first server's \
+         utf-8 (`fö.print()` is the mis-encoded read)"
+    );
+}
+
+#[tokio::test]
+async fn a_lazy_docs_resolve_goes_back_to_the_items_own_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_two_resolve");
+    // alpha offers nothing but still sorts first, so it is the buffer's "primary"
+    // server — and it answers `completionItem/resolve` with its OWN docs. The only
+    // row in the popup is beta's, so its docs must come from beta: a resolve routed
+    // to the first server is not a degraded result, it is a wrong request (the `data`
+    // blob is only meaningful to the server that issued the item).
+    arm_completion_mock(
+        dir.as_path(),
+        "alpha",
+        r#"{ "completion": [],
+             "completion_resolve": { "label": "compute",
+               "detail": "FROM-ALPHA", "documentation": "FROM-ALPHA-RESOLVE" } }"#,
+    );
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "completion": [ { "label": "compute", "insertText": "compute" } ],
+             "completion_resolve": { "label": "compute",
+               "detail": "fn compute() -> i32", "documentation": "FROM-BETA-RESOLVE" } }"#,
+    );
+    let (rpc, mut incoming) = start_two_servers(dir.as_path(), "", "icom").await;
+
+    await_items(&rpc, &mut incoming, "compute").await;
+    let docs = await_docs(&rpc, &mut incoming, "FROM-BETA-RESOLVE").await;
+
+    disarm_completion_mocks();
+    assert!(
+        docs.iter().any(|l| l.contains("FROM-BETA-RESOLVE")),
+        "the resolve reached the item's own server: {docs:?}"
+    );
+    assert!(
+        !docs.iter().any(|l| l.contains("FROM-ALPHA")),
+        "and not the buffer's first server: {docs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_completion_burst_does_not_accumulate_candidates() {
+    // The amplification guard (plan §Risks): fanning out re-requests per keystroke,
+    // so a burst must stay bounded — each round REPLACES the merged candidates rather
+    // than piling both servers' items on top of the last round's. A cache that grew
+    // per keystroke would still "work" until the popup showed hundreds of duplicates.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_two_burst");
+    arm_completion_mock(
+        dir.as_path(),
+        "alpha",
+        r#"{ "completion": [ { "label": "prfix_alpha", "insertText": "prfix_alpha" } ] }"#,
+    );
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "completion": [ { "label": "prfix_beta", "insertText": "prfix_beta" } ] }"#,
+    );
+    let (rpc, mut incoming) = start_two_servers(dir.as_path(), "", "ip").await;
+
+    // Type a burst inside one word, each key re-triggering the fan-out.
+    let started = std::time::Instant::now();
+    for _ in 0..12 {
+        feed(&rpc, "r<BS>");
+    }
+    feed(&rpc, "r");
+    nxvim_test_harness::barrier(&rpc).await;
+    let elapsed = started.elapsed();
+
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        exec_lua(&rpc, "nx.complete.trigger()").await;
+        if let Some(items) = poll_menu_items(&rpc, &mut incoming).await {
+            if items.iter().any(|i| i == "prfix_alpha") && items.iter().any(|i| i == "prfix_beta") {
+                rows = items;
+                break;
+            }
+            if !items.is_empty() {
+                rows = items;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let alphas = rows.iter().filter(|i| *i == "prfix_alpha").count();
+    let betas = rows.iter().filter(|i| *i == "prfix_beta").count();
+
+    disarm_completion_mocks();
+    assert_eq!(
+        (alphas, betas),
+        (1, 1),
+        "each round replaces the merged candidates — one row per server after a \
+         12-keystroke burst, got {rows:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the burst must not stall the editor (took {elapsed:?})"
+    );
+}

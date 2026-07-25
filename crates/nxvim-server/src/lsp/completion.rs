@@ -14,24 +14,61 @@
 //! `EditHost::lsp_complete_docs_md` and rendered by `Editor::open_completion_docs_float`.
 
 use nxvim_core::{BufferId, Mode};
-use nxvim_lsp::{CompletionItemData, PositionEncoding};
+use nxvim_lsp::CompletionItemData;
 
 use super::*;
 use crate::EditHost;
 
-/// The current LSP completion's raw items + the word they anchor at, kept so a
-/// delegated accept can apply the chosen item's edit and so a `isIncomplete = false`
-/// list can be re-served on a prefix edit without another round-trip. Indexed by the
+/// Whether two candidates are the **same offer**: same label, same kind, and the same
+/// text an accept would insert. Used to drop the duplicate when two servers on one
+/// buffer both offer a symbol — the rows would be indistinguishable in the popup and
+/// accept identically, so the second is noise rather than a second choice.
+///
+/// Compared on the *effective* insert text (the `textEdit`'s replacement, else
+/// `insertText`, else the label) so an item that merely spells its insertion
+/// differently — a different range, a snippet body — is kept: accepting it does
+/// something different.
+fn same_offer(a: &CompletionItemData, b: &CompletionItemData) -> bool {
+    fn inserted(item: &CompletionItemData) -> &str {
+        item.text_edit
+            .as_ref()
+            .map(|e| e.new_text.as_str())
+            .or(item.insert_text.as_deref())
+            .unwrap_or(&item.label)
+    }
+    a.label == b.label
+        && a.kind_label() == b.kind_label()
+        && a.is_snippet == b.is_snippet
+        && inserted(a) == inserted(b)
+}
+
+/// One completion **round**'s merged candidates: every capable server is asked at
+/// once and their items accumulate here as the replies land, kept so a delegated
+/// accept can apply the chosen item's edit and so an `isIncomplete = false` list can
+/// be re-served on a prefix edit without another round-trip. Indexed by the
 /// `MenuItem.key` the engine carries (the position in `items`).
+///
+/// The round is opened — and this cache reset — when the requests go out, so a reply
+/// only ever *appends*. That is what keeps `key` stable while a round is still
+/// filling: a lazy `completionItem/resolve` issued against row 3 of the first
+/// server's share still addresses row 3 after the second server's share arrives.
 pub(crate) struct LspComplete {
-    /// The server's items, verbatim; `items[key]` is the row the engine accepted.
+    /// The servers' items, verbatim; `items[key]` is the row the engine accepted.
     pub items: Vec<CompletionItemData>,
-    /// The buffer + (row, word-start byte col) the items were computed at. Reused
+    /// The server that produced each entry, parallel to [`items`](Self::items).
+    ///
+    /// Load-bearing twice over: the accept converts that item's `textEdit` ranges at
+    /// **its** server's negotiated encoding, and its lazy `completionItem/resolve`
+    /// must go back to the same server — the `data` blob it round-trips is only
+    /// meaningful there.
+    pub origins: Vec<ServerKey>,
+    /// The buffer + (row, word-start byte col) the round was requested at. Reused
     /// while the cursor stays in this word; invalidated when it moves on.
     pub buffer: BufferId,
     pub anchor: (usize, usize),
-    /// The server's `isIncomplete`: when `true`, a prefix edit must re-request rather
-    /// than re-serve the cached list (the list was narrowed to the old prefix).
+    /// `isIncomplete` **OR-ed** across the servers that have replied: if any narrowed
+    /// its list to the old prefix, a prefix edit must re-request rather than re-serve
+    /// the cached list.
     pub is_incomplete: bool,
 }
 
@@ -66,63 +103,172 @@ impl EditHost {
             self.complete_lsp_push(gen);
             return;
         }
-        // Cache miss / incomplete / moved word: ask the server. The reply pushes into
-        // whatever generation is live when it lands.
-        self.request_lsp(LspReqKind::Completion, 0);
+        // Cache miss / incomplete / moved word: open a fresh round against every
+        // capable server. Each reply pushes into whatever generation is live when it
+        // lands.
+        self.request_lsp_completion();
     }
 
-    /// Handle a `textDocument/completion` reply (already past the generation / buffer
-    /// staleness checks in [`EditHost::on_lsp_reply`]). Cache the items against the
-    /// current word and stream them into the open completion menu at the live
-    /// generation. Dropped if the user left insert mode.
+    /// Open a completion **round**: ask every attached server that advertises
+    /// `completionProvider`, each at its own negotiated encoding, and reset the merged
+    /// cache so their replies accumulate into this round rather than the last one's
+    /// candidates.
+    ///
+    /// Every capable server, not the first: on a `pyright` + `ruff` buffer, asking
+    /// only the first shows half the candidates — and completion is the kind where
+    /// "the whole point of a second server" most often *is* its candidates.
+    ///
+    /// The replies **stream**: each server's share appends to the open menu the moment
+    /// it lands, so a slow server delays only its own candidates instead of holding
+    /// the fast one's behind a barrier. Every in-flight request for this buffer is
+    /// retired first, so a straggler from the previous round can't land in this one.
+    ///
+    /// Silent when nothing can answer: this fires on a keystroke, so echoing "no
+    /// language server" here would shout once per typed character (the same reason
+    /// [`drain_signature_auto_request`](EditHost::drain_signature_auto_request) drops
+    /// quietly).
+    fn request_lsp_completion(&mut self) {
+        self.sync_lsp();
+        let buffer = self.editor.current_buffer_id();
+        let Some(uri) = self.lsp_states.get(&buffer).and_then(|s| s.uri.clone()) else {
+            return;
+        };
+        let targets = self.lsp_capable_servers(buffer, LspReqKind::Completion);
+        if targets.is_empty() {
+            return;
+        }
+        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+        let line = self.editor.buffer().line(row);
+        let (word_start, _prefix) = completion_word(&line, col);
+        // Retire the previous round's outstanding requests wholesale — not just the
+        // per-server supersede `register_multi_request` does — so a server this round
+        // does NOT ask (it stopped advertising completion, or detached) cannot land
+        // its stale share in this round's cache.
+        self.lsp_multi_requests
+            .retain(|_, p| !(p.kind == LspReqKind::Completion && p.buffer == buffer));
+        // Reset the cache to this round's (empty) merged list, anchored where the
+        // request was actually computed. A round that resets on ISSUE rather than on
+        // first reply is what makes every later reply a plain append.
+        self.lsp_complete = Some(LspComplete {
+            items: Vec::new(),
+            origins: Vec::new(),
+            buffer,
+            anchor: (row, word_start),
+            is_incomplete: false,
+        });
+        // A new round supersedes any in-flight docs resolve: its key indexed the old
+        // items, so drop it (the late reply is ignored — `on_completion_resolve_reply`
+        // takes a `None` key) and let the new selection re-issue against the new list.
+        self.lsp_complete_resolve_key = None;
+        for (key, encoding) in targets {
+            let position = self.lsp_position(encoding, row, col);
+            let token = self.register_multi_request(LspReqKind::Completion, buffer, &key);
+            self.fx.lsp_request(
+                key,
+                token,
+                nxvim_lsp::LspRequest::Completion {
+                    uri: uri.clone(),
+                    position,
+                },
+            );
+        }
+    }
+
+    /// Fold one server's share of a completion round into the merged cache and stream
+    /// it into the open menu at the live generation.
+    ///
+    /// Appends rather than replaces — the round was reset when the requests went out —
+    /// so the candidates of a server that answers second join the first's instead of
+    /// wiping them. Dropped if the user left insert mode, the buffer changed since the
+    /// request, or the round was already superseded (no cache).
+    ///
+    /// A candidate another server already offered **identically** (same label, kind and
+    /// inserted text) is skipped: the two rows would be indistinguishable in the popup
+    /// and accept to the same text, so the duplicate is noise. Anything that differs —
+    /// a different `textEdit`, kind, or insert text — is kept, because accepting it
+    /// does something different.
     pub(crate) fn on_completion_reply(
         &mut self,
+        buffer: BufferId,
+        server: ServerKey,
         is_incomplete: bool,
         items: Vec<CompletionItemData>,
     ) {
         if self.editor.mode != Mode::Insert {
             return;
         }
-        let buffer = self.editor.current_buffer_id();
-        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
-        let line = self.editor.buffer().line(row);
-        let (word_start, _prefix) = completion_word(&line, col);
-        self.lsp_complete = Some(LspComplete {
-            items,
-            buffer,
-            anchor: (row, word_start),
-            is_incomplete,
-        });
-        // A fresh list supersedes any in-flight docs resolve: its key indexed the old
-        // items, so drop it (the late reply is ignored — `on_completion_resolve_reply`
-        // takes a `None` key) and let the new selection re-issue against the new list.
-        self.lsp_complete_resolve_key = None;
+        if buffer != self.editor.current_buffer_id() {
+            return;
+        }
+        let Some(cache) = self.lsp_complete.as_mut() else {
+            return; // the round was superseded before this share landed
+        };
+        if cache.buffer != buffer {
+            return;
+        }
+        let start = cache.items.len();
+        for item in items {
+            if cache.items.iter().any(|had| same_offer(had, &item)) {
+                continue;
+            }
+            cache.items.push(item);
+            cache.origins.push(server.clone());
+        }
+        cache.is_incomplete |= is_incomplete;
         // Push into the live menu generation — the engine bumped it on the keystroke
         // that fired the request, and a `Complete` menu is open (core seeded it, or
         // will re-seed on the next key). A `0` generation means no menu is open.
         let gen = self.editor.menu_generation();
         if gen != 0 {
-            self.complete_lsp_push(gen);
+            self.complete_lsp_push_from(gen, start);
         }
         self.lsp_dirty = true;
     }
 
-    /// Build `MenuItem`s from the cached LSP items and append them to the open
-    /// completion menu at generation `gen`. Each row carries the LSP merge priority,
-    /// `source_accept = true` (accept is delegated back to apply its `textEdit`), and
-    /// its index as the `key` so the accept can find the raw item. The engine's
-    /// matcher ranks them against the prefix and merges them with the buffer rows by
-    /// priority; a stale `gen` is dropped by [`Editor::menu_push`].
+    /// Build `MenuItem`s from the whole merged cache and append them to the open
+    /// completion menu at generation `gen` — the re-serve path, for a fresh generation
+    /// whose menu holds none of them yet.
     pub(crate) fn complete_lsp_push(&mut self, gen: u64) {
+        self.complete_lsp_push_from(gen, 0);
+    }
+
+    /// [`complete_lsp_push`](Self::complete_lsp_push) for the merged cache's tail from
+    /// `start` — one server's freshly-arrived share, so a streaming append doesn't
+    /// re-push (and duplicate) the shares already in the menu.
+    ///
+    /// Each row carries the LSP merge priority, `source_accept = true` (accept is
+    /// delegated back to apply its `textEdit`), and its index as the `key` so the
+    /// accept can find the raw item. The engine's matcher ranks them against the prefix
+    /// and merges them with the buffer rows by priority; a stale `gen` is dropped by
+    /// [`Editor::menu_push`].
+    ///
+    /// The priority is stepped down by the producing server's position in key order,
+    /// so **equally-good** matches from two servers rank in a stable order instead of
+    /// in whichever order the replies happened to arrive (the engine's blended sort is
+    /// stable, so streamed order decides ties). One point per server keeps every LSP
+    /// row far above the buffer-word tier — the `lsp` bias is 8 against 0.
+    fn complete_lsp_push_from(&mut self, gen: u64, start: usize) {
         let Some(cache) = self.lsp_complete.as_ref() else {
             return;
         };
-        let priority = self.complete_lsp_priority;
+        let base_priority = self.complete_lsp_priority;
+        let rank: Vec<ServerKey> = self
+            .lsp_states
+            .get(&cache.buffer)
+            .map(|s| s.servers().map(|(k, _)| k.clone()).collect())
+            .unwrap_or_default();
         let items: Vec<nxvim_core::MenuItem> = cache
             .items
             .iter()
             .enumerate()
+            .skip(start)
             .map(|(key, item)| {
+                let step = cache
+                    .origins
+                    .get(key)
+                    .and_then(|o| rank.iter().position(|k| k == o))
+                    .unwrap_or(0) as i32;
+                let priority = base_priority - step;
                 // Display the label; insert the label as a no-op fallback (the real
                 // edit is applied server-side on accept via `source_accept`).
                 let label = item.label.clone();
@@ -162,9 +308,16 @@ impl EditHost {
         else {
             return;
         };
-        let encoding = self
-            .current_lsp_target()
-            .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
+        // At the encoding of the server that OFFERED this item: a `textEdit` range is
+        // authored in its own server's coordinates, and a two-server buffer can hold
+        // a utf-8 and a utf-16 one at once — reading one as the other shifts every
+        // column after the line's first multi-byte glyph.
+        let origin = self
+            .lsp_complete
+            .as_ref()
+            .and_then(|c| c.origins.get(key))
+            .cloned();
+        let encoding = self.reply_encoding(origin.as_ref());
         // Anchor the word fallback at the current word start (the engine kept the
         // cursor in the word; recompute rather than thread core's anchor through).
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
@@ -298,10 +451,19 @@ impl EditHost {
         let Some(resolve_data) = item.resolve_data.clone() else {
             return; // the server gave no `data` to resolve against — stays docless
         };
-        let Some((server_key, _uri, _enc)) = self.current_lsp_target() else {
+        // Back to the server that OFFERED this row, not the buffer's first: the
+        // `data` blob being round-tripped is that server's own handle on the item.
+        // Resolving ruff's candidate against pyright is a wrong request, not a
+        // degraded one — and with a merged popup the two are routinely different.
+        let Some(server_key) = self
+            .lsp_complete
+            .as_ref()
+            .and_then(|c| c.origins.get(key))
+            .cloned()
+        else {
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::CompletionResolve, 0);
+        let token = self.register_lsp_request_to(LspReqKind::CompletionResolve, 0, &server_key);
         self.lsp_complete_resolve_key = Some(key);
         self.fx.lsp_request(
             server_key,

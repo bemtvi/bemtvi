@@ -39,7 +39,7 @@ impl EditHost {
         let Some(uri) = state.uri.clone() else {
             return;
         };
-        let token = self.register_buffer_scoped_request(LspReqKind::FoldingRange, buffer, &key);
+        let token = self.register_multi_request(LspReqKind::FoldingRange, buffer, &key);
         self.fx
             .lsp_request(key, token, nxvim_lsp::LspRequest::FoldingRange { uri });
     }
@@ -60,7 +60,7 @@ impl EditHost {
         // (a fresh reply clears the "needs request" condition by storing its result).
         let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
         if self
-            .lsp_buf_requests
+            .lsp_multi_requests
             .values()
             .any(|p| p.kind == LspReqKind::FoldingRange && p.buffer == buffer && p.tick == tick)
         {

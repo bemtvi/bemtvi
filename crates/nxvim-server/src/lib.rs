@@ -190,7 +190,7 @@ use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::Keymaps;
 use lsp::{
     DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspFanout, LspReqKind,
-    PendingBufReq, PendingLspReq, ServerRuntime,
+    PendingLspReq, PendingMultiReq, ServerRuntime,
 };
 use nxvim_core::{
     BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, PluginEntry, PluginNamespace,
@@ -934,8 +934,8 @@ pub struct EditHost {
     /// hints, folding ranges), keyed by the unique generation their token carries.
     /// Separate from `lsp_requests` because a buffer asks every capable server for
     /// its decorations at once and each reply must be decoded against the server
-    /// that produced it — see [`PendingBufReq`].
-    lsp_buf_requests: HashMap<u64, PendingBufReq>,
+    /// that produced it — see [`PendingMultiReq`].
+    lsp_multi_requests: HashMap<u64, PendingMultiReq>,
     /// In-flight `inlayHint/resolve`s, keyed by the `cb_id` their token carries.
     /// Unlike the single-slot `lsp_requests`, many lazy hints can resolve at once,
     /// so each gets a distinct `cb_id` (from `inlay_resolve_seq`) and routes back
@@ -1508,7 +1508,7 @@ impl EditHost {
             lsp_req_gen: 0,
             lsp_requests: HashMap::new(),
             lsp_fanouts: HashMap::new(),
-            lsp_buf_requests: HashMap::new(),
+            lsp_multi_requests: HashMap::new(),
             inlay_resolves: HashMap::new(),
             inlay_resolve_seq: 0,
             complete_lsp_active: false,

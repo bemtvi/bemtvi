@@ -279,19 +279,25 @@ pub(crate) struct InlayResolveTarget {
     pub(crate) idx: usize,
 }
 
-/// An in-flight **whole-buffer decoration** request — semantic tokens, inlay hints,
-/// folding ranges — kept in [`EditHost::lsp_buf_requests`] keyed by the unique
-/// `generation` its [`ReqToken`] carries.
+/// An in-flight request whose pending is tracked per **(kind, buffer, server)**
+/// rather than one slot per kind — the whole-buffer decorations (semantic tokens,
+/// inlay hints, folding ranges) and completion. Kept in
+/// [`EditHost::lsp_multi_requests`], keyed by the unique `generation` its
+/// [`ReqToken`] carries.
 ///
-/// These need their own map because a buffer asks **every** capable server for its
-/// decorations at once (a `pyright` + `ruff` buffer has two semantic-token requests
-/// in flight for one change), and their results do not merge into a single
-/// presentation the way a fan-out round's do — each lands in its own server's cache
-/// and the projection concatenates. The single-slot `lsp_requests` kind-map cannot
-/// express either: the second request would evict the first, and the reply would
-/// then be decoded against whichever server happened to be recorded last — with a
-/// wrong legend or a wrong position encoding, which paints plausible nonsense.
-pub(crate) struct PendingBufReq {
+/// These need their own map because a buffer asks **every** capable server at once
+/// (a `pyright` + `ruff` buffer has two semantic-token requests, and two completion
+/// requests, in flight for one keystroke), and their results do not merge into a
+/// single presentation the way a fan-out round's do — each lands in its own server's
+/// cache, or streams into the open menu as it arrives. The single-slot `lsp_requests`
+/// kind-map cannot express either: the second request would evict the first, and the
+/// reply would then be decoded against whichever server happened to be recorded last
+/// — with a wrong legend or a wrong position encoding, which paints plausible
+/// nonsense rather than failing visibly.
+///
+/// Folding ranges ride this map for the buffer scoping alone; they stay
+/// single-target ([`LspReqKind::per_server_pending`]).
+pub(crate) struct PendingMultiReq {
     pub(crate) kind: LspReqKind,
     pub(crate) buffer: BufferId,
     /// The buffer's `changedtick` at issue time; a reply computed against
@@ -412,18 +418,22 @@ impl LspReqKind {
         })
     }
 
-    /// Whether this kind is a **whole-buffer decoration refresh** — issued per
-    /// buffer on open/change/enable rather than at the cursor, and tracked in
-    /// [`EditHost::lsp_buf_requests`] rather than the single-slot kind map.
+    /// Whether this kind's in-flight requests are tracked per **(kind, buffer,
+    /// server)** in [`EditHost::lsp_multi_requests`], rather than in the single-slot
+    /// kind map — see [`PendingMultiReq`].
     ///
-    /// Semantic tokens and inlay hints go to *every* capable server (their caches
-    /// are per server and the projection concatenates); folding ranges stay
-    /// single-target — a buffer has one fold structure, and merging two servers'
-    /// containment trees is not defined.
-    pub(crate) fn is_whole_buffer(self) -> bool {
+    /// Semantic tokens, inlay hints and completion go to *every* capable server: the
+    /// first two cache per server and the projection concatenates, completion streams
+    /// each server's candidates into the open menu as they land. Folding ranges are
+    /// here only for the buffer scoping and stay **single-target** — a buffer has one
+    /// fold structure, and merging two servers' containment trees is not defined.
+    pub(crate) fn per_server_pending(self) -> bool {
         matches!(
             self,
-            LspReqKind::SemanticTokens | LspReqKind::InlayHints | LspReqKind::FoldingRange
+            LspReqKind::SemanticTokens
+                | LspReqKind::InlayHints
+                | LspReqKind::FoldingRange
+                | LspReqKind::Completion
         )
     }
 

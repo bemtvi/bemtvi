@@ -103,8 +103,7 @@ impl EditHost {
             })
             .collect();
         for (key, request) in requests {
-            let token =
-                self.register_buffer_scoped_request(LspReqKind::SemanticTokens, buffer, &key);
+            let token = self.register_multi_request(LspReqKind::SemanticTokens, buffer, &key);
             self.fx.lsp_request(key, token, request);
         }
     }

@@ -86,17 +86,20 @@ impl EditHost {
             },
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
-            LspReqKind::Completion => LspRequest::Completion { uri, position },
             // Document symbols are whole-document (position-less), but ride the
             // cursor-tick request path like the goto family.
             LspReqKind::DocumentSymbol => LspRequest::DocumentSymbol { uri },
             // Workspace symbols carry a query, not the cursor — issued by
             // `request_lsp_workspace_symbol` below, never here.
             LspReqKind::WorkspaceSymbol => return,
+            // Completion goes to EVERY capable server, each at its own encoding, and
+            // its shares stream into the open menu — `request_lsp_completion` owns
+            // that round, so it never rides this single-target path.
+            LspReqKind::Completion
             // Formatting/rename/codeAction(+resolve) and completion-resolve don't
             // share the uniform {uri, position} shape and have their own issue
             // functions below (resolve is fired from the menu, not the cursor).
-            LspReqKind::Formatting
+            | LspReqKind::Formatting
             | LspReqKind::Rename
             | LspReqKind::CodeAction
             | LspReqKind::ResolveCodeAction
@@ -230,13 +233,13 @@ impl EditHost {
     /// encoding). These are background refreshes, not user verbs — no promise to
     /// settle.
     ///
-    /// Recorded in `lsp_buf_requests`, keyed by the unique generation, so several
+    /// Recorded in `lsp_multi_requests`, keyed by the unique generation, so several
     /// can be in flight at once: a buffer asks **every** capable server for its
     /// decorations, and the single-slot kind map would have each request evict the
     /// last. Only a request for the same `(kind, buffer, server)` supersedes — an
     /// older one for that exact triple is retired, since its reply is about to be
     /// replaced anyway.
-    pub(crate) fn register_buffer_scoped_request(
+    pub(crate) fn register_multi_request(
         &mut self,
         kind: LspReqKind,
         buffer: BufferId,
@@ -245,11 +248,11 @@ impl EditHost {
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
         let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
-        self.lsp_buf_requests
+        self.lsp_multi_requests
             .retain(|_, p| !(p.kind == kind && p.buffer == buffer && p.server == *server));
-        self.lsp_buf_requests.insert(
+        self.lsp_multi_requests.insert(
             generation,
-            PendingBufReq {
+            PendingMultiReq {
                 kind,
                 buffer,
                 tick,
@@ -291,15 +294,15 @@ impl EditHost {
             .collect()
     }
 
-    /// Route a whole-buffer decoration reply (semantic tokens / inlay hints /
-    /// folding ranges) to its cache, using the [`PendingBufReq`] its generation
-    /// identifies: the issuing buffer, the tick to check staleness against, and the
-    /// **server that answered** — which is what its legend and position encoding
-    /// must be read from. An unknown generation is a superseded request's reply and
-    /// is dropped; a reply whose payload doesn't match its kind means the server
-    /// answered off-protocol, and is likewise dropped.
-    fn on_buffer_scoped_reply(&mut self, token: &ReqToken, reply: LspReply) {
-        let Some(pending) = self.lsp_buf_requests.remove(&token.generation) else {
+    /// Route a per-server reply (a whole-buffer decoration, or one server's share of
+    /// a completion round) using the [`PendingMultiReq`] its generation identifies:
+    /// the issuing buffer, the tick to check staleness against, and the **server that
+    /// answered** — which is what its legend and position encoding must be read from.
+    /// An unknown generation is a superseded request's reply and is dropped; a reply
+    /// whose payload doesn't match its kind means the server answered off-protocol,
+    /// and is likewise dropped.
+    fn on_multi_target_reply(&mut self, token: &ReqToken, reply: LspReply) {
+        let Some(pending) = self.lsp_multi_requests.remove(&token.generation) else {
             return; // superseded by a newer request for this (kind, buffer, server)
         };
         let (buffer, tick, key) = (pending.buffer, pending.tick, pending.server);
@@ -309,6 +312,10 @@ impl EditHost {
             }
             LspReply::InlayHints(hints) => self.on_inlay_hints_reply(buffer, tick, key, hints),
             LspReply::Folds(folds) => self.on_folding_range_reply(buffer, tick, folds),
+            LspReply::Completion {
+                is_incomplete,
+                items,
+            } => self.on_completion_reply(buffer, key, is_incomplete, items),
             _ => {}
         }
     }
@@ -812,8 +819,8 @@ impl EditHost {
         // Whole-buffer decorations route by generation through their own map: one
         // request per capable server can be outstanding at a time, each landing in
         // its own server's cache.
-        if kind.is_whole_buffer() {
-            self.on_buffer_scoped_reply(&token, reply);
+        if kind.per_server_pending() {
+            self.on_multi_target_reply(&token, reply);
             return;
         }
         let Some(pending) = self.lsp_requests.get(&kind) else {
@@ -848,14 +855,11 @@ impl EditHost {
         self.lsp_requests.remove(&kind);
 
         match reply {
-            LspReply::Completion {
-                is_incomplete,
-                items,
-            } => {
-                if buffer_changed {
-                    return;
-                }
-                self.on_completion_reply(is_incomplete, items);
+            // Completion is per-server now (a round asks every capable server and
+            // each share streams into the open menu), so it routes by generation
+            // through `on_multi_target_reply` above, never here.
+            LspReply::Completion { .. } => {
+                unreachable!("completion replies are routed in on_multi_target_reply")
             }
             LspReply::Locations(locations) => {
                 if buffer_changed || cursor_moved {
@@ -960,10 +964,10 @@ impl EditHost {
             }
             // The whole-buffer decorations (semantic tokens / inlay hints / folding
             // ranges) never reach here — they are routed by generation through
-            // `on_buffer_scoped_reply` above, because a buffer has one request per
+            // `on_multi_target_reply` above, because a buffer has one request per
             // capable server outstanding rather than one per kind.
             LspReply::SemanticTokens(_) | LspReply::InlayHints(_) | LspReply::Folds(_) => {
-                unreachable!("whole-buffer replies are routed in on_buffer_scoped_reply")
+                unreachable!("whole-buffer replies are routed in on_multi_target_reply")
             }
             // Generic `client:request` replies are routed to their Lua handler in
             // `on_lsp_event` before reaching here, never through the typed path.

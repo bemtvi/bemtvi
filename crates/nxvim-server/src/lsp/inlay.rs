@@ -84,7 +84,7 @@ impl EditHost {
             },
         };
         for (key, _enc) in self.lsp_capable_servers(buffer, LspReqKind::InlayHints) {
-            let token = self.register_buffer_scoped_request(LspReqKind::InlayHints, buffer, &key);
+            let token = self.register_multi_request(LspReqKind::InlayHints, buffer, &key);
             self.fx.lsp_request(
                 key,
                 token,

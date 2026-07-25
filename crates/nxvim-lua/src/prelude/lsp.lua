@@ -879,6 +879,10 @@ end
 -- `get_at_pos(bufnr, row, col)`: the decoded tokens covering the 0-based (row, col)
 -- (neovim's `vim.lsp.semantic_tokens.get_at_pos`). `col` is a 0-based byte column;
 -- a token covers `[start_col, end_col)`. Returns a list (possibly empty).
+--
+-- A buffer served by several language servers carries **every** capable server's
+-- tokens, each tagged with its `client_id`, so one column can hold more than one
+-- token. Filter on `client_id` when you mean a specific server's.
 function nx.lsp.semantic_tokens.get_at_pos(bufnr, row, col)
   local toks = nx._semantic_tokens[cur_bufnr(bufnr)] or {}
   local out = {}
@@ -917,6 +921,10 @@ end
 -- current), each `{ bufnr, client_id, inlay_hint = <decoded entry> }` to match
 -- neovim's shape. `filter.range` ({ start_line, end_line }, 0-based inclusive)
 -- narrows by line. Reads the mirror — no request is issued.
+--
+-- Every capable server's hints are here, in line-then-column order, each tagged
+-- with the `client_id` that produced it — a buffer served by two servers shows
+-- both sets.
 function nx.lsp.inlay_hint.get(filter)
   filter = filter or {}
   local bufnr = cur_bufnr(filter.bufnr)

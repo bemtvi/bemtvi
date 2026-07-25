@@ -224,13 +224,18 @@ impl EditHost {
     /// Register a **buffer-scoped** pending request — the semantic-tokens /
     /// inlay-hints / folding-range shape, unlike the cursor-scoped
     /// [`register_lsp_request`](Self::register_lsp_request) which issues for the
-    /// *current* buffer: bump the generation and record the issuing `buffer` and
-    /// its `changedtick`, so a reply computed against superseded text is dropped.
-    /// The cursor field is filled with the current cursor only to satisfy the
-    /// shared [`PendingLspReq`] shape; the whole-buffer replies ignore it. These
-    /// are background refreshes, not user verbs — no promise to settle
-    /// (`cb_id = 0`; a superseded pending of these kinds is fire-and-forget too,
-    /// so there is nothing to settle on replace).
+    /// *current* buffer: bump the generation and record the issuing `buffer`, its
+    /// `changedtick` (so a reply computed against superseded text is dropped) and
+    /// the `server` asked (so the reply is decoded against *its* legend and
+    /// encoding). These are background refreshes, not user verbs — no promise to
+    /// settle.
+    ///
+    /// Recorded in `lsp_buf_requests`, keyed by the unique generation, so several
+    /// can be in flight at once: a buffer asks **every** capable server for its
+    /// decorations, and the single-slot kind map would have each request evict the
+    /// last. Only a request for the same `(kind, buffer, server)` supersedes — an
+    /// older one for that exact triple is retired, since its reply is about to be
+    /// replaced anyway.
     pub(crate) fn register_buffer_scoped_request(
         &mut self,
         kind: LspReqKind,
@@ -240,22 +245,71 @@ impl EditHost {
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
         let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
-        self.lsp_requests.insert(
-            kind,
-            PendingLspReq {
-                generation,
+        self.lsp_buf_requests
+            .retain(|_, p| !(p.kind == kind && p.buffer == buffer && p.server == *server));
+        self.lsp_buf_requests.insert(
+            generation,
+            PendingBufReq {
+                kind,
                 buffer,
-                cursor: (self.editor.cursor.line, self.editor.cursor.col),
                 tick,
-                cb_id: 0,
-                code_action: CodeActionOpts::default(),
-                server: Some(server.clone()),
+                server: server.clone(),
             },
         );
         ReqToken {
             kind: kind.as_u16(),
             generation,
             cb_id: 0,
+        }
+    }
+
+    /// Every attached server on `buffer` that has finished `initialize` and
+    /// advertises the provider answering `kind`, in [`ServerKey`] order, with the
+    /// encoding each negotiated.
+    ///
+    /// The plural of [`lsp_target_for`](Self::lsp_target_for): the selector for the
+    /// surfaces that ask *all* capable servers — the fan-out rounds (references,
+    /// symbols, code actions) and the whole-buffer decorations (semantic tokens,
+    /// inlay hints), whose caches are per server.
+    pub(crate) fn lsp_capable_servers(
+        &self,
+        buffer: BufferId,
+        kind: LspReqKind,
+    ) -> Vec<(ServerKey, PositionEncoding)> {
+        let Some(state) = self.lsp_states.get(&buffer) else {
+            return Vec::new();
+        };
+        state
+            .servers()
+            .filter_map(|(key, _)| {
+                let rt = self.lsp_servers.get(key)?;
+                match kind.provider(&rt.providers) {
+                    Some(true) | None => Some((key.clone(), rt.encoding)),
+                    Some(false) => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Route a whole-buffer decoration reply (semantic tokens / inlay hints /
+    /// folding ranges) to its cache, using the [`PendingBufReq`] its generation
+    /// identifies: the issuing buffer, the tick to check staleness against, and the
+    /// **server that answered** — which is what its legend and position encoding
+    /// must be read from. An unknown generation is a superseded request's reply and
+    /// is dropped; a reply whose payload doesn't match its kind means the server
+    /// answered off-protocol, and is likewise dropped.
+    fn on_buffer_scoped_reply(&mut self, token: &ReqToken, reply: LspReply) {
+        let Some(pending) = self.lsp_buf_requests.remove(&token.generation) else {
+            return; // superseded by a newer request for this (kind, buffer, server)
+        };
+        let (buffer, tick, key) = (pending.buffer, pending.tick, pending.server);
+        match reply {
+            LspReply::SemanticTokens(data) => {
+                self.on_semantic_tokens_reply(buffer, tick, key, data)
+            }
+            LspReply::InlayHints(hints) => self.on_inlay_hints_reply(buffer, tick, key, hints),
+            LspReply::Folds(folds) => self.on_folding_range_reply(buffer, tick, folds),
+            _ => {}
         }
     }
 
@@ -605,16 +659,7 @@ impl EditHost {
         let Some(uri) = state.uri.clone() else {
             return Vec::new();
         };
-        let targets: Vec<(ServerKey, PositionEncoding)> = state
-            .servers()
-            .filter_map(|(key, _)| {
-                let rt = self.lsp_servers.get(key)?;
-                match kind.provider(&rt.providers) {
-                    Some(true) | None => Some((key.clone(), rt.encoding)),
-                    Some(false) => None,
-                }
-            })
-            .collect();
+        let targets = self.lsp_capable_servers(buffer, kind);
         if targets.is_empty() {
             return Vec::new();
         }
@@ -764,6 +809,13 @@ impl EditHost {
         if LspFanout::is_fanout(kind) && self.absorb_fanout_reply(kind, &token, &reply) {
             return;
         }
+        // Whole-buffer decorations route by generation through their own map: one
+        // request per capable server can be outstanding at a time, each landing in
+        // its own server's cache.
+        if kind.is_whole_buffer() {
+            self.on_buffer_scoped_reply(&token, reply);
+            return;
+        }
         let Some(pending) = self.lsp_requests.get(&kind) else {
             return;
         };
@@ -778,12 +830,6 @@ impl EditHost {
         // then must drop it — applying stale edits would corrupt the buffer. A
         // mere cursor move is fine to apply over.
         let tick_changed = pending.tick != self.editor.buffer().changedtick;
-        // The buffer/tick the request was issued for — semantic tokens are
-        // whole-buffer (cache to the issuing buffer regardless of focus, drop on
-        // *its* content change), so they use these rather than the current-buffer
-        // staleness above.
-        let req_buffer = pending.buffer;
-        let req_tick = pending.tick;
         // The async verb's promise callback (`0` = fire-and-forget). Settled on a
         // successful apply (with the result value) or on a staleness drop (`nil`) so
         // it never hangs. The generation-mismatch / missing-pending drops above
@@ -794,6 +840,11 @@ impl EditHost {
         // The code-action request's `only`/`apply` options, needed to filter this reply
         // and to decide chooser-vs-one-shot. Default (and unused) for every other kind.
         let code_action = pending.code_action.clone();
+        // The encoding the ANSWERING server's positions are in — an apply reply
+        // (formatting / rename / resolved code action) carries ranges that must be
+        // converted with it, and on a multi-server buffer that is not the first
+        // server's. `format{ name = … }` makes this reachable by design.
+        let reply_encoding = self.reply_encoding(pending.server.clone().as_ref());
         self.lsp_requests.remove(&kind);
 
         match reply {
@@ -853,7 +904,7 @@ impl EditHost {
                     self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.apply_formatting_edits(edits);
+                self.apply_formatting_edits(edits, reply_encoding);
                 self.lsp_dirty = true;
                 // A mutation verb resolves `nil` — the effect is the buffer change.
                 self.settle_lsp_promise(cb_id, serde_json::Value::Null);
@@ -863,7 +914,7 @@ impl EditHost {
                     self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.apply_workspace_edit(changes);
+                self.apply_workspace_edit(changes, reply_encoding);
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             }
@@ -886,7 +937,7 @@ impl EditHost {
                     return;
                 }
                 match edit {
-                    Some(changes) => self.apply_workspace_edit(changes),
+                    Some(changes) => self.apply_workspace_edit(changes, reply_encoding),
                     None => self
                         .editor
                         .echo(LspReqKind::ResolveCodeAction.empty_message()),
@@ -907,22 +958,12 @@ impl EditHost {
                 // a replaced list is dropped via the reset `lsp_complete_resolve_key`.
                 self.on_completion_resolve_reply(documentation, detail);
             }
-            LspReply::SemanticTokens(data) => {
-                // Whole-buffer, focus-independent: cache to the issuing buffer
-                // (which may not be current) and let `on_semantic_tokens_reply`
-                // drop it on that buffer's own content change.
-                self.on_semantic_tokens_reply(req_buffer, req_tick, data);
-            }
-            LspReply::InlayHints(hints) => {
-                // Whole-buffer, focus-independent like semantic tokens: cache to the
-                // issuing buffer and drop on *its* content change.
-                self.on_inlay_hints_reply(req_buffer, req_tick, hints);
-            }
-            LspReply::Folds(folds) => {
-                // Whole-buffer, focus-independent like semantic tokens / inlay hints:
-                // push into the fold engine for the issuing buffer and drop on *its*
-                // content change.
-                self.on_folding_range_reply(req_buffer, req_tick, folds);
+            // The whole-buffer decorations (semantic tokens / inlay hints / folding
+            // ranges) never reach here — they are routed by generation through
+            // `on_buffer_scoped_reply` above, because a buffer has one request per
+            // capable server outstanding rather than one per kind.
+            LspReply::SemanticTokens(_) | LspReply::InlayHints(_) | LspReply::Folds(_) => {
+                unreachable!("whole-buffer replies are routed in on_buffer_scoped_reply")
             }
             // Generic `client:request` replies are routed to their Lua handler in
             // `on_lsp_event` before reaching here, never through the typed path.

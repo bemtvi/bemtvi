@@ -157,14 +157,13 @@ impl EditHost {
             }
             LspOp::SemanticTokensRefresh { bufnr } => {
                 let buffer = BufferId(bufnr);
-                // Drop the delta cursor so the refresh re-requests the whole `full`
-                // set (neovim's `force_refresh` discards the prior result).
-                if let Some(doc) = self
-                    .lsp_states
-                    .get_mut(&buffer)
-                    .and_then(|s| s.primary_doc_mut())
-                {
-                    doc.semantic.result_id = None;
+                // Drop every server's delta cursor so the refresh re-requests whole
+                // `full` sets (neovim's `force_refresh` discards the prior result) —
+                // the user asked to recompute the buffer, not one server's half of it.
+                if let Some(state) = self.lsp_states.get_mut(&buffer) {
+                    for (_, doc) in state.servers_mut() {
+                        doc.semantic.result_id = None;
+                    }
                 }
                 self.request_semantic_tokens(buffer);
                 return;
@@ -178,14 +177,13 @@ impl EditHost {
                     // paints it. (No-op unless the server advertises the provider.)
                     self.request_inlay_hints(buffer);
                 } else {
-                    if let Some(doc) = self
-                        .lsp_states
-                        .get_mut(&buffer)
-                        .and_then(|s| s.primary_doc_mut())
-                    {
-                        // Disabling clears the cache — no surviving paint (neovim drops
-                        // the hints on disable; they re-fetch on the next enable).
-                        doc.inlay = Default::default();
+                    if let Some(state) = self.lsp_states.get_mut(&buffer) {
+                        // Disabling clears EVERY server's cache — no surviving paint
+                        // (neovim drops the hints on disable; they re-fetch on the next
+                        // enable). Clearing only one would leave the other's painted.
+                        for (_, doc) in state.servers_mut() {
+                            doc.inlay = Default::default();
+                        }
                     }
                     // Clear the read mirror too, so `vim.lsp.inlay_hint.get` returns
                     // nothing for a disabled buffer.
@@ -860,6 +858,13 @@ impl EditHost {
                 // never coming, and without this the round would wait on it forever
                 // (the merged result would simply never present).
                 self.drop_fanout_server(&key);
+                // Same reasoning for the whole-buffer decoration requests and the
+                // lazy inlay resolves it had outstanding: those replies are never
+                // coming, and both maps are keyed per (buffer, server) rather than
+                // being single slots, so a dead server's entries would otherwise
+                // accumulate one per buffer it served.
+                self.lsp_buf_requests.retain(|_, p| p.server != key);
+                self.inlay_resolves.retain(|_, t| t.server != key);
                 if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
                     // Buffers attached to this server, with a display name for the
                     // event's `args.file`. Clear `opened` so a later `:bdelete`
@@ -923,10 +928,13 @@ impl EditHost {
                 RefreshKind::SemanticTokens => {
                     // A refresh means "recompute"; drop the delta cursor so the
                     // re-request fetches the whole `full` set (like force_refresh).
+                    // Only for the server that ASKED — the others' cursors are still
+                    // valid, and invalidating them would refetch two whole token sets
+                    // because one server recomputed.
                     if let Some(doc) = self
                         .lsp_states
                         .get_mut(&buffer)
-                        .and_then(|s| s.primary_doc_mut())
+                        .and_then(|s| s.doc_mut(&key))
                     {
                         doc.semantic.result_id = None;
                     }
@@ -1040,5 +1048,19 @@ impl EditHost {
     pub(crate) fn buffer_encoding(&self, id: BufferId) -> Option<PositionEncoding> {
         let key = self.lsp_states.get(&id)?.primary_key()?;
         Some(self.lsp_servers.get(key)?.encoding)
+    }
+
+    /// The position encoding a reply from `key` is authored in, falling back to the
+    /// current buffer's first server (then utf-8) when the producing server isn't
+    /// known — the Lua-supplied `apply_workspace_edit`, which has no server at all.
+    ///
+    /// The fallback is deliberately last: with several servers on a buffer, reading
+    /// a reply at the *first* server's encoding is right only by luck, so every
+    /// native path threads the answering server through instead.
+    pub(crate) fn reply_encoding(&self, key: Option<&ServerKey>) -> PositionEncoding {
+        key.and_then(|k| self.lsp_servers.get(k))
+            .map(|rt| rt.encoding)
+            .or_else(|| self.buffer_encoding(self.editor.current_buffer_id()))
+            .unwrap_or(PositionEncoding::Utf8)
     }
 }

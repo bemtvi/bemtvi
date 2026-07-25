@@ -51,11 +51,15 @@ fn inlay_mirror(cache: &InlayHintsCache, client_id: u64) -> Vec<InlayHintMirrorD
 }
 
 impl EditHost {
-    /// Issue an inlay-hint request for `buffer`, if it has the feature enabled and
-    /// its server is up, finished `initialize`, and advertised `inlayHintProvider`.
-    /// A no-op otherwise (the buffer shows no hints). Whole-buffer, so — like
-    /// semantic tokens — it is fired on enable and after each change, and the reply
-    /// is stale-dropped on a content (`tick`) change, not a cursor move.
+    /// Issue an inlay-hint request for `buffer` to **every** attached server that is
+    /// up, finished `initialize`, and advertised `inlayHintProvider` — provided the
+    /// buffer has the feature enabled. A no-op otherwise (the buffer shows no
+    /// hints). Whole-buffer, so — like semantic tokens — it is fired on enable and
+    /// after each change, and each reply is stale-dropped on a content (`tick`)
+    /// change, not a cursor move.
+    ///
+    /// All of them, not the first: the hints of a type-checker and of a linter are
+    /// both worth showing, they cache per server, and the projection concatenates.
     pub(crate) fn request_inlay_hints(&mut self, buffer: BufferId) {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return;
@@ -63,12 +67,6 @@ impl EditHost {
         if !state.inlay_enabled {
             return;
         }
-        // Selected, not assumed: the first attached server advertising
-        // `inlayHintProvider` answers, so a second server providing hints is used
-        // even when the buffer's first one doesn't.
-        let Some((key, _uri, _enc)) = self.lsp_target_for(buffer, LspReqKind::InlayHints) else {
-            return;
-        };
         let Some(uri) = state.uri.clone() else {
             return;
         };
@@ -85,20 +83,35 @@ impl EditHost {
                 character: 0,
             },
         };
-        let token = self.register_buffer_scoped_request(LspReqKind::InlayHints, buffer, &key);
-        self.fx
-            .lsp_request(key, token, nxvim_lsp::LspRequest::InlayHint { uri, range });
+        for (key, _enc) in self.lsp_capable_servers(buffer, LspReqKind::InlayHints) {
+            let token = self.register_buffer_scoped_request(LspReqKind::InlayHints, buffer, &key);
+            self.fx.lsp_request(
+                key,
+                token,
+                nxvim_lsp::LspRequest::InlayHint {
+                    uri: uri.clone(),
+                    range,
+                },
+            );
+        }
     }
 
-    /// Cache an `inlayHint` reply for the buffer it was requested for, decoding each
-    /// hint's `character` against that buffer's server encoding into a line-local
-    /// byte column and bucketing by line. Dropped when the buffer is gone, its
-    /// server is unknown, or its content changed since the request (`req_tick`
-    /// mismatch — a fresh request is already in flight against the newer text).
+    /// Cache an `inlayHint` reply under the server that produced it, decoding each
+    /// hint's `character` against **that server's** negotiated encoding into a
+    /// line-local byte column and bucketing by line. Dropped when the buffer is
+    /// gone, the server is no longer running, or the content changed since the
+    /// request (`req_tick` mismatch — a fresh request is already in flight against
+    /// the newer text).
+    ///
+    /// `key` is carried through the pending request rather than re-derived: two
+    /// servers on one buffer can negotiate different encodings, so a hint's
+    /// `character` is only meaningful against the encoding of the server that sent
+    /// it — read at another's, a multi-byte line lands the hint mid-glyph.
     pub(crate) fn on_inlay_hints_reply(
         &mut self,
         buffer: BufferId,
         req_tick: u64,
+        key: ServerKey,
         hints: Vec<InlayHintData>,
     ) {
         let Some(buf) = self.editor.buffer_of(buffer) else {
@@ -107,25 +120,10 @@ impl EditHost {
         if buf.changedtick != req_tick {
             return; // computed against superseded text; the newer request wins.
         }
-        let Some(state) = self.lsp_states.get(&buffer) else {
-            return;
-        };
-        // The server that answered, recorded at issue time — its encoding is what the
-        // hints' `character` columns are authored in, and two attached servers can
-        // have negotiated different ones.
-        let Some(key) = self
-            .lsp_requests
-            .get(&LspReqKind::InlayHints)
-            .and_then(|p| p.server.clone())
-            .or_else(|| state.primary_key().cloned())
-        else {
-            return;
-        };
         let Some(rt) = self.lsp_servers.get(&key) else {
             return;
         };
         let encoding = rt.encoding;
-        let client_id = rt.client_id;
         let server_key = key.clone();
 
         let mut by_line: BTreeMap<usize, Vec<InlayHintSpan>> = BTreeMap::new();
@@ -157,17 +155,39 @@ impl EditHost {
             spans.sort_by_key(|s| s.byte_col);
         }
 
-        let state = self.lsp_states.get_mut(&buffer).expect("checked above");
+        let Some(state) = self.lsp_states.get_mut(&buffer) else {
+            return;
+        };
         let Some(doc) = state.doc_mut(&server_key) else {
             return;
         };
         doc.inlay.hints = by_line;
         // Push the read mirror (`nx._inlay_hints`) and then resolve any lazy
         // placeholders; a resolve reply refreshes the mirror again as it fills in.
-        let mirror = inlay_mirror(&doc.inlay, client_id);
-        let _ = self.lua.set_inlay_hints(buffer.0, &mirror);
+        self.push_inlay_mirror(buffer);
         self.issue_inlay_resolves(buffer, &server_key, req_tick);
         self.lsp_dirty = true;
+    }
+
+    /// Rebuild `nx._inlay_hints[bufnr]` from every attached server's cache, each
+    /// entry tagged with its producing `client_id`, in line-then-column order.
+    ///
+    /// Buffer-wide rather than per reply: the mirror is one flat list, so pushing
+    /// only the answering server's hints would erase the other's.
+    pub(crate) fn push_inlay_mirror(&mut self, buffer: BufferId) {
+        let Some(state) = self.lsp_states.get(&buffer) else {
+            return;
+        };
+        let mut mirror: Vec<InlayHintMirrorData> = state
+            .servers()
+            .filter_map(|(key, doc)| {
+                let client_id = self.lsp_servers.get(key)?.client_id;
+                Some(inlay_mirror(&doc.inlay, client_id))
+            })
+            .flatten()
+            .collect();
+        mirror.sort_by_key(|h| (h.line, h.col, h.client_id));
+        let _ = self.lua.set_inlay_hints(buffer.0, &mirror);
     }
 
     /// Issue an `inlayHint/resolve` for every lazy placeholder cached for `buffer`,
@@ -195,6 +215,7 @@ impl EditHost {
                 cb_id,
                 InlayResolveTarget {
                     buffer,
+                    server: server_key.clone(),
                     tick,
                     line,
                     idx,
@@ -219,6 +240,10 @@ impl EditHost {
     /// its content changed since the request (`tick` mismatch — the placeholder was
     /// already replaced), or the resolved label is empty (nothing to paint). On
     /// success the span's `text` is filled and the `get` mirror refreshed.
+    ///
+    /// The placeholder is addressed under the **issuing server's** cache (recorded
+    /// in the target): two servers can both have a lazy hint at the same
+    /// `(line, idx)`, so the position alone names the wrong one.
     pub(crate) fn on_inlay_hint_resolved(&mut self, cb_id: u64, label: Option<String>) {
         let Some(target) = self.inlay_resolves.remove(&cb_id) else {
             return;
@@ -232,21 +257,10 @@ impl EditHost {
         if buf.changedtick != target.tick {
             return; // the placeholder belonged to a now-superseded reply.
         }
-        let Some(state) = self.lsp_states.get(&target.buffer) else {
+        let Some(state) = self.lsp_states.get_mut(&target.buffer) else {
             return;
         };
-        let client_id = state
-            .primary_key()
-            .and_then(|k| self.lsp_servers.get(k))
-            .map(|rt| rt.client_id);
-        let Some(client_id) = client_id else {
-            return;
-        };
-        let state = self
-            .lsp_states
-            .get_mut(&target.buffer)
-            .expect("checked above");
-        let Some(doc) = state.primary_doc_mut() else {
+        let Some(doc) = state.doc_mut(&target.server) else {
             return;
         };
         let Some(span) = doc
@@ -259,8 +273,7 @@ impl EditHost {
         };
         span.text = sanitize_label(&label);
         span.resolve_data = None;
-        let mirror = inlay_mirror(&doc.inlay, client_id);
-        let _ = self.lua.set_inlay_hints(target.buffer.0, &mirror);
+        self.push_inlay_mirror(target.buffer);
         self.lsp_dirty = true;
     }
 
@@ -305,9 +318,12 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
-                // Across every attached server — the hints are cached under whichever
-                // one advertised `inlayHintProvider`, not necessarily the first.
-                let spans: Vec<&InlayHintSpan> = state
+                // Across every attached server — each caches the hints it published,
+                // so a two-server buffer paints both sets. Re-sorted by anchor: each
+                // server's own hints are already in column order, but merging two
+                // servers' interleaves them, and the client inserts them left to
+                // right (an out-of-order hint would land at a shifted column).
+                let mut spans: Vec<&InlayHintSpan> = state
                     .servers()
                     .filter_map(|(_, d)| d.inlay.hints.get(&line_idx))
                     .flatten()
@@ -315,6 +331,7 @@ impl EditHost {
                 if spans.is_empty() {
                     return Value::Array(Vec::new());
                 }
+                spans.sort_by_key(|s| s.byte_col);
                 let Some(text) = buf.map(|b| b.line(line_idx)) else {
                     return Value::Array(Vec::new());
                 };

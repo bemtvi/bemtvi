@@ -191,15 +191,48 @@ own design rather than this round mechanism. Tracked as 3c.
 Done when: two servers with overlapping capabilities both contribute references,
 and a slow server cannot stall the other's reply.
 
-### Phase 4 — diagnostics, semantic tokens, inlay hints per server
+### Phase 4 — diagnostics, semantic tokens, inlay hints per server (done)
 
 `publishDiagnostics` stores under its own server; `diagnostics_merged` concatenates
 across servers, each with its own encoding (the pair shape already supports it).
-Semantic tokens and inlay hints request only from advertising servers and merge
-their spans.
+That half landed with Phase 3, because `publishDiagnostics` is a *push*: two attached
+servers publish independently, so a shared slot has each one's set erase the other's.
+
+Semantic tokens and inlay hints now request from **every** advertising server, cache
+per server, and merge at projection. Three things that were forced by the work:
+
+- **Their own pending map.** `lsp_requests` is one slot per kind, which cannot hold
+  two semantic-token requests in flight for one buffer — the second evicts the first,
+  and the reply is then decoded against whichever server was recorded last. Wrong
+  legend ⇒ plausible nonsense; wrong encoding ⇒ columns inside a multi-byte glyph.
+  `lsp_buf_requests` keys by the token's unique generation and records `(kind, buffer,
+  server)`, so one request per capable server is outstanding and each reply lands
+  under the server that produced it. Folding ranges moved there too, but stay
+  **single-target**: a buffer has one fold structure, and merging two containment
+  trees is not defined.
+- **The mirrors are per buffer, so they rebuild across servers.**
+  `nx._semantic_tokens[buf]` / `nx._inlay_hints[buf]` are one flat list each; pushing
+  the answering server's half would erase the other's. Both are rebuilt from every
+  attached server's cache, each entry tagged with its producing `client_id`, sorted
+  line-then-column. The projections likewise re-sort the merged spans — inlay hints
+  are inserted left to right, so an out-of-order anchor lands at a shifted column.
+- **A reply's positions belong to the server that sent it, on the apply paths too.**
+  `apply_formatting_edits` / `apply_workspace_edit` derived their encoding from the
+  buffer's *first* server. `format{ name = … }` (Phase 5) makes that reachable by
+  design: name the utf-16 server on a buffer whose first is utf-8 and every edit on a
+  line with a multi-byte character shifts. Both now take the producing server's
+  encoding — carried on `PendingLspReq.server` for a reply, on the merged action's
+  origin for a code action, `codeAction/resolve` included.
 
 Done when: two servers publishing diagnostics for one buffer both render, with
 correct columns under differing negotiated encodings.
+
+Covered by `semantic_tokens_merge_from_every_capable_server`,
+`inlay_hints_merge_from_every_capable_server` and
+`a_named_formatter_applies_edits_at_its_own_encoding` in
+`crates/nxvim/tests/lsp_config.rs` — each mock pair negotiates utf-8 against utf-16
+over a line (`let föö = 1`) whose byte and code-unit columns disagree, so a shared
+encoding fails the assertion rather than passing by luck.
 
 ### Phase 5 — the Lua/compat surface catches up (done)
 

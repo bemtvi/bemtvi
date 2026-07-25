@@ -60,9 +60,9 @@ impl EditHost {
         // (a fresh reply clears the "needs request" condition by storing its result).
         let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
         if self
-            .lsp_requests
-            .get(&LspReqKind::FoldingRange)
-            .is_some_and(|p| p.buffer == buffer && p.tick == tick)
+            .lsp_buf_requests
+            .values()
+            .any(|p| p.kind == LspReqKind::FoldingRange && p.buffer == buffer && p.tick == tick)
         {
             return;
         }

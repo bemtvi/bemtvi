@@ -36,13 +36,22 @@ impl EditHost {
     /// Apply whole-document formatting edits to the current buffer (one undo
     /// step) and re-sync so the server's version stays consistent. Empty ⇒ a
     /// brief message (already formatted), so a no-op re-run is visible.
-    pub(crate) fn apply_formatting_edits(&mut self, edits: Vec<TextEdit>) {
+    ///
+    /// `encoding` is the **formatting server's** negotiated encoding, not the
+    /// buffer's first server's: `format{ name = … }` can pick a server that
+    /// negotiated utf-8 on a buffer whose other server negotiated utf-16, and
+    /// reading one's columns as the other's shifts every edit on a line with any
+    /// multi-byte character.
+    pub(crate) fn apply_formatting_edits(
+        &mut self,
+        edits: Vec<TextEdit>,
+        encoding: PositionEncoding,
+    ) {
         if edits.is_empty() {
             self.editor.echo(LspReqKind::Formatting.empty_message());
             return;
         }
         let id = self.editor.current_buffer_id();
-        let encoding = self.buffer_encoding(id).unwrap_or(PositionEncoding::Utf8);
         let buffer = self.editor.buffer();
         let byte_edits = edits
             .iter()
@@ -65,7 +74,11 @@ impl EditHost {
     pub(crate) fn apply_lua_workspace_edit(&mut self, edit: serde_json::Value) {
         match serde_json::from_value::<WorkspaceEdit>(edit) {
             Ok(edit) => {
-                self.apply_workspace_edit(normalize_workspace_edit(edit));
+                // No producing server: a Lua-built edit uses nxvim's own columns,
+                // which the current buffer's server encoding reads back (utf-8 when
+                // there is none).
+                let encoding = self.reply_encoding(None);
+                self.apply_workspace_edit(normalize_workspace_edit(edit), encoding);
                 self.lsp_dirty = true;
             }
             Err(e) => self
@@ -131,13 +144,18 @@ impl EditHost {
     /// URI that doesn't map to a path) is collected and reported loud rather than
     /// silently dropped (the no-silent-stubs rule). An edit that touches — and defers —
     /// nothing applicable reports a brief message.
-    pub(crate) fn apply_workspace_edit(&mut self, changes: WorkspaceEditData) {
-        // The originating server's encoding (the current buffer's, where the rename /
-        // code action was requested): the WorkspaceEdit's positions are all in that
-        // one encoding, so a target buffer with no server of its own uses it.
-        let origin_encoding = self
-            .buffer_encoding(self.editor.current_buffer_id())
-            .unwrap_or(PositionEncoding::Utf8);
+    ///
+    /// `origin_encoding` is the encoding negotiated by the server that **produced**
+    /// this edit — every position in a `WorkspaceEdit` is in that one encoding,
+    /// including those for target buffers with no server of their own. It is passed
+    /// in rather than re-derived from the current buffer because a buffer can carry
+    /// several servers at different encodings, and the one that answered is not
+    /// necessarily the one listed first.
+    pub(crate) fn apply_workspace_edit(
+        &mut self,
+        changes: WorkspaceEditData,
+        origin_encoding: PositionEncoding,
+    ) {
         let mut touched = 0usize;
         let mut deferred = 0usize;
         let mut unresolved: Vec<String> = Vec::new();
@@ -359,7 +377,11 @@ impl EditHost {
         };
         let has_edit = action.edit.is_some();
         if let Some(changes) = action.edit {
-            self.apply_workspace_edit(changes);
+            // At the ORIGIN server's encoding: the merged chooser can list ruff's
+            // quick-fix next to pyright's refactor, and each action's positions are
+            // in its own server's encoding.
+            let encoding = self.reply_encoding(origin.as_ref());
+            self.apply_workspace_edit(changes, encoding);
             self.lsp_dirty = true;
         }
         // An action may carry a `command` alongside (or instead of) its edit:
@@ -435,7 +457,9 @@ impl EditHost {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::ResolveCodeAction, cb_id);
+        // Recorded against `key`: the resolved edit comes back in THAT server's
+        // encoding, and it is the only server whose `data` blob this action carries.
+        let token = self.register_lsp_request_to(LspReqKind::ResolveCodeAction, cb_id, &key);
         self.fx
             .lsp_request(key, token, LspRequest::ResolveCodeAction { action });
     }

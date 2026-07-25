@@ -441,6 +441,37 @@ fn arm_mock_named(dir: &Path, name: &str, script: &str) {
     );
 }
 
+/// [`open_rust`] with the buffer's own body — the decoration tests need a line with
+/// **multi-byte** text so a UTF-8 and a UTF-16 server disagree about columns.
+async fn open_rust_with(dir: &Path, body: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let file_path = dir.join("a.rs");
+    std::fs::write(&file_path, body).expect("write test file");
+    let init = ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    feed(&rpc, "gg0");
+    (rpc, incoming)
+}
+
+/// Enable two mock servers, `alpha` and `beta`, for the `rust` filetype and wait
+/// for both to attach.
+async fn enable_alpha_beta(rpc: &Rpc) {
+    exec_lua(
+        rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+}
+
 #[tokio::test]
 async fn two_servers_attach_to_one_buffer() {
     let _guard = serial_lock().lock().await;
@@ -691,5 +722,181 @@ async fn format_selects_the_named_server() {
         unknown.as_str(),
         Some("false"),
         "an unmodelled option still fails loud"
+    );
+}
+
+// ----- Phase 4: per-server decorations (semantic tokens + inlay hints) --------
+// Both are whole-buffer *caches*, so they don't merge like a fan-out round: each
+// server is asked, each reply lands under its own server's document state, and the
+// projection concatenates. The tests deliberately negotiate DIFFERENT encodings —
+// two servers on one buffer at utf-8 and utf-16 is exactly where column math breaks
+// (a shared encoding decodes the second server's columns into the middle of a
+// multi-byte glyph).
+
+/// A line whose columns differ between utf-8 bytes and utf-16 code units:
+/// `let föö = 1` — `föö` is bytes 4..9 but utf-16 units 4..7.
+const MULTIBYTE_LINE: &str = "let föö = 1\n";
+
+#[tokio::test]
+async fn semantic_tokens_merge_from_every_capable_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-semantic-merge");
+    // alpha (utf-8) paints `let` as a keyword; beta (utf-16) paints `föö` as a
+    // variable. Only alpha was ever asked before this phase — it is the first
+    // capable server in key order — so beta's tokens never existed.
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "semantic_tokens": {
+               "legend": { "tokenTypes": ["keyword"], "tokenModifiers": [] },
+               "data": [0, 0, 3, 0, 0] } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "position_encoding": "utf-16",
+             "semantic_tokens": {
+               "legend": { "tokenTypes": ["variable"], "tokenModifiers": [] },
+               "data": [0, 4, 3, 0, 0] } }"#,
+    );
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), MULTIBYTE_LINE).await;
+    enable_alpha_beta(&rpc).await;
+
+    let alpha_token = await_lua_eq(
+        &rpc,
+        "(nx.lsp.semantic_tokens.get_at_pos(0, 0, 0)[1] or {}).type",
+        "keyword",
+    )
+    .await;
+    let beta_token = await_lua_eq(
+        &rpc,
+        "(nx.lsp.semantic_tokens.get_at_pos(0, 0, 4)[1] or {}).type",
+        "variable",
+    )
+    .await;
+    // Byte 8 is the *second* byte of the trailing `ö`. beta's token spans utf-16
+    // units 4..7 = bytes 4..9, so it covers byte 8 — but only when decoded at
+    // beta's OWN negotiated encoding. Decoded at alpha's utf-8 it would stop at
+    // byte 7 and this column would be bare.
+    let beta_encoding = await_lua_eq(
+        &rpc,
+        "(nx.lsp.semantic_tokens.get_at_pos(0, 0, 8)[1] or {}).type",
+        "variable",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(alpha_token, "the first server's tokens still decode");
+    assert!(
+        beta_token,
+        "the second server's tokens must be requested and decoded too"
+    );
+    assert!(
+        beta_encoding,
+        "the second server's tokens decode at ITS negotiated encoding (utf-16), \
+         not the first server's"
+    );
+}
+
+#[tokio::test]
+async fn inlay_hints_merge_from_every_capable_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-inlay-merge");
+    // alpha (utf-8) anchors at character 4 = byte 4; beta (utf-16) at character 7,
+    // which is byte 9 — the same glyph boundary only if decoded at utf-16.
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "inlay_hints": [
+               { "position": { "line": 0, "character": 4 }, "label": ":A", "kind": 1 } ] }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "position_encoding": "utf-16",
+             "inlay_hints": [
+               { "position": { "line": 0, "character": 7 }, "label": ":B", "kind": 1 } ] }"#,
+    );
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), MULTIBYTE_LINE).await;
+    enable_alpha_beta(&rpc).await;
+    exec_lua(&rpc, "vim.lsp.inlay_hint.enable(true)").await;
+
+    // Each hint's label with the byte column it decoded to, sorted.
+    let merged = await_lua_eq(
+        &rpc,
+        "(function()\n\
+         \x20 local out = {}\n\
+         \x20 for _, h in ipairs(nx.lsp.inlay_hint.get({ bufnr = 0 })) do\n\
+         \x20   out[#out+1] = h.inlay_hint.label .. '@' .. h.inlay_hint.col\n\
+         \x20 end\n\
+         \x20 table.sort(out)\n\
+         \x20 return table.concat(out, ',')\n\
+         end)()",
+        ":A@4,:B@9",
+    )
+    .await;
+    // Each hint is tagged with the client that produced it, so a plugin can tell
+    // pyright's hints from ruff's.
+    let two_clients = await_lua_eq(
+        &rpc,
+        "(function()\n\
+         \x20 local ids, n = {}, 0\n\
+         \x20 for _, h in ipairs(nx.lsp.inlay_hint.get({ bufnr = 0 })) do\n\
+         \x20   if not ids[h.client_id] then ids[h.client_id] = true; n = n + 1 end\n\
+         \x20 end\n\
+         \x20 return n\n\
+         end)()",
+        "2",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        merged,
+        "both servers' hints must be requested and decoded, each at its own \
+         negotiated encoding"
+    );
+    assert!(two_clients, "each hint carries its producing client's id");
+}
+
+#[tokio::test]
+async fn a_named_formatter_applies_edits_at_its_own_encoding() {
+    // The other half of "two servers at different encodings": a REPLY's positions
+    // are authored in the encoding of the server that produced it. `format{name=}`
+    // makes that reachable — the named formatter need not be the buffer's first
+    // server, and reading its utf-16 columns as utf-8 (what the apply path did,
+    // deriving the encoding from the buffer's first server) shifts every edit on a
+    // line with a multi-byte character.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-format-encoding");
+    // `föö` is utf-16 units 4..7 but bytes 4..9. beta asks to replace exactly it.
+    arm_mock_named(dir.as_path(), "alpha", "{}");
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "position_encoding": "utf-16",
+             "formatting": [ { "range": { "start": { "line": 0, "character": 4 },
+                                          "end":   { "line": 0, "character": 7 } },
+                               "newText": "X" } ] }"#,
+    );
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), MULTIBYTE_LINE).await;
+    enable_alpha_beta(&rpc).await;
+
+    exec_lua(&rpc, "nx.lsp.format({ name = 'beta' })").await;
+    let formatted = await_lua_eq(&rpc, "nx.buf.lines(0, 0, 1)[1]", "let X = 1").await;
+    let line = exec_lua(&rpc, "return nx.buf.lines(0, 0, 1)[1]").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        formatted,
+        "the edit must convert at beta's utf-16, not alpha's utf-8 (got {:?}; \
+         `let Xö = 1` is the utf-8 misread)",
+        line.as_str()
     );
 }

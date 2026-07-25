@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use nxvim_core::{Buffer, BufferId};
 use nxvim_lsp::lsp_types::{SemanticToken, SemanticTokensEdit};
-use nxvim_lsp::{PositionEncoding, SemanticLegend, SemanticTokensData};
+use nxvim_lsp::{PositionEncoding, SemanticLegend, SemanticTokensData, ServerKey};
 use nxvim_lua::SemanticTokenData;
 
 use super::{byte_col, LspReqKind, SemanticSpan};
@@ -49,16 +49,21 @@ fn semantic_mirror(
 }
 
 impl EditHost {
-    /// Issue a semantic-tokens request for `buffer`, if its server is up, finished
-    /// `initialize`, and advertised a legend. A no-op otherwise (the buffer keeps
-    /// the treesitter floor alone). Whole-buffer, so — unlike the cursor-anchored
-    /// features — it is fired on open and after each change, and the reply is
-    /// stale-dropped on a content (`tick`) change, not a cursor move.
+    /// Issue a semantic-tokens request for `buffer` to **every** attached server
+    /// that is up, finished `initialize`, and advertised a legend. A no-op when none
+    /// has (the buffer keeps the treesitter floor alone). Whole-buffer, so — unlike
+    /// the cursor-anchored features — it is fired on open and after each change, and
+    /// each reply is stale-dropped on a content (`tick`) change, not a cursor move.
     ///
-    /// Once the buffer has cached a `result_id`, the request is `full/delta`
-    /// (quoting it as `previousResultId`) so the server can ship a diff; with no
-    /// cached `result_id` (first request, or the server sent none) it is a whole
-    /// `full` request.
+    /// Every capable server is asked because the caches are per server and the
+    /// projection concatenates them: asking only the first would silently drop a
+    /// second server's tokens, which is the whole `pyright` + `ruff` failure in
+    /// miniature. Each request carries **that** server's own delta cursor — a
+    /// `result_id` is meaningful only to the server that issued it.
+    ///
+    /// Once a server has cached a `result_id`, its request is `full/delta` (quoting
+    /// it as `previousResultId`) so it can ship a diff; with no cached `result_id`
+    /// (first request, or the server sent none) it is a whole `full` request.
     pub(crate) fn request_semantic_tokens(&mut self, buffer: BufferId) {
         // Disabled editor-wide, or this buffer was `stop`ped: nothing to fetch (the
         // projection is hidden anyway, and a later enable re-requests).
@@ -71,51 +76,53 @@ impl EditHost {
         if !state.semantic_on() {
             return;
         }
-        // The server must have finished initialize (so its legend is known) and
-        // actually advertise semantic tokens — with several attached, that is a
-        // *selection*, not a check on the first one.
-        let Some((key, _uri, _enc)) = self.lsp_target_for(buffer, LspReqKind::SemanticTokens)
-        else {
-            return;
-        };
-        let Some(doc) = state.doc(&key) else {
-            return;
-        };
-        let cached_result_id = doc.semantic.result_id.clone();
         let Some(uri) = state.uri.clone() else {
             return;
         };
-        let Some(rt) = self.lsp_servers.get(&key) else {
-            return;
-        };
-        if rt.legend.is_none() {
-            return;
+        // Per server: its own cached `result_id` and its own delta support.
+        let requests: Vec<(ServerKey, nxvim_lsp::LspRequest)> = self
+            .lsp_capable_servers(buffer, LspReqKind::SemanticTokens)
+            .into_iter()
+            .filter_map(|(key, _enc)| {
+                let rt = self.lsp_servers.get(&key)?;
+                // No legend ⇒ nothing to decode a reply against; skip this server.
+                rt.legend.as_ref()?;
+                let supports_delta = rt.semantic_tokens_delta;
+                let cached = state.doc(&key).and_then(|d| d.semantic.result_id.clone());
+                let uri = uri.clone();
+                let request = match cached {
+                    Some(previous_result_id) if supports_delta => {
+                        nxvim_lsp::LspRequest::SemanticTokensDelta {
+                            uri,
+                            previous_result_id,
+                        }
+                    }
+                    _ => nxvim_lsp::LspRequest::SemanticTokensFull { uri },
+                };
+                Some((key, request))
+            })
+            .collect();
+        for (key, request) in requests {
+            let token =
+                self.register_buffer_scoped_request(LspReqKind::SemanticTokens, buffer, &key);
+            self.fx.lsp_request(key, token, request);
         }
-        let supports_delta = rt.semantic_tokens_delta;
-        // Send `full/delta` only once we have a cached `result_id` *and* the server
-        // advertised delta support; otherwise re-request the whole `full` set.
-        let request = match cached_result_id {
-            Some(previous_result_id) if supports_delta => {
-                nxvim_lsp::LspRequest::SemanticTokensDelta {
-                    uri,
-                    previous_result_id,
-                }
-            }
-            _ => nxvim_lsp::LspRequest::SemanticTokensFull { uri },
-        };
-        let token = self.register_buffer_scoped_request(LspReqKind::SemanticTokens, buffer, &key);
-        self.fx.lsp_request(key, token, request);
     }
 
-    /// Cache a `semanticTokens/full` or `full/delta` reply for the buffer it was
-    /// requested for, decoding the (possibly delta-patched) packed tokens against
-    /// that buffer's server legend + encoding into the per-line spans the
-    /// projection reads. Dropped when the buffer is gone, its server has no legend,
-    /// or its content changed since the request (`req_tick` mismatch — a fresh
-    /// request is already in flight, computed against the new text).
+    /// Cache a `semanticTokens/full` or `full/delta` reply under the server that
+    /// produced it, decoding the (possibly delta-patched) packed tokens against
+    /// **that** server's legend + encoding into the per-line spans the projection
+    /// reads. Dropped when the buffer is gone, the server is no longer attached or
+    /// has no legend, or the content changed since the request (`req_tick` mismatch
+    /// — a fresh request is already in flight, computed against the new text).
     ///
-    /// A [`SemanticTokensData::Full`] replaces the cached token set wholesale; a
-    /// [`SemanticTokensData::Delta`] splices its edits into the cached set and
+    /// `key` is the server the request was *sent* to, carried through the pending
+    /// request rather than re-derived: the token-type indices are per-legend, so
+    /// decoding one server's reply against another's legend paints plausible-looking
+    /// nonsense rather than failing visibly.
+    ///
+    /// A [`SemanticTokensData::Full`] replaces that server's cached token set
+    /// wholesale; a [`SemanticTokensData::Delta`] splices its edits into it and
     /// re-decodes. A delta that arrives with no cached base to patch (the
     /// `result_id` the request quoted is gone) can't be applied: the cache is
     /// cleared and a fresh `full` request issued, so the buffer recovers rather
@@ -124,6 +131,7 @@ impl EditHost {
         &mut self,
         buffer: BufferId,
         req_tick: u64,
+        key: ServerKey,
         data: SemanticTokensData,
     ) {
         let Some(buf) = self.editor.buffer_of(buffer) else {
@@ -133,18 +141,6 @@ impl EditHost {
             return; // computed against superseded text; the newer request wins.
         }
         let Some(state) = self.lsp_states.get(&buffer) else {
-            return;
-        };
-        // Decode against the server that ANSWERED, recorded when the request was
-        // issued. Re-deriving it from the buffer would decode one server's tokens
-        // with another's legend — the indices are per-legend, so the result is
-        // plausible-looking nonsense rather than an obvious failure.
-        let Some(key) = self
-            .lsp_requests
-            .get(&LspReqKind::SemanticTokens)
-            .and_then(|p| p.server.clone())
-            .or_else(|| state.primary_key().cloned())
-        else {
             return;
         };
         let Some(doc) = state.doc(&key) else {
@@ -157,7 +153,6 @@ impl EditHost {
             return;
         };
         let encoding = rt.encoding;
-        let client_id = rt.client_id;
 
         let (result_id, tokens) = match data {
             SemanticTokensData::Full { result_id, tokens } => (result_id, tokens),
@@ -168,7 +163,7 @@ impl EditHost {
                 // clear and re-request a full set rather than splice into nothing.
                 if base.is_empty() && !edits.is_empty() {
                     let state = self.lsp_states.get_mut(&buffer).expect("checked above");
-                    if let Some(doc) = state.primary_doc_mut() {
+                    if let Some(doc) = state.doc_mut(&key) {
                         doc.semantic = Default::default();
                     }
                     self.lsp_dirty = true;
@@ -180,18 +175,37 @@ impl EditHost {
         };
 
         let spans = decode_tokens(&tokens, legend, encoding, buf);
-        // Mirror the decoded tokens into `nx._semantic_tokens[bufnr]` so the
-        // synchronous `vim.lsp.semantic_tokens.get_at_pos` can read them from pure
-        // Lua (the diagnostics-mirror analogue), then cache the spans for the paint.
-        let mirror = semantic_mirror(&spans, client_id);
         let state = self.lsp_states.get_mut(&buffer).expect("checked above");
         if let Some(doc) = state.doc_mut(&key) {
             doc.semantic.result_id = result_id;
             doc.semantic.tokens = tokens;
             doc.semantic.spans = spans;
         }
-        let _ = self.lua.set_semantic_tokens(buffer.0, &mirror);
+        // Re-mirror the buffer's tokens into `nx._semantic_tokens[bufnr]` so the
+        // synchronous `vim.lsp.semantic_tokens.get_at_pos` can read them from pure
+        // Lua (the diagnostics-mirror analogue). Rebuilt across ALL servers, not
+        // just the one that answered: the mirror is one flat list per buffer, so
+        // pushing only this reply's tokens would erase the other server's.
+        self.push_semantic_mirror(buffer);
         self.lsp_dirty = true;
+    }
+
+    /// Rebuild `nx._semantic_tokens[bufnr]` from every attached server's cache, each
+    /// entry tagged with its producing `client_id`, in line-then-column order.
+    pub(crate) fn push_semantic_mirror(&mut self, buffer: BufferId) {
+        let Some(state) = self.lsp_states.get(&buffer) else {
+            return;
+        };
+        let mut mirror: Vec<SemanticTokenData> = state
+            .servers()
+            .filter_map(|(key, doc)| {
+                let client_id = self.lsp_servers.get(key)?.client_id;
+                Some(semantic_mirror(&doc.semantic.spans, client_id))
+            })
+            .flatten()
+            .collect();
+        mirror.sort_by_key(|t| (t.line, t.start_col, t.end_col, t.client_id));
+        let _ = self.lua.set_semantic_tokens(buffer.0, &mirror);
     }
 
     /// The semantic-token highlight intervals on buffer line `line_idx`, ready to
@@ -221,11 +235,11 @@ impl EditHost {
         if !state.semantic_on() {
             return Vec::new();
         }
-        // Read across every attached server, not just the first: the tokens are
-        // cached under whichever server ADVERTISED semantic tokens, which need not be
-        // the buffer's first. (In practice one server provides them; the flat_map is
-        // what makes "which one" irrelevant here.)
-        let spans: Vec<&SemanticSpan> = state
+        // Read across every attached server: each caches the tokens it published, so
+        // a buffer served by two of them paints both sets. Sorted left to right so
+        // the merged intervals' `order` is a stable function of the text rather than
+        // of which server answered first.
+        let mut spans: Vec<&SemanticSpan> = state
             .servers()
             .filter_map(|(_, d)| d.semantic.spans.get(&line_idx))
             .flatten()
@@ -233,6 +247,7 @@ impl EditHost {
         if spans.is_empty() {
             return Vec::new();
         }
+        spans.sort_by_key(|s| (s.start, s.end));
         spans
             .iter()
             .enumerate()

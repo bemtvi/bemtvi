@@ -136,10 +136,13 @@ impl LspDocState {
     /// The buffer's first attached server and its document state — the lowest
     /// [`ServerKey`], so the choice is stable across runs rather than hash-ordered.
     ///
-    /// This is the *provisional* answer to "which server serves this buffer" for the
-    /// paths that still assume one: language requests, semantic tokens, inlay hints.
-    /// Phase 3 replaces those with capability-aware selection (and fan-out where
-    /// merging is well defined); document sync and diagnostics already iterate
+    /// The *provisional* answer to "which server serves this buffer", left for the
+    /// few surfaces that still want a single one: the `:LspInfo` header, the
+    /// fallback encoding when no producing server is known, and the legacy
+    /// single-encoding diagnostics accessor. Every path where the choice can be
+    /// wrong now selects by capability ([`EditHost::lsp_target_for`]) or asks them
+    /// all ([`EditHost::lsp_capable_servers`]) — document sync, diagnostics,
+    /// requests, semantic tokens and inlay hints all iterate
     /// [`servers`](Self::servers).
     pub(crate) fn primary(&self) -> Option<(&ServerKey, &LspServerDoc)> {
         self.servers.iter().next()
@@ -148,11 +151,6 @@ impl LspDocState {
     /// The key half of [`primary`](Self::primary).
     pub(crate) fn primary_key(&self) -> Option<&ServerKey> {
         self.servers.keys().next()
-    }
-
-    /// The first attached server's document state.
-    pub(crate) fn primary_doc_mut(&mut self) -> Option<&mut LspServerDoc> {
-        self.servers.values_mut().next()
     }
 
     /// Is `key` among this buffer's servers?
@@ -266,14 +264,41 @@ pub(crate) struct InlayHintSpan {
 /// An in-flight `inlayHint/resolve`, keyed by the `cb_id` its [`ReqToken`] carries
 /// (so concurrent resolves don't clobber each other in the single-slot
 /// `lsp_requests` kind-map — they route by `cb_id` like a generic `client:request`).
-/// Records where the resolved label lands: the issuing buffer, the `tick` it was
-/// issued against (the reply is dropped if the buffer changed since), and the
-/// `(line, idx)` of the placeholder span in [`InlayHintsCache::hints`] to fill.
+/// Records where the resolved label lands: the issuing buffer, the `server` whose
+/// cache holds the placeholder, the `tick` it was issued against (the reply is
+/// dropped if the buffer changed since), and the `(line, idx)` of the placeholder
+/// span in [`InlayHintsCache::hints`] to fill.
 pub(crate) struct InlayResolveTarget {
     pub(crate) buffer: BufferId,
+    /// The server that produced the lazy hint — and therefore the only one whose
+    /// cache the resolved label belongs in. Two servers can both have hints on the
+    /// same line, so `(line, idx)` alone addresses the wrong span.
+    pub(crate) server: ServerKey,
     pub(crate) tick: u64,
     pub(crate) line: usize,
     pub(crate) idx: usize,
+}
+
+/// An in-flight **whole-buffer decoration** request — semantic tokens, inlay hints,
+/// folding ranges — kept in [`EditHost::lsp_buf_requests`] keyed by the unique
+/// `generation` its [`ReqToken`] carries.
+///
+/// These need their own map because a buffer asks **every** capable server for its
+/// decorations at once (a `pyright` + `ruff` buffer has two semantic-token requests
+/// in flight for one change), and their results do not merge into a single
+/// presentation the way a fan-out round's do — each lands in its own server's cache
+/// and the projection concatenates. The single-slot `lsp_requests` kind-map cannot
+/// express either: the second request would evict the first, and the reply would
+/// then be decoded against whichever server happened to be recorded last — with a
+/// wrong legend or a wrong position encoding, which paints plausible nonsense.
+pub(crate) struct PendingBufReq {
+    pub(crate) kind: LspReqKind,
+    pub(crate) buffer: BufferId,
+    /// The buffer's `changedtick` at issue time; a reply computed against
+    /// superseded text is dropped.
+    pub(crate) tick: u64,
+    /// The server asked — the legend and encoding its reply must be decoded with.
+    pub(crate) server: ServerKey,
 }
 
 /// Which language-feature request a [`ReqToken`] / [`PendingLspReq`] belongs to.
@@ -385,6 +410,21 @@ impl LspReqKind {
             18 => LspReqKind::FoldingRange,
             _ => return None,
         })
+    }
+
+    /// Whether this kind is a **whole-buffer decoration refresh** — issued per
+    /// buffer on open/change/enable rather than at the cursor, and tracked in
+    /// [`EditHost::lsp_buf_requests`] rather than the single-slot kind map.
+    ///
+    /// Semantic tokens and inlay hints go to *every* capable server (their caches
+    /// are per server and the projection concatenates); folding ranges stay
+    /// single-target — a buffer has one fold structure, and merging two servers'
+    /// containment trees is not defined.
+    pub(crate) fn is_whole_buffer(self) -> bool {
+        matches!(
+            self,
+            LspReqKind::SemanticTokens | LspReqKind::InlayHints | LspReqKind::FoldingRange
+        )
     }
 
     /// Whether results always go to the picker location list (references, symbols)

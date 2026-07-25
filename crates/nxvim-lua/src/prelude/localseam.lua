@@ -86,9 +86,16 @@ nx.fs_local = {
   append = function(path, data)
     return local_fs_op({ op = "append", path = path, data = data })
   end,
-  -- `nx.fs_local.mkdir(path[, { recursive }])` -> promise; creates the directory.
+  -- `nx.fs_local.mkdir(path[, { recursive, mode }])` -> promise; creates the directory.
+  -- `mode` is the Unix permission bits, exactly as in `nx.fs.mkdir` — pass it to keep a
+  -- private local store (a trust/credential dir) from being created world-readable.
   mkdir = function(path, opts)
-    return local_fs_op({ op = "mkdir", path = path, recursive = opts and opts.recursive or false })
+    return local_fs_op({
+      op = "mkdir",
+      path = path,
+      recursive = opts and opts.recursive or false,
+      mode = opts and opts.mode or nil,
+    })
   end,
   -- `nx.fs_local.rename(from, to)` -> promise (resolves nil). Atomic on a POSIX
   -- filesystem, so a write-temp-then-rename gives a torn-read-free local update.

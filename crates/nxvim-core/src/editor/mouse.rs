@@ -332,6 +332,12 @@ impl Editor {
         // wheel *on a doc float*, which scrolls the float and keeps it open. This is
         // the mouse counterpart of the next-key dismissal in [`Editor::input`].
         self.dismiss_cursor_popups_on_mouse(&ev);
+        // Only a left-button gesture on *text* drives the viewport by pointer (the
+        // arms below re-arm it), so every other gesture — a wheel, a right/middle
+        // press, a click on chrome — hands the view back to `'scrolloff'`. Cleared
+        // here rather than in each arm so a new gesture kind can't inherit a stale
+        // suspension. See [`Editor::mouse_dragging`].
+        self.mouse_dragging = false;
         match (ev.button, ev.action) {
             // In multi-cursor placement mode a left-click *toggles* a cursor at the
             // clicked cell — drop one if it's bare, remove it if one is there — the
@@ -461,9 +467,13 @@ impl Editor {
             // `<S-LeftMouse>` map fires, else [`Editor::mouse_apply_default`] runs the
             // extend. (`shift` distinguishes it from a plain left in the keymap.)
             (MouseButton::Left, MouseAction::Press) if ev.shift => {
+                self.mouse_dragging = true;
                 self.mouse_queue_press(&ev, MouseButton::Left, 1)
             }
-            (MouseButton::Left, MouseAction::Press) => self.mouse_left_press(&ev),
+            (MouseButton::Left, MouseAction::Press) => {
+                self.mouse_dragging = true;
+                self.mouse_left_press(&ev)
+            }
             // A plain-text drag / release is a mappable gesture (`<LeftDrag>` /
             // `<LeftRelease>`): queue it for the server, which fires a bound map or runs
             // the default ([`Editor::mouse_apply_default`] — the drag-select for a left
@@ -471,9 +481,15 @@ impl Editor {
             // widget / resize / multi-cursor arms above already claimed their drags, so
             // only a text drag reaches here.
             (MouseButton::Left, MouseAction::Drag) => {
+                self.mouse_dragging = true;
                 self.mouse_queue_gesture(&ev, MouseButton::Left, MouseKind::Drag)
             }
+            // The release keeps the suspension: it ends the *gesture*, not the
+            // mouse's hold on the view. Restoring the margin here would snap the
+            // viewport the instant the button came up, undoing the selection's
+            // position on screen — the next keystroke is what hands it back.
             (MouseButton::Left, MouseAction::Release) => {
+                self.mouse_dragging = true;
                 self.mouse_queue_gesture(&ev, MouseButton::Left, MouseKind::Release)
             }
             // Right- and middle-press are mappable too (`<RightMouse>` / `<MiddleMouse>`,

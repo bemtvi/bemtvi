@@ -1109,6 +1109,147 @@ async fn linewise_drag_below_window_autoscrolls() {
     assert_eq!(win_topline(&rpc, win).await, 2, "auto-scrolled down a line");
 }
 
+/// A left-button text gesture suspends `'scrolloff'`: clicking (and dragging)
+/// inside the margin selects exactly where the pointer is, without the viewport
+/// chasing the cursor to restore the margin. Without the suspension a press two
+/// rows below the top edge under `scrolloff=8` yanks the view six lines up under
+/// the pointer, and every further drag repeats it — the "selection scrolls like
+/// crazy" bug.
+#[tokio::test]
+async fn press_and_drag_inside_the_scrolloff_margin_do_not_scroll() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "40G");
+    let top0 = win_topline(&rpc, win).await;
+    assert!(top0 > 9, "line 40 is far enough down to have room above");
+
+    // Press two rows below the top edge — well inside the 8-row margin.
+    feed_mouse(&rpc, "left", "press", 2, 0);
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0,
+        "the press left the view put"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0 as u64,
+        top0 + 2,
+        "the cursor landed on the clicked line"
+    );
+
+    // Drag one row further up, still inside the margin but off the edge row.
+    feed_mouse(&rpc, "left", "drag", 1, 0);
+    assert_eq!(mode(&rpc).await, "v", "the drag entered Visual");
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0,
+        "dragging inside the margin still doesn't scroll"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0 as u64,
+        top0 + 1,
+        "the live end followed the pointer"
+    );
+
+    // Releasing doesn't snap the view back either.
+    feed_mouse(&rpc, "left", "release", 1, 0);
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0,
+        "the release left the view put"
+    );
+}
+
+/// With the margin suspended, a drag held at the window's **real** bottom edge
+/// still auto-scrolls — one line per drag event, the same pace as with
+/// `scrolloff=0`. Under the un-suspended margin the first edge drag jumped
+/// `scrolloff` extra lines (`ensure_visible` re-enforcing the margin on the
+/// newly-parked cursor), so holding at the edge tore through the buffer.
+#[tokio::test]
+async fn edge_drag_under_scrolloff_scrolls_one_line_per_event() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "40G");
+    let top0 = win_topline(&rpc, win).await;
+    let h = win_height(&rpc, win).await;
+
+    feed_mouse(&rpc, "left", "press", 5, 0); // anchor mid-window
+    for step in 1..=3u64 {
+        feed_mouse(&rpc, "left", "drag", h as usize - 1, 0); // the last text row
+        assert_eq!(
+            win_topline(&rpc, win).await,
+            top0 + step,
+            "drag {step} at the bottom edge scrolled exactly one line"
+        );
+    }
+    assert_eq!(
+        cursor(&rpc).await.0 as u64,
+        top0 + 3 + h - 1,
+        "the live end rode the newly-exposed bottom line"
+    );
+}
+
+/// The same at the **top** edge: a drag held on the first text row walks the view
+/// up a line per event, instead of the margin flinging it `scrolloff` lines at a
+/// time. Selecting upward past the top of the screen is the direction the runaway
+/// was worst in, since the press itself already sat inside the margin.
+#[tokio::test]
+async fn top_edge_drag_under_scrolloff_scrolls_one_line_per_event() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "40G");
+    let top0 = win_topline(&rpc, win).await;
+
+    feed_mouse(&rpc, "left", "press", 5, 0); // anchor mid-window
+    for step in 1..=3u64 {
+        feed_mouse(&rpc, "left", "drag", 0, 0); // the first text row
+        assert_eq!(
+            win_topline(&rpc, win).await,
+            top0 - step,
+            "drag {step} at the top edge scrolled exactly one line"
+        );
+    }
+    assert_eq!(
+        cursor(&rpc).await.0 as u64,
+        top0 - 3,
+        "the live end rode the newly-exposed top line"
+    );
+}
+
+/// The suspension lasts only as long as the mouse drives the view: the next
+/// keystroke restores `'scrolloff'`, so a cursor the mouse parked inside the
+/// margin is pulled back into the band on the following motion.
+#[tokio::test]
+async fn a_keystroke_after_the_gesture_restores_scrolloff() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    command(&rpc, "set scrolloff=8").await;
+    feed(&rpc, "40G");
+    let top0 = win_topline(&rpc, win).await;
+
+    feed_mouse(&rpc, "left", "press", 2, 0);
+    feed_mouse(&rpc, "left", "release", 2, 0);
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0,
+        "the click didn't scroll"
+    );
+
+    feed(&rpc, "j");
+    assert_eq!(
+        cursor(&rpc).await.0 as u64,
+        top0 + 3,
+        "the motion moved one line down"
+    );
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        top0 + 3 - 8,
+        "the keystroke restored the margin, scrolling the view up to keep 8 rows"
+    );
+}
+
 // ===== Phase 5: drag the separator / status line to resize splits ===========
 
 /// A window's rect width (`nvim_win_get_width`).

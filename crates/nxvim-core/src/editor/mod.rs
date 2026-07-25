@@ -1361,6 +1361,17 @@ pub struct Editor {
     /// a left-press landed on a split divider. See [`crate::editor::mouse`].
     mouse_resize: Option<mouse::ResizeDrag>,
 
+    /// Whether a left-button **text** gesture is currently driving the viewport, in
+    /// which case `'scrolloff'` is suspended
+    /// ([`scroll_margin_now`](Self::scroll_margin_now)) so a click / drag lands where
+    /// the pointer is instead of the view chasing the cursor to restore the margin.
+    /// Set by the text press / drag / release arms of [`Editor::mouse`], cleared by
+    /// every other mouse gesture (a wheel, a right / middle press, a click on chrome)
+    /// and by the next key in [`input`](Self::input). Neovim's `mouse_dragging`
+    /// (`globals.h`), widened from its drags-in-Visual to the whole gesture — a press
+    /// inside the margin yanking the view out from under the pointer is the same bug.
+    mouse_dragging: bool,
+
     /// The global screen cell of the most recent processed mouse event (press, drag,
     /// release, or wheel), backing [`mouse_pos`](Self::mouse_pos) / `vim.fn.getmousepos`.
     /// `None` before any mouse event. See [`crate::editor::mouse`].
@@ -1974,6 +1985,7 @@ impl Editor {
             mouse_select: None,
             statusline_click_seq: None,
             mouse_resize: None,
+            mouse_dragging: false,
             last_mouse: None,
             mouse_button_seq: None,
             mouse_wheels: Vec::new(),
@@ -2122,6 +2134,12 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
+        // The keyboard takes the viewport back from the mouse: any `'scrolloff'`
+        // suspended for a click / drag is restored for this key, so the margin the
+        // user configured is in force again from the next motion on (the cursor a
+        // mouse gesture parked inside the band is pulled back by the `ensure_visible`
+        // at the end of this call). See [`Editor::mouse_dragging`].
+        self.mouse_dragging = false;
         // A *transient* content float (hover / signature help / a plain
         // `nx.ui.float`) never grabs input: the next key dismisses it, then is
         // handled normally below (vim closes a hover float on the next motion). It

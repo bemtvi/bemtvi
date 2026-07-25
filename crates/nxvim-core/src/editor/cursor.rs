@@ -15,6 +15,33 @@ pub(crate) fn scroll_margin(scrolloff: usize, th: usize) -> usize {
 }
 
 impl Editor {
+    /// The `'scrolloff'` margin in force for the focused window *right now*:
+    /// [`scroll_margin`] normally, but **0** while a left-button mouse gesture is
+    /// driving the viewport ([`mouse_dragging`](Editor::mouse_dragging)).
+    ///
+    /// Suspending it is what lets the mouse select from anywhere on screen: the
+    /// pointer, not the margin, decides where the cursor goes, so a press / drag
+    /// inside the band leaves `top` alone. Enforcing it there instead scrolls the
+    /// view the moment the cursor enters the band — and since the drag cell is
+    /// resolved against the *new* viewport, the next drag event at the same screen
+    /// row lands further in and scrolls again: the selection tears through the
+    /// buffer. Auto-scroll during a drag stays the business of the real window edges
+    /// ([`mouse_drag_target`](Editor::mouse_drag_target)), a line per drag event.
+    ///
+    /// Only [`ensure_visible`](Self::ensure_visible) needs this: the other margin
+    /// readers are the explicit scrolls (`<C-e>` / the wheel), and every one of those
+    /// paths clears the flag first (a key through [`input`](Editor::input), a wheel
+    /// through [`mouse`](Editor::mouse)) — so they always see the real `'scrolloff'`.
+    ///
+    /// Mirrors neovim's `update_topline`, which zeroes the value the same way while
+    /// `mouse_dragging` is set (`move.c`).
+    pub(crate) fn scroll_margin_now(&self, th: usize) -> usize {
+        if self.mouse_dragging {
+            return 0;
+        }
+        scroll_margin(self.windows.cur().options.scrolloff, th)
+    }
+
     pub(crate) fn text_height(&self) -> usize {
         // The window's own rows minus a bordered float's one-cell inset (top and
         // bottom) and its status line *when it has one*. The vertical analog of
@@ -409,8 +436,10 @@ impl Editor {
 
     pub(crate) fn ensure_visible(&mut self) {
         let th = self.text_height();
-        // `'scrolloff'`: keep at least this many text rows above and below the cursor.
-        let so = scroll_margin(self.windows.cur().options.scrolloff, th);
+        // `'scrolloff'`: keep at least this many text rows above and below the cursor
+        // — suspended while the mouse is driving the view, so a click / drag inside
+        // the margin selects where the pointer is instead of scrolling the buffer.
+        let so = self.scroll_margin_now(th);
 
         // The largest useful `top`: the last buffer line resting on the bottom text
         // row. The bottom scrolloff margin is only honored while real content sits

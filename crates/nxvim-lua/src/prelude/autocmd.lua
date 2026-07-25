@@ -364,7 +364,7 @@ end
 -- ones that fired (collected during the pass and removed after it, so the live `ipairs`
 -- isn't mutated underneath). `nx._fire` / `nx._fire_gated` each supply their own
 -- per-handler `run` (they differ only in what they do with the callback's return value).
-local function au_dispatch(event, pattern, buf, run)
+local function au_dispatch(event, pattern, buf, run, group)
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
   for _, au in ipairs(nx._autocmds) do
     local ev = au.event
@@ -373,6 +373,10 @@ local function au_dispatch(event, pattern, buf, run)
       ev_ok
       and au_pattern_matches(au.opts.pattern, pattern)
       and (au.buffer == nil or au.buffer == buf)
+      -- `group` (an augroup id, nil = every group) narrows a MANUAL fire to one
+      -- group's handlers. Editor-triggered events pass nil: a real event belongs to
+      -- every subscriber. See `nx.autocmd.exec`.
+      and (group == nil or au.group == group)
     then
       run(au)
       if au.opts.once then
@@ -409,7 +413,10 @@ local function track_au_promise(ret, event)
   end
 end
 
-function nx._fire(event, pattern, buf, file, data)
+-- `group` is the optional trailing augroup-id filter (see `au_dispatch`); the Rust
+-- fire paths pass fewer arguments, so an editor-triggered event leaves it nil and
+-- reaches every subscriber.
+function nx._fire(event, pattern, buf, file, data, group)
   local any = false
   au_dispatch(event, pattern, buf, function(au)
     local cb = au.opts.callback
@@ -428,7 +435,7 @@ function nx._fire(event, pattern, buf, file, data)
       vim.cmd(au.opts.command)
       any = true
     end
-  end)
+  end, group)
   return any
 end
 
@@ -552,12 +559,40 @@ function nx._fire_dir_changed(scope, cwd)
   nx._fire("DirChanged", scope, nil, cwd, event)
 end
 
+-- Resolve an `opts.group` filter (an augroup id, or its name) to an id. `nil` means
+-- "every group" — no filter. An unknown NAME fails loud rather than falling back to
+-- nil: silently widening a scoped request into an unscoped one is exactly backwards
+-- (a typo'd `nvim_exec_autocmds{group=…}` would broadcast to every subscriber, a
+-- typo'd `nvim_clear_autocmds{group=…}` would delete every autocmd). `where` names
+-- the calling API in the error. Matches neovim, which raises on an invalid augroup.
+local function au_resolve_group(spec, where)
+  if spec == nil or type(spec) == "number" then
+    return spec
+  end
+  if type(spec) ~= "string" then
+    error(where .. ": `group` must be an augroup id or name, got " .. type(spec), 2)
+  end
+  local id = nx._augroups[spec]
+  if id == nil then
+    error(where .. ": invalid augroup '" .. spec .. "'", 2)
+  end
+  return id
+end
+nx._resolve_augroup = au_resolve_group
+
 -- `nx.autocmd.exec(event, opts)` [alias `nvim_exec_autocmds`]: fire `event` (or a
 -- list of events) manually. `opts.pattern` (string or list) is matched as in
 -- registration; `opts.buffer` supplies the buffer context (defaulting to the
 -- current snapshot buffer), and the callback's `args.file` is the snapshot name
 -- when firing for it. `opts.data` is an arbitrary payload delivered to each handler
 -- as `args.data` (e.g. `nx.autocmd.exec("User", { pattern = "MyEvent", data = … })`).
+--
+-- `opts.group` (an augroup id or name) narrows the fire to THAT group's handlers.
+-- Reach for it when a plugin needs to re-run its own handlers for a buffer — a
+-- late-loading plugin catching up on a `FileType` that already fired, say — without
+-- re-broadcasting the event to every other subscriber (the LSP dispatcher,
+-- treesitter, the user's own autocmds), which would make them redo work they have
+-- already correctly done. An unknown group name fails loud.
 function nx.autocmd.exec(event, opts)
   opts = opts or {}
   local events = au_canon_event(type(event) == "table" and event or { event })
@@ -569,15 +604,16 @@ function nx.autocmd.exec(event, opts)
   if nx._cur_buf and buf == nx._cur_buf.bufnr then
     file = nx._cur_buf.name
   end
+  local group = au_resolve_group(opts.group, "nvim_exec_autocmds")
   local patterns = opts.pattern
   local data = opts.data
   for _, ev in ipairs(events) do
     if type(patterns) == "table" then
       for _, p in ipairs(patterns) do
-        nx._fire(ev, p, buf, file, data)
+        nx._fire(ev, p, buf, file, data, group)
       end
     else
-      nx._fire(ev, patterns, buf, file, data)
+      nx._fire(ev, patterns, buf, file, data, group)
     end
   end
 end
@@ -593,10 +629,7 @@ function nx.autocmd.get(opts)
   opts = opts or {}
   local want_events = opts.event
     and au_canon_event(type(opts.event) == "table" and opts.event or { opts.event })
-  local want_group = opts.group
-  if type(want_group) == "string" then
-    want_group = nx._augroups[want_group]
-  end
+  local want_group = au_resolve_group(opts.group, "nvim_get_autocmds")
   -- reverse map: group id → its registered name, for human-readable output
   local group_name = {}
   for nm, id in pairs(nx._augroups) do
@@ -834,13 +867,24 @@ function nx._ex_autocmd(bang, args)
   return au_list(group, events, patterns)
 end
 
--- :doau[tocmd] {event} [pattern]: fire `event` now (optionally for a pattern),
--- the manual analogue of `nvim_exec_autocmds`. The optional [group] argument vim
--- accepts is not supported — `nx._fire` has no group filter — so the first word
--- is always the event; pass the event directly.
+-- :doau[tocmd] [group] {event} [pattern]: fire `event` now (optionally for a
+-- pattern), the manual analogue of `nvim_exec_autocmds`. The optional leading
+-- [group] narrows the fire to one augroup's autocmds, exactly as `opts.group` does
+-- on the API. Disambiguated the way vim does it: the first word is the group only
+-- when it NAMES a live augroup *and* another word follows it — so `:doautocmd User
+-- Marker` still reads `User` as the event, and only a real group name shifts it.
 function nx._ex_doautocmd(args)
   args = vim.trim(args):gsub("^<nomodeline>%s*", "")
   local event, rest = take_word(args)
+  if event ~= "" and rest ~= "" and nx._augroups[event] ~= nil then
+    local group = event
+    event, rest = take_word(rest)
+    if event == "" then
+      return "E217: Can't execute autocommands for ALL events"
+    end
+    nx.autocmd.exec(event, { pattern = rest ~= "" and rest or nil, group = group })
+    return ""
+  end
   if event == "" then
     return "E217: Can't execute autocommands for ALL events"
   end
@@ -1109,10 +1153,7 @@ function nx.autocmd.clear(opts)
   opts = opts or {}
   local want_events = opts.event
     and au_canon_event(type(opts.event) == "table" and opts.event or { opts.event })
-  local want_group = opts.group
-  if type(want_group) == "string" then
-    want_group = nx._augroups[want_group]
-  end
+  local want_group = au_resolve_group(opts.group, "nvim_clear_autocmds")
   local want_pats = opts.pattern
     and (type(opts.pattern) == "table" and opts.pattern or { opts.pattern })
   nx._autocmds = vim.tbl_filter(function(au)

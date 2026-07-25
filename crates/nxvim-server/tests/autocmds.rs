@@ -1931,3 +1931,178 @@ async fn bufreadpost_setting_fileencoding_does_not_fire_spurious_encodingchanged
         "no spurious EncodingChanged"
     );
 }
+
+// ----- group-scoped manual firing -------------------------------------------
+// `nvim_exec_autocmds` narrows a manual fire to one augroup, so a plugin can
+// re-run its OWN handlers for a buffer without re-broadcasting the event to
+// every other subscriber (the editor's LSP/treesitter/editorconfig wiring, the
+// user's own autocmds). Without the filter a scoped fire is a global one — and
+// silently so, which is the dangerous shape.
+
+#[tokio::test]
+async fn exec_autocmds_group_fires_only_that_groups_handlers() {
+    // Two groups + an ungrouped autocmd all listen for the same event. Firing
+    // with `group=` runs exactly one of them.
+    let dir = temp_dir("au_exec_group");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local mine = vim.api.nvim_create_augroup('Mine', { clear = true })\n\
+         local other = vim.api.nvim_create_augroup('Other', { clear = true })\n\
+         vim.api.nvim_create_autocmd('User', { group = mine, pattern = 'M',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'mine' end })\n\
+         vim.api.nvim_create_autocmd('User', { group = other, pattern = 'M',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'other' end })\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'M',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'ungrouped' end })\n",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'M', group = 'Mine' })",
+    )
+    .await;
+    let v = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "mine",
+        "only the named group's handler ran"
+    );
+}
+
+#[tokio::test]
+async fn exec_autocmds_group_accepts_an_id_and_omitting_it_fires_all() {
+    // The group may be given as the augroup id (what nvim_create_augroup
+    // returned), not just its name; and no `group` still fires everything.
+    let dir = temp_dir("au_exec_group_id");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         _G.gid = vim.api.nvim_create_augroup('Mine', { clear = true })\n\
+         vim.api.nvim_create_autocmd('User', { group = _G.gid, pattern = 'M',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'mine' end })\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'M',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'ungrouped' end })\n",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'M', group = _G.gid })",
+    )
+    .await;
+    let by_id = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(by_id.as_str().unwrap_or("<nil>"), "mine", "id narrows too");
+
+    exec_lua(&rpc, "_G.log = {}").await;
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'M' })",
+    )
+    .await;
+    let all = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        all.as_str().unwrap_or("<nil>"),
+        "mine,ungrouped",
+        "no group = every handler, as before"
+    );
+}
+
+#[tokio::test]
+async fn exec_autocmds_unknown_group_fails_loud() {
+    // A typo'd group name must NOT degrade into an unfiltered (global) fire, nor
+    // quietly match nothing — either way the caller's intent is lost silently.
+    let dir = temp_dir("au_exec_group_bad");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'M',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'ungrouped' end })\n",
+    )
+    .await;
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(vim.api.nvim_exec_autocmds, 'User',\n\
+         \x20 { pattern = 'M', group = 'NoSuchGroup' })\n\
+         return tostring(ok) .. '|' .. tostring(e) .. '|' .. table.concat(_G.log, ',')",
+    )
+    .await;
+    let s = err.as_str().unwrap_or("<nil>");
+    assert!(
+        s.starts_with("false|"),
+        "an unknown group raises, got {s:?}"
+    );
+    assert!(
+        s.contains("NoSuchGroup"),
+        "the error names the group, got {s:?}"
+    );
+    assert!(
+        s.ends_with("|"),
+        "and nothing fired (no global broadcast), got {s:?}"
+    );
+}
+
+#[tokio::test]
+async fn ex_doautocmd_accepts_a_group_argument() {
+    // `:doautocmd [group] {event} [pattern]` — vim's optional group word. The
+    // first word is the group only when it names one AND an event follows, so a
+    // bare `:doautocmd User M` still reads `User` as the event.
+    let dir = temp_dir("ex_doau_group");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    redraw_after(&rpc, &mut incoming, ":augroup Mine<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":autocmd User M lua print('mine')<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":augroup END<CR>").await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        ":autocmd User M lua print('other')<CR>",
+    )
+    .await;
+
+    let scoped = message(&redraw_after(&rpc, &mut incoming, ":doautocmd Mine User M<CR>").await);
+    assert_eq!(scoped, "mine", "the group word scoped the fire");
+
+    // Without the group word both fire; the last one printed wins the message line.
+    let all = message(&redraw_after(&rpc, &mut incoming, ":doautocmd User M<CR>").await);
+    assert_eq!(all, "other", "no group word = event, as before");
+}
+
+#[tokio::test]
+async fn ex_doautocmd_unknown_group_word_is_still_read_as_an_event() {
+    // The disambiguation is "is this a known augroup?" — an unknown first word is
+    // an event name, which is what makes `:doautocmd User M` keep working.
+    let dir = temp_dir("ex_doau_group_unknown");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        ":autocmd User M lua print('fired')<CR>",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":doautocmd User M<CR>").await);
+    assert_eq!(msg, "fired");
+}
+
+#[tokio::test]
+async fn clear_autocmds_unknown_group_fails_loud_instead_of_clearing_everything() {
+    // The same resolver guards nvim_clear_autocmds, where a silently-dropped group
+    // filter is worse than a broadcast: an unfiltered clear deletes EVERY autocmd.
+    let dir = temp_dir("au_clear_group_bad");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_autocmd('User', { pattern = 'M', callback = function() end })\n",
+    )
+    .await;
+    let v = exec_lua(
+        &rpc,
+        "local before = #vim.api.nvim_get_autocmds({ event = 'User' })\n\
+         local ok = pcall(vim.api.nvim_clear_autocmds, { group = 'NoSuchGroup' })\n\
+         local after = #vim.api.nvim_get_autocmds({ event = 'User' })\n\
+         return tostring(ok) .. '|' .. before .. '|' .. after",
+    )
+    .await;
+    assert_eq!(
+        v.as_str().unwrap_or("<nil>"),
+        "false|1|1",
+        "it raised and left the autocmds alone"
+    );
+}

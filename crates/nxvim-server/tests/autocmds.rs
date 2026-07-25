@@ -2106,3 +2106,32 @@ async fn clear_autocmds_unknown_group_fails_loud_instead_of_clearing_everything(
         "it raised and left the autocmds alone"
     );
 }
+
+#[tokio::test]
+async fn create_autocmd_unknown_group_fails_loud_instead_of_registering_ungrouped() {
+    // The sharpest edge of the group-resolution family. `augroup(name, {clear=true})`
+    // + `create_autocmd({group = name})` is THE neovim idiom for "re-sourcing my
+    // config must not stack handlers". Resolving a bad name to nil registered the
+    // autocmd as UNGROUPED, so no later clear could ever reach it — handlers pile up
+    // on every reload, which is the exact failure the idiom exists to prevent.
+    let dir = temp_dir("au_create_group_bad");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let v = exec_lua(
+        &rpc,
+        "local ok, e = pcall(vim.api.nvim_create_autocmd, 'User',\n\
+         \x20 { group = 'NotYetCreated', pattern = 'M', callback = function() end })\n\
+         local n = #vim.api.nvim_get_autocmds({ event = 'User' })\n\
+         return tostring(ok) .. '|' .. tostring(e) .. '|' .. n",
+    )
+    .await;
+    let s = v.as_str().unwrap_or("<nil>");
+    assert!(s.starts_with("false|"), "it raised, got {s:?}");
+    assert!(
+        s.contains("invalid augroup 'NotYetCreated'"),
+        "the error names the group, got {s:?}"
+    );
+    assert!(
+        s.ends_with("|0"),
+        "and registered nothing (not an unreachable ungrouped autocmd), got {s:?}"
+    );
+}

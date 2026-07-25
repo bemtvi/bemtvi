@@ -212,6 +212,31 @@ end
 --   callback = function(ev) nx.notify("entered " .. (ev.file or "[No Name]")) end,
 -- })
 -- ```
+-- Resolve an `opts.group` (an augroup id, or its name) to an id. `nil` means "every
+-- group" — no filter on the query APIs, ungrouped on `create`. An unknown NAME fails
+-- loud rather than falling back to nil, because every consumer degrades badly on nil
+-- and does so SILENTLY: a typo'd `nvim_exec_autocmds{group=…}` would broadcast to
+-- every subscriber, a typo'd `nvim_clear_autocmds{group=…}` would delete every
+-- autocmd, and a typo'd `nvim_create_autocmd{group=…}` would register the autocmd
+-- ungrouped — where no later `augroup(…, {clear=true})` can reach it, so handlers
+-- stack on every config reload (the exact failure that idiom exists to prevent).
+-- `where` names the calling API in the error. Matches neovim, which raises on an
+-- invalid augroup.
+local function au_resolve_group(spec, where)
+  if spec == nil or type(spec) == "number" then
+    return spec
+  end
+  if type(spec) ~= "string" then
+    error(where .. ": `group` must be an augroup id or name, got " .. type(spec), 2)
+  end
+  local id = nx._augroups[spec]
+  if id == nil then
+    error(where .. ": invalid augroup '" .. spec .. "'", 2)
+  end
+  return id
+end
+nx._resolve_augroup = au_resolve_group
+
 function nx.augroup.create(name, opts)
   opts = opts or {}
   local clear = opts.clear ~= false -- absent → clear, matching neovim's default
@@ -268,10 +293,7 @@ function nx.autocmd.create(event, opts)
   opts = opts or {}
   event = au_canon_event(event)
   autocmd_seq = autocmd_seq + 1
-  local group = opts.group
-  if type(group) == "string" then
-    group = nx._augroups[group]
-  end
+  local group = au_resolve_group(opts.group, "nvim_create_autocmd")
   local buffer = opts.buffer
   if buffer == 0 then
     buffer = nx._cur_buf and nx._cur_buf.bufnr or 0
@@ -558,27 +580,6 @@ function nx._fire_dir_changed(scope, cwd)
   nx._v_mirror.event = event
   nx._fire("DirChanged", scope, nil, cwd, event)
 end
-
--- Resolve an `opts.group` filter (an augroup id, or its name) to an id. `nil` means
--- "every group" — no filter. An unknown NAME fails loud rather than falling back to
--- nil: silently widening a scoped request into an unscoped one is exactly backwards
--- (a typo'd `nvim_exec_autocmds{group=…}` would broadcast to every subscriber, a
--- typo'd `nvim_clear_autocmds{group=…}` would delete every autocmd). `where` names
--- the calling API in the error. Matches neovim, which raises on an invalid augroup.
-local function au_resolve_group(spec, where)
-  if spec == nil or type(spec) == "number" then
-    return spec
-  end
-  if type(spec) ~= "string" then
-    error(where .. ": `group` must be an augroup id or name, got " .. type(spec), 2)
-  end
-  local id = nx._augroups[spec]
-  if id == nil then
-    error(where .. ": invalid augroup '" .. spec .. "'", 2)
-  end
-  return id
-end
-nx._resolve_augroup = au_resolve_group
 
 -- `nx.autocmd.exec(event, opts)` [alias `nvim_exec_autocmds`]: fire `event` (or a
 -- list of events) manually. `opts.pattern` (string or list) is matched as in

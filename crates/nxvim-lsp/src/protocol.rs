@@ -7,6 +7,7 @@
 //! protocol's many response shapes are reduced to these before they cross back,
 //! so the JSON layer (`async-lsp`, `lsp-types`) never leaks past the manager.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use lsp_types::{
@@ -445,14 +446,155 @@ pub enum SemanticTokensData {
     },
 }
 
-/// A [`WorkspaceEdit`](lsp_types::WorkspaceEdit) normalized to per-document text
-/// edits: the protocol's `changes` map and the versioned `documentChanges` (with
-/// `OneOf`/annotation edits, and edit-vs-resource operations) both collapse to one
-/// `(Url, Vec<TextEdit>)` list. File resource operations (create/rename/delete)
-/// are **dropped** — the editor applies only to already-open buffers (the
-/// unopened-file case is scoped out). Ranges stay in the negotiated encoding for
-/// the editor to convert, like the goto/completion normalizations.
-pub type WorkspaceEditData = Vec<(Url, Vec<TextEdit>)>;
+/// A [`WorkspaceEdit`](lsp_types::WorkspaceEdit) normalized to an **ordered** list
+/// of [`WorkspaceChange`]s: the protocol's `changes` map and the versioned
+/// `documentChanges` (with its `OneOf`/annotation edits and its interleaved
+/// edit-vs-resource operations) both collapse to this one shape. Ranges stay in the
+/// negotiated encoding for the editor to convert, like the goto/completion
+/// normalizations.
+///
+/// Order is load-bearing and therefore preserved: `documentChanges` must be applied
+/// in sequence, and a refactor that extracts to a new file sends `create <uri>`
+/// *before* the edits that fill it (gopls's `extract_to_new_file` is the worked
+/// example).
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceEditData {
+    /// The changes, in the order the server listed them.
+    pub changes: Vec<WorkspaceChange>,
+    /// The edit's `changeAnnotations`, by id — the labels a change points at with
+    /// its [`annotation`](WorkspaceChange::annotation). Empty for the vast majority
+    /// of edits (only a server that declares annotations sends any), and the editor
+    /// only *has* to read them for the ones that ask to be confirmed.
+    pub annotations: HashMap<String, ChangeAnnotationData>,
+}
+
+impl WorkspaceEditData {
+    /// A plain edit: changes with no annotations at all (what a `changes`-map
+    /// `WorkspaceEdit`, and every internally-built edit, produces).
+    pub fn plain(changes: Vec<WorkspaceChange>) -> Self {
+        Self {
+            changes,
+            annotations: HashMap::new(),
+        }
+    }
+
+    /// The annotation ids this edit's changes actually reference **and** that ask the
+    /// user first (`needsConfirmation`), in first-referenced order — an annotation
+    /// declared but never pointed at asks nothing. This is the whole confirm gate:
+    /// empty ⇒ apply straight away.
+    pub fn confirmable(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for change in &self.changes {
+            let Some(id) = change.annotation() else {
+                continue;
+            };
+            if seen.iter().any(|s| s == id) {
+                continue;
+            }
+            if self
+                .annotations
+                .get(id)
+                .is_some_and(|a| a.needs_confirmation)
+            {
+                seen.push(id.to_string());
+            }
+        }
+        seen
+    }
+}
+
+/// One `changeAnnotation` of a [`WorkspaceEdit`](lsp_types::WorkspaceEdit): the
+/// human-readable name for a group of changes, and whether the client must ask
+/// before applying that group. A server uses them to separate the safe part of a
+/// refactor from the part you should look at — "Rename symbol" alongside "Update
+/// string literals", the second wanting a yes/no.
+#[derive(Clone, Debug)]
+pub struct ChangeAnnotationData {
+    /// Short human-readable name, shown as the question.
+    pub label: String,
+    /// Optional longer text, shown with the label.
+    pub description: Option<String>,
+    /// Whether the user must confirm this group before it applies.
+    pub needs_confirmation: bool,
+}
+
+/// One step of a normalized [`WorkspaceEditData`]: either text edits for a document
+/// or a file resource operation. The `changes`-map form of a `WorkspaceEdit` yields
+/// only [`Edits`](WorkspaceChange::Edits); `documentChanges` can yield any variant.
+///
+/// The option flags each resource op carries are kept (rather than flattened to a
+/// bare path pair) because they decide what happens when the target already exists —
+/// dropping them would silently overwrite a file the server asked us to leave alone.
+/// Each variant carries the `annotationId` the server tagged it with, if any — the
+/// key into [`WorkspaceEditData::annotations`], and so the group a confirmation
+/// accepts or declines as a whole.
+#[derive(Clone, Debug)]
+pub enum WorkspaceChange {
+    /// Text edits for one document, in the order the server listed them. A
+    /// `documentChanges` edit may annotate each `TextEdit` individually; when it
+    /// annotates several differently, the document's edits split into one change per
+    /// annotation so a declined group takes only its own edits with it.
+    Edits {
+        uri: Url,
+        edits: Vec<TextEdit>,
+        annotation: Option<String>,
+    },
+    /// Create a file. `overwrite` truncates an existing file; `ignore_if_exists`
+    /// leaves it alone (overwrite wins when both are set, per the protocol). A URI
+    /// ending in `/` names a **directory** to create rather than a file.
+    Create {
+        uri: Url,
+        overwrite: bool,
+        ignore_if_exists: bool,
+        annotation: Option<String>,
+    },
+    /// Move a file. Same overwrite/ignore semantics as [`Create`](Self::Create),
+    /// against the *destination*.
+    Rename {
+        old_uri: Url,
+        new_uri: Url,
+        overwrite: bool,
+        ignore_if_exists: bool,
+        annotation: Option<String>,
+    },
+    /// Delete a file (`recursive` ⇒ a directory and its contents).
+    Delete {
+        uri: Url,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+        annotation: Option<String>,
+    },
+}
+
+impl WorkspaceChange {
+    /// The `changeAnnotation` id this change belongs to, if the server tagged it.
+    pub fn annotation(&self) -> Option<&str> {
+        match self {
+            Self::Edits { annotation, .. }
+            | Self::Create { annotation, .. }
+            | Self::Rename { annotation, .. }
+            | Self::Delete { annotation, .. } => annotation.as_deref(),
+        }
+    }
+}
+
+/// The editor's answer to a server→client `workspace/applyEdit` — the
+/// `ApplyWorkspaceEditResponse` body, minted editor-side and framed by whichever
+/// client owns the request ([`crate::client`] natively, [`crate::sync_client`] on
+/// wasm). `applied` is the *real* outcome, never an optimistic ack: a server that
+/// asked for something the editor could not do (an unresolvable URI, a resource op
+/// it does not implement) learns so, with `failure_reason` naming it.
+#[derive(Clone, Debug, Default)]
+pub struct ApplyEditOutcome {
+    pub applied: bool,
+    pub failure_reason: Option<String>,
+    /// Which change of the edit failed, as its index in `documentChanges` — meaningful
+    /// to a server precisely because nxvim declares a `failureHandling` strategy
+    /// (`abort`), so "everything before this index was applied, nothing after it was"
+    /// is a statement it can act on. `None` when nothing failed, or when the failure
+    /// isn't attributable to one change.
+    pub failed_change: Option<u32>,
+}
 
 /// One symbol distilled for the editor (`textDocument/documentSymbol` /
 /// `workspace/symbol`): its `name`, a human-readable `kind` label
@@ -654,6 +796,26 @@ pub enum LspEvent {
     /// tokens never appear. The editor re-issues the matching whole-buffer request
     /// for every buffer this server owns.
     WorkspaceRefresh { key: ServerKey, kind: RefreshKind },
+    /// A server→client `workspace/applyEdit`: the server is asking the *editor* to
+    /// apply a `WorkspaceEdit` it authored. This is how a refactor delivered as a
+    /// `command` lands — the `workspace/executeCommand` reply carries no edit, the
+    /// server pushes one back instead (gopls's `extract_to_new_file`, ts_ls's
+    /// move-to-file, rust-analyzer's structural search-replace, …).
+    ///
+    /// Unlike every other event this one is a **request**: the server is blocked on
+    /// the answer, so the editor must answer it exactly once — via
+    /// `HostEffects::lsp_apply_edit_response(key, id, outcome)` — whatever the
+    /// outcome. `id` is minted by the client that received the request and is
+    /// meaningful only to it (it stands in for the JSON-RPC request id, whose shape
+    /// differs between the async and sync clients).
+    ApplyEdit {
+        key: ServerKey,
+        id: u64,
+        /// The server's label for the edit (`"Extract to new file"`), for the
+        /// user-facing message; `None` when it sent none.
+        label: Option<String>,
+        changes: WorkspaceEditData,
+    },
 }
 
 /// Which decoration a [`LspEvent::WorkspaceRefresh`] asks the editor to re-query.

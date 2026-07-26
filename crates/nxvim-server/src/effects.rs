@@ -3019,6 +3019,13 @@ impl EditHost {
                 }
             }
             LoopEvent::FsResult { id, result } => {
+                // A workspace edit's own file operation (`rename`/`delete`) rides the
+                // same seam under an id above `WORKSPACE_FS_JOB_BASE`, and settles in
+                // the editor rather than in a Lua promise.
+                if self.on_workspace_fs_result(id, &result) {
+                    self.apply_lua_effects();
+                    return;
+                }
                 // An off-tick `nx.fs` op settled: resolve / reject its promise on this
                 // thread (the typed result is marshalled to Lua in `run_callback`),
                 // then drain whatever the reaction queued — the process-event shape.

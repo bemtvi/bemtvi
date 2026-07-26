@@ -9,18 +9,17 @@
 //! back.
 
 use lsp_types::{
-    AnnotatedTextEdit, CodeActionOrCommand, CodeActionResponse, CompletionItem, CompletionItemKind,
-    CompletionResponse, CompletionTextEdit, DocumentChangeOperation, DocumentChanges,
-    DocumentSymbol, DocumentSymbolResponse, Documentation, FoldingRange, GotoDefinitionResponse,
-    Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkedString, OneOf,
-    ParameterLabel, SemanticTokensFullDeltaResult, SemanticTokensResult, SignatureHelp,
-    SymbolInformation, SymbolKind, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionResponse,
+    CompletionTextEdit, DocumentSymbol, DocumentSymbolResponse, Documentation, FoldingRange,
+    GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel,
+    Location, MarkedString, OneOf, ParameterLabel, ResourceOp, SemanticTokensFullDeltaResult,
+    SemanticTokensResult, SignatureHelp, SymbolInformation, SymbolKind, TextEdit, Url,
     WorkspaceSymbolResponse,
 };
 
 use crate::protocol::{
-    CodeActionData, CompletionItemData, FoldRangeData, InlayHintData, LspReply, SemanticTokensData,
-    SymbolData, WorkspaceEditData,
+    ChangeAnnotationData, CodeActionData, CompletionItemData, FoldRangeData, InlayHintData,
+    LspReply, SemanticTokensData, SymbolData, WorkspaceChange, WorkspaceEditData,
 };
 
 /// Reduce a `textDocument/foldingRange` reply to nxvim's whole-line spans: each
@@ -38,86 +37,306 @@ pub(crate) fn folding_ranges(ranges: Vec<FoldingRange>) -> Vec<FoldRangeData> {
         .collect()
 }
 
-/// Distill a `textDocument/codeAction` response (a mixed `(Command | CodeAction)[]`)
-/// into the editor-facing list: a `CodeAction`'s `title` + normalized eager
-/// `edit` + optional `command` (run via `workspace/executeCommand` after the
-/// edit); a bare `Command` lands as a `command`-only entry (Phase 8).
-pub(crate) fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
-    resp.into_iter()
-        .map(|item| match item {
-            CodeActionOrCommand::CodeAction(mut ca) => {
-                let title = ca.title.clone();
-                // The kind rides along so the editor can enforce the caller's `only`
-                // filter itself (a server may ignore the request's `context.only`).
-                let kind = ca.kind.as_ref().map(|k| k.as_str().to_string());
-                // Move the edit/command out rather than cloning (a `WorkspaceEdit`
-                // is a deep tree); the `resolve` branch below only fires when both
-                // are `None`, so the boxed original is unchanged by taking them.
-                let command = ca.command.take();
-                let edit = ca.edit.take().map(normalize_workspace_edit);
-                // With neither an eager edit nor a command, keep the original
-                // action to resolve lazily; a command makes it directly applicable.
-                let resolve = (edit.is_none() && command.is_none()).then(|| Box::new(ca));
-                CodeActionData {
-                    title,
-                    kind,
-                    edit,
-                    resolve,
-                    command,
-                }
-            }
-            CodeActionOrCommand::Command(cmd) => CodeActionData {
-                title: cmd.title.clone(),
-                // A bare `Command` carries no kind — it can never match an `only` filter.
-                kind: None,
+/// Distill one item of a `textDocument/codeAction` response (a mixed
+/// `(Command | CodeAction)[]`) into the editor-facing shape: a `CodeAction`'s `title`
+/// and its optional `command` (run via `workspace/executeCommand` after the edit). A
+/// bare `Command` lands as a `command`-only entry (Phase 8).
+///
+/// The eager `edit` is deliberately **left `None`** here: the typed value has already
+/// lost its change annotations, so [`code_actions_value`] — this function's only
+/// caller — fills it in from the item's raw JSON. Whether the action *had* one still
+/// decides `resolve`, which is all this needs it for.
+fn code_action(item: CodeActionOrCommand) -> CodeActionData {
+    match item {
+        CodeActionOrCommand::CodeAction(mut ca) => {
+            let title = ca.title.clone();
+            // The kind rides along so the editor can enforce the caller's `only`
+            // filter itself (a server may ignore the request's `context.only`).
+            let kind = ca.kind.as_ref().map(|k| k.as_str().to_string());
+            // Move the edit/command out rather than cloning (a `WorkspaceEdit`
+            // is a deep tree); the `resolve` branch below only fires when both
+            // are `None`, so the boxed original is unchanged by taking them.
+            let command = ca.command.take();
+            let had_edit = ca.edit.take().is_some();
+            // With neither an eager edit nor a command, keep the original
+            // action to resolve lazily; a command makes it directly applicable.
+            let resolve = (!had_edit && command.is_none()).then(|| Box::new(ca));
+            CodeActionData {
+                title,
+                kind,
                 edit: None,
-                resolve: None,
-                command: Some(cmd),
-            },
+                resolve,
+                command,
+            }
+        }
+        CodeActionOrCommand::Command(cmd) => CodeActionData {
+            title: cmd.title.clone(),
+            // A bare `Command` carries no kind — it can never match an `only` filter.
+            kind: None,
+            edit: None,
+            resolve: None,
+            command: Some(cmd),
+        },
+    }
+}
+
+/// [`code_action`] over the **raw JSON** reply, so each action's inline `edit` keeps
+/// its change annotations (see [`normalize_workspace_edit_value`] for why the typed
+/// value cannot). Each item is still read typed for everything else — title, kind,
+/// `command`, and the whole action a lazy one resolves with — so the two views agree;
+/// only the edit is taken from the wire shape. An item that doesn't deserialize at all
+/// is skipped rather than failing the round: one malformed action shouldn't cost the
+/// user the others.
+pub(crate) fn code_actions_value(value: serde_json::Value) -> Vec<CodeActionData> {
+    let serde_json::Value::Array(items) = value else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let raw_edit = item.get("edit").filter(|e| !e.is_null()).cloned();
+            let typed: CodeActionOrCommand = serde_json::from_value(item).ok()?;
+            let mut data = code_action(typed);
+            if let Some(edit) = raw_edit {
+                data.edit = Some(normalize_workspace_edit_value(&edit));
+            }
+            Some(data)
         })
         .collect()
 }
 
-/// Normalize a [`WorkspaceEdit`] to flat per-document [`TextEdit`]s (see
-/// [`WorkspaceEditData`]). `documentChanges` (versioned) is preferred when present
-/// — collapsing the `OneOf<TextEdit, AnnotatedTextEdit>` and dropping file
-/// resource operations — else the plain `changes` map is used.
+/// Normalize a `WorkspaceEdit` **from its raw JSON**, which is the only form that
+/// still has its change annotations.
 ///
-/// `pub` so `nxvim-server` can reuse it for `vim.lsp.util.apply_workspace_edit`
-/// (Phase 7): a WorkspaceEdit handed up from Lua normalizes through the exact same
-/// path the native rename / code-action replies use.
-pub fn normalize_workspace_edit(edit: WorkspaceEdit) -> WorkspaceEditData {
-    if let Some(changes) = edit.document_changes {
-        return match changes {
-            DocumentChanges::Edits(edits) => edits.into_iter().map(text_document_edit).collect(),
-            DocumentChanges::Operations(ops) => ops
-                .into_iter()
-                .filter_map(|op| match op {
-                    DocumentChangeOperation::Edit(e) => Some(text_document_edit(e)),
-                    // create/rename/delete file ops are scoped out (open buffers only).
-                    DocumentChangeOperation::Op(_) => None,
-                })
-                .collect(),
-        };
-    }
-    edit.changes
-        .map(|m| m.into_iter().collect())
-        .unwrap_or_default()
+/// `lsp-types` models a `documentChanges` edit as `OneOf<TextEdit, AnnotatedTextEdit>`
+/// with serde's `untagged`, and `TextEdit` does not deny unknown fields — so an
+/// annotated edit deserializes as a *plain* one and its `annotationId` is dropped
+/// before any of our code sees it. Since that id is the whole confirm gate (a server
+/// marks the part of a refactor a human should look at), reading it back off the
+/// typed value is impossible: it has to be parsed here, from the wire shape.
+///
+/// Everything else matches the typed path: `documentChanges` (versioned) is preferred,
+/// carrying its interleaved resource operations through **in order**; otherwise the
+/// plain `changes` map, which predates annotations and so carries none.
+///
+/// Order matters: a refactor that extracts into a new file sends `create <uri>`
+/// followed by the edits that fill it, so flattening the two apart breaks it.
+///
+/// Infallible: an edit whose JSON doesn't parse degrades to an empty one. Every caller
+/// that has somewhere to *report* a malformed edit should use
+/// [`try_normalize_workspace_edit_value`] instead — an empty edit is indistinguishable
+/// from "the server sent no changes", and answering `applied: true` to something we
+/// couldn't read is exactly the pretended success the apply path exists to avoid.
+pub fn normalize_workspace_edit_value(value: &serde_json::Value) -> WorkspaceEditData {
+    try_normalize_workspace_edit_value(value).unwrap_or_default()
 }
 
-/// Flatten one [`TextDocumentEdit`] to `(uri, TextEdit[])`, collapsing each
-/// `OneOf<TextEdit, AnnotatedTextEdit>` to a plain edit (the change annotation is
-/// dropped — nxvim does not surface them).
-fn text_document_edit(edit: TextDocumentEdit) -> (Url, Vec<TextEdit>) {
-    let edits = edit
-        .edits
+/// [`normalize_workspace_edit_value`] with the parse failure kept: `Err` is the serde
+/// error, for a caller that can tell someone (a server waiting on an
+/// `ApplyWorkspaceEditResponse`, or the LSP log).
+///
+/// The parse is all-or-nothing by design — one unreadable entry of `documentChanges`
+/// means we do not know what the edit says, and half-applying an edit we only partly
+/// understood is worse than refusing it.
+pub fn try_normalize_workspace_edit_value(
+    value: &serde_json::Value,
+) -> Result<WorkspaceEditData, String> {
+    let raw: RawWorkspaceEdit =
+        serde_json::from_value(value.clone()).map_err(|e| format!("malformed edit: {e}"))?;
+    let annotations = raw
+        .change_annotations
+        .unwrap_or_default()
         .into_iter()
-        .map(|oneof| match oneof {
-            OneOf::Left(te) => te,
-            OneOf::Right(AnnotatedTextEdit { text_edit, .. }) => text_edit,
+        .map(|(id, a)| {
+            (
+                id,
+                ChangeAnnotationData {
+                    label: a.label,
+                    description: a.description,
+                    needs_confirmation: a.needs_confirmation.unwrap_or(false),
+                },
+            )
         })
         .collect();
-    (edit.text_document.uri, edits)
+    if let Some(doc_changes) = raw.document_changes {
+        let changes = doc_changes
+            .into_iter()
+            .flat_map(|change| match change {
+                RawDocChange::Edit(e) => text_document_edit(e),
+                RawDocChange::Op(op) => vec![resource_op(op)],
+            })
+            .collect();
+        return Ok(WorkspaceEditData {
+            changes,
+            annotations,
+        });
+    }
+    // The `changes` map carries no annotations at all, so everything in it applies
+    // unconditionally.
+    Ok(WorkspaceEditData::plain(
+        raw.changes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(uri, edits)| WorkspaceChange::Edits {
+                uri,
+                edits,
+                annotation: None,
+            })
+            .collect(),
+    ))
+}
+
+/// The wire shape of a `WorkspaceEdit`, as far as normalization needs it — the parts
+/// `lsp-types` would either lose (a text edit's `annotationId`) or make awkward to
+/// reach. Missing/malformed fields degrade to "nothing here" rather than failing the
+/// whole edit, matching how the typed path treated an absent field.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawWorkspaceEdit {
+    changes: Option<std::collections::HashMap<Url, Vec<TextEdit>>>,
+    document_changes: Option<Vec<RawDocChange>>,
+    change_annotations: Option<std::collections::HashMap<String, RawAnnotation>>,
+}
+
+/// One entry of `documentChanges`: a document's edits, or a file resource operation.
+/// Untagged with the edit first — a resource op has a `kind` and no `edits`, so the
+/// two shapes cannot be confused.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum RawDocChange {
+    Edit(RawTextDocumentEdit),
+    Op(ResourceOp),
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTextDocumentEdit {
+    text_document: RawTextDocumentId,
+    edits: Vec<RawEdit>,
+}
+
+/// Only the URI matters here: the version is the server's own optimistic-concurrency
+/// bookkeeping, and nxvim applies against the buffer it has.
+#[derive(Debug, serde::Deserialize)]
+struct RawTextDocumentId {
+    uri: Url,
+}
+
+/// A `TextEdit` plus the `annotationId` an `AnnotatedTextEdit` carries — the field
+/// the typed layer drops.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEdit {
+    #[serde(flatten)]
+    edit: TextEdit,
+    annotation_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAnnotation {
+    label: String,
+    description: Option<String>,
+    needs_confirmation: Option<bool>,
+}
+
+/// Flatten one document's edits to [`WorkspaceChange::Edits`], **keeping the
+/// annotation id each edit carried**.
+///
+/// One document can yield more than one change: a server may annotate a document's
+/// edits differently (the safe half of a refactor and the half worth a second look),
+/// and a confirmation accepts or declines a whole annotation — so the edits split into
+/// consecutive runs, one per annotation, rather than travelling as one lump that would
+/// have to be all-or-nothing. Runs, not a regrouping: the protocol's order within the
+/// document is preserved.
+fn text_document_edit(edit: RawTextDocumentEdit) -> Vec<WorkspaceChange> {
+    let uri = edit.text_document.uri;
+    let mut out: Vec<WorkspaceChange> = Vec::new();
+    for RawEdit {
+        edit,
+        annotation_id,
+    } in edit.edits
+    {
+        match out.last_mut() {
+            // Same annotation as the run being built: keep them together.
+            Some(WorkspaceChange::Edits {
+                edits,
+                annotation: run,
+                ..
+            }) if *run == annotation_id => edits.push(edit),
+            _ => out.push(WorkspaceChange::Edits {
+                uri: uri.clone(),
+                edits: vec![edit],
+                annotation: annotation_id,
+            }),
+        }
+    }
+    out
+}
+
+/// Carry one file [`ResourceOp`] across to its [`WorkspaceChange`], keeping the
+/// option flags (`overwrite` / `ignoreIfExists` / `recursive` /
+/// `ignoreIfNotExists`) that decide what happens when the target already exists (or
+/// doesn't). Absent options mean all-false, per the protocol's defaults.
+fn resource_op(op: ResourceOp) -> WorkspaceChange {
+    match op {
+        ResourceOp::Create(create) => {
+            let (overwrite, ignore_if_exists) = create
+                .options
+                .map(|o| {
+                    (
+                        o.overwrite.unwrap_or(false),
+                        o.ignore_if_exists.unwrap_or(false),
+                    )
+                })
+                .unwrap_or((false, false));
+            WorkspaceChange::Create {
+                uri: create.uri,
+                overwrite,
+                ignore_if_exists,
+                annotation: create.annotation_id,
+            }
+        }
+        ResourceOp::Rename(rename) => {
+            let (overwrite, ignore_if_exists) = rename
+                .options
+                .map(|o| {
+                    (
+                        o.overwrite.unwrap_or(false),
+                        o.ignore_if_exists.unwrap_or(false),
+                    )
+                })
+                .unwrap_or((false, false));
+            WorkspaceChange::Rename {
+                old_uri: rename.old_uri,
+                new_uri: rename.new_uri,
+                overwrite,
+                ignore_if_exists,
+                annotation: rename.annotation_id,
+            }
+        }
+        ResourceOp::Delete(delete) => {
+            // `lsp-types` hangs the delete's annotation id off its *options* (where
+            // `CreateFile` / `RenameFile` carry theirs on the operation itself), so it
+            // comes out of the same destructure as the flags.
+            let (recursive, ignore_if_not_exists, annotation) = delete
+                .options
+                .map(|o| {
+                    (
+                        o.recursive.unwrap_or(false),
+                        o.ignore_if_not_exists.unwrap_or(false),
+                        o.annotation_id,
+                    )
+                })
+                .unwrap_or((false, false, None));
+            WorkspaceChange::Delete {
+                uri: delete.uri,
+                recursive,
+                ignore_if_not_exists,
+                annotation,
+            }
+        }
+    }
 }
 
 /// Distill a `textDocument/completion` reply into [`LspReply::Completion`],

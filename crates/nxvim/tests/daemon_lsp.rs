@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, feed, serial_lock, spawn_with_daemon_lsp, temp_dir};
+use nxvim_test_harness::{exec_lua, feed, lines, serial_lock, spawn_with_daemon_lsp, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const NXVIM_BIN: &str = env!("CARGO_BIN_EXE_nxvim");
@@ -182,5 +182,78 @@ async fn a_request_routes_by_capability_over_the_daemon_wire() {
     assert!(
         !hover.contains("FROM-ALPHA"),
         "and not the first server, which withholds hoverProvider: {hover:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_initiated_apply_edit_lands_over_the_daemon_wire() {
+    // `workspace/applyEdit` is the one inbound *request* the editor answers, and it
+    // answers it a tick or more later — after the edit has reached the buffers. That
+    // round trip runs through a different client on each transport (the async
+    // `async-lsp` router natively, the `SyncLspClient` on the wasm/daemon leg), so the
+    // wire leg has to be driven, not assumed: here the request arrives over the
+    // tunnel, the edit applies locally, and the response has to travel back down the
+    // same tunnel or the server would block forever.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("daemon-lsp-apply-edit");
+    let record = dir.join("rec-alpha.jsonl");
+    let uri = format!("file://{}", dir.join("a.rs").display());
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        &format!(
+            r#"{{ "record": "{rec}",
+                  "code_action": [ {{ "title": "Rewrite", "kind": "refactor",
+                    "command": {{ "title": "run", "command": "alpha.rewrite" }} }} ],
+                  "apply_edit": {{ "changes": {{ "{uri}": [ {{
+                      "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                  "end": {{ "line": 0, "character": 7 }} }},
+                      "newText": "bar" }} ] }} }} }}"#,
+            rec = record.display(),
+        ),
+    );
+    arm_mock_named(dir.as_path(), "beta", r#"{ "code_action": [] }"#);
+    let (rpc, _incoming) = start_two_over_daemon(dir.as_path(), "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached over the daemon wire"
+    );
+
+    // One action survives, so `apply` dispatches its command straight away; the mock
+    // answers with the applyEdit push.
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let mut applied_in_buffer = false;
+    for _ in 0..200 {
+        if lines(&rpc).await == vec!["let bar = 1".to_string()] {
+            applied_in_buffer = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // …and the server was answered down the tunnel it asked on.
+    let mut answered = String::new();
+    for _ in 0..200 {
+        let content = std::fs::read_to_string(&record).unwrap_or_default();
+        if let Some(line) = content
+            .lines()
+            .find(|l| l.contains("_apply_edit_response"))
+            .map(str::to_string)
+        {
+            answered = line;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    disarm_mocks();
+    assert!(
+        applied_in_buffer,
+        "the server-initiated edit must reach the buffer over the wire"
+    );
+    assert!(
+        answered.contains(r#""applied":true"#),
+        "the response must travel back down the tunnel: {answered:?}"
     );
 }

@@ -22,9 +22,9 @@ use lsp_types::{
 };
 
 use crate::convert::{
-    code_actions, completion_reply, document_symbols, folding_ranges, goto_locations, hover_reply,
-    inlay_hint, normalize_workspace_edit, resolved_completion, resolved_inlay_hint,
-    semantic_tokens_delta_data, semantic_tokens_full, signature_help_reply, workspace_symbols,
+    code_actions_value, completion_reply, document_symbols, folding_ranges, goto_locations,
+    hover_reply, inlay_hint, resolved_completion, resolved_inlay_hint, semantic_tokens_delta_data,
+    semantic_tokens_full, signature_help_reply, workspace_symbols,
 };
 use crate::log::{LogLevel, LspLog};
 use crate::protocol::{LspNotify, LspReply, LspRequest};
@@ -89,6 +89,27 @@ fn unwrap_logged<T>(
         Err(e) => {
             log.log(LogLevel::Warn, name, &format!("{what} failed: {e}"));
             None
+        }
+    }
+}
+
+/// Normalize a reply's `WorkspaceEdit` from its raw JSON, logging an edit that
+/// doesn't parse and degrading it to an empty one — the `unwrap_logged` shape, for
+/// the paths that read the wire value themselves (to keep its change annotations,
+/// which the typed form drops). Without the log a malformed edit would reach the user
+/// as a bare "No applicable changes", indistinguishable from a server with nothing to
+/// say.
+fn normalize_logged(
+    value: &serde_json::Value,
+    log: &LspLog,
+    name: &str,
+    what: &str,
+) -> crate::protocol::WorkspaceEditData {
+    match crate::convert::try_normalize_workspace_edit_value(value) {
+        Ok(data) => data,
+        Err(reason) => {
+            log.log(LogLevel::Warn, name, &format!("{what}: {reason}"));
+            Default::default()
         }
     }
 }
@@ -257,9 +278,15 @@ pub(crate) async fn issue_request(
                 new_name,
                 work_done_progress_params: Default::default(),
             };
+            // Raw, not `sock.rename(…)`: a typed `WorkspaceEdit` has already lost its
+            // text edits' `annotationId`s by the time we see it (see
+            // `normalize_workspace_edit_value`), and a rename is exactly the refactor a
+            // server annotates ("also update this in comments and strings?").
             LspReply::WorkspaceEdit(
-                unwrap_logged(sock.rename(params).await, log, name, "rename")
-                    .map(normalize_workspace_edit)
+                unwrap_logged(sock.request::<RawRename>(params).await, log, name, "rename")
+                    .filter(|e| !e.is_null())
+                    .as_ref()
+                    .map(|e| normalize_logged(e, log, name, "rename"))
                     .unwrap_or_default(),
             )
         }
@@ -283,24 +310,36 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            LspReply::CodeActions(code_actions(
-                unwrap_logged(sock.code_action(params).await, log, name, "codeAction")
-                    .unwrap_or_default(),
+            LspReply::CodeActions(code_actions_value(
+                unwrap_logged(
+                    sock.request::<RawCodeAction>(params).await,
+                    log,
+                    name,
+                    "codeAction",
+                )
+                .unwrap_or_default(),
             ))
         }
-        LspRequest::ResolveCodeAction { action } => match sock.code_action_resolve(*action).await {
-            Ok(resolved) => {
-                LspReply::ResolvedCodeAction(resolved.edit.map(normalize_workspace_edit))
+        // Raw for the same reason as `rename` above: the resolved action's edit keeps
+        // its change annotations only in its JSON form.
+        LspRequest::ResolveCodeAction { action } => {
+            match sock.request::<RawCodeActionResolve>(*action).await {
+                Ok(resolved) => LspReply::ResolvedCodeAction(
+                    resolved
+                        .get("edit")
+                        .filter(|e| !e.is_null())
+                        .map(|e| normalize_logged(e, log, name, "codeAction/resolve")),
+                ),
+                Err(e) => {
+                    log.log(
+                        LogLevel::Warn,
+                        name,
+                        &format!("codeAction/resolve failed: {e}"),
+                    );
+                    LspReply::ResolvedCodeAction(None)
+                }
             }
-            Err(e) => {
-                log.log(
-                    LogLevel::Warn,
-                    name,
-                    &format!("codeAction/resolve failed: {e}"),
-                );
-                LspReply::ResolvedCodeAction(None)
-            }
-        },
+        }
         LspRequest::SemanticTokensFull { uri } => {
             let params = SemanticTokensParams {
                 text_document: TextDocumentIdentifier { uri },
@@ -637,6 +676,33 @@ fn text_document_position(uri: Url, position: Position) -> TextDocumentPositionP
         text_document: TextDocumentIdentifier { uri },
         position,
     }
+}
+
+/// The three requests whose replies carry a `WorkspaceEdit`, re-declared with a **raw
+/// JSON result**. `lsp-types` drops a text edit's `annotationId` on the way in (its
+/// `OneOf<TextEdit, AnnotatedTextEdit>` is untagged and `TextEdit` accepts unknown
+/// fields), and that id is what decides whether nxvim asks before applying — so these
+/// paths take the wire shape and normalize it themselves. Same method, same params;
+/// only the result type differs.
+enum RawRename {}
+impl lsp_types::request::Request for RawRename {
+    type Params = RenameParams;
+    type Result = Option<serde_json::Value>;
+    const METHOD: &'static str = "textDocument/rename";
+}
+
+enum RawCodeAction {}
+impl lsp_types::request::Request for RawCodeAction {
+    type Params = CodeActionParams;
+    type Result = Option<serde_json::Value>;
+    const METHOD: &'static str = "textDocument/codeAction";
+}
+
+enum RawCodeActionResolve {}
+impl lsp_types::request::Request for RawCodeActionResolve {
+    type Params = lsp_types::CodeAction;
+    type Result = serde_json::Value;
+    const METHOD: &'static str = "codeAction/resolve";
 }
 
 /// A one-line summary of an outgoing request for the DEBUG log.

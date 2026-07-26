@@ -25,10 +25,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::client::{init_params, new_client, read_init_result};
+use crate::client::{init_params, new_client, read_init_result, ApplyEditDone};
 use crate::dispatch::{apply_notify, issue_request};
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
+use crate::protocol::{
+    ApplyEditOutcome, LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn,
+};
 use crate::transport::{LocalLspTransport, LspTransport};
 
 /// Commands from the editor to the supervisor, routed to per-server tasks by key.
@@ -46,6 +48,13 @@ enum LspCommand {
         token: ReqToken,
         req: LspRequest,
     },
+    /// The editor's answer to a server→client `workspace/applyEdit` (the one inbound
+    /// request nxvim answers asynchronously — it has to reach the buffers first).
+    ApplyEditResponse {
+        key: ServerKey,
+        id: u64,
+        outcome: ApplyEditOutcome,
+    },
     Shutdown {
         key: ServerKey,
     },
@@ -55,6 +64,7 @@ enum LspCommand {
 enum ServerMsg {
     Notify(LspNotify),
     Request(ReqToken, LspRequest),
+    ApplyEditResponse(u64, ApplyEditOutcome),
     Shutdown,
 }
 
@@ -137,6 +147,16 @@ impl LspManager {
         let _ = self.cmd_tx.send(LspCommand::Request { key, token, req });
     }
 
+    /// Answer a server→client `workspace/applyEdit` the editor received as
+    /// [`LspEvent::ApplyEdit`] — the server has been blocked on it since. `id` is the
+    /// one that came with the event. Fire-and-forget like the rest; dropped if the
+    /// server has since exited (its request died with it).
+    pub fn apply_edit_response(&self, key: ServerKey, id: u64, outcome: ApplyEditOutcome) {
+        let _ = self
+            .cmd_tx
+            .send(LspCommand::ApplyEditResponse { key, id, outcome });
+    }
+
     /// Cleanly `shutdown`/`exit` `key`'s server and forget it.
     pub fn shutdown(&self, key: ServerKey) {
         let _ = self.cmd_tx.send(LspCommand::Shutdown { key });
@@ -184,6 +204,11 @@ async fn run_supervisor(
             LspCommand::Request { key, token, req } => {
                 if let Some(tx) = servers.get(&key) {
                     let _ = tx.send(ServerMsg::Request(token, req));
+                }
+            }
+            LspCommand::ApplyEditResponse { key, id, outcome } => {
+                if let Some(tx) = servers.get(&key) {
+                    let _ = tx.send(ServerMsg::ApplyEditResponse(id, outcome));
                 }
             }
             LspCommand::Shutdown { key } => {
@@ -420,6 +445,14 @@ async fn run_server_once(
                         let reply = issue_request(&mut sock, req, &log, &key.name).await;
                         let _ = tx.send(LspEvent::Reply { key, token, reply });
                     });
+                }
+                // The editor answered a `workspace/applyEdit`: hand the outcome to
+                // the client loop as a custom event, where it resolves the parked
+                // request handler that frames the response. Routed through the loop
+                // (rather than answered here) because the pending map lives in the
+                // router's state, which only the loop can touch.
+                Some(ServerMsg::ApplyEditResponse(id, outcome)) => {
+                    let _ = socket.emit(ApplyEditDone { id, outcome });
                 }
                 // Explicit shutdown, or the manager dropped our sender: tear down.
                 Some(ServerMsg::Shutdown) | None => {

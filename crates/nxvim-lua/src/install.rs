@@ -2764,16 +2764,35 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `nx._lsp_apply_workspace_edit(edit)`: queue [`LspOp::ApplyWorkspaceEdit`]
-    // (Phase 7). `edit` is the LSP-shape WorkspaceEdit table, converted to JSON
-    // through the same `lua_to_json` bridge `client:request` params use; the server
-    // deserializes, normalizes, and applies it across the open buffers it names.
+    // `nx._lsp_apply_workspace_edit(edit, encoding)`: queue
+    // [`LspOp::ApplyWorkspaceEdit`] (Phase 7). `edit` is the LSP-shape WorkspaceEdit
+    // table, converted to JSON through the same `lua_to_json` bridge `client:request`
+    // params use; the server deserializes, normalizes, and applies it across the open
+    // buffers it names. `encoding` names the column units its ranges are in (the
+    // protocol's `"utf-16"` when the caller passes none).
     let sh = shared.clone();
     nx.set(
         "_lsp_apply_workspace_edit",
-        lua.create_function(move |_, edit: mlua::Value| {
+        lua.create_function(move |_, (edit, encoding): (mlua::Value, Option<String>)| {
             sh.borrow_mut().lsp_ops.push(LspOp::ApplyWorkspaceEdit {
                 edit: lua_to_json(&edit)?,
+                encoding: encoding.unwrap_or_else(|| "utf-16".to_string()),
+            });
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._lsp_edit_decision(group, accepted)`: the user's answer to a workspace
+    // edit's `needsConfirmation` annotations — the annotation ids they accepted, as a
+    // list of strings. Queues [`LspOp::WorkspaceEditDecision`], which applies the
+    // surviving changes (and answers the server that asked, if one did).
+    let sh = shared.clone();
+    nx.set(
+        "_lsp_edit_decision",
+        lua.create_function(move |_, (group, accepted): (u64, Option<Vec<String>>)| {
+            sh.borrow_mut().lsp_ops.push(LspOp::WorkspaceEditDecision {
+                group,
+                accepted: accepted.unwrap_or_default(),
             });
             Ok(())
         })?,

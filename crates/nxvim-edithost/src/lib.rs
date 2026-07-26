@@ -37,7 +37,8 @@ use nxvim_core::{
     OpenOutcome, PendingSave, PersistState, Span, SyntaxEngine,
 };
 use nxvim_lsp::{
-    LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp,
+    ApplyEditOutcome, LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn,
+    SyncLspClient, WireOp,
 };
 use nxvim_lua::LuaRuntime;
 use nxvim_server::{decode_config_bundle_bytes, EditHost, HostEffects};
@@ -899,6 +900,15 @@ impl HostEffects for WasmEffects {
         // it by `token`; its reply returns later inbound as an `LspEvent::Reply` once the
         // daemon's `lsp_stdout` lands. The framed request bytes drain to the Sink.
         self.lsp.request(key, token, req);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_apply_edit_response(&mut self, _key: ServerKey, id: u64, outcome: ApplyEditOutcome) {
+        // The editor's answer to a server→client `workspace/applyEdit`, which the
+        // server has been blocked on since it asked. The client frames the response
+        // (it holds the JSON-RPC request id behind `id`); the bytes drain to the Sink
+        // as an `lsp_stdin` for the Worker to forward, so flush.
+        self.lsp.apply_edit_response(id, outcome);
         self.flush_lsp_wire();
     }
 

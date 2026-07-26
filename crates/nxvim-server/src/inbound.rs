@@ -87,6 +87,13 @@ impl EditHost {
                 shada_due = true;
             } else if crate::is_parse_resume_timer(&event) {
                 resume_due = true;
+            } else if crate::is_workspace_fs_timeout_timer(&event) {
+                // The workspace file-operation watchdog: a `rename`/`delete`/`mkdir`
+                // whose fs leg stopped answering. Handled here (not through
+                // `on_loop_event`) for the same reason the two above are — it is the
+                // editor's own timer, not a Lua callback.
+                self.on_workspace_fs_timeout();
+                had_real = true;
             } else {
                 self.on_loop_event(event);
                 had_real = true;

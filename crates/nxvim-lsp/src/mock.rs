@@ -93,6 +93,17 @@
 //!   sections (the pull-config model lua_ls/gopls use) and records the editor's
 //!   reply under the synthetic method `_config_response`, so a test can assert the
 //!   client answered each section from the config's `settings`.
+//! - `apply_edit`: a `WorkspaceEdit` the mock pushes back as a server→client
+//!   `workspace/applyEdit` when it receives a `workspace/executeCommand` — gopls's
+//!   exact shape for a refactor delivered as a `command` (the command's own reply is
+//!   `null`; the edit arrives as this request). The editor's response is recorded
+//!   under the synthetic method `_apply_edit_response`, so a test can assert we
+//!   answered `{"applied": true}` rather than the method-not-found this used to be.
+//! - `apply_edit_by_command`: a `{ command: WorkspaceEdit }` map (overriding
+//!   `apply_edit` when it names the executed command) so one session can drive several
+//!   *different* server-initiated edits — a text edit, a `rename`, a `delete` — each
+//!   through its own code action. Deterministic where a consumed-in-order list is not:
+//!   re-running an action pushes the same edit again.
 //! - `custom_replies`: a `{ method: result }` map scripting the reply to an
 //!   otherwise-unhandled request — the generic `client:request` path (Phase 5).
 //!   A method not in the map falls back to a `null` result.
@@ -157,17 +168,22 @@ pub fn run(script_path: &str) {
     // The id of the `workspace/configuration` pull we sent, so its response can be
     // recorded for the test to assert on.
     let mut config_req_id: Option<i64> = None;
+    // Likewise for the `workspace/applyEdit` an `apply_edit` script pushes back: its
+    // response is the editor's `{applied, failureReason?}`, which a test reads to
+    // prove the edit was really applied (not merely acked).
+    let mut apply_req_id: Option<i64> = None;
 
     while let Some(msg) = read_message(&mut reader) {
         // A response to one of our server→client requests (it has an `id` but no
-        // `method`): capture the config-pull answer for tests, then ignore — never
-        // reply to a reply.
+        // `method`): capture the config-pull / applyEdit answers for tests, then
+        // ignore — never reply to a reply.
         if msg.get("method").is_none() {
-            if let (Some(rid), Some(want)) = (msg.get("id").and_then(Value::as_i64), config_req_id)
-            {
-                if rid == want {
-                    append_record(&script, "_config_response", msg.get("result"));
-                }
+            let rid = msg.get("id").and_then(Value::as_i64);
+            if rid.is_some() && rid == config_req_id {
+                append_record(&script, "_config_response", msg.get("result"));
+            }
+            if rid.is_some() && rid == apply_req_id {
+                append_record(&script, "_apply_edit_response", msg.get("result"));
             }
             continue;
         }
@@ -413,6 +429,39 @@ pub fn run(script_path: &str) {
             // Folding ranges: return the scripted `FoldingRange[]` for the whole
             // document. Absent ⇒ `null` (no folds).
             "textDocument/foldingRange" => reply_scripted(&stdout, id, &script, "folding_ranges"),
+            // A refactor delivered as a `command`: the reply carries nothing, and the
+            // edit comes back as a server→client `workspace/applyEdit` — the shape
+            // gopls uses for `gopls.extract_to_new_file`. Send the request FIRST, so
+            // the editor is applying while the command reply is still in flight
+            // (exactly the interleaving a real server produces).
+            "workspace/executeCommand" => {
+                // The edit this command pushes back: the per-command map when it names
+                // this command, else the single scripted `apply_edit`.
+                let command = msg
+                    .pointer("/params/command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let edit = script
+                    .get("apply_edit_by_command")
+                    .and_then(|m| m.get(command))
+                    .or_else(|| script.get("apply_edit"));
+                if let Some(edit) = edit {
+                    apply_req_id = Some(next_id);
+                    write_message(
+                        &stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "workspace/applyEdit",
+                            "params": { "label": "mock refactor", "edit": edit },
+                        }),
+                    );
+                    next_id += 1;
+                }
+                if let Some(id) = id {
+                    write_response(&stdout, id, Value::Null);
+                }
+            }
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply. A `custom_replies` map (method ->
             // result) scripts the answer to a generic `client:request` (Phase 5);

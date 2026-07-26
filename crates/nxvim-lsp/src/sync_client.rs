@@ -35,23 +35,24 @@
 use std::collections::HashMap;
 
 use lsp_types::{
-    CodeAction, CodeActionResponse, CompletionItem, CompletionResponse, ConfigurationParams,
-    DocumentSymbolResponse, FoldingRange, GotoDefinitionResponse, Hover, InitializeResult,
-    InlayHint, Location, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
-    SemanticTokensResult, ShowMessageParams, SignatureHelp, TextEdit, Url, WorkspaceEdit,
-    WorkspaceSymbolResponse,
+    CompletionItem, CompletionResponse, ConfigurationParams, DocumentSymbolResponse, FoldingRange,
+    GotoDefinitionResponse, Hover, InitializeResult, InlayHint, Location, PublishDiagnosticsParams,
+    SemanticTokensFullDeltaResult, SemanticTokensResult, ShowMessageParams, SignatureHelp,
+    TextEdit, Url, WorkspaceEdit, WorkspaceSymbolResponse,
 };
 use serde_json::{json, Value};
 
 use crate::client::{configuration_reply, init_params, read_init_result};
 use crate::convert::{
-    code_actions, completion_reply, document_symbols, folding_ranges, goto_locations, hover_reply,
-    inlay_hint, normalize_workspace_edit, resolved_completion, resolved_inlay_hint,
-    semantic_tokens_delta_data, semantic_tokens_full, signature_help_reply, workspace_symbols,
+    code_actions_value, completion_reply, document_symbols, folding_ranges, goto_locations,
+    hover_reply, inlay_hint, normalize_workspace_edit_value, resolved_completion,
+    resolved_inlay_hint, semantic_tokens_delta_data, semantic_tokens_full, signature_help_reply,
+    try_normalize_workspace_edit_value, workspace_symbols,
 };
 use crate::log::LspLog;
 use crate::protocol::{
-    LspEvent, LspNotify, LspReply, LspRequest, RefreshKind, ReqToken, ServerKey, ServerSpawn,
+    ApplyEditOutcome, LspEvent, LspNotify, LspReply, LspRequest, RefreshKind, ReqToken, ServerKey,
+    ServerSpawn,
 };
 
 /// One raw operation the wasm host forwards to the daemon's LSP leg. `Spawn`/`Kill`
@@ -153,6 +154,13 @@ pub struct SyncLspClient {
     next_wire_id: u64,
     wire: Vec<WireOp>,
     events: Vec<LspEvent>,
+    /// In-flight `workspace/applyEdit` requests, keyed by the id handed to the editor
+    /// on [`LspEvent::ApplyEdit`]: the server that asked, and its JSON-RPC request id
+    /// to answer on. The editor answers a tick or more later
+    /// ([`Self::apply_edit_response`]) — the one inbound request that can't be
+    /// answered from here, because only the editor knows whether the edit landed.
+    pending_apply: HashMap<u64, (ServerKey, Value)>,
+    next_apply_id: u64,
     /// Silent on wasm — the server's stderr is dropped here (the native path logs
     /// it to a file; the browser has none), and capability negotiation never logs.
     log: LspLog,
@@ -172,6 +180,8 @@ impl SyncLspClient {
             next_wire_id: 1,
             wire: Vec::new(),
             events: Vec::new(),
+            pending_apply: HashMap::new(),
+            next_apply_id: 1,
             log: LspLog::disabled(),
         }
     }
@@ -307,6 +317,27 @@ impl SyncLspClient {
             code,
             signal,
         });
+    }
+
+    /// Answer a server→client `workspace/applyEdit` the editor received as
+    /// [`LspEvent::ApplyEdit`] — the wasm twin of `LspManager::apply_edit_response`.
+    /// The server has been blocked on this since it asked; framing the response is
+    /// what unblocks it. Unknown `id` (a server that exited meanwhile, or a double
+    /// answer) is a no-op — its request died with the connection.
+    pub fn apply_edit_response(&mut self, id: u64, outcome: ApplyEditOutcome) {
+        let Some((key, req_id)) = self.pending_apply.remove(&id) else {
+            return;
+        };
+        let mut result = json!({ "applied": outcome.applied });
+        if let Some(map) = result.as_object_mut() {
+            if let Some(reason) = outcome.failure_reason {
+                map.insert("failureReason".to_string(), Value::String(reason));
+            }
+            if let Some(index) = outcome.failed_change {
+                map.insert("failedChange".to_string(), Value::from(index));
+            }
+        }
+        self.send_response(&key, req_id, result);
     }
 
     /// Drain the outbound wire ops the host forwards to the daemon.
@@ -475,6 +506,10 @@ impl SyncLspClient {
     /// `client:request` fires its Lua handler with the error rather than leaking
     /// the deferred callback forever.
     fn fail_pending(&mut self, key: &ServerKey, state: ServerState, reason: &str) {
+        // Its inbound `workspace/applyEdit`s die with it too: the response would go
+        // to a closed pipe, and leaving the entry would strand it forever (the ids
+        // are never reused, so a later answer for one is simply dropped).
+        self.pending_apply.retain(|_, (k, _)| k != key);
         let failed = |kind: ReqKind| match kind {
             // `distill` leaves `Raw` to the caller (it needs the error string).
             ReqKind::Raw => LspReply::Raw(Err(reason.to_string())),
@@ -548,9 +583,46 @@ impl SyncLspClient {
                 });
                 self.send_response(key, req_id, Value::Null);
             }
+            // `workspace/applyEdit`: the server asks the *editor* to apply an edit it
+            // authored (how a refactor delivered as a `command` lands). The answer
+            // can't be minted here — only the editor knows whether the edit reached
+            // its buffers — so stash the request and hand the normalized edit up;
+            // `apply_edit_response` frames the reply when the editor answers. A
+            // malformed payload is refused loud rather than acked as applied.
+            "workspace/applyEdit" => {
+                // Normalized from the **raw** value: the typed form has already lost
+                // its text edits' `annotationId`s, which decide what nxvim asks about.
+                // An edit that doesn't parse is refused loud rather than degraded to an
+                // empty one — which would be answered `applied: true`, a success for
+                // something that never reached a buffer. The native router refuses the
+                // same way, so both legs give a server the same answer.
+                let label = params
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let edit = params.get("edit").cloned().unwrap_or_default();
+                match try_normalize_workspace_edit_value(&edit) {
+                    Ok(changes) => {
+                        let id = self.next_apply_id;
+                        self.next_apply_id += 1;
+                        self.pending_apply.insert(id, (key.clone(), req_id));
+                        self.events.push(LspEvent::ApplyEdit {
+                            key: key.clone(),
+                            id,
+                            label,
+                            changes,
+                        });
+                    }
+                    Err(reason) => self.send_response(
+                        key,
+                        req_id,
+                        json!({ "applied": false, "failureReason": reason }),
+                    ),
+                }
+            }
             // Everything else a server may request (registerCapability,
-            // workDoneProgress/create, applyEdit, …) is acked with a null result so
-            // the server proceeds — matching async-lsp's lenient default.
+            // workDoneProgress/create, …) is acked with a null result so the server
+            // proceeds — matching async-lsp's lenient default.
             _ => self.send_response(key, req_id, Value::Null),
         }
     }
@@ -622,18 +694,29 @@ fn distill(kind: ReqKind, result: Result<Value, String>) -> LspReply {
         ReqKind::SignatureHelp => signature_help_reply(decode::<SignatureHelp>(result)),
         ReqKind::Completion => completion_reply(decode::<CompletionResponse>(result)),
         ReqKind::Formatting => LspReply::Edits(decode::<Vec<TextEdit>>(result).unwrap_or_default()),
+        // The three edit-carrying replies normalize from the **raw** value the wire
+        // already handed us: the typed form has lost its text edits' `annotationId`s,
+        // which decide whether nxvim asks before applying (see
+        // `normalize_workspace_edit_value`). Nothing to re-request — on this leg the
+        // JSON never left.
         ReqKind::Rename => LspReply::WorkspaceEdit(
-            decode::<WorkspaceEdit>(result)
-                .map(normalize_workspace_edit)
+            result
+                .ok()
+                .filter(|r| !r.is_null())
+                .as_ref()
+                .map(normalize_workspace_edit_value)
                 .unwrap_or_default(),
         ),
-        ReqKind::CodeAction => LspReply::CodeActions(code_actions(
-            decode::<CodeActionResponse>(result).unwrap_or_default(),
-        )),
+        ReqKind::CodeAction => {
+            LspReply::CodeActions(code_actions_value(result.unwrap_or_default()))
+        }
         ReqKind::ResolveCodeAction => LspReply::ResolvedCodeAction(
-            decode::<CodeAction>(result)
-                .and_then(|a| a.edit)
-                .map(normalize_workspace_edit),
+            result
+                .ok()
+                .as_ref()
+                .and_then(|r| r.get("edit"))
+                .filter(|e| !e.is_null())
+                .map(normalize_workspace_edit_value),
         ),
         ReqKind::ResolveCompletion => resolved_completion(decode::<CompletionItem>(result)),
         ReqKind::SemanticTokensFull => {

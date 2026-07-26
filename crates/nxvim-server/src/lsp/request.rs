@@ -961,7 +961,12 @@ impl EditHost {
                     return;
                 }
                 match edit {
-                    Some(changes) => self.apply_workspace_edit(changes, reply_encoding),
+                    // The outcome is only meaningful when a *server* asked us to
+                    // apply (`workspace/applyEdit`); here the user did, and
+                    // `apply_workspace_edit` has already echoed anything that failed.
+                    Some(changes) => {
+                        self.apply_workspace_edit(changes, reply_encoding);
+                    }
                     None => self
                         .editor
                         .echo(LspReqKind::ResolveCodeAction.empty_message()),
@@ -1222,23 +1227,36 @@ impl EditHost {
         json
     }
 
-    /// Jump the cursor to one LSP [`Location`]. Opens/switches to the target on
-    /// its line first, then refines the column once the line text is loaded (the
-    /// char→byte conversion needs the target line, which may live in a file just
-    /// opened by the jump). The second `jump_to` finds the buffer already current
-    /// and only moves the cursor, so the alternate `#` is recorded exactly once.
+    /// Jump the cursor to one LSP [`Location`]. Opens/switches to the target on its
+    /// line first, then refines the column once the line text is loaded (the
+    /// char→byte conversion needs the target line, which may live in a file this jump
+    /// just opened). The second `jump_to` finds the buffer already current and on the
+    /// same line, so it only moves the cursor — the alternate `#` and the jumplist
+    /// entry are recorded exactly once.
+    ///
+    /// The **first** jump already carries the raw `character` as its column rather
+    /// than `0`, which matters when the target file isn't open yet: its read is
+    /// deferred (locally as much as over a wire), so the cursor set here is clamped to
+    /// a still-empty buffer and the real landing happens when the bytes arrive, from
+    /// the target `land_cursor` recorded. Refining against the clamped line would
+    /// overwrite that record with the top of the file — which is exactly where a goto
+    /// into an unopened file used to land. The raw character is the same best effort
+    /// [`location_byte_col`](Self::location_byte_col) makes for a target that isn't
+    /// current (exact under utf-8, and for ASCII in any encoding); a loaded buffer
+    /// still gets the exact conversion below.
     pub(crate) fn jump_to_lsp_location(&mut self, loc: &Location, encoding: PositionEncoding) {
         let Some(path) = uri_to_path(&loc.uri) else {
             return;
         };
         let line = loc.range.start.line as usize;
         let character = loc.range.start.character as usize;
-        self.editor.jump_to(&path, line, 0);
-        if self.editor.current_buffer_is(&path) {
-            let landed = self.editor.cursor.line;
-            let text = self.editor.buffer().line(landed);
+        self.editor.jump_to(&path, line, character);
+        // Only when the line text is really here — a deferred open leaves the cursor
+        // clamped somewhere else, and its landing applies the target above.
+        if self.editor.current_buffer_is(&path) && self.editor.cursor.line == line {
+            let text = self.editor.buffer().line(line);
             let byte = byte_col(encoding, &text, character);
-            self.editor.jump_to(&path, landed, byte);
+            self.editor.jump_to(&path, line, byte);
         }
     }
 

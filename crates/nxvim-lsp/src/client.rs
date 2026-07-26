@@ -10,6 +10,8 @@
 //! `Command[]` and "apply the edit" becomes impossible.
 
 #[cfg(feature = "native")]
+use std::collections::HashMap;
+#[cfg(feature = "native")]
 use std::future::ready;
 #[cfg(feature = "native")]
 use std::ops::ControlFlow;
@@ -24,29 +26,46 @@ use async_lsp::{MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
 #[cfg(feature = "native")]
 use lsp_types::request::{InlayHintRefreshRequest, SemanticTokensRefresh, WorkspaceConfiguration};
+#[cfg(feature = "native")]
+use lsp_types::ApplyWorkspaceEditResponse;
 use lsp_types::{
-    ClientCapabilities, CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
-    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CompletionClientCapabilities,
-    CompletionItemCapability, CompletionItemCapabilityResolveSupport, ConfigurationParams,
-    DocumentFormattingClientCapabilities, FoldingRangeClientCapabilities,
+    ChangeAnnotationWorkspaceEditClientCapabilities, ClientCapabilities,
+    CodeActionCapabilityResolveSupport, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, CompletionClientCapabilities, CompletionItemCapability,
+    CompletionItemCapabilityResolveSupport, ConfigurationParams,
+    DocumentFormattingClientCapabilities, FailureHandlingKind, FoldingRangeClientCapabilities,
     GeneralClientCapabilities, HoverClientCapabilities, InitializeParams, InitializeResult,
     InlayHintClientCapabilities, InlayHintResolveClientCapabilities,
     InlayHintWorkspaceClientCapabilities, MarkupKind, MessageType, PositionEncodingKind,
-    PublishDiagnosticsClientCapabilities, RenameClientCapabilities, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
-    SemanticTokensFullOptions, SemanticTokensWorkspaceClientCapabilities, ServerCapabilities,
-    TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
-    TextDocumentSyncKind, TokenFormat, Url, WorkspaceClientCapabilities,
-    WorkspaceEditClientCapabilities,
+    PublishDiagnosticsClientCapabilities, RenameClientCapabilities, ResourceOperationKind,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensClientCapabilities,
+    SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions,
+    SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
+    TokenFormat, Url, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
 };
 #[cfg(feature = "native")]
 use tokio::sync::mpsc::UnboundedSender;
+#[cfg(feature = "native")]
+use tokio::sync::oneshot;
 
+#[cfg(feature = "native")]
+use crate::convert::try_normalize_workspace_edit_value;
+
+/// `workspace/applyEdit` with a **raw JSON** params type — see the handler below.
+#[cfg(feature = "native")]
+enum RawApplyWorkspaceEdit {}
+#[cfg(feature = "native")]
+impl lsp_types::request::Request for RawApplyWorkspaceEdit {
+    type Params = serde_json::Value;
+    type Result = ApplyWorkspaceEditResponse;
+    const METHOD: &'static str = "workspace/applyEdit";
+}
 use crate::log::{LogLevel, LspLog};
 // Pure helpers (always compiled) return these; the async router/handshake items
 // (gated below) use `LspEvent`/`RefreshKind`/`ServerKey`.
 #[cfg(feature = "native")]
-use crate::protocol::{LspEvent, RefreshKind, ServerKey};
+use crate::protocol::{ApplyEditOutcome, LspEvent, RefreshKind, ServerKey};
 use crate::protocol::{PositionEncoding, ProviderCaps, SemanticLegend, ServerCaps, ServerSpawn};
 
 /// State shared by the client `MainLoop`'s notification handlers: which server
@@ -60,14 +79,37 @@ pub(crate) struct ClientState {
     /// `workspace/configuration` requests (lua_ls/gopls read their config this way,
     /// returning the requested `section` slice). `None` when the config set none.
     settings: Option<serde_json::Value>,
+    /// In-flight `workspace/applyEdit` requests: the server is blocked on each until
+    /// the *editor* says whether it applied the edit, which happens a tick or more
+    /// later. The request handler parks on the receiver; [`ApplyEditDone`] (emitted
+    /// onto the loop by the manager when the editor answers) resolves the sender.
+    pending_apply: HashMap<u64, oneshot::Sender<ApplyEditOutcome>>,
+    /// Source of the [`LspEvent::ApplyEdit`] ids, which are per-client and opaque to
+    /// the editor (they stand in for the JSON-RPC request id).
+    next_apply_id: u64,
+}
+
+/// The editor's answer to a `workspace/applyEdit`, routed back into the client's
+/// `MainLoop` as an `async-lsp` custom event (`ServerSocket::emit`) so it reaches the
+/// [`ClientState`] the parked request handler left its sender in. The loop drives
+/// request futures in a `FuturesUnordered` *alongside* its event and incoming arms,
+/// so a handler parked on the editor never stalls the server's other traffic.
+#[cfg(feature = "native")]
+pub(crate) struct ApplyEditDone {
+    pub id: u64,
+    pub outcome: ApplyEditOutcome,
 }
 
 /// Build the `async-lsp` client `MainLoop` and its `ServerSocket`. The bare
-/// [`Router`] is the service: the client only *receives* notifications
-/// (diagnostics, log/show messages) whose handlers are trivial and panic-free,
-/// so the concurrency/catch-unwind middleware a server needs is unnecessary
-/// here. Unhandled server→client requests get a method-not-found response, which
-/// language servers tolerate.
+/// [`Router`] is the service: the client's handlers are trivial and panic-free, so
+/// the concurrency/catch-unwind middleware a server needs is unnecessary here.
+///
+/// Server→client *requests* are answered here too, and the modelled ones are the
+/// difference between a working feature and a broken one: `workspace/configuration`
+/// (a pull-only server runs on defaults without it), the inlay-hint / semantic-token
+/// refreshes, and `workspace/applyEdit` (every refactor delivered as a `command`).
+/// Anything still unmodelled falls to async-lsp's method-not-found, which servers
+/// tolerate for the optional rest (`client/registerCapability`, work-done progress).
 #[cfg(feature = "native")]
 pub(crate) fn new_client(
     key: ServerKey,
@@ -81,6 +123,8 @@ pub(crate) fn new_client(
             event_tx,
             log,
             settings,
+            pending_apply: HashMap::new(),
+            next_apply_id: 1,
         });
         // `workspace/configuration` (pull model): the server asks for its config by
         // `section`; answer each item with that dotted path into the config's
@@ -110,6 +154,85 @@ pub(crate) fn new_client(
                 kind: RefreshKind::SemanticTokens,
             });
             ready(Ok(()))
+        });
+        // `workspace/applyEdit`: the server asks the *editor* to apply an edit it
+        // authored — how a refactor delivered as a `command` actually lands (the
+        // `executeCommand` reply carries nothing). Forward the normalized edit and
+        // park until the editor answers, so the `applied` flag we return is the real
+        // outcome rather than an optimistic ack. Left unhandled this fell to
+        // async-lsp's method-not-found default and the refactor failed outright.
+        // Registered with a **raw** params type (same method, `serde_json::Value`):
+        // `lsp-types` drops a text edit's `annotationId` on the way in, and that id is
+        // what decides whether nxvim asks the user before applying.
+        router.request::<RawApplyWorkspaceEdit, _>(|st: &mut ClientState, params| {
+            let label = params
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let edit = params.get("edit").cloned().unwrap_or_default();
+            // An edit we cannot read is refused, loud, rather than degraded to an empty
+            // one — an empty edit is indistinguishable from "the server sent no
+            // changes" and would be answered `applied: true`, i.e. a success for
+            // something that never reached a buffer. The wasm client refuses the same
+            // way, so both legs give a server the same answer.
+            let parked = match try_normalize_workspace_edit_value(&edit) {
+                Err(reason) => {
+                    st.log.log(
+                        LogLevel::Warn,
+                        &st.key.name,
+                        &format!("applyEdit: {reason}"),
+                    );
+                    Err(reason)
+                }
+                Ok(changes) => {
+                    let id = st.next_apply_id;
+                    st.next_apply_id += 1;
+                    let (tx, rx) = oneshot::channel();
+                    st.pending_apply.insert(id, tx);
+                    let sent = st.event_tx.send(LspEvent::ApplyEdit {
+                        key: st.key.clone(),
+                        id,
+                        label,
+                        changes,
+                    });
+                    // The editor is gone (shutting down): drop the sender so the await
+                    // below resolves immediately to "not applied" instead of hanging
+                    // the server.
+                    if sent.is_err() {
+                        st.pending_apply.remove(&id);
+                    }
+                    Ok(rx)
+                }
+            };
+            async move {
+                let outcome = match parked {
+                    // A dropped sender (editor gone, or the server torn down mid-apply)
+                    // is a truthful "we did not apply it", never a fake success.
+                    Ok(rx) => rx.await.unwrap_or_else(|_| ApplyEditOutcome {
+                        applied: false,
+                        failure_reason: Some("editor did not answer the edit".to_string()),
+                        failed_change: None,
+                    }),
+                    Err(reason) => ApplyEditOutcome {
+                        applied: false,
+                        failure_reason: Some(reason),
+                        failed_change: None,
+                    },
+                };
+                Ok(ApplyWorkspaceEditResponse {
+                    applied: outcome.applied,
+                    failure_reason: outcome.failure_reason,
+                    failed_change: outcome.failed_change,
+                })
+            }
+        });
+        // The editor's answer, emitted onto this loop by the manager. Resolving the
+        // sender completes the parked request handler, which frames the response.
+        router.event::<ApplyEditDone>(|st: &mut ClientState, done| {
+            if let Some(tx) = st.pending_apply.remove(&done.id) {
+                let _ = tx.send(done.outcome);
+            }
+            ControlFlow::Continue(())
         });
         router.notification::<PublishDiagnostics>(|st, params| {
             st.log.log(
@@ -414,8 +537,42 @@ fn client_capabilities() -> ClientCapabilities {
         workspace: Some(WorkspaceClientCapabilities {
             workspace_edit: Some(WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
+                // The file operations a `documentChanges` edit may interleave with
+                // its text edits. Declared because a server may withhold a refactor
+                // whose edit needs one (an "extract to new file" is a `create` plus
+                // the edits that fill it); nxvim applies them in the order sent.
+                resource_operations: Some(vec![
+                    ResourceOperationKind::Create,
+                    ResourceOperationKind::Rename,
+                    ResourceOperationKind::Delete,
+                ]),
+                // What actually happens when one change of an edit fails: the ones
+                // before it stay applied, the ones after it are dropped — the
+                // protocol's `abort`. Declared because it is exactly what nxvim
+                // guarantees (the changes run strictly in order, one file operation at
+                // a time), and declaring it is what gives the response's `failedChange`
+                // index meaning. NOT `transactional`: a `delete` cannot be rolled back
+                // without a backup, so promising all-or-nothing would be a lie a server
+                // might act on.
+                failure_handling: Some(FailureHandlingKind::Abort),
+                // `changeAnnotations`: a server may split one edit into named groups
+                // and mark some `needsConfirmation`, which nxvim asks about before
+                // applying (the group is accepted or declined whole). Declared because
+                // a server checks it before bothering to annotate — and because not
+                // declaring it while *also* ignoring the flag would silently apply
+                // exactly the changes the server wanted a human to look at.
+                // `groupsOnLabel`: one question per label, not per change.
+                change_annotation_support: Some(ChangeAnnotationWorkspaceEditClientCapabilities {
+                    groups_on_label: Some(true),
+                }),
                 ..Default::default()
             }),
+            // We honor server→client `workspace/applyEdit`. This is how a refactor
+            // delivered as a `command` reaches the buffer at all — the
+            // `executeCommand` reply is empty and the edit arrives as this push — so
+            // a server that gates on the capability (rather than sending it blind,
+            // as gopls does) would otherwise silently do nothing.
+            apply_edit: Some(true),
             // We answer `workspace/configuration` (the pull model) from the config's
             // `settings` — declaring it is what makes a pull-only server (lua_ls,
             // gopls) read its options instead of running on defaults. Without it,

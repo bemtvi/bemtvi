@@ -53,11 +53,12 @@ pub use lsp_types;
 // `LspReply::Raw` (Phase 5) carry raw `serde_json::Value`s, so the `serde_json`
 // re-export below lets downstream crates name the type without a direct dependency
 // on the protocol JSON layer. All wasm-safe (plain data / pure transforms).
-pub use convert::normalize_workspace_edit;
+pub use convert::{normalize_workspace_edit_value, try_normalize_workspace_edit_value};
 pub use protocol::{
-    CodeActionData, CompletionItemData, FoldRangeData, InlayHintData, LspEvent, LspNotify,
-    LspReply, LspRequest, PositionEncoding, ProviderCaps, RefreshKind, ReqToken, SemanticLegend,
-    SemanticTokensData, ServerCaps, ServerKey, ServerSpawn, SymbolData, WorkspaceEditData,
+    ApplyEditOutcome, ChangeAnnotationData, CodeActionData, CompletionItemData, FoldRangeData,
+    InlayHintData, LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ProviderCaps,
+    RefreshKind, ReqToken, SemanticLegend, SemanticTokensData, ServerCaps, ServerKey, ServerSpawn,
+    SymbolData, WorkspaceChange, WorkspaceEditData,
 };
 pub use serde_json;
 

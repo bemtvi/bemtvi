@@ -2417,6 +2417,20 @@ impl LuaRuntime {
         dispatch.call((client_id, cmd))
     }
 
+    /// Ask the user about a workspace edit's `changeAnnotations` (the ones marked
+    /// `needsConfirmation`): runs `nx.lsp._confirm_edit(group, groups)`, which chains
+    /// an `nx.ui.confirm` per group and answers with `nx._lsp_edit_decision(group,
+    /// accepted)`. `groups` is a JSON array of `{ label, description, ids }` — one
+    /// entry per distinct annotation *label* (`groupsOnLabel`), each carrying the
+    /// annotation ids it speaks for. Errors are returned for the server to surface;
+    /// it then treats the edit as declined rather than leave it parked forever.
+    pub fn run_lsp_confirm_edit(&self, group: u64, groups: &serde_json::Value) -> mlua::Result<()> {
+        let lsp: Table = self.nx()?.get("lsp")?;
+        let confirm: mlua::Function = lsp.get("_confirm_edit")?;
+        let payload = json_to_lua(&self.lua, groups)?;
+        confirm.call((group, payload))
+    }
+
     /// Run the deferred callback registered under `id` (the `run_keymap` analogue
     /// for the async runtime). Invokes `nx._run_cb(id, keep, …)`; with `keep ==
     /// false` the registry entry is dropped after firing (one-shot), so

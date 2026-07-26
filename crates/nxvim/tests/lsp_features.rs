@@ -14,8 +14,8 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, menu_items, menu_of,
-    poll_menu, serial_lock, spawn, temp_dir, window0_field,
+    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, menu_items,
+    menu_of, poll_menu, serial_lock, spawn, temp_dir, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -149,6 +149,25 @@ async fn await_lua_eq(rpc: &Rpc, expr: &str, want: &str) -> bool {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     false
+}
+
+/// Poll `expr` (a `return`-ed Lua expression) until its string form contains `want`;
+/// returns the last value seen.
+async fn await_lua_contains(rpc: &Rpc, expr: &str, want: &str) -> String {
+    let code = format!("return tostring({expr})");
+    let mut last = String::new();
+    for _ in 0..200 {
+        last = exec_lua(rpc, &code)
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if last.contains(want) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    last
 }
 
 /// Enabling inlay hints requests them, the mock replies, and the decoded hint
@@ -2349,6 +2368,1659 @@ async fn did_save_fires_per_write_and_never_on_reload() {
         did_save_count(&record),
         2,
         ":e! must not fire a didSave — a reload is not a save"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+// ===== server→client `workspace/applyEdit` =====
+
+/// Poll the mock's record file for the body it captured under `method`, up to a few
+/// seconds. `None` if it never arrives (the caller asserts with its own message).
+async fn await_recorded(record: &Path, method: &str) -> Option<serde_json::Value> {
+    for _ in 0..200 {
+        let content = std::fs::read_to_string(record).unwrap_or_default();
+        for line in content.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("method").and_then(serde_json::Value::as_str) == Some(method) {
+                return v.get("params").cloned();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
+/// The `workspace/applyEdit` script both tests below share: the *exact* shape gopls
+/// sends for "Extract declarations to new file" — cut the declaration out of the
+/// open file, `create` a sibling, then paste into it — plus the code action that
+/// triggers it as a bare `command` (which is why the edit has to arrive as a
+/// server→client request at all: the `executeCommand` reply carries nothing).
+fn extract_to_new_file_mock(dir: &Path, record: &Path, tail: &str) -> String {
+    format!(
+        r#"{{
+            "record": "{rec}",
+            "code_action": [
+                {{
+                    "title": "Extract declarations to new file",
+                    "kind": "refactor.extract",
+                    "command": {{ "title": "Extract", "command": "mock.extract_to_new_file" }}
+                }}
+            ],
+            "apply_edit": {{
+                "documentChanges": [
+                    {{
+                        "textDocument": {{ "uri": "{a}", "version": 1 }},
+                        "edits": [ {{
+                            "range": {{ "start": {{ "line": 0, "character": 0 }},
+                                        "end": {{ "line": 1, "character": 0 }} }},
+                            "newText": ""
+                        }} ]
+                    }},
+                    {{ "kind": "create", "uri": "{b}" }},
+                    {{
+                        "textDocument": {{ "uri": "{b}", "version": 0 }},
+                        "edits": [ {{
+                            "range": {{ "start": {{ "line": 0, "character": 0 }},
+                                        "end": {{ "line": 0, "character": 0 }} }},
+                            "newText": "fn helper() {{}}\n"
+                        }} ]
+                    }}{tail}
+                ]
+            }}
+        }}"#,
+        rec = record.display(),
+        a = file_uri(dir, "a.rs"),
+        b = file_uri(dir, "helper.rs"),
+    )
+}
+
+/// The headline: a server→client `workspace/applyEdit` is applied — across an open
+/// buffer *and* a file the `create` operation brings into existence — and answered
+/// with the real `applied` flag.
+///
+/// This is the whole apply half of the protocol: a refactor delivered as a `command`
+/// (gopls's `extract_to_new_file`, ts_ls's move-to-file) replies to
+/// `workspace/executeCommand` with nothing and pushes its edit back as this request.
+/// nxvim answered it with method-not-found, so every such refactor failed outright.
+#[tokio::test]
+async fn a_servers_apply_edit_creates_the_new_file_and_is_answered_applied() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &extract_to_new_file_mock(&dir, &record, ""));
+    let (rpc, _incoming) = open_with_server(&dir, "fn helper() {}\nfn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    // Work from the project directory, as a session editing it would — that is what
+    // makes the created file's name relative (the assertion below). Restored at the end
+    // so the process cwd this `:cd` moves doesn't leak into the next test.
+    let original_cwd = std::env::current_dir().expect("cwd");
+    feed(&rpc, &format!(":cd {}<CR>", dir.display()));
+    barrier(&rpc).await;
+
+    // One action, `apply` ⇒ a one-shot: the command dispatches straight away and the
+    // mock answers it with the applyEdit push.
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    // The open buffer loses the extracted declaration.
+    let mut cut = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        if lines(&rpc).await == vec!["fn main() {}".to_string()] {
+            cut = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(cut, "the edit for the open document should apply");
+
+    // The `create`d file is on disk with the extracted text — the refactor is complete
+    // without the user remembering to save something they never opened.
+    let created = dir.join("helper.rs");
+    let mut written = String::new();
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        written = std::fs::read_to_string(&created).unwrap_or_default();
+        if !written.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        written, "fn helper() {}\n",
+        "the created file must be written out with what the edit put in it"
+    );
+
+    // …and its buffer holds it, unmodified (it *is* the file now), named the way `:e`
+    // would have named it: relative to the cwd, not the absolute path the server sent.
+    feed(&rpc, ":e helper.rs<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn helper() {}".to_string()],
+        "the created file's buffer should hold the pasted declaration"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(nx.bo[0].modified)")
+            .await
+            .as_str(),
+        Some("false"),
+        "the created buffer was written, so nothing is left unsaved"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(nx.buf.name(0))")
+            .await
+            .as_str(),
+        Some("helper.rs"),
+        "the created buffer's name should be cwd-relative, like every other buffer's"
+    );
+
+    // And the server was told it landed — the response the whole round trip hangs on.
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the server must be answered `applied: true`, got {answer:?}"
+    );
+
+    // The capability that makes a server willing to send it in the first place.
+    let init = await_recorded(&record, "initialize")
+        .await
+        .unwrap_or_default();
+    assert_eq!(
+        init.pointer("/capabilities/workspace/applyEdit")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "we must advertise workspace.applyEdit"
+    );
+    let ops = init
+        .pointer("/capabilities/workspace/workspaceEdit/resourceOperations")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        ops.iter().any(|v| v.as_str() == Some("create")),
+        "we must advertise the `create` resource operation, got {ops:?}"
+    );
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The `rename` resource operation moves the **real file** and the open buffer
+/// follows it: same buffer, same content, new name. Both halves matter — a rename
+/// that only renamed the buffer would leave the old file on disk (and the new one
+/// never written), and one that only moved the file would leave the editor holding a
+/// window onto a path that no longer exists.
+#[tokio::test]
+async fn a_rename_op_moves_the_file_and_the_buffer_follows() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_rename");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Move file", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.move" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "rename", "oldUri": "{a}", "newUri": "{b}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            a = file_uri(&dir, "a.rs"),
+            b = file_uri(&dir, "moved.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(
+        &dir,
+        "fn main() {}
+",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let moved = dir.join("moved.rs");
+    let mut on_disk = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        if moved.exists() && !dir.join("a.rs").exists() {
+            on_disk = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(on_disk, "the file itself must move on disk");
+    assert_eq!(
+        std::fs::read_to_string(&moved).unwrap_or_default(),
+        "fn main() {}\n",
+        "…carrying its contents, not a fresh empty file"
+    );
+
+    // The buffer is the same buffer — its name followed the file, and its text is
+    // still there (a re-open would have been a different buffer, and a wipe would
+    // have lost the unsaved state a real refactor may leave).
+    let name = await_lua_contains(&rpc, "nx.buf.name(0)", "moved.rs").await;
+    assert!(
+        name.contains("moved.rs"),
+        "the buffer name should follow the file, got {name:?}"
+    );
+    assert_eq!(lines(&rpc).await, vec!["fn main() {}".to_string()]);
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the response must wait for the move and report it, got {answer:?}"
+    );
+
+    // The server follows the move too: the moved buffer is a *different document*, so
+    // the old URI closes and the new one opens — on the same, still-attached server.
+    // (Dropping the buffer's LSP state instead would leave it silently server-less:
+    // nothing re-attaches it, since `FileType` doesn't fire again when only the stem
+    // changed. The browser leg caught exactly that.)
+    let opened = std::fs::read_to_string(&record).unwrap_or_default();
+    assert!(
+        opened
+            .lines()
+            .any(|l| l.contains("didClose") && l.contains("/a.rs")),
+        "the old document must close"
+    );
+    assert!(
+        opened
+            .lines()
+            .any(|l| l.contains("didOpen") && l.contains("moved.rs")),
+        "…and the new one open, on the same server"
+    );
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the buffer must still be attached after the move"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The `delete` resource operation removes the **real file** and wipes its buffer —
+/// a window onto a deleted file would let a later `:w` recreate what the server asked
+/// to remove.
+#[tokio::test]
+async fn a_delete_op_removes_the_file_and_wipes_its_buffer() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_delete");
+    let record = dir.join("rec.jsonl");
+    let doomed = dir.join("doomed.rs");
+    std::fs::write(&doomed, "fn doomed() {}\n").expect("write doomed file");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Remove file", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.remove" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "delete", "uri": "{d}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            d = file_uri(&dir, "doomed.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(
+        &dir,
+        "fn main() {}
+",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    // Open the doomed file too, so the wipe has a buffer to act on.
+    feed(&rpc, &format!(":e {}<CR>", doomed.display()));
+    feed(&rpc, ":e #<CR>");
+    barrier(&rpc).await;
+    assert!(
+        await_lua_contains(&rpc, "#nx.buf.list()", "2")
+            .await
+            .contains('2'),
+        "both files should be open before the delete"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let mut gone = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        if !doomed.exists() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(gone, "the file itself must be removed from disk");
+    let buffers = await_lua_contains(&rpc, "#nx.buf.list()", "1").await;
+    assert_eq!(
+        buffers, "1",
+        "the deleted file's buffer must be wiped, got {buffers:?} buffer(s)"
+    );
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the response must wait for the delete and report it, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A file operation that *fails* is reported **loud** — the server is told
+/// `applied: false` with the reason, and the user sees it. The alternative (answering
+/// "applied" because the edit was dispatched) is what makes a half-done refactor look
+/// like it worked.
+#[tokio::test]
+async fn a_failing_file_operation_is_reported_with_a_reason() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_failure");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Remove file", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.remove" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "delete", "uri": "{d}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            // Never created: the delete must fail rather than quietly "succeed".
+            d = file_uri(&dir, "absent.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(
+        &dir,
+        "fn main() {}
+",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "a failed file operation must not report success, got {answer:?}"
+    );
+    let reason = answer
+        .as_ref()
+        .and_then(|v| v.get("failureReason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        reason.contains("delete") && reason.contains("absent.rs"),
+        "the reason must name the operation that failed, got {reason:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// `documentChanges` is a **sequence**: two file operations on the same file only make
+/// sense applied in order (`a.rs → b.rs`, then `b.rs → c.rs`). Queued concurrently — one
+/// `tokio::spawn` each — the second races the first and renames a file that isn't there
+/// yet, so the refactor half-lands.
+///
+/// The first operation carries `ignoreIfExists`, which costs it an extra round trip (the
+/// destination probe), so the race is decided rather than merely likely — the same
+/// widening a daemon session's link latency does to *every* operation.
+#[tokio::test]
+async fn chained_file_operations_apply_in_order() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_order");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Move twice", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.move2" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "rename", "oldUri": "{a}", "newUri": "{b}",
+                       "options": {{ "ignoreIfExists": true }} }},
+                    {{ "kind": "rename", "oldUri": "{b}", "newUri": "{c}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            a = file_uri(&dir, "a.rs"),
+            b = file_uri(&dir, "b.rs"),
+            c = file_uri(&dir, "c.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("c.rs")).unwrap_or_default(),
+        "fn main() {}\n",
+        "the second rename must run on the first one's result"
+    );
+    assert!(
+        !dir.join("a.rs").exists() && !dir.join("b.rs").exists(),
+        "neither intermediate name should be left behind"
+    );
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "…and both operations report as applied, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// `failureHandling: abort` is a promise, so it has to hold: when a change fails, the
+/// ones *after* it don't run, and the server is told which one broke. Here the delete
+/// fails (no such file) and the rename that follows must never happen — the alternative
+/// is a refactor that half-lands while the server thinks it succeeded.
+#[tokio::test]
+async fn a_failed_change_aborts_the_ones_after_it() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_abort");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Clean up", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.cleanup" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "delete", "uri": "{absent}" }},
+                    {{ "kind": "rename", "oldUri": "{a}", "newUri": "{b}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            absent = file_uri(&dir, "absent.rs"),
+            a = file_uri(&dir, "a.rs"),
+            b = file_uri(&dir, "moved.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert!(
+        dir.join("a.rs").exists() && !dir.join("moved.rs").exists(),
+        "the rename after the failing delete must not run"
+    );
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the edit did not apply, got {answer:?}"
+    );
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("failedChange"))
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "…and the server is told which change broke, got {answer:?}"
+    );
+}
+
+/// A document the edit can't resolve aborts it **before anything is applied** — the
+/// text edits are staged against their buffers first, so an edit naming one file we can
+/// open and one we can't leaves the openable one untouched rather than half-refactored.
+#[tokio::test]
+async fn an_unresolvable_document_aborts_before_any_edit_applies() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_preflight");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Rewrite", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.rewrite" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{
+                        "textDocument": {{ "uri": "{a}", "version": 1 }},
+                        "edits": [ {{
+                            "range": {{ "start": {{ "line": 0, "character": 3 }},
+                                        "end": {{ "line": 0, "character": 7 }} }},
+                            "newText": "renamed"
+                        }} ]
+                    }},
+                    {{
+                        "textDocument": {{ "uri": "jdt://contents/Foo.class", "version": 1 }},
+                        "edits": [ {{
+                            "range": {{ "start": {{ "line": 0, "character": 0 }},
+                                        "end": {{ "line": 0, "character": 0 }} }},
+                            "newText": "x"
+                        }} ]
+                    }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            a = file_uri(&dir, "a.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn main() {}".to_string()],
+        "the resolvable document must be left untouched when a later one can't resolve"
+    );
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("failedChange"))
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the server is told which change could not be resolved, got {answer:?}"
+    );
+}
+
+/// A change may address a document by the name an *earlier* change gives it —
+/// `rename a → b`, then edits to `b`. The rename moves real bytes, so it can only run
+/// off the editor tick, *after* the text edits are staged; the edits therefore have to
+/// rewind through it to reach the buffer that still holds the file.
+///
+/// Without that they resolve to nothing, open a fresh buffer for a file that doesn't
+/// exist yet, and the rename then binds a **second** buffer to the same name — two
+/// buffers called `moved.rs` and the edit silently lost.
+#[tokio::test]
+async fn edits_addressed_to_a_renamed_file_reach_the_renamed_buffer() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_rename_then_edit");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Move and rewrite", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.move_edit" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "rename", "oldUri": "{a}", "newUri": "{b}" }},
+                    {{
+                        "textDocument": {{ "uri": "{b}", "version": 1 }},
+                        "edits": [ {{
+                            "range": {{ "start": {{ "line": 0, "character": 3 }},
+                                        "end": {{ "line": 0, "character": 7 }} }},
+                            "newText": "renamed"
+                        }} ]
+                    }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            a = file_uri(&dir, "a.rs"),
+            b = file_uri(&dir, "moved.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "both changes should apply, got {answer:?}"
+    );
+
+    // One buffer, holding the edit, under the new name.
+    assert!(
+        await_lua_eq(&rpc, "#nx.buf.list()", "1").await,
+        "the rename must not strand a second buffer for the same file: {:?}",
+        exec_lua(
+            &rpc,
+            "local t = {} for _, b in ipairs(nx.buf.list()) do \
+             t[#t + 1] = tostring(nx.buf.name(b)) end return table.concat(t, ', ')"
+        )
+        .await
+    );
+    let name = await_lua_contains(&rpc, "nx.buf.name(0)", "moved.rs").await;
+    assert!(
+        name.contains("moved.rs"),
+        "the buffer name should follow the file, got {name:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn renamed() {}".to_string()],
+        "the edit addressed by the new name must land in the buffer being renamed"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A `create` may name a file in a directory that doesn't exist yet — a refactor that
+/// extracts into a new module / package directory. `:w` refuses to create one (vim's
+/// `E212`, rightly), so the created buffer has to be written *behind* a recursive
+/// mkdir; otherwise the file silently never appears while the server is told the edit
+/// applied.
+#[tokio::test]
+async fn a_create_into_a_missing_directory_makes_the_directory() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_create_subdir");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Extract to a new package", "kind": "refactor.extract",
+                       "command": {{ "title": "Extract", "command": "mock.extract" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "create", "uri": "{b}" }},
+                    {{
+                        "textDocument": {{ "uri": "{b}", "version": 0 }},
+                        "edits": [ {{
+                            "range": {{ "start": {{ "line": 0, "character": 0 }},
+                                        "end": {{ "line": 0, "character": 0 }} }},
+                            "newText": "fn helper() {{}}\n"
+                        }} ]
+                    }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            b = file_uri(&dir, "sub/nested/helper.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let created = dir.join("sub/nested/helper.rs");
+    let mut written = String::new();
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        written = std::fs::read_to_string(&created).unwrap_or_default();
+        if !written.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        written, "fn helper() {}\n",
+        "the created file's directory must be made for it, not assumed to exist"
+    );
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "…and the server told it applied, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A `workspace/applyEdit` is a **request**: the server is blocked until nxvim
+/// answers, and the answer waits for the file operations the edit asked for. An fs
+/// leg that stops answering (a daemon link that goes quiet rather than erroring)
+/// would block that server forever — so a watchdog gives up on the stalled operation
+/// and the server is told, truthfully, that the edit did not apply.
+///
+/// The stall is real, not simulated: the session's `nx.fs` job leg is a
+/// [`RemoteFsJobs`] pointed at a duplex nobody serves, so the `delete` below is sent
+/// and never answered.
+#[tokio::test]
+async fn a_stalled_file_operation_gives_up_instead_of_blocking_the_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_apply_edit_stall");
+    let record = dir.join("rec.jsonl");
+    let doomed = dir.join("doomed.rs");
+    std::fs::write(&doomed, "fn doomed() {}\n").expect("write doomed file");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Remove file", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.remove" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "delete", "uri": "{d}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            d = file_uri(&dir, "doomed.rs"),
+        ),
+    );
+    // Short enough to keep the test quick; the product default is 30s.
+    // SAFETY: serialized on `serial_lock`, like every env write in this suite.
+    std::env::set_var("NXVIM_WORKSPACE_FS_TIMEOUT_MS", "400");
+
+    let file_path = dir.join("a.rs");
+    std::fs::write(&file_path, "fn main() {}\n").expect("write test file");
+    // The far end of the link is held open but never served: every fs job crosses and
+    // waits forever, which is the failure mode the watchdog exists for.
+    let (host_end, _never_served) = tokio::io::duplex(1 << 16);
+    let (host_reader, host_writer) = tokio::io::split(host_end);
+    let (rpc, _incoming) = spawn(ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        fs_jobs: Some(nxvim_server::RemoteFsJobs::connect(
+            host_reader,
+            host_writer,
+        )),
+        ..Default::default()
+    });
+    attach(&rpc, 80, 24).await;
+    feed(&rpc, "gg0");
+    exec_lua(
+        &rpc,
+        r#"
+        nx.lsp.config("mock", { cmd = { "mock" }, filetypes = { "rust" } })
+        nx.lsp.enable({ "mock" })
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the server must be answered rather than left blocked, got {answer:?}"
+    );
+    let reason = answer
+        .as_ref()
+        .and_then(|v| v.get("failureReason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        reason.contains("ETIMEDOUT") && reason.contains("may still complete"),
+        "the reason must say we gave up, and not claim the file is gone: {reason:?}"
+    );
+    assert!(
+        doomed.exists(),
+        "nothing answered the delete, so the file is still there — the point of the \
+         hedged wording"
+    );
+    std::env::remove_var("NXVIM_WORKSPACE_FS_TIMEOUT_MS");
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A goto whose target lives in a file that **isn't open yet** lands on the target,
+/// not at the top of the file. The read of a freshly-opened file is deferred (the
+/// cursor set now is clamped to a still-empty buffer and re-landed when the bytes
+/// arrive), so refining the column against that clamped line overwrote the pending
+/// target with line 1 — the single most-used LSP feature, going to the wrong place
+/// whenever the definition was in another file.
+#[tokio::test]
+async fn a_definition_in_an_unopened_file_lands_on_the_definition() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_def_crossfile");
+    std::fs::write(dir.join("b.rs"), "one\ntwo\nthree\n").expect("write b.rs");
+    let uri = file_uri(&dir, "b.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{ "definition": {{ "uri": "{uri}", "range": {{ "start": {{ "line": 2, "character": 1 }}, "end": {{ "line": 2, "character": 3 }} }} }} }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = bar()\nfoo()\nbar()\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.definition()").await;
+    let name = await_lua_contains(&rpc, "nx.buf.name(0)", "b.rs").await;
+    assert!(
+        name.contains("b.rs"),
+        "the jump should open b.rs, got {name:?}"
+    );
+    let mut landed = (0, 0);
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        landed = cursor(&rpc).await;
+        if landed == (3, 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        landed,
+        (3, 1),
+        "the cursor must land on the definition's own line and column"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+// ===== `nx.lsp.apply_workspace_edit` / `nx.lsp.show_document` (the Lua entry) =====
+
+/// Open `dir/a.rs` with no language server — the Lua entry points below apply an edit
+/// a caller already holds, so nothing needs to be attached.
+async fn open_plain(dir: &Path, body: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let file_path = dir.join("a.rs");
+    std::fs::write(&file_path, body).expect("write test file");
+    let (rpc, incoming) = spawn(ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    });
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
+/// The whole `WorkspaceEdit` surface is reachable from Lua — `nx.lsp.apply_workspace_edit`
+/// (and its `vim.lsp.util` alias), which a plugin or an `nx.lsp.commands` handler uses
+/// for an edit a server handed it as command arguments. Resource operations included:
+/// they were only ever reachable from a server reply before.
+#[tokio::test]
+async fn the_lua_entry_applies_resource_operations_too() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_lua_apply_resource_ops");
+    std::fs::write(dir.join("old.rs"), "fn moved() {}\n").expect("write old.rs");
+    std::fs::write(dir.join("doomed.rs"), "fn doomed() {}\n").expect("write doomed.rs");
+    let (rpc, _incoming) = open_plain(&dir, "fn main() {}\n").await;
+
+    let edit = format!(
+        r#"nx.lsp.apply_workspace_edit({{ documentChanges = {{
+            {{ kind = "create", uri = "{new}" }},
+            {{ textDocument = {{ uri = "{new}", version = 0 }},
+              edits = {{ {{ range = {{ start = {{ line = 0, character = 0 }},
+                                       ["end"] = {{ line = 0, character = 0 }} }},
+                           newText = "fn created() {{}}\n" }} }} }},
+            {{ kind = "rename", oldUri = "{old}", newUri = "{moved}" }},
+            {{ kind = "delete", uri = "{doomed}" }},
+        }} }})"#,
+        new = file_uri(&dir, "new.rs"),
+        old = file_uri(&dir, "old.rs"),
+        moved = file_uri(&dir, "moved.rs"),
+        doomed = file_uri(&dir, "doomed.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
+
+    // The file operations settle off-tick, one at a time, so poll for the end state.
+    let created = dir.join("new.rs");
+    let moved = dir.join("moved.rs");
+    let doomed = dir.join("doomed.rs");
+    let mut settled = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        if created.exists() && moved.exists() && !doomed.exists() {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        settled,
+        "create/rename/delete from Lua must all land (created={} moved={} doomed_gone={})",
+        created.exists(),
+        moved.exists(),
+        !doomed.exists()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&created).unwrap_or_default(),
+        "fn created() {}\n",
+        "the created file is written with what the edits put in it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&moved).unwrap_or_default(),
+        "fn moved() {}\n",
+        "the renamed file carries its own bytes"
+    );
+    assert!(
+        !dir.join("old.rs").exists(),
+        "the rename must not leave the old name behind"
+    );
+}
+
+/// The `vim.lsp.util` spelling exists and is the same verb — a neovim-shaped plugin
+/// reaches for it, and it used to be `nil` (the example in `nx.lsp.commands`'s own
+/// documentation called it), so every such call errored.
+#[tokio::test]
+async fn the_vim_lsp_util_aliases_are_the_same_verbs() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_lua_apply_alias");
+    let (rpc, _incoming) = open_plain(&dir, "let foo = 1\n").await;
+
+    let edit = format!(
+        r#"vim.lsp.util.apply_workspace_edit({{ changes = {{
+            ["{a}"] = {{ {{ range = {{ start = {{ line = 0, character = 4 }},
+                                       ["end"] = {{ line = 0, character = 7 }} }},
+                           newText = "bar" }} }},
+        }} }}, "utf-16")"#,
+        a = file_uri(&dir, "a.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let bar = 1".to_string()],
+        "the alias must apply the edit, not fail on a nil table"
+    );
+
+    // …and the location jump, whose docs example is what named the missing table.
+    std::fs::write(dir.join("b.rs"), "one\ntwo\nthree\n").expect("write b.rs");
+    let jump = format!(
+        r#"vim.lsp.util.show_document({{ uri = "{b}",
+            range = {{ start = {{ line = 2, character = 1 }},
+                       ["end"] = {{ line = 2, character = 1 }} }} }})"#,
+        b = file_uri(&dir, "b.rs"),
+    );
+    exec_lua(&rpc, &jump).await;
+    let name = await_lua_contains(&rpc, "nx.buf.name(0)", "b.rs").await;
+    assert!(
+        name.contains("b.rs"),
+        "the jump should open b.rs, got {name:?}"
+    );
+    let mut landed = (0, 0);
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        landed = cursor(&rpc).await;
+        if landed == (3, 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        landed,
+        (3, 1),
+        "…with the cursor on the location's own line and column"
+    );
+}
+
+// ===== change annotations, and a `create` that names a directory =====
+
+/// Poll the latest redraw until its `cmdline_prompt` contains `want` (the confirm
+/// dialog nxvim opens for an annotation), returning what was seen either way.
+async fn await_prompt(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, want: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..200 {
+        barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
+            last = map_get(&map, "cmdline_prompt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+        if last.contains(want) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    last
+}
+
+/// The `changeAnnotations` script both tests below share: two groups over one
+/// document — a "Rename" group that applies unconditionally and a "Comments" group the
+/// server marks `needsConfirmation`, exactly the split annotations exist for.
+fn annotated_edit_mock(dir: &Path, record: &Path) -> String {
+    format!(
+        r#"{{
+            "record": "{rec}",
+            "code_action": [
+                {{ "title": "Rename symbol", "kind": "refactor",
+                   "command": {{ "title": "run", "command": "mock.rename" }} }}
+            ],
+            "apply_edit": {{
+                "changeAnnotations": {{
+                    "rename": {{ "label": "Rename symbol" }},
+                    "comments": {{ "label": "Update comments",
+                                   "description": "occurrences in comments",
+                                   "needsConfirmation": true }}
+                }},
+                "documentChanges": [
+                    {{
+                        "textDocument": {{ "uri": "{a}", "version": 1 }},
+                        "edits": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                           "end": {{ "line": 0, "character": 7 }} }},
+                               "newText": "bar", "annotationId": "rename" }},
+                            {{ "range": {{ "start": {{ "line": 1, "character": 3 }},
+                                           "end": {{ "line": 1, "character": 6 }} }},
+                               "newText": "bar", "annotationId": "comments" }}
+                        ]
+                    }}
+                ]
+            }}
+        }}"#,
+        rec = record.display(),
+        a = file_uri(dir, "a.rs"),
+    )
+}
+
+/// A change the server marked `needsConfirmation` does **not** apply until the user
+/// says so — and the rest of the edit waits with it, because a server-initiated
+/// `workspace/applyEdit` is answered with what actually happened. Saying yes applies
+/// everything.
+#[tokio::test]
+async fn a_confirmed_annotation_applies_the_whole_edit() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_annotation_yes");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &annotated_edit_mock(&dir, &record));
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n// foo again\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    // The question is asked, and until it is answered NOTHING has applied — not even
+    // the unannotated half.
+    let asked = await_prompt(&rpc, &mut incoming, "Update comments").await;
+    assert!(
+        asked.contains("Update comments") && asked.contains("occurrences in comments"),
+        "the confirm should name the annotation and its description, got {asked:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let foo = 1".to_string(), "// foo again".to_string()],
+        "nothing may apply while the user is still being asked"
+    );
+
+    feed(&rpc, "y");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let bar = 1".to_string(), "// bar again".to_string()],
+        "yes applies the confirmed group along with the rest"
+    );
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "…and only then is the server told it applied, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// Declining takes only that annotation's changes with it: the unannotated (and
+/// un-confirmable) half of the same edit still applies, which is the point of a server
+/// splitting them.
+#[tokio::test]
+async fn a_declined_annotation_drops_only_its_own_changes() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_annotation_no");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &annotated_edit_mock(&dir, &record));
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n// foo again\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+    await_prompt(&rpc, &mut incoming, "Update comments").await;
+    feed(&rpc, "n");
+    barrier(&rpc).await;
+
+    let mut landed = Vec::new();
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        landed = lines(&rpc).await;
+        if landed.first().map(String::as_str) == Some("let bar = 1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        landed,
+        vec!["let bar = 1".to_string(), "// foo again".to_string()],
+        "the declined group must be dropped and only it — the rename still applies"
+    );
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the edit did apply, minus what was declined, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A `create` whose URI ends in `/` names a **directory**: it is made (with its
+/// parents) rather than opened as a file. Deliberately a directory *nothing else in
+/// the edit touches — a file create brings its own `mkdir -p`, so a folder that only
+/// exists because some file needed it would prove nothing about this.
+#[tokio::test]
+async fn a_create_of_a_directory_makes_the_directory() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_create_folder");
+    let record = dir.join("rec.jsonl");
+    // A URI with the trailing slash that says "directory".
+    let folder_uri = file_uri(&dir, "assets/icons") + "/";
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Scaffold the package", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.scaffold" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "create", "uri": "{folder}" }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            folder = folder_uri,
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let made = dir.join("assets/icons");
+    let mut is_dir = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        is_dir = made.is_dir();
+        if is_dir {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        is_dir,
+        "the `create` of a `/`-terminated URI must make a directory (and its parent), \
+         got exists={} is_dir={}",
+        made.exists(),
+        made.is_dir()
+    );
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A `changeAnnotations` script where **every** change is `needsConfirmation`, so
+/// declining leaves nothing to apply. The two tests below drive the two ways that can
+/// happen — the user saying no, and nobody being able to ask.
+fn all_annotated_edit_mock(dir: &Path, record: &Path) -> String {
+    format!(
+        r#"{{
+            "record": "{rec}",
+            "code_action": [
+                {{ "title": "Rewrite", "kind": "refactor",
+                   "command": {{ "title": "run", "command": "mock.rewrite" }} }}
+            ],
+            "apply_edit": {{
+                "changeAnnotations": {{
+                    "risky": {{ "label": "Update string literals",
+                                "needsConfirmation": true }}
+                }},
+                "documentChanges": [
+                    {{
+                        "textDocument": {{ "uri": "{a}", "version": 1 }},
+                        "edits": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                           "end": {{ "line": 0, "character": 7 }} }},
+                               "newText": "bar", "annotationId": "risky" }}
+                        ]
+                    }}
+                ]
+            }}
+        }}"#,
+        rec = record.display(),
+        a = file_uri(dir, "a.rs"),
+    )
+}
+
+/// Declining *everything* is not a success: the server asked whether its edit was
+/// applied, and it wasn't, so the answer is `applied: false` with a reason it can act
+/// on — not the unconditional "applied" a held-back response would otherwise settle to.
+#[tokio::test]
+async fn declining_every_change_answers_the_server_not_applied() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_decline_all");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &all_annotated_edit_mock(&dir, &record));
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+    await_prompt(&rpc, &mut incoming, "Update string literals").await;
+    feed(&rpc, "n");
+    barrier(&rpc).await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "declining every change must be reported as not applied, got {answer:?}"
+    );
+    assert!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("failureReason"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|r| r.contains("declined")),
+        "…with a reason naming the decline, got {answer:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let foo = 1".to_string()],
+        "and nothing may have applied"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The other way an annotated edit ends up unapplied: the confirm can't be *asked* at
+/// all (a config that broke `nx.lsp._confirm_edit`). Declining is the right fallback —
+/// but the server has to be told, and this settled the held-back response before it
+/// existed, so it answered the unconditional `applied: true` for an edit that never
+/// touched a buffer.
+#[tokio::test]
+async fn a_confirm_that_cannot_be_asked_declines_instead_of_pretending() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_confirm_unreachable");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &all_annotated_edit_mock(&dir, &record));
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    // The ask itself fails, so nothing is ever presented to the user.
+    exec_lua(
+        &rpc,
+        r#"nx.lsp._confirm_edit = function() error("no ui here") end"#,
+    )
+    .await;
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "an edit nobody could confirm is declined, and the server must hear that \
+         rather than a success it can act on, got {answer:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let foo = 1".to_string()],
+        "and nothing may have applied"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A `workspace/applyEdit` whose payload we cannot read is refused, loud. Normalizing
+/// degraded an unparseable edit to an *empty* one, which is indistinguishable from "the
+/// server sent no changes" and settles to `applied: true` — a success reported for
+/// something that never reached a buffer. (The wasm client already refused it; this is
+/// the native router catching up, so both legs answer a server the same way.)
+#[tokio::test]
+async fn a_malformed_apply_edit_is_refused_rather_than_acked() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_malformed_edit");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Rewrite", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.rewrite" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": "not a list of changes" }}
+            }}"#,
+            rec = record.display(),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "an edit we could not parse must be refused, not acked, got {answer:?}"
+    );
+    assert!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("failureReason"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|r| r.contains("malformed")),
+        "…with a reason that says so, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// `failedChange` is an index into the `documentChanges` the **server** sent, which is
+/// the only numbering it can act on — nxvim declares `failureHandling: abort`, so the
+/// index is precisely the "everything before this applied" boundary. A confirmation
+/// that drops a change in front of the failure must not shift it: change 0 is declined,
+/// change 2 fails, and 2 is what goes back.
+#[tokio::test]
+async fn failed_change_is_indexed_against_the_edit_the_server_sent() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_failed_change_index");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Rewrite", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.rewrite" }} }}
+                ],
+                "apply_edit": {{
+                    "changeAnnotations": {{
+                        "risky": {{ "label": "Update string literals",
+                                    "needsConfirmation": true }}
+                    }},
+                    "documentChanges": [
+                        {{
+                            "textDocument": {{ "uri": "{a}", "version": 1 }},
+                            "edits": [
+                                {{ "range": {{ "start": {{ "line": 0, "character": 4 }},
+                                               "end": {{ "line": 0, "character": 7 }} }},
+                                   "newText": "nope", "annotationId": "risky" }}
+                            ]
+                        }},
+                        {{ "kind": "create", "uri": "{made}" }},
+                        {{ "kind": "delete", "uri": "{gone}" }}
+                    ]
+                }}
+            }}"#,
+            rec = record.display(),
+            a = file_uri(&dir, "a.rs"),
+            made = file_uri(&dir, "made.rs"),
+            // Never created: the delete fails, and it is change index 2.
+            gone = file_uri(&dir, "absent.rs"),
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+    await_prompt(&rpc, &mut incoming, "Update string literals").await;
+    feed(&rpc, "n");
+    barrier(&rpc).await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("failedChange"))
+            .and_then(serde_json::Value::as_u64),
+        Some(2),
+        "the failing delete is change 2 in the edit the server sent, whatever the \
+         confirmation dropped in front of it, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A `delete` with `ignoreIfNotExists` over a file that is already gone is the outcome
+/// the server asked for, not a failure to report back — and it must not abort the
+/// changes after it.
+#[tokio::test]
+async fn an_ignore_if_not_exists_delete_of_an_absent_file_is_not_a_failure() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_delete_ignore_missing");
+    let record = dir.join("rec.jsonl");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "code_action": [
+                    {{ "title": "Tidy up", "kind": "refactor",
+                       "command": {{ "title": "run", "command": "mock.tidy" }} }}
+                ],
+                "apply_edit": {{ "documentChanges": [
+                    {{ "kind": "delete", "uri": "{gone}",
+                       "options": {{ "ignoreIfNotExists": true }} }},
+                    {{ "kind": "create", "uri": "{after}" }},
+                    {{ "textDocument": {{ "uri": "{after}", "version": 0 }},
+                       "edits": [ {{ "range": {{ "start": {{ "line": 0, "character": 0 }},
+                                                 "end": {{ "line": 0, "character": 0 }} }},
+                                     "newText": "fn after() {{}}\n" }} ] }}
+                ] }}
+            }}"#,
+            rec = record.display(),
+            gone = file_uri(&dir, "never-existed.rs"),
+            after = file_uri(&dir, "after.rs"),
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "fn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    // The change *after* the skipped delete still runs — an `abort` would have dropped it.
+    let after = dir.join("after.rs");
+    let mut written = String::new();
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        written = std::fs::read_to_string(&after).unwrap_or_default();
+        if !written.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        written, "fn after() {}\n",
+        "an ignored-missing delete must not abort the changes after it"
+    );
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "…and it is not reported as a failure, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A Lua-built edit's columns are counted in the encoding its **caller** names, not in
+/// whatever the current buffer's first server happens to have negotiated (utf-8 when it
+/// has none). The documented default is the protocol's `utf-16`, so a plain
+/// `nx.lsp.apply_workspace_edit` reads utf-16 columns — which is the whole point on a
+/// line with multi-byte characters, where the two counts diverge.
+#[tokio::test]
+async fn a_lua_edits_columns_are_read_at_the_encoding_the_caller_names() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_lua_apply_encoding");
+    // `ééé ` is 4 utf-16 units and 7 utf-8 bytes, so `foo` starts at utf-16 column 4
+    // and byte column 7 — reading one as the other lands three cells off.
+    let (rpc, _incoming) = open_plain(&dir, "ééé foo\n").await;
+
+    let edit = format!(
+        r#"nx.lsp.apply_workspace_edit({{ changes = {{
+            ["{a}"] = {{ {{ range = {{ start = {{ line = 0, character = 4 }},
+                                       ["end"] = {{ line = 0, character = 7 }} }},
+                           newText = "bar" }} }},
+        }} }})"#,
+        a = file_uri(&dir, "a.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["ééé bar".to_string()],
+        "the default must be utf-16, the protocol's own — as documented"
+    );
+
+    // And an explicit `utf-8` is honored: the same word is at byte column 4..7 now.
+    let edit = format!(
+        r#"nx.lsp.apply_workspace_edit({{ changes = {{
+            ["{a}"] = {{ {{ range = {{ start = {{ line = 0, character = 4 }},
+                                       ["end"] = {{ line = 0, character = 7 }} }},
+                           newText = "X" }} }},
+        }} }}, {{ encoding = "utf-8" }})"#,
+        a = file_uri(&dir, "a.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["ééXbar".to_string()],
+        "an explicit utf-8 must count bytes — `ééé bar`'s bytes 4..7 are the third \
+         `é` and the space, so utf-16's `bar` is untouched"
+    );
+}
+
+/// A confirm that *rejects* rather than answering must still settle the edit. A
+/// server-initiated `workspace/applyEdit` is a request the server is blocked on until
+/// the decision lands, so a broken chain would park it — and the server — forever,
+/// the same hole the file-operation watchdog closes on the other side.
+#[tokio::test]
+async fn a_confirm_that_rejects_still_answers_the_waiting_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_confirm_rejects");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &all_annotated_edit_mock(&dir, &record));
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    // The question is asked but never answered — the promise rejects instead.
+    exec_lua(
+        &rpc,
+        r#"nx.ui.confirm = function() return nx.promise.reject("no ui here") end"#,
+    )
+    .await;
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+
+    let answer = await_recorded(&record, "_apply_edit_response").await;
+    assert_eq!(
+        answer
+            .as_ref()
+            .and_then(|v| v.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "a confirm nobody could answer declines, and the server is told so instead of \
+         being left blocked, got {answer:?}"
     );
     std::env::remove_var("NXVIM_LSP_CMD");
 }

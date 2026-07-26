@@ -25,6 +25,12 @@
 //   * both servers' pushed diagnostics merge (each holds its own document);
 //   * the hover routes to the one advertising `hoverProvider` (`mock2` withholds it);
 //   * completion fans out and merges both servers' candidates (Phase 3c).
+//   * a server→client `workspace/applyEdit` applies and is ANSWERED down the tunnel, and
+//     its `create`/`rename`/`delete` resource operations write, move and remove real
+//     files on the daemon's disk —
+//     the direction every other check runs backwards, and the only one where the browser
+//     must frame a response of its own (`SyncLspClient`) and reach a filesystem it does
+//     not have (`docs/plans/2026-07-25-lsp-apply-edit.md`).
 //
 // Prereqs: ./build.sh (dist/eh.mjs + eh.wasm + vendor/msgpack), `cargo build -p nxvim`
 // (target/debug/nxvim — the daemon AND the mock server), and a Chromium for Playwright.
@@ -33,7 +39,7 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { globSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, globSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -74,12 +80,73 @@ const luaResult = (page, code) =>
 const root = mkdtempSync(join(tmpdir(), "nxvim-lsp-"));
 const rsFile = join(root, "a.rs");
 writeFileSync(rsFile, "let foo = bar()\n");
+// Where the `rename` resource operation moves it, and a file the `delete` operation
+// removes — both on the daemon's real disk (checks 6 and 7 stat them from here).
+const movedFile = join(root, "moved.rs");
+const doomedFile = join(root, "doomed.rs");
+writeFileSync(doomedFile, "let doomed = 1\n");
+// Where the `create` resource operation puts a file that does not exist yet (check 6).
+const extractedFile = join(root, "extracted.rs");
 // The scripted mock: diagnostics pushed on didOpen + a hover reply. Cargo.toml-style
 // absolute paths so the daemon (same machine) can spawn it and read the script.
 const mockJson = join(root, "mock.json");
+// Where the mock appends what it received, including the editor's answer to the
+// `workspace/applyEdit` it pushes (check 5 reads it back off disk — the daemon runs on
+// this machine, so the file is right here).
+const mockRecord = join(root, "rec.jsonl");
 writeFileSync(
   mockJson,
   JSON.stringify({
+    record: mockRecord,
+    // A refactor delivered as a bare `command`: the `executeCommand` reply carries
+    // nothing and the edit comes back as a server→client `workspace/applyEdit` — the
+    // one inbound REQUEST the editor answers, and the one place the browser's
+    // `SyncLspClient` has to frame a response of its own rather than distil a reply.
+    // Three actions, each with its own kind so a `context.only` request picks exactly
+    // one (the mock filters by kind the way a compliant server does) and `apply` makes
+    // it a one-shot — no chooser to drive from a verifier.
+    code_action: [
+      { title: "Rewrite via applyEdit", kind: "refactor.rewrite", command: { title: "run", command: "mock.rewrite" } },
+      { title: "Move file", kind: "refactor.move", command: { title: "run", command: "mock.move" } },
+      { title: "Remove file", kind: "refactor.remove", command: { title: "run", command: "mock.remove" } },
+      { title: "Extract to new file", kind: "refactor.extract", command: { title: "run", command: "mock.extract" } },
+    ],
+    // Three server-initiated edits, one per `executeCommand`: a text edit, then the
+    // two operations that move real bytes on the DAEMON's filesystem — which is the
+    // whole reason they run off-tick (nothing on the browser's editor tick can rename
+    // a file that lives across a WebTransport link).
+    apply_edit_by_command: {
+      "mock.rewrite": {
+        changes: {
+          [`file://${rsFile}`]: [
+            {
+              range: { start: { line: 0, character: 4 }, end: { line: 0, character: 7 } },
+              newText: "baz",
+            },
+          ],
+        },
+      },
+      "mock.move": {
+        documentChanges: [{ kind: "rename", oldUri: `file://${rsFile}`, newUri: `file://${movedFile}` }],
+      },
+      "mock.remove": { documentChanges: [{ kind: "delete", uri: `file://${doomedFile}` }] },
+      // create + the edits that fill it — gopls's extract-to-new-file shape. The file
+      // has to end up on the daemon's disk with the extracted text in it.
+      "mock.extract": {
+        documentChanges: [
+          { kind: "create", uri: `file://${extractedFile}` },
+          {
+            textDocument: { uri: `file://${extractedFile}`, version: 0 },
+            edits: [
+              {
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+                newText: "let extracted = 1\n",
+              },
+            ],
+          },
+        ],
+      },
+    },
     diagnostics: [
       {
         range: { start: { line: 0, character: 4 }, end: { line: 0, character: 7 } },
@@ -281,6 +348,97 @@ try {
       items.some((it) => /from_mock_two/.test(String(it))),
     `items=${JSON.stringify(items)}`);
 
+  // ── 5. server→client `workspace/applyEdit` over the wire (the apply half) ─────────────
+  //    Everything above is the editor asking and the server answering. This is the
+  //    reverse: the server asks, the editor applies, and — uniquely — has to send a
+  //    RESPONSE back down the tunnel or the server blocks forever. On this leg that
+  //    response is framed by the browser's `SyncLspClient`, a completely different
+  //    implementation from the native router, so it has to be driven here.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+  await page.evaluate(() => window.__nxvim.feed("gg"));
+  const rewritten = await until(
+    page,
+    () => {
+      window.__nxvim.execLua(
+        'nx.lsp.code_action({ context = { only = { "refactor.rewrite" } }, apply = true })',
+      );
+      return window.__nxvim.lines();
+    },
+    (v) => /let baz = bar\(\)/.test(String(v)),
+    15000,
+  );
+  check("lsp: a server-initiated workspace/applyEdit applies to the buffer over the wire",
+    /let baz = bar\(\)/.test(String(rewritten)), `lines=${JSON.stringify(rewritten)}`);
+  let answered = "";
+  for (let i = 0; i < 100; i++) {
+    answered = readFileSync(mockRecord, "utf8");
+    if (/_apply_edit_response/.test(answered)) break;
+    await sleep(50);
+  }
+  const answer = answered.split("\n").find((l) => l.includes("_apply_edit_response")) || "";
+  check("lsp: and the editor's `applied: true` response travels back down the tunnel",
+    /"applied":true/.test(answer), `response=${JSON.stringify(answer)}`);
+
+  // ── 6. the `create` resource operation writes a NEW file on the DAEMON's disk ─────────
+  //    The buffer is made in the browser and filled by the edits that follow, then
+  //    written out over the off-tick save leg — so the refactor is complete on the far
+  //    side, not sitting unsaved in a Worker.
+  await until(
+    page,
+    () => {
+      window.__nxvim.execLua(
+        'nx.lsp.code_action({ context = { only = { "refactor.extract" } }, apply = true })',
+      );
+      return window.__nxvim.execLua("return 1").then((r) => r.result);
+    },
+    () => existsSync(extractedFile) && readFileSync(extractedFile, "utf8").includes("extracted"),
+    15000,
+  );
+  check("lsp: a workspace edit's `create` writes the new file, with its content, on the daemon",
+    existsSync(extractedFile) && readFileSync(extractedFile, "utf8") === "let extracted = 1\n",
+    existsSync(extractedFile) ? JSON.stringify(readFileSync(extractedFile, "utf8")) : "<missing>");
+
+  // ── 7. the `rename` resource operation moves the file on the DAEMON's disk ────────────
+  //    The buffer half runs in the browser, the filesystem half on the daemon, and the
+  //    two have to meet: the file moves over there while the open buffer's name follows
+  //    over here. A browser session has no filesystem of its own to fall back on, so
+  //    this only passes if the op really crossed the wire.
+  const renamed = await until(
+    page,
+    () => {
+      window.__nxvim.execLua(
+        'nx.lsp.code_action({ context = { only = { "refactor.move" } }, apply = true })',
+      );
+      return window.__nxvim.execLua("return tostring(nx.buf.name(0))").then((r) => r.result);
+    },
+    (v) => /moved\.rs/.test(String(v)),
+    15000,
+  );
+  check("lsp: a workspace edit's `rename` moves the file on the daemon and the buffer name follows",
+    /moved\.rs/.test(String(renamed)) && existsSync(movedFile) && !existsSync(rsFile),
+    `name=${JSON.stringify(renamed)} moved=${existsSync(movedFile)} original=${existsSync(rsFile)}`);
+  // The file's own bytes moved with it — `let foo = …`, not the buffer's unsaved
+  // `let baz = …` (nxvim never writes an edit to disk behind you) and not an empty
+  // file (which is what a "rename" that only recreated the name would leave).
+  check("lsp: …carrying the file's own bytes, not an empty file",
+    existsSync(movedFile) && readFileSync(movedFile, "utf8") === "let foo = bar()\n",
+    existsSync(movedFile) ? JSON.stringify(readFileSync(movedFile, "utf8")) : "<missing>");
+
+  // ── 8. the `delete` resource operation removes the file on the DAEMON's disk ──────────
+  await until(
+    page,
+    () => {
+      window.__nxvim.execLua(
+        'nx.lsp.code_action({ context = { only = { "refactor.remove" } }, apply = true })',
+      );
+      return window.__nxvim.execLua("return 1").then((r) => r.result);
+    },
+    () => !existsSync(doomedFile),
+    15000,
+  );
+  check("lsp: a workspace edit's `delete` removes the file on the daemon",
+    !existsSync(doomedFile), `still present=${existsSync(doomedFile)}`);
+
   await browser.close();
 } catch (e) {
   console.error("verify-lsp error:", e);
@@ -291,6 +449,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — browser edit-host runs TWO LSP servers on a real nxvim --daemon over WebTransport (merged diagnostics pushes, capability-routed hover, fanned-out completion)"
+  ? "\nALL PASS — browser edit-host runs TWO LSP servers on a real nxvim --daemon over WebTransport (merged diagnostics pushes, capability-routed hover, fanned-out completion, server-initiated applyEdit incl. create/rename/delete on the daemon's filesystem)"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

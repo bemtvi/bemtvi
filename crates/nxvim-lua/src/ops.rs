@@ -389,7 +389,7 @@ pub enum LspOp {
         /// The notification params as JSON (`Null` when the caller passed none).
         params: serde_json::Value,
     },
-    /// `vim.lsp.util.apply_workspace_edit(edit)` (Phase 7) — apply a `WorkspaceEdit`
+    /// `nx.lsp.apply_workspace_edit(edit, opts)` (Phase 7) — apply a `WorkspaceEdit`
     /// across the open buffers it names, reusing the native rename / code-action
     /// application path. The server deserializes the JSON into `lsp_types`,
     /// normalizes it, and applies the per-document edits.
@@ -397,6 +397,20 @@ pub enum LspOp {
         /// The `WorkspaceEdit` as JSON (`changes` / `documentChanges`), converted
         /// through the same `lua_to_json` bridge `vim.json.encode` uses.
         edit: serde_json::Value,
+        /// The position encoding its ranges' `character` columns are counted in —
+        /// `"utf-8"` / `"utf-16"` / `"utf-32"`, defaulting to the protocol's
+        /// `"utf-16"`. There is no producing server to ask (the edit was built in
+        /// Lua, or handed over as a command's arguments), so the caller says.
+        encoding: String,
+    },
+    /// `nx._lsp_edit_decision(group, accepted)` — the user's answer to a workspace
+    /// edit's `needsConfirmation` annotations, sent back by `nx.lsp._confirm_edit`.
+    /// `accepted` is the annotation ids they said yes to; every change tagged with an
+    /// id NOT in the list is dropped before the edit applies.
+    WorkspaceEditDecision {
+        /// The parked edit's group id, exactly as it was handed to Lua.
+        group: u64,
+        accepted: Vec<String>,
     },
     /// `vim.lsp.util.show_document(location)` (Phase 7) — jump the cursor to an LSP
     /// location (opening the file if needed), reusing the native single-location

@@ -41,6 +41,127 @@ pub(crate) struct PendingReplicaEdit {
     pub(crate) encoding: PositionEncoding,
 }
 
+/// What [`EditHost::apply_workspace_edit`] did: the outcome a server-initiated
+/// `workspace/applyEdit` answers with, plus the ids of the **file** operations it
+/// queued off-tick and which have not landed yet. A server-initiated edit adopts
+/// those (its response waits for them); every other caller ignores them, since their
+/// failures echo on their own.
+pub(crate) struct AppliedEdit {
+    pub(crate) outcome: nxvim_lsp::ApplyEditOutcome,
+    /// The edit is held, unapplied, on a question the user hasn't answered
+    /// (`changeAnnotations` with `needsConfirmation`). A server-initiated apply keeps
+    /// its response back until the answer arrives — nothing has been applied yet, and
+    /// saying otherwise would be a lie the server may act on.
+    pub(crate) awaiting_confirm: bool,
+    /// The apply's group id: the file operations it queued carry it, so a
+    /// server-initiated edit can key the response it holds back by the same id.
+    pub(crate) group: u64,
+    /// How many file operations are still to run. Zero for the common edit (text and
+    /// creates are synchronous), and for one that aborted before starting any.
+    pub(crate) pending: usize,
+}
+
+/// One **file** operation a workspace edit asked for (a `rename` / `delete` resource
+/// operation), in flight on the off-tick `FsJob` seam. Moving or removing a real file
+/// can only happen off the editor tick — and must work identically local, over a
+/// daemon and in the browser — so the filesystem half rides the same seam `nx.fs`
+/// does, and the buffer half (rebind / wipe) waits here for the result.
+/// Stashed in [`EditHost::workspace_fs_jobs`] keyed by the job id.
+pub(crate) struct WorkspaceFsJob {
+    pub(crate) op: WorkspaceFsOp,
+    /// The apply this operation belongs to. A failure drops the rest of *this* group
+    /// (the `abort` strategy), and a server-initiated apply's held-back response is
+    /// keyed by the same id in [`EditHost::pending_apply_edits`].
+    pub(crate) group: u64,
+    /// The operation's position in the edit's `documentChanges`, reported to the server
+    /// as `failedChange` when it fails.
+    pub(crate) index: usize,
+    /// The filesystem half, held until this operation's turn — the queue runs one at a
+    /// time, in order. Taken at dispatch; `None` once it is in flight.
+    pub(crate) job: Option<nxvim_lua::FsJob>,
+}
+
+/// What to do once a [`WorkspaceFsJob`]'s filesystem half lands.
+pub(crate) enum WorkspaceFsOp {
+    /// The directory holding a `create`d file is there (created, or already was):
+    /// write `buffer` out. A refactor may extract into a directory that does not
+    /// exist yet (a new module / package), and `:w` — rightly, like vim's `E212` —
+    /// does not create one, so the write is queued *behind* a recursive `mkdir` on
+    /// this same ordered seam rather than fired straight at a path with no parent.
+    CreateDir { buffer: BufferId, dir: PathBuf },
+    /// A `create` whose URI named a **directory** (it ended in `/`): make it, and any
+    /// missing parent. There is no buffer half — a directory isn't editable content —
+    /// so this op only reports. Ordered with the rest of the edit's file operations,
+    /// which is what lets a later `create` put a file inside it.
+    MakeDir { dir: PathBuf },
+    /// The result of an `exists` probe on a rename's *destination*, for the
+    /// `ignoreIfExists` case: an existing destination means "leave it alone" (the
+    /// rename is skipped), an absent one queues the [`Rename`](Self::Rename) itself.
+    /// A probe rather than a guess, because the seam's rename — like `rename(2)` —
+    /// would silently clobber the file the server asked us to preserve, and nothing
+    /// on the editor tick can see a daemon's or the browser's filesystem.
+    RenameGuard {
+        from: PathBuf,
+        to: PathBuf,
+        /// The spelling to *store* on the buffer (cwd-relative where possible); `to`
+        /// stays absolute for the filesystem side. See `EditHost::buffer_path_for`.
+        to_name: PathBuf,
+    },
+    /// The file moved: rebind the buffer holding it — looked up by `from` when the
+    /// move lands, not when it was queued, since the same edit's text-edit half may
+    /// have opened it in between. Its content is unchanged (the bytes moved with the
+    /// file), so only the name follows, and the per-tick lifecycle diff re-fires
+    /// `FileType` (and so re-dispatches LSP) if the new extension resolves
+    /// differently.
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        /// The spelling to *store* on the buffer (cwd-relative where possible); `to`
+        /// stays absolute for the filesystem side. See `EditHost::buffer_path_for`.
+        to_name: PathBuf,
+    },
+    /// The file is gone: wipe the buffer holding it (looked up by `path` when the
+    /// delete lands) so the editor doesn't hold a window onto a file that no longer
+    /// exists. `ignore_missing` is the operation's `ignoreIfNotExists`: with it, a
+    /// file that was already absent is the asked-for outcome rather than a failure to
+    /// report.
+    Delete { path: PathBuf, ignore_missing: bool },
+}
+
+/// An edit parked on the user's answer to its `changeAnnotations`
+/// (`needsConfirmation`), kept in [`EditHost::pending_confirm_edits`] by group id.
+/// Held whole — the accepted groups are filtered out of it when the answer lands, and
+/// the whole thing is dropped if the answer is "no".
+pub(crate) struct PendingConfirmEdit {
+    pub(crate) edit: nxvim_lsp::WorkspaceEditData,
+    /// The encoding every position in it is expressed in — the *producing* server's,
+    /// which must survive the wait (the buffer's own servers are irrelevant).
+    pub(crate) encoding: PositionEncoding,
+}
+
+/// A server-initiated `workspace/applyEdit` whose response is held back until the file
+/// operations it asked for have landed: the `applied` flag must describe what actually
+/// happened, and a `rename`/`delete` only finishes off-tick. Kept in
+/// [`EditHost::pending_apply_edits`] keyed by an internal ticket, counting down as each
+/// operation settles.
+pub(crate) struct PendingApplyEdit {
+    /// The server to answer, and the id it is blocked on.
+    pub(crate) key: ServerKey,
+    pub(crate) id: u64,
+    /// The server's label for the edit, prefixed onto a failure reason.
+    pub(crate) label: Option<String>,
+    /// File operations still in flight; the response goes out when this hits zero.
+    pub(crate) outstanding: usize,
+    /// Everything that went wrong so far — empty ⇒ `applied: true`.
+    pub(crate) trouble: Vec<String>,
+    /// The index of the change that failed, reported as the response's `failedChange`
+    /// (meaningful because nxvim declares the `abort` failure-handling strategy).
+    pub(crate) failed_change: Option<u32>,
+    /// The edit hasn't been applied at all yet: it is waiting on the user's answer to
+    /// a `needsConfirmation` annotation. The response waits with it.
+    pub(crate) awaiting_confirm: bool,
+}
+
 mod completion;
 pub(crate) use completion::LspComplete;
 mod diagnostics;
@@ -1082,13 +1203,8 @@ pub(crate) fn lsp_root_override() -> Option<PathBuf> {
     std::env::var_os("NXVIM_LSP_ROOT").map(|root| absolutize(Path::new(&root)))
 }
 
-/// A `file://` URI for an absolute-ized path, or `None` if it can't be formed.
-pub(crate) fn path_to_uri(path: &Path) -> Option<Url> {
-    Url::from_file_path(absolutize(path)).ok()
-}
-
-/// The filesystem path behind a `file://` URI (the inverse of [`path_to_uri`]),
-/// or `None` for a non-file URI — the target of a go-to jump or a panel location.
+/// The filesystem path behind a `file://` URI (the inverse of
+/// [`EditHost::buffer_uri`](EditHost::buffer_uri)), or `None` for a non-file URI — the target of a go-to jump or a panel location.
 pub(crate) fn uri_to_path(uri: &Url) -> Option<PathBuf> {
     uri.to_file_path().ok()
 }

@@ -1389,6 +1389,49 @@ pub struct EditHost {
     ///
     /// [`apply_pending_replica_edit`]: EditHost::apply_pending_replica_edit
     pending_replica_edits: HashMap<BufferId, lsp::PendingReplicaEdit>,
+    /// The **file** operations a workspace edit asked for (`rename` / `delete`
+    /// resource operations) that are still in flight, keyed by the off-tick job id
+    /// they were queued under ([`WORKSPACE_FS_JOB_BASE`]` + n`). Each one moves or
+    /// removes a real file, which can only happen off-tick — the same `FsJob` seam
+    /// `nx.fs` rides, so one code path serves the local, daemon and browser sessions
+    /// — and the buffer-side half (rebind / wipe) runs here when the result lands.
+    /// See [`EditHost::on_workspace_fs_result`].
+    workspace_fs_jobs: HashMap<u64, lsp::WorkspaceFsJob>,
+    /// Source of the [`workspace_fs_jobs`](Self::workspace_fs_jobs) ids, from
+    /// [`WORKSPACE_FS_JOB_BASE`].
+    next_workspace_fs_id: u64,
+    /// Queued file operations, in `documentChanges` order, with **at most one in
+    /// flight** ([`workspace_fs_inflight`](Self::workspace_fs_inflight)): the seam
+    /// dispatches each job onto its own task (its own round trip, in a daemon session),
+    /// so operations started together would race — and `rename a→b` racing `rename b→c`
+    /// renames a file that isn't there yet.
+    workspace_fs_queue: std::collections::VecDeque<u64>,
+    /// The file operation currently running, if any. Cleared when its result lands, at
+    /// which point the next one starts.
+    workspace_fs_inflight: Option<u64>,
+    /// `create` resource operations whose "is the file already there?" question could
+    /// only be answered **off-tick** (`ignoreIfExists` in a daemon / browser session):
+    /// the buffer whose replica fetch was enqueued as the probe, mapped to its apply's
+    /// `(group, change index)`. The fetch's landing says whether the file existed, which
+    /// decides whether this was a create to write out or a file the server asked us to
+    /// leave exactly as it was. See [`EditHost::settle_workspace_create`].
+    pending_create_writes: HashMap<BufferId, (u64, usize)>,
+    /// Edits parked on a user confirmation (`changeAnnotations` with
+    /// `needsConfirmation`), by group id: nothing of them has been applied, and the
+    /// answer decides which of their changes ever will be. See
+    /// [`EditHost::on_workspace_edit_decision`].
+    pending_confirm_edits: HashMap<u64, lsp::PendingConfirmEdit>,
+    /// Server-initiated `workspace/applyEdit`s whose response is held back until the
+    /// file operations they asked for land — the server is told what actually
+    /// happened, so the answer can't be minted before the last `rename`/`delete`
+    /// settles. Keyed by an internal ticket; empty for an edit with no resource ops
+    /// (answered inline) and for every user-driven apply. See
+    /// [`EditHost::settle_apply_edit`].
+    pending_apply_edits: HashMap<u64, lsp::PendingApplyEdit>,
+    /// Source of the per-apply group ids: every `apply_workspace_edit` takes one, the
+    /// file operations it queues carry it, and a server-initiated apply keys its
+    /// held-back response by it.
+    next_workspace_group: u64,
     /// The working directory last pushed into the `nx._cwd` mirror — so
     /// [`EditHost::publish_cwd_mirror`] can report whether a publish actually *moved* the
     /// cwd. A daemon-session focus switch uses that to fire `DirChanged` only on a real
@@ -1592,6 +1635,14 @@ impl EditHost {
             dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
             pending_chdirs: HashMap::new(),
             pending_replica_edits: HashMap::new(),
+            workspace_fs_jobs: HashMap::new(),
+            next_workspace_fs_id: WORKSPACE_FS_JOB_BASE,
+            workspace_fs_queue: std::collections::VecDeque::new(),
+            workspace_fs_inflight: None,
+            pending_create_writes: HashMap::new(),
+            pending_confirm_edits: HashMap::new(),
+            pending_apply_edits: HashMap::new(),
+            next_workspace_group: 1,
             next_chdir_token: 0,
             published_cwd: None,
             remote_cwd_seeded: false,
@@ -1987,6 +2038,15 @@ impl EditHost {
             } else {
                 self.wasm_timers.remove(idx);
             }
+            // The editor's own watchdog over a workspace edit's file operations rides
+            // this wheel too (the browser twin of the native run loop's arm): it is not
+            // a Lua callback, so it never reaches `run_callback`.
+            if timer.id == WORKSPACE_FS_TIMEOUT_TIMER_ID {
+                self.on_workspace_fs_timeout();
+                self.apply_lua_effects();
+                fired_any = true;
+                continue;
+            }
             if let Err(e) = self
                 .lua
                 .run_callback(timer.id, keep, nxvim_lua::CallbackArgs::None)
@@ -2275,6 +2335,15 @@ impl EditHost {
                 message: format!("nx.fs: malformed luafs_op reply: {e}"),
             }),
         };
+        // A workspace edit's own file operation (`rename`/`delete`) rides the same leg
+        // under an id above `WORKSPACE_FS_JOB_BASE`, and settles in the editor (the
+        // buffer rebind/wipe, and the `workspace/applyEdit` response) rather than in a
+        // Lua promise — the wasm twin of the native `FsResult` arm's first branch.
+        if self.on_workspace_fs_result(id, &result) {
+            self.apply_lua_effects();
+            self.settle_events(true);
+            return;
+        }
         if let Err(e) =
             self.lua
                 .run_callback(id, false, nxvim_lua::CallbackArgs::FsResult { result })
@@ -2636,6 +2705,23 @@ impl EditHost {
 #[cfg(feature = "native")]
 pub(crate) const INTERNAL_WATCH_BASE: u64 = 1 << 48;
 
+/// Base for the ids of the off-tick [`FsJob`](nxvim_lua::FsJob)s the **editor itself**
+/// queues — a workspace edit's `rename` / `delete` resource operations
+/// ([`EditHost::workspace_fs_jobs`]). They ride the same `LoopOp::Fs` seam `nx.fs`
+/// does (that is what makes one implementation serve the local, daemon and browser
+/// sessions), so the two landing sites — the native `LoopEvent::FsResult` arm and the
+/// wasm `EditHost::fs_op_result` — tell an editor-owned job from a Lua promise by
+/// `id >= WORKSPACE_FS_JOB_BASE` alone, exactly as `INTERNAL_WATCH_BASE` does for
+/// watches. (Lua callback ids are monotonic from 1 and never approach `1 << 51`.)
+///
+/// Distinct from every other internal id — including the *timer* ones below, whose
+/// events are a different [`LoopEvent`] variant and so could technically share a
+/// number. They don't, deliberately: one id space with no overlaps is a property
+/// worth keeping, and the watchdog timer that guards these very jobs
+/// ([`WORKSPACE_FS_TIMEOUT_TIMER_ID`]) is exactly the case where a shared number
+/// would read as a bug.
+pub(crate) const WORKSPACE_FS_JOB_BASE: u64 = 1 << 51;
+
 /// The loop id of the shada **debounced-checkpoint** timer (Phase 5). Set above
 /// both the Lua-allocated callback ids (monotonic from 1) and the per-buffer watch
 /// ids ([`INTERNAL_WATCH_BASE`]` + buffer.0`), so a [`LoopEvent::Timer`] carrying it
@@ -2665,6 +2751,35 @@ pub(crate) const PARSE_RESUME_TIMER_ID: u64 = 1 << 50;
 /// non-zero so input/other events can interleave.
 #[cfg(feature = "native")]
 pub(crate) const PARSE_RESUME_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The loop id of the **workspace file-operation watchdog** — a one-shot re-armed
+/// each time a workspace edit's `rename` / `delete` / `mkdir` is dispatched, and
+/// disarmed when the queue drains. It exists because a server→client
+/// `workspace/applyEdit` is a *request*: the server is blocked until nxvim answers,
+/// and the answer waits for these operations. An fs leg that never delivers a result
+/// (a daemon link that goes quiet rather than erroring) would otherwise block that
+/// server forever — the watchdog fails the stalled operation instead, so the server
+/// gets a truthful `applied: false`.
+pub(crate) const WORKSPACE_FS_TIMEOUT_TIMER_ID: u64 = 1 << 52;
+
+/// How long one workspace file operation may take before the watchdog gives up on it.
+/// Generous — a single `rename` / `delete` / `mkdir` is milliseconds locally and one
+/// round trip over a daemon, so this only fires when a leg has genuinely stopped
+/// answering — and overridable through `$NXVIM_WORKSPACE_FS_TIMEOUT_MS` (the test
+/// hook, which is how the give-up path is exercised at all).
+pub(crate) fn workspace_fs_timeout_ms() -> u64 {
+    std::env::var("NXVIM_WORKSPACE_FS_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000)
+}
+
+/// Whether `event` is the workspace file-operation watchdog firing (vs. a real Lua
+/// timer / the shada or parse-resume wakes).
+#[cfg(feature = "native")]
+pub(crate) fn is_workspace_fs_timeout_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == WORKSPACE_FS_TIMEOUT_TIMER_ID)
+}
 
 /// Whether `event` is the progressive-parse resume timer firing (vs. the shada
 /// checkpoint or a real Lua timer / process / watch event).

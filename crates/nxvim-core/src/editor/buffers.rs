@@ -940,6 +940,37 @@ impl Editor {
         !self.pending_pre_writes.is_empty()
     }
 
+    /// Queue a write of `buffer` to its own bound path — `:w` on a buffer that need not
+    /// be current, for a caller that is *not* the user typing it. A workspace edit's
+    /// `create` uses it to persist the file the language server asked to create, once
+    /// the edits that fill it have landed.
+    ///
+    /// It goes through the ordinary pre-write pipeline rather than writing here, so the
+    /// file is created exactly the way `:w` creates one: `BufWritePre` fires (and is
+    /// awaited) first, the bytes are encoded per `'fileencoding'`/`'fileformat'`, the
+    /// disk baseline is stamped, `BufWritePost` fires, and a daemon / browser session
+    /// takes the off-tick save leg. The per-file `written` echo is suppressed (`report:
+    /// false`) — the edit reports its own summary. A no-op for an unknown or unnamed
+    /// buffer (there is nowhere to write it).
+    pub fn queue_buffer_write(&mut self, buffer: BufferId) {
+        let named = self
+            .buffers
+            .map
+            .get(&buffer)
+            .is_some_and(|ob| ob.buffer.path.is_some());
+        if !named {
+            return;
+        }
+        let seq = self.next_write_seq();
+        self.pending_pre_writes.push(PreWrite {
+            seq,
+            buffer,
+            path: None,
+            then_quit: None,
+            report: false,
+        });
+    }
+
     /// Commit a [`PreWrite`] the server has already fired (and settled) `BufWritePre`
     /// for: serialize the buffer to disk (or, off-tick, snapshot + enqueue it), record
     /// the completed write for `BufWritePost` (`fire_pre = false` — the pre already
@@ -1907,6 +1938,38 @@ impl Editor {
         }
         let id = self.add_buffer(Buffer::named(path.to_path_buf()));
         self.enqueue_open(id, path.to_path_buf());
+        id
+    }
+
+    /// Bring `path` into a buffer that stands for a file being **created** — a
+    /// workspace edit's `create` resource operation (an "extract to new file"
+    /// refactor sends one, then the edits that fill it).
+    ///
+    /// The buffer starts **empty and modified**, never read from disk: the file is
+    /// being created, so there is nothing to read, and any pre-existing content is
+    /// what the operation says to replace. Left modified so `:w`/`:wa` writes it —
+    /// the same in-memory contract [`ensure_buffer_loaded`](Self::ensure_buffer_loaded)
+    /// gives the rest of a workspace edit, rather than writing to disk behind the
+    /// user's back. Emptying an already-open buffer goes through the undo stack, so
+    /// the whole operation stays undoable.
+    ///
+    /// Identical in every session (local, daemon, browser): no read means no
+    /// off-tick fetch to race the edits that follow.
+    pub fn create_file_buffer(&mut self, path: &Path) -> BufferId {
+        let Some(id) = self.find_buffer_by_path(path) else {
+            let mut buffer = Buffer::named(path.to_path_buf());
+            buffer.modified = true;
+            return self.add_buffer(buffer);
+        };
+        // Already open: empty it (as one undoable edit) so the create is a create
+        // rather than a silent no-op on stale content.
+        let len = self.buffer_of(id).map(|b| b.len_bytes()).unwrap_or(0);
+        if len > 0 {
+            self.apply_edits_to(id, vec![(0..len, String::new())]);
+        }
+        if let Some(buffer) = self.buffer_of_mut(id) {
+            buffer.modified = true;
+        }
         id
     }
 

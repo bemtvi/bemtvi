@@ -76,6 +76,10 @@ impl EditHost {
                 self.reload_posts.remove(&buffer);
                 // The forced-encoding reload never landed; drop its stash too.
                 self.forced_fetch_enc.remove(&buffer);
+                // The probe never landed, so we do not know whether the file is there:
+                // never write over it on a guess (that is the clobber this path exists
+                // to avoid). The failure is reported below like any other.
+                self.pending_create_writes.remove(&buffer);
                 if self.pending_replica_edits.remove(&buffer).is_some() {
                     self.editor.echo(format!(
                         "apply_workspace_edit: could not open {path} over the daemon: {e}"
@@ -126,6 +130,11 @@ impl EditHost {
         // real contents have landed, before lifecycle events fire so a
         // `BufReadPost`-driven LSP attach / diagnostics see the renamed text.
         self.apply_pending_replica_edit(buffer);
+        // A `create` that could only ask the filesystem off-tick (`ignoreIfExists` in a
+        // daemon / browser session) gets its answer here: `existed` is the probe's
+        // result, and decides whether the file is written out or deliberately left as
+        // the server found it.
+        self.settle_workspace_create(buffer, existed);
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
         // A fresh read re-seeds the encoding baseline silently (no `EncodingChanged`).

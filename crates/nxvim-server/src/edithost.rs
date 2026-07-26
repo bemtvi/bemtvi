@@ -45,7 +45,7 @@ use crate::save::SaveDone;
 use nxvim_lsp::LspEvent;
 #[cfg(feature = "native")]
 use nxvim_lsp::LspManager;
-use nxvim_lsp::{LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
+use nxvim_lsp::{ApplyEditOutcome, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
 #[cfg(feature = "native")]
 use nxvim_rpc::Rpc;
 #[cfg(feature = "native")]
@@ -359,6 +359,15 @@ pub trait HostEffects {
     /// round-trip). Dropped if no such server is running.
     fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest);
 
+    /// LSP — answer a server→client `workspace/applyEdit` the editor received as
+    /// [`LspEvent::ApplyEdit`](nxvim_lsp::LspEvent). Unlike every other inbound LSP
+    /// message that one is a *request*: the server is blocked until this is called
+    /// with the `id` that came with the event, so it must be called exactly once
+    /// whatever the outcome. Dropped if the server has since exited (its request died
+    /// with it). Native routes it through the `LspManager` to the server's client
+    /// loop; wasm frames the response straight onto the `SyncLspClient`'s wire.
+    fn lsp_apply_edit_response(&mut self, key: ServerKey, id: u64, outcome: ApplyEditOutcome);
+
     /// LSP (wasm) — feed one `lsp_stdout` push from the daemon into the `SyncLspClient`,
     /// which parses its framed JSON-RPC. Native delivers stdout through the manager's
     /// `async-lsp` loop instead, so this is wasm-only.
@@ -612,6 +621,10 @@ impl HostEffects for NativeEffects {
 
     fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest) {
         self.lsp.request(key, token, req);
+    }
+
+    fn lsp_apply_edit_response(&mut self, key: ServerKey, id: u64, outcome: ApplyEditOutcome) {
+        self.lsp.apply_edit_response(key, id, outcome);
     }
 
     fn ts_install(&mut self, lang: String) {

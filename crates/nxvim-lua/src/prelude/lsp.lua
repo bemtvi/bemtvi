@@ -1044,6 +1044,138 @@ function nx.lsp._show_locations(items)
   nx.picker.open("lsp_locations")
 end
 
+-- ----- applying an edit / jumping to a location by hand ----------------------
+
+-- Apply an LSP `WorkspaceEdit` — the same path a rename reply or a server-initiated
+-- `workspace/applyEdit` takes, exposed for a plugin (or an `nx.lsp.commands`
+-- handler) holding an edit a server handed it as command arguments.
+--
+-- `edit` is the protocol shape, either form:
+--
+-- ```lua
+-- nx.lsp.apply_workspace_edit({
+--   changes = { ["file:///p/a.rs"] = { { range = r, newText = "bar" } } },
+-- })
+-- nx.lsp.apply_workspace_edit({
+--   documentChanges = {
+--     { kind = "create", uri = "file:///p/new.rs" },
+--     { textDocument = { uri = "file:///p/new.rs", version = 0 },
+--       edits = { { range = r, newText = "fn helper() {}\n" } } },
+--   },
+-- })
+-- ```
+--
+-- `documentChanges` is applied **in the order given**, resource operations
+-- (`create` / `rename` / `delete`) included: those move real files, so they run off
+-- the editor tick and settle a moment later — identically in a local, daemon or
+-- browser session. Text edits land in the buffers (left modified, written by `:w` /
+-- `:wa`) exactly as a rename's do; a `create` is written out for you.
+--
+-- `opts.encoding` is the position encoding the edit's `character` columns are
+-- counted in (`"utf-8"` / `"utf-16"` / `"utf-32"`), defaulting to the protocol's
+-- `"utf-16"`. Pass the encoding the server that *authored* the edit negotiated —
+-- `nx.lsp.clients({ bufnr = 0 })[1].offset_encoding` — when it isn't utf-16, or every
+-- column on a line with a multi-byte character lands in the wrong place. Anything
+-- that fails is reported loud, never silently skipped.
+function nx.lsp.apply_workspace_edit(edit, opts)
+  if type(edit) ~= "table" then
+    error("nx.lsp.apply_workspace_edit: edit must be a table, got " .. type(edit), 2)
+  end
+  local encoding = type(opts) == "table" and opts.encoding or "utf-16"
+  nx._lsp_apply_workspace_edit(edit, encoding)
+end
+
+-- Jump to an LSP `Location` (or `LocationLink`), opening its file if it isn't
+-- already in a buffer — for a location a server hands over, e.g. as a command's
+-- `arguments`:
+--
+-- ```lua
+-- nx.lsp.commands["rust-analyzer.gotoLocation"] = function(command)
+--   local loc = command.arguments and command.arguments[1]
+--   if loc then nx.lsp.show_document(loc) end
+-- end
+-- ```
+--
+-- `opts.encoding` is the position encoding the location's columns are in
+-- (`"utf-8"` / `"utf-16"` / `"utf-32"`), defaulting to the protocol's `"utf-16"`.
+-- A location with no usable URI is an error, not a silent no-op.
+function nx.lsp.show_document(location, opts)
+  if type(location) ~= "table" then
+    error("nx.lsp.show_document: location must be a table, got " .. type(location), 2)
+  end
+  local uri = location.uri or location.targetUri
+  if type(uri) ~= "string" then
+    error("nx.lsp.show_document: location has no uri", 2)
+  end
+  -- `Location.range`, or a `LocationLink`'s selection range (whose `targetRange` is
+  -- the whole declaration, while the selection range is the name to land on).
+  local range = location.range or location.targetSelectionRange or location.targetRange
+  local start = type(range) == "table" and range.start or nil
+  local line = type(start) == "table" and start.line or 0
+  local character = type(start) == "table" and start.character or 0
+  local encoding = type(opts) == "table" and opts.encoding or "utf-16"
+  nx._lsp_show_document(uri, line, character, encoding)
+end
+
+-- ----- change annotations: asking before applying ---------------------------
+
+-- `nx.lsp._confirm_edit(group, groups)`: the engine parks a workspace edit whose
+-- server marked some of its changes `needsConfirmation` and calls this to ask. Each
+-- entry of `groups` is `{ label, description, ids }` — one per distinct annotation
+-- LABEL (nxvim advertises `groupsOnLabel`), carrying the annotation ids it speaks
+-- for. Answers with `nx._lsp_edit_decision(group, accepted_ids)`; the changes tagged
+-- with an id that isn't accepted never apply.
+--
+-- Asked one at a time through `nx.ui.confirm` — a plain yes/no per group, `<Esc>`
+-- declining — because that is what the protocol's model is: a group is accepted or
+-- declined whole. Nothing blocks: the chain is promises, and the answer arrives on a
+-- later tick.
+--
+-- The chain **always** answers, including when it breaks: a server-initiated
+-- `workspace/applyEdit` is a request the server is blocked on until the decision
+-- lands, so a rejected confirm (or an error in this chain) reports what was accepted
+-- so far rather than leaving the edit — and the server — parked forever. The same
+-- reason the file operations have a watchdog.
+function nx.lsp._confirm_edit(group, groups)
+  local accepted = {}
+  local i = 0
+  local answered = false
+  local function answer()
+    if answered then
+      return
+    end
+    answered = true
+    nx._lsp_edit_decision(group, accepted)
+  end
+  local function ask()
+    i = i + 1
+    local g = groups and groups[i]
+    if g == nil then
+      answer()
+      return
+    end
+    local label = tostring(g.label or "change")
+    -- The description is the server's own longer explanation; it goes in the
+    -- question rather than being dropped, since it is the reason to say yes or no.
+    local question = g.description and (label .. " — " .. tostring(g.description)) or label
+    local asked = nx.ui.confirm("Apply: " .. question .. "?"):next(function(yes)
+      if yes then
+        for _, id in ipairs(g.ids or {}) do
+          accepted[#accepted + 1] = id
+        end
+      end
+      ask()
+    end)
+    -- On the promise `:next` returned, so it covers both a confirm that rejects and
+    -- a throw inside the handler above — either way the decision still goes back.
+    asked:catch(function(err)
+      nx.notify("nx.lsp: could not ask about a workspace edit: " .. tostring(err), "warn")
+      answer()
+    end)
+  end
+  ask()
+end
+
 -- ----- vim.* muscle-memory aliases (ADR 0002 §4 whitelist) -------------------
 -- The bounded neovim-shaped surface, routed onto the nx verbs above. `vim.lsp.buf`
 -- is the `.buf`-namespaced spelling muscle memory reaches for; `vim.lsp.config`
@@ -1148,3 +1280,16 @@ vim.lsp.foldexpr = nx.lsp.foldexpr
 -- The same table, not a copy: a config that registers through either spelling must
 -- be seen by the dispatcher, which reads `nx.lsp.commands`.
 vim.lsp.commands = nx.lsp.commands
+-- `vim.lsp.util` is the spelling a neovim-shaped plugin reaches for; both entries
+-- are the nx verbs above, so the two spellings cannot drift.
+vim.lsp.util = vim.lsp.util or {}
+vim.lsp.util.apply_workspace_edit = function(edit, encoding)
+  -- neovim takes the offset encoding as a second positional argument; nxvim takes it
+  -- in `opts`, so it is carried across rather than dropped (dropping it silently
+  -- misread every column on a line with a multi-byte character).
+  return nx.lsp.apply_workspace_edit(edit, encoding and { encoding = encoding } or nil)
+end
+vim.lsp.util.show_document = function(location, encoding, opts)
+  local _ = opts
+  return nx.lsp.show_document(location, encoding and { encoding = encoding } or nil)
+end

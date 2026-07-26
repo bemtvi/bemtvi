@@ -130,8 +130,12 @@ impl EditHost {
                 self.client_notify(client_id, method, params);
                 return;
             }
-            LspOp::ApplyWorkspaceEdit { edit } => {
-                self.apply_lua_workspace_edit(edit);
+            LspOp::ApplyWorkspaceEdit { edit, encoding } => {
+                self.apply_lua_workspace_edit(edit, &encoding);
+                return;
+            }
+            LspOp::WorkspaceEditDecision { group, accepted } => {
+                self.on_workspace_edit_decision(group, accepted);
                 return;
             }
             LspOp::ShowDocument {
@@ -226,7 +230,7 @@ impl EditHost {
             return;
         };
         let path = PathBuf::from(&name_str);
-        let Some(uri) = path_to_uri(&path) else {
+        let Some(uri) = self.buffer_uri(&path) else {
             return;
         };
         // Root: `$NXVIM_LSP_ROOT` overrides (the test hook), else the root Lua
@@ -235,7 +239,7 @@ impl EditHost {
         let root = lsp_root_override()
             .or_else(|| root.map(|r| absolutize(Path::new(&r))))
             .unwrap_or_else(|| {
-                let abs = absolutize(&path);
+                let abs = self.abs_buffer_path(&path);
                 abs.parent().map(Path::to_path_buf).unwrap_or(abs)
             });
         let key = ServerKey { name, root };
@@ -401,7 +405,7 @@ impl EditHost {
         let Some(path) = self.editor.buffer().path.clone() else {
             return;
         };
-        let Some(uri) = path_to_uri(&path) else {
+        let Some(uri) = self.buffer_uri(&path) else {
             return;
         };
 
@@ -681,29 +685,96 @@ impl EditHost {
             .collect();
         for id in dead {
             if let Some(state) = self.lsp_states.remove(&id) {
-                // Every server this buffer had open gets its own `didClose` and its own
-                // `LspDetach` — symmetric with the per-server attach-on-`didOpen`.
-                let opened: Vec<ServerKey> = state
-                    .servers()
-                    .filter(|(_, doc)| doc.opened)
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                let Some(uri) = state.uri else {
-                    continue;
-                };
-                for key in opened {
-                    // Fire `LspDetach` before the close goes out, while the runtime —
-                    // and so the client id — is still around.
-                    if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
-                        let file = uri_to_path(&uri)
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        self.fire_lsp_detach(id, &file, client_id);
-                    }
-                    self.fx
-                        .lsp_notify(key, LspNotify::DidClose { uri: uri.clone() });
-                }
+                self.close_lsp_state(id, state);
             }
+        }
+    }
+
+    /// A buffer's stored `path` as an absolute one, resolved against the **session's**
+    /// effective directory rather than this process's cwd. Buffer paths are stored the
+    /// way they were opened — `:e src/main.rs` keeps `src/main.rs`, and a workspace
+    /// edit names a file it creates the same way — while a daemon session's files live
+    /// on the remote, where the local process cwd means nothing. (Locally the two are
+    /// the same: `fix_current_dir` keeps the process cwd on the effective dir.)
+    pub(crate) fn abs_buffer_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let (_, base) = self.dirs.effective(win, tab);
+        base.join(path)
+    }
+
+    /// The `file://` URI addressing a buffer's document, from its stored path (see
+    /// [`abs_buffer_path`](Self::abs_buffer_path)). `None` when no URI can be formed.
+    pub(crate) fn buffer_uri(&self, path: &Path) -> Option<Url> {
+        Url::from_file_path(self.abs_buffer_path(path)).ok()
+    }
+
+    /// Close buffer `id`'s LSP document but **keep its servers**: `didClose` on the URI
+    /// they currently hold, then reset each one's per-document state so the next sync
+    /// re-`didOpen`s under the buffer's new URI.
+    ///
+    /// This is what a **file move** needs (a workspace edit's `rename`): the same
+    /// buffer, on the same servers, is a *different document* afterwards — a server
+    /// left holding the old URI would answer about a path that no longer exists, while
+    /// dropping the state outright would silently detach the buffer from its servers
+    /// (nothing re-attaches it: the `FileType` that bound them doesn't fire again when
+    /// only the stem changed).
+    pub(crate) fn reopen_lsp_document(&mut self, id: BufferId) {
+        let Some(state) = self.lsp_states.get_mut(&id) else {
+            return;
+        };
+        // Taken, so the next `sync_lsp_buffer` recomputes it from the buffer's path.
+        let Some(uri) = state.uri.take() else {
+            return;
+        };
+        let opened: Vec<ServerKey> = state
+            .servers()
+            .filter(|(_, doc)| doc.opened)
+            .map(|(k, _)| k.clone())
+            .collect();
+        // A fresh document per server: not opened, version 0, empty shadow, and none
+        // of the old URI's decorations (the server re-publishes for the new one).
+        for (_, doc) in state.servers_mut() {
+            *doc = LspServerDoc::default();
+        }
+        for key in opened {
+            if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
+                let file = uri_to_path(&uri)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.fire_lsp_detach(id, &file, client_id);
+            }
+            self.fx
+                .lsp_notify(key, LspNotify::DidClose { uri: uri.clone() });
+        }
+    }
+
+    /// The close itself, given the state already taken out of `lsp_states`.
+    fn close_lsp_state(&mut self, id: BufferId, state: LspDocState) {
+        // Every server this buffer had open gets its own `didClose` and its own
+        // `LspDetach` — symmetric with the per-server attach-on-`didOpen`.
+        let opened: Vec<ServerKey> = state
+            .servers()
+            .filter(|(_, doc)| doc.opened)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let Some(uri) = state.uri else {
+            return;
+        };
+        for key in opened {
+            // Fire `LspDetach` before the close goes out, while the runtime — and so
+            // the client id — is still around.
+            if let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) {
+                let file = uri_to_path(&uri)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.fire_lsp_detach(id, &file, client_id);
+            }
+            self.fx
+                .lsp_notify(key, LspNotify::DidClose { uri: uri.clone() });
         }
     }
 
@@ -875,6 +946,12 @@ impl EditHost {
                 // accumulate one per buffer it served.
                 self.lsp_multi_requests.retain(|_, p| p.server != key);
                 self.inlay_resolves.retain(|_, t| t.server != key);
+                // A `workspace/applyEdit` this server was still waiting on: there is
+                // nobody left to answer (its request died with the connection), so drop
+                // the held-back response rather than keep a record that can only be
+                // settled into the void. The edit's own file operations are left to
+                // finish — they were accepted, and the buffers they touch are still here.
+                self.pending_apply_edits.retain(|_, p| p.key != key);
                 if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
                     // Buffers attached to this server, with a display name for the
                     // event's `args.file`. Clear `opened` so a later `:bdelete`
@@ -914,6 +991,12 @@ impl EditHost {
                 self.editor.record_message(message, false);
             }
             LspEvent::WorkspaceRefresh { key, kind } => self.on_workspace_refresh(key, kind),
+            LspEvent::ApplyEdit {
+                key,
+                id,
+                label,
+                changes,
+            } => self.on_apply_edit(key, id, label, changes),
         }
     }
 

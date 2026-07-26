@@ -1547,6 +1547,63 @@ fn tabline_paints_a_top_row_and_pushes_the_window_down() {
 }
 
 #[test]
+fn tabline_falls_back_to_the_status_line_colors() {
+    // A colorscheme that themes `StatusLine` but leaves `TabLine`/`TabLineSel`/
+    // `TabLineFill` undefined must still get a themed tabline: the bar takes the
+    // status-line colors (the active cell their reverse) rather than dropping to
+    // the terminal default with a reverse-video cell, which reads as unthemed
+    // against the rest of the frame. This is the GUI's fallback, so both clients
+    // paint the same bar.
+    let buf = paint(
+        &view(vec![
+            ("lines", lines(&["hello"])),
+            (
+                "styles",
+                Value::Array(vec![style(vec![
+                    ("fg", rgb(0xab, 0xb2, 0xbf)),
+                    ("bg", rgb(0x21, 0x25, 0x2b)),
+                ])]),
+            ),
+            ("chrome", chrome(vec![("status_line", 0)])),
+            (
+                "tabline",
+                tabline(&[("a.txt", false, 1), ("b.txt", false, 1)]),
+            ),
+            ("current_tab", Value::from(1u64)),
+        ]),
+        40,
+        6,
+    );
+
+    let top = row_text(&buf, 0);
+    let b_col = top.find("b.txt").unwrap() as u16;
+    // The inactive cell and the fill past the last cell take the StatusLine look.
+    assert_eq!(
+        (fg(&buf, 1, 0), bg(&buf, 1, 0)),
+        (
+            Some(Color::Rgb(0xab, 0xb2, 0xbf)),
+            Some(Color::Rgb(0x21, 0x25, 0x2b))
+        ),
+        "the inactive tab cell falls back to StatusLine: {top:?}"
+    );
+    assert_eq!(
+        bg(&buf, 39, 0),
+        Some(Color::Rgb(0x21, 0x25, 0x2b)),
+        "the strip past the last cell falls back to StatusLine"
+    );
+    // The active cell is the reverse of that, painted as real colors (not a bare
+    // REVERSED modifier over the terminal default).
+    assert_eq!(
+        (fg(&buf, b_col, 0), bg(&buf, b_col, 0)),
+        (
+            Some(Color::Rgb(0x21, 0x25, 0x2b)),
+            Some(Color::Rgb(0xab, 0xb2, 0xbf))
+        ),
+        "the active tab cell is the StatusLine colors reversed"
+    );
+}
+
+#[test]
 fn no_tabline_with_a_single_tab() {
     // One (or zero) tab ⇒ no tabline; the window keeps row 0, unchanged from the
     // pre-tabs frame.

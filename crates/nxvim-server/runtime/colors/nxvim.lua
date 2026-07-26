@@ -30,7 +30,8 @@ local p = {
 local hl = nx.hl.define
 
 -- Editor chrome (the regions the renderer resolves: Normal, LineNr,
--- CursorLineNr, Visual, Search, IncSearch, StatusLine, EndOfBuffer — plus a few
+-- CursorLineNr, Visual, Search, IncSearch, StatusLine, TabLine*, EndOfBuffer —
+-- plus a few
 -- common extras for completeness).
 hl(0, "Normal",       { fg = p.fg, bg = p.bg })
 hl(0, "NormalFloat",  { fg = p.fg, bg = p.bg_dark })
@@ -49,6 +50,14 @@ hl(0, "Search",       { fg = p.fg, bg = p.search })
 hl(0, "IncSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "CurSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "StatusLine",   { fg = p.fg, bg = p.bg_dark })
+-- Tabline: the bar sits on the same darker chrome background as the status line
+-- (`TabLineFill`), inactive tabs are dimmed onto it (`TabLine`), and the active
+-- tab takes the *editor* background so it reads as the front tab joined to the
+-- window below (`TabLineSel`). Without these the TUI has nothing to resolve and
+-- paints the row in the terminal default with a reverse-video active cell.
+hl(0, "TabLine",      { fg = p.comment, bg = p.bg_dark })
+hl(0, "TabLineSel",   { fg = p.fg, bg = p.bg })
+hl(0, "TabLineFill",  { fg = p.comment, bg = p.bg_dark })
 -- `~` end-of-buffer fillers, highlighted like NonText (vim's default) so they
 -- stay visible — using the Normal bg here would blend them into the background.
 hl(0, "EndOfBuffer",  { fg = p.gutter })

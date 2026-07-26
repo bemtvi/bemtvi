@@ -2408,10 +2408,12 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
 
 /// Render the tabline across the top row. With a custom `'tabline'` set, the
 /// server has already rendered it into styled segments ([`View::tabline_segments`])
-/// — paint those verbatim. Otherwise fall back to the built-in cells: one per tab,
-/// each ` {count} {name}{+} ` (the window count only when >1, a `+` when the tab's
+/// — paint those over the bar's ground ([`tabline_colors`]), so an unstyled segment
+/// still lands on the theme's tabline background rather than the terminal default.
+/// Otherwise fall back to the built-in cells: one per tab, each
+/// ` {count} {name}{+} ` (the window count only when >1, a `+` when the tab's
 /// buffer is modified, matching vim's default tabline), the active cell
-/// reverse-video and the strip past the last cell left blank (vim's `TabLineFill`).
+/// highlighted and the strip past the last cell left blank (vim's `TabLineFill`).
 fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
     if !view.tabline_segments.is_empty() {
         let spans: Vec<Span> = view
@@ -2422,11 +2424,53 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
                 None => Span::raw(text.as_str()),
             })
             .collect();
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let fill = tabline_colors(view).fill;
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(fill), area);
         return;
     }
 
     render_tab_cells(frame, area, "", &view.tabline, view.current_tab, view);
+}
+
+/// The three styles the built-in tabline paints with, each falling back a step at
+/// a time so the bar stays themed under a colorscheme that defines only some of
+/// the groups (this is the GUI's fallback too, so both clients paint the same
+/// bar):
+///
+/// - `fill` — the bar's ground: `TabLineFill`, else the `StatusLine` tint. Without
+///   the status-line fallback a scheme that themes only `StatusLine` leaves the
+///   whole row on the terminal default, reading as unthemed against the frame.
+/// - `inactive` — `TabLine` patched *over* the ground, so a group that sets only a
+///   foreground keeps the bar's background instead of punching a hole in it.
+/// - `active` — `TabLineSel`, else the ground's own colors swapped. Swapping beats
+///   a bare `REVERSED` modifier because the cell then carries real colors from the
+///   theme; with no theme at all there is nothing to swap and it falls back to the
+///   modifier (vim's out-of-the-box reverse-video look).
+struct TablineColors {
+    fill: Style,
+    inactive: Style,
+    active: Style,
+}
+
+fn tabline_colors(view: &View) -> TablineColors {
+    let fill = view
+        .tabline_fill
+        .map(rt)
+        .or_else(|| view.status_line.map(rt))
+        .unwrap_or_default();
+    let inactive = fill.patch(view.tabline_style.map(rt).unwrap_or_default());
+    let active = view
+        .tabline_sel
+        .map(rt)
+        .unwrap_or_else(|| match (fill.fg, fill.bg) {
+            (Some(fg), Some(bg)) => Style::default().fg(bg).bg(fg),
+            _ => fill.add_modifier(Modifier::REVERSED),
+        });
+    TablineColors {
+        fill,
+        inactive,
+        active,
+    }
 }
 
 /// Paint built-in tabline cells into `area`: an optional bold `title` label first
@@ -2437,9 +2481,9 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
 /// tabline. A no-op for an empty strip (no title and no tabs) or zero-height area.
 ///
 /// The colors come from the theme's `TabLine` (inactive cells + bold title),
-/// `TabLineSel` (the active cell) and `TabLineFill` (the bar background) groups
-/// when the colorscheme defines them; otherwise the active cell falls back to
-/// reverse-video and the rest to the terminal default.
+/// `TabLineSel` (the active cell) and `TabLineFill` (the bar background) groups,
+/// each falling back through [`tabline_colors`] when the colorscheme leaves it
+/// undefined.
 fn render_tab_cells(
     frame: &mut Frame,
     area: Rect,
@@ -2451,12 +2495,11 @@ fn render_tab_cells(
     if (title.is_empty() && tabs.is_empty()) || area.height == 0 {
         return;
     }
-    let inactive = view.tabline_style.map(rt).unwrap_or_default();
-    let active = view
-        .tabline_sel
-        .map(rt)
-        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
-    let fill = view.tabline_fill.map(rt).unwrap_or_default();
+    let TablineColors {
+        fill,
+        inactive,
+        active,
+    } = tabline_colors(view);
     let mut spans: Vec<Span> = Vec::with_capacity(tabs.len() + 1);
     if !title.is_empty() {
         spans.push(Span::styled(

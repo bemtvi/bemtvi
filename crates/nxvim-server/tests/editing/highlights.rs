@@ -571,6 +571,37 @@ async fn builtin_nxvim_colorscheme_shows_eob_tildes() {
 }
 
 #[tokio::test]
+async fn builtin_nxvim_colorscheme_themes_the_tabline() {
+    // The bundled scheme themed `StatusLine` but not the tabline groups, so the
+    // tabline row fell back to the terminal default with a reverse-video active
+    // cell — visibly unthemed against the rest of the frame in the TUI. The bar
+    // now carries its own One Dark look: the active tab reads as the editor
+    // background (a real "front" tab), inactive tabs and the fill sit on the
+    // darker chrome background the status line uses.
+    let dir = temp_dir("tabline_nxvim");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+
+    let tabline = get_hl(&rpc, "TabLine").await;
+    assert_eq!(hl_color(&tabline, "fg"), Some(hex("5c6370")));
+    assert_eq!(hl_color(&tabline, "bg"), Some(hex("21252b")));
+    let sel = get_hl(&rpc, "TabLineSel").await;
+    assert_eq!(hl_color(&sel, "fg"), Some(hex("abb2bf")));
+    assert_eq!(
+        hl_color(&sel, "bg"),
+        Some(hex("282c34")),
+        "the active tab sits on the Normal background, so it reads as the front tab"
+    );
+    let fill = get_hl(&rpc, "TabLineFill").await;
+    assert_eq!(hl_color(&fill, "bg"), Some(hex("21252b")));
+    assert_ne!(
+        hl_color(&sel, "bg"),
+        hl_color(&tabline, "bg"),
+        "the active cell must be distinguishable from the inactive ones"
+    );
+}
+
+#[tokio::test]
 async fn truecolor_attach_defaults_in_the_nxvim_colorscheme() {
     // A client that declares truecolor support (`truecolor = true` in the attach
     // capabilities) with no config-chosen scheme lands on the bundled `nxvim` One

@@ -255,6 +255,53 @@ function nx.augroup.create(name, opts)
   return id
 end
 
+-- vim's file-pattern rules, spelled as `nx.glob` options. They differ from the
+-- `nx.glob` defaults on exactly two counts, both deliberate:
+--   * `literal_separator = false` — a bare `*` CROSSES `/` in vim (`/etc/*` matches
+--     `/etc/nginx/nginx.conf`), where every other glob dialect stops at it.
+--   * `basename = true` — a separator-less pattern matches the path TAIL, so
+--     `*.lua` fires for `/a/b/c/init.lua`.
+local AU_GLOB = { literal_separator = false, basename = true }
+
+-- Compile every glob in `pat` (a string, a list, or nil) at REGISTRATION time so an
+-- invalid one raises where the caller wrote it, naming the pattern and the reason.
+--
+-- Without this the failure is invisible: matching happens inside a `pcall` per event
+-- fire (it must — an autocmd cannot be allowed to raise out of every subsequent event),
+-- so a pattern that cannot compile just never matches, forever, with no diagnostic
+-- anywhere. Compiling here is also free at fire time: it warms the very cache the
+-- matcher reads.
+--
+-- A metacharacter-free pattern is skipped — it is only ever an exact compare, so it
+-- never reaches the glob engine (and a `[No Name]`-style name must stay usable).
+local function au_check_patterns(event, pat)
+  if pat == nil then
+    return
+  end
+  local list = type(pat) == "table" and pat or { pat }
+  for _, p in ipairs(list) do
+    if type(p) == "string" and nx.glob.is_glob(p) then
+      local ok, err = pcall(nx.glob.compile, p, AU_GLOB)
+      if not ok then
+        error(
+          ("nx.autocmd.create: %s autocmd has an invalid pattern %q: %s"):format(
+            type(event) == "table" and table.concat(event, "/") or tostring(event),
+            p,
+            -- Parenthesized: `gsub` returns (string, count), and the second value
+            -- would ride into `format` as a stray argument.
+            (tostring(err):gsub("^.*nx%.glob: ", ""))
+          ),
+          -- Level 3, not 2: 1 is this function, 2 is `nx.autocmd.create` (which is
+          -- prelude source the caller never wrote), 3 is the config line that called
+          -- it. Blaming `nxvim:prelude/autocmd` for a typo in the user's pattern is
+          -- the opposite of raising "where the caller wrote it".
+          3
+        )
+      end
+    end
+  end
+end
+
 -- `nx.autocmd.create(event, opts)` -> id [alias `nvim_create_autocmd`]: run something
 -- whenever `event` fires. Returns the autocmd's numeric id (pass it to
 -- `nx.autocmd.del` to remove it). `event` is an event name (`"FileType"`,
@@ -281,6 +328,10 @@ end
 --   its name, and `data` an event-specific payload (e.g. `LspAttach` carries
 --   `{ client_id = … }`), nil for most events.
 --
+-- An invalid glob in `pattern` raises **here**, at registration, naming the pattern and
+-- the reason — an autocmd that could never match is a typo, and the alternative is one
+-- that silently never fires for the rest of the session.
+--
 -- ```lua
 -- nx.autocmd.create("FileType", {
 --   pattern = "markdown",
@@ -292,6 +343,7 @@ end
 function nx.autocmd.create(event, opts)
   opts = opts or {}
   event = au_canon_event(event)
+  au_check_patterns(event, opts.pattern)
   autocmd_seq = autocmd_seq + 1
   local group = au_resolve_group(opts.group, "nvim_create_autocmd")
   local buffer = opts.buffer
@@ -315,10 +367,10 @@ end
 
 -- Does a single autocmd pattern `pat` match the event's `pattern` (the file path
 -- for file events, a filetype / id / mode-code for others)? Beyond an exact match
--- and `*`, a `pat` holding a shell glob metacharacter (`*` `?` `[`) is matched as
--- vim's file-pattern: a glob with no `/` matches the path *tail* (`*.lua` matches
--- any `.lua` file), one with a `/` the whole path. A metacharacter-free `pat` is
--- only ever an exact compare (so a `FileType` `rust` autocmd can't glob-match a path).
+-- and `*`, a `pat` holding a glob metacharacter is matched as vim's file-pattern
+-- through `nx.glob` (the canonical engine: `nxvim_core::glob`, which compiles the
+-- glob to a cached regex). A metacharacter-free `pat` is only ever an exact compare,
+-- so a `FileType` `rust` autocmd can't glob-match a path whose tail is `rust`.
 local function au_one_pattern_matches(pat, pattern)
   if pat == "*" or pat == pattern then
     return true
@@ -326,26 +378,17 @@ local function au_one_pattern_matches(pat, pattern)
   if pattern == nil or type(pat) ~= "string" then
     return false
   end
-  if not pat:find("[%*%?%[]") then
+  if not nx.glob.is_glob(pat) then
     return false -- no glob: exact compare above is the only match
   end
-  -- A separator-less glob matches the path tail (basename), like vim.
-  local target = pattern
-  if not pat:find("/", 1, true) then
-    target = pattern:match("[^/]*$") or pattern
-  end
-  -- Build an anchored Lua pattern: escape Lua magic (but not the glob `* ? [`),
-  -- then turn the shell wildcards into their Lua-pattern equivalents. A bracket
-  -- class rides through as-is, but its negation spellings need repair: shell-style
-  -- `[!abc]` becomes Lua's `[^abc]`, and vim-style `[^abc]` gets its `^` un-escaped
-  -- (the blanket escape above can't tell it opened a class).
-  local lp = pat:gsub("[%(%)%.%%%+%-%^%$]", "%%%1"):gsub("%*", ".*"):gsub("%?", ".")
-  lp = lp:gsub("%[!", "[^"):gsub("%[%%%^", "[^")
-  -- A malformed class (`foo[bar`) is not a valid Lua pattern; treat it as matching
-  -- nothing rather than raising out of every subsequent event fire (a buffer
-  -- literally named `foo[bar` was already caught by the exact compare above).
-  local ok, matched = pcall(string.match, target, "^" .. lp .. "$")
-  return ok and matched ~= nil
+  -- A backstop, not the diagnostic: `au_check_patterns` already rejected an
+  -- uncompilable pattern at registration, so reaching the failure arm here means the
+  -- pattern arrived some other way. It must not raise out of every subsequent event
+  -- fire, so it matches nothing — the literal spelling was already caught by the exact
+  -- compare above. (An unclosed class like `foo[bar` is not invalid: the engine takes
+  -- it as literal text.)
+  local ok, matched = pcall(nx.glob.match, pat, pattern, AU_GLOB)
+  return ok and matched
 end
 
 -- Whether the autocmd's `pat` (a string, a list, or nil = match-all) matches the

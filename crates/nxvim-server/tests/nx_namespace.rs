@@ -1303,3 +1303,67 @@ async fn option_value_rejects_an_unknown_scope() {
     );
     assert!(s.contains("bogus"), "the error names it, got {s:?}");
 }
+
+/// `nx.runtime_file` globs its final component with the full `nx.glob` dialect, not a
+/// single-`*` special case. Before the glob convergence `host.rs::glob_match` split
+/// the pattern on the FIRST `*` and compared a prefix/suffix, so a second `*`, a `?`,
+/// a bracket class and brace alternation all silently matched nothing (or the wrong
+/// thing).
+#[tokio::test]
+async fn runtime_file_globs_with_the_full_dialect() {
+    let dir = nxvim_test_harness::temp_dir("rtf_glob");
+    let colors = dir.join("colors");
+    std::fs::create_dir(&colors).expect("create colors dir");
+    for name in [
+        "alpha.lua",
+        "beta.lua",
+        "gamma-dark.lua",
+        "gamma-light.lua",
+        "notes.txt",
+    ] {
+        std::fs::write(colors.join(name), "-- x\n").expect("write color file");
+    }
+
+    // `config_init` puts `dir` on the runtimepath as well as sourcing its init.lua.
+    let (rpc, _incoming) = start_attached(nxvim_test_harness::config_init(&dir, ""), 80, 24).await;
+
+    // A helper returning the sorted basenames matched by a runtimepath pattern.
+    let names = |pattern: &str| {
+        let code = format!(
+            "local out = {{}}\n\
+             for _, p in ipairs(nx.runtime_file({pattern:?}, true)) do\n\
+             \x20 out[#out + 1] = p:match('[^/]+$')\n\
+             end\n\
+             table.sort(out)\n\
+             return table.concat(out, ',')"
+        );
+        let rpc = &rpc;
+        async move {
+            exec_lua(rpc, &code)
+                .await
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
+
+    // A single `*` worked before and must keep working.
+    assert_eq!(
+        names("colors/*.lua").await,
+        "alpha.lua,beta.lua,gamma-dark.lua,gamma-light.lua"
+    );
+    // TWO `*`s — the old prefix/suffix split could not express this.
+    assert_eq!(names("colors/*a*-dark.lua").await, "gamma-dark.lua");
+    // `?` is a single character.
+    assert_eq!(names("colors/?eta.lua").await, "beta.lua");
+    // A bracket class.
+    assert_eq!(names("colors/[ab]*.lua").await, "alpha.lua,beta.lua");
+    // Brace alternation.
+    assert_eq!(
+        names("colors/gamma-{dark,light}.lua").await,
+        "gamma-dark.lua,gamma-light.lua"
+    );
+    // A glob-free name still resolves as a literal path (the fast existence check).
+    assert_eq!(names("colors/alpha.lua").await, "alpha.lua");
+    assert_eq!(names("colors/nonesuch.lua").await, "");
+}

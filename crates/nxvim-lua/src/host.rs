@@ -6,10 +6,27 @@ use std::path::{Path, PathBuf};
 
 /// Full paths of the files matching `name` across `runtimepath`, the engine of
 /// `nvim_get_runtime_file`. `name` is a runtimepath-relative path whose final
-/// component may contain a single `*` glob; earlier components are matched
-/// literally. Stops at the first hit when `!all`.
+/// component may be a glob in the full [`nxvim_core::glob`] dialect (`*`, `?`,
+/// `[abc]`, `{a,b}`, several wildcards in one component); earlier components are
+/// matched literally. Stops at the first hit when `!all`.
+///
+/// Within one runtimepath entry the directory listing is sorted, so `all = false`
+/// picks a *deterministic* first match rather than whatever order the filesystem
+/// happened to yield.
 pub(crate) fn get_runtime_file(runtimepath: &[PathBuf], name: &str, all: bool) -> Vec<String> {
     let (dir_part, file_part) = name.rsplit_once('/').unwrap_or(("", name));
+    // Compile once, outside the loop: the same glob is tested against every
+    // runtimepath entry's listing, and the engine caches the compiled regex anyway.
+    //
+    // A pattern that carries a metacharacter but does not COMPILE (a reversed range,
+    // say) falls through to the literal branch. That is not a swallowed error: a real
+    // filename may contain `[`, `?` or `{`, so "not a valid glob" genuinely means
+    // "this is a literal name" here.
+    let glob = if nxvim_core::glob::is_glob(file_part) {
+        nxvim_core::glob::compile(file_part, &nxvim_core::glob::GlobOpts::default()).ok()
+    } else {
+        None
+    };
     let mut out = Vec::new();
     for rt in runtimepath {
         let base = if dir_part.is_empty() {
@@ -17,25 +34,31 @@ pub(crate) fn get_runtime_file(runtimepath: &[PathBuf], name: &str, all: bool) -
         } else {
             rt.join(dir_part)
         };
-        if file_part.contains('*') {
-            let Ok(entries) = std::fs::read_dir(&base) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let fname = entry.file_name();
-                if glob_match(file_part, &fname.to_string_lossy()) {
-                    out.push(entry.path().to_string_lossy().into_owned());
+        match &glob {
+            Some(glob) => {
+                let Ok(entries) = std::fs::read_dir(&base) else {
+                    continue;
+                };
+                let mut hits: Vec<PathBuf> = entries
+                    .flatten()
+                    .filter(|e| glob.is_match(entry_name_bytes(&e.file_name())))
+                    .map(|e| e.path())
+                    .collect();
+                hits.sort();
+                for hit in hits {
+                    out.push(hit.to_string_lossy().into_owned());
                     if !all {
                         return out;
                     }
                 }
             }
-        } else {
-            let full = base.join(file_part);
-            if full.exists() {
-                out.push(full.to_string_lossy().into_owned());
-                if !all {
-                    return out;
+            None => {
+                let full = base.join(file_part);
+                if full.exists() {
+                    out.push(full.to_string_lossy().into_owned());
+                    if !all {
+                        return out;
+                    }
                 }
             }
         }
@@ -43,14 +66,22 @@ pub(crate) fn get_runtime_file(runtimepath: &[PathBuf], name: &str, all: bool) -
     out
 }
 
-/// Match a single path component against a glob with at most one `*` (the only
-/// form `nvim_get_runtime_file` callers use, e.g. `lsp/*.lua`).
-fn glob_match(pat: &str, name: &str) -> bool {
-    match pat.split_once('*') {
-        Some((pre, suf)) => {
-            name.len() >= pre.len() + suf.len() && name.starts_with(pre) && name.ends_with(suf)
+/// A directory entry's name as the bytes the filesystem actually holds, which is what
+/// the glob engine matches. On unix a filename is arbitrary bytes, so matching its
+/// lossy UTF-8 rendering would let a `?` or `*` mismatch a perfectly real file (every
+/// invalid byte having become a 3-byte U+FFFD). Where `OsStr` offers no byte view,
+/// lossy is all there is — but those platforms have no byte filenames either.
+fn entry_name_bytes(name: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(name))
+    }
+    #[cfg(not(unix))]
+    {
+        match name.to_string_lossy() {
+            std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(s.as_bytes()),
+            std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s.into_bytes()),
         }
-        None => pat == name,
     }
 }
 

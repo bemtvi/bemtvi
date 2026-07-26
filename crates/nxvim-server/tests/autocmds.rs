@@ -2135,3 +2135,149 @@ async fn create_autocmd_unknown_group_fails_loud_instead_of_registering_ungroupe
         "and registered nothing (not an unreachable ungrouped autocmd), got {s:?}"
     );
 }
+
+/// Autocmd patterns speak the full `nx.glob` dialect, so `**` crosses path
+/// separators explicitly. Before the glob convergence the pattern matcher translated
+/// globs into Lua patterns, where `**` was just two `.*` in a row and `{a,b}` was
+/// literal text — both silently mismatched.
+#[tokio::test]
+async fn autocmd_patterns_support_doublestar_and_brace_alternation() {
+    let dir = temp_dir("au_glob_dialect");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let out = exec_lua(
+        &rpc,
+        "_G.hits = {}\n\
+         local function on(pat)\n\
+         \x20 vim.api.nvim_create_autocmd('User', { pattern = pat,\n\
+         \x20   callback = function(a) _G.hits[#_G.hits + 1] = pat .. '<-' .. a.match end })\n\
+         end\n\
+         on('src/**/*.rs')\n\
+         on('*.{rs,toml}')\n\
+         on('{a,b}/x.txt')\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'src/a/b/mod.rs' })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'Cargo.toml' })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'b/x.txt' })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'c/x.txt' })\n\
+         return table.concat(_G.hits, ',')",
+    )
+    .await;
+    assert_eq!(
+        out.as_str(),
+        Some(
+            "src/**/*.rs<-src/a/b/mod.rs,\
+             *.{rs,toml}<-src/a/b/mod.rs,\
+             *.{rs,toml}<-Cargo.toml,\
+             {a,b}/x.txt<-b/x.txt"
+        ),
+        "`**` must span directories and `{{a,b}}` must alternate. `*.{{rs,toml}}` is \
+         separator-less, so vim's basename rule ALSO fires it for `src/a/b/mod.rs` \
+         (tail `mod.rs`). `c/x.txt` matches nothing."
+    );
+}
+
+/// The convergence must NOT change vim's own file-pattern rules, which differ from
+/// the `nx.glob` defaults on two counts: a bare `*` crosses `/` (nx.glob defaults to
+/// stopping at it), and a separator-less pattern matches the path *tail*. Both are
+/// passed explicitly by the autocmd matcher.
+#[tokio::test]
+async fn autocmd_patterns_keep_vims_star_and_basename_rules() {
+    let dir = temp_dir("au_glob_vimrules");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let out = exec_lua(
+        &rpc,
+        "_G.hits = {}\n\
+         vim.api.nvim_create_autocmd('User', { pattern = '*.lua',\n\
+         \x20 callback = function(a) _G.hits[#_G.hits + 1] = 'tail:' .. a.match end })\n\
+         vim.api.nvim_create_autocmd('User', { pattern = '/etc/*',\n\
+         \x20 callback = function(a) _G.hits[#_G.hits + 1] = 'abs:' .. a.match end })\n\
+         -- a separator-less glob matches the path TAIL, at any depth\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = '/a/b/c/init.lua' })\n\
+         -- a `*` in a rooted pattern still crosses `/` (vim's rule, not nx.glob's default)\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = '/etc/nginx/nginx.conf' })\n\
+         return table.concat(_G.hits, ',')",
+    )
+    .await;
+    assert_eq!(
+        out.as_str(),
+        Some("tail:/a/b/c/init.lua,abs:/etc/nginx/nginx.conf"),
+        "vim's file-pattern rules must survive the glob convergence"
+    );
+}
+
+/// A `FileType`-style metacharacter-free pattern stays an EXACT compare — it must not
+/// start glob-matching a path's tail just because the engine underneath can. (`rust`
+/// must not match `/a/b/rust`.)
+#[tokio::test]
+async fn a_metacharacter_free_pattern_stays_an_exact_compare() {
+    let dir = temp_dir("au_glob_exact");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let out = exec_lua(
+        &rpc,
+        "_G.hits = {}\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'rust',\n\
+         \x20 callback = function(a) _G.hits[#_G.hits + 1] = a.match end })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = '/a/b/rust' })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'rust' })\n\
+         return table.concat(_G.hits, ',')",
+    )
+    .await;
+    assert_eq!(
+        out.as_str(),
+        Some("rust"),
+        "a glob-free pattern matches only itself, never a path whose tail equals it"
+    );
+}
+
+/// An autocmd whose pattern is a glob that cannot COMPILE must fail loud at
+/// registration. Matching happens inside a `pcall` per event fire (it has to — an
+/// autocmd must not raise out of every subsequent event), so without a registration
+/// check the autocmd would register happily and then silently never fire, for the rest
+/// of the session, with no diagnostic anywhere. The error names the pattern and the
+/// reason, and nothing is registered.
+#[tokio::test]
+async fn an_uncompilable_autocmd_pattern_fails_loud_at_registration() {
+    let dir = temp_dir("au_glob_invalid");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let out = exec_lua(
+        &rpc,
+        "_G.hits = {}\n\
+         local function reg(pat)\n\
+         \x20 return select(2, pcall(vim.api.nvim_create_autocmd, 'User', { pattern = pat,\n\
+         \x20   callback = function(a) _G.hits[#_G.hits + 1] = a.match end }))\n\
+         end\n\
+         local before = reg('*.before')\n\
+         local one = tostring(reg('x[z-a]*.lua'))\n\
+         -- a list form must be checked element-wise, not just the first entry\n\
+         local list = tostring(reg({ '*.lua', 'y[9-0]*.rs' }))\n\
+         local after = reg('*.after')\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'a.after' })\n\
+         return one:gsub('\\n.*', '') .. '\\n' .. list:gsub('\\n.*', '')\n\
+         \x20 .. '\\nids=' .. tostring(after - before)\n\
+         \x20 .. ' fired=' .. table.concat(_G.hits, ',')",
+    )
+    .await;
+    let s = out.as_str().unwrap_or_default();
+    assert!(
+        s.contains("invalid pattern \"x[z-a]*.lua\"") && s.contains("'z' > 'a'"),
+        "the error must name the offending pattern and the reason, got {s:?}"
+    );
+    assert!(
+        s.contains("invalid pattern \"y[9-0]*.rs\""),
+        "every pattern in a list form must be checked, got {s:?}"
+    );
+    assert!(
+        s.contains("nx.autocmd.create") && s.contains("User"),
+        "the error must name the call and the event, got {s:?}"
+    );
+    assert!(
+        !s.contains("nxvim:prelude/autocmd"),
+        "the raise must be positioned at the CALLER's line, not at the prelude source \
+         the caller never wrote (error level 3, not 2), got {s:?}"
+    );
+    assert!(
+        s.contains("ids=1 fired=a.after"),
+        "a valid pattern must still register and fire, and the two rejected ones must \
+         have consumed no autocmd id (so the id after them is the id before them + 1), \
+         got {s:?}"
+    );
+}

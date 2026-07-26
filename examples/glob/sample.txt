@@ -1,0 +1,43 @@
+# A list of paths, one per line — the :Glob commands match against these.
+# Edit them and re-run any command. Lines starting with # are skipped.
+
+# --- root-level files: `*.rs` matches these, `**/*.rs` matches these AND nested ones
+main.rs
+build.rs
+Cargo.toml
+README.md
+init.lua
+
+# --- nested: `*.rs` does NOT match these (`*` stops at `/`); `**/*.rs` does
+src/lib.rs
+src/editor/mod.rs
+src/editor/motions.rs
+src/glob.rs
+crates/nxvim-core/Cargo.toml
+crates/nxvim-core/src/glob.rs
+
+# --- lua, at several depths: try `**/*.lua` vs `*.lua` vs `**/[!_]*.lua`
+conf/init.lua
+conf/nvim/init.lua
+lua/plugin/_private.lua
+lua/plugin/public.lua
+
+# --- things an ignore set should drop: try :GlobIgnore
+target/debug/build.rs
+target/release/nxvim
+.git/config
+.git/hooks/pre-commit
+scratch/notes.tmp
+build/out.tmp
+
+# --- brace alternation: try `src/**/*.{rs,toml}` and `*.{md,txt}`
+docs/architecture.md
+docs/plans/2026-07-26-nx-glob.md
+notes.txt
+
+# --- these lines are themselves globs: try :GlobIsGlob
+src/*.rs
+**/*.lua
+a?c.txt
+[ab]-file.txt
+{a,b}.txt

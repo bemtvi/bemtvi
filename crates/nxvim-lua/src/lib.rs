@@ -26,6 +26,7 @@
 mod convert;
 mod fswire;
 mod gitwire;
+mod glob;
 mod host;
 mod httpwire;
 mod install;

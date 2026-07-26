@@ -28,6 +28,10 @@ ropey.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
 regex.workspace = true
+# Glob parsing for the pure `nxvim_core::glob` module (behind `nx.glob`). Translator
+# only: we compile its `Glob::regex()` output with the `regex` crate above so path
+# style stays an explicit option instead of a host `#[cfg]`. See `glob.rs`.
+globset.workspace = true
 nucleo-matcher.workspace = true
 encoding_rs.workspace = true
 pulldown-cmark.workspace = true

@@ -16,6 +16,7 @@ pub mod editor;
 pub mod encoding;
 pub mod extmark;
 pub mod fuzzy;
+pub mod glob;
 pub mod highlight;
 pub mod host;
 pub mod input;

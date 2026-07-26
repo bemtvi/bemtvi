@@ -512,6 +512,11 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // …) — builds on the timer and promise surfaces just above, and loads before
     // every editor-facing surface so any of them can lean on a util.
     ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
+    // nx.glob: shell/gitignore-style path patterns over the nx._glob* bridges (the
+    // canonical engine is nxvim_core::glob — globset parses, the translated regex is
+    // compiled and cached). Pure string math, no editor state, so it sits with the
+    // other utilities — and BEFORE autocmd.lua, whose pattern matcher is built on it.
+    ("nxvim:prelude/glob", include_str!("prelude/glob.lua")),
     // The Rust↔Lua mirror state, shared resolvers, context lock, and the scalar
     // surfaces (variables / options / registers) the entity API reads.
     ("nxvim:prelude/state", include_str!("prelude/state.lua")),

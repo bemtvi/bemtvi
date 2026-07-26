@@ -1083,10 +1083,13 @@ impl Editor {
         let Some((pattern, every, jump, files)) = self.parse_vimgrep_args(args) else {
             return;
         };
-        // Globbing is deferred (Phase 4); a glob argument fails loud and aborts the
-        // whole command rather than searching the rest and reporting a misleading
-        // "no match".
-        if let Some(g) = files.iter().find(|f| is_glob(f)) {
+        // Glob EXPANSION is still deferred: turning a pattern into a file list means
+        // walking directories, which under the remote/daemon rule has to ride the
+        // async fs seam rather than block here. Detection uses the canonical
+        // predicate (`crate::glob::is_glob`, the same one `nx.glob.is_glob` exposes),
+        // and a glob argument fails loud and aborts the whole command rather than
+        // searching the rest and reporting a misleading "no match".
+        if let Some(g) = files.iter().find(|f| crate::glob::is_glob(f)) {
             self.echo(format!(
                 "E: :vimgrep file globbing is not yet supported: {g}"
             ));
@@ -1239,12 +1242,6 @@ impl Editor {
             }
         }
     }
-}
-
-/// Whether `arg` carries a shell/file glob metacharacter (`*`, `?`, `[`). Globbing
-/// in `:vimgrep` file arguments is deferred (Phase 4); such an argument fails loud.
-fn is_glob(arg: &str) -> bool {
-    arg.contains('*') || arg.contains('?') || arg.contains('[')
 }
 
 /// A stable per-file identity for an entry, used by `:cnfile`/`:cpfile` to group

@@ -4022,6 +4022,72 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // The `nx.glob.*` primitives. The documented surface is the Lua wrapper in
+    // `prelude/glob.lua`; these are the private bridges over the canonical engine in
+    // `nxvim_core::glob`, which parses the glob with `globset`, translates it to regex
+    // source, and caches the compiled `regex::bytes::Regex` — so matching in a loop
+    // costs one parse total. Pure Rust, available on every build (native + wasm).
+    //
+    // `nx._glob(pattern, opts?)` -> a compiled `LuaGlob` userdata (`:test`/`:regex`/
+    // `:pattern`). An invalid pattern raises.
+    nx.set(
+        "_glob",
+        lua.create_function(|_, (pattern, opts): (mlua::Value, Option<Table>)| {
+            let pattern = crate::glob::pattern("nx.glob.compile", &pattern)?;
+            crate::glob::LuaGlob::compile(&pattern, opts.as_ref())
+        })?,
+    )?;
+    // `nx._glob_set(patterns, opts?)` -> a compiled `LuaGlobSet` userdata testing a
+    // path against every pattern in one `RegexSet` pass (`:test`/`:matches`).
+    nx.set(
+        "_glob_set",
+        lua.create_function(|_, (patterns, opts): (Vec<mlua::Value>, Option<Table>)| {
+            let patterns = patterns
+                .iter()
+                .enumerate()
+                .map(|(i, p)| crate::glob::pattern(&format!("nx.glob.set: pattern #{}", i + 1), p))
+                .collect::<mlua::Result<Vec<String>>>()?;
+            crate::glob::LuaGlobSet::compile(patterns, opts.as_ref())
+        })?,
+    )?;
+    // `nx._glob_match(pattern, path, opts?)` -> boolean: the one-shot match, straight
+    // through the core's cache (no userdata round-trip for a single test). The path is
+    // matched as BYTES, so a name that is not valid UTF-8 answers by its real bytes.
+    nx.set(
+        "_glob_match",
+        lua.create_function(
+            |_, (pattern, path, opts): (mlua::Value, mlua::Value, Option<Table>)| {
+                let pattern = crate::glob::pattern("nx.glob.match", &pattern)?;
+                let path = crate::glob::candidate("nx.glob.match", "path", &path)?;
+                let opts = crate::glob::opts_from_table(opts.as_ref())?;
+                nxvim_core::glob::is_match(&pattern, &*path.as_bytes(), &opts)
+                    .map_err(|e| mlua::Error::runtime(format!("nx.glob: {e}")))
+            },
+        )?,
+    )?;
+    // `nx._glob_to_regex(pattern, opts?)` -> the regex source `pattern` translates to,
+    // without compiling or caching it. Introspection, and for handing the translation
+    // to another engine.
+    nx.set(
+        "_glob_to_regex",
+        lua.create_function(|_, (pattern, opts): (mlua::Value, Option<Table>)| {
+            let pattern = crate::glob::pattern("nx.glob.to_regex", &pattern)?;
+            let opts = crate::glob::opts_from_table(opts.as_ref())?;
+            nxvim_core::glob::to_regex(&pattern, &opts)
+                .map_err(|e| mlua::Error::runtime(format!("nx.glob: {e}")))
+        })?,
+    )?;
+    // `nx._glob_is_glob(s)` -> boolean: does `s` carry a glob metacharacter (i.e. is
+    // it a pattern rather than a plain path)? The one canonical predicate. Every
+    // metacharacter is ASCII, so this answers for a non-UTF-8 name too.
+    nx.set(
+        "_glob_is_glob",
+        lua.create_function(|_, s: mlua::Value| {
+            let s = crate::glob::candidate("nx.glob.is_glob", "value", &s)?;
+            Ok(nxvim_core::glob::is_glob(&*s.as_bytes()))
+        })?,
+    )?;
+
     // `nx._json_decode(str)`: parse a JSON document into the equivalent Lua value
     // (objects -> string-keyed tables, arrays -> sequences, `null` -> nil). Backs
     // `vim.json.decode`; raises on malformed input, matching neovim. The config

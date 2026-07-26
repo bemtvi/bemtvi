@@ -382,6 +382,10 @@ pub struct ImageData {
 /// region's own origin; the renderer maps the region to an absolute screen origin
 /// using the [`View`]'s dock band sizes. `Main` is the default and the only region
 /// when no dock is open.
+///
+/// `Screen` is the whole **windows area** (the frame minus the command line) rather
+/// than a layout band: an `editor`-relative float is placed there so it can span the
+/// dock bands, and its origin is the windows area's own.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowRegion {
     #[default]
@@ -390,16 +394,18 @@ pub enum WindowRegion {
     DockRight,
     DockTop,
     DockBottom,
+    Screen,
 }
 
 impl WindowRegion {
-    /// Decode the wire string (`"main"`/`"dock_left"`/…); unknown ⇒ `Main`.
+    /// Decode the wire string (`"main"`/`"dock_left"`/`"screen"`/…); unknown ⇒ `Main`.
     fn from_wire(s: &str) -> WindowRegion {
         match s {
             "dock_left" => WindowRegion::DockLeft,
             "dock_right" => WindowRegion::DockRight,
             "dock_top" => WindowRegion::DockTop,
             "dock_bottom" => WindowRegion::DockBottom,
+            "screen" => WindowRegion::Screen,
             _ => WindowRegion::Main,
         }
     }

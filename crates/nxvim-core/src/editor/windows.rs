@@ -705,8 +705,9 @@ impl WindowTree {
     /// area; a `Split` subtracts one cell per inter-child border, distributes the
     /// rest by `sizes`, and recurses. After the tiled pass, [floats](Self::floats)
     /// are positioned absolutely on top (`cursor_off` is the focused window's
-    /// cursor cell offset from its own rect top-left, for `relative="cursor"`).
-    pub(crate) fn layout(&mut self, total: Rect, cursor_off: (usize, usize)) {
+    /// cursor cell offset from its own rect top-left, for `relative="cursor"`;
+    /// `screen` is the whole windows area, for `relative="editor"`).
+    pub(crate) fn layout(&mut self, total: Rect, screen: Rect, cursor_off: (usize, usize)) {
         let mut rects: Vec<(WindowId, Rect)> = Vec::new();
         let mut seps: Vec<Separator> = Vec::new();
         layout_node(&mut self.root, total, &mut rects, &mut seps);
@@ -716,7 +717,7 @@ impl WindowTree {
             }
         }
         self.separators = seps;
-        self.position_floats(total, cursor_off);
+        self.position_floats(total, screen, cursor_off);
     }
 
     /// Position every floating window absolutely on top of the freshly-laid tiled
@@ -724,7 +725,19 @@ impl WindowTree {
     /// reads up-to-date tiled rects. The cursor's absolute cell is the focused
     /// window's rect origin plus `cursor_off`. A no-op when there are no floats,
     /// so a session without floats lays out exactly as before.
-    pub(crate) fn position_floats(&mut self, total: Rect, cursor_off: (usize, usize)) {
+    ///
+    /// Two coordinate spaces meet here. A `win`/`cursor` float is anchored to
+    /// something *inside this tree*, so it is placed (and clamped) in the tree's own
+    /// region cells, like every tiled window. An `editor` float is anchored to the
+    /// whole editor, so it is placed in `screen` — the windows area, dock bands
+    /// included — and projected in [`WindowRegion::Screen`] cells. Which space a
+    /// float's `rect` is in is exactly what its region says.
+    pub(crate) fn position_floats(
+        &mut self,
+        total: Rect,
+        screen: Rect,
+        cursor_off: (usize, usize),
+    ) {
         if self.floats.is_empty() {
             return;
         }
@@ -740,19 +753,26 @@ impl WindowTree {
             .iter()
             .filter_map(|&id| {
                 let cfg = self.windows.get(&id)?.float.clone()?;
-                let origin = match cfg.relative {
-                    FloatRelative::Editor => total,
-                    FloatRelative::Win(wid) => {
-                        self.windows.get(&wid).map(|w| w.rect).unwrap_or(total)
-                    }
-                    FloatRelative::Cursor => Rect {
-                        x: cursor_cell.0,
-                        y: cursor_cell.1,
-                        width: 0,
-                        height: 0,
-                    },
+                // `bounds` is the space this float sizes, aligns, and clamps against
+                // — the whole screen for an `editor` float, this tree's region for
+                // the two tree-anchored ones.
+                let (origin, bounds) = match cfg.relative {
+                    FloatRelative::Editor => (screen, screen),
+                    FloatRelative::Win(wid) => (
+                        self.windows.get(&wid).map(|w| w.rect).unwrap_or(total),
+                        total,
+                    ),
+                    FloatRelative::Cursor => (
+                        Rect {
+                            x: cursor_cell.0,
+                            y: cursor_cell.1,
+                            width: 0,
+                            height: 0,
+                        },
+                        total,
+                    ),
                 };
-                Some((id, place_float(origin, total, &cfg)))
+                Some((id, place_float(origin, bounds, &cfg)))
             })
             .collect();
         for (id, rect) in placements {
@@ -2111,6 +2131,13 @@ impl Editor {
                     Some(cfg) => (true, cfg.border, cfg.title.clone()),
                     None => (false, BorderStyle::None, None),
                 };
+                // An `editor` float was placed in screen cells, not this tree's
+                // region cells (see `position_floats`), so it says so — the client
+                // offsets it by the windows-area origin instead of the region's.
+                let region = match &w.float {
+                    Some(cfg) if cfg.relative == FloatRelative::Editor => WindowRegion::Screen,
+                    _ => region,
+                };
                 out.push(WindowLayout {
                     id,
                     buffer: w.buffer,
@@ -2907,6 +2934,17 @@ impl Editor {
             .saturating_sub(bands.reserved_left())
             .saturating_sub(bands.reserved_right())
             .max(1);
+        // The whole windows area, in the client's own cells: everything the frame has
+        // left after the command line (which the reported `height` already excludes).
+        // This is what an `editor`-relative float positions against — the tabline row
+        // and the dock bands included, exactly like neovim's editor grid — so such a
+        // float is free to span regions the tree it belongs to cannot.
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        };
         // Lay out every open layer's tree at origin (0, 0) in its own region size;
         // each client maps the region to its absolute screen origin (the dock
         // bands it receives in the `View`). With no dock open this is exactly the
@@ -2961,7 +2999,7 @@ impl Editor {
                 (0, 0)
             };
             if let Some(t) = self.layer_tree_mut(layer) {
-                t.layout(rect, off);
+                t.layout(rect, screen, off);
             }
         }
         self.apply_panel_margin();
@@ -3050,10 +3088,12 @@ fn region_of_layer(layer: Layer) -> WindowRegion {
 
 /// The [`Layer`] a [`WindowRegion`] belongs to — the inverse of
 /// [`region_of_layer`], so a projection that carries a region can look up the
-/// region's dock-scoped options.
+/// region's dock-scoped options. [`WindowRegion::Screen`] is a coordinate space,
+/// not a layout band — it belongs to no dock, so it reads the main layer's
+/// (i.e. the global) scoped options.
 fn layer_of_region(region: WindowRegion) -> Layer {
     match region {
-        WindowRegion::Main => Layer::Main,
+        WindowRegion::Main | WindowRegion::Screen => Layer::Main,
         WindowRegion::DockLeft => Layer::Dock(DockSide::Left),
         WindowRegion::DockRight => Layer::Dock(DockSide::Right),
         WindowRegion::DockTop => Layer::Dock(DockSide::Top),

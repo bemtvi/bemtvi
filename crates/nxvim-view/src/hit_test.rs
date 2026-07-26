@@ -189,12 +189,15 @@ fn region_origin(view: &View, geo: Geometry, region: WindowRegion) -> (u16, u16)
             WindowRegion::DockRight => &view.region_tablines.right,
             WindowRegion::DockTop => &view.region_tablines.top,
             WindowRegion::DockBottom => &view.region_tablines.bottom,
-            WindowRegion::Main => return 0,
+            WindowRegion::Main | WindowRegion::Screen => return 0,
         };
         u16::from(!rt.tabs.is_empty() && band > 1)
     };
     match region {
         WindowRegion::Main => (reserved_left, mid_y),
+        // The windows area starts at the frame's top-left: a screen-relative float's
+        // cells are already absolute.
+        WindowRegion::Screen => (0, 0),
         WindowRegion::DockLeft => (0, mid_y.saturating_add(dock_tl(region, mid_h))),
         WindowRegion::DockRight => (
             reserved_left.saturating_add(main_w).saturating_add(1),

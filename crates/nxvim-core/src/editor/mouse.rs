@@ -11,6 +11,7 @@
 //! tab/wide-char [`virtcol`](crate::unicode::virtcol) math, run backwards.
 
 use super::*;
+use crate::editor::windows::Window;
 use crate::input::{MouseAction, MouseButton, MouseEvent, MouseKind, WheelDir};
 
 /// Place a docs sidebar of `content_w` columns beside a popup box whose content
@@ -1153,6 +1154,35 @@ impl Editor {
         })
     }
 
+    /// The top-most `editor`-relative float covering the **global** cell
+    /// `(row, col)`, with the cell made content-relative to it. These floats are laid
+    /// out in screen cells and may hang over any region (or the chrome between two),
+    /// so they are resolved *before* [`region_at`](Self::region_at) — which knows only
+    /// about layout bands — and are skipped by the per-region probe.
+    ///
+    /// Every layer's floats are candidates: a float belongs to whichever tree had
+    /// focus when it opened, but where it *paints* has nothing to do with that tree.
+    /// Both scans run top-most first, mirroring the paint order: within a tree `floats`
+    /// is sorted bottom-to-top by `(zindex, id)`, so it is walked in reverse; across
+    /// trees the client paints main's windows before the docks' (`window_layouts`
+    /// order), so the dock layers are probed before main.
+    fn screen_float_at(&self, row: usize, col: usize) -> Option<(WindowId, usize, usize)> {
+        self.open_layers()
+            .into_iter()
+            .rev()
+            .filter_map(|layer| self.layer_tree(layer))
+            .find_map(|tree| {
+                tree.floats
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|&id| is_screen_float(tree.get(id)))
+                    .find_map(|id| {
+                        probe_window(tree.get(id), col, row).map(|(rx, ry)| (id, rx, ry))
+                    })
+            })
+    }
+
     /// Switch the region whose tabline cell holds the click to that tab, moving
     /// focus into it (vim's tabline click, per region). A click on the
     /// already-active tab of the focused region is a no-op. No cursor is placed in
@@ -1968,49 +1998,38 @@ impl Editor {
     }
 
     /// The open cmdline **wildmenu** box's placement — `(box_row, box_col, box_w, box_h,
-    /// bound_w)` in the focused window's **region cells** — for the server's cmdline-docs
-    /// sync to place the docs float beside / above it. `None` unless a
-    /// [`MenuPlacement::Cmdline`] menu is open.
+    /// bound_w)` in **windows-area cells** — for the server's cmdline-docs sync to place
+    /// the docs float beside / above it. `None` unless a [`MenuPlacement::Cmdline`] menu
+    /// is open.
     ///
     /// The box is anchored to the **command line** (frame bottom), not the focused
     /// window: the client draws it against `cmd_area`, growing upward, and discards
-    /// `menu_geom`'s `row` (which is focused-window-text-area relative). The docs float,
-    /// though, is a real [`FloatRelative::Editor`](super::windows::FloatRelative) window
-    /// laid out in the focused window's region (origin `0,0`, height the region's tree
-    /// height), so it needs region-relative geometry — not the raw `menu_geom` row, which
-    /// would place it at a focused-window-relative row treated as region-absolute. With a
-    /// split that pulled the float up into the active pane (the half-height `text_height`),
-    /// and even without one left it several rows off the command line. So bottom-align the
-    /// box to the region's tree bottom (just above the command line) and rebase the token
-    /// column into the region, mirroring where the client actually draws the box — the
-    /// cmdline twin of [`complete_docs_geom`](Self::complete_docs_geom)'s region rebasing.
+    /// `menu_geom`'s `row` (which is focused-window-text-area relative). The docs float
+    /// is a real [`FloatRelative::Editor`](super::windows::FloatRelative) window, laid
+    /// out against the whole windows area — the same space the client draws this box in
+    /// — so bottom-align the box to the windows-area bottom (the row just above the
+    /// command line) and take `menu_geom`'s token column as-is (it is measured from the
+    /// full-width command line's start, i.e. already absolute). Using the raw
+    /// `menu_geom` row instead would place the float at a focused-window-relative row.
     pub fn cmdline_menu_box(&self) -> Option<(usize, usize, usize, usize, usize)> {
         let m = self.menu_view()?;
         if !matches!(m.placement, MenuPlacement::Cmdline) {
             return None;
         }
-        let (metrics, win, _num) = self.menu_anchor()?;
+        let (metrics, _win, _num) = self.menu_anchor()?;
         let geom = self.menu_geom(&m, metrics);
-        // The region (layer) `win` lives in, laid out at origin `0,0`: its tree width /
-        // height bound the float and give the command-line row (tree bottom); its screen
-        // x rebases the token column (measured from the full-width command line's start).
-        let (layer, _) = self.tree_of_window(win)?;
-        let (region_x, _region_y, region_w, region_h) = self
-            .region_geoms()
-            .into_iter()
-            .find(|g| g.layer == layer)?
-            .tree;
-        let box_row = region_h.saturating_sub(geom.height);
-        let box_col = geom.col.saturating_sub(region_x);
-        Some((box_row, box_col, geom.width, geom.height, region_w))
+        let (editor_w, editor_h) = self.screen_size();
+        let box_row = editor_h.saturating_sub(geom.height);
+        Some((box_row, geom.col, geom.width, geom.height, editor_w))
     }
 
     /// The completion **docs float**'s placement beside the popup box: its outer
-    /// top-left `(row, col)` and inner `(width, height)`, all in the focused window's
-    /// **region cells** (its layer's tree lays out at origin `0,0`; the client offsets
-    /// by the region's screen origin) — the space a `FloatRelative::Editor` float is
-    /// positioned in, so the float lands exactly where the server-projected popup
-    /// overlay does. `content_lines` (the rendered doc lines) sizes it: widest line ×
+    /// top-left `(row, col)` and inner `(width, height)`, all in **windows-area
+    /// cells** — the space a `FloatRelative::Editor` float is positioned in, so the
+    /// float lands exactly where the server-projected popup overlay does. The popup
+    /// is anchored to a window, whose rect is region-relative, so the region's screen
+    /// origin is added back here (the rebasing runs *into* the screen space, not out
+    /// of it). `content_lines` (the rendered doc lines) sizes it: widest line ×
     /// count, each clamped so a long doc scrolls rather than filling the screen. The
     /// float butts against the popup — its content one cell past the popup's right
     /// border, flipping to the left when that side has more room — and top-aligns its
@@ -2041,15 +2060,14 @@ impl Editor {
         // the sign column AND the number column — not just the number width, or the
         // sidebar slides `sign_width` cells left of the popup it butts against.
         let gutter = self.window_textoff(win).unwrap_or(0);
-        // The popup box's content top-left, region-relative.
-        let content_col = rx + pad.left + gutter + geom.col;
-        let content_row = ry + pad.top + geom.row;
-        // Bound by the editor edges MINUS this region's screen origin (the dock bands +
-        // global chrome), so the float can't overrun the editor's right / bottom edge.
+        // The popup box's content top-left. The window rect is region-relative, so add
+        // the region's screen origin (the dock bands + global chrome) to reach the
+        // windows-area cell the float is placed at — and then the editor's own edges
+        // are the bound, so the float can't overrun the right / bottom edge.
         let (region_x, region_y) = self.window_region_origin(win).unwrap_or((0, 0));
-        let (editor_w, editor_h) = self.screen_size();
-        let bound_w = editor_w.saturating_sub(region_x);
-        let bound_h = editor_h.saturating_sub(region_y);
+        let content_col = region_x + rx + pad.left + gutter + geom.col;
+        let content_row = region_y + ry + pad.top + geom.row;
+        let (bound_w, bound_h) = self.screen_size();
         let content_w = content_lines
             .iter()
             .map(|l| l.chars().count())
@@ -2292,6 +2310,11 @@ impl Editor {
     /// stops at the window — the wheel needs only *which* window to scroll, not a
     /// buffer cell.
     fn window_at_cell(&self, row: usize, col: usize) -> Option<WindowId> {
+        // An `editor` float lies over every region in screen cells; it takes the cell
+        // first (see [`screen_float_at`](Self::screen_float_at)).
+        if let Some((win, ..)) = self.screen_float_at(row, col) {
+            return Some(win);
+        }
         let (layer, ox, oy) = self.region_at(row, col)?;
         let tree = self.layer_tree(layer)?;
         window_at_in(tree, col - ox, row - oy).map(|(win, ..)| win)
@@ -2352,12 +2375,20 @@ impl Editor {
         if self.global_statusline_row() == Some(row) {
             return Some(MouseTarget::GlobalStatusLine { col });
         }
+        // An `editor` float paints over everything in screen cells — including the
+        // chrome and the dock bands no region's tree covers — so it claims the cell
+        // first, already in the global space.
         // Each region's tree lays out at its own origin (0, 0) and the client offsets
         // it by the region's screen origin; this runs that offset backwards. A cell
         // on chrome (a tabline, a separator, the panel) matches no region's tree.
-        let (layer, ox, oy) = self.region_at(row, col)?;
-        let tree = self.layer_tree(layer)?;
-        let (win, rel_x, rel_y) = window_at_in(tree, col - ox, row - oy)?;
+        let (win, rel_x, rel_y) = match self.screen_float_at(row, col) {
+            Some(hit) => hit,
+            None => {
+                let (layer, ox, oy) = self.region_at(row, col)?;
+                let tree = self.layer_tree(layer)?;
+                window_at_in(tree, col - ox, row - oy)?
+            }
+        };
         let (_, text_height) = self.window_text_area(win)?;
         if rel_y >= text_height {
             // Below the text body: the status row (the last content line). `rel_x`
@@ -2482,11 +2513,24 @@ impl Editor {
 
     /// The absolute screen top-left of window `win`: its region's tree origin (from
     /// [`Editor::region_geoms`]) plus its region-relative rect — the same place
-    /// every client paints it. `None` for an unknown window.
+    /// every client paints it. An `editor` float is already laid out in screen
+    /// cells, so its rect *is* that position (adding a region origin would shift it
+    /// by a dock band it doesn't live in). `None` for an unknown window.
     fn window_screen_pos(&self, win: WindowId) -> Option<(usize, usize)> {
-        let (ox, oy) = self.window_region_origin(win)?;
         let (wx, wy, _, _) = self.window_rect(win)?;
+        if self.is_screen_relative_window(win) {
+            return Some((wx, wy));
+        }
+        let (ox, oy) = self.window_region_origin(win)?;
         Some((ox.saturating_add(wx), oy.saturating_add(wy)))
+    }
+
+    /// Whether `win` is an `editor`-relative float — laid out in screen cells rather
+    /// than its owning tree's region cells.
+    fn is_screen_relative_window(&self, win: WindowId) -> bool {
+        self.tree_of_window(win)
+            .and_then(|(_, t)| t.try_get(win))
+            .is_some_and(is_screen_float)
     }
 
     /// The global screen origin (top-left) of the window-tree area of the region
@@ -2536,34 +2580,49 @@ fn rect_contains(x: usize, y: usize, w: usize, h: usize, col: usize, row: usize)
 /// `None` when the cell is on a separator or outside every window. `tree` lays out
 /// at its own origin `(0, 0)`, so the caller subtracts the region's screen origin
 /// before calling (see [`Editor::region_at`]).
+///
+/// `editor`-relative floats are **skipped**: their rects are in screen cells, not
+/// this tree's, so testing them here would both miss them where they really are and
+/// claim cells they don't cover. [`Editor::screen_float_at`] tests those, ahead of
+/// any region resolution (they may hang over a dock this tree knows nothing about).
 fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usize, usize)> {
-    let probe = |id: WindowId| -> Option<(WindowId, usize, usize)> {
-        let w = tree.get(id);
-        // A bordered float spends one cell per side on its border; its content
-        // is the rect inset by one. Tiled windows and borderless floats use the
-        // whole rect. `'padding'` insets the content box a further per-side margin,
-        // so a click in the margin matches no window (returns past this probe), and
-        // the returned cell is **padded-content-relative** — the coordinate
-        // `text_cell_to_buf` / the status-row check expect.
-        let inset = matches!(&w.float, Some(c) if c.border != BorderStyle::None) as usize;
-        let pad = w.options.padding;
-        let r = w.rect;
-        let x0 = r.x.saturating_add(inset).saturating_add(pad.left);
-        let y0 = r.y.saturating_add(inset).saturating_add(pad.top);
-        let x1 =
-            r.x.saturating_add(r.width)
-                .saturating_sub(inset.saturating_add(pad.right));
-        let y1 =
-            r.y.saturating_add(r.height)
-                .saturating_sub(inset.saturating_add(pad.bottom));
-        (x >= x0 && x < x1 && y >= y0 && y < y1).then(|| (id, x - x0, y - y0))
-    };
     tree.floats
         .iter()
         .rev()
         .copied()
+        .filter(|&id| !is_screen_float(tree.get(id)))
         .chain(tree.leaves())
-        .find_map(probe)
+        .find_map(|id| probe_window(tree.get(id), x, y).map(|(rx, ry)| (id, rx, ry)))
+}
+
+/// Whether `w` is an `editor`-relative float — one laid out in screen cells rather
+/// than its tree's region cells (see `WindowTree::position_floats`).
+fn is_screen_float(w: &Window) -> bool {
+    matches!(&w.float, Some(c) if c.relative == FloatRelative::Editor)
+}
+
+/// The cell `(x, y)` made **content-relative** to window `w`, or `None` when it
+/// falls outside `w`'s content area. `(x, y)` must be in the same space as `w.rect`
+/// (its region's cells, or screen cells for an `editor` float).
+///
+/// A bordered float spends one cell per side on its border; its content is the rect
+/// inset by one. Tiled windows and borderless floats use the whole rect.
+/// `'padding'` insets the content box a further per-side margin, so a cell in the
+/// margin matches no window, and the returned cell is **padded-content-relative** —
+/// the coordinate `text_cell_to_buf` / the status-row check expect.
+fn probe_window(w: &Window, x: usize, y: usize) -> Option<(usize, usize)> {
+    let inset = matches!(&w.float, Some(c) if c.border != BorderStyle::None) as usize;
+    let pad = w.options.padding;
+    let r = w.rect;
+    let x0 = r.x.saturating_add(inset).saturating_add(pad.left);
+    let y0 = r.y.saturating_add(inset).saturating_add(pad.top);
+    let x1 =
+        r.x.saturating_add(r.width)
+            .saturating_sub(inset.saturating_add(pad.right));
+    let y1 =
+        r.y.saturating_add(r.height)
+            .saturating_sub(inset.saturating_add(pad.bottom));
+    (x >= x0 && x < x1 && y >= y0 && y < y1).then(|| (x - x0, y - y0))
 }
 
 /// The soft-wrap display segments of `text` and the continuation-prefix width that

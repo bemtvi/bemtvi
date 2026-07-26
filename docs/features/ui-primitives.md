@@ -303,7 +303,7 @@ bottom panel — shares one placement vocabulary, so you learn it once:
 | `width` / `height` | **Cells** (`40`) or a **viewport fraction** string — `"50vw"` (50% of editor width), `"30vh"`, `"50%"`. A fraction re-resolves on every layout, so it reflows when the terminal resizes. |
 | `align` | A 9-grid word — `"top-left"`, `"top"`, `"top-right"`, `"left"`, `"center"`, `"right"`, `"bottom-left"`, `"bottom"`, `"bottom-right"`. |
 | `margin` | Inset from the aligned corner. A number (the vertical gap; sides get ~2× to look even), or `{vertical, horizontal}` / `{top, right, bottom, left}`. |
-| `relative` | `"editor"`, `"cursor"` (anchored at the cursor, flipping for room), or `"win"`. |
+| `relative` | `"editor"` (the **whole screen** — dock bands included, so a centered float centers on the screen, not on whichever region has focus), `"cursor"` (anchored at the cursor, flipping for room), or `"win"`. |
 | `border` | `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"` (plus `"shadow"` for `nx.view` floats). |
 | `title` | A string drawn on the top border. |
 | `grab` | `true` (default for a view/component float) locks focus to it — the modal-dialog shape; `false` is a non-modal panel focus can leave. |

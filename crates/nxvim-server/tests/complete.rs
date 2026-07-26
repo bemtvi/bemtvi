@@ -1726,10 +1726,10 @@ nx.complete.setup { sources = { { 'doc' } } }";
     );
 }
 
-/// With a left dock open, the sidebar's region-relative geometry must be bounded
-/// by the editor width MINUS that region's left offset (the dock band), or it
-/// overruns the editor's right edge. Regression: it was bounded by the full editor
-/// width, so the box spilled past the right edge by the dock band's width.
+/// The sidebar is an `editor`-relative float, so its geometry is in windows-area
+/// (screen) cells — it must be placed past a left dock's band and still stop at the
+/// editor's right edge. Regression: it was computed in the popup's *region* cells,
+/// so the box spilled past the right edge by the dock band's width.
 #[tokio::test]
 async fn docs_sidebar_respects_the_right_edge_past_a_left_dock() {
     let dir = temp_dir("complete_docs_left_dock");
@@ -1759,16 +1759,19 @@ nx.complete.setup { sources = { { 'doc' } } }";
         .await
         .expect("docs float appears");
     let docs = docs_window(&map).expect("docs float window");
-    // The docs float's OUTER rect is region-relative (main-region cells). Its right edge
-    // (rect.x + rect.width, border included) must stay within the region.
+    // The docs float's OUTER rect is in windows-area cells. Its right edge
+    // (rect.x + rect.width, border included) must stay within the 80-column editor.
     let docs_col = win_rect(&docs, "x");
     let docs_outer_width = win_rect(&docs, "width");
-    // The main region begins one cell past the 20-col dock (band 21). The editor is
-    // 80 cols, so the region-relative right edge is 80 − 21 = 59.
-    let region_right = 80 - (20 + 1);
     assert!(
-        docs_col + docs_outer_width <= region_right,
-        "docs float must stay within the editor's right edge: x {docs_col} + width {docs_outer_width} > {region_right}"
+        docs_col + docs_outer_width <= 80,
+        "docs float must stay within the editor's right edge: x {docs_col} + width {docs_outer_width} > 80"
+    );
+    // And it really is in screen cells: the popup it butts against lives in the main
+    // region, which starts one cell past the 20-col dock.
+    assert!(
+        docs_col > 20,
+        "the float sits past the dock band it is placed beyond, got x {docs_col}"
     );
     // ...and still be usable, not collapsed to a sliver (inner width past the border).
     assert!(
@@ -2090,10 +2093,10 @@ nx.complete.source {\n\
 }\n\
 nx.complete.setup { sources = { { 'docs' } } }";
 
-/// With a top dock open, the sidebar's region-relative height must be clamped
-/// against the editor height MINUS the region's top offset (the dock band), or a
-/// tall doc opened low in the region runs past the editor's bottom edge.
-/// Regression: it was clamped against the full editor height.
+/// The sidebar's height is clamped against the editor's bottom edge in windows-area
+/// cells, so a tall doc opened low in a region pushed down by a top dock still fits
+/// on screen. Regression: the box was computed in the popup's *region* cells, which
+/// (measured against the full editor height) let it run past the bottom edge.
 #[tokio::test]
 async fn docs_sidebar_respects_the_bottom_edge_past_a_top_dock() {
     let dir = temp_dir("complete_docs_top_dock");
@@ -2119,23 +2122,26 @@ async fn docs_sidebar_respects_the_bottom_edge_past_a_top_dock() {
         .await
         .expect("docs float appears");
     let docs = docs_window(&map).expect("docs float window");
-    // The docs float's OUTER rect is region-relative (main-region cells).
+    // The docs float's OUTER rect is in windows-area cells: its bottom edge must stay
+    // within the 24-row editor.
     let docs_row = win_rect(&docs, "y");
     let docs_height = win_rect(&docs, "height");
-    // The main region begins one row past the 5-row top dock (band 6). The editor is
-    // 24 rows, so the region-relative bottom edge is 24 − 6 = 18; the float's rows must
-    // stay within it.
-    let region_bottom = 24 - (5 + 1);
     assert!(
-        docs_row + docs_height <= region_bottom,
-        "docs float must stay within the editor's bottom edge: y {docs_row} + height {docs_height} > {region_bottom}"
+        docs_row + docs_height <= 24,
+        "docs float must stay within the editor's bottom edge: y {docs_row} + height {docs_height} > 24"
+    );
+    // And it really is in screen cells: the popup it is placed beside sits in the main
+    // region, which starts one row past the 5-row top dock.
+    assert!(
+        docs_row > 5,
+        "the float sits past the dock band it is placed beyond, got y {docs_row}"
     );
 }
 
-/// The docs float's geometry is region-relative, but the mouse hit-test resolves a
-/// GLOBAL cell back to a window — so with a dock shifting the region's screen origin, a
-/// wheel over the float's on-screen cells must still scroll it (via the native window
-/// mouse path, not the retired bespoke stash).
+/// The docs float is laid out in screen cells while the tree that owns it lays out in
+/// its region's — so with a dock shifting that region's origin, the mouse hit-test
+/// (which resolves a GLOBAL cell back to a window) must still find the float under the
+/// wheel and scroll it (via the native window mouse path, not the retired bespoke stash).
 #[tokio::test]
 async fn wheeling_the_docs_sidebar_hit_tests_in_global_cells_past_a_dock() {
     let dir = temp_dir("complete_docs_scroll_dock");
@@ -2156,12 +2162,13 @@ async fn wheeling_the_docs_sidebar_hit_tests_in_global_cells_past_a_dock() {
     })
     .await
     .expect("docs float opens at the top");
-    // The float rect is region-relative (main-region cells); its GLOBAL screen cell adds
-    // the region origin (col 21, row 0). Wheel there, inside the box (past the border).
-    let region_x = 20 + 1; // the dock content width + its separator
+    // The float rect is already in windows-area cells (it sits past the dock band the
+    // main region starts after), so it IS the global cell. Wheel inside the box (past
+    // the border).
     let (rx, ry) = (win_rect(&win, "x") as usize, win_rect(&win, "y") as usize);
+    assert!(rx > 20, "the float is placed past the dock band");
     for _ in 0..3 {
-        feed_mouse(&rpc, "wheel", "down", ry + 1, region_x + rx + 1);
+        feed_mouse(&rpc, "wheel", "down", ry + 1, rx + 1);
     }
     let scrolled = poll_docs_win(&rpc, &mut incoming, |ls| {
         ls.first().map(String::as_str) != Some("doc line 01")

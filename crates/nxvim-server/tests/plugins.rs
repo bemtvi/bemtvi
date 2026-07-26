@@ -3203,3 +3203,113 @@ async fn a_lock_entry_with_no_commit_fails_loud() {
         "must name the bad entry and the file: {msg}"
     );
 }
+
+// Expanding a plugin row (`<CR>`) shows the spec's own `desc` — the human line the
+// config author wrote — alongside the url / dir / trigger details.
+#[tokio::test]
+async fn the_dashboard_shows_a_plugins_desc_when_expanded() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_uidesc_src");
+    let repo = make_repo(&src, "vista");
+    setup_root(&rpc, "plug_uidesc").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"vista\", dir = \"{dir}\", \
+               desc = \"Panoramic tag viewer\" }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+    assert!(
+        poll_true(&rpc, "return vim.bo.filetype == 'nxplugins'").await,
+        ":Plugins should open the manager dashboard"
+    );
+    // Wait for the row, then put the cursor on it and expand.
+    let mut listed = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.join("\n").contains("vista") {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(listed, "the dashboard should list the plugin");
+    feed(&rpc, "/vista<CR>");
+    feed(&rpc, "<CR>");
+
+    let mut saw_desc = false;
+    for _ in 0..200 {
+        if lines(&rpc)
+            .await
+            .join("\n")
+            .contains("desc: Panoramic tag viewer")
+        {
+            saw_desc = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw_desc,
+        "the expanded row should show the spec's own description"
+    );
+}
+
+// The dashboard is a screen-centered dialog: opening `:Plugins` from a focused dock
+// still frames it in the middle of the whole editor (it rides the `screen` region),
+// rather than being boxed into the region that happened to have focus.
+#[tokio::test]
+async fn the_dashboard_is_centered_on_the_whole_screen() {
+    let (rpc, mut incoming) = start().await; // 80 x 24
+    setup_root(&rpc, "plug_uicenter").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+    assert!(
+        poll_true(&rpc, "return vim.bo.filetype == 'nxplugins'").await,
+        ":Plugins should open the manager dashboard"
+    );
+
+    // The dashboard float is 80% x 80% of the editor, centered: 64 inner columns plus
+    // one border cell per side = 66, leaving 7 columns on each side of the 80.
+    let mut geom = None;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| float_rect(m).is_some()) {
+            geom = float_rect(&map);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (region, x, width) = geom.expect("the dashboard float in a redraw");
+    assert_eq!(
+        region, "screen",
+        "the dashboard is placed against the screen"
+    );
+    assert_eq!(width, 66, "80% of 80 columns, plus the border");
+    assert_eq!(x, 7, "centered on the whole screen, not on the main region");
+}
+
+/// The floating window in a redraw map as `(region, x, width)`.
+fn float_rect(map: &[(Value, Value)]) -> Option<(String, u64, u64)> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| {
+        let Value::Map(m) = w else { return None };
+        if map_get(m, "floating").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let region = map_get(m, "region")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let Some(Value::Map(r)) = map_get(m, "rect") else {
+            return None;
+        };
+        let n = |k: &str| map_get(r, k).and_then(Value::as_u64).unwrap_or(0);
+        Some((region, n("x"), n("width")))
+    })
+}

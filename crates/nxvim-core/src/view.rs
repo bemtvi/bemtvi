@@ -343,11 +343,18 @@ pub struct ViewRect {
 }
 
 /// Which screen region a window (or separator) belongs to: the main editor area,
-/// or one of the four permanent docks. A window's `rect`/separator coordinates are
-/// relative to its region's own origin (each region lays out at `(0, 0)`); the
-/// client maps the region to its absolute screen origin using the [`View`]'s dock
-/// band sizes. `Main` is the default and the only region when no dock is open, so
-/// a dock-free session renders exactly as before.
+/// one of the four permanent docks, or the whole screen. A window's
+/// `rect`/separator coordinates are relative to its region's own origin (each
+/// region lays out at `(0, 0)`); the client maps the region to its absolute screen
+/// origin using the [`View`]'s dock band sizes. `Main` is the default and the only
+/// region when no dock is open, so a dock-free session renders exactly as before.
+///
+/// `Screen` is the odd one out: it is not a layout band but the whole **windows
+/// area** (the frame minus the command line), the space an `editor`-relative float
+/// positions against. Such a float is owned by some layer's tree (whichever had
+/// focus when it opened) but must be free to span the dock bands, so it is
+/// projected in screen cells and the client offsets it by the windows-area origin
+/// — never a region's. Only floats ever carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowRegion {
     #[default]
@@ -356,6 +363,7 @@ pub enum WindowRegion {
     DockRight,
     DockTop,
     DockBottom,
+    Screen,
 }
 
 /// A split border between sibling windows: a vertical `│` run (between the

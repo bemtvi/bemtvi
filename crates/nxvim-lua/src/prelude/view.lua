@@ -305,7 +305,9 @@ local FLOAT_BORDER =
 --
 -- The float table takes `width` / `height` (inner size; required) — cells (a
 -- number) or a viewport fraction (`"50vw"` / `"30vh"` / `"50%"`), which reflows on
--- resize — `relative` (`"editor"`|`"win"`|`"cursor"`, default `"editor"`), and either the
+-- resize — `relative` (`"editor"`|`"win"`|`"cursor"`, default `"editor"`; `"editor"` is
+-- the WHOLE screen, dock bands included, so a centered float centers on the screen
+-- rather than on whatever region happens to be focused), and either the
 -- high-level `align` (`"top-left"`|`"top"`|`"top-right"`|`"left"`|`"center"`|`"right"`|
 -- `"bottom-left"`|`"bottom"`|`"bottom-right"`) + `margin` (a gap from the edges: a number
 -- — the vertical gap, the horizontal sides getting 2x to look even since cells are

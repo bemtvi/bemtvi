@@ -1996,3 +1996,73 @@ async fn cw_cw_cross_no_ops_and_wraps_with_one_axis_open() {
     feed(&rpc, "<C-w><C-w>h");
     assert_eq!(lines(&rpc).await, vec!["MAIN"], "h from right reaches main");
 }
+
+// ===== editor-relative floats span the whole screen ==========================
+
+/// The floating window in a redraw map, as `(region, x, y, width, height)`.
+fn float_win(map: &[(Value, Value)]) -> Option<(String, u64, u64, u64, u64)> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| {
+        let Value::Map(m) = w else { return None };
+        if map_get(m, "floating").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let region = map_get(m, "region")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let Some(Value::Map(r)) = map_get(m, "rect") else {
+            return None;
+        };
+        let n = |k: &str| map_get(r, k).and_then(Value::as_u64).unwrap_or(0);
+        Some((region, n("x"), n("y"), n("width"), n("height")))
+    })
+}
+
+/// Poll for the latest redraw that carries a floating window.
+async fn poll_float_win(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<(String, u64, u64, u64, u64)> {
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| float_win(m).is_some()) {
+            return float_win(&map);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// A `relative = "editor"` float positions against the **whole editor** — the full
+/// windows area — not the focused layer's region. With a left dock open, a centered
+/// float still centers on the full 80 columns (and rides the `screen` region, so the
+/// client offsets it by the windows-area origin instead of the main region's).
+#[tokio::test]
+async fn editor_relative_float_centers_on_the_whole_screen_not_the_main_region() {
+    let (rpc, mut incoming) = start().await; // 80 x 24
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "x" }
+           vw:mount{ float = { width = 40, height = 10, align = "center" } }"#,
+    )
+    .await;
+
+    let (region, x, _y, width, _h) = poll_float_win(&rpc, &mut incoming)
+        .await
+        .expect("a floating window in the redraw");
+    assert_eq!(
+        region, "screen",
+        "an editor-relative float is screen-relative, not region-relative"
+    );
+    // 40 inner cells + the rounded border = 42 outer; centered on 80 → x = 19.
+    assert_eq!(width, 42, "inner 40 plus one border cell per side");
+    assert_eq!(
+        x, 19,
+        "centered on the whole 80-column screen, not on the dock-shrunk main region"
+    );
+}

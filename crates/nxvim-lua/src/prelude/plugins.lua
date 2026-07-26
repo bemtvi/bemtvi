@@ -243,6 +243,10 @@ local function normalize(spec)
   return {
     name = name,
     url = url,
+    -- The author's own one-line description, kept verbatim: the manager never reads
+    -- it, but the dashboard shows it when a row is expanded (and the recommended-set
+    -- checklist labels its entries with it), so it must survive normalization.
+    desc = spec.desc,
     branch = spec.branch,
     commit = commit,
     tag = tag,

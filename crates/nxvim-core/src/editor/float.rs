@@ -441,7 +441,7 @@ impl Editor {
     /// server sources the `markdown` (the selected row's LSP / resolved / inline docs)
     /// and passes `wrap` (the configured `docs_wrap`); **core** owns the placement,
     /// computing it beside the popup box via [`complete_docs_geom`](Self::complete_docs_geom)
-    /// — the region-relative twin of the old `redraw.rs::project_complete_docs` geometry,
+    /// — the windows-area twin of the old `redraw.rs::project_complete_docs` geometry,
     /// so the float lands exactly where the server-projected menu overlay does. Empty
     /// markup — or no completion popup / no room beside it — closes the float instead of
     /// showing an empty box. Re-opening replaces the previous float in place.

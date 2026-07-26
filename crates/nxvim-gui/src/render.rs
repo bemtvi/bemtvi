@@ -911,6 +911,9 @@ impl Renderer {
         let region_origin = |region: WindowRegion| -> (u16, u16) {
             match region {
                 WindowRegion::Main => (main_x, mid_y),
+                // Not a band: an `editor` float's cells are already relative to the
+                // whole windows area, whose origin is the frame's top-left.
+                WindowRegion::Screen => (0, 0),
                 WindowRegion::DockLeft => (0, dock_left_y + tl_left),
                 WindowRegion::DockRight => (cols.saturating_sub(dr), dock_right_y + tl_right),
                 WindowRegion::DockTop => (0, dock_top_y + tl_top),

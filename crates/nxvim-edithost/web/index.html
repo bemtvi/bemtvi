@@ -1366,6 +1366,9 @@
       const g = dockGeo(tablineRows);
       const tl = dockTl(region, g);
       switch (region) {
+        // `screen` is not a band: an `editor`-relative float's cells are already
+        // relative to the whole windows area, whose origin is the frame's top-left.
+        case "screen": return { x: 0, y: 0 };
         case "dock_left": return { x: 0, y: g.midY + tl };
         case "dock_right": return { x: cols - g.dr, y: g.midY + tl };
         case "dock_top": return { x: 0, y: tl };

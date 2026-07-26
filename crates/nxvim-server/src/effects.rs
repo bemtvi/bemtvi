@@ -3496,9 +3496,9 @@ impl EditHost {
             .map(str::to_string)
             .skip_while(|l| l.trim().is_empty())
             .collect();
-        // All region-relative (the frame the `FloatRelative::Editor` docs float lays out
-        // in): `box_row`/`box_col` are the wildmenu box's region-cell top-left, `bound_w`
-        // the region width the sidebar is bounded by.
+        // All in windows-area cells (the frame the `FloatRelative::Editor` docs float
+        // lays out in): `box_row`/`box_col` are the wildmenu box's top-left, `bound_w`
+        // the editor width the sidebar is bounded by.
         let Some((box_row, box_col, box_w, box_h, bound_w)) = self.editor.cmdline_menu_box() else {
             self.editor.close_cmdline_docs_float();
             return;
@@ -3516,7 +3516,7 @@ impl EditHost {
             .max()
             .unwrap_or(1)
             .clamp(1, MAX_DOCS_W);
-        // Beside the box, bounded by the region (the command line spans its full width),
+        // Beside the box, bounded by the editor (the command line spans its full width),
         // flipping to the side with more room — or nothing rather than a sliver.
         let Some((docs_col, docs_w)) =
             crate::redraw::place_docs_beside(box_col, box_w, content_w, bound_w)

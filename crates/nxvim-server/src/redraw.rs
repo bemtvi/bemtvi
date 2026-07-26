@@ -1565,12 +1565,15 @@ fn separator_value(sep: &Separator) -> Value {
     ])
 }
 
-/// The wire string for a window/separator [`WindowRegion`] — `"main"` or one of
-/// `"dock_left"`/`"dock_right"`/`"dock_top"`/`"dock_bottom"`. Clients map it to the
-/// region's absolute screen origin using the redraw map's dock band sizes.
+/// The wire string for a window/separator [`WindowRegion`] — `"main"`, one of
+/// `"dock_left"`/`"dock_right"`/`"dock_top"`/`"dock_bottom"`, or `"screen"`.
+/// Clients map it to the region's absolute screen origin using the redraw map's
+/// dock band sizes; `"screen"` (only ever an `editor`-relative float) is already in
+/// windows-area cells, so its origin is the windows area's own.
 fn region_str(region: WindowRegion) -> &'static str {
     match region {
         WindowRegion::Main => "main",
+        WindowRegion::Screen => "screen",
         WindowRegion::DockLeft => "dock_left",
         WindowRegion::DockRight => "dock_right",
         WindowRegion::DockTop => "dock_top",

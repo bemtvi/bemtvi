@@ -516,6 +516,9 @@ struct DockLayout {
     cmd: Rect,
     /// The `[left|main|right]` band, for full-height left/right dock borders.
     mid: Rect,
+    /// The whole windows area (the frame minus the command line) — the space an
+    /// `editor`-relative float (region `screen`) is placed in, dock bands included.
+    screen: Rect,
     /// Each dock's own tabline row (its band's first row), `None` when that dock
     /// draws no tabline. The dock's content rect above already excludes this row.
     tl_left: Option<Rect>,
@@ -590,6 +593,13 @@ impl DockLayout {
         let tl_bottom = tl(bottom, !rt.bottom.tabs.is_empty());
         let tl_left = tl(left, !rt.left.tabs.is_empty());
         let tl_right = tl(right, !rt.right.tabs.is_empty());
+        // Everything above the command line: the frame the `screen` region maps to.
+        let screen = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(cmd.height),
+        );
         DockLayout {
             main,
             left,
@@ -600,6 +610,7 @@ impl DockLayout {
             global_status,
             cmd,
             mid,
+            screen,
             tl_left,
             tl_right,
             tl_top,
@@ -617,6 +628,9 @@ impl DockLayout {
     fn content(&self, region: WindowRegion) -> Rect {
         let (rect, tabline) = match region {
             WindowRegion::Main => (self.main, None),
+            // Not a band: the whole windows area, which an `editor` float's cells are
+            // already relative to.
+            WindowRegion::Screen => (self.screen, None),
             WindowRegion::DockLeft => (self.left, self.tl_left),
             WindowRegion::DockRight => (self.right, self.tl_right),
             WindowRegion::DockTop => (self.top, self.tl_top),

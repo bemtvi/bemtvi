@@ -611,7 +611,9 @@ impl Editor {
             return crate::WinHl::parse(&wo.winhighlight);
         }
         let dock = match region {
-            WindowRegion::Main => None,
+            // `Screen` is an `editor` float's coordinate space, not a dock band: it
+            // floats *over* the docks and inherits nothing from them.
+            WindowRegion::Main | WindowRegion::Screen => None,
             WindowRegion::DockLeft => Some(DockSide::Left),
             WindowRegion::DockRight => Some(DockSide::Right),
             WindowRegion::DockTop => Some(DockSide::Top),

@@ -541,6 +541,9 @@ local Manager = nx.view.component({
         if st.expanded[p.name] then
           local spec = M._specs[p.name]
           if spec then
+            -- The author's own `desc` leads: it says what the plugin is *for*, which
+            -- is what a reader opening a row wants before the mechanics below it.
+            detail("desc", spec.desc)
             detail("url", spec.url)
             detail("dir", spec._dir)
             detail("branch", spec.branch)

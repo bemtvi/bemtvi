@@ -128,7 +128,10 @@ gains focus — the same trick tab pages use to keep one tree active. Because ev
 `split` / `close` / `focus` / edit / redraw reads from `self.windows`, they "just
 work" inside the focused dock with no retargeting. Geometry reserves the edge
 bands before laying out the main area, and each client maps a window's region
-(`Main` / `DockLeft` / `…`) to its absolute screen origin.
+(`Main` / `DockLeft` / `…`) to its absolute screen origin. One region is not a
+band: an `editor`-relative float is laid out against the **whole** windows area
+and tagged `Screen`, so a centered dialog centers on the screen and paints over
+the dock bands rather than being boxed into whichever region opened it.
 
 For the full design — the layer-swap model, geometry, `<C-w><C-w>` parsing, and
 the cross-client rendering — see the

@@ -826,3 +826,49 @@ async fn a_focused_float_owns_the_terminal_cursor() {
     // there is no gutter offset to add.
     assert_eq!(cursor, Some((5 + 1 + 1, 3 + 1)), "cursor inside the float");
 }
+
+/// An `editor`-relative float is centered on the **whole screen**, not on the
+/// region that happens to be focused: with a 20-column left dock open, a centered
+/// float still straddles the middle of the full 80 columns — painting over the dock
+/// band it overlaps. (Centered in the dock-shrunk main region it would sit ten
+/// columns to the right, its left border at 29.)
+#[tokio::test]
+async fn an_editor_float_centers_on_the_whole_screen_over_a_dock() {
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    let fb = new_buffer(&rpc).await;
+    open_float(
+        &rpc,
+        fb,
+        true,
+        vec![
+            ("relative", Value::from("editor")),
+            ("align", Value::from("center")),
+            ("width", Value::from(40u64)),
+            ("height", Value::from(10u64)),
+            ("border", Value::from("single")),
+        ],
+    )
+    .await;
+    feed(&rpc, "iFLOATBODY<Esc>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    let y = (0..ROWS)
+        .find(|&y| row_text(&buf, y).contains("FLOATBODY"))
+        .expect("the float's content is painted somewhere");
+    let row: Vec<char> = row_text(&buf, y).chars().collect();
+    // Outer box = 40 inner + one border cell per side = 42, centered on 80 → the
+    // side borders land on columns 19 and 60.
+    assert_eq!(
+        row[19],
+        '│',
+        "left border at col 19: {:?}",
+        row_text(&buf, y)
+    );
+    assert_eq!(
+        row[60],
+        '│',
+        "right border at col 60: {:?}",
+        row_text(&buf, y)
+    );
+}

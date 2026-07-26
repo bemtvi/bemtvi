@@ -16,30 +16,95 @@ event by the path tail, one containing a `/` matches the whole path, and `"*"` (
 an omitted pattern) matches everything. A pattern with no glob metacharacter is an
 exact compare — so a `FileType rust` autocmd never glob-matches a path.
 
-**Handlers may be async.** A `callback` can return a promise (`nx.promise`, or the
-result of an `nx.*` async call). Most events are fire-and-forget — the promise simply
-runs in the background and the editor does not wait. A few events are **awaited**: the
-write holds on `BufWritePre` until every handler's promise settles (so an async
-format-on-save works — see [Writing](#writing)), and the editor exit holds on `QuitPre`
-/ `ExitPre` / `VimLeavePre` until they settle (so an async flush/cleanup runs before the
-process leaves — see [Quitting & exit](#quitting--exit)). A returned promise is never
-dropped; a rejection surfaces the same way an unhandled `nx.promise` rejection does,
-named for the event that raised it.
+## Hot-path events are synchronous
+
+Events fall into two classes, and it decides whether your handler may be async.
+
+**Hot-path** events fire while the editor converges a single input tick — that is, on
+nearly every keypress:
+
+```
+CursorMoved   CursorMovedI   TextChanged   TextChangedI   ModeChanged
+InsertEnter   InsertLeave    BufEnter      BufLeave
+WinEnter      WinLeave       WinScrolled   WinResized
+```
+
+Their handlers **must be synchronous**. Returning a promise from one raises, naming
+the event and the file:line you registered it at. The editor will never wait for it,
+so returning one means expecting an ordering that cannot happen.
+
+This is not a ban on async *work* — only on handing back the promise. Start it and
+return nothing:
+
+```lua
+-- WRONG: raises. Nothing awaits this.
+nx.autocmd.create("CursorMoved", { callback = function()
+  return nx.lsp.buf.hover()
+end })
+
+-- Right: fire-and-forget, or defer with nx.schedule / nx.on_next_tick.
+nx.autocmd.create("CursorMoved", { callback = function()
+  nx.lsp.buf.hover()
+end })
+```
+
+Every **other** event is async-capable: a `callback` may return a promise
+(`nx.promise`, or the result of an `nx.*` async call). A returned promise is never
+dropped — a rejection surfaces like any unhandled `nx.promise` rejection, named for the
+event that raised it.
+
+The split exists so the machinery below never touches the per-keypress path.
+
+## What happens when a handler is async
+
+Two guarantees, both reproducing for async what vim gets for free by being
+synchronous.
+
+**Late subscribers still get the event.** If a handler registers *another* handler for
+the same event while the first is still running, the newcomer receives that event too.
+This is what makes a lazily-loaded plugin work: `FileType` wakes the plugin, the
+plugin's `config` runs (possibly `nx.await`-ing), it registers its own `FileType`
+handler — and that handler still fires for the buffer that woke it. Nothing fires
+twice: delivery is filtered by registration order, not replayed wholesale.
+
+**The read sequence is ordered.** `BufReadPost` → `FileType` → `BufEnter` →
+`BufWinEnter` advances one stage at a time, each waiting for the previous stage's async
+handlers to finish. So a `BufReadPost` handler that detects the filetype asynchronously
+is reflected in the `FileType` that follows — you get one correct `FileType`, not a
+wrong one followed by a correction. This is vim's order, and an async handler does not
+reorder it: `BufEnter` and `BufWinEnter` stay behind the read, however long it takes.
+`BufWritePre` (the write waits — see [Writing](#writing)) and
+`QuitPre` / `ExitPre` / `VimLeavePre` (the exit waits — see
+[Quitting & exit](#quitting--exit)) are awaited the same way.
+
+**Handlers have a time budget: 500 ms by default.** It bounds how long the editor
+*waits*, never whether anything gets delivered — when it expires, the sequence advances
+and late subscribers are still served, so one slow handler cannot wedge a buffer
+half-initialised. Blowing it warns, naming the handler's file:line; finishing late
+warns again with the elapsed time. Raise it for a handler you know is slow:
+
+```lua
+nx.autocmd.create("FileType", { timeout = 5000, callback = function() … end })
+```
+
+A handler that never settles at all never reports completion, so it stays listed in
+`nx.autocmd.pending()` — inspect with
+`:lua print(vim.inspect(nx.autocmd.pending()))`. Warnings go to `:messages`.
 
 ## Buffer lifecycle
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `BufAdd` | A buffer is added to the buffer list — before its `BufReadPost` (a file open into a fresh buffer adds it, then reads it). | Fires with the *added* buffer as `<afile>` (`buf` / `file`), so a `:badd` that never enters the buffer still carries it. The startup buffer never fires it (it is the baseline, like `WinNew`/`TabNew` skip the initial window/tab); only buffers created **after** startup do. `BufCreate` is an accepted alias (see [Event aliases](#event-aliases)). |
-| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). `buf` / `file` set. `BufRead` is an accepted alias (see [Event aliases](#event-aliases)). |
+| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). Fires for **every** buffer that lands in a window, not only the focused one — so a session/workspace restore announces each restored file rather than leaving background splits uninitialised until you focus them. `buf` / `file` set. `BufRead` is an accepted alias (see [Event aliases](#event-aliases)). |
 | `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
-| `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. |
-| `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. |
-| `BufWinEnter` | A buffer first becomes *displayed* in a window (its window-visibility goes 0 → ≥1) — including buffers a session/workspace restore fills into non-current windows, which the current-buffer events never visit. A no-arg `:split` (already displayed) and merely focusing another window don't fire it; a hidden buffer re-shown does. | `buf` / `file` set. **Gated on a registered handler.** |
+| `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. On the first announce it is ordered behind `BufReadPost`'s handlers, including async ones — see [What happens when a handler is async](#what-happens-when-a-handler-is-async). |
+| `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. Hot-path, so handlers must be synchronous. On a buffer's first announce it is ordered last, after `BufReadPost` and `FileType` have settled. Restoring a session does **not** fire it for background windows — nothing became current there. |
+| `BufWinEnter` | A buffer first becomes *displayed* in a window (its window-visibility goes 0 → ≥1) — including buffers a session/workspace restore fills into non-current windows, which the current-buffer events never visit. A no-arg `:split` (already displayed) and merely focusing another window don't fire it; a hidden buffer re-shown does. | `buf` / `file` set. **Gated on a registered handler.** Fires **last** on a buffer's first announce — after `BufReadPost`, `FileType` and `BufEnter` have settled, async handlers included. |
 | `BufReadCmd` | A deferred open is about to perform its default read — vim's "replace the default read" hook. A handler that returns `true` **claims** the read: it owns filling the buffer (e.g. the file explorer listing a directory) and the default load is skipped. | `match` / `file` is the path; `args.isdir` says whether it's a directory. **Gated on a registered handler.** |
 | `BufDelete` | Just before a buffer is deleted (`:bdelete`), while its state still exists. | `buf` / `file` set. |
 
-Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter`.
+Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter` → `BufWinEnter`, and an async handler does not reorder it — see [What happens when a handler is async](#what-happens-when-a-handler-is-async).
 
 ## Writing
 

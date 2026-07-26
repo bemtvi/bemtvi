@@ -673,6 +673,26 @@ pub async fn poll_true(rpc: &Rpc, code: &str) -> bool {
     false
 }
 
+/// Let the server run for `ms` of real time, then [`barrier`] so everything it did in
+/// that window has been processed before the next assertion.
+///
+/// For a **negative** assertion — "give a spurious second event a chance to land, then
+/// assert it didn't" — where no observable signals that the window has passed. Prefer an
+/// event-driven barrier when one exists ([`poll_true`] on the state you expect, or
+/// feeding a key to force the diff the spurious event would ride); a wall-clock wait is
+/// the fallback, not the default.
+///
+/// **The wait has to be on this side.** `exec_lua(rpc, "return nx.promise.delay(80)")`
+/// reads like a wait and is not: `nvim_exec_lua` answers with the chunk's *value* and
+/// never awaits it, so the call returns in ~1ms carrying an unresolved promise table
+/// (`{ _state = "pending" }`) and the window it was supposed to open is zero. A test
+/// written that way passes for the wrong reason — it asserts on state sampled
+/// immediately, not after the settle it claims to wait for.
+pub async fn settle_ms(rpc: &Rpc, ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    barrier(rpc).await;
+}
+
 // ===== menu (picker / completion popup) ======================================
 
 /// Poll for the latest redraw whose `menu` key is a map — the widget is open —

@@ -1520,3 +1520,161 @@ async fn session_holds_main_focus_against_a_deferred_dock_grab() {
         );
     }
 }
+
+// ----- restored buffers get the full read lifecycle ---------------------------
+
+/// `init` plus startup Lua sourced *before* the lifecycle seed — the hook a session
+/// manager or plugin would register its autocmds from, so they are live when the
+/// restored layout announces.
+fn init_probed(dir: &Path, file: Option<String>, session: bool, lua: &str) -> ServerInit {
+    let mut i = init(dir, file, session);
+    i.client_init_lua = Some(lua.to_string());
+    i
+}
+
+/// Record every buffer-lifecycle event, tagged with the basename it fired for.
+const EVENT_PROBE: &str = r#"
+_G.evs = {}
+for _, e in ipairs({ "BufReadPost", "BufNewFile", "FileType", "BufEnter", "BufWinEnter" }) do
+  nx.autocmd.create({ e }, { callback = function(a)
+    local base = tostring(a.file):match("([^/]+)$") or tostring(a.file)
+    _G.evs[#_G.evs + 1] = e .. ":" .. base
+  end })
+end
+"#;
+
+/// Events recorded for `basename`, in fire order, joined with `,`.
+async fn events_for(rpc: &nxvim_rpc::Rpc, basename: &str) -> String {
+    exec_lua(
+        rpc,
+        &format!(
+            "local out = {{}}\n\
+             for _, e in ipairs(_G.evs) do\n\
+             \x20 if e:sub(-#{name:?}) == {name:?} then out[#out+1] = e:match('^([^:]+)') end\n\
+             end\n\
+             return table.concat(out, ',')",
+            name = basename
+        ),
+    )
+    .await
+    .as_str()
+    .unwrap_or_default()
+    .to_string()
+}
+
+#[tokio::test]
+async fn restoring_a_session_announces_every_restored_buffer_not_just_the_focused_one() {
+    // The defect this closes: `emit_lifecycle_events` was a CURRENT-buffer diff, so a
+    // restore — which fills background windows without entering them — fired
+    // `BufWinEnter` for them and nothing else. Everything `FileType`-driven (LSP
+    // attach, treesitter, buffer-local maps) stayed inert until the user happened to
+    // focus that window.
+    //
+    // Neovim announces all three, because its session script `:buffer`s each file into
+    // its window and entering an unloaded buffer loads it. Measured on nvim 0.12.2:
+    //
+    //   BufReadPost:c.txt  FileType:c.txt  BufEnter:c.txt  BufWinEnter:c.txt
+    //   BufReadPost:b.py   FileType:b.py   BufEnter:b.py   BufWinEnter:b.py
+    //   BufReadPost:a.lua  FileType:a.lua  BufEnter:a.lua  BufWinEnter:a.lua
+    //
+    // We match that on BufReadPost/FileType/BufWinEnter. `BufEnter` is deliberately
+    // NOT fired for the background two: it means "this buffer became current", which
+    // is true only of the focused one. (Neovim fires it because its script really does
+    // enter each window in turn; our restore builds the layout directly.)
+    let dir = temp_dir("session_lifecycle");
+    let file_a = write_temp("sess_life_a", "lua", "return 1\n");
+    let file_b = write_temp("sess_life_b", "py", "x = 1\n");
+    let file_c = write_temp("sess_life_c", "rs", "fn main() {}\n");
+    let base = |p: &str| p.rsplit('/').next().unwrap().to_string();
+    let (a, b, c) = (base(&file_a), base(&file_b), base(&file_c));
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, &format!(":vsplit {file_b}<CR>"));
+        feed(&rpc, &format!(":split {file_c}<CR>"));
+        assert_eq!(window_count(&rpc).await, 3, "three windows before quit");
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    let (rpc, _incoming) = start_attached(init_probed(&dir, None, true, EVENT_PROBE), 80, 25).await;
+    assert_eq!(window_count(&rpc).await, 3, "the layout came back");
+
+    for name in [&a, &b, &c] {
+        let evs = events_for(&rpc, name).await;
+        assert!(
+            evs.contains("BufReadPost"),
+            "{name} was read-announced on restore, got {evs:?}"
+        );
+        assert!(
+            evs.contains("FileType"),
+            "{name} got its FileType (this is what drives LSP attach / treesitter / \
+             buffer-local maps), got {evs:?}"
+        );
+        assert!(
+            evs.starts_with("BufReadPost,FileType"),
+            "and in neovim's per-buffer order, got {evs:?}"
+        );
+        assert!(
+            evs.contains("BufWinEnter"),
+            "{name} is displayed, got {evs:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restored_buffer_is_not_announced_twice_when_it_is_later_focused() {
+    // The announce is fire-once per buffer (`announced`). Before this phase a
+    // background buffer announced lazily on first focus; now it announces at restore,
+    // and focusing it later must NOT re-fire — otherwise every plugin keyed on
+    // BufReadPost/FileType does its setup twice.
+    let dir = temp_dir("session_lifecycle_once");
+    let file_a = write_temp("sess_once_a", "lua", "return 1\n");
+    let file_b = write_temp("sess_once_b", "py", "x = 1\n");
+    let base = |p: &str| p.rsplit('/').next().unwrap().to_string();
+    let b = base(&file_b);
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, &format!(":vsplit {file_b}<CR>"));
+        feed(&rpc, "<C-w>h"); // focus A, so B is restored in a background window
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    let (rpc, _incoming) = start_attached(init_probed(&dir, None, true, EVENT_PROBE), 80, 25).await;
+    let before = events_for(&rpc, &b).await;
+    assert!(
+        before.contains("BufReadPost") && before.contains("FileType"),
+        "the background buffer announced at restore, got {before:?}"
+    );
+
+    // Now focus it: BufEnter is expected, a second announce is not.
+    exec_lua(
+        &rpc,
+        &format!(
+            "for _, w in ipairs(nx.win.list()) do\n\
+             \x20 if nx.buf.name(nx.win.buf(w)):sub(-#{b:?}) == {b:?} then nx.win.set_current(w) end\n\
+             end"
+        ),
+    )
+    .await;
+    exec_lua(&rpc, "return 1").await;
+    let after = events_for(&rpc, &b).await;
+    assert_eq!(
+        after.matches("BufReadPost").count(),
+        1,
+        "BufReadPost fired exactly once across restore + focus, got {after:?}"
+    );
+    assert_eq!(
+        after.matches("FileType").count(),
+        1,
+        "and FileType exactly once, got {after:?}"
+    );
+    assert!(
+        after.contains("BufEnter"),
+        "while BufEnter did fire on the actual entry, got {after:?}"
+    );
+}

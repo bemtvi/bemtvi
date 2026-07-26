@@ -10,8 +10,8 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_test_harness::{
-    command, exec_lua, feed, message, redraw_after, start_with_config, start_with_file_and_config,
-    temp_dir,
+    barrier, command, exec_lua, feed, message, poll_true, redraw_after, settle_ms,
+    start_with_config, start_with_file_and_config, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -2279,5 +2279,860 @@ async fn an_uncompilable_autocmd_pattern_fails_loud_at_registration() {
         "a valid pattern must still register and fire, and the two rejected ones must \
          have consumed no autocmd id (so the id after them is the id before them + 1), \
          got {s:?}"
+    );
+}
+
+// ----- hot-path events are synchronous-only -----------------------------------
+//
+// The event set splits in two (`docs/plans/2026-07-26-async-event-model.md`):
+// *hot-path* events fire while converging a single input tick — i.e. on nearly every
+// keypress — and their handlers must be synchronous, so the settle protocol (the
+// replay pass and the gated read chain) can never park the input tick. Returning a
+// promise from one is a contract violation and raises. Every *other* event stays
+// async-capable, which is what the lazy-plugin machinery rides.
+
+#[tokio::test]
+async fn hot_path_handler_returning_a_promise_raises_and_names_the_event() {
+    // A `CursorMoved` handler that returns a promise is a mistake: the editor will
+    // never await it, so the author is expecting sequencing that cannot happen. It
+    // must fail LOUD rather than be tracked and silently dropped — and the message
+    // has to name the event, or the user cannot tell which of their handlers is
+    // wrong.
+    let dir = temp_dir("au_hot_async");
+    let file = dir.join("hot.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "nx.autocmd.create('CursorMoved', {\n\
+         \x20 callback = function() return nx.promise.resolve(1) end })\n",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, "j").await);
+    assert!(
+        msg.contains("CursorMoved handlers must be synchronous"),
+        "the raise names the event and the rule, got {msg:?}"
+    );
+    assert!(
+        msg.contains("nx.schedule"),
+        "and carries the escape hatch so the fix is obvious from the message, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_path_handler_may_start_async_work_it_does_not_return() {
+    // The rule is "don't return a promise", NOT "no async work": a hot-path handler
+    // may still kick off async work fire-and-forget (the statusline / diff plugins
+    // do exactly this). That must keep working and the work must actually run —
+    // otherwise the hard error above would have made hot-path handlers useless.
+    let dir = temp_dir("au_hot_fire_forget");
+    let file = dir.join("hot.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.ran = false\n\
+         nx.autocmd.create('CursorMoved', {\n\
+         \x20 callback = function()\n\
+         \x20   nx.promise.resolve(1):next(function() _G.ran = true end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, "j").await);
+    assert!(
+        !msg.contains("must be synchronous"),
+        "starting async work without returning it is legal, got {msg:?}"
+    );
+    let ran = exec_lua(&rpc, "return tostring(_G.ran)").await;
+    assert_eq!(
+        ran.as_str(),
+        Some("true"),
+        "and the async continuation actually ran"
+    );
+}
+
+#[tokio::test]
+async fn non_hot_path_handler_may_return_a_promise() {
+    // `FileType` is NOT hot-path — it fires roughly once per buffer, and an async
+    // handler there is the whole point (an `ft`-lazy plugin whose `config` is async).
+    // It must be accepted, or the lazy-load path this plan exists to fix would be
+    // outlawed by phase 1.
+    let dir = temp_dir("au_nonhot_async");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.ran = false\n\
+         nx.autocmd.create('FileType', {\n\
+         \x20 callback = function()\n\
+         \x20   return nx.promise.resolve(1):next(function() _G.ran = true end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, "<Esc>").await);
+    assert!(
+        !msg.contains("must be synchronous"),
+        "a non-hot-path handler may return a promise, got {msg:?}"
+    );
+    let ran = exec_lua(&rpc, "return tostring(_G.ran)").await;
+    assert_eq!(ran.as_str(), Some("true"), "and its promise ran");
+}
+
+// ----- registration-site capture ----------------------------------------------
+
+#[tokio::test]
+async fn autocmd_records_the_file_and_line_it_was_registered_at() {
+    // Every autocmd carries `site` — where the code that installed it lives. This is
+    // what turns "a FileType handler exceeded its budget" (unactionable with N plugins
+    // loaded) into "init.lua:3". Captured once per REGISTRATION, never per fire.
+    //
+    // Both entry points must report the CALLER, not the prelude: `nx.on` forwards to
+    // `nx.autocmd.create`, so a naive `debug.getinfo(2)` would blame
+    // `nxvim:prelude/nx` for every `nx.on` subscription in existence.
+    let dir = temp_dir("au_site");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "nx.autocmd.create('User', { pattern = 'Direct', callback = function() end })\n\
+         nx.on('User', { pattern = 'ViaOn' }, function() end)\n",
+    )
+    .await;
+    let v = exec_lua(
+        &rpc,
+        "local out = {}\n\
+         for _, au in ipairs(nx.autocmd.get({ event = 'User' })) do\n\
+         \x20 out[#out+1] = tostring(au.pattern) .. '@' .. tostring(au.site)\n\
+         end\n\
+         return table.concat(out, '|')",
+    )
+    .await;
+    let s = v.as_str().unwrap_or("<nil>");
+    assert!(
+        s.contains("Direct@") && s.contains("ViaOn@"),
+        "both autocmds report a site, got {s:?}"
+    );
+    assert!(
+        !s.contains("nxvim:prelude/"),
+        "the site is the CALLER's config, not the forwarding prelude module, got {s:?}"
+    );
+    // init.lua line 1 registers the direct one, line 2 the nx.on one.
+    assert!(
+        s.contains("Direct@") && s.contains(":1|"),
+        "the direct registration reports its own line, got {s:?}"
+    );
+    assert!(
+        s.ends_with(":2"),
+        "and nx.on reports the caller's line, got {s:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_autocmd_listing_names_each_callbacks_registration_site() {
+    // The interactive half of the same affordance. `:autocmd` renders every callback
+    // handler as a bare `<callback>` — which, with N of them registered for the same
+    // event, tells you nothing about which is which. It carries the site now.
+    let dir = temp_dir("au_site_list");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "nx.autocmd.create('User', { pattern = 'Listed', callback = function() end })\n",
+    )
+    .await;
+    // The listing is multi-line, so it lands in the messages panel rather than on the
+    // message line; read what `:autocmd` renders directly.
+    let listing = exec_lua(&rpc, "return nx._ex_autocmd(false, 'User')").await;
+    let s = listing.as_str().unwrap_or("<nil>");
+    assert!(
+        s.contains("<callback>") && s.contains("init.lua:1"),
+        "the listing names where the handler was registered, got {s:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_path_violation_names_the_registration_site() {
+    // Phase 1's raise fell back to the autocmd id; with sites captured it must name
+    // the file:line instead — the whole point of phase 2 is that this message is
+    // actionable without further digging.
+    let dir = temp_dir("au_hot_site");
+    let file = dir.join("hot.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "nx.autocmd.create('CursorMoved', {\n\
+         \x20 callback = function() return nx.promise.resolve(1) end })\n",
+    )
+    .await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, "j").await);
+    assert!(
+        msg.contains("registered at") && msg.contains("init.lua:1"),
+        "the raise names where the offending handler was installed, got {msg:?}"
+    );
+}
+
+// ----- settle protocol: replay to late subscribers ----------------------------
+//
+// A handler registered while an event was still in its async tail must still receive
+// that event — the async analogue of neovim's synchronous "when the fire returns,
+// everything it triggered has finished". This is what makes an `ft`-lazy plugin with
+// an async `config` work at all: the trigger loads the plugin, the plugin registers
+// its own FileType handler a tick later, and that handler still runs for the buffer
+// that woke it.
+
+/// Wrap `nx.notify` so the warnings the settle protocol emits are capturable, on top
+/// of their normal delivery (which lands them in `:messages` via `Editor::echo` →
+/// `record_message`). Prepended to a test's config.
+const CAPTURE_WARNS: &str = "_G.warns = {}\n\
+     local _real_notify = nx.notify\n\
+     nx.notify = function(m, l, o) _G.warns[#_G.warns+1] = tostring(m); return _real_notify(m, l, o) end\n";
+
+/// Poll until the captured warnings contain `needle`, then return them all.
+async fn warns_containing(rpc: &Rpc, needle: &str) -> String {
+    let ok = poll_true(
+        rpc,
+        &format!("return table.concat(_G.warns, '\\n'):find({needle:?}, 1, true) ~= nil"),
+    )
+    .await;
+    let all = exec_lua(rpc, "return table.concat(_G.warns, '\\n')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ok,
+        "timed out waiting for a warning containing {needle:?}; got {all:?}"
+    );
+    all
+}
+
+#[tokio::test]
+async fn late_subscriber_registered_during_an_async_handler_still_gets_the_event() {
+    // The core guarantee. A FileType handler goes async and, on resolving, registers a
+    // SECOND FileType handler — exactly the shape of a lazy plugin whose `config` is
+    // async. Without replay the second handler never runs for the buffer that
+    // triggered the load, which is the defect this phase exists to fix.
+    let dir = temp_dir("au_replay_late");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         nx.autocmd.create('FileType', { callback = function()\n\
+         \x20 _G.log[#_G.log+1] = 'first'\n\
+         \x20 return nx.promise.delay(1):next(function()\n\
+         \x20   nx.autocmd.create('FileType', { callback = function(a)\n\
+         \x20     _G.log[#_G.log+1] = 'late:' .. a.match\n\
+         \x20   end })\n\
+         \x20 end)\n\
+         end })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return #_G.log == 2").await,
+        "the late handler ran; log was {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, '|')").await
+    );
+    let log = exec_lua(&rpc, "return table.concat(_G.log, '|')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("first|late:rust"),
+        "the handler registered during the async tail still received the event"
+    );
+}
+
+#[tokio::test]
+async fn replay_does_not_refire_handlers_that_already_ran() {
+    // The watermark is an EXACT filter on autocmd id, not a blanket re-fire: a handler
+    // present at first dispatch must not run twice. lazy.nvim's re-fire re-runs
+    // everyone and leans on handlers being idempotent; we must not need that.
+    let dir = temp_dir("au_replay_once");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n_G.late = 0\n\
+         nx.autocmd.create('FileType', { callback = function()\n\
+         \x20 _G.n = _G.n + 1\n\
+         \x20 return nx.promise.delay(1):next(function()\n\
+         \x20   nx.autocmd.create('FileType', { callback = function() _G.late = _G.late + 1 end })\n\
+         \x20 end)\n\
+         end })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.late >= 1").await,
+        "the late handler ran at all"
+    );
+    let counts = exec_lua(&rpc, "return _G.n .. '/' .. _G.late").await;
+    assert_eq!(
+        counts.as_str(),
+        Some("1/1"),
+        "the original handler ran exactly once and the late one exactly once"
+    );
+}
+
+#[tokio::test]
+async fn a_fires_two_live_replay_paths_still_deliver_at_most_once() {
+    // The hard case for "no handler ever sees the same event twice". A fire whose budget
+    // expires has TWO live replay paths from then on: the timeout replay (which may arm
+    // further rounds for late subscribers that are themselves async) and the eventual
+    // late-settle replay of the handler that blew the budget. Given a watermark per
+    // round, each path advances its own copy, both dispatch the same id range, and a
+    // handler registered in between runs TWICE — the defect the watermark exists to
+    // prevent. One shared cursor per fire is what makes the guarantee hold.
+    //
+    // Timeline: t=0 the slow handler starts (30ms budget, 200ms of work); t=10 an async
+    // second handler is registered — the timeout replay at t=30 reaches it and arms a
+    // round; t=60 the observer is registered, so BOTH the armed round (t≈130) and the
+    // late-settle replay (t≈200) would deliver to it.
+    let dir = temp_dir("au_replay_two_paths");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        &(CAPTURE_WARNS.to_string()
+            + "_G.seen = 0\n\
+         nx.autocmd.create('User', { pattern = 'Dup', timeout = 30, callback = function()\n\
+         \x20 return nx.promise.delay(200)\n\
+         end })\n\
+         nx.promise.delay(10):next(function()\n\
+         \x20 nx.autocmd.create('User', { pattern = 'Dup', callback = function()\n\
+         \x20   return nx.promise.delay(100)\n\
+         \x20 end })\n\
+         end)\n\
+         nx.promise.delay(60):next(function()\n\
+         \x20 nx.autocmd.create('User', { pattern = 'Dup', callback = function()\n\
+         \x20   _G.seen = _G.seen + 1\n\
+         \x20 end })\n\
+         end)\n\
+         nx.autocmd.exec('User', { pattern = 'Dup' })\n"),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.seen >= 1").await,
+        "the late subscriber received the event at all"
+    );
+    // Wait on the *event* rather than a wall-clock delay: the late-settle warning is
+    // emitted by the same callback that runs the second path's replay, so once it has
+    // landed, a duplicate delivery would already have happened.
+    warns_containing(&rpc, "settled").await;
+    let n = exec_lua(&rpc, "return _G.seen").await;
+    assert_eq!(
+        n.as_i64(),
+        Some(1),
+        "delivered exactly once despite two live replay paths"
+    );
+}
+
+#[tokio::test]
+async fn a_handler_past_its_budget_warns_and_the_replay_happens_anyway() {
+    // The budget bounds how long we WAIT, never whether late subscribers get the
+    // event: one slow handler must not cost every other subscriber the fire (nor, once
+    // the read chain gates on this, wedge the buffer half-initialized). The warning
+    // must name the registration site or it is unactionable with N plugins loaded.
+    let dir = temp_dir("au_replay_budget");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let cfg = format!(
+        "{CAPTURE_WARNS}\
+         _G.late = false\n\
+         nx.autocmd.create('FileType', {{ timeout = 30, callback = function()\n\
+         \x20 nx.promise.delay(1):next(function()\n\
+         \x20   nx.autocmd.create('FileType', {{ callback = function() _G.late = true end }})\n\
+         \x20 end)\n\
+         \x20 return nx.promise.delay(1500)\n\
+         end }})\n"
+    );
+    let (rpc, _incoming) = start_with_file_and_config(&dir, file.to_str().unwrap(), &cfg).await;
+    assert!(
+        poll_true(&rpc, "return _G.late == true").await,
+        "the replay ran despite the slow handler still being in flight"
+    );
+    let msgs = warns_containing(&rpc, "budget").await;
+    assert!(
+        msgs.contains("exceeded its 30ms budget"),
+        "the expiry warning names the budget, got {msgs:?}"
+    );
+    assert!(
+        msgs.contains("init.lua:"),
+        "and names the registration site, got {msgs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_handler_that_settles_late_warns_with_its_elapsed_time() {
+    // A handler that blew its budget and then finished has to say so — that is the
+    // only thing distinguishing "slow" from "hung", and they want different fixes.
+    let dir = temp_dir("au_replay_late_settle");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let cfg = format!(
+        "{CAPTURE_WARNS}\
+         nx.autocmd.create('FileType', {{ timeout = 20, callback = function()\n\
+         \x20 return nx.promise.delay(300)\n\
+         end }})\n"
+    );
+    let (rpc, _incoming) = start_with_file_and_config(&dir, file.to_str().unwrap(), &cfg).await;
+    let msgs = warns_containing(&rpc, "settled").await;
+    assert!(
+        msgs.contains("past its 20ms budget"),
+        "the late-settle warning reports the elapsed time against the budget, got {msgs:?}"
+    );
+    // The site must survive to the COMPLETION warning. By then every handler is
+    // `done`, so recomputing "who is unsettled" yields nothing — the sites have to be
+    // the ones captured when the budget blew, or the warning names no one and is
+    // useless. (Caught by examples/async-events, which printed `handler () settled`.)
+    let late = msgs
+        .lines()
+        .find(|l| l.contains("settled"))
+        .unwrap_or_default();
+    assert!(
+        late.contains("init.lua:"),
+        "the late-settle warning still names the registration site, got {late:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hung_handler_stays_visible_in_autocmd_pending() {
+    // A handler that never settles never warns on completion, so the expiry warning
+    // plus this introspection listing are the only evidence it exists. Without it a
+    // permanently-hung handler is invisible.
+    let dir = temp_dir("au_pending");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        // A promise nobody ever resolves.
+        "nx.autocmd.create('FileType', { timeout = 20, callback = function()\n\
+         \x20 return nx.promise.new(function() end)\n\
+         end })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return #nx.autocmd.pending() > 0").await,
+        "the hung handler is listed"
+    );
+    let p = exec_lua(
+        &rpc,
+        "local p = nx.autocmd.pending()[1]\n\
+         return p.event .. '@' .. tostring(p.site) .. '@' .. tostring(p.budget)",
+    )
+    .await;
+    let s = p.as_str().unwrap_or("<nil>");
+    assert!(
+        s.starts_with("FileType@") && s.contains("init.lua:") && s.ends_with("@20"),
+        "listed with its event, site and budget, got {s:?}"
+    );
+}
+
+#[tokio::test]
+async fn replay_gives_up_loudly_when_handlers_keep_registering_handlers() {
+    // An unbounded registration loop must fail loud rather than spin forever — the
+    // fixpoint needs a cap, and hitting it has to say so rather than going quiet.
+    let dir = temp_dir("au_replay_cap");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let cfg = format!(
+        "{CAPTURE_WARNS}\
+         _G.n = 0\n\
+         local function arm()\n\
+         \x20 nx.autocmd.create('FileType', {{ callback = function()\n\
+         \x20   _G.n = _G.n + 1\n\
+         \x20   return nx.promise.delay(1):next(arm)\n\
+         \x20 end }})\n\
+         end\n\
+         arm()\n"
+    );
+    let (rpc, _incoming) = start_with_file_and_config(&dir, file.to_str().unwrap(), &cfg).await;
+    let msgs = warns_containing(&rpc, "did not converge").await;
+    assert!(
+        msgs.contains("FileType"),
+        "the cap warning names the event, got {msgs:?}"
+    );
+    let n = exec_lua(&rpc, "return _G.n").await.as_i64().unwrap_or(-1);
+    assert!(
+        (1..=16).contains(&n),
+        "and it terminated rather than spinning, got {n} rounds"
+    );
+}
+
+// ----- the gated read chain ---------------------------------------------------
+//
+// Neovim's ordering guarantee is trivially "when BufReadPost returns, everything it
+// triggered has finished, so FileType fires into a settled world" — it is synchronous.
+// We reproduce it explicitly: each stage of BufReadPost -> FileType -> BufEnter waits
+// for the previous stage's async handlers (and their replay rounds) to converge.
+
+#[tokio::test]
+async fn filetype_waits_for_an_async_bufreadpost_handler() {
+    // The ordering payoff. A BufReadPost handler detects the filetype ASYNCHRONOUSLY
+    // (reading content, consulting a server) and sets it. Ungated, FileType would
+    // already have fired for the extension-derived filetype and the real one would
+    // arrive a diff later via the ft_changed re-fire — two FileType events, the first
+    // wrong. Gated, FileType fires ONCE, with the detected value.
+    let dir = temp_dir("au_chain_ft");
+    let file = dir.join("script.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.fts = {}\n\
+         nx.autocmd.create('BufReadPost', { callback = function()\n\
+         \x20 return nx.promise.delay(5):next(function() nx.bo[nx.buf.current()].filetype = 'detected' end)\n\
+         end })\n\
+         nx.autocmd.create('FileType', { callback = function(a) _G.fts[#_G.fts+1] = a.match end })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return #_G.fts > 0").await,
+        "FileType eventually fired"
+    );
+    // Give any spurious second fire a real chance to land before asserting there isn't
+    // one: wait out anything still in flight, then force a diff with a keypress — the
+    // `ft_changed` re-fire rides that path, and it is what produced the second, wrong
+    // FileType before the chain gated the sequence.
+    settle_ms(&rpc, 80).await;
+    feed(&rpc, "jk");
+    barrier(&rpc).await;
+    let fts = exec_lua(&rpc, "return table.concat(_G.fts, ',')").await;
+    assert_eq!(
+        fts.as_str(),
+        Some("detected"),
+        "FileType fired exactly once, with the filetype the async BufReadPost handler set"
+    );
+}
+
+#[tokio::test]
+async fn bufenter_is_sequenced_after_the_chains_gates() {
+    // BufEnter stays a synchronous hot-path event, but its POSITION is deferred: it
+    // must not beat a still-settling FileType, or a handler keyed on "the buffer is
+    // ready" sees a half-announced buffer.
+    let dir = temp_dir("au_chain_order");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         local function note(n) return function() _G.log[#_G.log+1] = n end end\n\
+         nx.autocmd.create('BufReadPost', { callback = function()\n\
+         \x20 _G.log[#_G.log+1] = 'read:start'\n\
+         \x20 return nx.promise.delay(5):next(note('read:done'))\n\
+         end })\n\
+         nx.autocmd.create('FileType', { callback = note('filetype') })\n\
+         nx.autocmd.create('BufEnter', { callback = note('bufenter') })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.log[#_G.log] == 'bufenter'").await,
+        "the chain completed; log so far {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, ',')").await
+    );
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("read:start,read:done,filetype,bufenter"),
+        "the async BufReadPost handler fully settled before FileType, and BufEnter came last"
+    );
+}
+
+#[tokio::test]
+async fn bufwinenter_is_sequenced_after_the_chains_gates_too() {
+    // The async twin of `deferred_open_fires_read_events_in_order_before_bufwinenter`,
+    // which pins vim's order — BufReadPost -> FileType -> BufEnter -> BufWinEnter — on
+    // the synchronous path. An async read handler must not reorder it: the window walk
+    // runs in the same pass that parked the chain, so firing BufWinEnter there put it
+    // SECOND ("read:start,bufwinenter,read:done,filetype,bufenter") — ahead of the very
+    // events the chain exists to order, and against a buffer whose setup is incomplete.
+    let dir = temp_dir("au_chain_bwe_order");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         local function note(n) return function() _G.log[#_G.log+1] = n end end\n\
+         nx.autocmd.create('BufReadPost', { callback = function()\n\
+         \x20 _G.log[#_G.log+1] = 'read:start'\n\
+         \x20 return nx.promise.delay(5):next(note('read:done'))\n\
+         end })\n\
+         nx.autocmd.create('FileType', { callback = note('filetype') })\n\
+         nx.autocmd.create('BufEnter', { callback = note('bufenter') })\n\
+         nx.autocmd.create('BufWinEnter', { callback = note('bufwinenter') })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.log[#_G.log] == 'bufwinenter'").await,
+        "the chain completed; log so far {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, ',')").await
+    );
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("read:start,read:done,filetype,bufenter,bufwinenter"),
+        "BufWinEnter waited behind the chain instead of jumping it, and stayed last"
+    );
+    // And exactly once — deferring must not leave the walk's baseline thinking the
+    // buffer is still unshown, which would fire it again on the next diff. So force
+    // that diff, after waiting out anything still in flight.
+    settle_ms(&rpc, 60).await;
+    feed(&rpc, "jk");
+    barrier(&rpc).await;
+    let n = exec_lua(
+        &rpc,
+        "local n = 0 for _, e in ipairs(_G.log) do if e == 'bufwinenter' then n = n + 1 end end return n",
+    )
+    .await;
+    assert_eq!(n.as_i64(), Some(1), "BufWinEnter fired exactly once");
+}
+
+#[tokio::test]
+async fn a_chain_with_no_async_handler_completes_within_one_tick() {
+    // The mandatory fast path. Gating must cost nothing when nothing is async — which
+    // is nearly every config. If the chain ever needed a tick to advance, every plain
+    // file open would get slower.
+    let dir = temp_dir("au_chain_sync");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         nx.autocmd.create('BufReadPost', { callback = function() _G.log[#_G.log+1] = 'read' end })\n\
+         nx.autocmd.create('FileType', { callback = function() _G.log[#_G.log+1] = 'ft' end })\n\
+         nx.autocmd.create('BufEnter', { callback = function() _G.log[#_G.log+1] = 'enter' end })\n",
+    )
+    .await;
+    // The FIRST thing asked of the server after startup already sees a complete chain —
+    // no polling, no extra tick.
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("read,ft,enter"),
+        "a fully synchronous chain converged before the first request was answered"
+    );
+    let msg = message(&redraw_after(&rpc, &mut incoming, "<Esc>").await);
+    assert!(!msg.contains("E5108"), "and raised nothing, got {msg:?}");
+}
+
+#[tokio::test]
+async fn a_hung_bufreadpost_handler_does_not_wedge_the_chain() {
+    // Liveness, and why the settle budget stops being merely diagnostic once the chain
+    // gates on it: a handler that NEVER resolves must not leave the buffer permanently
+    // half-announced with no FileType and no BufEnter. The budget expiry advances it.
+    let dir = temp_dir("au_chain_hung");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         nx.autocmd.create('BufReadPost', { timeout = 30, callback = function()\n\
+         \x20 return nx.promise.new(function() end)\n\
+         end })\n\
+         nx.autocmd.create('FileType', { callback = function() _G.log[#_G.log+1] = 'ft' end })\n\
+         nx.autocmd.create('BufEnter', { callback = function() _G.log[#_G.log+1] = 'enter' end })\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return #_G.log == 2").await,
+        "the chain advanced past the hung handler; log {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, ',')").await
+    );
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("ft,enter"),
+        "FileType and BufEnter still fired, in order, despite a handler that never settles"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_buffer_mid_chain_does_not_panic_or_orphan_the_gate() {
+    // A handler can do anything, including destroy the buffer being announced. The
+    // chain must unwind rather than fire BufEnter for a dead buffer or leave a gate
+    // parked forever.
+    let dir = temp_dir("au_chain_bwipe");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.done = false\n\
+         _G.after = {}\n\
+         nx.autocmd.create('BufReadPost', { callback = function(a)\n\
+         \x20 _G.wiped = a.buf\n\
+         \x20 return nx.promise.delay(5):next(function()\n\
+         \x20   nx.cmd('enew')\n\
+         \x20   pcall(nx.cmd, 'bwipeout! ' .. a.buf)\n\
+         \x20   _G.done = true\n\
+         \x20 end)\n\
+         end })\n\
+         for _, ev in ipairs({ 'FileType', 'BufEnter', 'BufWinEnter' }) do\n\
+         \x20 nx.autocmd.create(ev, { callback = function(x)\n\
+         \x20   if _G.done and x.buf == _G.wiped then\n\
+         \x20     _G.after[#_G.after+1] = x.event\n\
+         \x20   end\n\
+         \x20 end })\n\
+         end\n",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.done == true").await,
+        "the handler ran and wiped the buffer"
+    );
+    // The server is still alive and answering — no panic, no wedged gate.
+    let alive = exec_lua(&rpc, "return 1 + 1").await;
+    assert_eq!(
+        alive.as_i64(),
+        Some(2),
+        "the server survived the mid-chain wipe"
+    );
+    // And the chain was abandoned rather than driven on over a dead buffer: nothing it
+    // had left to fire may reach the wiped bufnr. (The state it held — the chain entry
+    // and its gate mapping — is dropped with it, so a handler that never settles cannot
+    // leave either map populated for a buffer that no longer exists.)
+    // The wait is real: the gate signal for the abandoned chain is still in flight when
+    // `_G.done` becomes visible, so sampling immediately would assert nothing.
+    settle_ms(&rpc, 60).await;
+    feed(&rpc, "jk");
+    barrier(&rpc).await;
+    let after = exec_lua(&rpc, "return table.concat(_G.after, ',')").await;
+    assert_eq!(
+        after.as_str(),
+        Some(""),
+        "no chain stage fired for the wiped buffer"
+    );
+}
+
+#[tokio::test]
+async fn a_rejecting_async_read_handler_surfaces_its_rejection() {
+    // The gated read chain must not be a place where errors go to die. A `BufReadPost`
+    // handler whose promise rejects (a failed fetch, a throw in a `:next`) has to
+    // surface exactly as it does on the ungated path — `all_settled` swallowing the
+    // rejection for the *chain's* purposes (a broken handler must not wedge the buffer)
+    // is a liveness decision, not a licence to hide the error. Before the fix this
+    // printed nothing at all: `nx._fire_gated` collected the promise without the
+    // `track_au_promise` `:catch` that `nx._fire` attaches, and `all_settled`'s own
+    // rejection handler marked it handled, so even the generic unhandled-rejection
+    // reporter stayed quiet.
+    let dir = temp_dir("au_chain_reject");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.notified = {}\n\
+         local orig = nx.notify\n\
+         nx.notify = function(msg, level)\n\
+         \x20 _G.notified[#_G.notified+1] = tostring(msg)\n\
+         \x20 return orig(msg, level)\n\
+         end\n\
+         _G.log = {}\n\
+         nx.autocmd.create('BufReadPost', { callback = function()\n\
+         \x20 return nx.promise.delay(5):next(function() error('read blew up') end)\n\
+         end })\n\
+         nx.autocmd.create('FileType', { callback = function() _G.log[#_G.log+1] = 'ft' end })\n",
+    )
+    .await;
+    assert!(
+        poll_true(
+            &rpc,
+            "return table.concat(_G.notified, '\\n'):find('read blew up', 1, true) ~= nil"
+        )
+        .await,
+        "a rejecting async BufReadPost handler must surface its rejection; got {:?}",
+        exec_lua(&rpc, "return table.concat(_G.notified, '\\n')").await
+    );
+    let msg = exec_lua(&rpc, "return table.concat(_G.notified, '\\n')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        msg.contains("BufReadPost"),
+        "and name the event that raised it, got {msg:?}"
+    );
+    // And the chain still advanced — surfacing the error must not change the liveness
+    // guarantee that a broken handler cannot leave the buffer half-announced.
+    assert!(
+        poll_true(&rpc, "return #_G.log == 1").await,
+        "the chain still reached FileType past the rejecting handler"
+    );
+}
+
+#[tokio::test]
+async fn re_reading_a_file_mid_chain_abandons_the_previous_chain() {
+    // `:e!` on a buffer whose async `BufReadPost` handler is still in flight starts a
+    // *fresh* chain for the same buffer. The old chain's gate must be abandoned with
+    // it: the phase already does this when the buffer is deleted, and a re-read is the
+    // same situation — the chain describes a read that no longer exists.
+    //
+    // Before the fix the stale gate stayed mapped to the buffer, so the FIRST read's
+    // handler settling un-parked the SECOND read's chain and drove it on — firing
+    // `FileType` while the second `BufReadPost` handler was still running, which is
+    // precisely the ordering the chain exists to guarantee.
+    let dir = temp_dir("au_chain_reread");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        // The first read parks for a long time so the re-read below lands underneath it;
+        // the second settles fast, so the ordering assertion is about which gate released
+        // `FileType`, not about who finished first.
+        "_G.log = {}\n\
+         _G.reads = 0\n\
+         nx.autocmd.create('BufReadPost', { timeout = 30000, callback = function()\n\
+         \x20 _G.reads = _G.reads + 1\n\
+         \x20 local n = _G.reads\n\
+         \x20 _G.log[#_G.log+1] = 'read' .. n .. ':start'\n\
+         \x20 return nx.promise.delay(n == 1 and 1500 or 3000):next(function()\n\
+         \x20   _G.log[#_G.log+1] = 'read' .. n .. ':done'\n\
+         \x20 end)\n\
+         end })\n\
+         nx.autocmd.create('FileType', { callback = function() _G.log[#_G.log+1] = 'ft' end })\n\
+         nx.autocmd.create('BufEnter', { callback = function() _G.log[#_G.log+1] = 'enter' end })\n\
+         nx.autocmd.create('BufWinEnter', { callback = function() _G.log[#_G.log+1] = 'winenter' end })\n",
+    )
+    .await;
+    // The first read is parked on a 1.5s handler; re-read now, from underneath it. The
+    // second parks for longer, so the first handler settles while the SECOND chain is
+    // the one in flight — the window in which a stale gate does its damage.
+    assert!(
+        poll_true(&rpc, "return _G.reads == 1").await,
+        "the first read's handler started"
+    );
+    redraw_after(&rpc, &mut incoming, &format!(":e! {}<CR>", file.display())).await;
+    assert!(
+        poll_true(&rpc, "return _G.reads == 2").await,
+        "the re-read started a second chain; log {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, ',')").await
+    );
+    // If the abandoned chain's gate is still live, the first handler settling un-parks
+    // the SECOND chain and drives it on — firing `FileType` while the second read's
+    // handler is still running.
+    assert!(
+        poll_true(
+            &rpc,
+            "return table.concat(_G.log, ','):find('ft', 1, true) ~= nil"
+        )
+        .await,
+        "FileType fired; log {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, ',')").await
+    );
+    settle_ms(&rpc, 100).await;
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        log, "read1:start,read2:start,read1:done,read2:done,ft,enter,winenter",
+        "FileType waits for the SECOND read's handler — the abandoned first chain's \
+         still-pending gate neither releases it early nor holds it — and the tail the \
+         first chain had parked (this buffer's one entry, its first display) carries \
+         over to the new chain rather than being dropped with it: nothing re-detects \
+         either, since the buffer is already current and already in the displayed baseline"
     );
 }

@@ -9,14 +9,25 @@
 //!     effect lands at convergence in the same handler;
 //!   * off-tick (timers / async `vim.system`) — the *two-barrier* pattern: a
 //!     barrier right after the trigger sees the effect ABSENT (it didn't run
-//!     inline), then after a real sleep a second barrier sees it PRESENT (the
-//!     actor fired it off-tick and the server settled).
-
-use std::time::Duration;
+//!     inline), then a second barrier sees it PRESENT (the actor fired it off-tick
+//!     and the server settled).
+//!
+//! How to wait for that second barrier depends on which way the assertion points,
+//! and getting it backwards is how these tests go flaky or go vacuous:
+//!
+//!   * **Waiting for something to HAPPEN** — `poll_true` on the state itself. A
+//!     fixed sleep has to be long enough for the slowest machine or it flakes, and
+//!     every run then pays that worst case. Spawning a process is the common case
+//!     here, and it is the one that actually flaked: a 250ms budget for `sh` to
+//!     start, write and exit is fine idle and not fine under a loaded
+//!     `cargo test --workspace`.
+//!   * **Proving something will NOT happen** — `settle_ms`, a real wait. There is
+//!     nothing to poll for: the assertion is that the window passed with the state
+//!     unchanged, so the window has to genuinely pass.
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, poll_true, start_attached};
+use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, poll_true, settle_ms, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread (its runtime has timers enabled, so the
@@ -89,7 +100,7 @@ async fn defer_fn_fires_after_the_delay_not_before() {
     // Barrier #1, immediate: the deferred fn has NOT run (it didn't run inline).
     assert_eq!(lua_bool(&rpc, "return _G.fired").await, Some(false));
     // Past the delay: the actor fired it off-tick and the server settled.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    poll_true(&rpc, "return _G.fired").await;
     assert_eq!(lua_bool(&rpc, "return _G.fired").await, Some(true));
 }
 
@@ -103,8 +114,12 @@ async fn a_throwing_timer_callback_does_not_wedge_the_loop() {
          vim.defer_fn(function() _G.ok = true end, 50)",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(180)).await;
-    assert_eq!(lua_bool(&rpc, "return _G.ok").await, Some(true));
+    poll_true(&rpc, "return _G.ok").await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.ok").await,
+        Some(true),
+        "the second timer ran even though the first threw"
+    );
 }
 
 // ----- nx.utils.debounce (trailing-edge debounce over nx.timer) --------------------
@@ -123,7 +138,10 @@ async fn debounce_collapses_a_burst_to_one_trailing_call() {
     // Immediate: nothing ran inline — the burst is still pending.
     assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(0));
     // Past the delay: exactly one trailing call, with the MOST RECENT arguments.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Both halves need their own wait — poll for the call to arrive, then let a real
+    // window pass, because "exactly one" is only proved by a SECOND one not showing up.
+    poll_true(&rpc, "return _G.n >= 1").await;
+    settle_ms(&rpc, 120).await;
     assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(1));
     assert_eq!(exec_lua(&rpc, "return _G.last").await.as_str(), Some("c"));
 }
@@ -138,20 +156,27 @@ async fn debounce_cancel_drops_the_pending_call() {
          _G.d(); _G.d:cancel()",
     )
     .await;
-    // The pending call was cancelled — it never fires.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The pending call was cancelled — it never fires. Nothing to poll for: the whole
+    // claim is that the delay elapses with the counter untouched, so it must elapse.
+    settle_ms(&rpc, 150).await;
     assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(0));
 }
 
 #[tokio::test]
 async fn debounce_flush_runs_the_pending_call_now() {
     let (rpc, _incoming) = start().await;
-    // A long delay so only :flush() can make it fire promptly.
+    // The delay has to sit in a window: far longer than an RPC round-trip, so the timer
+    // provably cannot have fired on its own before the first assertion (that is what
+    // makes it a test of `flush` rather than of elapsed time — the delay used to be
+    // 5000ms for this reason); and short enough that the settle below OUTLIVES it, so a
+    // leftover timer really does get a chance to fire. Against the old 5000ms delay the
+    // second assertion could not fail no matter how broken `flush` was: 120ms of waiting
+    // can observe nothing about a call scheduled 5 seconds out.
     exec_lua(
         &rpc,
         "_G.n = 0\n\
          _G.last = nil\n\
-         _G.d = nx.utils.debounce(function(x) _G.n = _G.n + 1; _G.last = x end, 5000)\n\
+         _G.d = nx.utils.debounce(function(x) _G.n = _G.n + 1; _G.last = x end, 150)\n\
          _G.d('z'); _G.d:flush()",
     )
     .await;
@@ -159,7 +184,7 @@ async fn debounce_flush_runs_the_pending_call_now() {
     assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(1));
     assert_eq!(exec_lua(&rpc, "return _G.last").await.as_str(), Some("z"));
     // And flushing consumed the pending timer — no second, delayed fire.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    settle_ms(&rpc, 320).await;
     assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(1));
 }
 
@@ -181,7 +206,7 @@ async fn nx_run_resolves_with_exit_result() {
     // Barrier #1: still pending (no inline resolution).
     assert_eq!(lua_bool(&rpc, "return _G.res == nil").await, Some(true));
     // Past the run: resolved with stdout + a zero exit code.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    poll_true(&rpc, "return _G.res ~= nil").await;
     assert_eq!(
         exec_lua(&rpc, "return _G.res.stdout").await.as_str(),
         Some("hello\n")
@@ -210,7 +235,7 @@ async fn spawned_child_is_detached_from_the_controlling_terminal() {
          }):next(function(r) _G.sess = r.stdout end)",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    poll_true(&rpc, "return _G.sess ~= nil").await;
     assert_eq!(
         exec_lua(&rpc, "return _G.sess and _G.sess:gsub('%s+$', '')")
             .await
@@ -232,7 +257,7 @@ async fn nx_run_reports_spawn_failure_as_code_minus_one() {
          nx.run({ cmd = 'definitely-not-a-real-binary-xyz' }):next(function(r) _G.code = r.code end)",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    poll_true(&rpc, "return _G.code ~= nil").await;
     assert_eq!(lua_bool(&rpc, "return _G.code == -1").await, Some(true));
 }
 
@@ -254,7 +279,7 @@ async fn nx_run_stream_iterates_batches_via_await_each() {
          end)()",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    poll_true(&rpc, "return _G.done").await;
     // The collected lines, sorted to be order-independent of stdout batching.
     let joined = exec_lua(
         &rpc,
@@ -290,7 +315,11 @@ async fn nx_run_stream_exit_carries_stderr() {
          end)()",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // Poll on the EXIT landing, which is exactly the claim: whenever it lands, the
+    // stderr assertion below must already hold. A detached collector reporting early
+    // fails here just as it did against the fixed 700ms wait, and without budgeting
+    // the slowest machine into every run.
+    poll_true(&rpc, "return _G.exit ~= nil").await;
     assert_eq!(
         lua_u64(&rpc, "return _G.exit and _G.exit.code").await,
         Some(3)
@@ -393,7 +422,7 @@ async fn nx_socket_round_trips_over_tcp() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    poll_true(&rpc, "return _G.got ~= ''").await;
     assert_eq!(
         lua_bool(&rpc, "return _G.connected").await,
         Some(true),
@@ -402,7 +431,7 @@ async fn nx_socket_round_trips_over_tcp() {
     assert_eq!(exec_lua(&rpc, "return _G.got").await.as_str(), Some("ping"));
     // Closing fires on_close (clean — no error).
     exec_lua(&rpc, "_G.s:close()").await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    poll_true(&rpc, "return _G.closed ~= nil").await;
     assert_eq!(
         exec_lua(&rpc, "return _G.closed").await.as_str(),
         Some("clean"),
@@ -426,7 +455,10 @@ async fn nx_socket_connect_failure_is_loud() {
          })",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Poll for the failure report. A connect that wrongly SUCCEEDS sets no error, so
+    // this times out — and the `connected` assertion below is what then fails, naming
+    // the real defect rather than a timeout.
+    poll_true(&rpc, "return _G.err ~= nil").await;
     assert_eq!(lua_bool(&rpc, "return _G.connected").await, Some(false));
     assert_eq!(
         lua_bool(&rpc, "return type(_G.err) == 'string' and #_G.err > 0").await,
@@ -457,7 +489,7 @@ async fn nx_process_round_trips_stdin_to_stdout() {
          _G.proc:write('world\\n')",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    poll_true(&rpc, "return _G.got == 'hello\\nworld\\n'").await;
     let got = exec_lua(&rpc, "return _G.got").await;
     assert_eq!(
         got.as_str(),
@@ -468,7 +500,7 @@ async fn nx_process_round_trips_stdin_to_stdout() {
     assert_eq!(lua_bool(&rpc, "return _G.code == nil").await, Some(true));
     // Kill it; the exit callback fires.
     exec_lua(&rpc, "_G.proc:kill()").await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    poll_true(&rpc, "return _G.code ~= nil").await;
     assert_eq!(
         lua_bool(&rpc, "return _G.code ~= nil").await,
         Some(true),
@@ -493,7 +525,11 @@ async fn nx_process_streams_stderr_and_natural_exit_code() {
          })",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Poll rather than sleep a fixed span: this waits on a *spawned process*, and 250ms
+    // is not enough for `sh` to start, write and exit when the machine is loaded (it
+    // flaked in a full `cargo test --workspace` run while passing in isolation). The
+    // assertions below still do the verifying — polling only decides when to look.
+    poll_true(&rpc, "return _G.code ~= nil and _G.err ~= ''").await;
     assert_eq!(exec_lua(&rpc, "return _G.err").await.as_str(), Some("oops"));
     assert_eq!(lua_u64(&rpc, "return _G.code").await, Some(3));
 }
@@ -514,7 +550,7 @@ async fn nx_process_spawn_failure_is_loud_not_silent() {
          })",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    poll_true(&rpc, "return _G.code ~= nil and #_G.err > 0").await;
     assert_eq!(
         lua_bool(&rpc, "return _G.code == -1").await,
         Some(true),
@@ -579,18 +615,12 @@ async fn nx_hash_new_hashes_a_stream_via_await_each() {
          end)()",
     )
     .await;
-    // Off-tick stream: poll until the async chain sets _G.sum.
-    let mut got = None;
-    for _ in 0..150 {
-        let v = exec_lua(&rpc, "return _G.sum").await;
-        if let Some(s) = v.as_str() {
-            got = Some(s.to_owned());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Off-tick stream: poll until the async chain sets _G.sum (the hand-rolled loop
+    // this replaces was `poll_true` spelled out).
+    poll_true(&rpc, "return _G.sum ~= nil").await;
+    let got = exec_lua(&rpc, "return _G.sum").await;
     assert_eq!(
-        got.as_deref(),
+        got.as_str(),
         Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
         "hashing a stream's chunks via await_each yields sha256 of the concatenated data"
     );

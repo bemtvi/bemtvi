@@ -1,0 +1,6 @@
+Async event model — sample buffer.
+
+Open this file with the config in this directory and the numbered
+sections in init.lua each demonstrate one part of the model.
+
+Move the cursor around. Run :messages. Run :lua print(vim.inspect(nx.autocmd.pending())).

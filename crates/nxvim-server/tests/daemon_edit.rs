@@ -334,3 +334,71 @@ async fn edit_existing_remote_file_fires_bufreadpost_not_bufnewfile() {
         "a missing remote path is still a new file (fires BufNewFile, never BufReadPost; got {events:?})"
     );
 }
+
+/// The gated read chain works identically over the wire — the tier-1 rule applied to the
+/// async event model (`docs/plans/2026-07-26-async-event-model.md`, phases 4–5).
+///
+/// A remote open takes the off-tick path: the buffer is created empty, the bytes land a
+/// tick or more later, and only *then* is the buffer announced. Both halves of the model
+/// must survive that split — the chain's ordering (`FileType` waits for an async
+/// `BufReadPost` handler to settle) and replay (a handler registered during the async
+/// tail still receives the event). Ungated, `FileType` fires the moment `BufReadPost`
+/// returns, i.e. between `read:start` and `read:done`, which is the mutation this pins.
+#[tokio::test]
+async fn the_gated_read_chain_orders_and_replays_over_the_wire() {
+    let fake = DaemonFs::default();
+    fake.set("/virtual/note.txt", "alpha\n")
+        .set("/virtual/chain.rs", "fn over_the_wire() {}\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/note.txt").await;
+    await_lines(&rpc, &["alpha"]).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.log = {}
+        -- An async BufReadPost handler that reads the loaded content: it can only see
+        -- "over the wire" if the fetched bytes really landed before the announce.
+        nx.autocmd.create("BufReadPost", { pattern = "*chain.rs", callback = function(a)
+          _G.log[#_G.log + 1] = "read:start"
+          return nx.promise.delay(30):next(function()
+            _G.log[#_G.log + 1] = "read:done:" .. (nx.buf.lines(a.buf, 0, 1)[1] or "")
+          end)
+        end })
+        -- Pattern-less, so EVERY FileType this buffer fires is visible — including one
+        -- that jumped the gate. It then goes async itself and registers a LATE
+        -- subscriber, which must still receive the same event.
+        nx.autocmd.create("FileType", { callback = function(a)
+          _G.log[#_G.log + 1] = "ft:" .. a.match
+          return nx.promise.delay(5):next(function()
+            nx.autocmd.create("FileType", { callback = function(x)
+              _G.log[#_G.log + 1] = "late:" .. x.match
+            end })
+          end)
+        end })
+        return 1
+        "#,
+    )
+    .await;
+
+    feed(&rpc, ":edit /virtual/chain.rs<CR>");
+    await_lines(&rpc, &["fn over_the_wire() {}"]).await;
+
+    let mut log = String::new();
+    for _ in 0..200 {
+        log = exec_lua(&rpc, "return table.concat(_G.log, ',')")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if log.contains("late:") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        log, "read:start,read:done:fn over_the_wire() {},ft:rust,late:rust",
+        "over the wire: the async read handler saw the fetched content, FileType waited \
+         for it to settle rather than firing between start and done, and the late \
+         subscriber still got the event"
+    );
+}

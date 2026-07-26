@@ -431,8 +431,14 @@ end
 
 -- Load `name` and report a rejection (uninstalled / load error) on the message
 -- line — the fire-and-forget entry the lazy triggers and eager activation use.
+-- Returns the load promise (already `:catch`ed, so it resolves rather than rejects on a
+-- failed load). An event/filetype trigger hands it back to the autocmd dispatcher so
+-- the settle protocol waits for the load — including an *async* `config` — and then
+-- replays the event to the handlers that config registered. Without returning it, the
+-- fire sees no pending promise, never arms a replay, and the plugin's own `FileType`
+-- handler misses the very buffer that woke it.
 local function load_reporting(name)
-  M.load(name):catch(function(err)
+  return M.load(name):catch(function(err)
     nx.notify(tostring(err and err.message or err), 4)
   end)
 end
@@ -440,10 +446,21 @@ end
 -- ----- lazy triggers ---------------------------------------------------------
 
 -- Arm a lazy plugin's triggers: the first matching command / event / filetype /
--- keypress loads it, then the trigger re-fires against the now-loaded plugin (a
--- command re-dispatches with its original args; a key is fed back through the
--- typeahead so the plugin's own mapping handles it). `init` (the always-run hook)
--- fires here, at startup, regardless of when the body loads.
+-- keypress loads it, and the trigger then makes sure the plugin still sees what woke
+-- it. Each trigger kind does that differently:
+--
+--   * `cmd` re-dispatches the original invocation, with its args, against the real
+--     command the plugin just defined (it replaced this stub);
+--   * `keys` feeds the key back through the typeahead so the plugin's own mapping
+--     handles it;
+--   * `event` / `ft` **return the load promise**, so the autocmd dispatcher's settle
+--     protocol waits for the load — including an *async* `config` — and then replays
+--     the event to the handlers that config registered. A hot-path `event` is the one
+--     exception (returning a promise from one raises), so there the plugin's handler
+--     catches the next occurrence instead of this one.
+--
+-- `init` (the always-run hook) fires here, at startup, regardless of when the body
+-- loads.
 local function arm_lazy(spec)
   local name = spec.name
   if spec.init then
@@ -471,13 +488,23 @@ local function arm_lazy(spec)
 
   for _, ev in ipairs(spec._triggers.event) do
     nx.on(ev, {}, function()
-      load_reporting(name)
+      -- A hot-path event (`BufEnter`, `CursorMoved`, …) must not be handed a promise —
+      -- it fires per keypress and the dispatcher raises on one — so there the load is
+      -- fire-and-forget and the plugin's own handler catches the *next* occurrence
+      -- rather than this one. Every other event returns the promise and gets the replay.
+      if nx._hot_events[ev] then
+        load_reporting(name)
+        return
+      end
+      return load_reporting(name)
     end)
   end
 
   if #spec._triggers.ft > 0 then
     nx.on("FileType", { pattern = spec._triggers.ft }, function()
-      load_reporting(name)
+      -- `FileType` is non-hot, so returning the promise is what makes an ft-lazy plugin
+      -- with an async `config` actually receive the event it was woken by.
+      return load_reporting(name)
     end)
   end
 

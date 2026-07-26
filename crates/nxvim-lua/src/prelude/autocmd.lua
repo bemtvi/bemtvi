@@ -302,6 +302,46 @@ local function au_check_patterns(event, pat)
   end
 end
 
+-- Modules that merely *forward* a registration — `nx.on` hands straight to
+-- `nx.autocmd.create`, and `create` is where the capture happens — so their frames are
+-- never the interesting answer and the walk skips past them. Every other frame is
+-- reported as-is: a user's `init.lua`, a plugin, or another prelude module registering
+-- a handler of its own (`nxvim:prelude/statusline:186` is a useful answer).
+local SITE_SKIP = {
+  ["nxvim:prelude/autocmd"] = true,
+  ["nxvim:prelude/nx"] = true,
+}
+
+-- `debug.getinfo().short_src` renders a *named string chunk* — which is how every
+-- prelude module is loaded (`nxvim:prelude/autocmd`, see `runtime.rs`) — in the
+-- bracketed form `[string "nxvim:prelude/autocmd"]`. Unwrap it to the bare chunk name
+-- so `SITE_SKIP` can compare exact module names, and so a site that legitimately lands
+-- in the prelude reads `nxvim:prelude/statusline:186` rather than the noisy form. A
+-- file-backed chunk (a user's `init.lua`, a plugin) has no wrapper and passes through.
+local function unwrap_chunk_name(src)
+  return src:match('^%[string "(.*)"%]$') or src
+end
+
+-- Where the calling code registered this autocmd, as `"src:line"`. Captured ONCE per
+-- registration — never per fire — so the cost is paid at config time and a
+-- slow, hung, or contract-violating handler can be traced back to the line that
+-- installed it. Without this, "a FileType handler exceeded its budget" is unactionable
+-- with N plugins loaded. Returns nil rather than guessing when the stack is all C
+-- frames (a registration driven from Rust, e.g. the `:autocmd` ex-command).
+local function capture_site()
+  for lvl = 2, 12 do
+    local info = debug.getinfo(lvl, "Sl")
+    if not info then
+      return nil
+    end
+    local src = info.short_src and unwrap_chunk_name(info.short_src)
+    if src and src ~= "[C]" and not SITE_SKIP[src] then
+      return src .. ":" .. tostring(info.currentline)
+    end
+  end
+  return nil
+end
+
 -- `nx.autocmd.create(event, opts)` -> id [alias `nvim_create_autocmd`]: run something
 -- whenever `event` fires. Returns the autocmd's numeric id (pass it to
 -- `nx.autocmd.del` to remove it). `event` is an event name (`"FileType"`,
@@ -321,6 +361,11 @@ end
 --   * `buffer` — make it buffer-local: it then fires only for that buffer (and
 --     `pattern` is ignored). `0` resolves to the current buffer at registration time.
 --   * `once` — fire once, then auto-remove. `desc` — a human description.
+--   * `timeout` — how many milliseconds the editor waits for *this* handler's returned
+--     promise before warning and moving on (default 500). It bounds the **wait**, never
+--     the delivery: the work keeps running and late subscribers are still served. Raise
+--     it for a handler you know is slow (a first LSP spawn) so it does not warn on every
+--     open. Ignored by the hot-path events, whose handlers must be synchronous.
 --
 -- The `callback` receives one table describing the event:
 --   `{ id, event, match, buf, file, data }` — `id` this autocmd's id, `event` the
@@ -350,8 +395,14 @@ function nx.autocmd.create(event, opts)
   if buffer == 0 then
     buffer = nx._cur_buf and nx._cur_buf.bufnr or 0
   end
-  nx._autocmds[#nx._autocmds + 1] =
-    { id = autocmd_seq, event = event, opts = opts, group = group, buffer = buffer }
+  nx._autocmds[#nx._autocmds + 1] = {
+    id = autocmd_seq,
+    event = event,
+    opts = opts,
+    group = group,
+    buffer = buffer,
+    site = capture_site(),
+  }
   nx._au_touch()
   return autocmd_seq
 end
@@ -429,13 +480,19 @@ end
 -- ones that fired (collected during the pass and removed after it, so the live `ipairs`
 -- isn't mutated underneath). `nx._fire` / `nx._fire_gated` each supply their own
 -- per-handler `run` (they differ only in what they do with the callback's return value).
-local function au_dispatch(event, pattern, buf, run, group)
+-- `min_id` (optional) restricts the pass to autocmds registered *after* that id — the
+-- replay filter: it re-delivers an event to handlers that appeared while the first
+-- dispatch's async handlers were still running, without re-running the ones that
+-- already saw it. Ids are monotonic (`autocmd_seq`), so the comparison is exact and no
+-- handler can ever observe the same fire twice.
+local function au_dispatch(event, pattern, buf, run, group, min_id)
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
   for _, au in ipairs(nx._autocmds) do
     local ev = au.event
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
     if
       ev_ok
+      and (min_id == nil or au.id > min_id)
       and au_pattern_matches(au.opts.pattern, pattern)
       and (au.buffer == nil or au.buffer == buf)
       -- `group` (an augroup id, nil = every group) narrows a MANUAL fire to one
@@ -457,10 +514,55 @@ local function au_dispatch(event, pattern, buf, run, group)
   end
 end
 
--- Track the promise a non-gating handler returned. The editor does **not** block on
--- it — only `BufWritePre` awaits (`nx._fire_gated`); every other event is
+-- ----- hot-path events --------------------------------------------------------
+
+-- The **hot-path** events: the ones the editor fires while converging a single input
+-- tick — i.e. on (nearly) every keypress. Their handlers must be **synchronous**: a
+-- hot-path handler that returns a promise raises, because the editor will not wait
+-- for it and an author who returns one is expecting sequencing that cannot happen.
+-- Async work is still allowed from a hot-path handler; it just has to be *started
+-- and not returned* (`nx.schedule` / `nx.on_next_tick` are the escape hatches).
+--
+-- The split is what keeps the settle protocol off the input tick entirely: only a
+-- *non*-hot event can park the gated read chain or arm a replay pass, and those fire
+-- roughly once per buffer rather than once per key. Every other event is non-hot and
+-- async-capable. See `docs/plans/2026-07-26-async-event-model.md`.
+local HOT_EVENTS = {
+  BufEnter = true,
+  BufLeave = true,
+  CursorMoved = true,
+  CursorMovedI = true,
+  InsertEnter = true,
+  InsertLeave = true,
+  ModeChanged = true,
+  TextChanged = true,
+  TextChangedI = true,
+  WinEnter = true,
+  WinLeave = true,
+  WinResized = true,
+  WinScrolled = true,
+}
+nx._hot_events = HOT_EVENTS
+
+-- The error raised when a hot-path handler returns a promise. It names the event and
+-- where the handler was registered (`au.site`, captured at registration; until that
+-- lands the autocmd id stands in), and — the part that makes it actionable rather
+-- than merely loud — spells out the escape hatch, so the fix is obvious from the
+-- message alone without reading any docs.
+local function hot_async_error(au, event)
+  local where = au.site and ("registered at " .. au.site) or ("autocmd id " .. tostring(au.id))
+  return "nxvim: "
+    .. event
+    .. " handlers must be synchronous ("
+    .. where
+    .. "): it fires on every keypress, so the editor cannot wait for a promise. "
+    .. "Start the async work with nx.schedule / nx.on_next_tick and return nothing."
+end
+
+-- Track the promise a non-hot-path handler returned. The editor does **not** block on
+-- it — only `BufWritePre` awaits (`nx._fire_gated`); every other non-hot event is
 -- *async-tolerant*: a handler may kick off async work (an LSP request from
--- `CursorMoved`, a `nx.fs` write from `BufWritePost`) and the fire returns without
+-- `FileType`, a `nx.fs` write from `BufWritePost`) and the fire returns without
 -- waiting. But an async-tolerant return must not be *silently dropped* — a handler
 -- whose promise rejects (a failed request, a throw in a `:next`) has to surface, not
 -- vanish. Attaching this `:catch` marks the promise handled, so the generic
@@ -478,11 +580,283 @@ local function track_au_promise(ret, event)
   end
 end
 
+-- ----- settle protocol: replay to late subscribers ----------------------------
+--
+-- Neovim's event guarantee is trivially "when the fire returns, everything it
+-- triggered has finished" — it is synchronous. Ours cannot be, so the async analogue
+-- has two halves: events are ordered against each other (the gated read chain), and
+-- **anyone who shows up during the settle window still gets the event**. This is that
+-- second half, and it is what makes an `ft`-lazy plugin with an *async* `config` work:
+-- the trigger loads the plugin, the plugin registers its own `FileType` handler a tick
+-- or more later, and that handler still runs for the buffer that woke it.
+--
+-- See `docs/plans/2026-07-26-async-event-model.md`.
+
+-- How long a fire waits for its async handlers before replaying anyway. This is NOT
+-- merely diagnostic: once the read chain gates on these settles, a handler that never
+-- resolves would leave a buffer permanently half-initialized, so expiry has to advance
+-- the world regardless. Overridable per-autocmd via `opts.timeout` for a legitimately
+-- slow one-off (a first LSP spawn) that should not warn on every open.
+local DEFAULT_SETTLE_BUDGET_MS = 500
+-- A replayed handler may itself load something that registers more handlers, so the
+-- pass runs to a fixpoint. An unbounded registration loop must fail loud rather than
+-- spin, so the rounds are capped.
+local REPLAY_MAX_ROUNDS = 8
+-- Sentinel distinguishing "the budget elapsed" from "the handlers settled" as the
+-- winner of the race below (a handler could otherwise fulfil with anything).
+local SETTLE_TIMEOUT = "\0nx_settle_timeout"
+
+-- Handler promises still in flight, keyed by a monotonic token: `nx.autocmd.pending()`
+-- reads it. Entries are cleared when their promise settles, so what remains past its
+-- budget is exactly the set of slow — or permanently hung — handlers. A hung handler
+-- never settles and so never warns on completion; this table is how it stays visible.
+nx._au_pending = nx._au_pending or {}
+local au_pending_seq = 0
+
+-- The budget for one fire: the most generous request among the handlers we are waiting
+-- on, so a handler that asked for more time gets it rather than being cut short by a
+-- stricter sibling on the same event. The default is what a handler that expressed no
+-- preference asks for — NOT a floor, so a lone `timeout = 20` handler really does get
+-- 20ms rather than being silently raised to the default.
+local function settle_budget(waits)
+  local budget
+  for _, w in ipairs(waits) do
+    local t = w.au.opts.timeout
+    if type(t) ~= "number" then
+      t = DEFAULT_SETTLE_BUDGET_MS
+    end
+    if budget == nil or t > budget then
+      budget = t
+    end
+  end
+  return budget or DEFAULT_SETTLE_BUDGET_MS
+end
+
+local function site_of(w)
+  return w.au.site or ("autocmd id " .. tostring(w.au.id))
+end
+
+-- Where the still-unsettled handlers of this fire were registered, for the warnings.
+-- Naming the site is the whole point: "a FileType handler was slow" is unactionable
+-- with N plugins loaded.
+--
+-- Falls back to naming EVERY handler this fire waited on when none looks unsettled.
+-- That is not hypothetical: the budget timer and the handlers can become ready in the
+-- same loop turn, and `race` may still pick the timeout even though `finally` has
+-- already marked them done — leaving the precise filter with nothing to report. Naming
+-- all of them is less pointed but always true; naming none is useless.
+local function unsettled_sites(waits)
+  local out = {}
+  for _, w in ipairs(waits) do
+    if not w.done then
+      out[#out + 1] = site_of(w)
+    end
+  end
+  if #out == 0 then
+    for _, w in ipairs(waits) do
+      out[#out + 1] = site_of(w)
+    end
+  end
+  return table.concat(out, ", ")
+end
+
+local arm_settle -- forward declaration: each replay round can arm the next
+
+-- Wait for one fire's async handlers, then hand the event to whatever registered while
+-- they were running. `cursor` is `{ hw = <highest autocmd id already delivered to> }`,
+-- so a replay reaches exactly the handlers that missed the event.
+--
+-- The cursor is a shared, mutable box rather than a per-round number **on purpose**: one
+-- fire can have two live replay paths at once. A fire whose budget expired declares
+-- convergence and replays, and its late subscribers may go async and arm a further
+-- round — while the handler that blew the budget is still running and will replay again
+-- when it finally settles. Given a number, each path advances its own copy and both
+-- dispatch the same id range, so a handler registered in between receives the event
+-- TWICE — the exact thing the watermark exists to prevent. Sharing the box makes the
+-- delivered-up-to point global to the fire, so whichever path reaches a handler first is
+-- the only one that does.
+--
+-- `on_done` (optional) is called EXACTLY ONCE when this fire has fully converged —
+-- handlers settled and every replay round done. It is how a *gated* caller learns the
+-- event is finished, so the read chain can advance to its next stage knowing the
+-- previous one saw a settled world. A timeout counts as converged: the chain must
+-- advance even on a handler that never resolves, or the buffer stays half-initialized.
+arm_settle = function(ctx, cursor, waits, round, on_done)
+  local finished = false
+  local function finish()
+    if finished then
+      return
+    end
+    finished = true
+    if on_done then
+      on_done()
+    end
+  end
+
+  if round > REPLAY_MAX_ROUNDS then
+    nx.notify(
+      "nxvim: "
+        .. ctx.event
+        .. " autocmd replay did not converge after "
+        .. REPLAY_MAX_ROUNDS
+        .. " rounds (handlers keep registering handlers); giving up",
+      "warn"
+    )
+    finish()
+    return
+  end
+
+  local promises = {}
+  for i, w in ipairs(waits) do
+    promises[i] = w.promise
+    -- Per-handler completion, so a timeout can name *which* handler is slow rather
+    -- than the whole batch.
+    w.promise:finally(function()
+      w.done = true
+    end)
+  end
+
+  local started = nx.now_ms()
+  local budget = settle_budget(waits)
+  au_pending_seq = au_pending_seq + 1
+  local token = au_pending_seq
+  nx._au_pending[token] = {
+    event = ctx.event,
+    buf = ctx.buf,
+    budget = budget,
+    started = started,
+    waits = waits,
+  }
+
+  -- Deliver the event to handlers registered since `cursor.hw`, and if any of *those* go
+  -- async, arm the next round for them. Reads `autocmd_seq` before dispatching, since
+  -- dispatching can register more. Returns whether a nested round was armed and given
+  -- ownership of `finish` — when it wasn't, this fire has converged here.
+  -- `chain` false means nobody is waiting on convergence any more (we already advanced
+  -- past a timeout), so a nested round runs purely for the late subscribers' benefit.
+  local function replay(chain)
+    local next_hw = autocmd_seq
+    local late
+    au_dispatch(ctx.event, ctx.pattern, ctx.buf, function(au)
+      local cb = au.opts.callback
+      if type(cb) == "function" then
+        local ret = cb({
+          id = au.id,
+          event = ctx.event,
+          match = ctx.pattern,
+          buf = ctx.buf,
+          file = ctx.file or ctx.pattern,
+          data = ctx.data,
+        })
+        if nx._is_promise(ret) then
+          late = late or {}
+          late[#late + 1] = { promise = ret, au = au }
+          track_au_promise(ret, ctx.event)
+        end
+      elseif type(au.opts.command) == "string" then
+        vim.cmd(au.opts.command)
+      end
+    end, ctx.group, cursor.hw)
+    -- `next_hw` was read before the dispatch, and `autocmd_seq` only grows, so this is
+    -- monotonic no matter which of the fire's live paths gets here first.
+    cursor.hw = next_hw
+    if late then
+      arm_settle(ctx, cursor, late, round + 1, chain and finish or nil)
+      return chain
+    end
+    return false
+  end
+
+  local settled = nx.promise.all_settled(promises)
+  local timed_out = false
+  -- The sites that were still unsettled when the budget blew. Captured THERE and
+  -- reused by the completion warning below, because by the time a handler finally
+  -- settles it is `done` and `unsettled_sites` would report nothing — losing exactly
+  -- the file:line that makes the warning actionable.
+  local overdue_sites = ""
+
+  nx.promise.race({ settled, nx.promise.delay(budget, SETTLE_TIMEOUT) }):next(function(res)
+    if res == SETTLE_TIMEOUT then
+      timed_out = true
+      overdue_sites = unsettled_sites(waits)
+      nx.notify(
+        "nxvim: "
+          .. ctx.event
+          .. " handler exceeded its "
+          .. budget
+          .. "ms budget ("
+          .. overdue_sites
+          .. "); continuing without it",
+        "warn"
+      )
+      -- Replay for the late subscribers, then declare convergence regardless: the
+      -- budget bounds how long we WAIT, never whether subscribers get the event, and a
+      -- gated caller must advance rather than hang on a handler that may never resolve.
+      replay(false)
+      finish()
+    elseif not replay(true) then
+      -- Converged here: no nested round took ownership of `finish`.
+      finish()
+    end
+  end)
+
+  -- Independently of the race: when the handlers do eventually settle, drop them from
+  -- the pending table, and — if we had already given up on them — say so with the real
+  -- elapsed time and replay once more for anything that registered in the meantime.
+  settled:next(function()
+    nx._au_pending[token] = nil
+    if timed_out then
+      nx.notify(
+        "nxvim: "
+          .. ctx.event
+          .. " handler ("
+          .. overdue_sites
+          .. ") settled "
+          .. math.floor(nx.now_ms() - started)
+          .. "ms after starting, past its "
+          .. budget
+          .. "ms budget",
+        "warn"
+      )
+      -- Late subscribers still get the event; convergence was already declared at the
+      -- timeout, so nothing is waiting on this round.
+      replay(false)
+    end
+  end)
+end
+
+-- `nx.autocmd.pending()` -> the autocmd handler promises still in flight past their
+-- settle budget, as `{ event, buf, site, elapsed_ms, budget }` entries. A handler that
+-- hangs forever never settles and so never warns on completion — this is where it stays
+-- visible. Inspect with `:lua print(vim.inspect(nx.autocmd.pending()))`.
+function nx.autocmd.pending()
+  local now = nx.now_ms()
+  local out = {}
+  for _, e in pairs(nx._au_pending) do
+    local elapsed = now - e.started
+    if elapsed > e.budget then
+      out[#out + 1] = {
+        event = e.event,
+        buf = e.buf,
+        site = unsettled_sites(e.waits),
+        elapsed_ms = math.floor(elapsed),
+        budget = e.budget,
+      }
+    end
+  end
+  return out
+end
+
 -- `group` is the optional trailing augroup-id filter (see `au_dispatch`); the Rust
 -- fire paths pass fewer arguments, so an editor-triggered event leaves it nil and
 -- reaches every subscriber.
 function nx._fire(event, pattern, buf, file, data, group)
   local any = false
+  local hot = HOT_EVENTS[event]
+  -- Ids at or below this existed when we dispatched; anything above registered DURING
+  -- this fire and never saw it. Captured before the pass, used by the replay.
+  local watermark = autocmd_seq
+  local waits -- nil unless a non-hot handler returned a pending promise
   au_dispatch(event, pattern, buf, function(au)
     local cb = au.opts.callback
     if type(cb) == "function" then
@@ -494,29 +868,68 @@ function nx._fire(event, pattern, buf, file, data, group)
         file = file or pattern,
         data = data,
       })
-      track_au_promise(ret, event)
+      -- A hot-path handler must be synchronous; a promise here is a contract
+      -- violation, so it raises like any other handler error (aborting the rest of
+      -- this fire and surfacing through `report_autocmd_err`) rather than being
+      -- quietly tracked and never awaited.
+      if hot then
+        if nx._is_promise(ret) then
+          error(hot_async_error(au, event), 0)
+        end
+      else
+        if nx._is_promise(ret) then
+          waits = waits or {}
+          waits[#waits + 1] = { promise = ret, au = au }
+        end
+        track_au_promise(ret, event)
+      end
       any = true
     elseif type(au.opts.command) == "string" then
       vim.cmd(au.opts.command)
       any = true
     end
   end, group)
+  -- Only a fire that actually went async pays for the settle protocol; with no pending
+  -- promise this returns exactly as it always did — same tick, no timer, no bookkeeping
+  -- — which is the overwhelmingly common case and every case on the hot path.
+  if waits then
+    arm_settle(
+      { event = event, pattern = pattern, buf = buf, file = file, data = data, group = group },
+      { hw = watermark },
+      waits,
+      1
+    )
+  end
   return any
 end
 
 -- Fire an **awaited** event: run every matching handler like `nx._fire`, but a handler
--- may return a promise the caller must wait on before proceeding. Currently drives
--- `BufWritePre` — the write waits for format/trim-on-save (including *async* handlers,
--- e.g. an LSP format that resolves a tick later) to settle before the bytes serialize.
+-- may return a promise the caller must wait on before proceeding. Drives `BufWritePre`
+-- (the write waits for format/trim-on-save — including *async* handlers, e.g. an LSP
+-- format that resolves a tick later — to settle before the bytes serialize), each stage
+-- of the gated read chain (`BufReadPost`/`BufNewFile` → `FileType`), and the `*Pre`
+-- stages of the exit sequence.
 -- Collects each handler's returned promise; if none are pending, returns `true` so the
 -- caller commits synchronously (identical timing to the plain `nx._fire` path). Otherwise
 -- waits for all of them via `nx.promise.all_settled` and, once settled, signals the
 -- server through `nx._au_gate_done(gate_id)` (the parked follow-up's key), returning
 -- `false` so the caller defers until that signal. `all_settled` never rejects, so a
--- handler whose promise *rejects* still lets the write proceed (its rejection surfaces via
--- the normal unhandled-path) — a failing formatter must not silently block saving.
+-- handler whose promise *rejects* still lets the gated action proceed — a failing
+-- formatter must not silently block saving, and a failing read handler must not leave a
+-- buffer half-announced. That is a LIVENESS decision, not permission to hide the error:
+-- `track_au_promise` still reports the rejection named for the event, exactly as on the
+-- ungated path. (It has to be attached here explicitly — `all_settled` subscribes with a
+-- rejection handler of its own, which marks the promise handled and would otherwise leave
+-- even the generic unhandled-rejection reporter silent.)
+-- It rides the same settle protocol as `nx._fire`, so a gated event ALSO replays to
+-- handlers that registered during its async tail — and the gate is signalled only once
+-- that whole fixpoint has converged. That is what lets the read chain advance knowing
+-- the previous stage saw a fully settled world: when `FileType` fires, an async
+-- `BufReadPost` handler has finished *and* anything it registered has run.
 function nx._fire_gated(event, pattern, buf, file, gate_id, data)
-  local promises -- nil until a handler returns a pending promise
+  local hot = HOT_EVENTS[event]
+  local watermark = autocmd_seq
+  local waits -- nil until a handler returns a pending promise
   au_dispatch(event, pattern, buf, function(au)
     local cb = au.opts.callback
     local ret
@@ -533,16 +946,29 @@ function nx._fire_gated(event, pattern, buf, file, gate_id, data)
       vim.cmd(au.opts.command)
     end
     if nx._is_promise(ret) then
-      promises = promises or {}
-      promises[#promises + 1] = ret
+      -- No gated event is hot today, but the guard is the contract rather than a
+      -- reaction to a caller: being sequenced behind a gate must never be the loophole
+      -- that lets a per-keypress event go async.
+      if hot then
+        error(hot_async_error(au, event), 0)
+      end
+      waits = waits or {}
+      waits[#waits + 1] = { promise = ret, au = au }
+      track_au_promise(ret, event)
     end
   end)
-  if not promises then
+  if not waits then
     return true
   end
-  nx.promise.all_settled(promises):next(function()
-    nx._au_gate_done(gate_id)
-  end)
+  arm_settle(
+    { event = event, pattern = pattern, buf = buf, file = file, data = data },
+    { hw = watermark },
+    waits,
+    1,
+    function()
+      nx._au_gate_done(gate_id)
+    end
+  )
   return false
 end
 
@@ -665,7 +1091,8 @@ end
 -- `nx.autocmd.get(opts)` [alias `nvim_get_autocmds`]: introspect the registered
 -- autocmds — a debugging affordance for confirming what `clear`/`del` left
 -- behind. Returns a list of
--- `{id, event, group, group_name, pattern, buffer, command}` entries, optionally
+-- `{id, event, group, group_name, pattern, buffer, command, site}` entries — `site`
+-- being the `"src:line"` the autocmd was registered at — optionally
 -- filtered by `opts.event` (string or list) and `opts.group` (id or name). Run it
 -- interactively as
 -- `:lua print(vim.inspect(nx.autocmd.get({})))`.
@@ -703,6 +1130,9 @@ function nx.autocmd.get(opts)
         pattern = au.opts.pattern,
         buffer = au.buffer,
         command = type(au.opts.command) == "string" and au.opts.command or nil,
+        -- `"src:line"` of the registration (nil when it came from a C frame). The
+        -- handle for "which of my handlers is the slow one" — see `capture_site`.
+        site = au.site,
       }
     end
   end
@@ -776,7 +1206,11 @@ local function au_list(group, events, patterns)
       local pat = au.opts.pattern
       pat = type(pat) == "table" and table.concat(pat, ",") or (pat or "*")
       local g = au.group and (gname[au.group] or ("group#" .. au.group)) or ""
-      local body = au.opts.command or "<callback>"
+      -- A callback has no source text to show, so name where it was registered
+      -- instead — the listing's whole job is telling you *which* handler is which,
+      -- and `<callback>` repeated N times does not. (vim's answer to the same
+      -- problem is `:verbose autocmd`'s "Last set from …".)
+      local body = au.opts.command or (au.site and ("<callback> " .. au.site) or "<callback>")
       lines[#lines + 1] = string.format("%-10s %-12s %-16s %s", g, evs, pat, body)
     end
   end

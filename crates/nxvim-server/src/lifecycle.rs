@@ -5,7 +5,7 @@
 #[cfg(feature = "native")]
 use crate::evloop::LoopCommand;
 use crate::filetype_of;
-use crate::{EditHost, ExitStage, WindowRect};
+use crate::{EditHost, ExitStage, ReadChain, ReadStage, WindowRect};
 #[cfg(feature = "native")]
 use crate::{FsRead, WatchEvent, INTERNAL_WATCH_BASE};
 use nxvim_core::{
@@ -600,8 +600,9 @@ impl EditHost {
         }
         self.known_windows = wins;
 
+        // The file-backed test that used to gate `BufReadPost` here now lives inside
+        // `drive_read_chain`, which owns the announce sequence.
         let name = self.editor.buffer_name(buf).unwrap_or_default();
-        let file_backed = !name.is_empty();
 
         // ----- BufAdd: a buffer newly added to the list -----
         // Fires before the buffer's `BufReadPost` (a file open into a fresh bufnr
@@ -625,16 +626,13 @@ impl EditHost {
         // `[No Name]`/scratch buffer was never read. A buffer whose file does not
         // exist on disk fires `BufNewFile` *instead of* `BufReadPost` (matching
         // `vim file-that-does-not-exist`); an existing file fires `BufReadPost`.
+        // Driven as a *gated chain* (`BufReadPost` → `FileType` → deferred `BufEnter`)
+        // so each stage's async handlers settle before the next fires. With no async
+        // handler — nearly always — the whole chain completes inside this one call and
+        // the timing is exactly what it was before. See `drive_read_chain`.
         if unannounced && !pending_open {
             self.announced.insert(buf);
-            if file_backed {
-                let event = if self.editor.buffer_is_new_file(buf) {
-                    "BufNewFile"
-                } else {
-                    "BufReadPost"
-                };
-                self.fire_lifecycle(event, &name, buf, &name);
-            }
+            self.begin_read_chain(buf);
         }
 
         // Re-read the filetype / fileencoding now that `BufReadPost`/`BufNewFile` has
@@ -664,7 +662,11 @@ impl EditHost {
         // buffers too, so a core-created special buffer's `FileType <ft>` autocmd
         // installs its buffer-local maps (the unified special-buffer model — see
         // docs/plans/2026-06-16-unify-special-buffer-kinds.md).
-        if ft_changed && !pending_open {
+        // Skipped while a read chain owns this buffer: the chain's `FileType` stage fires
+        // the initial one, in order behind `BufReadPost`'s settle. This path remains for
+        // a *later* filetype change on an already-announced buffer (`:set ft=x`, an
+        // in-place buffer reuse across kinds), which is not part of any read sequence.
+        if ft_changed && !pending_open && !self.read_chains.contains_key(&buf) {
             if let Some(ft) = &cur_ft {
                 self.fire_lifecycle("FileType", ft, buf, &name);
             }
@@ -693,7 +695,15 @@ impl EditHost {
                 self.fire_lifecycle("BufLeave", &old_name, old, &old_name);
             }
             self.last_buffer_id = Some(buf);
-            self.fire_lifecycle("BufEnter", &name, buf, &name);
+            // If this buffer's read chain is still in flight (a stage parked on an async
+            // handler), hand `BufEnter` to the chain so it lands *after* the gates rather
+            // than beating a still-settling `FileType`. A chain that completed
+            // synchronously — the common case — is already gone from the map, so this
+            // fires inline exactly as before.
+            match self.read_chains.get_mut(&buf) {
+                Some(c) => c.deferred_enter = true,
+                None => self.fire_lifecycle("BufEnter", &name, buf, &name),
+            }
         }
 
         // Mode events: `InsertEnter` on the transition into insert (the entered
@@ -721,12 +731,19 @@ impl EditHost {
             self.fire_window("WinEnter", cur_win, b);
         }
 
+        // ----- read lifecycle for buffers in NON-current windows -----
+        // Announce every displayed-but-unannounced buffer (`BufReadPost`/`BufNewFile`
+        // → `FileType`) before the `BufWinEnter` walk below, so a restored background
+        // window gets neovim's full per-buffer sequence in order rather than
+        // `BufWinEnter` alone. See `announce_displayed_buffers`.
+        self.announce_displayed_buffers();
+
         // ----- BufWinEnter: a buffer first becoming displayed in a window -----
         // Fires once per buffer whose window-visibility went 0 -> >=1 this diff.
-        // Unlike the current-buffer `BufReadPost`/`BufEnter` events above, this
-        // walks *every* window, so a session/workspace restore — which fills
-        // non-current windows the current-buffer diff never visits — fires it for
-        // each restored file. A no-arg `:split` (the buffer is already displayed)
+        // Like the read-lifecycle walk just above (and unlike the current-buffer
+        // `BufEnter`), this walks *every* window, so a session/workspace restore —
+        // which fills non-current windows the current-buffer diff never visits —
+        // fires it for each restored file. A no-arg `:split` (the buffer is already displayed)
         // and merely focusing another window don't fire it; a buffer hidden then
         // re-shown does (neovim's "hidden buffer displayed"). The baseline
         // (`known_window_buffers`) is rebuilt every diff so it stays current even
@@ -762,7 +779,17 @@ impl EditHost {
         self.known_window_buffers = new_map;
         if self.au_active_events.contains("BufWinEnter") {
             for b in newly_shown {
-                self.fire_buf_event("BufWinEnter", b);
+                // Sequenced behind an in-flight read chain, exactly like `BufEnter`
+                // above: the buffer became displayed while a stage was still parked on
+                // an async handler, and firing now would land `BufWinEnter` *second* —
+                // ahead of the `FileType`/`BufEnter` the chain exists to order (vim's
+                // order is `BufReadPost` → `FileType` → `BufEnter` → `BufWinEnter`). A
+                // chain that completed synchronously — the common case — is already out
+                // of the map, so this fires inline exactly as before.
+                match self.read_chains.get_mut(&b) {
+                    Some(c) => c.deferred_win_enter = true,
+                    None => self.fire_buf_event("BufWinEnter", b),
+                }
             }
         }
         if resized {
@@ -862,6 +889,16 @@ impl EditHost {
             self.announced.remove(b);
             self.fired_filetype.remove(b);
             self.fired_encoding.remove(b);
+            // Abandon an in-flight read chain: a handler can destroy the very buffer
+            // being announced (`:bwipeout` from a `BufReadPost` callback), and there is
+            // nothing left to announce. Dropping the gate mapping too is what keeps a
+            // *hung* handler from leaving both maps populated forever — its gate signal
+            // may never arrive, and without this nothing else would ever remove them.
+            if let Some(chain) = self.read_chains.remove(b) {
+                if let Some(gate) = chain.gate {
+                    self.chain_gates.remove(&gate);
+                }
+            }
         }
         self.known_buffers = live_bufs;
 
@@ -1312,13 +1349,240 @@ impl EditHost {
     /// fires for scratch buffers too).
     pub(crate) fn fire_buf_event(&mut self, event: &str, buf: BufferId) {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
+        self.fire_buf_lifecycle(event, &name, buf);
+    }
+
+    /// [`fire_buf_event`](Self::fire_buf_event) with an explicit `pattern`, for the
+    /// buffer events whose `<amatch>` is *not* the buffer's name — `FileType`, whose
+    /// pattern is the filetype. Like `fire_buf_event` (and unlike
+    /// [`fire_lifecycle`](Self::fire_lifecycle)) every piece of context is resolved
+    /// from `buf` itself, so this is the helper the every-window read-lifecycle walk
+    /// uses: a buffer restored into a *background* window must announce with its own
+    /// name and filetype, not the current buffer's.
+    fn fire_buf_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId) {
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
         let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
         // The snapshot carries the DISPLAY name (see `set_buf_snapshot`) while the
-        // autocmd's pattern / `<afile>` stays the path above — the two differ for a
-        // pathless surface, and seeding the snapshot from the path blanks it.
+        // autocmd's `<afile>` stays the path above — the two differ for a pathless
+        // surface, and seeding the snapshot from the path blanks it.
         let shown = self.editor.display_name(buf);
         let _ = self.lua.set_buf_snapshot(buf.0, &shown, &ft);
-        self.fire_and_drain(event, &name, buf.0, &name);
+        self.fire_and_drain(event, pattern, buf.0, &name);
+    }
+
+    /// Fire a buffer-lifecycle event **gated**, returning whether it settled
+    /// synchronously. `true` ⇒ no handler returned a pending promise, so the caller
+    /// advances at once (identical timing to the ungated path — the common case, and
+    /// the one every no-async config takes). `false` ⇒ the chain is parked under a fresh
+    /// gate id and [`drain_au_gate_done`](Self::drain_au_gate_done) resumes it when Lua
+    /// signals `nx._au_gate_done`.
+    ///
+    /// Note the Lua side signals only once the fire has *fully* converged — handlers
+    /// settled **and** every replay round done — so the next stage really does see a
+    /// settled world, including handlers a plugin registered while loading.
+    fn fire_buf_lifecycle_gated(&mut self, event: &str, pattern: &str, buf: BufferId) -> bool {
+        let gate_id = self.next_gate_id;
+        self.next_gate_id += 1;
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
+        let shown = self.editor.display_name(buf);
+        let _ = self.lua.set_buf_snapshot(buf.0, &shown, &ft);
+        self.push_buf_mirror();
+        let settled = match self
+            .lua
+            .fire_autocmd_buf_gated(event, pattern, buf.0, &name, gate_id)
+        {
+            Ok(sync_settled) => sync_settled,
+            Err(e) => {
+                // A throwing handler is reported and treated as settled: a broken
+                // handler must not wedge the buffer half-announced, exactly as it must
+                // not wedge a write or a quit.
+                self.report_autocmd_err(event, Err::<(), _>(e));
+                true
+            }
+        };
+        // A handler's synchronous effects land now; an async one's continuation arrives
+        // a tick later through `on_loop_event` → `run_pending`.
+        self.apply_lua_effects();
+        if !settled {
+            self.chain_gates.insert(gate_id, buf);
+            if let Some(c) = self.read_chains.get_mut(&buf) {
+                c.gate = Some(gate_id);
+            }
+        }
+        settled
+    }
+
+    /// Drive `buf`'s read chain as far as it can go this tick: fire the next stage, and
+    /// if its handlers settled synchronously keep going, otherwise park and return.
+    ///
+    /// This is the ordering guarantee neovim gets for free by being synchronous — when
+    /// `FileType` fires, everything `BufReadPost` triggered has finished. Its practical
+    /// payoff is that a `BufReadPost` handler which detects the filetype *asynchronously*
+    /// (reading a shebang over the wire, say) is reflected in the `FileType` that
+    /// follows, rather than arriving a diff late through the `ft_changed` re-fire.
+    ///
+    /// The whole chain runs inside this one call whenever no handler goes async, which
+    /// is nearly always — so an ordinary open costs exactly what it did before.
+    pub(crate) fn drive_read_chain(&mut self, buf: BufferId) {
+        loop {
+            let Some(chain) = self.read_chains.get(&buf) else {
+                return;
+            };
+            if chain.gate.is_some() {
+                return; // parked on an async handler; the gate resumes us
+            }
+            match chain.stage {
+                ReadStage::ReadPost => {
+                    // File-backed only: a `[No Name]` / scratch surface was never read.
+                    // A file absent from disk fires `BufNewFile` instead, matching
+                    // `vim file-that-does-not-exist`.
+                    let name = self.editor.buffer_name(buf).unwrap_or_default();
+                    let mut parked = false;
+                    if !name.is_empty() {
+                        let event = if self.editor.buffer_is_new_file(buf) {
+                            "BufNewFile"
+                        } else {
+                            "BufReadPost"
+                        };
+                        parked = !self.fire_buf_lifecycle_gated(event, &name, buf);
+                    }
+                    // Advance before returning, so the resume runs the NEXT stage.
+                    if let Some(c) = self.read_chains.get_mut(&buf) {
+                        c.stage = ReadStage::FileType;
+                    }
+                    if parked {
+                        return;
+                    }
+                }
+                ReadStage::FileType => {
+                    // Read the filetype now, not at chain start: the read stage has
+                    // settled, so a handler that set `vim.bo.filetype` — synchronously
+                    // or asynchronously — is already reflected here.
+                    let ft = self.editor.buffer_filetype(buf);
+                    let mut parked = false;
+                    if self.fired_filetype.get(&buf) != Some(&ft) {
+                        if let Some(f) = ft.clone() {
+                            parked = !self.fire_buf_lifecycle_gated("FileType", &f, buf);
+                        }
+                        self.fired_filetype.insert(buf, ft);
+                    }
+                    if let Some(c) = self.read_chains.get_mut(&buf) {
+                        c.stage = ReadStage::Done;
+                    }
+                    if parked {
+                        return;
+                    }
+                }
+                ReadStage::Done => {
+                    let done = self.read_chains.remove(&buf);
+                    let deferred_enter = done.as_ref().is_some_and(|c| c.deferred_enter);
+                    let deferred_win_enter = done.is_some_and(|c| c.deferred_win_enter);
+                    // The deferred `BufEnter` / `BufWinEnter`, now correctly ordered
+                    // behind the gates and against each other (vim fires `BufWinEnter`
+                    // last). Skipped if the buffer went away mid-chain (a handler
+                    // `:bdelete`d it) — firing for a dead buffer would announce an
+                    // empty name.
+                    if !self.editor.buffer_ids().contains(&buf) {
+                        return;
+                    }
+                    if deferred_enter {
+                        let name = self.editor.buffer_name(buf).unwrap_or_default();
+                        self.fire_lifecycle("BufEnter", &name, buf, &name);
+                    }
+                    if deferred_win_enter {
+                        self.fire_buf_event("BufWinEnter", buf);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Fire the fire-once read lifecycle (`BufReadPost`/`BufNewFile` → `FileType`) for
+    /// every buffer displayed in a window that has not been announced yet — the
+    /// **non-current** ones the current-buffer diff never visits.
+    ///
+    /// This is what a session / workspace restore needs. Restore fills background
+    /// windows directly (it does not enter each one), so before this walk those buffers
+    /// fired `BufWinEnter` and nothing else: everything `FileType`-driven — LSP attach,
+    /// treesitter, buffer-local maps — stayed inert until the user focused the window.
+    /// Neovim announces every restored file because its session script `:buffer`s each
+    /// one into its window, and entering an unloaded buffer loads it.
+    ///
+    /// Scope matches neovim's: a buffer that lands in a **window** announces; one that
+    /// is merely listed-but-unloaded (`:badd`) does not. `BufEnter` is deliberately NOT
+    /// fired here — it means "this buffer became current", which is true only of the
+    /// focused one, and it is a hot-path event fired per entry by the diff above.
+    ///
+    /// Ordering per buffer is neovim's `BufReadPost` → `FileType`, and this runs before
+    /// the `BufWinEnter` walk so the full sequence lands in order. Called every diff;
+    /// the cost when there is nothing to announce is one `announced` lookup per window.
+    fn announce_displayed_buffers(&mut self) {
+        // Collect first, fire second: a handler can mutate windows/buffers, so the
+        // walk must not be iterating the window list while Lua runs.
+        let mut todo: Vec<BufferId> = Vec::new();
+        let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
+        for &w in &self.known_windows {
+            let Some(b) = self.editor.window_buffer(w) else {
+                continue;
+            };
+            // A buffer whose bytes have not landed yet (a deferred `:edit`, or any
+            // off-tick/daemon open) is named but empty: announcing it now would fire
+            // against the pre-load filetype. It announces on the diff its content lands,
+            // exactly as the current-buffer path holds for `pending_open`.
+            if seen.insert(b) && !self.announced.contains(&b) && !self.editor.has_pending_open(b) {
+                todo.push(b);
+            }
+        }
+        for b in todo {
+            self.announced.insert(b);
+            // These chains start with no deferred `BufEnter`: entering is the current
+            // buffer's business, and these are by definition the ones the current-buffer
+            // diff did not visit. (Nothing carries over either — `announced` gates this
+            // walk, and a chain in flight implies the buffer is already announced.)
+            self.begin_read_chain(b);
+        }
+    }
+
+    /// Start `buf`'s read chain at [`ReadStage::ReadPost`] and drive it as far as it
+    /// goes this tick.
+    ///
+    /// Any chain already in flight for `buf` is **abandoned** first, gate mapping and
+    /// all. That is not hypothetical: `:e!` re-reads a buffer in place, which drops it
+    /// from `announced` and announces it again — from underneath an async `BufReadPost`
+    /// handler that is still running. Left mapped, the abandoned chain's gate signal
+    /// arrives later, is still keyed to this buffer, and un-parks the *new* chain — so
+    /// `FileType` fires released by the previous read's handler while the current read's
+    /// is still in flight, which is exactly the ordering the chain exists to guarantee.
+    /// (Its own gate signal then finds no chain and is ignored, so the read that really
+    /// is in flight never releases anything.) A chain describes one read; a new read
+    /// replaces it, the same way a deleted buffer drops it.
+    ///
+    /// Its **deferred tail carries over**, though: a `BufEnter`/`BufWinEnter` parked on
+    /// the old chain records an entry / a first display that really happened and has not
+    /// been announced yet. Dropping those with the chain would lose them outright —
+    /// nothing re-detects them, since by then the buffer is already current and already
+    /// in the displayed baseline.
+    fn begin_read_chain(&mut self, buf: BufferId) {
+        let (mut deferred_enter, mut deferred_win_enter) = (false, false);
+        if let Some(old) = self.read_chains.remove(&buf) {
+            if let Some(gate) = old.gate {
+                self.chain_gates.remove(&gate);
+            }
+            deferred_enter = old.deferred_enter;
+            deferred_win_enter = old.deferred_win_enter;
+        }
+        self.read_chains.insert(
+            buf,
+            ReadChain {
+                stage: ReadStage::ReadPost,
+                gate: None,
+                deferred_enter,
+                deferred_win_enter,
+            },
+        );
+        self.drive_read_chain(buf);
     }
 
     /// Fire a tab-lifecycle autocmd (`TabNew`/`TabEnter`/`TabLeave`/`TabClosed`).
@@ -1497,8 +1761,18 @@ impl EditHost {
             return;
         }
         let mut committed_any = false;
+        // Read chains resumed by this drain, driven after the loop so the borrow of
+        // `au_gate_done` is released before a stage re-enters Lua.
+        let mut resumed_chains: Vec<BufferId> = Vec::new();
         for id in std::mem::take(&mut self.au_gate_done) {
-            if self.exit_gate == Some(id) {
+            if let Some(buf) = self.chain_gates.remove(&id) {
+                // A read-chain stage's handlers settled (and its replay rounds are done,
+                // so the next stage sees a fully converged world). Unpark and continue.
+                if let Some(c) = self.read_chains.get_mut(&buf) {
+                    c.gate = None;
+                }
+                resumed_chains.push(buf);
+            } else if self.exit_gate == Some(id) {
                 // An exit-sequence gate settled (an async `ExitPre`/`VimLeavePre`/`QuitPre`
                 // handler's promises all resolved): clear the park so `drive_exit` — next in
                 // the fixpoint — advances to the following stage.
@@ -1508,6 +1782,9 @@ impl EditHost {
                 self.apply_commit_outcome(outcome);
                 committed_any = true;
             }
+        }
+        for buf in resumed_chains {
+            self.drive_read_chain(buf);
         }
         if committed_any {
             self.reseed_cur_snapshot();

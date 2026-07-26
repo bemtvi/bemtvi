@@ -790,6 +790,42 @@ enum ExitStage {
     Leaving,
 }
 
+/// Which stage of a buffer's gated read chain fires **next**. See
+/// [`EditHost::read_chains`] and `drive_read_chain`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReadStage {
+    /// Fire `BufReadPost` (or `BufNewFile`) — the buffer's content is present.
+    ReadPost,
+    /// Fire `FileType`, now that the read stage has fully settled — so a handler that
+    /// detected the filetype *asynchronously* from the content is already reflected.
+    FileType,
+    /// Nothing left to fire: complete the chain (and its deferred `BufEnter`).
+    Done,
+}
+
+/// A buffer's in-flight gated read chain. Created when the buffer is first announced,
+/// dropped when it completes.
+pub(crate) struct ReadChain {
+    /// The stage to fire next.
+    pub(crate) stage: ReadStage,
+    /// Set while parked on a stage's async handlers; cleared by `drain_au_gate_done`,
+    /// which then re-drives the chain.
+    pub(crate) gate: Option<u64>,
+    /// Fire `BufEnter` for this buffer when the chain completes. The buffer was
+    /// *entering* when the chain started, and `BufEnter` must be sequenced after the
+    /// chain's gates — otherwise it would beat a still-settling `FileType`. It stays a
+    /// synchronous hot-path event; only its position in the order is deferred.
+    pub(crate) deferred_enter: bool,
+    /// Fire `BufWinEnter` for this buffer when the chain completes, for the same reason
+    /// and with the same mechanism as [`Self::deferred_enter`]: the buffer became
+    /// *displayed* while its chain was still parked on an async read handler, and vim's
+    /// order is `BufReadPost` → `FileType` → `BufEnter` → `BufWinEnter`. Firing it from
+    /// the window walk at that moment would put it *second*, ahead of the very events
+    /// the chain exists to order. Set only when a handler is actually registered (the
+    /// walk's existing gate), so this stays as cheap as it was.
+    pub(crate) deferred_win_enter: bool,
+}
+
 pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
@@ -1256,6 +1292,22 @@ pub struct EditHost {
     /// clears this, and re-drives the sequence. `None` when the current stage settled
     /// synchronously (or between stages).
     exit_gate: Option<u64>,
+    /// Each buffer's in-flight **gated read chain** — the `BufReadPost`/`BufNewFile` →
+    /// `FileType` → (deferred `BufEnter`) announce sequence, driven one stage at a time
+    /// so a stage's async handlers settle before the next stage fires. Neovim gets that
+    /// ordering for free by being synchronous; we reproduce it explicitly.
+    ///
+    /// Keyed per buffer, so a session restore's several concurrently-announcing
+    /// background buffers each progress independently. A buffer with a chain in flight
+    /// is held out of the announce pass, so a keypress mid-chain can't re-enter it. The
+    /// overwhelmingly common case never appears here at all: a stage whose handlers
+    /// return no promise advances inline and the chain completes within the one call.
+    read_chains: HashMap<BufferId, ReadChain>,
+    /// `gate_id` → the buffer whose read chain is parked on it, the read-chain twin of
+    /// [`Self::pending_gated_writes`]. [`drain_au_gate_done`](Self::drain_au_gate_done)
+    /// uses it to tell a chain gate from a write gate or the exit gate, and re-drives
+    /// that buffer's chain.
+    chain_gates: HashMap<u64, BufferId>,
     /// The picker preview pane's read cache (Phase 3): the file last read for the
     /// preview, so moving the selection within the results — or simply re-projecting
     /// every frame — re-reads only when the selected row's target *path* changes.
@@ -1621,6 +1673,8 @@ impl EditHost {
             au_gate_done: Vec::new(),
             exit_stage: None,
             exit_gate: None,
+            read_chains: HashMap::new(),
+            chain_gates: HashMap::new(),
             quit_all_replay: None,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),

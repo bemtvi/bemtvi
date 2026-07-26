@@ -3313,3 +3313,65 @@ fn float_rect(map: &[(Value, Value)]) -> Option<(String, u64, u64)> {
         Some((region, n("x"), n("width")))
     })
 }
+
+// ----- ft-lazy plugin with an ASYNC config -----------------------------------
+
+#[tokio::test]
+async fn ft_lazy_plugin_with_an_async_config_still_gets_the_filetype_event() {
+    // The end-to-end defect this whole async-event-model work exists to fix
+    // (docs/plans/2026-07-26-async-event-model.md, D2 + D3).
+    //
+    // An `ft = "python"`-lazy plugin is woken by the FileType event, and its `config`
+    // is ASYNC — so by the time it registers its own `FileType python` handler, that
+    // event has long since finished dispatching. Before the settle protocol the
+    // plugin's handler simply never ran for the buffer that woke it: the plugin
+    // "loaded" and did nothing, on every single open.
+    //
+    // lazy.nvim gets away with a blanket re-fire because it is synchronous; we cannot
+    // re-fire on `load()` returning, because `load()` returns a promise. The watermark
+    // replay is what delivers the event once the async config settles.
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_ftlazy_async");
+    let repo = make_repo(&src, "zeta");
+    setup_root(&rpc, "plug_ftlazy_async").await;
+    let marker = repo.join("lua").join("zeta").join("init.lua");
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.zeta_ft = nil\n\
+             nx.plugins {{ {{ name = \"zeta\", dir = \"{dir}\", ft = \"python\", config = function()\n\
+               -- async: the handler below is registered a tick or more after the\n\
+               -- FileType fire that triggered this load.\n\
+               local txt = nx.await(nx.fs.read_text(\"{f}\"))\n\
+               _G.zeta_loaded = #txt > 0\n\
+               nx.autocmd.create(\"FileType\", {{ pattern = \"python\", callback = function(a)\n\
+                 _G.zeta_ft = a.file\n\
+               end }})\n\
+             end }} }}",
+            dir = q(&repo),
+            f = q(&marker)
+        ),
+    )
+    .await;
+
+    // Opening a .py file fires FileType, which wakes the lazy plugin.
+    let py = src.join("sample.py");
+    std::fs::write(&py, "x = 1\n").unwrap();
+    exec_lua(&rpc, &format!("nx.cmd('edit {}')", q(&py))).await;
+
+    assert!(
+        poll_true(&rpc, "return _G.zeta_loaded == true").await,
+        "the ft trigger loaded the plugin and its async config ran to completion"
+    );
+    assert!(
+        poll_true(&rpc, "return _G.zeta_ft ~= nil").await,
+        "the plugin's OWN FileType handler ran for the buffer that woke it — \
+         without the replay it would never fire, which is the whole defect"
+    );
+    let seen = exec_lua(&rpc, "return _G.zeta_ft").await;
+    assert!(
+        seen.as_str().unwrap_or_default().ends_with("sample.py"),
+        "and it saw the triggering buffer, got {seen:?}"
+    );
+}

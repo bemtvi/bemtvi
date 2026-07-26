@@ -3271,6 +3271,57 @@ pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
         .map(|(_, ft)| *ft)
 }
 
+/// Language *aliases* that aren't spelled like a file extension — the names a
+/// markdown fence info string (or a hand-set `'filetype'`) uses for a grammar
+/// nxvim knows under a different noun, and which [`EXT_FILETYPE`] therefore can't
+/// supply. Extension-shaped aliases (`sh`, `jsonc`, `cs`, `rs`, `py`, `ts`, `yml`,
+/// …) are *not* listed here: [`resolve_language`] falls back to the extension
+/// table for those, so the two can never disagree about what `foo.jsonc` and a
+/// ```` ```jsonc ```` fence mean. Mirrors neovim's `vim.treesitter.language`
+/// `ft_to_lang` plus the long-form names code fences commonly carry.
+const LANG_ALIAS: &[(&str, &str)] = &[
+    ("csharp", "c_sharp"),
+    ("dosbatch", "batch"),
+    ("golang", "go"),
+    ("handlebars", "glimmer"),
+    ("help", "vimdoc"),
+    ("javascriptreact", "javascript"),
+    ("makefile", "make"),
+    ("pandoc", "markdown"),
+    ("protobuf", "proto"),
+    ("python2", "python"),
+    ("python3", "python"),
+    ("quarto", "markdown"),
+    ("rmd", "markdown"),
+    ("shell", "bash"),
+    ("systemverilog", "verilog"),
+    ("typescriptreact", "tsx"),
+];
+
+/// Resolve a language *alias* — a markdown fence's info string, a `'filetype'`, a
+/// treesitter injection's language — to the grammar nxvim highlights it with, or
+/// return `name` unchanged when it needs no translation.
+///
+/// The order is: a name that already *is* one of nxvim's languages (a value of
+/// [`EXT_FILETYPE`]) stands; else a curated [`LANG_ALIAS`]; else the name is read
+/// as an **extension** through [`EXT_FILETYPE`], which is what makes `jsonc` → `json`,
+/// `sh` → `bash` and `cs` → `c_sharp` fall out of the table that already decides
+/// `foo.jsonc` is json. An unknown name passes through untouched — it may well be a
+/// grammar the table doesn't list (`vimdoc`, a user-installed parser), and resolution
+/// must never lose one.
+pub fn resolve_language(name: &str) -> &str {
+    if EXT_FILETYPE.iter().any(|(_, ft)| *ft == name) {
+        return name;
+    }
+    if let Some((_, lang)) = LANG_ALIAS.iter().find(|(a, _)| *a == name) {
+        return lang;
+    }
+    EXT_FILETYPE
+        .iter()
+        .find(|(e, _)| *e == name)
+        .map_or(name, |(_, ft)| *ft)
+}
+
 /// The distinct filetype names nxvim recognizes (the value set of [`EXT_FILETYPE`]),
 /// sorted. These are the highlighting-capable filetypes `:setfiletype` completion
 /// offers — the same source of truth extension detection uses, so the list is never

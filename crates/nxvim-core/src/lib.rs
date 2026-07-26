@@ -33,17 +33,17 @@ pub use buffer::{dir_listing, Buffer, BufferEdit, BufferKind, DiskChange, EditBa
 pub use clipboard::Clipboard;
 pub use editor::{
     command_pending_after, command_status, known_filetypes, language_of_help_doc, language_of_path,
-    place_aligned, AcceptBehavior, Align, BorderStyle, BufferId, ClickSurface, CmdlineCandidate,
-    CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus, CommitOutcome,
-    CompleteConfig, CompleteKeys, Cursor, DecorViewport, DeferredCmd, Editor, Extent,
-    FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor,
-    FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry, JumpPos, LocListEntry, Margin,
-    MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos, NumberedMark,
-    PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry, PluginNamespace, PreWrite,
-    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
-    RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
-    StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec,
-    WindowId, WriteEvent, WriteScope,
+    place_aligned, resolve_language, AcceptBehavior, Align, BorderStyle, BufferId, ClickSurface,
+    CmdlineCandidate, CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus,
+    CommitOutcome, CompleteConfig, CompleteKeys, Cursor, DecorViewport, DeferredCmd, Editor,
+    Extent, FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry,
+    FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry, JumpPos,
+    LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos,
+    NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry,
+    PluginNamespace, PreWrite, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList,
+    QfStack, QfWhich, RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow,
+    ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture,
+    WindowConfigSpec, WindowId, WriteEvent, WriteScope,
 };
 pub use encoding::Encoding;
 pub use extmark::{

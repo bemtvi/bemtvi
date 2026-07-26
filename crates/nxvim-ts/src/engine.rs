@@ -587,7 +587,13 @@ impl Engine {
     /// early return below therefore drops any previous language's `BufferState` —
     /// leaving it in place would keep painting (and incrementally updating) the
     /// *old* language's highlights on a buffer the editor believes has none.
+    ///
+    /// `lang` is a filetype, which may be an *alias* of the grammar's own noun
+    /// (`sh` → `bash`, `jsonc` → `json`); it is resolved here so everything the
+    /// engine stores and looks up downstream — `BufferState::language`, the grammar
+    /// cache key, [`language_of`](Self::language_of) — is the canonical grammar name.
     pub fn open(&mut self, buffer: BufferId, lang: &str, text: &str) -> OpenOutcome {
+        let lang = nxvim_core::resolve_language(lang);
         let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
             Slot::NotInstalled => {
@@ -809,6 +815,9 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> (Vec<Span>, Vec<usize>) {
+        // The host language is an alias-resolvable name too: this is fed a fence's
+        // info string (a markdown doc float's code block) as often as a filetype.
+        let lang = nxvim_core::resolve_language(lang);
         let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
             _ => return (Vec::new(), Vec::new()), // silent: no grammar (or load failed)
@@ -1826,8 +1835,11 @@ fn point_at(shadow: &Rope, byte: usize) -> Point {
 }
 
 /// Normalize an injection language name the way `languagetree.lua`'s `resolve_lang`
-/// does — strip whitespace, lowercase, `-`→`_` — and reject anything that isn't a
-/// legal grammar identifier. Returns `None` for an empty or invalid name (skipped).
+/// does — strip whitespace, lowercase, `-`→`_`, reject anything that isn't a legal
+/// grammar identifier — then resolve the *alias* (`resolve_lang`'s `get_lang` half):
+/// a fence info string names a language the way its writers spell it (```` ```sh ````,
+/// ```` ```jsonc ````, ```` ```cs ````), which is not always the grammar's own noun.
+/// Returns `None` for an empty or invalid name (skipped).
 fn normalize_lang(raw: &str) -> Option<String> {
     let norm: String = raw
         .chars()
@@ -1838,7 +1850,7 @@ fn normalize_lang(raw: &str) -> Option<String> {
     if norm.is_empty() || !norm.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return None;
     }
-    Some(norm)
+    Some(nxvim_core::resolve_language(&norm).to_string())
 }
 
 /// Bytes of `rope[range]`, walking chunks (no whole-buffer materialization).

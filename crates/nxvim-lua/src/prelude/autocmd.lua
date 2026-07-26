@@ -386,6 +386,22 @@ end
 -- })
 -- ```
 function nx.autocmd.create(event, opts)
+  -- Named here, because the alternative is the worst error in the API: a non-table
+  -- `opts` (nearly always the handler, passed as if this were `nx.on`) reaches
+  -- `opts.pattern` below and raises `attempt to index a function value` from inside
+  -- the prelude — no mention of the caller, and since a config is one chunk, every
+  -- line after the registration silently never runs. `nx.on` accepts the bare-handler
+  -- form outright; this signature is neovim's, where `opts` is always a table, so it
+  -- says so and points at the spelling that does take one.
+  if opts ~= nil and type(opts) ~= "table" then
+    error(
+      ("nx.autocmd.create: opts must be a table, got %s%s"):format(
+        type(opts),
+        type(opts) == "function" and " (for a bare handler use nx.on(event, fn))" or ""
+      ),
+      2
+    )
+  end
   opts = opts or {}
   event = au_canon_event(event)
   au_check_patterns(event, opts.pattern)

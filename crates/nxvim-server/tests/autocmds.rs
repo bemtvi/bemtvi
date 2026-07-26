@@ -3136,3 +3136,68 @@ async fn re_reading_a_file_mid_chain_abandons_the_previous_chain() {
          either, since the buffer is already current and already in the displayed baseline"
     );
 }
+
+#[tokio::test]
+async fn nx_on_takes_a_bare_handler_with_no_options_table() {
+    // `nx.on(event, fn)` — the two-argument spelling a config reaches for when there
+    // is nothing to configure. It has to work, because the failure mode when it does
+    // not is disproportionate: the handler lands in `opts`, the registration raises
+    // `attempt to index a function value` from inside `nxvim:prelude/autocmd`, and the
+    // rest of the config file never runs. One wrong argument count silently costs
+    // every line after it, and the message names the prelude rather than the caller.
+    let dir = temp_dir("au_on_bare");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "nx.on('User', function(ev) _G.saw = tostring(ev.match) end)\n\
+         _G.reached_end = true\n",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(_G.reached_end)")
+            .await
+            .as_str(),
+        Some("true"),
+        "the config ran past the registration"
+    );
+    exec_lua(&rpc, "nx.autocmd.exec('User', { pattern = 'Bare' })").await;
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(_G.saw)").await.as_str(),
+        Some("Bare"),
+        "and the bare handler fires with the event args"
+    );
+    // The shift must not cost the caller its registration site: `site` is what turns a
+    // slow-handler warning into a file:line, and it is captured by walking past the
+    // forwarding prelude frames — one more forward here would blame the prelude.
+    let site = exec_lua(
+        &rpc,
+        "return tostring(nx.autocmd.get({ event = 'User' })[1].site)",
+    )
+    .await;
+    let site = site.as_str().unwrap_or("<nil>");
+    assert!(
+        site.ends_with(":1") && !site.contains("nxvim:prelude/"),
+        "the bare form still reports the caller's line, got {site:?}"
+    );
+}
+
+#[tokio::test]
+async fn autocmd_create_names_a_non_table_opts_instead_of_dying_on_index() {
+    // The same mistake against the neovim-shaped signature, where `opts` really is
+    // always a table. It cannot be silently reinterpreted here, so it has to be named:
+    // `attempt to index a function value` blames the prelude for the caller's typo and
+    // says nothing about the fix.
+    let dir = temp_dir("au_create_badopts");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let err = exec_lua(
+        &rpc,
+        "local ok, err = pcall(nx.autocmd.create, 'User', function() end)\n\
+         return tostring(ok) .. '|' .. tostring(err)",
+    )
+    .await;
+    let err = err.as_str().unwrap_or("<nil>");
+    assert!(err.starts_with("false|"), "it raises, got {err:?}");
+    assert!(
+        err.contains("opts must be a table, got function") && err.contains("nx.on(event, fn)"),
+        "the error names the argument and the spelling that takes a bare handler, got {err:?}"
+    );
+}

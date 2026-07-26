@@ -110,7 +110,7 @@ and a deeper treatment in the [API design](specs/2026-06-11-native-plugin-api.md
   docs pane as `:Name <usage>`, exactly like a built-in. `complete` (`"file"` / `"dir"`
   / a `fn(args)`) drives `<Tab>` completion of the argument.
 - **Autocmds / events** — `nx.on(event, { pattern = … }, fn)` for editor lifecycle
-  events (`BufReadPost`, `FileType`, …).
+  events (`BufReadPost`, `FileType`, …), or `nx.on(event, fn)` with no options.
 - **Options & vars** — read/write `nx.o` (global), `nx.bo` (buffer), `nx.wo`
   (window), and `nx.g` (globals). Edge docks have their own scope too:
   `nx.dock.opt(side)` (e.g. `nx.dock.opt("left").size = 32`), alongside

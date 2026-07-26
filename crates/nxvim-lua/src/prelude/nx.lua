@@ -17,7 +17,23 @@ nx = nx or {}
 -- canonical verb. `fn` (when given) is the handler; otherwise `opts.callback` /
 -- `opts.command` apply, exactly as the underlying registry expects. Returns the
 -- subscription id (droppable with `nx.off`).
+--
+-- `nx.on(event, fn)` is the same thing with no options — the spelling to reach for
+-- when there is nothing to configure:
+--
+-- ```lua
+-- nx.on("FileType", { pattern = "lua" }, function(ev) … end)  -- with options
+-- nx.on("BufWritePost", function(ev) … end)                   -- without
+-- ```
 function nx.on(event, opts, fn)
+  -- The two-argument form, normalized here rather than left to fail downstream. It
+  -- has to be accepted, because the failure when it is not is out of all proportion
+  -- to the mistake: the handler lands in `opts`, `nx.autocmd.create` raises
+  -- `attempt to index a function value` from inside the prelude, and — since a
+  -- config is one chunk — every line after the registration silently never runs.
+  if type(opts) == "function" and fn == nil then
+    opts, fn = {}, opts
+  end
   opts = opts or {}
   if fn ~= nil then
     -- Don't mutate the caller's table; layer the handler on a shallow copy.

@@ -49,9 +49,14 @@ end
 
 -- `nx.utils.ancestors(path)`: iterate the ancestor directories of `path`, nearest
 -- first — `dirname(path)`, then its parent, and so on. Stops before the empty
--- string, so the filesystem root itself is never produced; for a relative path the
--- walk ends at its first component. The upward-walk loop behind `.editorconfig`
--- discovery and LSP root-marker search:
+-- string, so the filesystem root itself is never produced. A **relative** `path` is
+-- first resolved against the editor's working directory (`nx.fname.modify(path, ":p")`,
+-- which also collapses `.` / `..`) — the ancestry of a relative path is only
+-- meaningful against the cwd, and the paths callers walk are buffer names
+-- (`nx.buf.name`, an autocmd's `ev.file`), which are whatever the user typed and so
+-- routinely relative (`nxvim src/main.rs`). Without that, the walk would stop at the
+-- first typed component and never reach the project root. The upward-walk loop behind
+-- `.editorconfig` discovery and LSP root-marker search:
 --
 -- ```lua
 -- for dir in nx.utils.ancestors("/a/b/c.txt") do
@@ -59,7 +64,7 @@ end
 -- end
 -- ```
 function nx.utils.ancestors(path)
-  local dir = nx.utils.dirname(path)
+  local dir = nx.utils.dirname(nx.fname.modify(path, ":p"))
   return function()
     if not dir or dir == "" then
       return nil

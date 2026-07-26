@@ -66,7 +66,10 @@ async fn expanduser_expands_only_the_leading_tilde() {
 }
 
 // ancestors iterates dirname(path) upward, nearest first, and never produces the
-// root / empty string; a relative path ends at its first component.
+// root / empty string; a *relative* path is first resolved against the editor's
+// cwd, so the walk reaches the real project tree rather than stopping at the first
+// typed component (the `.editorconfig` / LSP-root discovery case: a buffer's name
+// is the path as typed, so `nxvim src/main.rs` hands in a relative one).
 #[tokio::test]
 async fn ancestors_walks_upward_nearest_first() {
     let (rpc, _incoming) = start().await;
@@ -80,8 +83,21 @@ async fn ancestors_walks_upward_nearest_first() {
     let abs = exec_lua(&rpc, &walk("/a/b/c.txt")).await;
     assert_eq!(abs.as_str(), Some("/a/b|/a"), "absolute path walk");
 
+    // The relative walk starts at `<cwd>/a/b` and keeps climbing *through* the cwd
+    // into its own ancestors — an absolute chain, not the two bare components.
     let rel = exec_lua(&rpc, &walk("a/b/c.txt")).await;
-    assert_eq!(rel.as_str(), Some("a/b|a"), "relative path walk");
+    let cwd = eval_str(&rpc, "vim.fn.getcwd()").await;
+    let dirs: Vec<String> = rel
+        .as_str()
+        .unwrap_or_default()
+        .split('|')
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        dirs.iter().take(3).collect::<Vec<_>>(),
+        vec![&format!("{cwd}/a/b"), &format!("{cwd}/a"), &cwd],
+        "a relative path resolves against the cwd before walking"
+    );
 
     let top = exec_lua(&rpc, &walk("/top.txt")).await;
     assert_eq!(

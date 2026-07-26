@@ -10,12 +10,25 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    command, exec_lua, lua_bool, lua_u64, poll_true, start_attached, temp_dir,
+    command, exec_lua, lua_bool, lua_u64, poll_true, serial_lock, start_attached, temp_dir,
 };
 use rmpv::Value;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+/// Restore the process cwd on drop — the relative-path test `:cd`s away from it.
+struct CwdGuard(std::path::PathBuf);
+impl CwdGuard {
+    fn capture() -> Self {
+        CwdGuard(std::env::current_dir().expect("cwd"))
+    }
+}
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
 
 /// Write `content` to `dir/name`, creating parent directories as needed.
 fn write(dir: &Path, name: &str, content: &str) {
@@ -348,5 +361,62 @@ async fn exposes_resolved_properties() {
         )
         .await,
         "resolved properties should be queryable, including unsupported ones"
+    );
+}
+
+#[tokio::test]
+async fn applies_when_opened_by_relative_path() {
+    // The everyday case: `:cd project` then `:edit sub/main.txt` (or `nxvim
+    // sub/main.txt` from the project root). The buffer's name is the *relative* path
+    // as typed, so the upward `.editorconfig` walk must still resolve it against the
+    // cwd. `:cd` moves the process cwd, so this holds the serial lock and restores it.
+    let _g = serial_lock().lock().await;
+    let _cwd = CwdGuard::capture();
+    let dir = temp_dir("editorconfig_relative");
+    write(
+        &dir,
+        ".editorconfig",
+        "root = true\n[*]\nindent_style = space\nindent_size = 2\n",
+    );
+    write(&dir, "sub/main.txt", "hello\n");
+    let (rpc, _inc) = server().await;
+    command(&rpc, &format!("cd {}", dir.to_string_lossy())).await;
+    command(&rpc, "edit sub/main.txt").await;
+
+    assert!(
+        poll_true(&rpc, "return vim.bo.shiftwidth == 2").await,
+        "a relatively-opened file should still find the project .editorconfig"
+    );
+}
+
+#[tokio::test]
+async fn applies_to_the_startup_file_argument() {
+    // `nxvim main.txt` from the project root: the startup buffer's name is the bare
+    // relative argument, and its BufReadPost must resolve the project .editorconfig
+    // the same way an explicit `:edit` does.
+    let _g = serial_lock().lock().await;
+    let _cwd = CwdGuard::capture();
+    let dir = temp_dir("editorconfig_argv");
+    write(
+        &dir,
+        ".editorconfig",
+        "root = true\n[*]\nindent_style = space\nindent_size = 3\n",
+    );
+    write(&dir, "main.txt", "hello\n");
+    std::env::set_current_dir(&dir).expect("chdir");
+
+    let (rpc, _inc) = start_attached(
+        ServerInit {
+            file: Some("main.txt".into()),
+            ..ServerInit::default()
+        },
+        80,
+        24,
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, "return vim.bo.shiftwidth == 3").await,
+        "the startup file argument should pick up the project .editorconfig"
     );
 }

@@ -342,6 +342,12 @@ end
 -- `root = true` one, then applies farthest-first so the nearest file wins; within
 -- a file, later matching sections override earlier ones.
 M._run = nx.async(function(bufnr, file)
+  -- A buffer's name is the path as typed, so it is routinely *relative*
+  -- (`nxvim src/main.rs`, `:e sub/file.txt`). Resolve it against the editor's cwd
+  -- up front: the walk below must reach the real project root, and the per-config
+  -- `rel` below is computed by stripping an ancestor directory off this path, so
+  -- the two must be the same (absolute) spelling.
+  file = nx.fname.modify(file, ":p")
   -- (dir, cfg) pairs, nearest directory first.
   local chain = {}
   for dir in nx.utils.ancestors(file) do

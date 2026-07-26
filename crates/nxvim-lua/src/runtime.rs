@@ -647,15 +647,6 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // the native selection engine through the `nx._helix_action` seam. Inert until a
     // Helix mode is entered. See docs/plans/2026-07-21-helix-editing-model.md (Phase 5).
     ("nxvim:prelude/helix", include_str!("prelude/helix.lua")),
-    // Built-in `.editorconfig` support. Loads AFTER nx.lua: it builds on `nx.on` /
-    // `nx.augroup` (events) plus `nx.fs` (async, above), `nx.bo` (buffer options,
-    // state.lua) and the `vim.g` / `vim.b` variable toggle. On by default; switch
-    // off with `vim.g.editorconfig = false` (global) or `vim.b.editorconfig = false`
-    // (per buffer).
-    (
-        "nxvim:prelude/editorconfig",
-        include_str!("prelude/editorconfig.lua"),
-    ),
     // The package manager (`nx.plugins`) — declarative install + lazy/eager load
     // over `git` (`nx.run`) and `nx.fs`. Loads AFTER nx.lua: it builds on
     // `nx.command` / `nx.on` (defined there) plus nx.run / nx.fs / nx.promise /

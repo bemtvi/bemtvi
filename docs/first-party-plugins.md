@@ -31,6 +31,7 @@ worth studying it for.
 | [**nxvim-dap**](https://github.com/nxvim/nxvim-dap) | Debug Adapter Protocol client (sibling of `nvim-dap`) | The richest example: a Content-Length-framed JSON protocol over the duplex `nx.process` primitive, breakpoint / stopped signs as extmarks, a scopes-and-stack sidebar plus REPL on read-only `nx.view` docks, and cross-tick scheduling (`nx.on_next_tick`). |
 | [**nxvim-diff**](https://github.com/nxvim/nxvim-diff) | Meld-style side-by-side diff viewer | Read-only `nx.view` panes locked in lockstep through `WinScrolled` + `nx.win.set_topline` / `set_leftcol` / `set_cursor`, with every line tint and intra-line span an extmark. A renderer you feed a diff to. |
 | [**nxvim-help**](https://github.com/nxvim/nxvim-help) | Vim-style `:help` | A navigable read-only `nx.view` split, a tag index merged across the runtimepath (`nx.runtime_file`), files read with the promise `nx.fs` API, and fuzzy topic search through the picker. |
+| [**nxvim-editorconfig**](https://github.com/nxvim/nxvim-editorconfig) | `.editorconfig` support (port of neovim's built-in `editorconfig.lua`) | The smallest *behavioral* plugin: an async upward directory walk on `nx.fs` inside `nx.async` / `nx.await` (`nx.utils.ancestors` + `nx.fname.modify`), option application through `nx.bo[bufnr]`, and a whole feature driven by four `nx.on` autocmds — including live reload off `BufWritePost`. |
 
 Every one ships its own integration-test suite (most run a real server over the
 black-box harness, exactly as [Testing plugins](plugin-testing.md) describes) —
@@ -38,13 +39,10 @@ those tests double as worked, runnable usage examples for the surfaces above.
 
 ## Bundled in the editor
 
-A handful of plugins ship *inside* nxvim and load by default — also pure `nx.*`,
-and browsable in this repository under
+A plugin that ships *inside* nxvim and loads by default — also pure `nx.*`, and
+browsable in this repository under
 [`crates/nxvim-lua/src/prelude/`](../crates/nxvim-lua/src/prelude):
 
-- [`editorconfig.lua`](../crates/nxvim-lua/src/prelude/editorconfig.lua) —
-  `.editorconfig` support: an async `nx.fs` directory walk, its own glob matcher,
-  and option application driven by autocmds.
 - [`plugins.lua`](../crates/nxvim-lua/src/prelude/plugins.lua) +
   [`plugins_ui.lua`](../crates/nxvim-lua/src/prelude/plugins_ui.lua) — the
   `nx.plugins` package manager and its dashboard: declarative specs, async `git`

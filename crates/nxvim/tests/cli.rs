@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 fn fresh_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nxvim_cli_{tag}_{}_{n}", std::process::id()));
+    let dir =
+        nxvim_test_harness::temp_root().join(format!("nxvim_cli_{tag}_{}_{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }

@@ -761,6 +761,148 @@ pub fn menu_items(menu: &[(Value, Value)]) -> Vec<String> {
 
 // ===== temp filesystem =======================================================
 
+/// Prefix of a **run root** — the one directory a single test process puts all
+/// of its temp paths in. Distinct from the `nxvim-test-` prefix `nx.test.tempdir()`
+/// uses, so the sweep below can never mistake one for the other.
+const RUN_ROOT_PREFIX: &str = "nxvim-testrun-";
+
+/// The per-process run root: `$TMPDIR/nxvim-testrun-<pid>`, created on first use.
+///
+/// Every path the helpers below hand out lives inside it, which is what makes
+/// the temp footprint of a test binary a *single* directory that can be removed
+/// wholesale when the process exits. Before this existed each helper dropped its
+/// path straight into the shared system temp dir and nothing ever collected it,
+/// so one `cargo test --workspace` left ~2000 entries (~130 MB) behind in `/tmp`.
+///
+/// First call also [sweeps](sweep_stale_temp_roots) the roots of runs that are
+/// gone, and arms the exit hook that removes this one.
+pub fn temp_root() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        sweep_stale_temp_roots();
+        let root = std::env::temp_dir().join(format!("{RUN_ROOT_PREFIX}{}", std::process::id()));
+        // `create_dir_all`, not `create_dir`: the sweep just removed any root
+        // left by an earlier run that happened to hold this pid, but a *live*
+        // sibling process cannot legitimately own our pid, so tolerating an
+        // existing directory here costs nothing and keeps a recycled pid from
+        // failing every test in the binary. The per-path `create_dir` /
+        // `create_new` below still fail loud on a hostile pre-creation, which is
+        // where the symlink/TOCTOU exposure actually is.
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|e| panic!("create temp run root {}: {e}", root.display()));
+        // Removes the root on a normal exit — including the `process::exit` the
+        // libtest harness makes after reporting results, which runs no
+        // destructors. A run that dies without unwinding leaves its root for the
+        // sweep above to reclaim.
+        unsafe { libc::atexit(remove_run_root) };
+        root
+    })
+    .clone()
+}
+
+/// `atexit` handler: remove this process's run root. Best-effort — a failure at
+/// exit must not turn a passing run into a nonzero exit status, and whatever it
+/// leaves behind the next run's sweep reclaims.
+///
+/// Must not panic: unwinding out of an `extern "C"` handler is undefined
+/// behavior, so every step here swallows its error.
+extern "C" fn remove_run_root() {
+    let root = std::env::temp_dir().join(format!("{RUN_ROOT_PREFIX}{}", std::process::id()));
+    remove_tree(&root);
+}
+
+/// `remove_dir_all`, retried after restoring write+search permission on every
+/// directory underneath.
+///
+/// A test that deliberately makes a directory unwritable — proving a save into
+/// one fails safely, say — leaves a subtree the plain removal cannot enter if it
+/// panics before restoring the mode. Without the retry that root is not merely
+/// leaked once: the [sweep](sweep_stale_temp_roots) hits the same wall on every
+/// subsequent run, so it would sit in the temp dir forever.
+fn remove_tree(root: &std::path::Path) -> bool {
+    if std::fs::remove_dir_all(root).is_ok() {
+        return true;
+    }
+    if !root.exists() {
+        return true;
+    }
+    chmod_dirs_writable(root);
+    std::fs::remove_dir_all(root).is_ok()
+}
+
+/// Give the owner `rwx` on `dir` and every directory below it. Symlinks are not
+/// followed (`symlink_metadata`), so a link planted inside the tree cannot steer
+/// the chmod at a directory outside it.
+fn chmod_dirs_writable(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o700);
+        let _ = std::fs::set_permissions(dir, perms);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            chmod_dirs_writable(&entry.path());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Remove every run root in the system temp dir whose process is gone, and
+/// return how many were removed.
+///
+/// This is the half of the cleanup that survives runs which never unwind — a
+/// SIGKILL, an abort under `panic=abort`, a killed CI job — and so never ran
+/// their exit hook. Roots belonging to *live* processes (concurrent test
+/// binaries in the same `cargo test` invocation, most of all) are left alone.
+pub fn sweep_stale_temp_roots() -> usize {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(RUN_ROOT_PREFIX)) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        if pid == std::process::id() as i32 || process_is_alive(pid) {
+            continue;
+        }
+        // Racy by nature: another run may be sweeping the same stale root. Ignore
+        // the failure — either way it ends up gone.
+        if remove_tree(&entry.path()) {
+            swept += 1;
+        }
+    }
+    swept
+}
+
+/// Whether `pid` names a live process. `kill(pid, 0)` performs the existence and
+/// permission checks without delivering a signal; `EPERM` means the process
+/// exists but belongs to someone else, which still counts as alive (and means
+/// its root is not ours to remove).
+fn process_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// A unique suffix (`<pid>_<n>_<rand>`) for temp paths, stable within a test
 /// process. The `<rand>` component is an OS-seeded per-call random value, so a
 /// path is not predictable from pid+counter alone: that narrows the symlink /
@@ -798,24 +940,27 @@ pub fn q(path: &std::path::Path) -> String {
         .replace('"', "\\\"")
 }
 
-/// A fresh, uniquely-named `.txt` temp file path (not created).
+/// A fresh, uniquely-named `.txt` temp file path (not created), inside this
+/// run's [`temp_root`].
 pub fn temp_path(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("nxvim_test_{tag}_{}.txt", unique()))
+    temp_root().join(format!("nxvim_test_{tag}_{}.txt", unique()))
 }
 
-/// Create and return a fresh, uniquely-named temp directory. Uses `create_dir`
-/// (not `create_dir_all`) so it fails loud if the path already exists — an
-/// idempotent `create_dir_all` would silently accept an attacker-planted
-/// directory or symlink at the (otherwise unique) path.
+/// Create and return a fresh, uniquely-named temp directory inside this run's
+/// [`temp_root`]. Uses `create_dir` (not `create_dir_all`) so it fails loud if
+/// the path already exists — an idempotent `create_dir_all` would silently
+/// accept an attacker-planted directory or symlink at the (otherwise unique)
+/// path.
 pub fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}", unique()));
+    let dir = temp_root().join(format!("nxvim_test_{tag}_{}", unique()));
     std::fs::create_dir(&dir).expect("create temp dir");
     dir
 }
 
-/// Write `content` to a fresh temp file with extension `ext`; return its path.
+/// Write `content` to a fresh temp file with extension `ext` inside this run's
+/// [`temp_root`]; return its path.
 pub fn write_temp(tag: &str, ext: &str, content: &str) -> String {
-    let path = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}.{ext}", unique()));
+    let path = temp_root().join(format!("nxvim_test_{tag}_{}.{ext}", unique()));
     write_new(&path, content.as_bytes());
     path.to_string_lossy().into_owned()
 }

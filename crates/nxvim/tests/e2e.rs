@@ -38,7 +38,8 @@ struct Session {
 fn empty_config_dir() -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("nxvim_e2e_cfg_{}_{n}", std::process::id()));
+    let dir =
+        nxvim_test_harness::temp_root().join(format!("nxvim_e2e_cfg_{}_{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create empty config dir");
     dir
 }
@@ -164,7 +165,8 @@ impl Drop for Session {
 #[test]
 #[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
 fn startup_shows_the_file_contents() {
-    let path = std::env::temp_dir().join(format!("nxvim_e2e_startup_{}.txt", std::process::id()));
+    let path = nxvim_test_harness::temp_root()
+        .join(format!("nxvim_e2e_startup_{}.txt", std::process::id()));
     std::fs::write(&path, "alpha\nbeta\n").unwrap();
 
     let mut s = Session::spawn(&[path.to_str().unwrap()], 80, 24);
@@ -271,7 +273,8 @@ fn catppuccin_repaints_the_editor_in_truecolor() {
 
     // A throwaway config (init.lua loads catppuccin) + a redirected compile
     // cache, so the test neither reads nor writes the user's real dirs.
-    let base = std::env::temp_dir().join(format!("nxvim_e2e_cat_{}", std::process::id()));
+    let base =
+        nxvim_test_harness::temp_root().join(format!("nxvim_e2e_cat_{}", std::process::id()));
     let config = base.join("config");
     let cache = base.join("cache");
     std::fs::create_dir_all(&config).unwrap();
@@ -333,7 +336,7 @@ fn catppuccin_repaints_the_editor_in_truecolor() {
 #[test]
 #[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
 fn truecolor_terminal_defaults_in_the_nxvim_colorscheme() {
-    let base = std::env::temp_dir().join(format!("nxvim_e2e_tc_{}", std::process::id()));
+    let base = nxvim_test_harness::temp_root().join(format!("nxvim_e2e_tc_{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
     // A plain-text buffer (no grammar), so its glyphs paint in the theme's `Normal`
     // foreground rather than a treesitter capture color.
@@ -538,7 +541,8 @@ fn a_killed_session_is_still_there_on_the_next_launch() {
     // the same store and jump to `'0`: the file reopens at that line. After a kill
     // that skipped the exit sequence there is no `'0` at all and nothing opens.
     let state = empty_config_dir(); // a scratch XDG_STATE_HOME, not a config
-    let path = std::env::temp_dir().join(format!("nxvim_e2e_shada_{}.txt", std::process::id()));
+    let path =
+        nxvim_test_harness::temp_root().join(format!("nxvim_e2e_shada_{}.txt", std::process::id()));
     std::fs::write(&path, "one\ntwo\nSURVIVES-THE-KILL\nfour\n").unwrap();
     let state_env: &[(&str, &str)] = &[("XDG_STATE_HOME", state.to_str().unwrap())];
 
@@ -642,6 +646,8 @@ fn daemon_stderr_log_is_private_and_per_pid() {
         24,
     );
     let pid = s._child.process_id().expect("the spawned nxvim has a pid");
+    // The *daemon* chooses this path (`session_spawn.rs`), so it is the system
+    // temp dir — not the harness run root the tests' own temp paths live under.
     let log = std::env::temp_dir().join(format!("nxvim-daemon-{pid}.log"));
 
     // Poll for the log to appear.

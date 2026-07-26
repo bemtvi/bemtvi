@@ -2080,7 +2080,13 @@ pub(crate) fn install_runtime_api(
             use std::sync::atomic::{AtomicU64, Ordering};
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("nxvim-test-{}-{}", std::process::id(), n));
+            // Nested under this process's `nxvim-testrun-<pid>` root, the same
+            // convention `nxvim-test-harness` uses, so the directory is reclaimed
+            // by that crate's stale-root sweep once this runner exits instead of
+            // accumulating in the shared system temp dir run after run.
+            let dir = std::env::temp_dir()
+                .join(format!("nxvim-testrun-{}", std::process::id()))
+                .join(format!("tempdir-{n}"));
             std::fs::create_dir_all(&dir)
                 .map_err(|e| mlua::Error::external(format!("nx.test.tempdir: {e}")))?;
             Ok(dir.to_string_lossy().into_owned())

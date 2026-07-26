@@ -138,7 +138,7 @@ const RUST_INDENTS: &str = r#"
 fn fixture_data_dir() -> &'static Path {
     static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
     DATA_DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join("nxvim-ts-indent-fixture");
+        let dir = nxvim_test_harness::temp_root().join("nxvim-ts-indent-fixture");
         let parser_dir = dir.join("parser");
         let query_dir = dir.join("queries").join("rust");
         std::fs::create_dir_all(&parser_dir).unwrap();

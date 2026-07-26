@@ -152,7 +152,7 @@ async fn editing_a_nonexistent_file_does_not_storm_the_file_watch() {
     // and froze the UI. A new-file buffer (nothing to watch) must arm no watch at all,
     // so the channel goes quiet once the open settles.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let missing = std::env::temp_dir().join(format!(
+    let missing = nxvim_test_harness::temp_root().join(format!(
         "nxvim_missing_{}_{}.txt",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -724,7 +724,8 @@ async fn buffer_rpc_api_lists_reads_switches_and_creates() {
 async fn a_save_that_cannot_be_made_atomic_leaves_the_original_intact() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = std::env::temp_dir().join(format!("nxvim_atomic_ro_{}", std::process::id()));
+    let dir =
+        nxvim_test_harness::temp_root().join(format!("nxvim_atomic_ro_{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("keep.txt");
@@ -777,8 +778,8 @@ async fn write_preserves_the_existing_file_mode() {
 #[tokio::test]
 async fn write_through_a_symlink_keeps_the_link_and_updates_the_target() {
     let real = temp_file("symlink_real", "original\n");
-    let link =
-        std::env::temp_dir().join(format!("nxvim_buf_symlink_link_{}.txt", std::process::id()));
+    let link = nxvim_test_harness::temp_root()
+        .join(format!("nxvim_buf_symlink_link_{}.txt", std::process::id()));
     std::fs::remove_file(&link).ok();
     std::os::unix::fs::symlink(&real, &link).unwrap();
 

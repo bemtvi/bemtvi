@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// A unique temp dir for one fixture (pid + counter, no wall-clock — hermetic).
 fn fixture_dir(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = nxvim_test_harness::temp_root().join(format!(
         "nxvim-testrunner-{}-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed),

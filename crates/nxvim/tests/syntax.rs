@@ -37,7 +37,7 @@ const ROWS: u16 = 24;
 fn fixture_data_dir() -> &'static Path {
     static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
     DATA_DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join("nxvim-ts-fixture");
+        let dir = nxvim_test_harness::temp_root().join("nxvim-ts-fixture");
         std::fs::create_dir_all(dir.join("parser")).unwrap();
 
         // `rust`: the workhorse grammar most tests use. Its highlights query is the
@@ -485,7 +485,8 @@ vim.api.nvim_set_hl(0, 'StatusLine', { fg = '#cdd6f4', bg = '#313244' })\n";
 
 /// Create a fresh runtimepath dir holding the `colors/cattest.lua` fixture.
 fn theme_runtimepath(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nxvim-theme-{}-{}", std::process::id(), tag));
+    let dir =
+        nxvim_test_harness::temp_root().join(format!("nxvim-theme-{}-{}", std::process::id(), tag));
     std::fs::create_dir_all(dir.join("colors")).unwrap();
     std::fs::write(dir.join("colors").join("cattest.lua"), COLORS_FIXTURE).unwrap();
     dir
@@ -810,7 +811,8 @@ async fn switching_buffers_shows_each_buffers_own_highlights() {
 /// (garbage bytes — `dlopen` rejects it), under `parser/python.so`. Stands in for
 /// a corrupt / wrong-arch / ABI-mismatched installed grammar.
 fn broken_data_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nxvim-ts-broken-{}", std::process::id()));
+    let dir =
+        nxvim_test_harness::temp_root().join(format!("nxvim-ts-broken-{}", std::process::id()));
     let parser_dir = dir.join("parser");
     std::fs::create_dir_all(&parser_dir).unwrap();
     std::fs::write(parser_dir.join("python.so"), b"not a real shared object").unwrap();
@@ -872,7 +874,8 @@ async fn a_set_directive_with_a_capture_value_still_loads() {
     // A fresh data dir carrying the (already-compiled) rust parser plus a highlights
     // query whose only pattern uses the neovim capture-as-value `#set!` form — the
     // exact shape that broke vimdoc.
-    let dir = std::env::temp_dir().join(format!("nxvim-ts-seturl-{}", std::process::id()));
+    let dir =
+        nxvim_test_harness::temp_root().join(format!("nxvim-ts-seturl-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("parser")).unwrap();
     std::fs::copy(
         fixture_data_dir().join("parser").join("rust.so"),
@@ -1171,7 +1174,7 @@ async fn fenced_code_block_backs_the_whole_block_via_line_bg() {
     // is captured as `@markup.raw.block` (the group the real nvim-treesitter query
     // uses; the bundled 0.5.3 fixture query tags it `@text.literal`), plus a
     // colorscheme giving that group a background so `line_bg` resolves it.
-    let dir = std::env::temp_dir().join(format!("nxvim-mdbg-{}", std::process::id()));
+    let dir = nxvim_test_harness::temp_root().join(format!("nxvim-mdbg-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("after").join("queries").join("markdown")).unwrap();
     std::fs::write(
         dir.join("after")

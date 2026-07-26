@@ -4146,6 +4146,7 @@ dependencies = [
 name = "nxvim-test-harness"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nxvim-core",
  "nxvim-rpc",
  "nxvim-server",

@@ -77,7 +77,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 /// top-level directory name — which GitHub does *not* always make
 /// `tree-sitter-rust-<revision>` (a `vX.Y.Z` tag's dir drops the `v`).
 fn fixture_rev(tag: &str, revision: &str, archive_top_dir: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!("nxvim-tsinstall-{tag}"));
+    let base = nxvim_test_harness::temp_root().join(format!("nxvim-tsinstall-{tag}"));
     let _ = std::fs::remove_dir_all(&base);
     let data_dir = base.join("data");
     let mirror = base.join("mirror");
@@ -415,7 +415,7 @@ async fn bare_ts_install_without_a_filetype_shows_usage() {
 #[ignore = "hits the network (GitHub + nvim-treesitter); run with --ignored"]
 async fn ts_install_rust_over_the_real_network() {
     let _guard = test_lock().lock().await;
-    let base = std::env::temp_dir().join("nxvim-tsinstall-live");
+    let base = nxvim_test_harness::temp_root().join("nxvim-tsinstall-live");
     let _ = std::fs::remove_dir_all(&base);
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -455,7 +455,7 @@ async fn ts_install_fetches_inherited_query_sets() {
     // without this base highlighting of an inherits-based grammar (js → ecma) is
     // missing the parent's patterns. We reuse the rust grammar source but mirror a
     // `rust/highlights.scm` that inherits a synthetic `base`, and serve `base`'s query.
-    let root = std::env::temp_dir().join("nxvim-tsinstall-inherits");
+    let root = nxvim_test_harness::temp_root().join("nxvim-tsinstall-inherits");
     let _ = std::fs::remove_dir_all(&root);
     let data_dir = root.join("data");
     let mirror = root.join("mirror");
@@ -587,7 +587,7 @@ fn build_repo_tarball(out: &Path, top_dir: &str, tree_sitter_json: &str) {
 /// the tarball's top dir both key off the ref, as GitHub serves them) with the given
 /// `tree-sitter.json`, and export the installer env. Returns `data_dir`.
 fn repo_fixture(tag: &str, git_ref: &str, tree_sitter_json: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("nxvim-tsinstall-repo-{tag}"));
+    let base = nxvim_test_harness::temp_root().join(format!("nxvim-tsinstall-repo-{tag}"));
     let _ = std::fs::remove_dir_all(&base);
     let data_dir = base.join("data");
     let mirror = base.join("mirror");
@@ -738,7 +738,7 @@ async fn ts_install_repo_generates_parser_from_grammar_js_via_cli() {
         eprintln!("skip: `tree-sitter` CLI not installed (needed for the generate path)");
         return;
     }
-    let base = std::env::temp_dir().join("nxvim-tsinstall-repo-generate");
+    let base = nxvim_test_harness::temp_root().join("nxvim-tsinstall-repo-generate");
     let _ = std::fs::remove_dir_all(&base);
     let data_dir = base.join("data");
     let mirror = base.join("mirror");

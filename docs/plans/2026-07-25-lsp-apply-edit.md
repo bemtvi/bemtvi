@@ -1,6 +1,6 @@
 # `workspace/applyEdit` — server-initiated workspace edits
 
-**Status:** Done (ten phases). Verified against real gopls, over the daemon wire, and
+**Status:** Done (eleven phases). Verified against real gopls, over the daemon wire, and
 against a real daemon's filesystem from the browser.
 
 ## The bug
@@ -112,16 +112,13 @@ test asserting the didClose/didOpen pair and the surviving attachment.
 
 Two follow-ups from using it:
 
-1. **`create` writes the file.** Leaving the extracted code in an unwritten buffer means a
-   `:q!` loses it, and the on-disk project is half-refactored. The created buffer is now
-   written once the edits filling it have landed — `Editor::queue_buffer_write`, which
-   pushes the ordinary `PreWrite` intent, so it goes out exactly as `:w` writes it
-   (`BufWritePre`/`Post`, `'fileencoding'`/`'fileformat'`, the disk baseline stamped, and
-   the off-tick save leg in a daemon / browser session). Deliberately *not* waited on by the
-   applyEdit response: the edit itself landed in the buffer, and a failed write reports
-   itself loud like any other `:w`. (neovim writes an empty placeholder at `create` time
-   instead, and leaves the content unsaved — this is the deliberate deviation.) Phase 5
-   puts a recursive `mkdir` of the file's directory in front of that write.
+1. **`create` puts the file on disk.** Leaving the file itself uncreated means the
+   on-disk project is half-refactored, so the `create` resource operation writes it out.
+   **Superseded by Phase 11**, which settled *what* is written: an empty placeholder, with
+   the extracted content left unsaved in the buffer (neovim's model). Phase 3 wrote the
+   content too, as a deliberate deviation; Phase 11 reverts that, so the deviation is gone
+   and `Editor::queue_buffer_write` with it. Phase 5 puts a recursive `mkdir` of the file's
+   directory in front of the write either way.
 2. **Buffer names are cwd-relative again.** A workspace edit only ever has absolute URIs,
    so every file it created or opened was *named* absolutely while its neighbours were
    short. `EditHost::buffer_path_for` stores the path relative to the session's effective
@@ -229,8 +226,8 @@ filesystem" as "there is nothing there".
    very file the server asked to spare. The probe it needed already exists: the replica
    fetch. Off-tick the create now enqueues one (`enqueue_replica_open`) and the
    *landing* answers the question — `existed` ⇒ leave it alone, its real content is in
-   the buffer with the edits on top; absent ⇒ this was a create after all, so it is
-   written out exactly as the synchronous path writes one (`settle_workspace_create`).
+   the buffer with the edits on top; absent ⇒ this was a create after all, so the file
+   appears exactly as the synchronous path makes one (`settle_workspace_create`).
    A fetch that *fails* writes nothing: not knowing is not a licence to overwrite.
    The same knowledge fixed the local path's own inconsistency — an `ignoreIfExists`
    create over a file that turns out not to exist is a create, and lands on disk.
@@ -386,3 +383,41 @@ Both fixes are covered by tests mutation-checked against the unfixed code: the l
 with exactly the edit's bytes) in `lsp_features.rs`, and the off-tick goto's two
 (a line-0 column surviving the deferred open, and a utf-16 column converting against the
 line that landed) in `lsp_offtick.rs`.
+
+## Phase 11 — a `create` creates the file, and stops there
+
+Phase 3's deliberate deviation is reverted, at the user's call: nxvim now does what
+neovim does. A `create` resource operation puts the file on disk **empty**, and the
+content the edits after it put in its buffer stays there — modified, unsaved, yours to
+`:w` — exactly the in-memory contract every *other* change in a workspace edit gets. The
+argument for writing the content (a `:q!` loses what the refactor extracted) applies just
+as much to the edits a rename makes in ten other files, and those have never been written
+behind your back; a `create` is not special enough to be the one exception.
+
+So the disk half of a `create` is now a two-step chain on the same ordered fs seam —
+recursive `mkdir` of the directory, then the empty file
+(`WorkspaceFsOp::CreateDir` → `CreatePlaceholder`) — and the response waits for the file
+to exist rather than merely for its directory. `Editor::queue_buffer_write`, added in
+Phase 3 for the content write and now with no callers, is gone.
+
+Writing the placeholder ourselves means telling **both** change detectors that the write
+was ours, or each reports it straight back as an external change to a modified buffer — a
+W12 conflict over nxvim's own file:
+
+- **Locally**, re-snapshot the buffer's disk baseline (`Editor::restamp_disk_baseline`).
+  It had none, never having been read, and that is load-bearing twice over: without it a
+  later `:w` *refuses* (the mutation test drops the content on the floor), and the
+  buffer's file watch never arms at all, since `sync_buffer_watches` skips a buffer with
+  no snapshot.
+- **Over a daemon**, re-arm the watch with no `known` stat. The arm re-baselines to the
+  live file and, per that leg's contract, "an absent/equal `known` pushes nothing" — so
+  the daemon silently adopts the file we just made. Its `fs_write` leg self-suppresses
+  this way for `:w`; the `luafs_op` leg the placeholder rides has no such hook, and this
+  is the reason it needed one.
+
+Tests updated to the new contract rather than deleted: the file must *appear* and be
+empty, the buffer must hold the extracted text and be **modified**, and a plain `:w` must
+then write it with no W11/W12/E211 (`:checktime` asserted clean). Two off-tick tests moved
+their assertion from the daemon fake to the real disk, because the placeholder rides the
+`FsJob` seam and that harness wires only the buffer legs to the fake — including the abort
+test, whose "the file was not written" assertion would otherwise have become vacuous.

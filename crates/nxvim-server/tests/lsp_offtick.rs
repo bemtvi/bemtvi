@@ -68,8 +68,8 @@ async fn workspace_edit_reaches_an_unopened_file_off_tick() {
 /// exactly as it is — the edits that follow land on its real content. Off-tick the
 /// editor tick cannot see the remote filesystem, so this used to fall through to
 /// "create it empty": the existing content was replaced by whatever the edit inserted,
-/// and (since Phase 3 writes a created file out) that emptied version would have been
-/// written back over the real file.
+/// and (while a created file was still written out) that emptied version went back over
+/// the real file.
 #[tokio::test]
 async fn an_ignore_if_exists_create_spares_the_remote_file_it_finds() {
     let fake = DaemonFs::with_files(&[
@@ -135,12 +135,12 @@ async fn two_changes_for_one_unopened_file_both_survive_the_fetch() {
 }
 
 /// The other half of the same probe: `create` with `ignoreIfExists` over a file that
-/// turns out **not** to be there is a create after all — the edits filling it land on
-/// disk, so a `:q!` can't lose what the refactor extracted. Off-tick nothing on the
-/// editor tick knows which case this is; the replica fetch's answer decides it.
+/// turns out **not** to be there is a create after all, so the file appears (empty —
+/// its content stays in the buffer). Off-tick nothing on the editor tick knows which
+/// case this is; the replica fetch's answer decides it.
 ///
-/// Real paths under a temp dir (not `/virtual/…`) so the write's own leg — the daemon's
-/// `fs_write` — can be asserted through the fake's stored content.
+/// Real paths under a temp dir (not `/virtual/…`) because the file operations
+/// themselves are asserted on a real filesystem — see the note at the assertion.
 #[tokio::test]
 async fn an_ignore_if_exists_create_of_an_absent_file_still_lands_on_disk() {
     let dir = temp_dir("lsp_offtick_create");
@@ -165,19 +165,42 @@ async fn an_ignore_if_exists_create_of_an_absent_file_still_lands_on_disk() {
     );
     exec_lua(&rpc, &edit).await;
 
-    let mut written = None;
+    // The file has to *appear*, and appear **empty**: a `create` creates the file, and the
+    // content the edits put in the buffer stays there unsaved, exactly as it does locally.
+    //
+    // Asserted on the real disk rather than through `fake`, because the placeholder rides
+    // the `nx.fs` `FsJob` seam and this harness wires only the *buffer* legs (read / save)
+    // to the daemon fake — `init.fs_jobs` is `None`, so a workspace edit's file operations
+    // run against the local disk here. That the placeholder crosses a real wire is what
+    // `web/verify-lsp.mjs` checks, against a real daemon's filesystem. What *this* test
+    // owns is the decision the local path cannot make: off-tick, "does this file exist?"
+    // is answerable only by the replica fetch, and its answer ("no") has to turn this into
+    // a create at all.
+    let mut exists = false;
     for _ in 0..200 {
-        written = fake.content(&made.to_string_lossy());
-        if written.is_some() {
+        exists = made.exists();
+        if exists {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    assert!(
+        exists,
+        "an absent file is a real create: the off-tick probe's answer must produce the file"
+    );
     assert_eq!(
-        written.as_deref(),
-        Some("fn created() {}\n"),
-        "an absent file is a real create: written over the wire, with exactly the \
-         edit's text and no trailing blank line"
+        std::fs::read_to_string(&made).unwrap_or_default(),
+        "",
+        "…created empty, like every other `create`"
+    );
+
+    // …and the buffer holds exactly the edit's text, with no trailing blank line from the
+    // rope's phantom newline (the deferred fill has to consume it, like the local path).
+    command(&rpc, &format!("edit {}", made.display())).await;
+    assert_eq!(
+        await_lines(&rpc, &["fn created() {}"]).await,
+        vec!["fn created() {}"],
+        "the deferred fill must land in the buffer, phantom newline consumed"
     );
 }
 
@@ -222,10 +245,13 @@ async fn an_aborted_edit_does_not_write_the_file_its_create_probe_was_checking()
         exec_lua(&rpc, "return 1").await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        fake.content(&made.to_string_lossy()),
-        None,
-        "the aborted edit must not write the file its create probe was still checking"
+    // On the real disk, for the same reason as the create test above: the placeholder rides
+    // the `FsJob` seam, which this harness runs locally. Asserting on `fake` here would be
+    // vacuous — nothing in this path ever writes to it — and a test that cannot fail is
+    // worse than no test.
+    assert!(
+        !made.exists(),
+        "the aborted edit must not create the file its probe was still checking"
     );
 }
 

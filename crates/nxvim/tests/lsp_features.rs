@@ -15,7 +15,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, menu_items,
-    menu_of, poll_menu, serial_lock, spawn, temp_dir, window0_field,
+    menu_of, message, poll_menu, serial_lock, spawn, temp_dir, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -2450,7 +2450,7 @@ async fn a_servers_apply_edit_creates_the_new_file_and_is_answered_applied() {
     let dir = temp_dir("lsp_features_apply_edit");
     let record = dir.join("rec.jsonl");
     arm_mock(&dir, &extract_to_new_file_mock(&dir, &record, ""));
-    let (rpc, _incoming) = open_with_server(&dir, "fn helper() {}\nfn main() {}\n").await;
+    let (rpc, mut incoming) = open_with_server(&dir, "fn helper() {}\nfn main() {}\n").await;
     assert!(
         await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
         "the mock server should attach"
@@ -2478,25 +2478,30 @@ async fn a_servers_apply_edit_creates_the_new_file_and_is_answered_applied() {
     }
     assert!(cut, "the edit for the open document should apply");
 
-    // The `create`d file is on disk with the extracted text — the refactor is complete
-    // without the user remembering to save something they never opened.
+    // The `create`d file appears on disk — and **empty**. That is the whole of what the
+    // resource operation asks for: the file exists, and the extracted text the edits put
+    // in its buffer is unsaved, exactly like every other change in a workspace edit
+    // (neovim's model).
     let created = dir.join("helper.rs");
-    let mut written = String::new();
+    let mut exists = false;
     for _ in 0..200 {
         barrier(&rpc).await;
-        written = std::fs::read_to_string(&created).unwrap_or_default();
-        if !written.is_empty() {
+        exists = created.exists();
+        if exists {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(exists, "the `create` must put the file on disk");
     assert_eq!(
-        written, "fn helper() {}\n",
-        "the created file must be written out with what the edit put in it"
+        std::fs::read_to_string(&created).unwrap_or_default(),
+        "",
+        "…empty: a `create` creates the file, it does not save the content for you"
     );
 
-    // …and its buffer holds it, unmodified (it *is* the file now), named the way `:e`
-    // would have named it: relative to the cwd, not the absolute path the server sent.
+    // …and its buffer holds the extracted text, **modified** (that is the unsaved part),
+    // named the way `:e` would have named it: relative to the cwd, not the absolute path
+    // the server sent.
     feed(&rpc, ":e helper.rs<CR>");
     barrier(&rpc).await;
     assert_eq!(
@@ -2508,8 +2513,8 @@ async fn a_servers_apply_edit_creates_the_new_file_and_is_answered_applied() {
         exec_lua(&rpc, "return tostring(nx.bo[0].modified)")
             .await
             .as_str(),
-        Some("false"),
-        "the created buffer was written, so nothing is left unsaved"
+        Some("true"),
+        "the content is yours to save — the buffer must be left modified"
     );
     assert_eq!(
         exec_lua(&rpc, "return tostring(nx.buf.name(0))")
@@ -2517,6 +2522,37 @@ async fn a_servers_apply_edit_creates_the_new_file_and_is_answered_applied() {
             .as_str(),
         Some("helper.rs"),
         "the created buffer's name should be cwd-relative, like every other buffer's"
+    );
+
+    // Saving it is an ordinary `:w` — no "file changed on disk" complaint about the empty
+    // placeholder nxvim itself wrote (the disk baseline was re-snapshotted for exactly
+    // that reason), and the content lands.
+    feed(&rpc, ":w<CR>");
+    barrier(&rpc).await;
+    let mut saved = String::new();
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        saved = std::fs::read_to_string(&created).unwrap_or_default();
+        if !saved.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        saved, "fn helper() {}\n",
+        "a plain `:w` on the created buffer must write the extracted text"
+    );
+    // …and nxvim's own placeholder write never came back as somebody else's change: a
+    // `:checktime` over the buffer must find nothing to report (its disk baseline was
+    // re-snapshotted when the placeholder landed), so no W11/W12/E211.
+    feed(&rpc, ":checktime<CR>");
+    barrier(&rpc).await;
+    let msg = drain_to_latest_redraw(&mut incoming, |_| true)
+        .map(|m| message(&m))
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("W12") && !msg.contains("W11") && !msg.contains("E211"),
+        "nxvim's own placeholder write must not be reported as an external change: {msg:?}"
     );
 
     // And the server was told it landed — the response the whole round trip hangs on.
@@ -3106,19 +3142,27 @@ async fn a_create_into_a_missing_directory_makes_the_directory() {
 
     exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
 
+    // The file has to *appear* — inside a directory that did not exist — which is what
+    // fails when the `mkdir` isn't put in front of it. Empty, like every `create`: the
+    // extracted text stays in the buffer for you to save.
     let created = dir.join("sub/nested/helper.rs");
-    let mut written = String::new();
+    let mut exists = false;
     for _ in 0..200 {
         barrier(&rpc).await;
-        written = std::fs::read_to_string(&created).unwrap_or_default();
-        if !written.is_empty() {
+        exists = created.exists();
+        if exists {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(
-        written, "fn helper() {}\n",
+    assert!(
+        exists,
         "the created file's directory must be made for it, not assumed to exist"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&created).unwrap_or_default(),
+        "",
+        "…and the file itself is created empty, not written with the buffer's content"
     );
     let answer = await_recorded(&record, "_apply_edit_response").await;
     assert_eq!(
@@ -3341,8 +3385,8 @@ async fn the_lua_entry_applies_resource_operations_too() {
     );
     assert_eq!(
         std::fs::read_to_string(&created).unwrap_or_default(),
-        "fn created() {}\n",
-        "the created file is written with what the edits put in it"
+        "",
+        "the created file is created empty — its content stays in the buffer, unsaved"
     );
     assert_eq!(
         std::fs::read_to_string(&moved).unwrap_or_default(),
@@ -3393,23 +3437,36 @@ async fn an_ignore_if_exists_create_spares_a_file_and_still_creates_an_absent_on
     );
     exec_lua(&rpc, &edit).await;
 
-    // The absent one is a create: written out, with no blank line the edit never asked
-    // for. (The write goes out behind a recursive `mkdir` on the off-tick fs seam, so
-    // poll for it.)
+    // The absent one is a create: the file appears on disk (empty — a `create` creates
+    // the file, the content stays in the buffer). It goes out behind a recursive `mkdir`
+    // on the off-tick fs seam, so poll for it.
     let fresh = dir.join("fresh.rs");
-    let mut written = String::new();
+    let mut exists = false;
     for _ in 0..200 {
         barrier(&rpc).await;
-        written = std::fs::read_to_string(&fresh).unwrap_or_default();
-        if !written.is_empty() {
+        exists = fresh.exists();
+        if exists {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(
+        exists,
+        "an `ignoreIfExists` create over an absent file is a create: the file must appear"
+    );
     assert_eq!(
-        written, "fn fresh() {}\n",
-        "an `ignoreIfExists` create over an absent file is a create, and lands \
-         holding exactly what filled it"
+        std::fs::read_to_string(&fresh).unwrap_or_default(),
+        "",
+        "…created empty, like every other `create`"
+    );
+    // And the buffer holds exactly the edit's text — no spurious blank last line from the
+    // rope's phantom newline, which is the bug this half of the test was written for.
+    feed(&rpc, &format!(":e {}<CR>", fresh.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn fresh() {}".to_string()],
+        "the fill must consume the phantom newline, not insert before it"
     );
 
     // The one that was already there kept its own content, with the edit on top and
@@ -3987,19 +4044,20 @@ async fn an_ignore_if_not_exists_delete_of_an_absent_file_is_not_a_failure() {
 
     exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
 
-    // The change *after* the skipped delete still runs — an `abort` would have dropped it.
+    // The change *after* the skipped delete still runs — an `abort` would have dropped it,
+    // and then this file would never appear at all.
     let after = dir.join("after.rs");
-    let mut written = String::new();
+    let mut exists = false;
     for _ in 0..200 {
         barrier(&rpc).await;
-        written = std::fs::read_to_string(&after).unwrap_or_default();
-        if !written.is_empty() {
+        exists = after.exists();
+        if exists {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(
-        written, "fn after() {}\n",
+    assert!(
+        exists,
         "an ignored-missing delete must not abort the changes after it"
     );
     let answer = await_recorded(&record, "_apply_edit_response").await;

@@ -940,37 +940,6 @@ impl Editor {
         !self.pending_pre_writes.is_empty()
     }
 
-    /// Queue a write of `buffer` to its own bound path — `:w` on a buffer that need not
-    /// be current, for a caller that is *not* the user typing it. A workspace edit's
-    /// `create` uses it to persist the file the language server asked to create, once
-    /// the edits that fill it have landed.
-    ///
-    /// It goes through the ordinary pre-write pipeline rather than writing here, so the
-    /// file is created exactly the way `:w` creates one: `BufWritePre` fires (and is
-    /// awaited) first, the bytes are encoded per `'fileencoding'`/`'fileformat'`, the
-    /// disk baseline is stamped, `BufWritePost` fires, and a daemon / browser session
-    /// takes the off-tick save leg. The per-file `written` echo is suppressed (`report:
-    /// false`) — the edit reports its own summary. A no-op for an unknown or unnamed
-    /// buffer (there is nowhere to write it).
-    pub fn queue_buffer_write(&mut self, buffer: BufferId) {
-        let named = self
-            .buffers
-            .map
-            .get(&buffer)
-            .is_some_and(|ob| ob.buffer.path.is_some());
-        if !named {
-            return;
-        }
-        let seq = self.next_write_seq();
-        self.pending_pre_writes.push(PreWrite {
-            seq,
-            buffer,
-            path: None,
-            then_quit: None,
-            report: false,
-        });
-    }
-
     /// Commit a [`PreWrite`] the server has already fired (and settled) `BufWritePre`
     /// for: serialize the buffer to disk (or, off-tick, snapshot + enqueue it), record
     /// the completed write for `BufWritePost` (`fire_pre = false` — the pre already
@@ -1143,6 +1112,36 @@ impl Editor {
             size: ob.buffer.len_bytes() as u64,
         });
         ob.buffer.stamp_disk(Some(stat));
+    }
+
+    /// Re-snapshot `id`'s disk baseline from the filesystem *as it is now*, leaving the
+    /// buffer's content and its `modified` flag alone. The baseline is only ever "the
+    /// state we last saw the file in", so this says: whatever is there now, we know about
+    /// it — stop reporting it as somebody else's change.
+    ///
+    /// A workspace edit's `create` needs exactly that. It puts an **empty** file on disk
+    /// (the resource operation means the file exists; the content the edits put in the
+    /// buffer stays unsaved, as in neovim) while the buffer it made had no baseline at
+    /// all, never having been read. Without this, the next `:checktime` would find a file
+    /// where the baseline said there was none, see a modified buffer, and warn **W12**
+    /// about nxvim's own write.
+    ///
+    /// Off-tick (daemon / web) the local `stat` cannot see the session's filesystem and
+    /// returns `None`, which is what the baseline already holds — a no-op, and correct:
+    /// there, change detection is the daemon's watch leg, not this snapshot. No-op for a
+    /// gone or path-less buffer.
+    pub fn restamp_disk_baseline(&mut self, id: BufferId) {
+        let fs = self.host_fs.clone();
+        let Some(ob) = self.buffers.map.get_mut(&id) else {
+            return;
+        };
+        let Some(path) = ob.buffer.path.clone() else {
+            return;
+        };
+        let stat = fs.stat(&path);
+        if stat.is_some() {
+            ob.buffer.stamp_disk(stat);
+        }
     }
 
     /// Enqueue an off-tick fetch of `path` into `buffer` (an already-created, empty

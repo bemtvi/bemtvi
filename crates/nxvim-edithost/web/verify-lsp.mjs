@@ -26,7 +26,7 @@
 //   * the hover routes to the one advertising `hoverProvider` (`mock2` withholds it);
 //   * completion fans out and merges both servers' candidates (Phase 3c).
 //   * a server→client `workspace/applyEdit` applies and is ANSWERED down the tunnel, and
-//     its `create`/`rename`/`delete` resource operations write, move and remove real
+//     its `create`/`rename`/`delete` resource operations make, move and remove real
 //     files on the daemon's disk —
 //     the direction every other check runs backwards, and the only one where the browser
 //     must frame a response of its own (`SyncLspClient`) and reach a filesystem it does
@@ -379,10 +379,11 @@ try {
   check("lsp: and the editor's `applied: true` response travels back down the tunnel",
     /"applied":true/.test(answer), `response=${JSON.stringify(answer)}`);
 
-  // ── 6. the `create` resource operation writes a NEW file on the DAEMON's disk ─────────
-  //    The buffer is made in the browser and filled by the edits that follow, then
-  //    written out over the off-tick save leg — so the refactor is complete on the far
-  //    side, not sitting unsaved in a Worker.
+  // ── 6. the `create` resource operation makes a NEW file on the DAEMON's disk ──────────
+  //    The file itself has to appear on the far side — a browser session has no local
+  //    filesystem to fall back on, so it can only have crossed the wire — and it appears
+  //    EMPTY: a `create` creates the file, and the extracted text the edits put in its
+  //    buffer stays there, modified and unsaved, for you to `:w` (neovim's model).
   await until(
     page,
     () => {
@@ -391,12 +392,39 @@ try {
       );
       return window.__nxvim.execLua("return 1").then((r) => r.result);
     },
-    () => existsSync(extractedFile) && readFileSync(extractedFile, "utf8").includes("extracted"),
+    () => existsSync(extractedFile),
     15000,
   );
-  check("lsp: a workspace edit's `create` writes the new file, with its content, on the daemon",
-    existsSync(extractedFile) && readFileSync(extractedFile, "utf8") === "let extracted = 1\n",
+  check("lsp: a workspace edit's `create` makes the new file on the daemon",
+    existsSync(extractedFile), "<missing>");
+  check("lsp: …empty — the content stays in the buffer, unsaved",
+    existsSync(extractedFile) && readFileSync(extractedFile, "utf8") === "",
     existsSync(extractedFile) ? JSON.stringify(readFileSync(extractedFile, "utf8")) : "<missing>");
+  // …while the content really is in that buffer, modified and unsaved — the other half of
+  // the contract. Read it back through Lua rather than by switching to it: the buffer is
+  // modified, so an `:edit` would (rightly) refuse with E37.
+  const extractedBuf = await luaResult(page,
+    `local n
+     for _, id in ipairs(nx.buf.list()) do
+       if tostring(nx.buf.name(id)):find("extracted") then n = id end
+     end
+     if not n then return "no buffer" end
+     return table.concat(nx.buf.lines(n, 0, -1), "|") .. "  modified=" .. tostring(nx.bo[n].modified)`);
+  check("lsp: …while the extracted text sits in its buffer, modified and unsaved",
+    /let extracted = 1/.test(String(extractedBuf)) && /modified=true/.test(String(extractedBuf)),
+    `buffer=${JSON.stringify(extractedBuf)}`);
+
+  // And the daemon's watch leg did not report nxvim's own placeholder back as somebody
+  // else's change: the arm re-baselined it, so no W11/W12/E211 turns up on the message
+  // line. Give the daemon's poll a couple of cycles to have pushed one if it were going to.
+  let sawConflict = "";
+  for (let i = 0; i < 40; i++) {
+    const m = String(await page.evaluate(() => window.__nxvim.message()));
+    if (/W1[12]|E211/.test(m)) { sawConflict = m; break; }
+    await sleep(100);
+  }
+  check("lsp: …and the placeholder write is not reported back as an external change",
+    sawConflict === "", `message=${JSON.stringify(sawConflict)}`);
 
   // ── 7. the `rename` resource operation moves the file on the DAEMON's disk ────────────
   //    The buffer half runs in the browser, the filesystem half on the daemon, and the

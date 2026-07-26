@@ -97,12 +97,23 @@ pub(crate) struct WorkspaceFsJob {
 
 /// What to do once a [`WorkspaceFsJob`]'s filesystem half lands.
 pub(crate) enum WorkspaceFsOp {
-    /// The directory holding a `create`d file is there (created, or already was):
-    /// write `buffer` out. A refactor may extract into a directory that does not
-    /// exist yet (a new module / package), and `:w` — rightly, like vim's `E212` —
-    /// does not create one, so the write is queued *behind* a recursive `mkdir` on
-    /// this same ordered seam rather than fired straight at a path with no parent.
-    CreateDir { buffer: BufferId, dir: PathBuf },
+    /// The directory holding a `create`d file is there (created, or already was): put
+    /// the empty file in it ([`CreatePlaceholder`](Self::CreatePlaceholder), chained
+    /// from here). A refactor may extract into a directory that does not exist yet (a
+    /// new module / package), so the file is queued *behind* a recursive `mkdir` on this
+    /// same ordered seam rather than fired straight at a path with no parent.
+    CreateDir {
+        buffer: BufferId,
+        dir: PathBuf,
+        /// The file itself, carried through so the chained write knows its target.
+        path: PathBuf,
+    },
+    /// Put the `create`d file on disk — **empty**, which is the whole of what a `create`
+    /// resource operation means: the file exists, and the content the edits after it put
+    /// in `buffer` stays there, modified and unsaved, until you write it (neovim's
+    /// model). Its landing re-snapshots `buffer`'s disk baseline, so the file we just
+    /// made is not then reported back to the user as an external change.
+    CreatePlaceholder { buffer: BufferId, path: PathBuf },
     /// A `create` whose URI named a **directory** (it ended in `/`): make it, and any
     /// missing parent. There is no buffer half — a directory isn't editable content —
     /// so this op only reports. Ordered with the rest of the edit's file operations,

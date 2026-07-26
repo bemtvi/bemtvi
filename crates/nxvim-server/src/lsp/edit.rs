@@ -219,7 +219,7 @@ impl EditHost {
         let mut deferred = 0usize;
         let mut queued = 0usize;
         // Files a `create` op actually brought into existence, named in the closing
-        // message (and written out — a created file is not left unsaved). A `create`
+        // message (and put on disk, empty — see the chain below). A `create`
         // that `ignoreIfExists` turned into "open what is already there" is *not* one of
         // these: reporting "Created" for a file we deliberately left alone would be a
         // claim about something that did not happen.
@@ -318,9 +318,8 @@ impl EditHost {
                         None => {
                             let id = self.editor.create_file_buffer(&name);
                             // A *freshly emptied* buffer: it needs the phantom-newline
-                            // handling below, and it is the one this edit is creating,
-                            // so it is also the one written out — and the one dropped
-                            // again if the edit aborts.
+                            // handling below, it is the one whose file goes on disk, and
+                            // it is the one dropped again if the edit aborts.
                             created_bufs.push(id);
                             filled_bufs.push(id);
                             self.queue_created_file_write(group, index, id, &path);
@@ -330,10 +329,10 @@ impl EditHost {
                         }
                     };
                     // `ignoreIfExists` over a file that turns out **not** to exist is a
-                    // plain create, and a create lands on disk (else a `:q!` loses what
-                    // the refactor extracted). Locally that is knowable right here — an
-                    // absent file gives a buffer with no disk baseline; off-tick the same
-                    // question is answered when the probe above lands.
+                    // plain create, and a create puts the file on disk. Locally that is
+                    // knowable right here — an absent file gives a buffer with no disk
+                    // baseline; off-tick the same question is answered when the probe
+                    // above lands.
                     if spare_existing
                         && !filled_bufs.contains(&id)
                         && !self.pending_create_writes.contains_key(&id)
@@ -577,16 +576,11 @@ impl EditHost {
         } else if touched == 0 && deferred == 0 && queued == 0 {
             self.editor.echo("No applicable changes");
         }
-        // A `create`d file is written out now that the edits filling it have landed —
-        // the whole point of the operation is that the file exists, and leaving it as an
-        // unwritten buffer means a `:q!` loses what the refactor extracted. That write is
-        // queued by the `create`'s own [`WorkspaceFsOp::CreateDir`] when its directory
-        // lands, through the ordinary pre-write pipeline
-        // ([`Editor::queue_buffer_write`]) so it goes out exactly as `:w` writes it —
-        // `BufWritePre`/`Post` included, and over the off-tick save leg in a daemon /
-        // browser session. Deliberately not waited on by the applyEdit response: the
-        // edit itself has landed (in the buffer), and a failed write reports itself loud
-        // like any other `:w`.
+        // A `create`d file is put on disk **empty**, by the `create`'s own chain of file
+        // operations ([`WorkspaceFsOp::CreateDir`] → [`WorkspaceFsOp::CreatePlaceholder`]).
+        // That is all the resource operation asks for and all nxvim does: the file exists,
+        // and the content the edits just put in its buffer is left modified and unsaved,
+        // for you to write like any other edit in this workspace edit — neovim's model.
         //
         // Start the file operations (one at a time, in order).
         self.pump_workspace_fs_queue();
@@ -789,15 +783,19 @@ impl EditHost {
     }
 
     /// Queue the disk half of a `create`: a recursive `mkdir` of the file's directory,
-    /// which queues `buffer`'s write when it lands
-    /// ([`WorkspaceFsOp::CreateDir`](super::WorkspaceFsOp::CreateDir)).
+    /// which chains the **empty** file itself when it lands
+    /// ([`WorkspaceFsOp::CreateDir`](super::WorkspaceFsOp::CreateDir) →
+    /// [`CreatePlaceholder`](super::WorkspaceFsOp::CreatePlaceholder)).
     ///
-    /// A refactor may extract into a directory that doesn't exist yet, and `:w` —
-    /// rightly, like vim's `E212` — refuses to create one, so writing straight out
-    /// would fail *after* the edit had already answered the server. Off-tick because
-    /// that is the only way one code path serves the local, daemon and browser
-    /// sessions; `recursive` ⇒ an existing directory is a success, so the common
-    /// same-directory create needs no special case.
+    /// Empty, not the buffer's contents: a `create` resource operation says the file
+    /// exists, and what the edits after it put in the buffer is yours to save — the same
+    /// in-memory contract every other change in a workspace edit gets, and neovim's
+    /// behavior. (nxvim used to write the contents out too; that deviation is gone.)
+    ///
+    /// The directory comes first because a refactor may extract into one that doesn't
+    /// exist yet. Off-tick because that is the only way one code path serves the local,
+    /// daemon and browser sessions; `recursive` ⇒ an existing directory is a success, so
+    /// the common same-directory create needs no special case.
     fn queue_created_file_write(
         &mut self,
         group: u64,
@@ -817,7 +815,11 @@ impl EditHost {
                 recursive: true,
                 mode: 0o755,
             },
-            WorkspaceFsOp::CreateDir { buffer, dir },
+            WorkspaceFsOp::CreateDir {
+                buffer,
+                dir,
+                path: path.to_path_buf(),
+            },
         );
     }
 
@@ -830,7 +832,8 @@ impl EditHost {
     /// `existed` ⇒ the server asked us to leave that file alone, and we did: its real
     /// content is in the buffer, the edits are on top of it, and (like every other
     /// workspace edit) they stay in memory until a `:w`. Otherwise this was a create
-    /// after all, so the file lands on disk exactly as the synchronous path's does.
+    /// after all, so the file appears on disk exactly as the synchronous path's does —
+    /// empty, the edits staying in the buffer.
     /// A no-op for every other buffer — the common case on every open.
     pub(crate) fn settle_workspace_create(&mut self, buffer: BufferId, existed: bool) {
         let Some((group, index)) = self.pending_create_writes.remove(&buffer) else {
@@ -1002,16 +1005,62 @@ impl EditHost {
         };
         let failure = match (&job.op, result) {
             // The `create`d file's directory exists (we made it, or it already did):
-            // write the buffer the edits filled. Queued behind the mkdir rather than
-            // fired with it, so a refactor extracting into a new directory lands the
-            // file instead of failing the write after the fact.
-            (WorkspaceFsOp::CreateDir { buffer, .. }, Ok(_)) => {
-                self.editor.queue_buffer_write(*buffer);
+            // put the **empty** file there. Queued behind the mkdir rather than fired
+            // with it, so a refactor extracting into a new directory lands its file
+            // instead of failing after the fact. Front of the queue, ahead of any later
+            // change: it is the same change.
+            (WorkspaceFsOp::CreateDir { buffer, path, .. }, Ok(_)) => {
+                let (buffer, path) = (*buffer, path.clone());
+                self.queue_workspace_fs_job(
+                    job.group,
+                    job.index,
+                    FsJob::Write {
+                        path: path.to_string_lossy().into_owned(),
+                        data: Vec::new(),
+                    },
+                    WorkspaceFsOp::CreatePlaceholder { buffer, path },
+                );
+                if let Some(next) = self.workspace_fs_queue.pop_back() {
+                    self.workspace_fs_queue.push_front(next);
+                }
+                // Counted before the generic decrement below, so the applyEdit waits for
+                // the file to exist rather than merely for its directory.
+                if let Some(pending) = self.pending_apply_edits.get_mut(&job.group) {
+                    pending.outstanding += 1;
+                }
                 None
             }
             (WorkspaceFsOp::CreateDir { dir, .. }, Err(e)) => Some(format!(
                 "create directory {} failed: {} ({})",
                 dir.display(),
+                e.message,
+                e.code
+            )),
+            // The file exists on disk, empty — neovim's model: a `create` *creates the
+            // file*, and the content the edits put in the buffer is yours to save.
+            //
+            // Both change detectors have to be told this write was **ours**, or each
+            // reports it straight back as an external change to a modified buffer — a
+            // W12 conflict over nxvim's own placeholder:
+            //   * locally, re-snapshot the buffer's disk baseline (it had none, never
+            //     having been read) — which is also what lets its file watch arm at all,
+            //     since `sync_buffer_watches` skips a buffer with no snapshot;
+            //   * over a daemon, re-arm the watch with **no** `known` stat. The arm
+            //     re-baselines to the live file and, per the leg's contract, "an
+            //     absent/equal `known` pushes nothing" — so the daemon silently adopts
+            //     the file we just made. (Its `fs_write` leg self-suppresses this way for
+            //     `:w`; the `luafs_op` leg this write rides has no such hook.)
+            (WorkspaceFsOp::CreatePlaceholder { buffer, path }, Ok(_)) => {
+                self.editor.restamp_disk_baseline(*buffer);
+                if self.fx.has_remote_fs() {
+                    let path = path.to_string_lossy().into_owned();
+                    self.fx.fs_watch(path, None);
+                }
+                None
+            }
+            (WorkspaceFsOp::CreatePlaceholder { path, .. }, Err(e)) => Some(format!(
+                "create {} failed: {} ({})",
+                path.display(),
                 e.message,
                 e.code
             )),

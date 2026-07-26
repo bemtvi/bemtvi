@@ -1,6 +1,6 @@
 # `workspace/applyEdit` — server-initiated workspace edits
 
-**Status:** Done (nine phases). Verified against real gopls, over the daemon wire, and
+**Status:** Done (ten phases). Verified against real gopls, over the daemon wire, and
 against a real daemon's filesystem from the browser.
 
 ## The bug
@@ -335,3 +335,54 @@ change (`applied: false` with the reason), an `ignoreIfNotExists` delete of an a
 file not aborting the changes after it, and the encoding option both ways.
 
 Deliberately *not* in scope: `failureHandling = transactional` / `undo` (see above).
+
+## Phase 10 — a second review of Phases 1–9
+
+Two behaviors that only went wrong on the paths the earlier phases reached last: the
+*local* half of an off-tick fix, and the *off-tick* half of a local one.
+
+1. **A local `create` with `ignoreIfExists` over an absent file gained a blank line.**
+   Phase 7 taught that path that such a create is a create after all, and queued the
+   write — but its buffer comes from `ensure_buffer_loaded` (an empty rope for a file
+   that isn't there), not `create_file_buffer`, so it never joined `created_bufs` and
+   missed the phantom-newline handling Phase 1 built for exactly this. The fill
+   inserted *before* the rope's trailing newline and the created file ended one line
+   longer than the edit asked for. Off-tick was unaffected (it keys the same handling
+   off `pending_create_writes`), which is why the browser and daemon checks were green.
+2. **A goto into an unopened file lost its column off-tick.** Phase 6's
+   `jump_to_lsp_location` fix refined the column "only when the line text is really
+   here", tested with `self.editor.cursor.line == line` — which a *deferred* open
+   satisfies whenever the target is on **line 0**, the empty buffer clamping there. It
+   then read the column off an empty line and overwrote the landing target with `0`, so
+   a definition on line 0 still landed on the top-left, the very bug that fix was for.
+   And on the lines it did leave alone the recorded column was the raw protocol
+   `character` used as a byte offset — right for ASCII, wrong on any line with a
+   multi-byte character under the protocol's utf-16 default. A deferred open is now not
+   refined at the jump at all: the position is stashed (`PendingGoto`) and converted at
+   the fetch landing, where the target line finally exists. Locally the jump was always
+   exact — this is the tier-1 rule, so the remote one is too now.
+
+And three smaller things the same read turned up:
+
+- **A `changes`-map edit applied in hash order.** The map has no order of its own, but
+  Phase 4 made this list one that is applied *in sequence* and reported on *by index*,
+  so leaving it `HashMap`-ordered meant the messages — and a `failedChange` — differed
+  between two runs of the same rename. Sorted by URI: which document goes first is
+  arbitrary either way, being the same arbitrary each time is the point.
+- **Two file-operation echoes still blared absolute paths** (`Deleted /tmp/…/x.rs`, and
+  the skipped-rename note), which is what Phase 3 changed every other buffer-facing name
+  away from.
+- **Housekeeping:** Phase 8's move to the raw reply shape left `sync_client` importing a
+  `WorkspaceEdit` it no longer names. Invisible to `cargo clippy --all-targets` (the
+  module is `#[cfg(not(feature = "native"))]`), a warning in the build that actually
+  compiles it — the wasm-eligible one.
+- **`vim.lsp.util.show_document`'s third argument was discarded silently.** neovim's
+  `{ reuse_win, focus }`: nxvim's jump is always a focused `'switchbuf'`-aware one, so
+  `reuse_win` is the behavior anyway, but `focus = false` asks for something this path
+  cannot do — and now says so rather than focusing regardless.
+
+Both fixes are covered by tests mutation-checked against the unfixed code: the local
+`ignoreIfExists` create's two halves (spare a file that is there, create one that isn't,
+with exactly the edit's bytes) in `lsp_features.rs`, and the off-tick goto's two
+(a line-0 column surviving the deferred open, and a utf-16 column converting against the
+line that landed) in `lsp_offtick.rs`.

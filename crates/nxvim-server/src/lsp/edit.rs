@@ -219,13 +219,23 @@ impl EditHost {
         let mut deferred = 0usize;
         let mut queued = 0usize;
         // Files a `create` op actually brought into existence, named in the closing
-        // message, plus the buffers they landed in (see the phantom-newline note below,
-        // and the write — a created file is written out, not left unsaved). A `create`
+        // message (and written out — a created file is not left unsaved). A `create`
         // that `ignoreIfExists` turned into "open what is already there" is *not* one of
         // these: reporting "Created" for a file we deliberately left alone would be a
         // claim about something that did not happen.
         let mut created: Vec<String> = Vec::new();
+        // Buffers this edit **brought into existence**, and so the ones it takes back
+        // out if it aborts. Deliberately not every buffer a `create` reached: one that
+        // was already open belongs to the user, and force-deleting it would throw away
+        // whatever they had in it.
         let mut created_bufs: Vec<BufferId> = Vec::new();
+        // Buffers a `create` is *filling*: to the server their document is **empty** —
+        // it authored these edits against a file that does not exist — so the fill
+        // consumes the rope's phantom newline (see the note at the apply below). A
+        // superset of `created_bufs`, because a `create` that `ignoreIfExists` turned
+        // out to be a real create after all may have reached its (empty, never-written)
+        // buffer rather than made one.
+        let mut filled_bufs: Vec<BufferId> = Vec::new();
         // Text edits **resolved but not yet applied**. Resolving every document first
         // is what makes the common failure — a URI that maps to no file we can open —
         // abort with *nothing* applied instead of half the refactor; the changes are
@@ -309,8 +319,10 @@ impl EditHost {
                             let id = self.editor.create_file_buffer(&name);
                             // A *freshly emptied* buffer: it needs the phantom-newline
                             // handling below, and it is the one this edit is creating,
-                            // so it is also the one written out.
+                            // so it is also the one written out — and the one dropped
+                            // again if the edit aborts.
                             created_bufs.push(id);
+                            filled_bufs.push(id);
                             self.queue_created_file_write(group, index, id, &path);
                             queued += 1;
                             created.push(name.display().to_string());
@@ -323,13 +335,22 @@ impl EditHost {
                     // absent file gives a buffer with no disk baseline; off-tick the same
                     // question is answered when the probe above lands.
                     if spare_existing
-                        && !created_bufs.contains(&id)
+                        && !filled_bufs.contains(&id)
                         && !self.pending_create_writes.contains_key(&id)
                         && self
                             .editor
                             .buffer_of(id)
                             .is_some_and(|b| b.disk_stat().is_none())
                     {
+                        // A create after all, so the fill has an empty document to land
+                        // in — phantom newline and all. `ensure_buffer_loaded` hands back
+                        // an empty rope (`"\n"`) for a file that isn't there, exactly as
+                        // `create_file_buffer` does, and without this the fill inserts
+                        // *before* that newline and the created file gains a spurious
+                        // blank last line. (Not `created_bufs`: the buffer may be one the
+                        // user opened with `:e` and never wrote, which this edit did not
+                        // create and must not delete out from under them on an abort.)
+                        filled_bufs.push(id);
                         self.queue_created_file_write(group, index, id, &path);
                         queued += 1;
                         created.push(name.display().to_string());
@@ -541,7 +562,7 @@ impl EditHost {
             // `…}\n` landing as `…}\n\n`). Let the edit whose text ends up last
             // consume the phantom instead; `normalize` puts one back if the new text
             // doesn't end in a newline.
-            if created_bufs.contains(&id) && buffer.len_bytes() == 1 {
+            if filled_bufs.contains(&id) && buffer.len_bytes() == 1 {
                 if let Some((range, _)) = byte_edits.last_mut() {
                     *range = 0..1;
                 }
@@ -1011,9 +1032,11 @@ impl EditHost {
             // change, since it is the same change.
             (WorkspaceFsOp::RenameGuard { from, to, to_name }, Ok(value)) => {
                 if matches!(value, nxvim_lua::FsValue::Bool(true)) {
+                    // The name the user would have typed, like every other buffer-facing
+                    // message here — `to` stays absolute for the filesystem side only.
                     self.editor.echo(format!(
                         "Skipped rename → {} (already exists)",
-                        to.display()
+                        to_name.display()
                     ));
                 } else {
                     self.queue_workspace_fs_job(
@@ -1083,7 +1106,8 @@ impl EditHost {
                 if let Some(buffer) = self.editor.find_buffer_by_path(path) {
                     self.editor.delete_buffer(buffer, true);
                 }
-                self.editor.echo(format!("Deleted {}", path.display()));
+                self.editor
+                    .echo(format!("Deleted {}", self.buffer_path_for(path).display()));
                 None
             }
             (WorkspaceFsOp::Rename { from, to, .. }, Err(e)) => Some(format!(

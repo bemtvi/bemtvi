@@ -41,6 +41,20 @@ pub(crate) struct PendingReplicaEdit {
     pub(crate) encoding: PositionEncoding,
 }
 
+/// A goto whose target file wasn't open yet, so its bytes are still being fetched
+/// **off-tick** (a daemon / web session): the LSP position, kept with the answering
+/// server's encoding, because the `character`→byte-column conversion needs the target
+/// *line text* and there isn't any until the fetch lands. Stashed in
+/// [`EditHost::pending_goto_cols`] by the replica buffer's id and settled by
+/// `EditHost::settle_pending_goto` when the bytes arrive — the exact conversion the
+/// local path does inline, done at the only moment the off-tick path can do it.
+/// (Locally a jump reads its file synchronously, so this is never populated.)
+pub(crate) struct PendingGoto {
+    pub(crate) encoding: PositionEncoding,
+    pub(crate) line: usize,
+    pub(crate) character: usize,
+}
+
 /// What [`EditHost::apply_workspace_edit`] did: the outcome a server-initiated
 /// `workspace/applyEdit` answers with, plus the ids of the **file** operations it
 /// queued off-tick and which have not landed yet. A server-initiated edit adopts

@@ -172,10 +172,17 @@ pub fn try_normalize_workspace_edit_value(
         });
     }
     // The `changes` map carries no annotations at all, so everything in it applies
-    // unconditionally.
+    // unconditionally. Sorted by URI, because a map has no order of its own and
+    // `HashMap` iteration has a different one every run: the editor applies this list
+    // *in order* and reports a failure by its index, so leaving it hash-ordered would
+    // make both the messages and a `failedChange` differ between two runs of the same
+    // rename. (Which document goes first is arbitrary either way — being the same
+    // arbitrary each time is the point.)
+    let mut changes: Vec<(Url, Vec<TextEdit>)> =
+        raw.changes.unwrap_or_default().into_iter().collect();
+    changes.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
     Ok(WorkspaceEditData::plain(
-        raw.changes
-            .unwrap_or_default()
+        changes
             .into_iter()
             .map(|(uri, edits)| WorkspaceChange::Edits {
                 uri,

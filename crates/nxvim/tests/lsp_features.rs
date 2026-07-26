@@ -3355,6 +3355,80 @@ async fn the_lua_entry_applies_resource_operations_too() {
     );
 }
 
+/// A `create` carrying `ignoreIfExists` is two operations wearing one name, and both
+/// halves have to be right **locally** as well as off-tick:
+///
+/// - over a file that **is** there, it is "open what is already there" — the edits land
+///   on the real content and the file is not rewritten;
+/// - over a file that turns out **not** to be there, it is an ordinary create — the
+///   file lands on disk holding exactly what the edits put in it.
+///
+/// The second half reached its (empty) buffer through `ensure_buffer_loaded` rather
+/// than `create_file_buffer`, so it missed the phantom-newline handling the plain
+/// `create` gets: nxvim's rope always carries a trailing newline, every position in an
+/// empty document maps to byte 0, and the fill therefore inserted *before* it — the
+/// created file gained a spurious blank last line.
+#[tokio::test]
+async fn an_ignore_if_exists_create_spares_a_file_and_still_creates_an_absent_one() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_ignore_if_exists_local");
+    std::fs::write(dir.join("keep.rs"), "fn keep() {}\n").expect("write keep.rs");
+    let (rpc, _incoming) = open_plain(&dir, "fn main() {}\n").await;
+
+    let edit = format!(
+        r#"nx.lsp.apply_workspace_edit({{ documentChanges = {{
+            {{ kind = "create", uri = "{keep}", options = {{ ignoreIfExists = true }} }},
+            {{ textDocument = {{ uri = "{keep}", version = 0 }},
+              edits = {{ {{ range = {{ start = {{ line = 1, character = 0 }},
+                                       ["end"] = {{ line = 1, character = 0 }} }},
+                           newText = "fn added() {{}}\n" }} }} }},
+            {{ kind = "create", uri = "{fresh}", options = {{ ignoreIfExists = true }} }},
+            {{ textDocument = {{ uri = "{fresh}", version = 0 }},
+              edits = {{ {{ range = {{ start = {{ line = 0, character = 0 }},
+                                       ["end"] = {{ line = 0, character = 0 }} }},
+                           newText = "fn fresh() {{}}\n" }} }} }},
+        }} }})"#,
+        keep = file_uri(&dir, "keep.rs"),
+        fresh = file_uri(&dir, "fresh.rs"),
+    );
+    exec_lua(&rpc, &edit).await;
+
+    // The absent one is a create: written out, with no blank line the edit never asked
+    // for. (The write goes out behind a recursive `mkdir` on the off-tick fs seam, so
+    // poll for it.)
+    let fresh = dir.join("fresh.rs");
+    let mut written = String::new();
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        written = std::fs::read_to_string(&fresh).unwrap_or_default();
+        if !written.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        written, "fn fresh() {}\n",
+        "an `ignoreIfExists` create over an absent file is a create, and lands \
+         holding exactly what filled it"
+    );
+
+    // The one that was already there kept its own content, with the edit on top and
+    // nothing written behind our back — a `create` we were told to spare is not a
+    // create, so it stays an in-memory edit like every other.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("keep.rs")).unwrap_or_default(),
+        "fn keep() {}\n",
+        "a spared file must not be rewritten by the edit that spared it"
+    );
+    feed(&rpc, &format!(":e {}<CR>", dir.join("keep.rs").display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn keep() {}".to_string(), "fn added() {}".to_string()],
+        "…and the edits after it land on its real content, not on an emptied buffer"
+    );
+}
+
 /// The `vim.lsp.util` spelling exists and is the same verb — a neovim-shaped plugin
 /// reaches for it, and it used to be `nil` (the example in `nx.lsp.commands`'s own
 /// documentation called it), so every such call errored.

@@ -68,6 +68,12 @@ fn term_data_for(buf: u64, method: &str, params: &[Value]) -> Option<Vec<u8>> {
 /// Collect `term_data` for `buf` until its text contains `needle` (returns `Some(exit?)`,
 /// the exit code if a `term_exit` already arrived) or the budget runs out (returns `None`).
 /// The accumulated text is returned either way so a failure can show what *did* arrive.
+///
+/// A poll that times out with nothing is the *normal* case while the daemon is still
+/// spawning its child — it means keep waiting, not give up. Treating it as the end of the
+/// stream collapsed the whole 200 × 50ms budget into the first 50ms, so the test failed
+/// (instantly, having never waited) whenever a loaded `cargo test --workspace` made the
+/// daemon slower than one poll. Only a *closed* channel ends the wait.
 async fn await_text(
     incoming: &mut UnboundedReceiver<Incoming>,
     buf: u64,
@@ -93,13 +99,15 @@ async fn await_text(
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break, // closed or this poll timed out with nothing
+            Ok(None) => break,  // the connection closed — nothing more is coming
+            Err(_) => continue, // this poll saw nothing; spend the rest of the budget
         }
     }
     (text, None)
 }
 
-/// Wait for `buf`'s `term_exit`, returning its code (or `None` on timeout).
+/// Wait for `buf`'s `term_exit`, returning its code (or `None` on timeout). An empty poll
+/// spends one slice of the budget rather than ending the wait — see [`await_text`].
 async fn await_exit(incoming: &mut UnboundedReceiver<Incoming>, buf: u64) -> Option<i32> {
     for _ in 0..200 {
         match tokio::time::timeout(Duration::from_millis(50), incoming.recv()).await {
@@ -109,7 +117,8 @@ async fn await_exit(incoming: &mut UnboundedReceiver<Incoming>, buf: u64) -> Opt
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(_) => continue,
         }
     }
     None

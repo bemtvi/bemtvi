@@ -14,7 +14,7 @@
 //! buffer can only have come across the wire from the daemon's fs.
 
 use nxvim_test_harness::{
-    await_lines, command, exec_lua, spawn_with_daemon_fs, temp_dir, DaemonFs,
+    await_lines, command, cursor, exec_lua, spawn_with_daemon_fs, temp_dir, DaemonFs,
 };
 
 /// A rename's `WorkspaceEdit` touches the open file *and* a file that was never
@@ -226,5 +226,96 @@ async fn an_aborted_edit_does_not_write_the_file_its_create_probe_was_checking()
         fake.content(&made.to_string_lossy()),
         None,
         "the aborted edit must not write the file its create probe was still checking"
+    );
+}
+
+/// A goto (`textDocument/definition` and friends, reached here through
+/// `nx.lsp.show_document`, which is the same `jump_to_lsp_location`) into a file that
+/// isn't open yet must land on the **column** the server named, not just its line —
+/// off-tick as exactly as it does locally. The remote session is tier-1: a feature
+/// that works locally has to work identically over the wire, and this one didn't.
+///
+/// Two ways it went wrong, both because the file's bytes are still crossing the wire
+/// when the jump happens:
+///
+/// 1. The refinement pass ran anyway whenever the clamped cursor happened to agree
+///    with the target line — which is every **line-0** target, the buffer being empty.
+///    It read the column off an empty line (so: `0`) and *overwrote* the landing
+///    target the first jump had recorded. A definition on line 0 landed on column 0.
+/// 2. On the lines it did correctly leave alone, the recorded column was the raw
+///    protocol `character` used as a byte offset. Exact for ASCII; wrong on any line
+///    with a multi-byte character, under the utf-16 encoding the protocol defaults to.
+///
+/// One unopened file per case, because a jump *back* to a file the first case opened
+/// would take the synchronous path and prove nothing.
+#[tokio::test]
+async fn a_goto_into_an_unopened_file_lands_on_the_column_off_tick() {
+    let fake = DaemonFs::with_files(&[
+        ("/virtual/a.rs", "let foo = 1\n"),
+        ("/virtual/top.rs", "fn zero() {}\n"),
+        ("/virtual/wide.rs", "// header\nlet héllo = world;\n"),
+    ]);
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/a.rs").await;
+    assert_eq!(
+        await_lines(&rpc, &["let foo = 1"]).await,
+        vec!["let foo = 1"],
+        "the open file should load over the daemon wire"
+    );
+
+    // Line 0, column 3 of a file that has never been opened — the case the clamped
+    // refinement used to flatten to (1, 0).
+    exec_lua(
+        &rpc,
+        "nx.lsp.show_document({ uri = 'file:///virtual/top.rs', \
+         range = { start = { line = 0, character = 3 }, \
+                   ['end'] = { line = 0, character = 3 } } })",
+    )
+    .await;
+    assert_eq!(
+        await_lines(&rpc, &["fn zero() {}"]).await,
+        vec!["fn zero() {}"],
+        "the jump should fetch and open the unopened file"
+    );
+    let mut landed = (0, 0);
+    for _ in 0..80 {
+        landed = cursor(&rpc).await;
+        if landed == (1, 3) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        landed,
+        (1, 3),
+        "a line-0 target must keep its column across the deferred open"
+    );
+
+    // …and a utf-16 column on a line with a multi-byte character converts to the byte
+    // column it actually names: in `let héllo = world;`, utf-16 8 is the `o` of
+    // `héllo`, which is byte 9 — `é` costs one utf-16 unit and two bytes.
+    exec_lua(
+        &rpc,
+        "nx.lsp.show_document({ uri = 'file:///virtual/wide.rs', \
+         range = { start = { line = 1, character = 8 }, \
+                   ['end'] = { line = 1, character = 8 } } })",
+    )
+    .await;
+    assert_eq!(
+        await_lines(&rpc, &["// header", "let héllo = world;"]).await,
+        vec!["// header", "let héllo = world;"],
+        "the second jump should fetch and open its file too"
+    );
+    let mut landed = (0, 0);
+    for _ in 0..80 {
+        landed = cursor(&rpc).await;
+        if landed == (2, 9) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        landed,
+        (2, 9),
+        "a utf-16 column must be converted against the line that landed, not used raw"
     );
 }

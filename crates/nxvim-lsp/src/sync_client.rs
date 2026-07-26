@@ -38,7 +38,7 @@ use lsp_types::{
     CompletionItem, CompletionResponse, ConfigurationParams, DocumentSymbolResponse, FoldingRange,
     GotoDefinitionResponse, Hover, InitializeResult, InlayHint, Location, PublishDiagnosticsParams,
     SemanticTokensFullDeltaResult, SemanticTokensResult, ShowMessageParams, SignatureHelp,
-    TextEdit, Url, WorkspaceEdit, WorkspaceSymbolResponse,
+    TextEdit, Url, WorkspaceSymbolResponse,
 };
 use serde_json::{json, Value};
 

@@ -1389,6 +1389,13 @@ pub struct EditHost {
     ///
     /// [`apply_pending_replica_edit`]: EditHost::apply_pending_replica_edit
     pending_replica_edits: HashMap<BufferId, lsp::PendingReplicaEdit>,
+    /// Gotos whose target file wasn't open, in a session where opening it is **off-tick**
+    /// (a daemon / web one): the LSP position, keyed by the replica buffer whose fetch is
+    /// in flight. The `character`→byte-column conversion needs the target line's text, so
+    /// off-tick it can only happen when the bytes land — see
+    /// [`EditHost::settle_pending_goto`]. Empty in a local session, which reads
+    /// synchronously and converts inline.
+    pending_goto_cols: HashMap<BufferId, lsp::PendingGoto>,
     /// The **file** operations a workspace edit asked for (`rename` / `delete`
     /// resource operations) that are still in flight, keyed by the off-tick job id
     /// they were queued under ([`WORKSPACE_FS_JOB_BASE`]` + n`). Each one moves or
@@ -1635,6 +1642,7 @@ impl EditHost {
             dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
             pending_chdirs: HashMap::new(),
             pending_replica_edits: HashMap::new(),
+            pending_goto_cols: HashMap::new(),
             workspace_fs_jobs: HashMap::new(),
             next_workspace_fs_id: WORKSPACE_FS_JOB_BASE,
             workspace_fs_queue: std::collections::VecDeque::new(),

@@ -1235,15 +1235,20 @@ impl EditHost {
     /// entry are recorded exactly once.
     ///
     /// The **first** jump already carries the raw `character` as its column rather
-    /// than `0`, which matters when the target file isn't open yet: its read is
-    /// deferred (locally as much as over a wire), so the cursor set here is clamped to
-    /// a still-empty buffer and the real landing happens when the bytes arrive, from
-    /// the target `land_cursor` recorded. Refining against the clamped line would
-    /// overwrite that record with the top of the file — which is exactly where a goto
-    /// into an unopened file used to land. The raw character is the same best effort
-    /// [`location_byte_col`](Self::location_byte_col) makes for a target that isn't
-    /// current (exact under utf-8, and for ASCII in any encoding); a loaded buffer
-    /// still gets the exact conversion below.
+    /// than `0`, which matters when the target file isn't open yet: in a daemon / web
+    /// session its read is deferred, so the cursor set here is clamped to a still-empty
+    /// buffer and the real landing happens when the bytes arrive, from the target
+    /// `land_cursor` recorded. Refining against that clamped cursor would overwrite the
+    /// record with a column read off an empty line — which is exactly where a goto into
+    /// an unopened file used to land.
+    ///
+    /// So a deferred open is not refined here at all: the position is stashed
+    /// ([`PendingGoto`]) and converted by
+    /// [`settle_pending_goto`](Self::settle_pending_goto) at the landing, where the
+    /// target line's text finally exists. That is what makes the off-tick jump land
+    /// exactly where the local one does — the remote session is tier-1 — including a
+    /// **line-0** target, whose clamped cursor agrees with the target line and so used
+    /// to take the refinement's column-`0` answer whatever the server asked for.
     pub(crate) fn jump_to_lsp_location(&mut self, loc: &Location, encoding: PositionEncoding) {
         let Some(path) = uri_to_path(&loc.uri) else {
             return;
@@ -1251,13 +1256,54 @@ impl EditHost {
         let line = loc.range.start.line as usize;
         let character = loc.range.start.character as usize;
         self.editor.jump_to(&path, line, character);
-        // Only when the line text is really here — a deferred open leaves the cursor
-        // clamped somewhere else, and its landing applies the target above.
-        if self.editor.current_buffer_is(&path) && self.editor.cursor.line == line {
+        if !self.editor.current_buffer_is(&path) {
+            return;
+        }
+        // Bytes still crossing the wire: there is no line text to convert against, and
+        // jumping again would clobber the landing target. Hand it to the landing.
+        let buffer = self.editor.current_buffer_id();
+        if self.editor.has_pending_open(buffer) {
+            self.pending_goto_cols.insert(
+                buffer,
+                PendingGoto {
+                    encoding,
+                    line,
+                    character,
+                },
+            );
+            return;
+        }
+        // Loaded: the exact conversion, against the line we actually landed on.
+        if self.editor.cursor.line == line {
             let text = self.editor.buffer().line(line);
             let byte = byte_col(encoding, &text, character);
             self.editor.jump_to(&path, line, byte);
         }
+    }
+
+    /// Refine a deferred goto's column once its file's bytes have landed — the off-tick
+    /// tail of [`jump_to_lsp_location`](Self::jump_to_lsp_location), called from the
+    /// fetch-landing site (`load_replica_bytes`, shared native/wasm).
+    ///
+    /// The core's own landing (`settle_loaded_cursor`) has already put the cursor on the
+    /// recorded `(line, raw character)`; only now is the line's text here to turn that
+    /// protocol `character` into the byte column it names. A no-op when nothing is
+    /// stashed for `buffer` (the common case on every open), when the landing wasn't the
+    /// current buffer (a background fetch keeps its own saved position), or when the
+    /// target line turned out not to exist — the same guard the synchronous path uses.
+    pub(crate) fn settle_pending_goto(&mut self, buffer: BufferId) {
+        let Some(goto) = self.pending_goto_cols.remove(&buffer) else {
+            return;
+        };
+        if self.editor.current_buffer_id() != buffer || self.editor.cursor.line != goto.line {
+            return;
+        }
+        let Some(path) = self.editor.buffer_of(buffer).and_then(|b| b.path.clone()) else {
+            return;
+        };
+        let text = self.editor.buffer().line(goto.line);
+        let byte = byte_col(goto.encoding, &text, goto.character);
+        self.editor.jump_to(&path, goto.line, byte);
     }
 
     /// Best-effort LSP char→byte column for a target location: exact when the

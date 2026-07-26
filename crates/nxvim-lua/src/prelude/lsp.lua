@@ -1290,6 +1290,12 @@ vim.lsp.util.apply_workspace_edit = function(edit, encoding)
   return nx.lsp.apply_workspace_edit(edit, encoding and { encoding = encoding } or nil)
 end
 vim.lsp.util.show_document = function(location, encoding, opts)
-  local _ = opts
+  -- neovim's third argument is `{ reuse_win, focus }`. nxvim's jump is always a focused
+  -- `'switchbuf'`-aware one (which is `reuse_win` behavior by default), and there is no
+  -- "open it but leave me where I am" on this path — so a caller that asked for
+  -- `focus = false` is told rather than quietly focused anyway.
+  if type(opts) == "table" and opts.focus == false then
+    nx.notify("vim.lsp.util.show_document: `focus = false` is not supported — jumping", "warn")
+  end
   return nx.lsp.show_document(location, encoding and { encoding = encoding } or nil)
 end

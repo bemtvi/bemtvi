@@ -80,6 +80,8 @@ impl EditHost {
                 // never write over it on a guess (that is the clobber this path exists
                 // to avoid). The failure is reported below like any other.
                 self.pending_create_writes.remove(&buffer);
+                // No bytes ⇒ no line text to convert a goto's column against, ever.
+                self.pending_goto_cols.remove(&buffer);
                 if self.pending_replica_edits.remove(&buffer).is_some() {
                     self.editor.echo(format!(
                         "apply_workspace_edit: could not open {path} over the daemon: {e}"
@@ -135,6 +137,11 @@ impl EditHost {
         // result, and decides whether the file is written out or deliberately left as
         // the server found it.
         self.settle_workspace_create(buffer, existed);
+        // A goto whose target file this fetch was opening: the core's landing put the
+        // cursor on the recorded line with the protocol `character` as a raw byte
+        // column, and only now is the line's text here to convert it exactly. After the
+        // edits above, which may have moved that text.
+        self.settle_pending_goto(buffer);
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
         // A fresh read re-seeds the encoding baseline silently (no `EncodingChanged`).

@@ -4098,6 +4098,8 @@ fn git_job_from_table(job: &Table) -> mlua::Result<GitJob> {
         },
         "status" => GitJob::Status {
             path: job.get("path")?,
+            // Absent ⇒ false: the default status never pays for the ignored dirwalk.
+            ignored: job.get::<Option<bool>>("ignored")?.unwrap_or(false),
         },
         // Mutation / network verbs. Optional fields (`depth`/`branch`/`detach`/`init`/
         // `recursive`) come through as `nil` → the Rust `Option`/`bool` default when the

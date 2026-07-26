@@ -39,7 +39,7 @@ pub fn run_git_job(job: &GitJob) -> Result<GitValue, GitError> {
         GitJob::Head { path } => head(path),
         GitJob::Show { file, rev } => show(file, rev),
         GitJob::DiffFile { path, file } => diff_file(path, file),
-        GitJob::Status { path } => status(path),
+        GitJob::Status { path, ignored } => status(path, *ignored),
         GitJob::Clone {
             url,
             dir,
@@ -407,12 +407,24 @@ fn diff_file(path: &str, file: &str) -> Result<GitValue, GitError> {
 /// Worktree rename detection is off by default in gix (git has no config for it
 /// either), which makes a renamed-but-unstaged file look like an untracked new path.
 /// It is enabled here so a rename reads as `R` on its destination.
-fn status(path: &str) -> Result<GitValue, GitError> {
+///
+/// `ignored` additionally emits git-ignored paths (porcelain `!!`), which the dirwalk
+/// prunes by default. It is opt-in because that pruning is the whole reason a status over
+/// a repo with a big `target/` is fast: asked for, the walk must descend into every
+/// ignored directory. `CollapseDirectory` keeps the *result* small — a wholly-ignored
+/// directory is reported as itself rather than as each file beneath it — which is what
+/// makes this affordable for a file tree that refreshes on every write.
+fn status(path: &str, ignored: bool) -> Result<GitValue, GitError> {
     let repo = open(path)?;
-    let platform = repo
+    let mut platform = repo
         .status(gix::progress::Discard)
         .map_err(|e| egit("status", e))?
         .index_worktree_rewrites(Some(gix::diff::Rewrites::default()));
+    if ignored {
+        platform = platform.dirwalk_options(|opts| {
+            opts.emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory))
+        });
+    }
     let iter = platform.into_iter(None).map_err(|e| egit("status", e))?;
 
     // Fold by path, preserving first-seen order (`at[path]` indexes into `entries`).
@@ -891,10 +903,11 @@ fn status_entry(item: &gix::status::Item) -> Option<GitStatusEntry> {
             let (path, worktree, orig_path) = index_worktree_change(change)?;
             Some(GitStatusEntry {
                 path,
-                // Untracked is porcelain's `??` — both columns, not a lone worktree
-                // `?`, which is neither `??` nor a status letter any consumer can read.
-                index: if worktree == "?" {
-                    "?".into()
+                // Untracked is porcelain's `??` and ignored is `!!` — BOTH columns, not
+                // a lone worktree letter, which is neither the porcelain code nor a
+                // status letter any consumer can read.
+                index: if worktree == "?" || worktree == "!" {
+                    worktree.clone()
                 } else {
                     " ".into()
                 },
@@ -937,8 +950,17 @@ fn index_worktree_change(
             };
             Some((rela_path.to_string(), letter.into(), String::new()))
         }
+        // A dirwalk hit: untracked by default, and — when `status` asked for it —
+        // ignored. Both are spelled by their porcelain letter here and doubled into the
+        // index column by the caller. A path we can't classify is dropped rather than
+        // mis-spelled as untracked: `Pruned`/`Tracked` are walk bookkeeping, not a status.
         Item::DirectoryContents { entry, .. } => {
-            Some((entry.rela_path.to_string(), "?".into(), String::new()))
+            let letter = match entry.status {
+                gix::dir::entry::Status::Untracked => "?",
+                gix::dir::entry::Status::Ignored(_) => "!",
+                _ => return None,
+            };
+            Some((entry.rela_path.to_string(), letter.into(), String::new()))
         }
         // A rewrite is reported against its DESTINATION (`dirwalk_entry.rela_path` is
         // where the content now lives), carrying the source as `orig_path`. Detection

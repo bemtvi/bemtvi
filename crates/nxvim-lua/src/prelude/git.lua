@@ -78,7 +78,7 @@ local function define(surface, bridge)
     return run_git(bridge, { op = "diff_file", path = path, file = file })
   end
 
-  -- `status(path)` -> promise of `{ dirty, entries }` in `git status --porcelain`
+  -- `status(path, opts)` -> promise of `{ dirty, entries }` in `git status --porcelain`
   -- XY terms. Each entry is `{ path, index, worktree, orig_path }`:
   --
   -- ```
@@ -96,8 +96,25 @@ local function define(surface, bridge)
   -- Unlike `git status`, an unstaged rename IS detected: it reads `R` on the
   -- destination with `orig_path` set, where git prints a deletion plus an untracked
   -- file.
-  function surface.status(path)
-    return run_git(bridge, { op = "status", path = path })
+  --
+  -- `opts.ignored` (default `false`) additionally reports git-**ignored** paths as
+  -- porcelain's `!!` — both columns — like `git status --porcelain --ignored`. It is
+  -- opt-in because the default walk PRUNES ignored directories, which is what keeps a
+  -- status over a repo with a large `target/` fast; asked for, the walk must descend
+  -- into them. A wholly-ignored directory collapses to ONE entry naming the directory
+  -- (`target`, not its 50k files), exactly like a collapsed untracked directory — so a
+  -- consumer resolves directory-ness from its own model and matches descendants by path
+  -- prefix:
+  --
+  -- ```lua
+  -- local st = nx.await(nx.git.status(root, { ignored = true }))
+  -- for _, e in ipairs(st.entries) do
+  --   if e.index == "!" then ignored[e.path] = true end   -- a file OR a directory
+  -- end
+  -- ```
+  function surface.status(path, opts)
+    opts = opts or {}
+    return run_git(bridge, { op = "status", path = path, ignored = opts.ignored == true })
   end
 
   -- ----- mutation / network verbs (plugin-manager backing) -----

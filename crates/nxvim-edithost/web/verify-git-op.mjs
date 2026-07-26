@@ -12,7 +12,9 @@
 //   (3) nx.git.discover on a non-repo path REJECTS with err.code == "ENOREPO";
 //   (4) nx.git.clone (a Phase-2 MUTATION verb) runs daemon-side over the wire and lands a real
 //       worktree on the daemon's disk with the committed HEAD content — proving the mutation
-//       verbs ride the same git_op leg as the reads.
+//       verbs ride the same git_op leg as the reads;
+//   (5) nx.git.status carries its `ignored` OPT-IN over the wire — off, no `!!` entries; on, the
+//       ignored file and the collapsed ignored directory both arrive.
 //
 // Prereqs: ./build.sh (dist/eh.mjs + eh.wasm + vendor/msgpack), `cargo build -p nxvim`
 // (target/debug/nxvim), a Chromium for Playwright, and `git` on PATH. Run: node verify-git-op.mjs
@@ -86,6 +88,16 @@ git(root, ["add", "-A"]);
 git(root, ["commit", "-q", "-m", "initial"]);
 // Diverge the working tree from HEAD so `show` proving it read the object store is meaningful.
 writeFileSync(trackedFile, "EDITED-IN-WORKTREE\n");
+// A committed .gitignore plus an ignored file + a wholly-ignored directory, for the
+// `status { ignored = true }` check: the flag is a field on the status job, so this proves the
+// wire carries it (without it the daemon walks with ignored pruned and reports neither).
+writeFileSync(join(root, ".gitignore"), "*.log\nbuild\n");
+git(root, ["add", ".gitignore"]);
+git(root, ["commit", "-q", "-m", "ignore"]);
+writeFileSync(join(root, "noise.log"), "noise\n");
+mkdirSync(join(root, "build"), { recursive: true });
+writeFileSync(join(root, "build", "a.o"), "x");
+writeFileSync(join(root, "build", "b.o"), "x");
 // A non-repo directory (outside the repo) for the ENOREPO reject.
 const noRepo = mkdtempSync(join(tmpdir(), "nxvim-norepo-"));
 // A fresh (non-existent) destination the browser will clone the daemon repo INTO, over the
@@ -184,6 +196,38 @@ try {
     fileOnDisk && content === "a\nb\nc\n" && !/E[A-Z]/.test(String(cloned)),
     `cloned=${JSON.stringify(cloned)} fileOnDisk=${fileOnDisk} content=${JSON.stringify(content)}`);
 
+  // ── 5. status { ignored = true }: the opt-in flag crosses the wire ────────────────────────
+  // `opts.ignored` is a field on the status job; a codec that drops it silently degrades a
+  // browser session to "no ignored paths" — a feature that works natively and not remotely.
+  // The wholly-ignored `build/` must arrive COLLAPSED (one entry, not one per .o file), which
+  // is what makes this affordable for a file tree.
+  const statusCall = (opts) => `_G.__st, _G.__sterr = nil, nil
+     nx.git.status("${root}"${opts}):next(
+       function(r)
+         local out = {}
+         for _, e in ipairs(r.entries) do out[#out + 1] = e.path .. "=" .. e.index .. e.worktree end
+         table.sort(out)
+         _G.__st = table.concat(out, ",")
+       end,
+       function(e) _G.__sterr = e.code end)
+     return 1`;
+  const readStatus = () => until(page,
+    () => window.__nxvim.execLua("return tostring(_G.__st or _G.__sterr)").then((r) => r.result),
+    (v) => !/^nil$/.test(String(v)), 15000);
+
+  await luaResult(page, statusCall(""));
+  const plain = String(await readStatus());
+  check("nx.git.status default does NOT report ignored paths over the wire",
+    /file\.txt= M/.test(plain) && !/!!/.test(plain), `status=${JSON.stringify(plain)}`);
+
+  await luaResult(page, statusCall(", { ignored = true }"));
+  const withIgnored = String(await readStatus());
+  check("nx.git.status { ignored = true } crosses the wire (build/ collapsed to one !! entry)",
+    /noise\.log=!!/.test(withIgnored) &&
+      /build=!!/.test(withIgnored) &&
+      !/build\/a\.o/.test(withIgnored),
+    `status=${JSON.stringify(withIgnored)}`);
+
   await browser.close();
 } catch (e) {
   console.error("verify-git-op error:", e);
@@ -194,6 +238,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — browser nx.git runs on a real nxvim --daemon over WebTransport (head, show-from-object-store, ENOREPO reject, clone)"
+  ? "\nALL PASS — browser nx.git runs on a real nxvim --daemon over WebTransport (head, show-from-object-store, ENOREPO reject, clone, status+ignored)"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

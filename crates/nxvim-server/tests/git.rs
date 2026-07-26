@@ -1469,3 +1469,187 @@ async fn attaching_to_a_remote_only_branch_tracks_its_upstream_so_pull_works() {
         "the attached branch should have advanced to the remote tip"
     );
 }
+
+/// `nx.git.status(path, { ignored = true })` reports git-ignored paths as porcelain's
+/// `!!` — both columns — and reports them ONLY when asked. The default (no opts, or
+/// `ignored = false`) must stay byte-identical to what every existing consumer sees,
+/// because emitting ignored costs a full dirwalk of directories git otherwise prunes.
+///
+/// A file tree needs this: `.gitignore` parsing in a plugin is a heuristic that rots on
+/// nested ignore files, negations, and `core.excludesFile`. The engine already knows.
+#[tokio::test]
+async fn status_reports_ignored_paths_only_when_asked() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_ignored");
+    std::fs::write(repo.join(".gitignore"), "ignored.log\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    std::fs::write(repo.join("ignored.log"), "noise\n").unwrap();
+
+    // A helper that collects "<path>=<XY>" for every entry, sorted, so one assertion
+    // reads the whole status set.
+    let collect = "return (function()\n\
+           if not _G.st then return nil end\n\
+           local out = {}\n\
+           for _, e in ipairs(_G.st.entries) do\n\
+             out[#out + 1] = e.path .. \"=\" .. e.index .. e.worktree\n\
+           end\n\
+           table.sort(out)\n\
+           return table.concat(out, \",\")\n\
+         end)()";
+
+    // Default: the ignored file is invisible (the repo is otherwise clean).
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st, _G.sterr = nil, nil\n\
+             nx.git.status({repo:?}):next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, collect).await.as_str(),
+        Some(""),
+        "an ignored file must not show without opts.ignored: {:?}",
+        exec_lua(&rpc, "return _G.sterr").await
+    );
+
+    // Asked for: it arrives as `!!`.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st, _G.sterr = nil, nil\n\
+             nx.git.status({repo:?}, {{ ignored = true }})\n\
+               :next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, collect).await.as_str(),
+        Some("ignored.log=!!"),
+        "opts.ignored must report the ignored file as `!!`: {:?}",
+        exec_lua(&rpc, "return _G.sterr").await
+    );
+}
+
+/// An ignored DIRECTORY collapses to ONE entry (`target`), not one per file inside it —
+/// the property that makes this usable in a file tree at all (a `target/` or
+/// `node_modules/` can hold tens of thousands of paths). A consumer resolves
+/// directory-ness from its own model and matches descendants by path prefix, so the
+/// entry carries the plain path, exactly like a collapsed *untracked* directory already
+/// does.
+#[tokio::test]
+async fn status_collapses_an_ignored_directory_into_one_entry() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_ignored_dir");
+    std::fs::write(repo.join(".gitignore"), "target\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    let target = repo.join("target");
+    std::fs::create_dir_all(target.join("deep/deeper")).unwrap();
+    for name in ["a.o", "b.o", "c.o"] {
+        std::fs::write(target.join(name), "x").unwrap();
+        std::fs::write(target.join("deep").join(name), "x").unwrap();
+        std::fs::write(target.join("deep/deeper").join(name), "x").unwrap();
+    }
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st, _G.sterr = nil, nil\n\
+             nx.git.status({repo:?}, {{ ignored = true }})\n\
+               :next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Exactly one entry, naming the directory — not the 9 files under it.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st and #_G.st.entries")
+            .await
+            .as_u64(),
+        Some(1),
+        "an ignored directory must collapse to one entry: {:?} / {:?}",
+        exec_lua(&rpc, "return _G.sterr").await,
+        exec_lua(
+            &rpc,
+            "return _G.st and table.concat((function() local t = {} \
+               for _, e in ipairs(_G.st.entries) do t[#t + 1] = e.path end return t end)(), \",\")"
+        )
+        .await,
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.st.entries[1].path")
+            .await
+            .as_str(),
+        Some("target")
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return _G.st.entries[1].index .. _G.st.entries[1].worktree"
+        )
+        .await
+        .as_str(),
+        Some("!!")
+    );
+}
+
+/// Ignored reporting must not swallow the ordinary statuses: with `ignored = true` a
+/// modified tracked file still reads `M` and an untracked one still reads `??`, beside
+/// the `!!` entries. (A dirwalk that reclassified untracked paths as ignored would pass
+/// the tests above and still break every consumer.)
+#[tokio::test]
+async fn status_with_ignored_keeps_modified_and_untracked_intact() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let repo = make_repo("git_status_ignored_mix");
+    std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    std::fs::write(repo.join("file.txt"), "a\nb\nc\nd\n").unwrap(); // tracked, modified
+    std::fs::write(repo.join("fresh.txt"), "new\n").unwrap(); // untracked
+    std::fs::write(repo.join("noise.log"), "noise\n").unwrap(); // ignored
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.st, _G.sterr = nil, nil\n\
+             nx.git.status({repo:?}, {{ ignored = true }})\n\
+               :next(function(r) _G.st = r end, function(e) _G.sterr = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return (function()\n\
+               if not _G.st then return nil end\n\
+               local out = {}\n\
+               for _, e in ipairs(_G.st.entries) do\n\
+                 out[#out + 1] = e.path .. \"=\" .. e.index .. e.worktree\n\
+               end\n\
+               table.sort(out)\n\
+               return table.concat(out, \",\")\n\
+             end)()"
+        )
+        .await
+        .as_str(),
+        Some("file.txt= M,fresh.txt=??,noise.log=!!"),
+        "ignored reporting must leave M / ?? alone: {:?}",
+        exec_lua(&rpc, "return _G.sterr").await
+    );
+}

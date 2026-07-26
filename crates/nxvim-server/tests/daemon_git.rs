@@ -281,3 +281,61 @@ async fn nx_git_fetch_and_attach_checkout_run_on_the_daemon_over_the_wire() {
         "unshallow should have removed .git/shallow on the daemon's disk"
     );
 }
+
+/// `opts.ignored` must survive the daemon wire: the flag is a NEW field on the status
+/// job, and a codec that forgets to carry it silently degrades a remote session to
+/// "no ignored paths" — a feature that works locally and not remotely, which the
+/// tier-1-remote rule forbids. The actor has no local git, so a `!!` entry can only
+/// have come from the daemon's gix engine having received `ignored = true`.
+///
+/// Asserted as `<path>=<XY>` pairs so the same expression also proves the flag does not
+/// leak into the default call (checked first, with the ignored file already on disk).
+#[tokio::test]
+async fn nx_git_status_reports_ignored_over_the_wire() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let repo = make_repo("daemon_git_status_ignored");
+    std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    std::fs::write(repo.join("noise.log"), "noise\n").unwrap();
+    std::fs::write(repo.join("fresh.txt"), "new\n").unwrap();
+    let repo_str = repo.to_string_lossy().replace('\\', "\\\\");
+    let (rpc, _incoming) = spawn_with_daemon_git().await;
+
+    // Collect "<path>=<XY>", sorted, into a single string per call.
+    let call = |opts: &str| {
+        format!(
+            r#"_G.__st = nil
+               nx.git.status("{repo_str}"{opts}):next(
+                 function(r)
+                   local out = {{}}
+                   for _, e in ipairs(r.entries) do
+                     out[#out + 1] = e.path .. "=" .. e.index .. e.worktree
+                   end
+                   table.sort(out)
+                   _G.__st = table.concat(out, ",")
+                 end,
+                 function(e) _G.__st = "err:" .. tostring(e.code) end)
+               return 1"#,
+        )
+    };
+
+    // Default over the wire: the ignored file stays invisible.
+    exec_lua(&rpc, &call("")).await;
+    assert!(
+        await_lua_eq(&rpc, "_G.__st", "fresh.txt=??").await,
+        "default remote status must not report ignored paths; got {:?}",
+        exec_lua(&rpc, "return tostring(_G.__st)").await.as_str(),
+    );
+
+    // With the flag: the `!!` entry crosses the wire alongside the untracked one.
+    exec_lua(&rpc, &call(", { ignored = true }")).await;
+    assert!(
+        await_lua_eq(&rpc, "_G.__st", "fresh.txt=??,noise.log=!!").await,
+        "opts.ignored must cross the daemon wire; got {:?}",
+        exec_lua(&rpc, "return tostring(_G.__st)").await.as_str(),
+    );
+}

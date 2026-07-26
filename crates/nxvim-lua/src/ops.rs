@@ -583,11 +583,19 @@ pub enum GitJob {
     /// the plugins' hunk-count parsing. `file` is any path form the executor can
     /// resolve against the repo.
     DiffFile { path: String, file: String },
-    /// `nx.git.status(path)` — the repo's working-tree status: `{ dirty, entries }`,
+    /// `nx.git.status(path, opts)` — the repo's working-tree status: `{ dirty, entries }`,
     /// each entry a `{ path, index, worktree, orig_path }` porcelain-`XY` record, ONE
     /// per path (the staged and unstaged halves are folded together). A canonical
     /// working-tree signal so plugins stop re-deriving one from `diff` output.
-    Status { path: String },
+    ///
+    /// `ignored` additionally reports git-**ignored** paths as porcelain's `!!` (both
+    /// columns), like `git status --porcelain --ignored`. Opt-in because it costs a full
+    /// dirwalk of the directories git otherwise prunes; off, the result is identical to
+    /// what every consumer saw before the flag existed. An ignored directory collapses
+    /// to one entry (`target`, not its 50k files) — the property that makes this usable
+    /// in a file tree; a consumer resolves directory-ness from its own model and matches
+    /// descendants by path prefix.
+    Status { path: String, ignored: bool },
 
     // --- Phase 2: mutation / network verbs (plugin-manager backing) ---
     /// `nx.git_local.clone(url, dir, opts)` — clone `url` into `dir` and check out its

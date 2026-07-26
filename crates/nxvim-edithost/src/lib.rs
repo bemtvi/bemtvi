@@ -2059,9 +2059,10 @@ fn git_job_to_json(id: u64, job: &nxvim_lua::GitJob, local: bool) -> serde_json:
             put("path", path.clone().into());
             put("file", file.clone().into());
         }
-        GitJob::Status { path } => {
+        GitJob::Status { path, ignored } => {
             put("op", "status".into());
             put("path", path.clone().into());
+            put("ignored", serde_json::json!(ignored));
         }
         // Phase-2 mutation / network verbs. Optional `depth`/`branch` are included only
         // when set, so the daemon decoder reads them back as `None` (matching the rmpv

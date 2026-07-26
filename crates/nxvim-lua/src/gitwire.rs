@@ -18,7 +18,8 @@
 //! ### Wire shapes
 //!
 //! **Request (read)** — `{ op = "discover", path }`, `{ op = "head", path }`, `{ op =
-//! "show", file, rev }`, `{ op = "diff_file", path, file }`, `{ op = "status", path }`.
+//! "show", file, rev }`, `{ op = "diff_file", path, file }`, `{ op = "status", path,
+//! ignored }`.
 //! **Request (mutation)** — `{ op = "clone", url, dir, depth?, branch? }`, `{ op =
 //! "checkout", dir, rev, detach }`, `{ op = "fetch", dir, unshallow }`, `{ op = "pull",
 //! dir }`, `{ op = "submodule_update",
@@ -64,6 +65,9 @@ pub fn git_job_from_value(v: &Value) -> Result<GitJob, String> {
         },
         "status" => GitJob::Status {
             path: str_field("path")?,
+            // Optional, like the mutation verbs' flags below: an older peer that omits
+            // the key means "no ignored reporting", the pre-flag behavior.
+            ignored: get("ignored").and_then(Value::as_bool).unwrap_or(false),
         },
         "clone" => GitJob::Clone {
             url: str_field("url")?,
@@ -122,9 +126,10 @@ pub fn git_job_to_value(job: &GitJob) -> Value {
             ("path", path.as_str().into()),
             ("file", file.as_str().into()),
         ]),
-        GitJob::Status { path } => m(vec![
+        GitJob::Status { path, ignored } => m(vec![
             ("op", "status".into()),
             ("path", path.as_str().into()),
+            ("ignored", (*ignored).into()),
         ]),
         GitJob::Clone {
             url,

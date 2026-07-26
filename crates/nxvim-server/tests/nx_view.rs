@@ -1321,3 +1321,67 @@ async fn deleting_a_views_buffer_cleans_it_up_without_panicking() {
         "view bufnr should be nil after its buffer is deleted, got {bufnr:?}"
     );
 }
+
+/// A view's name must hold **while an autocmd is firing**, not merely once the tick has
+/// settled. A statusline plugin renders from inside an event callback (nxvim-line's
+/// segments are invalidated by `TextChanged` / `BufEnter` / `FileType` / …, then re-render
+/// reading `nx.buf.name`), and every lifecycle emitter re-seeds the current-buffer
+/// snapshot that `nx.buf.name(0)`'s fast path reads. Two of those emitters seeded it from
+/// the buffer's PATH — `""` for a pathless view — so each structural update of a tree or
+/// diff view flashed `[No Name]` in the statusline until the next refresh restored it.
+///
+/// Drives the real thing: focus a named view, then rewrite its lines (what a file tree
+/// does on every expand/collapse) with recorders on the events a status bar listens to.
+/// Every observation must read the view's name.
+#[tokio::test]
+async fn view_name_holds_while_an_autocmd_is_firing() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"seen = {}
+           vw = nx.view.create{ name = "ours", filetype = "ourview" }
+           vw:set_lines{ "x" }
+           vw:mount{ split = "vsplit" }
+           vw:focus()
+           for _, ev in ipairs({ "TextChanged", "BufEnter", "FileType", "BufWritePost" }) do
+             nx.on(ev, {}, function()
+               -- Exactly what a statusline segment reads: the current-buffer fast path
+               -- and the by-handle mirror path, for the view's own buffer.
+               if nx.buf.current() == vw:bufnr() then
+                 seen[#seen + 1] = ev .. ":cur=" .. tostring(nx.buf.name(0))
+               end
+               seen[#seen + 1] = ev .. ":handle=" .. tostring(nx.buf.name(vw:bufnr()))
+             end)
+           end"#,
+    )
+    .await;
+    feed_sync(&rpc, "").await;
+    // The structural update: a file tree does exactly this on every expand/collapse.
+    exec_lua(&rpc, r#"seen = {}; vw:set_lines{ "a", "b", "c" }"#).await;
+    feed_sync(&rpc, "").await;
+
+    let count = exec_lua(&rpc, "return #seen").await.as_u64().unwrap_or(0);
+    assert!(
+        count > 0,
+        "no event fired on a view update — the recorders never ran, so this proves nothing"
+    );
+    let bad = exec_lua(
+        &rpc,
+        r#"local out = {}
+           for _, s in ipairs(seen) do
+             if s:match("=$") or s:match("=nil$") then out[#out + 1] = s end
+           end
+           return table.concat(out, ",")"#,
+    )
+    .await;
+    assert_eq!(
+        bad.as_str(),
+        Some(""),
+        "a view's name went empty while an event was firing (the statusline's [No Name] \
+         flash); all observations: {:?}",
+        exec_lua(&rpc, "return table.concat(seen, ',')")
+            .await
+            .as_str()
+    );
+}

@@ -1655,7 +1655,7 @@ impl EditHost {
     /// runs both back-to-back when there is no config phase.
     pub fn boot_begin(&mut self) {
         let buf = self.editor.current_buffer_id();
-        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let name = self.editor.display_name(buf);
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
         self.push_buf_mirror();
@@ -3541,7 +3541,7 @@ where
     // earlier.
     {
         let buf = host.editor.current_buffer_id();
-        let name = host.editor.buffer_name(buf).unwrap_or_default();
+        let name = host.editor.display_name(buf);
         let ft = filetype_of(host.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = host.lua.set_buf_snapshot(buf.0, &name, ft);
     }

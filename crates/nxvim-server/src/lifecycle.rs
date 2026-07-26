@@ -1297,7 +1297,11 @@ impl EditHost {
     pub(crate) fn fire_buf_event(&mut self, event: &str, buf: BufferId) {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
-        let _ = self.lua.set_buf_snapshot(buf.0, &name, &ft);
+        // The snapshot carries the DISPLAY name (see `set_buf_snapshot`) while the
+        // autocmd's pattern / `<afile>` stays the path above — the two differ for a
+        // pathless surface, and seeding the snapshot from the path blanks it.
+        let shown = self.editor.display_name(buf);
+        let _ = self.lua.set_buf_snapshot(buf.0, &shown, &ft);
         self.fire_and_drain(event, &name, buf.0, &name);
     }
 
@@ -1325,7 +1329,14 @@ impl EditHost {
     /// drained by the caller's `run_pending`.
     pub(crate) fn fire_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId, file: &str) {
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
-        let _ = self.lua.set_buf_snapshot(buf.0, file, ft);
+        // `file` is the PATH (it is also the `<afile>` the autocmd fires with); the
+        // snapshot's name is the DISPLAY name, which for a file-backed buffer is the same
+        // string and for a pathless surface — an `nx.view`, a terminal — is its label
+        // rather than `""`. Seeding from the path made every event a statusline listens
+        // to (`TextChanged` on a tree's re-render, …) blank the name mid-tick, so the bar
+        // flashed `[No Name]` until the next refresh restored it.
+        let shown = self.editor.display_name(buf);
+        let _ = self.lua.set_buf_snapshot(buf.0, &shown, ft);
         self.fire_and_drain(event, pattern, buf.0, file);
     }
 
@@ -1550,7 +1561,7 @@ impl EditHost {
     /// (a broken cleanup handler must not wedge the quit), matching the `BufWritePre` gate.
     fn fire_exit_event_gated(&mut self, event: &str) -> bool {
         let buf = self.editor.current_buffer_id();
-        let file = self.editor.buffer_name(buf).unwrap_or_default();
+        let file = self.editor.display_name(buf);
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, &file, ft);
         self.push_buf_mirror();
@@ -1619,7 +1630,7 @@ impl EditHost {
     /// `nvim_buf_get_name(0)` would otherwise read the last-written buffer.
     fn reseed_cur_snapshot(&mut self) {
         let cur = self.editor.current_buffer_id();
-        let name = self.editor.buffer_name(cur).unwrap_or_default();
+        let name = self.editor.display_name(cur);
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(cur.0, &name, ft);
         self.push_buf_mirror();

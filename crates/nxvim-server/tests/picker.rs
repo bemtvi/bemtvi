@@ -7,10 +7,12 @@
 //! projected `menu` redraw surface (rows, selected, query, match spans) and on the
 //! `confirm` side effects read back through `nvim_exec_lua`.
 //!
-//! The sources here are custom **in-memory** drivers (no process spawn), so the
-//! suite is hermetic — it never depends on `rg` being installed. The shipped
-//! `files`/`live_grep` sources (which stream `rg`) are exercised by the example
-//! config and manual runs, not here.
+//! Most sources here are custom **in-memory** drivers (no process spawn), so the
+//! suite is hermetic — it never depends on `rg` being installed. The two exceptions
+//! drive the shipped `files`/`live_grep` sources over a temp tree to pin their
+//! *unrestricted* search (ignored + hidden files in, `.git` out); they stay hermetic
+//! because every leg of those sources' fallback chain enumerates the same set,
+//! whichever binary the machine happens to have.
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
@@ -3111,4 +3113,94 @@ async fn builtin_jumplist_picker_lists_and_jumps() {
         line, 2,
         "confirming the jumplist row jumps the cursor back to line 2 (1-based)"
     );
+}
+
+/// The shipped `files` source searches **unrestricted**: a `.gitignore`d file and a
+/// dotfile both show up (`rg -uu` = `--no-ignore --hidden`), while `.git`'s own
+/// contents stay out. Hermetic without pinning a binary — every leg of the fallback
+/// chain (`rg -uu -g'!.git'` → `find … -not -path '*/.git/*'` → `nx.fs.walk{hidden}`,
+/// whose default `skip` prunes `.git`) is specified to produce exactly this set, so
+/// the assertion holds whichever one the machine lands on.
+#[tokio::test]
+async fn builtin_files_picker_lists_ignored_and_hidden_files() {
+    let dir = temp_dir("picker_files_unrestricted_cfg");
+    let proj = temp_dir("picker_files_unrestricted");
+    // A git repo (rg honors .gitignore only inside one) with one ignored file, one
+    // dotfile, one plain file, and a `.git` entry that must never be listed.
+    std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
+    std::fs::write(proj.join(".git").join("config"), "[core]\n").expect("write .git/config");
+    std::fs::write(proj.join(".gitignore"), "ignored.txt\n").expect("write .gitignore");
+    std::fs::write(proj.join("ignored.txt"), "x\n").expect("write ignored.txt");
+    std::fs::write(proj.join(".hidden.txt"), "x\n").expect("write .hidden.txt");
+    std::fs::write(proj.join("visible.txt"), "x\n").expect("write visible.txt");
+
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('files')").await;
+    let mut rows = Vec::new();
+    for _ in 0..60 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.len() >= 4 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    for want in ["visible.txt", "ignored.txt", ".hidden.txt", ".gitignore"] {
+        assert!(
+            rows.iter().any(|r| r == want),
+            "the files picker is unrestricted, so it lists {want}; got {rows:?}"
+        );
+    }
+    assert!(
+        !rows.iter().any(|r| r.starts_with(".git/")),
+        ".git's contents stay out of the listing; got {rows:?}"
+    );
+}
+
+/// Same for `live_grep`: the match inside a `.gitignore`d file and inside a dotfile
+/// both surface. Binary-agnostic for the same reason as the `files` test — `rg -uu`,
+/// `grep -rnI --exclude-dir=.git` and the `nx.fs` walk all search this set.
+#[tokio::test]
+async fn builtin_live_grep_searches_ignored_and_hidden_files() {
+    let dir = temp_dir("picker_grep_unrestricted_cfg");
+    let proj = temp_dir("picker_grep_unrestricted");
+    std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
+    std::fs::write(proj.join(".gitignore"), "ignored.txt\n").expect("write .gitignore");
+    for name in ["ignored.txt", ".hidden.txt", "visible.txt"] {
+        std::fs::write(proj.join(name), "zqxneedle here\n").expect("write file");
+    }
+
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep picker opens");
+    feed(&rpc, "zqxneedle");
+
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            let now = menu_items(&menu_of(&m));
+            if now.len() >= rows.len() {
+                rows = now;
+            }
+            if rows.len() >= 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    for want in ["ignored.txt", ".hidden.txt", "visible.txt"] {
+        assert!(
+            rows.iter().any(|r| r.starts_with(&format!("{want}:"))),
+            "live_grep is unrestricted, so it matches inside {want}; got {rows:?}"
+        );
+    }
 }

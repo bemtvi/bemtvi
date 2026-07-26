@@ -11,6 +11,14 @@ It ships with a set of built-in sources — `files`, `live_grep`, `buffers`,
 `curbuf`, `diagnostics`, `keymaps`, `marks`, `jumplist`, `pickers` — and
 registering your own is a few lines.
 
+`files` and `live_grep` search **unrestricted** by default — the equivalent of
+`rg -uu` (`--no-ignore --hidden`), so a `.gitignore`d build artifact or a dotfile
+like `.github/workflows/ci.yml` is still findable. The one exclusion is `.git`
+itself. To narrow it, register your own source under the same name (a later
+`nx.picker.source` call with `name = "files"` replaces the shipped one) — see
+[Writing a source](#writing-a-source) and the `examples/telescope-parity` config,
+which builds plain / `-uu` / `-uu` + excludes grep variants from one factory.
+
 ## Using a picker
 
 The built-in sources are bound out of the box, plus a **resume** map:

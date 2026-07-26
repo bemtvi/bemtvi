@@ -623,11 +623,16 @@ end
 -- path; returning ends the run. The stream is reaped on close via on_cancel.
 --
 -- Enumeration falls back through a chain so the picker lists files in every mode:
--- `rg --files` (fast, .gitignore-aware) → `find` (any real shell lacking rg) → a
--- transport-agnostic `nx.fs` walk. The binaries need a real shell, so the pure web
--- client — where a hostless spawn fails loud with code -1 — lands on the nx.fs walk
--- (which rides the off-tick seam to OPFS / the daemon). Each step runs only when the
--- previous produced nothing.
+-- `rg --files` (fast) → `find` (any real shell lacking rg) → a transport-agnostic
+-- `nx.fs` walk. The binaries need a real shell, so the pure web client — where a
+-- hostless spawn fails loud with code -1 — lands on the nx.fs walk (which rides the
+-- off-tick seam to OPFS / the daemon). Each step runs only when the previous produced
+-- nothing.
+--
+-- The search is **unrestricted by default** (`rg -uu` = `--no-ignore --hidden`): a
+-- file you can't find isn't a file, so ignore rules and dotfiles don't hide it. Only
+-- `.git` is excluded (its object store is noise, not source), matching what the
+-- `find` / `nx.fs` steps already do. Register your own `files` source to narrow it.
 nx.picker.source({
   name = "files",
   title = "Find Files",
@@ -658,14 +663,16 @@ nx.picker.source({
       end
       return pushed
     end
-    if run("rg", { "--files", "--color=never" }) then
+    if run("rg", { "--files", "--color=never", "-uu", "-g", "!.git" }) then
       return
     end
     if run("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true) then
       return
     end
     -- No shell / no rg / no find (the pure web client): walk the tree over nx.fs.
-    local ok, files = pcall(nx.await, nx.fs.walk(ctx.cwd))
+    -- `hidden = true` keeps this leg unrestricted like the two above (the walk's
+    -- default `skip` already prunes `.git`).
+    local ok, files = pcall(nx.await, nx.fs.walk(ctx.cwd, { hidden = true }))
     if ok then
       for _, f in ipairs(files) do
         ctx.push({ text = f, path = f })
@@ -678,12 +685,16 @@ nx.picker.source({
 })
 
 -- live_grep: a dynamic source — re-run per prompt edit, the matcher bypassed. Search
--- falls back through a chain so it works in every mode: `rg --vimgrep` (fast,
--- .gitignore-aware) → `grep -rn` (any real shell lacking rg) → a transport-agnostic
--- nx.fs walk + in-Lua substring match. The binaries need a real shell, so the pure web
--- client — where a hostless spawn fails loud with code -1 — lands on the nx.fs match
--- (which rides the off-tick seam to OPFS). Each step runs only when the previous found
--- nothing; the superseded job is reaped via ctx.on_cancel.
+-- falls back through a chain so it works in every mode: `rg --vimgrep` (fast) →
+-- `grep -rn` (any real shell lacking rg) → a transport-agnostic nx.fs walk + in-Lua
+-- substring match. The binaries need a real shell, so the pure web client — where a
+-- hostless spawn fails loud with code -1 — lands on the nx.fs match (which rides the
+-- off-tick seam to OPFS). Each step runs only when the previous found nothing; the
+-- superseded job is reaped via ctx.on_cancel.
+--
+-- Unrestricted by default, exactly like `files` above: `rg -uu` (`--no-ignore
+-- --hidden`) minus `.git`, so an ignored or dotted file still matches. rg still skips
+-- binaries (that needs a third `u`), and the `grep -rnI` step keeps the same shape.
 nx.picker.source({
   name = "live_grep",
   title = "Live Grep",
@@ -726,7 +737,7 @@ nx.picker.source({
       return pushed
     end
 
-    if run("rg", { "--vimgrep", "--color=never", "--", q }, true, false) then
+    if run("rg", { "--vimgrep", "--color=never", "-uu", "-g", "!.git", "--", q }, true, false) then
       return
     end
     if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true) then
@@ -737,7 +748,7 @@ nx.picker.source({
     -- + in-Lua substring match. Performance isn't a concern — the pure-client trees are
     -- small and the picker caps results; pushes for a superseded query are dropped by the
     -- sink.
-    local ok, matches = pcall(nx.await, nx.fs.grep(ctx.cwd, q))
+    local ok, matches = pcall(nx.await, nx.fs.grep(ctx.cwd, q, { hidden = true }))
     if ok then
       for _, m in ipairs(matches) do
         ctx.push({

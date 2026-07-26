@@ -75,4 +75,16 @@ check that the toggle survives a workspace restart.
 ## Status
 
 - [x] Phase 1 — engine capability
-- [ ] Phase 2 — tree presentation
+- [x] Phase 2 — tree presentation
+
+Notes from the build:
+
+- `signcolumn` normalizes `yes:1` → `yes` on read-back, so the tree sets `"yes"`.
+- The gutter is pinned from the git module's **first successful status**, not at build time:
+  that is the only point where "we are in a repo" is known. A rebuild inside a live session
+  re-pins it from the window-chrome step, since the fresh window starts at the default.
+- `sign_hl_group` turned out to be painted end to end (`merged_sign_cells` resolves it into
+  the sign cell's style) — `nx.buf.set_extmark`'s doc comment claimed otherwise and was
+  stale; corrected in `prelude/api.lua` while here.
+- Hiding ignored entries is a **render-time** filter, not a scandir filter, so `I` is
+  instant and a directory you un-hide keeps its expand state.

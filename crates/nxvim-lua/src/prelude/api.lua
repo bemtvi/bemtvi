@@ -777,15 +777,18 @@ local EXTMARK_OPT_OK = {
 -- `line_hl_group` (a full-width line background, neovim's `line_hl_group`) also
 -- RENDERS — projected as the per-window `line_bg` layer painted under the text, the
 -- `'cursorline'` model — so a plugin can back a whole line (e.g. a markdown code block
--- with `@markup.raw.block`) end to end. The remainder — signs' `sign_hl_group`,
--- conceal, and the other line-highlight groups — are likewise
--- accepted and stored but unpainted. (The gravity flags `right_gravity` /
--- `end_right_gravity` are NOT in this bucket — they are honored end to end; see
--- `EXTMARK_OPT_OK` and `nx.buf.set_extmark`.) A documented approximation (the matchadd /
--- winblend pattern): a plugin that decorates with, say, gutter signs loads and runs;
--- those supplementary glyphs just aren't painted yet. Rejecting them loud would instead
--- break the plugin's render path. The core extmark store still tracks the mark's
--- POSITION (for get_extmarks) regardless.
+-- with `@markup.raw.block`) end to end. So does the gutter sign pair `sign_text` +
+-- `sign_hl_group`: the sign is merged with the LSP diagnostic signs into the row's single
+-- sign cell (`extmarks.rs::merged_sign_cells`, highest `priority` wins) and its
+-- highlight is resolved through the window's `winhighlight` into the cell's style, so a
+-- plugin's signs paint AND take their colour. The remainder — conceal and the other
+-- line-highlight groups — are accepted and stored but unpainted. (The gravity flags
+-- `right_gravity` / `end_right_gravity` are NOT in this bucket — they are honored end to
+-- end; see `EXTMARK_OPT_OK` and `nx.buf.set_extmark`.) For the unpainted rest, a
+-- documented approximation (the matchadd / winblend pattern): a plugin that decorates
+-- with them loads and runs, those supplementary bits just aren't painted yet. Rejecting
+-- them loud would instead break the plugin's render path. The core extmark store still
+-- tracks the mark's POSITION (for get_extmarks) regardless.
 local EXTMARK_OPT_DECORATION = {
   virt_text = true,
   virt_text_pos = true,

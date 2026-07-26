@@ -20,6 +20,63 @@ impl EditHost {
         self.run_pending();
     }
 
+    /// Run `cmd` to full convergence with its message output suppressed — the
+    /// `:sil[ent][!] {cmd}` modifier, and what `nx.cmd(cmd, { silent = … })`
+    /// compiles to. The `!` form is the one plugins lean on to ignore a command
+    /// that errors or doesn't exist (a plugin manager's `silent! runtime
+    /// plugin/rplugin.vim`).
+    ///
+    /// Suppression is done by snapshot-and-restore around the run (the inner
+    /// command may defer further — `run_command` drains that): whatever it echoed
+    /// is rolled back off both the message line and the `:messages` history, which
+    /// is where vim puts it too (`msg_hist_add` skips the entry outright while
+    /// `msg_silent` is set).
+    ///
+    /// `bang` is the only thing that separates the two forms, exactly as in vim:
+    ///
+    /// * `:silent!` (`bang`) sets vim's `emsg_silent` as well, so *errors are
+    ///   swallowed too* and the line is always restored.
+    /// * a bare `:silent` keeps errors. Vim resets `msg_silent` the moment one is
+    ///   emitted ("an error causes messages to be switched back on", message.c) —
+    ///   so the error **and anything the command said after it** stay visible,
+    ///   while the output that preceded it is still dropped. That is what the
+    ///   error-position split below reproduces: [`Editor::echo`] already classifies
+    ///   each recorded line by vim's `E###:` convention, so the level distinction
+    ///   the flag needs is in the history already.
+    pub(crate) fn run_silent(&mut self, cmd: &str, bang: bool) {
+        if cmd.is_empty() {
+            return;
+        }
+        let saved_msg = self.editor.message.clone();
+        let saved_err = self.editor.message_error;
+        let saved_len = self.editor.messages.len();
+        let cmd = cmd.to_string();
+        self.run_command(&cmd);
+        // The history is a capped ring, so a command that logged a flood can leave
+        // it *shorter* than the mark we took; clamp before slicing from it.
+        let saved_len = saved_len.min(self.editor.messages.len());
+        let first_error = (!bang)
+            .then(|| {
+                self.editor.messages[saved_len..]
+                    .iter()
+                    .position(|m| m.error)
+            })
+            .flatten();
+        match first_error {
+            // Messages came back on at the error: keep it and everything after,
+            // and leave the message line showing whatever the command left there.
+            Some(off) => {
+                self.editor.messages.drain(saved_len..saved_len + off);
+            }
+            // Nothing survives the modifier — put the line back as we found it.
+            None => {
+                self.editor.messages.truncate(saved_len);
+                self.editor.message = saved_msg;
+                self.editor.message_error = saved_err;
+            }
+        }
+    }
+
     /// Resolve an ex-command the core didn't recognize: load a colorscheme,
     /// dispatch a Lua user command if one is registered under that name, or
     /// report the standard unknown-command error. `cmd` is the trimmed line.
@@ -151,27 +208,9 @@ impl EditHost {
                 Ok(out) => self.surface_autocmd_output("Autocommands", &out),
                 Err(e) => self.editor.echo(format!("E5108: Error in :augroup: {e}")),
             },
-            // `:sil[ent][!] {cmd}` — the silent command modifier. Run `{cmd}` to
-            // full convergence with its message-line output suppressed; the `!`
-            // form is the one plugins lean on to ignore a command that errors or
-            // doesn't exist (e.g. a plugin manager: `silent! runtime plugin/rplugin.vim`). The
-            // core defers the whole `silent …` string here, so this is the one
-            // place it resolves. We snapshot the message line + history, run the
-            // inner command (it may defer further — `run_command` drains that), then
-            // restore: anything it echoed is dropped. nxvim doesn't yet distinguish
-            // error- from normal-level output, so a bare `:silent` suppresses errors
-            // too — a minor over-suppression versus neovim, where `:silent` keeps
-            // errors and only `:silent!` swallows them.
-            _ if is_silent(base) => {
-                let inner = args.trim().to_string();
-                if !inner.is_empty() {
-                    let saved_msg = self.editor.message.clone();
-                    let saved_len = self.editor.messages.len();
-                    self.run_command(&inner);
-                    self.editor.message = saved_msg;
-                    self.editor.messages.truncate(saved_len);
-                }
-            }
+            // `:sil[ent][!] {cmd}` — the silent command modifier. The core defers the
+            // whole `silent …` string here, so this is the one place it resolves.
+            _ if is_silent(base) => self.run_silent(args.trim(), bang),
             _ if is_doautocmd(base) => {
                 match self.lua.ex_doautocmd(args) {
                     Ok(out) => self.surface_autocmd_output("Autocommands", &out),

@@ -1,0 +1,19 @@
+Silent-commands demo buffer.
+
+The mappings below all run ex-commands under the `:silent[!]` modifier — from
+Lua, via `nx.cmd(cmd, opts)` and the `vim.cmd` aliases.
+
+  <Space>w   save this file with no "…written" message
+  <Space>o   run an optional (nonexistent) command — silent!, so nothing reports
+  <Space>e   the same command with a bare silent — E492 still reports
+  <Space>v   three quiet echoes, then jump to the last line
+  <Space>x   an unsupported modifier (`keepjumps`) raises by name
+
+Typed at the command line, for comparison:
+
+  :echom 'hello'          shows `hello`
+  :silent echom 'hello'   shows nothing, and logs nothing to :messages
+  :silent NotACommand     still reports E492
+  :silent! NotACommand    reports nothing
+
+This is the last line — <Space>v should land here.

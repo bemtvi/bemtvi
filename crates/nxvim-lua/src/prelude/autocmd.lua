@@ -1091,16 +1091,21 @@ end
 -- ----- vim.cmd: callable AND indexable ---------------------------------------
 -- `vim.cmd("…")` queues a raw ex-command (the Rust function installed earlier);
 -- `vim.cmd.colorscheme("x")` / `vim.cmd.set("number")` build `"<name> <args…>"`.
+-- Every form also takes the modifier table `nx.cmd` accepts —
+-- `vim.cmd("write", { silent = true })`, `vim.cmd.write({ mods = { silent = true } })`
+-- — and the neovim structured form `vim.cmd{ cmd = …, args = …, mods = … }` routes
+-- through `nvim_cmd`, so `mods.silent` reaches the same `:silent` modifier instead
+-- of being dropped.
 do
   local raw_cmd = vim.cmd
   -- An <expr> mapping RHS must not change editor state (textlock): while
   -- nx._expr_lock is set, running an ex-command raises instead of mutating.
-  local function raw(c)
+  local function raw(c, opts)
     if nx._expr_lock then
       error("E5555: <expr> mapping must not change the editor (vim.cmd is blocked)", 0)
     end
     nx._assert_call_ctx("an ex-command (vim.cmd)")
-    return raw_cmd(c)
+    return raw_cmd(c, opts)
   end
   local function build(name, ...)
     local first = ...
@@ -1112,7 +1117,7 @@ do
       if first.args then
         s = s .. " " .. table.concat(first.args, " ")
       end
-      return raw(s)
+      return raw(s, first.mods)
     end
     local parts = {}
     for i = 1, select("#", ...) do
@@ -1125,8 +1130,14 @@ do
     return raw(s)
   end
   vim.cmd = setmetatable({}, {
-    __call = function(_, c)
-      return raw(c)
+    __call = function(_, c, opts)
+      -- The structured neovim form (`{ cmd = "echo", args = {…}, mods = {…} }`)
+      -- flattens through the shared `nvim_cmd` adapter rather than a second copy
+      -- of that shape here.
+      if type(c) == "table" then
+        return vim.api.nvim_cmd(c, opts or {})
+      end
+      return raw(c, opts)
     end,
     __index = function(_, name)
       return function(...)

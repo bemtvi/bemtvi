@@ -335,6 +335,61 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
     }))
 }
 
+/// Compile `nx.cmd`'s optional modifier table onto the command line itself, so a
+/// `nx.cmd("write", { silent = true })` runs exactly what `:silent write` does —
+/// the modifier's one implementation lives in the server's resolver
+/// (`EditHost::run_silent`), and the scripting surface reaches it rather than
+/// growing a second suppression path that could drift from the typed one.
+///
+/// Modelled on neovim's `nvim_cmd` mods, which is what the `vim.cmd`/`nvim_cmd`
+/// aliases forward here:
+///
+/// * `silent` → `:silent` (message-line output suppressed, errors still shown)
+/// * `silent` + `emsg_silent` → `:silent!` (errors swallowed too)
+///
+/// `emsg_silent` *without* `silent` — suppress errors but keep ordinary output —
+/// has no vim modifier to spell it, and nxvim has no other way to reach it. Rather
+/// than quietly rounding it up to `:silent!` (which would also eat the output the
+/// caller asked to keep), it is rejected by name; likewise any modifier nxvim
+/// doesn't dispatch, so a `mods` key can never be silently dropped.
+fn cmd_with_mods(cmd: String, opts: Option<mlua::Table>) -> mlua::Result<String> {
+    let Some(opts) = opts else { return Ok(cmd) };
+    let mut silent = false;
+    let mut emsg_silent = false;
+    for pair in opts.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let name = match &key {
+            mlua::Value::String(s) => s.to_str()?.to_string(),
+            other => other.to_string()?,
+        };
+        // Lua truthiness: `silent = false` is the same as not asking for it.
+        let on = !matches!(value, mlua::Value::Nil | mlua::Value::Boolean(false));
+        match name.as_str() {
+            "silent" => silent = on,
+            "emsg_silent" => emsg_silent = on,
+            _ => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "nx.cmd: unsupported command modifier '{name}' — nxvim honors \
+                     `silent` and `emsg_silent`"
+                )))
+            }
+        }
+    }
+    if emsg_silent && !silent {
+        return Err(mlua::Error::RuntimeError(
+            "nx.cmd: `emsg_silent` needs `silent` — nxvim's `:silent!` suppresses \
+             errors as part of suppressing output, so pass \
+             { silent = true, emsg_silent = true }"
+                .to_string(),
+        ));
+    }
+    Ok(match (silent, emsg_silent) {
+        (true, true) => format!("silent! {cmd}"),
+        (true, false) => format!("silent {cmd}"),
+        _ => cmd,
+    })
+}
+
 pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
     let vim = lua.create_table()?;
 
@@ -344,13 +399,15 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     // with `vim.*` forwarding to the same value.
     let nx = lua.create_table()?;
 
-    // `nx.cmd` (alias: `vim.cmd` / `nvim_command`): the ex-command funnel. Only the
-    // canonical `nx.*` natives are seeded from Rust; the muscle-memory `vim.api.nvim_*`
-    // names are aliased onto them in the Lua prelude (ADR 0002), so there is no
-    // second registration path here.
+    // `nx.cmd(cmd[, opts])` (alias: `vim.cmd` / `nvim_command`): the ex-command
+    // funnel. Only the canonical `nx.*` natives are seeded from Rust; the
+    // muscle-memory `vim.api.nvim_*` names are aliased onto them in the Lua prelude
+    // (ADR 0002), so there is no second registration path here. `opts` carries the
+    // command modifiers the call wants applied ([`cmd_with_mods`]) — today just
+    // `silent` / `emsg_silent`.
     let sh = shared.clone();
-    let cmd = lua.create_function(move |_, cmd: String| {
-        sh.borrow_mut().commands.push(cmd);
+    let cmd = lua.create_function(move |_, (cmd, opts): (String, Option<mlua::Table>)| {
+        sh.borrow_mut().commands.push(cmd_with_mods(cmd, opts)?);
         Ok(())
     })?;
     nx.set("cmd", cmd.clone())?;

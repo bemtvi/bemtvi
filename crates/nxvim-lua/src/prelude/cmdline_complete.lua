@@ -148,7 +148,11 @@ local BUILTIN = {
   { "augroup", ":augroup {name}", "Define or switch to autocommand group {name}." },
   { "doautocmd", ":doautocmd {event}", "Fire the autocommands for {event}." },
   { "command", ":command {name} {repl}", "Define a user command :{name}." },
-  { "silent", ":silent {cmd}", "Run {cmd}, suppressing its messages." },
+  {
+    "silent",
+    ":silent[!] {cmd}",
+    "Run {cmd}, suppressing its messages (errors still show; `!` hides those too).",
+  },
   { "tab", ":tab {cmd}", "Run {cmd} so a window it opens becomes a new tab page." },
   -- LSP (the `:Lsp*` verbs).
   { "LspInfo", ":LspInfo", "Show the LSP clients attached to the buffer." },

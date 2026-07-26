@@ -7,7 +7,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, exec_lua, message_after, spawn, temp_dir};
+use nxvim_test_harness::{attach, exec_lua, feed, lines, message_after, spawn, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start(dir: &std::path::Path) -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -42,6 +42,161 @@ async fn silent_bang_suppresses_command_error() {
     assert!(
         !quiet.contains("E492") && quiet.trim().is_empty(),
         "silent! should suppress the error, got {quiet:?}"
+    );
+}
+
+/// A **bare** `:silent` keeps errors: it suppresses ordinary output only, exactly as
+/// in vim, where an error switches messages back on (`msg_silent` is reset in
+/// `emsg`). Only the `!` form swallows the error — the two must not be the same
+/// command.
+#[tokio::test]
+async fn bare_silent_hides_output_but_keeps_errors() {
+    let dir = temp_dir("excmd_silent_bare");
+    let (rpc, mut incoming) = start(&dir).await;
+
+    // The control: `:echomsg` shows its text and records it.
+    let loud = message_after(&rpc, &mut incoming, ":echom 'SHOWN'<CR>").await;
+    assert_eq!(
+        loud.trim(),
+        "SHOWN",
+        "control: expected output, got {loud:?}"
+    );
+
+    // Ordinary output goes away under the modifier…
+    let quiet = message_after(&rpc, &mut incoming, ":silent echom 'HIDDEN'<CR>").await;
+    assert!(
+        !quiet.contains("HIDDEN"),
+        ":silent should suppress ordinary output, got {quiet:?}"
+    );
+
+    // …but an error still reports — the whole difference from `silent!`.
+    let err = message_after(&rpc, &mut incoming, ":silent NotARealCommand<CR>").await;
+    assert!(
+        err.contains("E492"),
+        "a bare :silent must keep the error visible, got {err:?}"
+    );
+
+    // The same split holds in `:messages`: the suppressed line never reaches the
+    // history (vim skips the entry outright under `msg_silent`), the kept error does.
+    feed(&rpc, ":messages<CR>");
+    let history = lines(&rpc).await;
+    assert!(
+        !history.iter().any(|l| l.contains("HIDDEN")),
+        "a silenced message must not reach :messages: {history:?}"
+    );
+    assert!(
+        history.iter().any(|l| l.contains("E492")),
+        "the kept error should be logged: {history:?}"
+    );
+    assert!(
+        history.iter().any(|l| l.contains("SHOWN")),
+        "the control message is in the history: {history:?}"
+    );
+}
+
+/// `nx.cmd(cmd, { silent = … })` — the Lua funnel's modifier table. It compiles to
+/// the very same `:silent[!]` modifier, so the message-line behavior matches what
+/// typing it does, including keeping an error under the bare form.
+#[tokio::test]
+async fn nx_cmd_silent_option() {
+    let dir = temp_dir("excmd_cmd_silent");
+    let (rpc, mut incoming) = start(&dir).await;
+
+    // Without the option the command's output shows (the control).
+    let loud = message_after(&rpc, &mut incoming, ":lua nx.cmd(\"echo 'SHOWN'\")<CR>").await;
+    assert!(
+        loud.contains("SHOWN"),
+        "control: expected output, got {loud:?}"
+    );
+
+    let quiet = message_after(
+        &rpc,
+        &mut incoming,
+        ":lua nx.cmd(\"echo 'HIDDEN'\", { silent = true })<CR>",
+    )
+    .await;
+    assert!(
+        !quiet.contains("HIDDEN"),
+        "{{ silent = true }} should suppress the output, got {quiet:?}"
+    );
+
+    // `silent` alone keeps an error…
+    let err = message_after(
+        &rpc,
+        &mut incoming,
+        ":lua nx.cmd('NotARealCommand', { silent = true })<CR>",
+    )
+    .await;
+    assert!(
+        err.contains("E492"),
+        "{{ silent = true }} keeps errors, got {err:?}"
+    );
+
+    // …and `emsg_silent` swallows it (`:silent!`).
+    let swallowed = message_after(
+        &rpc,
+        &mut incoming,
+        ":lua nx.cmd('NotARealCommand', { silent = true, emsg_silent = true })<CR>",
+    )
+    .await;
+    assert!(
+        !swallowed.contains("E492"),
+        "emsg_silent should swallow the error, got {swallowed:?}"
+    );
+}
+
+/// The `vim.*` aliases reach the same modifier: `vim.cmd(str, opts)`, the structured
+/// `vim.cmd{ cmd = …, mods = … }` / `nvim_cmd`, and the indexed `vim.cmd.echo{…}`.
+/// A `mods` key nxvim cannot honor raises rather than being silently dropped, and so
+/// does `emsg_silent` without `silent` (nxvim's `:silent!` cannot express it).
+#[tokio::test]
+async fn vim_cmd_mods_reach_the_same_modifier() {
+    let dir = temp_dir("excmd_vim_cmd_mods");
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let quiet = message_after(
+        &rpc,
+        &mut incoming,
+        ":lua vim.cmd({ cmd = 'echo', args = { \"'TABLE'\" }, mods = { silent = true } })<CR>",
+    )
+    .await;
+    assert!(
+        !quiet.contains("TABLE"),
+        "vim.cmd's structured form should honor mods.silent, got {quiet:?}"
+    );
+
+    let quiet = message_after(
+        &rpc,
+        &mut incoming,
+        ":lua vim.cmd.echo({ args = { \"'INDEXED'\" }, mods = { silent = true } })<CR>",
+    )
+    .await;
+    assert!(
+        !quiet.contains("INDEXED"),
+        "vim.cmd.<name> should honor mods.silent, got {quiet:?}"
+    );
+
+    // A modifier nxvim doesn't dispatch fails loud, naming it.
+    let raised = exec_lua(
+        &rpc,
+        "local ok, err = pcall(nx.cmd, 'echo 1', { keepjumps = true }) return tostring(err)",
+    )
+    .await;
+    assert!(
+        raised.as_str().unwrap_or_default().contains("keepjumps"),
+        "an unsupported modifier should raise by name, got {raised:?}"
+    );
+
+    // So does `emsg_silent` on its own — rounding it up to `:silent!` would also
+    // eat the ordinary output the caller asked to keep.
+    let raised = exec_lua(
+        &rpc,
+        "local ok, err = pcall(nx.cmd, 'echo 1', { emsg_silent = true }) return tostring(err)",
+    )
+    .await;
+    assert!(
+        raised.as_str().unwrap_or_default().contains("emsg_silent"),
+        "emsg_silent without silent should raise, got {raised:?}"
     );
 }
 

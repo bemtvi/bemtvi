@@ -1545,10 +1545,13 @@ api.nvim_list_uis = nx.list_uis
 
 -- `nvim_cmd(cmd, opts)`: the structured ex-command form. nxvim's command engine
 -- consumes a string, so flatten {cmd, args, bang} into one and route through
--- `nvim_command` — the body only adapts the table shape onto that sibling nvim_
--- funnel, so it carries no implementation of its own (there is no structured nx
--- twin; the canonical nxvim form is the string-taking `nx.cmd`). `opts.output`
--- capture isn't modelled (returns `""`); the common callers
+-- `nx.cmd` — the body only adapts the table shape onto that funnel, so it carries
+-- no implementation of its own (there is no structured nx twin; the canonical
+-- nxvim form is the string-taking `nx.cmd`). `cmd.mods` rides along as `nx.cmd`'s
+-- modifier table, so `mods = { silent = true }` runs the command under `:silent`
+-- (and `mods.emsg_silent` under `:silent!`); a modifier nxvim doesn't dispatch
+-- raises there rather than being silently dropped. `opts.output` capture isn't
+-- modelled (returns `""`); the common callers
 -- (`nvim_cmd{cmd='normal', args={...}, bang=true}`) only need the side effect.
 function api.nvim_cmd(cmd, opts)
   local s = cmd.cmd
@@ -1558,7 +1561,8 @@ function api.nvim_cmd(cmd, opts)
   if cmd.args and #cmd.args > 0 then
     s = s .. " " .. table.concat(cmd.args, " ")
   end
-  api.nvim_command(s)
+  nx._assert_call_ctx("an ex-command (nvim_cmd)")
+  nx.cmd(s, cmd.mods)
   if opts and opts.output then
     return ""
   end

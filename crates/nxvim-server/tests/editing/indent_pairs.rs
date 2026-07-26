@@ -247,6 +247,83 @@ async fn indentemptylines_option_reads_back_through_vim_bo() {
     assert_eq!(v.as_bool(), Some(false), ":set noiel clears it");
 }
 
+// ===== `=` reindent: no change => no modification ============================
+//
+// neovim's `op_reindent` only calls `changed_lines()` when `set_indent()` actually
+// rewrote a line: reindenting already-correctly-indented text leaves `'modified'`
+// (and the undo history) alone. The same holds for `>`/`<` via `shift_line`.
+
+/// Whether the current buffer reports `'modified'`.
+async fn modified(rpc: &Rpc) -> bool {
+    lua_bool(rpc, "return vim.bo.modified").await == Some(true)
+}
+
+#[tokio::test]
+async fn reindent_without_a_change_leaves_the_buffer_unmodified() {
+    // No grammar and no autoindent/smartindent, so `=` wants every line at column
+    // 0 — which is where this file's lines already are. Nothing is rewritten, so
+    // the buffer must stay clean (and `u` must have nothing to undo).
+    let path = write_temp("reindent_clean", "txt", "alpha\nbeta\ngamma\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "gg=G");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta", "gamma"],
+        "`=` changed nothing here"
+    );
+    assert!(
+        !modified(&rpc).await,
+        "a no-op `=` must not mark the buffer modified"
+    );
+
+    // …and it pushed no undo state either: `u` has nothing to revert.
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta", "gamma"],
+        "a no-op `=` must not leave an undo step behind"
+    );
+}
+
+#[tokio::test]
+async fn reindent_that_changes_a_line_still_marks_modified() {
+    // The positive control for the test above: here `=` really does rewrite the
+    // indent (to column 0), so the buffer becomes modified as usual.
+    let path = write_temp("reindent_dirty", "txt", "alpha\n    beta\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "gg=G");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta"],
+        "`=` stripped the indent"
+    );
+    assert!(
+        modified(&rpc).await,
+        "a `=` that rewrites a line marks the buffer modified"
+    );
+}
+
+#[tokio::test]
+async fn shift_without_a_change_leaves_the_buffer_unmodified() {
+    // `<<` on a line already at column 0 shifts nothing (vim's `shift_line` only
+    // reports a change when `set_indent` rewrote the line).
+    let path = write_temp("shift_clean", "txt", "alpha\nbeta\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "gg<G");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta"],
+        "`<` changed nothing"
+    );
+    assert!(
+        !modified(&rpc).await,
+        "a no-op `<` must not mark the buffer modified"
+    );
+}
+
 // ===== insert `<CR>`: the line left behind ===================================
 
 #[tokio::test]

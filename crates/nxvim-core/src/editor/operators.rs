@@ -177,10 +177,16 @@ impl Editor {
     /// else 0) indent — the body shared by `==`, `=motion`, `gg=G`, and visual `=`.
     /// One undo step covers the whole run; the cursor settles on `first`'s first
     /// non-blank, as vim does after `=`.
+    ///
+    /// A run that rewrites *no* line leaves the buffer entirely alone — no undo
+    /// state, `'modified'` untouched — mirroring neovim's `op_reindent`, which only
+    /// calls `changed_lines()` for the lines `set_indent()` reported as changed. So
+    /// the undo snapshot (which must be taken *before* the first edit) is pushed
+    /// lazily, on the first line whose indent actually differs.
     fn reindent_lines(&mut self, first: usize, last: usize) {
-        self.push_undo();
         let last = last.min(self.last_line());
         let indent_blanks = self.buffer().options.indentemptylines;
+        let mut changed = false;
         for line in first..=last {
             // A blank line is forced to column 0, never handed to the indent
             // source — mirroring neovim's `op_reindent` (`amount = *l == NUL ?
@@ -194,9 +200,18 @@ impl Editor {
             } else {
                 self.indent_for(line)
             };
+            if self.line_indent_matches(line, width) {
+                continue;
+            }
+            if !changed {
+                changed = true;
+                self.push_undo();
+            }
             self.set_line_indent(line, width);
         }
-        self.buffer_mut().modified = true;
+        if changed {
+            self.buffer_mut().modified = true;
+        }
         self.cursor.line = first.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
@@ -210,12 +225,15 @@ impl Editor {
     /// (spaces under `expandtab`, else tabs+spaces). Blank lines (only whitespace)
     /// are left untouched, as vim's `>>` never indents an empty line. One undo
     /// step covers the whole run; the cursor settles on `first`'s first non-blank.
+    /// A run that moves nothing (`<` over lines already at column 0, or a range of
+    /// only blank lines) leaves undo and `'modified'` alone — see
+    /// [`reindent_lines`](Self::reindent_lines) for the same rule under `=`.
     fn shift_lines(&mut self, first: usize, last: usize, right: bool, count: usize) {
-        self.push_undo();
         let last = last.min(self.last_line());
         let opts = self.buffer().options;
         let amount = opts.effective_shiftwidth() * count;
         let tabstop = opts.effective_tabstop();
+        let mut changed = false;
         for line in first..=last {
             let s = self.buffer().line(line);
             // A blank line keeps no indent (vim leaves empty lines at column 0).
@@ -228,9 +246,18 @@ impl Editor {
             } else {
                 cur.saturating_sub(amount)
             };
+            if self.line_indent_matches(line, new) {
+                continue;
+            }
+            if !changed {
+                changed = true;
+                self.push_undo();
+            }
             self.set_line_indent(line, new);
         }
-        self.buffer_mut().modified = true;
+        if changed {
+            self.buffer_mut().modified = true;
+        }
         self.cursor.line = first.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();

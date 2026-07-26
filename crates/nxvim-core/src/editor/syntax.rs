@@ -475,16 +475,35 @@ impl Editor {
         Some(indent_width(&self.buffer().line(prev), tabstop))
     }
 
+    /// What re-indenting line `line` to visual width `width` would do: the
+    /// whitespace run it would lay down, the byte length of the line's existing
+    /// leading whitespace, and whether the two already agree (so the edit would
+    /// rewrite nothing). The one place the "already correct" test is spelled.
+    fn indent_plan(&self, line: usize, width: usize) -> (String, usize, bool) {
+        let opts = self.buffer().options;
+        let s = self.buffer().line(line);
+        let old_ws = s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        let fill = fill_indent(0, width, opts.effective_tabstop(), opts.expandtab);
+        let same = old_ws == fill.len() && s.starts_with(&fill);
+        (fill, old_ws, same)
+    }
+
+    /// Is line `line` already indented to exactly what `width` would lay down —
+    /// i.e. would [`set_line_indent`](Self::set_line_indent) rewrite nothing? The
+    /// operators ask before editing: a `=` / `>` / `<` run that changes no line must
+    /// leave `'modified'` and the undo history alone (neovim's `op_reindent` only
+    /// calls `changed_lines()` for lines `set_indent()` reported as changed).
+    pub(crate) fn line_indent_matches(&self, line: usize, width: usize) -> bool {
+        self.indent_plan(line, width).2
+    }
+
     /// Replace line `line`'s leading whitespace with indentation of visual width
     /// `width` (tabs/spaces per the buffer's `expandtab`/`tabstop`), returning the
     /// new leading-whitespace **byte length** — i.e. the column the first
     /// non-blank now begins at, where an auto-indent caller parks the cursor.
     pub(crate) fn set_line_indent(&mut self, line: usize, width: usize) -> usize {
-        let opts = self.buffer().options;
-        let s = self.buffer().line(line);
-        let old_ws = s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
-        let fill = fill_indent(0, width, opts.effective_tabstop(), opts.expandtab);
-        if old_ws == fill.len() && s.starts_with(&fill) {
+        let (fill, old_ws, same) = self.indent_plan(line, width);
+        if same {
             return fill.len(); // already correct — no edit (keeps `=` idempotent)
         }
         let start = self.buffer().line_start(line);

@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    buf_lines, buf_name_of, command, cursor, exec_lua, feed, field, lines, start_attached,
-    write_temp,
+    buf_lines, buf_name_of, command, cursor, drain_to_latest_redraw, exec_lua, feed, field, lines,
+    map_get, start_attached, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -44,6 +44,39 @@ async fn message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Strin
         }
     }
     msg
+}
+
+/// Wait for a status `message` containing `want` — the disk-change variant of
+/// [`message`]. Panics (naming `want`) if none arrives.
+///
+/// Taking the *latest* message is right for persistent state, but nxvim arms a native
+/// file watch on every file-backed buffer that auto-runs `:checktime` when the file
+/// changes on disk. Its W11/W12 warning lands on its own tick, asynchronously with
+/// respect to the test's own actions — so it can repaint *after* the frame the
+/// assertion means and overwrite it (W12's text shares no substring with a `:w`
+/// clobber warning, so the assert then fails on a message the test never asked
+/// about). A test that writes a file behind the editor's back must pin its frame by
+/// CONTENT rather than by recency.
+async fn await_message_containing(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let keep = |map: &[(Value, Value)]| {
+        map_get(map, "message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains(want))
+    };
+    // Bounded poll: the qualifying frame is queued before the barrier resolves, but
+    // the client's reader task can lag under load (see `drain_to_latest_redraw`).
+    for _ in 0..200 {
+        if drain_to_latest_redraw(incoming, keep).is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no status message containing {want:?} arrived");
 }
 
 /// Whether the focused window's buffer is unnamed (`windows[0].unnamed`), read off
@@ -927,12 +960,7 @@ async fn wall_warns_and_switches_to_a_buffer_changed_on_disk() {
     // that changed on disk: it switches to that buffer and warns instead of
     // clobbering it.
     command(&rpc, "wall").await;
-    assert!(
-        message(&rpc, &mut incoming)
-            .await
-            .contains("changed on disk"),
-        "expected a clobber warning"
-    );
+    await_message_containing(&rpc, &mut incoming, "changed on disk").await;
     assert_eq!(current_buf(&rpc).await, 1, "must switch to the conflict");
     assert_eq!(
         std::fs::read_to_string(&a).unwrap(),

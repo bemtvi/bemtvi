@@ -123,13 +123,23 @@ async fn feed_until(rpc: &Rpc, key: &str, code: &str) -> bool {
     lua_bool(rpc, code).await == Some(true)
 }
 
-/// Declare the manager's install root (a temp dir) so the test never touches the
-/// host data dir, and return that root path.
+/// Declare the manager's install root AND config dir (both temp dirs) so the test
+/// never touches the host's data or config dir, and return that root path.
+///
+/// The config dir matters as much as the install root: the LOCKFILE lives beside the
+/// user's `init.lua` (`<config>/nxvim-lock.json`), so a `sync()` under the default
+/// config dir writes the developer's real lockfile — a hermeticity leak that also
+/// makes two tests race over one host file.
 async fn setup_root(rpc: &Rpc, tag: &str) -> PathBuf {
-    let root = temp_dir(tag).join("install");
+    let base = temp_dir(tag);
+    let root = base.join("install");
     exec_lua(
         rpc,
-        &format!("nx.plugins.setup_manager({{ root = \"{}\" }})", q(&root)),
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{}\", config = \"{}\" }})",
+            q(&root),
+            q(&base.join("config"))
+        ),
     )
     .await;
     root
@@ -444,12 +454,13 @@ async fn install_of_unreachable_repo_rejects_loud() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
              nx.plugins {{ {{ \"file:///no/such/repo\", name = \"zeta\" }} }}\n\
              nx.plugins.install():next(\n\
                function() _G.err = false end,\n\
                function(e) _G.err = tostring(e and e.message or e) end)",
             root = q(&root),
+            cfg = q(&dir.join("config")),
         ),
     )
     .await;
@@ -515,13 +526,14 @@ async fn submodules_are_initialised_on_install() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
              nx.plugins {{\n\
                {{ \"file://{withsub}\", name = \"withsub\" }},\n\
                {{ \"file://{nosub}\", name = \"nosub\", submodules = false }} }}\n\
              nx.plugins.sync():next(function() _G.synced = true end)\n\
                :catch(function(e) _G.err = tostring(e and e.message or e) end)",
             root = q(&root),
+            cfg = q(&base.join("config")),
             withsub = q(&withsub),
             nosub = q(&nosub),
         ),
@@ -1441,10 +1453,11 @@ async fn nx_plugins_system_clones_into_the_system_dir_and_loads() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\", system = \"{sys}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", system = \"{sys}\", config = \"{cfg}\" }})\n\
              nx.plugins.system({{ \"file://{repo}\", name = \"conn\" }})",
             root = q(&base.join("install")),
             sys = q(&sysdir),
+            cfg = q(&base.join("config")),
             repo = q(&repo),
         ),
     )
@@ -1488,11 +1501,12 @@ async fn nx_plugins_promote_moves_a_managed_plugin_into_the_tier() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\", system = \"{sys}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", system = \"{sys}\", config = \"{cfg}\" }})\n\
              nx.plugins({{ {{ \"file://{repo}\", name = \"promo\" }} }})\n\
              nx.plugins.sync()",
             root = q(&base.join("install")),
             sys = q(&sysdir),
+            cfg = q(&base.join("config")),
             repo = q(&repo),
         ),
     )

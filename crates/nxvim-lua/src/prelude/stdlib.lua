@@ -510,13 +510,41 @@ function nx.tbl.deepcopy(orig)
 end
 vim.deepcopy = nx.tbl.deepcopy
 
+-- True iff `t` is a *list* — a table whose keys are exactly `1..#t`. The one
+-- implementation behind both `deep_extend`'s merge rule (just below) and the public
+-- `nx.list.is_list` (further down this file), so the two can never drift apart, and
+-- so neither routes through the `vim.islist` global a config is free to overwrite.
+local function is_list(t)
+  if type(t) ~= "table" then
+    return false
+  end
+  local n = 0
+  for _ in pairs(t) do
+    n = n + 1
+  end
+  return n == #t
+end
+
+-- Is `t` mergeable — a table that is a *map* rather than a list? An empty table
+-- counts (nothing distinguishes `{}` the empty map from `{}` the empty list, and
+-- merging into it is lossless).
+local function mergeable(t)
+  return type(t) == "table" and (next(t) == nil or not is_list(t))
+end
+
 -- `nx.tbl.deep_extend(behavior, ...)` [alias `vim.tbl_deep_extend`]: Merge `...` maps into one. `behavior` is `"force"` | `"keep"` | `"error"`. Nested
--- tables merge recursively; scalar conflicts resolve per `behavior`.
+-- maps merge recursively; **lists are replaced whole**; scalar conflicts resolve per
+-- `behavior`.
+--
+-- The list rule is neovim's, and it is load-bearing rather than cosmetic: merging a
+-- list index-by-index fuses two unrelated entries and leaves a stale tail, so a
+-- re-registered tool list (`nx.lsp.config`'s `settings.languages.<ft>`) would keep
+-- the dropped tool's keys on entry 1 and its old entry 2 — a config nobody wrote.
 function nx.tbl.deep_extend(behavior, ...)
   local result = {}
   local function merge(dst, src)
     for k, v in pairs(src) do
-      if type(v) == "table" and type(dst[k]) == "table" then
+      if mergeable(v) and mergeable(dst[k]) then
         merge(dst[k], v)
       elseif dst[k] == nil or behavior == "force" then
         dst[k] = nx.tbl.deepcopy(v)
@@ -1169,14 +1197,7 @@ vim.trim = nx.str.trim
 -- keys are exactly `1..#t`).
 nx.list = nx.list or {}
 function nx.list.is_list(t)
-  if type(t) ~= "table" then
-    return false
-  end
-  local n = 0
-  for _ in pairs(t) do
-    n = n + 1
-  end
-  return n == #t
+  return is_list(t)
 end
 vim.islist = nx.list.is_list
 vim.tbl_islist = nx.list.is_list -- the pre-0.10 name

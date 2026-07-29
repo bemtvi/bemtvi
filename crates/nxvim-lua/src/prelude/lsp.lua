@@ -244,22 +244,46 @@ local function start_for(name, cfg, bufnr, ft)
   end
 end
 
+-- The enabled configs, resolved once into `{ name = , cfg = }` entries. `only` (a set
+-- of config names, optional) narrows it to those names.
+--
+-- Split out from the dispatch below so a caller that sweeps MANY buffers resolves each
+-- config once for the whole sweep rather than once per buffer: `resolve` deep-merges
+-- three layers and deep-COPIES the result, and a config's `settings` is not always
+-- small (nxvim-efmls-configs hands efm one `languages` map covering every loaded
+-- filetype). Per-event dispatch touches one buffer and doesn't care; `enable`'s
+-- catch-up touches every open one.
+local function enabled_entries(only)
+  local entries = {}
+  for name, on in pairs(nx.lsp._enabled) do
+    if on and (only == nil or only[name]) then
+      entries[#entries + 1] = { name = name, cfg = resolve(name) }
+    end
+  end
+  return entries
+end
+
+-- Start every config in `entries` whose `filetypes` includes `ft`, for `bufnr`.
+local function start_matching(entries, bufnr, ft)
+  if not ft or ft == "" then
+    return
+  end
+  for _, e in ipairs(entries) do
+    if e.cfg.filetypes and vim.tbl_contains(e.cfg.filetypes, ft) then
+      start_for(e.name, e.cfg, bufnr, ft)
+    end
+  end
+end
+
 -- The shared FileType dispatcher body: for every enabled config whose resolved
 -- `filetypes` includes `ft`, resolve the root and start the server for `bufnr`.
 -- This is the engine's declarative FileType -> start step (neovim wires an internal
 -- autocmd; nxvim keeps it here so it behaves identically under the wasm edit-host).
 function nx.lsp._on_filetype(bufnr, ft)
-  if not ft or ft == "" then
+  if not ft or ft == "" then -- ahead of `enabled_entries`, which is the expensive half
     return
   end
-  for name, on in pairs(nx.lsp._enabled) do
-    if on then
-      local cfg = resolve(name)
-      if cfg.filetypes and vim.tbl_contains(cfg.filetypes, ft) then
-        start_for(name, cfg, bufnr, ft)
-      end
-    end
-  end
+  start_matching(enabled_entries(nil), bufnr, ft)
 end
 
 -- The built-in LSP keymaps. They are installed *buffer-local* when a server first
@@ -358,19 +382,48 @@ function nx.lsp.enable(names)
   if type(names) == "string" then
     names = { names }
   end
+  local named = {}
   for _, n in ipairs(names) do
     if n == "*" then
       error("nx.lsp.enable: '*' is the base layer, not a server name", 2)
     end
     nx.lsp._enabled[n] = true
+    named[n] = true
   end
   ensure_dispatcher()
-  -- The current buffer's FileType has already fired, so the dispatcher just
-  -- installed won't catch it; process it on the spot (a start is idempotent
-  -- server-side, so overlapping the startup FileType from init.lua is harmless).
+  -- Every buffer already read has had its `FileType` fired, so the dispatcher just
+  -- installed will never see any of them; catch them all up on the spot (a start is
+  -- idempotent server-side, so overlapping the startup FileType from init.lua is
+  -- harmless).
+  --
+  -- ALL of them, not just the current one: a config enabled late — a plugin that
+  -- resolves its tools over the async `nx.fs` seam before registering the server, as
+  -- nxvim-efmls-configs does for efm — lands several ticks after the files were read,
+  -- and nothing re-fires `FileType` for a buffer whose filetype is already set. Miss
+  -- a buffer here and it is served by nothing for the rest of the session.
+  --
+  -- Scoped to the names being enabled (`named`) and resolved ONCE for the whole
+  -- sweep, because this pass is per-BUFFER where the dispatcher is per-event. Every
+  -- other enabled config was already caught up when *it* was enabled, so including
+  -- them here would only re-resolve their configs and re-walk their `root_markers`
+  -- roots (an ancestor walk with a `readdir` per level) once more per open buffer —
+  -- and a plugin that enables lazily calls `enable` once per language it loads.
+  local entries = enabled_entries(named)
+  local seen = {}
   local cur = nx._cur_buf
   if cur and cur.filetype and cur.filetype ~= "" then
-    nx.lsp._on_filetype(cur.bufnr, cur.filetype)
+    seen[cur.bufnr] = true
+    start_matching(entries, cur.bufnr, cur.filetype)
+  end
+  for bufnr in pairs(nx._bufs or {}) do
+    if not seen[bufnr] then
+      -- `nx._bo_mirror` is the canonical per-buffer filetype (what `nx.bo[buf]`
+      -- reads); `nx._cur_buf` carries only the current one's.
+      local ft = ((nx._bo_mirror or {})[bufnr] or {}).filetype
+      if ft and ft ~= "" then
+        start_matching(entries, bufnr, ft)
+      end
+    end
   end
 end
 

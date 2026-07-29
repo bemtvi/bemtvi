@@ -16,7 +16,7 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, map_get, serial_lock, spawn, temp_dir,
+    attach, command, drain_to_latest_redraw, exec_lua, feed, map_get, serial_lock, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -160,6 +160,31 @@ async fn config_accumulates_with_deep_merge_and_list_replace() {
         "deep-merge precedence wrong (map merge + list replace)"
     );
 
+    // A list of TABLES is replaced whole too, and a shorter list leaves no tail —
+    // the shape a tool-config plugin re-registers (efm's `settings.languages.<ft>`
+    // is a list of `{ lintCommand = … }` / `{ formatCommand = … }` entries). Merged
+    // index-wise instead, entry 1 would carry BOTH tools' keys and the dropped
+    // entry 2 would survive: a config nobody wrote, silently driving the server.
+    let relisted = exec_lua(
+        &rpc,
+        r#"
+        nx.lsp.config("tools", { settings = { languages = { lua = {
+          { lintCommand = "luacheck -" }, { formatCommand = "stylua -" },
+        } } } })
+        nx.lsp.config("tools", { settings = { languages = { lua = {
+          { formatCommand = "stylua -" },
+        } } } })
+        local l = nx.lsp._config["tools"].settings.languages.lua
+        return #l .. "|" .. tostring(l[1].lintCommand) .. "|" .. tostring(l[1].formatCommand)
+        "#,
+    )
+    .await;
+    assert_eq!(
+        relisted.as_str(),
+        Some("1|nil|stylua -"),
+        "a re-registered list must replace, not fuse entry-by-entry"
+    );
+
     // A non-string name fails loud (registrations-are-data, but typed).
     let errored = exec_lua(&rpc, "return tostring(pcall(nx.lsp.config, 123, {}))").await;
     assert_eq!(
@@ -198,6 +223,54 @@ async fn enable_starts_a_server_and_hover_works() {
     assert!(
         lines.iter().any(|l| l.contains("foo")),
         "hover float should carry the markup, got {lines:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// `nx.lsp.enable` catches up on **every** buffer already read, not just the current
+/// one. A server enabled lazily — a plugin that resolves its tools over the async
+/// `nx.fs` seam before it registers the config, as nxvim-efmls-configs does for efm —
+/// lands several ticks after the files were read, so the dispatcher it installs never
+/// sees any of them. Only the current buffer used to be caught up: every other
+/// already-read buffer was served by nothing for the rest of the session, since no
+/// later event re-fires `FileType` for a buffer that already has one.
+#[tokio::test]
+async fn enable_catches_up_on_every_open_buffer() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cfg_catchup");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown", "value": "scripted" } } }"#,
+    );
+    // `a.rs` is the startup buffer (1); `b.rs` is read next and becomes current (2).
+    // Both filetypes settle before anything enables a server.
+    let (rpc, _incoming) = open_rust(&dir).await;
+    let second = dir.join("b.rs");
+    std::fs::write(&second, "let bar = baz()\n").expect("write second file");
+    command(&rpc, &format!("e {}", second.display())).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        nx.lsp.config("mock", { cmd = { "placeholder" }, filetypes = { "rust" } })
+        nx.lsp.enable("mock")
+        "#,
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 2 })", "1").await,
+        "the current buffer should carry the server"
+    );
+    // The buffer left behind was *bound* by the same catch-up, so going back to it
+    // serves it — document sync is per current buffer, so its `didOpen` (and the
+    // attach) lands the moment it is displayed again. Without the catch-up it stays
+    // bound to nothing forever: nothing re-fires `FileType` for a buffer that has one.
+    command(&rpc, "b 1").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 1 })", "1").await,
+        "the buffer read BEFORE the enable must be caught up too"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

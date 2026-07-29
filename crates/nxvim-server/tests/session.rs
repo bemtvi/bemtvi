@@ -509,7 +509,8 @@ async fn session_restores_a_persisted_view_when_the_owning_plugin_loads_async() 
     // survive until that late registration claims it, instead of collapsing at boot (the bug:
     // the slot was gone before the plugin ever got a chance to adopt it).
     let dir = temp_dir("session_view_async_plugin_store");
-    let root = temp_dir("session_view_async_plugin_root").join("install");
+    let mroot = temp_dir("session_view_async_plugin_root");
+    let root = mroot.join("install");
     let plugdir = write_restore_plugin(&temp_dir("session_view_async_plugin_dir"), "treens");
 
     // Session 1: create + mount a persisted view (via the RPC escape hatch, ns "treens") in a
@@ -541,10 +542,11 @@ async fn session_restores_a_persisted_view_when_the_owning_plugin_loads_async() 
     {
         let mut si = init(&dir, None, true);
         si.client_init_lua = Some(format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
              nx.plugins {{ {{ name = \"treens\", dir = \"{plug}\",\n\
                config = function() require(\"treens\").setup() end }} }}",
             root = q(&root),
+            cfg = q(&mroot.join("config")),
             plug = q(&plugdir),
         ));
         let (rpc, _incoming) = start_attached(si, 80, 25).await;
@@ -606,14 +608,16 @@ async fn session_restores_a_persisted_component_when_the_owning_plugin_loads_asy
     // (via `on_restore`) after the boot dispatch, so the reserved slot must survive and the
     // router's pull-on-register must adopt it — rebuilding content from `ctx.store`.
     let dir = temp_dir("session_component_async_store");
-    let root = temp_dir("session_component_async_root").join("install");
+    let mroot = temp_dir("session_component_async_root");
+    let root = mroot.join("install");
     let plugdir = write_component_plugin(&temp_dir("session_component_async_dir"), "notes");
 
     let decl = format!(
-        "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+        "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
          nx.plugins {{ {{ name = \"notes\", dir = \"{plug}\",\n\
            config = function() require(\"notes\").setup() end }} }}",
         root = q(&root),
+        cfg = q(&mroot.join("config")),
         plug = q(&plugdir),
     );
 

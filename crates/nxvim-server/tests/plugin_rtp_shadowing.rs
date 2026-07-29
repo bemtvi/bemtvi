@@ -49,10 +49,11 @@ async fn a_loaded_plugin_does_not_shadow_the_users_require_of_a_config_module() 
     std::fs::write(
         cfg.join("init.lua"),
         format!(
-            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
              nx.plugins({{ {{ dir = \"{plug}\", name = \"shadowplug\" }} }})\n\
              _G.REQ_OK, _G.REQ_ERR = pcall(require, \"plugins\")\n",
             root = q(&root),
+            cfg = q(&cfg),
             plug = q(&plugdir),
         ),
     )

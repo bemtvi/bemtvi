@@ -73,6 +73,31 @@ async fn vim_tbl_deep_extend_merges_nested_tables() {
     assert_eq!(startup_message(&rpc, &mut incoming).await, "1,2,3");
 }
 
+/// A **list** value is replaced whole, never merged index-by-index (neovim's
+/// `tbl_deep_extend` semantics, which `nx.lsp.config`'s deep-merge documents).
+/// Merging index-wise fuses two unrelated entries and leaves a stale tail: an
+/// efm `languages.lua = { <luacheck>, <stylua> }` re-registered as
+/// `{ <stylua> }` would keep luacheck's `lintCommand` on entry 1 and luacheck's
+/// old entry 2 — a config the user never wrote. An empty table stays mergeable
+/// (it is indistinguishable from an empty map), as in neovim.
+#[tokio::test]
+async fn vim_tbl_deep_extend_replaces_lists_whole() {
+    let dir = temp_dir("tbl_list");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local r = vim.tbl_deep_extend('force',\n\
+        \x20 { l = { { lint = 'luacheck' }, { fmt = 'stylua' } }, s = { 'a', 'b' }, m = { k = 1 } },\n\
+        \x20 { l = { { fmt = 'stylua' } }, s = { 'c' }, m = {} })\n\
+         print(#r.l .. ',' .. tostring(r.l[1].lint) .. ',' .. tostring(r.l[1].fmt)\n\
+        \x20 .. ',' .. #r.s .. ',' .. r.s[1] .. ',' .. tostring(r.m.k))\n",
+    )
+    .await;
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "1,nil,stylua,1,c,1"
+    );
+}
+
 #[tokio::test]
 async fn vim_g_round_trips_a_global() {
     let dir = temp_dir("vimg");

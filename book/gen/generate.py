@@ -10,17 +10,23 @@ from the code:
 
   2. nx.* API reference — extracts every PUBLIC declaration from the Lua prelude
      together with the doc-comment block above it, one page per top-level
-     namespace (nx._private excluded). The prelude declares functions in four
-     shapes, one collector each:
-       * `function nx.NS.name(args)` / `nx.NS.name = function(args)`  (DECL_RE)
+     namespace (nx._private excluded). The prelude declares its public surface in
+     six shapes, one collector each:
+       * `function nx.NS.name(args)` / `nx.NS.name = function(args)` /
+         `nx.NS.name = nx.async(function(args)` — a promise-returning verb, which
+         is a plain public shape here, not an implementation detail    (DECL_RE)
        * `nx.NS = { name = function(args) … }` table literals   (collect_table_literals)
        * a factory installing one verb table onto twin surfaces  (collect_surface_factories)
          — `nx.git` / `nx.git_local`
        * a module-local alias, `local M = nx.NS` + `function M.name()`
                                                           (collect_module_aliases)
+       * a HANDLE's methods — `function View:mount(opts)` on an object an `nx.*`
+         function hands back                              (collect_handle_methods)
+       * a documented public VALUE — `nx.json.null = …`         (collect_values)
      A COVERAGE GUARD then fails the build if any namespace the prelude creates
-     produced no page, so a fifth shape cannot silently drop a whole module the
-     way the alias shape hid `nx.plugins` and `nx.editorconfig`.
+     produced no page, so a seventh shape cannot silently drop a whole module the
+     way the alias shape hid `nx.plugins` and `nx.editorconfig`; an unmapped handle
+     table fails the same way (HANDLE_SURFACES).
 
 Finally it renders src/SUMMARY.md from src/SUMMARY.template.md, replacing the
 {{API_REFERENCE}} marker with the generated namespace list.
@@ -179,7 +185,7 @@ def import_docs():
 # ---------------------------------------------------------------------------
 DECL_RE = re.compile(
     r"^\s*(?:function\s+(nx\.[A-Za-z0-9_.]+)\s*\(([^)]*)\)"
-    r"|(nx\.[A-Za-z0-9_.]+)\s*=\s*function\s*\(([^)]*)\))"
+    r"|(nx\.[A-Za-z0-9_.]+)\s*=\s*(?:nx\.async\s*\(\s*)?function\s*\(([^)]*)\))"
 )
 # `nx.NS = {` opening a namespace table literal whose fields are the public
 # functions (e.g. `nx.fs_local = { exists = function(path) … }` in localseam.lua).
@@ -203,6 +209,50 @@ MODULE_ALIAS_RE = re.compile(r"^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(nx\.[A-Z
 ALIAS_ASSIGN_RE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]+)\s*=\s*function\s*\(([^)]*)\)"
 )
+# A method on a HANDLE — an object an `nx.*` function hands back, whose methods are
+# called with `:` (`function View:mount(opts)`, `function client_handle:exec_cmd(…)`).
+# These are public API the same way a namespace function is, but they name no `nx.`
+# holder, so every one of them was invisible here: 76 methods across 15 handles,
+# including the whole of `nx.view`'s View, `Promise`, and the LSP client handle.
+HANDLE_METHOD_RE = re.compile(
+    r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*):([A-Za-z0-9_]+)\s*\(([^)]*)\)"
+)
+# handle table -> (namespace page it documents under, the receiver name a caller writes).
+# The page is where a reader would look for the thing that HANDS OUT the handle, and the
+# receiver is what the docs call it (`view:mount(opts)`, not `View:mount(opts)`), so an
+# entry reads as the call site would spell it.
+HANDLE_SURFACES = {
+    "client_handle": ("lsp", "client"),  # nx.lsp.clients() / client_by_id()
+    "Ctx": ("test", "ctx"),  # the `nx.test` spec context
+    "debounced": ("utils", "debounced"),  # nx.utils.debounce / throttle
+    "defer_handle": ("nx", "timer"),  # nx.timer
+    "float_handle": ("ui", "float"),  # nx.ui.float
+    "Iter": ("nx", "iter"),  # nx.iter
+    "Mount": ("http", "mount"),  # nx.http.mount
+    "Option": ("opt", "opt"),  # nx.opt.<name>
+    "Process": ("process", "process"),  # nx.process.open
+    "Promise": ("nx", "promise"),  # nx.async / nx.await / nx.run / nx.promise.*
+    "Response": ("http", "response"),  # nx.http.fetch
+    "Socket": ("socket", "socket"),  # nx.socket.connect
+    "Stream": ("nx", "stream"),  # nx.run_stream
+    "View": ("view", "view"),  # nx.view.create
+    "Watch": ("fs", "watch"),  # nx.fs.watch
+}
+# Handle tables that are genuinely internal — no `nx.*` function hands one to a caller,
+# so there is nothing for a reader to call these on. Both are `nx.component` internals:
+# `inst` is the component instance the framework owns, `proxy` the reactive-state
+# wrapper a component sees only as a plain table.
+PRIVATE_HANDLES = {"inst", "proxy"}
+# A documented public VALUE (`nx.json.null = setmetatable(…)`) — not every public name is
+# a function, and the collectors above only look for functions, so a value's doc-comment
+# was extracted nowhere. Anchored at column 0 (a top-level assignment, never one inside a
+# function body) and paired with the docstring convention below, which is what keeps
+# aliases and internal assignments out.
+VALUE_ASSIGN_RE = re.compile(r"^(nx\.[A-Za-z0-9_.]+)\s*=\s*(?!function\b|nx\.async\b)\S")
+# `nx.X = nx.X or {}` — the namespace-creation idiom, not a value. Its doc block is the
+# namespace's blurb, which opens by naming the namespace and so otherwise reads as a
+# documented value and renders as an entry on its own page.
+NAMESPACE_IDIOM_RE = re.compile(r"^nx\.([A-Za-z0-9_]+)\s*=\s*nx\.\1\s+or\s+\{\}\s*$")
 # Namespaces the prelude creates that legitimately expose NO functions, so the
 # "every namespace is documented" guard below must not flag them. Keep this list tiny and
 # justified — an entry here is a claim that the namespace is pure data.
@@ -369,6 +419,52 @@ def collect_module_aliases(lines):
             yield ("%s.%s" % (ns, m.group(2)), m.group(3), i)
 
 
+def collect_handle_methods(lines, fname):
+    """Yield (ns, display, args, decl_idx) for `function Handle:method(args)` decls.
+
+    A handle's methods are public API — `view:mount{}`, `promise:next(fn)`,
+    `client:exec_cmd(cmd)` — but they carry no `nx.` holder, so no other collector sees
+    them. Every handle must be mapped in HANDLE_SURFACES or declared internal in
+    PRIVATE_HANDLES: an unmapped one is a new public object silently producing no docs,
+    which is exactly the failure mode the namespace coverage guard exists to prevent.
+    """
+    for i, line in enumerate(lines):
+        m = HANDLE_METHOD_RE.match(line)
+        if not m:
+            continue
+        holder, method, args = m.group(1), m.group(2), m.group(3)
+        if holder in PRIVATE_HANDLES or method.startswith("_"):
+            continue
+        surface = HANDLE_SURFACES.get(holder)
+        if not surface:
+            die(
+                "unmapped handle table `%s` (%s:%d declares `%s:%s`).\n"
+                "       Add it to HANDLE_SURFACES with the nx.* page a reader would look\n"
+                "       on and the receiver name callers write, or to PRIVATE_HANDLES if\n"
+                "       no nx.* function ever hands one out." % (holder, fname, i + 1, holder, method)
+            )
+        ns, receiver = surface
+        yield (ns, "%s:%s" % (receiver, method), args, i)
+
+
+def collect_values(lines):
+    """Yield (name, decl_idx) for documented public `nx.NAME = <value>` declarations.
+
+    Only a top-level assignment whose doc block OPENS by naming it (the prelude's
+    ``-- `nx.json.null`: …`` convention) counts. That one rule is what separates a
+    documented value from the aliases and internal wiring assigned all over the prelude
+    — those either carry no doc block or document something else.
+    """
+    for i, line in enumerate(lines):
+        m = VALUE_ASSIGN_RE.match(line)
+        if not m or NAMESPACE_IDIOM_RE.match(line):
+            continue
+        name = m.group(1)
+        doc = doc_above(lines, i)
+        if doc.startswith("`%s`" % name):
+            yield (name, i)
+
+
 def collect_created_namespaces(lines):
     """The `nx.<NS>` namespaces a file creates via the `nx.X = nx.X or {}` idiom.
 
@@ -398,6 +494,10 @@ def extract_api():
         # direct `function nx.NS.name` / `nx.NS.name = function`, namespace table
         # literals, and twin-surface factories. Sort by source line so a page's
         # entries stay in file order regardless of which collector found them.
+        # Each entry is (line, name, args, ns_override): `ns_override` is set only for
+        # the shapes whose namespace can't be read off the name — a handle method
+        # (`view:mount`), which names its receiver rather than its namespace. `args` is
+        # None for a value, which renders without a call signature.
         decls = []
         created |= collect_created_namespaces(lines)
         for i, line in enumerate(lines):
@@ -405,23 +505,32 @@ def extract_api():
             if m:
                 name = m.group(1) or m.group(3)
                 args = m.group(2) if m.group(1) else m.group(4)
-                decls.append((i, name, args))
+                decls.append((i, name, args, None))
         for name, args, i in collect_table_literals(lines):
-            decls.append((i, name, args))
+            decls.append((i, name, args, None))
         for name, args, i in collect_surface_factories(lines):
-            decls.append((i, name, args))
+            decls.append((i, name, args, None))
         for name, args, i in collect_module_aliases(lines):
-            decls.append((i, name, args))
+            decls.append((i, name, args, None))
+        for ns, display, args, i in collect_handle_methods(lines, fname):
+            decls.append((i, display, args, ns))
+        for name, i in collect_values(lines):
+            decls.append((i, name, None, None))
         decls.sort(key=lambda d: d[0])
 
-        for i, name, args in decls:
+        for i, name, args, ns_override in decls:
             if is_private(name) or name in seen:
                 continue
             seen.add(name)
-            parts = name[len("nx.") :].split(".")
-            ns = "nx" if len(parts) == 1 else parts[0]
+            if ns_override:
+                ns = ns_override
+            else:
+                parts = name[len("nx.") :].split(".")
+                ns = "nx" if len(parts) == 1 else parts[0]
             doc = doc_above(lines, i)
-            namespaces.setdefault(ns, []).append((name, args.strip(), doc, fname))
+            namespaces.setdefault(ns, []).append(
+                (name, None if args is None else args.strip(), doc, fname)
+            )
 
     if not namespaces:
         die("extracted zero nx.* declarations — extraction is broken")
@@ -452,13 +561,18 @@ def extract_api():
         entries = namespaces[ns]
         out = ["# `%s`\n" % ns_title(ns)]
         if ns == "nx":
-            out.append("Top-level `nx.*` functions (those without a sub-namespace).\n")
+            out.append(
+                "Top-level `nx.*` functions (those without a sub-namespace), plus the\n"
+                "methods of the handles they hand back (`promise:`, `iter:`, `stream:`,\n"
+                "`timer:`).\n"
+            )
         out.append(
             "<!-- GENERATED from crates/nxvim-lua/src/prelude/ by"
             " book/gen/generate.py. Do not edit. -->\n"
         )
         for name, args, doc, fname in entries:
-            out.append("## `%s(%s)`\n" % (name, args))
+            # A value has no call signature; everything else renders as a call.
+            out.append("## `%s`\n" % name if args is None else "## `%s(%s)`\n" % (name, args))
             if doc:
                 out.append(escape_angles_outside_code(doc) + "\n")
             else:
@@ -474,21 +588,22 @@ def extract_api():
         "# nx.* API Reference\n",
         "The public `nx.*` Lua API, **extracted directly from the prelude**",
         "(`crates/nxvim-lua/src/prelude/*.lua`) by `book/gen/generate.py`. Every",
-        "entry is a public declaration plus its doc-comment; private `nx._*`",
-        "internals are excluded. This is the canonical surface per",
+        "entry is a public declaration — a function, a handle method",
+        "(`view:mount(opts)`), or a value (`nx.json.null`) — plus its doc-comment;",
+        "private `nx._*` internals are excluded. This is the canonical surface per",
         "[ADR 0002](%s/docs/decisions/0002-native-plugin-system.md).\n" % GH_BLOB,
-        "| Namespace | Functions |",
+        "| Namespace | Entries |",
         "| --------- | --------- |",
     ]
     for ns in ordered:
         idx.append(
             "| [`%s`](%s) | %d |" % (ns_title(ns), ns_page(ns), len(namespaces[ns]))
         )
-    idx.append("\n_%d functions across %d namespaces._" % (total, len(ordered)))
+    idx.append("\n_%d entries across %d namespaces._" % (total, len(ordered)))
     write(os.path.join(SRC_DIR, "api", "index.md"), "\n".join(idx) + "\n")
 
     print(
-        "  extracted %d nx.* functions across %d namespaces"
+        "  extracted %d nx.* entries across %d namespaces"
         % (total, len(ordered))
     )
     return ordered

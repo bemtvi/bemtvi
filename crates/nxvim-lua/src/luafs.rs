@@ -615,6 +615,10 @@ pub fn run_fs_job(fs: &dyn LuaFs, job: &FsJob) -> Result<FsValue, FsError> {
             .map(|()| FsValue::Nil)
             .map_err(fs_error),
         FsJob::Realpath { path } => fs.realpath(path).map(FsValue::Text).map_err(fs_error),
+        // Not-found is `nil`, never a rejection: a config asking "is the local
+        // `node_modules/.bin` copy there?" gets a plain no, and only a *transport*
+        // failure would be an error.
+        FsJob::Which { name } => Ok(fs.which(name).map_or(FsValue::Nil, FsValue::Text)),
         FsJob::HashFile { path, algo } => hash_file(fs, path, algo).map(FsValue::Text),
     }
 }

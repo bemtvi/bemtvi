@@ -1535,10 +1535,10 @@ impl LuaRuntime {
     }
 
     /// Mirror one LSP client into `nx.lsp._clients[id]` (the Rust→Lua client
-    /// registry) so `get_client_by_id` — and the `LspAttach` `on_attach` it feeds
-    /// — can read `client.server_capabilities`. Pushed once per server when it
-    /// finishes `initialize`. The provider flags become the camelCase
-    /// `*Provider` keys neovim configs probe.
+    /// registry) so `client_by_id` — and the `LspAttach` `on_attach` it feeds
+    /// — can read `client.server_capabilities` and `client.offset_encoding`.
+    /// Pushed once per server when it finishes `initialize`. The provider flags
+    /// become the camelCase `*Provider` keys neovim configs probe.
     pub fn set_lsp_client(&self, client: &LspClientData) -> mlua::Result<()> {
         let lsp: Table = self.nx()?.get("lsp")?;
         let set: mlua::Function = lsp.get("_set_client")?;
@@ -1559,7 +1559,12 @@ impl LuaRuntime {
         caps.set("inlayHintProvider", c.inlay_hints)?;
         caps.set("documentSymbolProvider", c.document_symbol)?;
         caps.set("workspaceSymbolProvider", c.workspace_symbol)?;
-        set.call((client.id, client.name.clone(), caps))
+        set.call((
+            client.id,
+            client.name.clone(),
+            caps,
+            client.offset_encoding.clone(),
+        ))
     }
 
     /// Forget an LSP client (`nx.lsp._clients[id] = nil`) when its server exits,

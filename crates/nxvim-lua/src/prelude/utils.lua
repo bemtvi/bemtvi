@@ -76,6 +76,181 @@ function nx.utils.ancestors(path)
   end
 end
 
+-- `nx.utils.joinpath(...)`: join path components with a single `/`, collapsing the
+-- separators at each seam so `joinpath("/a/", "/b/", "c")` is `"/a/b/c"`. An empty
+-- or `nil` component is skipped rather than producing a doubled slash, so a
+-- conditionally-absent middle segment doesn't corrupt the result. A leading `/` on
+-- the FIRST component is preserved (the only place an absolute path is decided);
+-- everything after it is treated as relative, so a later `"/b"` appends rather than
+-- restarting at the root. Pure string math — nothing is resolved against the
+-- filesystem or the cwd.
+--
+-- ```lua
+-- nx.utils.joinpath(root, "node_modules/.bin", cmd)
+-- ```
+function nx.utils.joinpath(...)
+  local parts = { ... }
+  local n = select("#", ...)
+  local out = nil
+  for i = 1, n do
+    local p = parts[i]
+    if p ~= nil and p ~= "" then
+      if type(p) ~= "string" then
+        error("nx.utils.joinpath: component " .. i .. " must be a string, got " .. type(p), 2)
+      end
+      if out == nil then
+        -- The first component alone decides absolute-vs-relative; only its TRAILING
+        -- separators are trimmed.
+        out = p:gsub("/+$", "")
+        -- A first component that is exactly the root collapses to "" above; keep it
+        -- as "/" so the join below doesn't emit a relative path.
+        if out == "" then
+          out = "/"
+        end
+      else
+        local seg = p:gsub("^/+", ""):gsub("/+$", "")
+        if seg ~= "" then
+          out = (out == "/" and "/" or out .. "/") .. seg
+        end
+      end
+    end
+  end
+  return out or ""
+end
+
+-- `nx.utils.normalize(path)`: canonicalize a path as pure string math — expand a
+-- leading `~`, fold `\` to `/`, collapse repeated separators, drop `.` components,
+-- and resolve `..` against the component before it. Trailing separators are stripped
+-- (except on the root itself). Nothing touches the filesystem, so this does NOT
+-- resolve symlinks — a `..` after a symlinked directory resolves lexically, which is
+-- what a config comparing two configured paths wants (for the real thing, `nx.fs.realpath`
+-- is the async op).
+--
+-- A `..` that would escape a relative path is KEPT (`"a/../../b"` → `"../b"`), since
+-- there is no cwd here to resolve it against; on an absolute path it is dropped at
+-- the root (`"/../a"` → `"/a"`), matching every OS.
+function nx.utils.normalize(path)
+  if type(path) ~= "string" then
+    error("nx.utils.normalize: path must be a string, got " .. type(path), 2)
+  end
+  if path == "" then
+    return ""
+  end
+  path = nx.utils.expanduser(path:gsub("\\", "/"))
+  local absolute = path:sub(1, 1) == "/"
+  local out = {}
+  for seg in path:gmatch("[^/]+") do
+    if seg == ".." then
+      local last = out[#out]
+      if last ~= nil and last ~= ".." then
+        out[#out] = nil -- cancel against the component before it
+      elseif not absolute then
+        out[#out + 1] = ".." -- nothing to cancel, and no root to clamp at
+      end
+      -- On an absolute path with nothing to cancel, `..` at the root is dropped.
+    elseif seg ~= "." then
+      out[#out + 1] = seg -- `.` is a no-op component, so only anything else lands
+    end
+  end
+  local joined = table.concat(out, "/")
+  if absolute then
+    return "/" .. joined
+  end
+  return joined == "" and "." or joined
+end
+
+-- `nx.utils.relpath(base, target)`: `target` expressed relative to `base`, or `nil`
+-- when `target` is not inside `base`. Both are normalized first, and the comparison
+-- is on whole path COMPONENTS — so `relpath("/a/b", "/a/bc")` is nil, not `"c"`,
+-- which a plain prefix-match would get wrong. `target == base` yields `"."`.
+--
+-- The "is this file under that directory?" test, which is how a config decides a
+-- buffer belongs to a dependency tree (a cargo registry checkout, a Go module
+-- cache) rather than the project:
+--
+-- ```lua
+-- if nx.utils.relpath(cargo_registry, file) then --[[ it's a library file ]] end
+-- ```
+function nx.utils.relpath(base, target)
+  base = nx.utils.normalize(base)
+  target = nx.utils.normalize(target)
+  if base == target then
+    return "."
+  end
+  -- Root is the one base whose string form doesn't take a trailing separator.
+  local prefix = base == "/" and "/" or base .. "/"
+  if target:sub(1, #prefix) ~= prefix then
+    return nil
+  end
+  return target:sub(#prefix + 1)
+end
+
+-- `nx.utils.is_windows()`: is this a Windows host? Answered from `package.config`'s
+-- directory separator, which Lua fills in at build time — so it is correct in every
+-- build (native, daemon-side, wasm) without a host round-trip or an env-var guess.
+--
+-- The check behind "which name does this program have here?" — a tool installed as
+-- `foo` on Unix is `foo.exe` or `foo.bat` on Windows, and a plugin resolving an
+-- executable has to know which to look for. Prefer `nx.fs.which`, which searches for
+-- you; reach for this when the *name itself* differs.
+function nx.utils.is_windows()
+  -- `string.sub(package.config, …)` rather than the method form: selene's standard
+  -- library model types `package.config` as a plain string without the string
+  -- metatable, so `package.config:sub(…)` trips its stdlib check.
+  return string.sub(package.config, 1, 1) == "\\"
+end
+
+-- ----- file:// URIs ----------------------------------------------------------
+-- The one copy of the path <-> `file://` conversion. A language server addresses
+-- every document by URI while nxvim addresses it by path, so anything that hands a
+-- document to a server (`nx.lsp.position_params`, a command's `arguments`) or reads
+-- one back out of a reply crosses this seam. Pure string math — nothing is resolved
+-- against the filesystem.
+
+-- `nx.utils.uri_from_path(path)`: the `file://` URI naming `path`.
+--
+-- Percent-encodes everything outside the URI unreserved set, `/` excepted — a path
+-- holding a space, a `#` or a non-ASCII character is otherwise a malformed URI the
+-- server silently misreads (it truncates at the `#`, or fails to match the document
+-- it already has open under the encoded spelling). The path is normalized first, so
+-- the same file always produces the same URI and a server's document map hits.
+function nx.utils.uri_from_path(path)
+  if type(path) ~= "string" then
+    error("nx.utils.uri_from_path: path must be a string, got " .. type(path), 2)
+  end
+  local encoded = nx.utils.normalize(path):gsub("[^%w%-%.%_%~/]", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end)
+  return "file://" .. encoded
+end
+
+-- `nx.utils.uri_from_buf(bufnr)`: buffer `bufnr`'s `file://` URI (`0`/nil = the
+-- current buffer), or `""` for a buffer with no file — which is what a server should
+-- be told, rather than a `file://` naming nothing.
+function nx.utils.uri_from_buf(bufnr)
+  local name = nx.buf.name(bufnr or 0)
+  return (name == nil or name == "") and "" or nx.utils.uri_from_path(name)
+end
+
+-- `nx.utils.uri_to_path(uri)`: the filesystem path a `file://` URI names, with its
+-- percent-escapes decoded, or `nil` for any other scheme.
+--
+-- `nil` rather than the raw string: a `deno:` / `jdt:` / `untitled:` URI names a
+-- document that has no path at all, and treating one as a path creates a buffer for a
+-- file that will never exist. Callers branch on the nil.
+function nx.utils.uri_to_path(uri)
+  if type(uri) ~= "string" then
+    return nil
+  end
+  local path = uri:match("^file://(.*)$")
+  if not path then
+    return nil
+  end
+  return (path:gsub("%%(%x%x)", function(hex)
+    return string.char(tonumber(hex, 16))
+  end))
+end
+
 -- ----- nx.utils.argv ---------------------------------------------------------
 -- `nx.utils.argv(spec)`: build a flat argv list from a run-family spec — `spec.cmd`
 -- is the program (a string, or an argv list whose first element is the program),

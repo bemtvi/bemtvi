@@ -1260,14 +1260,16 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
 }
 
 /// The argument tuple of `nx._lsp_start`: the original five
-/// (`name`, `cmd`, `root`, `filetype`, `bufnr`) plus the Phase-2 config payloads
-/// (`init_options`, `settings`, `capabilities`, each a table or `nil`).
+/// (`name`, `cmd`, `root`, `filetype`, `bufnr`), the Phase-2 config payloads
+/// (`init_options`, `settings`, `capabilities`, each a table or `nil`), and the
+/// config's `cmd_env` (a `{ NAME = "value" }` table, already stringified in Lua).
 type LspStartArgs = (
     String,
     Vec<String>,
     Option<String>,
     String,
     u64,
+    Option<Table>,
     Option<Table>,
     Option<Table>,
     Option<Table>,
@@ -2001,7 +2003,18 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_lsp_start",
         lua.create_function(move |_, args: LspStartArgs| {
-            let (name, cmd, root, filetype, bufnr, init_options, settings, capabilities) = args;
+            let (name, cmd, root, filetype, bufnr, init_options, settings, capabilities, env) =
+                args;
+            // `cmd_env` arrives already normalized to string values by the prelude, so
+            // a non-string pair here is a caller reaching past `nx.lsp` — skip it
+            // rather than spawn with a half-built environment.
+            let env = env.map_or_else(
+                || Ok(Vec::new()),
+                |t| {
+                    t.pairs::<String, String>()
+                        .collect::<mlua::Result<Vec<_>>>()
+                },
+            )?;
             sh.borrow_mut().lsp_ops.push(LspOp::Start {
                 name,
                 cmd,
@@ -2011,7 +2024,21 @@ pub(crate) fn install_runtime_api(
                 init_options: opt_table_to_json(init_options)?,
                 settings: opt_table_to_json(settings)?,
                 capabilities: opt_table_to_json(capabilities)?,
+                env,
             });
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._lsp_stop(name, cb_id)`: queue an [`LspOp::Stop`] — shut every running
+    // server with this config name down and detach it from its buffers, with no
+    // respawn (backs `nx.lsp.stop` and `:LspStop`). The promise settles with the
+    // number actually stopped.
+    let sh = shared.clone();
+    nx.set(
+        "_lsp_stop",
+        lua.create_function(move |_, (name, cb_id): (String, u64)| {
+            sh.borrow_mut().lsp_ops.push(LspOp::Stop { name, cb_id });
             Ok(())
         })?,
     )?;
@@ -2878,6 +2905,22 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._lsp_set_offset_encoding(client_id, encoding)`: queue
+    // [`LspOp::SetOffsetEncoding`] — a config's `on_init` assigning
+    // `client.offset_encoding` re-negotiates the live client's position encoding, so
+    // the handle and the wire cannot disagree.
+    let sh = shared.clone();
+    nx.set(
+        "_lsp_set_offset_encoding",
+        lua.create_function(move |_, (client_id, encoding): (u64, String)| {
+            sh.borrow_mut().lsp_ops.push(LspOp::SetOffsetEncoding {
+                client_id,
+                encoding,
+            });
+            Ok(())
+        })?,
     )?;
 
     // `nx._lsp_semantic_enable(bufnr, enabled)`: queue [`LspOp::SemanticTokensEnable`]
@@ -4210,6 +4253,9 @@ fn fs_job_from_table(job: &Table) -> mlua::Result<FsJob> {
         },
         "realpath" => FsJob::Realpath {
             path: job.get("path")?,
+        },
+        "which" => FsJob::Which {
+            name: job.get("name")?,
         },
         "hash_file" => FsJob::HashFile {
             path: job.get("path")?,

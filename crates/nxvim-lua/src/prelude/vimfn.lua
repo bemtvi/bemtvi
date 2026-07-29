@@ -387,6 +387,65 @@ function nx.expand(expr, nosuf, list)
 end
 vim.fn.expand = nx.expand
 
+-- `nx.cwd()` [alias `vim.fn.getcwd`]: the editor's effective working directory, as an
+-- absolute path with no trailing separator.
+--
+-- This is editor state, not a filesystem read: it is answered from the mirror the
+-- server republishes on every `:cd` / `:lcd`, so it costs nothing and is safe on a
+-- hot path. Over a daemon it reports the *daemon's* cwd — the directory relative
+-- paths actually resolve against — which is the whole reason a plugin should ask
+-- here rather than at whatever process it happens to be running in.
+--
+-- The fallback root: a config that walks up looking for a project marker and finds
+-- none often wants "wherever the user is working" rather than the file's own
+-- directory.
+--
+-- ```lua
+-- local root = nx.await(nx.lsp.find_root(bufnr, { ".git" })) or nx.cwd()
+-- ```
+function nx.cwd()
+  return vim.fn.getcwd()
+end
+
+-- `nx.pid()` [alias `vim.fn.getpid`]: this editor process's id.
+--
+-- What a language server wants when it offers a `--hostPID`-style flag: it watches
+-- that process and exits when the process does, so a crashed editor doesn't leave a
+-- server holding a project's worth of memory. In a daemon session this is still the
+-- process the server is a child of, which is the one it must watch.
+function nx.pid()
+  return vim.fn.getpid()
+end
+
+-- `nx.version()` [alias `vim.version`]: the editor's version, as `"nxvim <x.y.z>"`.
+--
+-- For the protocols that carry a client identity — LSP `clientInfo`, a vendor's
+-- "integration version" telemetry field — and for a plugin reporting what it is
+-- running under. It is a display string, not a comparable version object: nxvim's
+-- surfaces are not version-gated, so there is nothing here to branch on.
+function nx.version()
+  return vim.version
+end
+
+-- `nx.stdpath(what)` [alias `vim.fn.stdpath`]: the XDG directory nxvim keeps `what`
+-- in, as an absolute path with no trailing separator. `"config"`, `"data"`,
+-- `"cache"`, `"state"`, `"log"`, `"run"`.
+--
+-- Where a plugin puts the things that are neither the user's code nor the editor's:
+-- a downloaded language server, a parser cache, a scratch workspace. Ask here rather
+-- than composing `$HOME` by hand — the answer honors `$XDG_*` and `$NXVIM_CONFIG`, so
+-- a hand-built path silently diverges from where the editor itself looks.
+--
+-- ```lua
+-- local workspace = nx.utils.joinpath(nx.stdpath("cache"), "jdtls", "workspace")
+-- ```
+--
+-- The directory is *named*, not created: `nx.fs.mkdir(dir, { recursive = true })`
+-- when you are about to write into it.
+function nx.stdpath(what)
+  return vim.fn.stdpath(what)
+end
+
 -- `nx.fname.modify(fname, mods)` [alias `vim.fn.fnamemodify`]: apply vim's filename
 -- modifiers left to right. A pure path-string helper (no I/O beyond reading cwd),
 -- so it lives with the `vim.fn` read builtins — `expand('%:t')` / `'%:h'` and a

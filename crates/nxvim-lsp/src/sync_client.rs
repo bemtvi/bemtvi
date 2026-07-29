@@ -67,6 +67,10 @@ pub enum WireOp {
         program: String,
         args: Vec<String>,
         cwd: String,
+        /// The config's `cmd_env`, layered over the daemon's environment when it
+        /// spawns the process. A browser session configures a server exactly as a
+        /// native one does — the env has to reach the machine the server runs on.
+        env: Vec<(String, String)>,
     },
     Stdin {
         id: u64,
@@ -215,6 +219,7 @@ impl SyncLspClient {
             program: spawn.program.clone(),
             args: spawn.args.clone(),
             cwd: key.root.to_string_lossy().into_owned(),
+            env: spawn.env.clone(),
         });
         let init = init_params(&key.root, &spawn, None, &self.log, &name);
         let params = serde_json::to_value(&init).unwrap_or(Value::Null);

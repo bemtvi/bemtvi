@@ -212,6 +212,36 @@ function nx.fs.realpath(path)
   return run_fs({ op = "realpath", path = path })
 end
 
+-- `nx.fs.which(name)` -> promise of the absolute path of the executable `name`, or
+-- **nil** when nothing matches. A bare name is searched across `$PATH`; a `name` that
+-- already contains a `/` is taken as an explicit path and accepted only when it *is*
+-- an executable file. The async, transport-agnostic replacement for vim's blocking
+-- `executable()` / `exepath()` — a build/tool lookup is I/O, so it rides the same
+-- off-tick `nx.fs` seam as every other op and works unchanged against local disk, a
+-- daemon, and a browser session.
+--
+-- It resolves `nil` rather than rejecting when the program is absent: "not installed"
+-- is a true answer, and only a transport failure is an error. That makes the two
+-- common shapes read naturally —
+--
+-- ```lua
+-- -- prefer a project-local binary, fall back to the one on $PATH
+-- local local_bin = nx.utils.joinpath(root, "node_modules/.bin", "eslint")
+-- local cmd = nx.await(nx.fs.which(local_bin)) or "eslint"
+--
+-- -- gate a feature on a tool being present
+-- nx.fs.which("rg"):next(function(path)
+--   if path then use_ripgrep(path) end
+-- end)
+-- ```
+--
+-- In a **serverless** browser session there are no executables at all, so every
+-- lookup resolves nil; with a daemon attached the daemon's own `$PATH` answers — which
+-- is the right one, since that is where the language servers and tools actually run.
+function nx.fs.which(name)
+  return run_fs({ op = "which", name = name })
+end
+
 nx.hash = nx.hash or {}
 
 -- `nx.hash.file(path[, algo])` -> promise of the file's lowercase-hex digest. The

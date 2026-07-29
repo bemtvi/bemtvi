@@ -33,6 +33,11 @@ impl EditHost {
                 self.restart_lsp_servers(&name, init_options, settings, capabilities);
                 return;
             }
+            LspOp::Stop { name, cb_id } => {
+                let stopped = self.stop_lsp_servers(&name);
+                self.settle_lsp_promise(cb_id, serde_json::json!(stopped));
+                return;
+            }
             LspOp::BufRequest { kind, cb_id } => {
                 match LspReqKind::from_u16(kind) {
                     Some(kind) => self.request_lsp(kind, cb_id),
@@ -147,6 +152,13 @@ impl EditHost {
                 self.show_lua_document(&uri, line, character, &encoding);
                 return;
             }
+            LspOp::SetOffsetEncoding {
+                client_id,
+                encoding,
+            } => {
+                self.set_lsp_offset_encoding(client_id, &encoding);
+                return;
+            }
             LspOp::SemanticTokensEnable { bufnr, enabled } => {
                 let buffer = BufferId(bufnr);
                 let state = self.lsp_states.entry(buffer).or_default();
@@ -220,6 +232,7 @@ impl EditHost {
             init_options,
             settings,
             capabilities,
+            env,
         } = start
         else {
             unreachable!("non-Start ops returned above");
@@ -264,6 +277,7 @@ impl EditHost {
         spawn.init_options = init_options;
         spawn.settings = settings;
         spawn.capabilities = capabilities;
+        spawn.env = env;
         // Always remember the LATEST spawn for this key — the daemon-reconnect resync
         // and `nx.lsp.restart` both re-`ensure` from it, so it must reflect the config
         // in force now (which may have grown since the server first started), not the
@@ -326,6 +340,102 @@ impl EditHost {
         self.lsp_dirty = true;
     }
 
+    /// Everything the editor owes a server that is going away: `LspDetach` for each
+    /// buffer it served, the config's `on_exit(code, signal, client)`, and dropping
+    /// its handle from `nx.lsp.clients()`. Idempotent — the record is taken out of
+    /// `lsp_servers` here, so a second call (the asynchronous `ServerExited` arriving
+    /// after a deliberate stop already retired it) does nothing.
+    ///
+    /// Both callers need this, and only one of them used to run it. A stop/restart
+    /// kills the process synchronously but the exit is reported back as an *event*,
+    /// and that event was the only place the exit path lived — so an explicit
+    /// `:LspStop` removed the record first and the event then found nothing to
+    /// retire. The hooks never ran and the Lua handle leaked, leaving
+    /// `nx.lsp.clients()` listing a server `:LspInfo` said was not running.
+    ///
+    /// `drop_docs` distinguishes the two: a crashed server may be respawned by the
+    /// breaker, and its per-buffer doc (marked closed) is what the respawn
+    /// re-`didOpen`s from, so it is kept. A deliberate stop is not coming back —
+    /// nothing re-ensures it — so its docs are dropped outright, or the next sync
+    /// would try to `didChange` into a shut-down process.
+    fn retire_lsp_server(
+        &mut self,
+        key: &ServerKey,
+        code: Option<i32>,
+        signal: Option<i32>,
+        drop_docs: bool,
+    ) {
+        let Some(client_id) = self.lsp_servers.remove(key).map(|r| r.client_id) else {
+            return;
+        };
+        // Buffers attached to this server, with a display name for the event's
+        // `args.file`. Clear `opened` so a later `:bdelete` doesn't re-fire
+        // `LspDetach`, and so a respawn re-`didOpen`s.
+        let detaching: Vec<(BufferId, String)> = self
+            .lsp_states
+            .iter_mut()
+            .filter(|(_, s): &(&BufferId, &mut LspDocState)| s.is_opened_under(key))
+            .map(|(id, s)| {
+                if let Some(doc) = s.doc_mut(key) {
+                    doc.opened = false;
+                    doc.version = 0;
+                }
+                let file = s
+                    .uri
+                    .as_ref()
+                    .and_then(uri_to_path)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (*id, file)
+            })
+            .collect();
+        for (id, file) in detaching {
+            self.fire_lsp_detach(id, &file, client_id);
+        }
+        if drop_docs {
+            for state in self.lsp_states.values_mut() {
+                state.detach(key);
+            }
+        }
+        // Run the config's on_exit(code, signal, client) hook (Phase 3) while the
+        // client is still registered, then forget it.
+        if let Err(e) = self.lua.run_lsp_on_exit(client_id, code, signal) {
+            self.editor
+                .echo(format!("E5108: Error in LSP on_exit: {e}"));
+        }
+        let _ = self.lua.remove_lsp_client(client_id);
+    }
+
+    /// `nx.lsp.stop(name)` — shut every running server with config `name` down and
+    /// forget it, WITHOUT respawning. The stopping half of [`restart_lsp_servers`],
+    /// separated because "stop" and "restart" differ only in whether the cached spawn
+    /// is re-ensured afterwards.
+    ///
+    /// Each bound buffer is detached from the server, so a later `nx.lsp.enable` (or a
+    /// fresh `FileType`) starts a new one and re-`didOpen`s the buffer against it
+    /// rather than syncing into a dead process. The cached spawn is kept: it is what a
+    /// subsequent restart/re-ensure rebuilds from.
+    ///
+    /// Returns how many servers were stopped, so the caller can tell the user whether
+    /// anything happened instead of reporting a silent success.
+    pub(crate) fn stop_lsp_servers(&mut self, name: &str) -> usize {
+        let keys: Vec<ServerKey> = self
+            .lsp_ensured
+            .iter()
+            .filter(|k| k.name == name)
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.fx.lsp_shutdown(key.clone());
+            self.lsp_ensured.remove(key);
+            // The editor asked it to go, so no exit status has been observed yet —
+            // `on_exit` is told that rather than a made-up code.
+            self.retire_lsp_server(key, None, None, true);
+        }
+        self.lsp_dirty = true;
+        keys.len()
+    }
+
     /// Restart every running server whose config `name` matches (`nx.lsp.restart`).
     /// Reuses the reconnect teardown → re-`ensure` path, scoped to one config name.
     /// The caller passes the config's payloads *as they are now* (resolved in Lua):
@@ -353,7 +463,11 @@ impl EditHost {
         for key in keys {
             self.fx.lsp_shutdown(key.clone());
             self.lsp_ensured.remove(&key);
-            self.lsp_servers.remove(&key);
+            // The replaced process is owed its exit path too — a restart is a new
+            // client id, so the old handle must go or the buffer reports two servers
+            // and one of them is dead. The docs are kept (`drop_docs = false`): the
+            // re-open loop below re-`didOpen`s them under the fresh process.
+            self.retire_lsp_server(&key, None, None, false);
             if let Some(mut spawn) = self.lsp_spawns.get(&key).cloned() {
                 // Refresh the config payloads to what is in force now (the cmd stays as
                 // cached — restart applies config changes, not a new command).
@@ -859,6 +973,7 @@ impl EditHost {
                     id: client_id,
                     name: key.name.clone(),
                     capabilities: provider_caps_to_lua(&caps.providers),
+                    offset_encoding: encoding_label(encoding).to_string(),
                 };
                 let _ = self.lua.set_lsp_client(&client);
                 // Run the config's on_init(client, result) hook (Phase 3) now that
@@ -983,39 +1098,7 @@ impl EditHost {
                 // settled into the void. The edit's own file operations are left to
                 // finish — they were accepted, and the buffers they touch are still here.
                 self.pending_apply_edits.retain(|_, p| p.key != key);
-                if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
-                    // Buffers attached to this server, with a display name for the
-                    // event's `args.file`. Clear `opened` so a later `:bdelete`
-                    // doesn't re-fire `LspDetach`, and so a respawn re-`didOpen`s.
-                    let detaching: Vec<(BufferId, String)> = self
-                        .lsp_states
-                        .iter_mut()
-                        .filter(|(_, s): &(&BufferId, &mut LspDocState)| s.is_opened_under(&key))
-                        .map(|(id, s)| {
-                            if let Some(doc) = s.doc_mut(&key) {
-                                doc.opened = false;
-                                doc.version = 0;
-                            }
-                            let file = s
-                                .uri
-                                .as_ref()
-                                .and_then(uri_to_path)
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            (*id, file)
-                        })
-                        .collect();
-                    for (id, file) in detaching {
-                        self.fire_lsp_detach(id, &file, client_id);
-                    }
-                    // Run the config's on_exit(code, signal, client) hook (Phase 3)
-                    // while the client is still registered, then forget it.
-                    if let Err(e) = self.lua.run_lsp_on_exit(client_id, code, signal) {
-                        self.editor
-                            .echo(format!("E5108: Error in LSP on_exit: {e}"));
-                    }
-                    let _ = self.lua.remove_lsp_client(client_id);
-                }
+                self.retire_lsp_server(&key, code, signal, false);
             }
             LspEvent::Log { message, .. } => {
                 // Record to `:messages` without disturbing the message line.
@@ -1185,6 +1268,44 @@ impl EditHost {
     pub(crate) fn buffer_encoding(&self, id: BufferId) -> Option<PositionEncoding> {
         let key = self.lsp_states.get(&id)?.primary_key()?;
         Some(self.lsp_servers.get(key)?.encoding)
+    }
+
+    /// `client.offset_encoding = "utf-8"` from Lua — re-negotiate a live client's
+    /// position encoding ([`LspOp::SetOffsetEncoding`]).
+    ///
+    /// The one caller that matters is a config's `on_init` reading an encoding the
+    /// server reported OUTSIDE `capabilities.positionEncoding` — clangd answers
+    /// `initialize` with a top-level `offsetEncoding`, which
+    /// [`nxvim_lsp::client::encoding_of`] cannot see because it isn't in the
+    /// protocol. Without this the handle would say utf-8 while every column on the
+    /// wire stayed utf-16: wrong only on lines with multi-byte characters, which is
+    /// the hardest kind of wrong to notice.
+    ///
+    /// A client that has already exited is reported rather than ignored — the write
+    /// was meant to change how nxvim talks to a server, and silently dropping it
+    /// leaves the caller believing it took.
+    pub(crate) fn set_lsp_offset_encoding(&mut self, client_id: u64, encoding: &str) {
+        let Some(key) = self.client_id_to_key(client_id) else {
+            self.editor.echo(format!(
+                "nxvim: client.offset_encoding: LSP client {client_id} is not running"
+            ));
+            return;
+        };
+        let encoding = match encoding {
+            "utf-8" => PositionEncoding::Utf8,
+            "utf-16" => PositionEncoding::Utf16,
+            "utf-32" => PositionEncoding::Utf32,
+            other => {
+                self.editor.echo(format!(
+                    "nxvim: client.offset_encoding: unknown encoding '{other}' \
+                     (expected utf-8 / utf-16 / utf-32)"
+                ));
+                return;
+            }
+        };
+        if let Some(rt) = self.lsp_servers.get_mut(&key) {
+            rt.encoding = encoding;
+        }
     }
 
     /// The position encoding a reply from `key` is authored in, falling back to the

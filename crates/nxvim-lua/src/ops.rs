@@ -245,6 +245,9 @@ pub enum LspOp {
         /// The config's `capabilities`, deep-merged OVER nxvim's base client
         /// capabilities at `initialize` (Phase 2). `None` when the config adds none.
         capabilities: Option<serde_json::Value>,
+        /// The config's `cmd_env`, layered over the editor's environment when the
+        /// process is spawned. Empty when the config sets none.
+        env: Vec<(String, String)>,
     },
     /// `nx.lsp.restart(name)` — tear down and respawn every running server with this
     /// config `name`, so the fresh process picks up a config that changed since it
@@ -264,6 +267,20 @@ pub enum LspOp {
         settings: Option<serde_json::Value>,
         /// The config's `capabilities` now (or `None` to keep the cached ones).
         capabilities: Option<serde_json::Value>,
+    },
+    /// `nx.lsp.stop(name)` — shut every running server with this config `name` down
+    /// and detach it from the buffers it was serving, with no respawn (`Restart`
+    /// without the second half). Backs `:LspStop`, which otherwise could only be
+    /// built on `nx.lsp.disable` — and that blocks *future* starts while leaving the
+    /// running process serving, i.e. a command that reports success and stops
+    /// nothing. A no-op for a name with nothing running.
+    Stop {
+        /// The `nx.lsp.config('<name>', …)` name whose servers to stop.
+        name: String,
+        /// The `nx._cb_fns` id settled with the number of servers actually stopped,
+        /// so the caller can say "no server named X is running" rather than claim a
+        /// silent success.
+        cb_id: u64,
     },
     /// A `nx.lsp.*` language-feature request (definition, references,
     /// hover, …) on the current buffer. `kind` is `LspReqKind::as_u16` — the same
@@ -388,6 +405,22 @@ pub enum LspOp {
         method: String,
         /// The notification params as JSON (`Null` when the caller passed none).
         params: serde_json::Value,
+    },
+    /// `client.offset_encoding = "utf-8"` — re-negotiate a live client's position
+    /// encoding from Lua, which is how a config's `on_init` honors a server that
+    /// answers `initialize` with an encoding OUTSIDE the standard
+    /// `capabilities.positionEncoding` (clangd's top-level `offsetEncoding`).
+    ///
+    /// Every column nxvim sends that server, and every column it reads back, is
+    /// counted in this encoding — so a write that never reached the engine would
+    /// leave the handle *reporting* utf-8 while the wire stayed utf-16, and every
+    /// position on a line with a multi-byte character would be silently wrong.
+    SetOffsetEncoding {
+        /// The target client id (`client.id`).
+        client_id: u64,
+        /// `"utf-8"` / `"utf-16"` / `"utf-32"`; anything else is the protocol
+        /// default, `"utf-16"`.
+        encoding: String,
     },
     /// `nx.lsp.apply_workspace_edit(edit, opts)` (Phase 7) — apply a `WorkspaceEdit`
     /// across the open buffers it names, reusing the native rename / code-action
@@ -533,6 +566,14 @@ pub enum FsJob {
     },
     /// `nx.fs.realpath(path)` — the canonical absolute path (symlinks resolved).
     Realpath { path: String },
+    /// `nx.fs.which(name)` — resolve `name` to an executable's absolute path by
+    /// searching `$PATH` (a `name` that already contains a `/` is accepted as-is
+    /// when it *is* an executable file). Resolves [`FsValue::Nil`] when nothing
+    /// matches — "not installed" is a true answer, not an error, so this never
+    /// rejects. Rides the fs seam rather than a spawn so it answers identically
+    /// against a daemon (where the executables that matter actually live) and in a
+    /// serverless browser session (where there are none, and `nil` is correct).
+    Which { name: String },
     /// `nx.hash.file(path, algo)` — stream the file through `algo` (`sha1` / `sha256`
     /// / `sha512` / `md5`) and resolve with the lowercase-hex digest. Hashing a file
     /// is a fs op (not an in-memory `nx.hash.*` call) precisely so a huge file is read
@@ -1835,6 +1876,15 @@ pub struct LspClientData {
     /// Per-feature provider flags, surfaced as the camelCase
     /// `server_capabilities.*Provider` keys neovim configs probe.
     pub capabilities: LspServerCapabilities,
+    /// The position encoding negotiated at `initialize` (`"utf-8"` / `"utf-16"` /
+    /// `"utf-32"`), surfaced as `client.offset_encoding`.
+    ///
+    /// A config that hand-builds a request's `position` (`nx.lsp.position_params`)
+    /// or reads columns out of a server's reply needs the encoding that server
+    /// actually agreed to: nxvim's own columns are bytes, and on a line with a
+    /// multi-byte character a utf-16 column is a different number. Assuming the
+    /// protocol default instead is wrong exactly where it is hardest to notice.
+    pub offset_encoding: String,
 }
 
 /// The per-feature provider flags of an [`LspClientData`], one bool per feature

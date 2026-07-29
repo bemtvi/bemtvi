@@ -928,6 +928,13 @@ async function opfsFsOp(req) {
         return ["ok", fsNil()];
       case "realpath":
         return ["ok", fsText("/" + splitPath(req.path).join("/"))];
+      // A serverless OPFS session has no $PATH and no executables at all, so
+      // "nothing matches" is the honest answer rather than a stub — nil, exactly as
+      // a native lookup for an uninstalled binary answers. (With a daemon attached
+      // this op never reaches here: `daemonFsOp` forwards it and the daemon's real
+      // $PATH — where the language servers actually live — answers.)
+      case "which":
+        return ["ok", fsNil()];
       default:
         return ["err", "EINVAL", `unknown nx.fs op '${req.op}'`];
     }
@@ -1986,7 +1993,9 @@ async function drainLspRequests() {
   }
   for (const s of reqs.spawn) {
     liveLsp.add(s.id);
-    await daemon.notify("lsp_spawn", [s.id, s.program, s.args, s.cwd]);
+    // `s.env` is the config's `cmd_env` as `[[name, value], …]` — forwarded so a
+    // browser session configures a server exactly as a native one does.
+    await daemon.notify("lsp_spawn", [s.id, s.program, s.args, s.cwd, s.env || []]);
   }
   for (const i of reqs.stdin) {
     await daemon.notify("lsp_stdin", [i.id, new Uint8Array(i.bytes)]);

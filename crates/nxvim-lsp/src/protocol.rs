@@ -48,6 +48,13 @@ pub struct ServerSpawn {
     /// Deep-merged OVER nxvim's base `client_capabilities` at `initialize`.
     /// `None` when the config adds none.
     pub capabilities: Option<serde_json::Value>,
+    /// Extra environment variables for the spawned process (`cmd_env` in the
+    /// config), layered OVER the editor's own environment rather than replacing it —
+    /// a server still needs `$PATH` and `$HOME` to find its toolchain. Several
+    /// servers are only configurable this way (jdtls' `JAVA_HOME`, denols'
+    /// `NO_COLOR`, roslyn's `DOTNET_*`), so dropping it silently starts a server
+    /// that misbehaves for no visible reason. Empty when the config sets none.
+    pub env: Vec<(String, String)>,
 }
 
 /// The position encoding negotiated at `initialize` (Decision 4). nxvim columns

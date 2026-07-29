@@ -46,3 +46,9 @@ globals:
   # `utf8.offset` for char→byte column conversion. Open-ended like `bit`.
   utf8:
     any: true
+  # 5.2+ `package.config` (present in nxvim's PUC 5.4): its first line is the
+  # platform's directory separator, which `nx.utils.is_windows` reads. Baked in at
+  # Lua build time, so it is right in every build with no host round-trip — but it
+  # is not in selene's lua51 std, so declare it here.
+  package.config:
+    property: read-only

@@ -340,6 +340,14 @@ impl LspDocState {
     pub(crate) fn attach(&mut self, key: ServerKey) -> &mut LspServerDoc {
         self.servers.entry(key).or_default()
     }
+
+    /// The inverse of [`attach`](Self::attach): forget `key`'s document state for
+    /// this buffer. Used when a server is stopped (`nx.lsp.stop`) — a buffer left
+    /// bound to a dead server would keep looking served while nothing answered, and
+    /// its next sync would push `didChange` into a shut-down process.
+    pub(crate) fn detach(&mut self, key: &ServerKey) {
+        self.servers.remove(key);
+    }
 }
 
 /// A buffer's decoded semantic tokens, plus the bookkeeping a `full/delta`

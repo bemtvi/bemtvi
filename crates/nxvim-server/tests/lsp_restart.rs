@@ -123,3 +123,91 @@ async fn restart_is_a_noop_when_nothing_is_running() {
     let out = exec_lua(&rpc, "return 1 + 1").await;
     assert_eq!(out.as_i64(), Some(2));
 }
+
+/// `nx.lsp.stop(name)` — the stopping half, which backs `:LspStop`. Built on the same
+/// script server: after a stop, a *restart* has nothing left to respawn, so the log
+/// stops growing. That's the observable that distinguishes a real shutdown from
+/// `nx.lsp.disable`, which only closes the gate on future starts.
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_shuts_the_server_down_so_a_restart_has_nothing_to_respawn() {
+    let dir = temp_dir("lsp-stop");
+    let log = dir.as_path().join("spawns.log");
+    let script = dir.as_path().join("srv.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncat >/dev/null\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let file = dir.as_path().join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+
+    let (rpc, _incoming) = start(dir.as_path()).await;
+    command(&rpc, &format!("e {}", file.display())).await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.lsp.start({{ name = 'srv', cmd = {{ '{}', 'v1' }}, root_dir = '{}' }}, {{ filetype = 'rust' }})",
+            script.display(),
+            dir.as_path().display()
+        ),
+    )
+    .await;
+    assert_eq!(wait_for_lines(&log, 1).await, vec!["v1"]);
+
+    // Stop it, and record how many were stopped — a caller needs that to say "no
+    // server named X is running" instead of reporting a silent success.
+    exec_lua(
+        &rpc,
+        "nx.lsp.stop('srv'):next(function(n) _G.stopped = n end)",
+    )
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(n) = exec_lua(&rpc, "return _G.stopped").await.as_i64() {
+            assert_eq!(n, 1, "exactly the one running server was stopped");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "stop never settled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The proof it really went down: a restart re-ensures whatever is *running*, and
+    // after a stop that is nothing — so the log stays at one line.
+    exec_lua(&rpc, "nx.lsp.restart('srv')").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        spawn_lines(&log),
+        vec!["v1"],
+        "a stopped server must not be respawned by a later restart"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_resolves_zero_when_nothing_is_running() {
+    let dir = temp_dir("lsp-stop-noop");
+    let (rpc, _incoming) = start(dir.as_path()).await;
+    // The count is what lets `:LspStop ghost` say so rather than claim success.
+    exec_lua(
+        &rpc,
+        "nx.lsp.stop('ghost'):next(function(n) _G.stopped = n end)",
+    )
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(n) = exec_lua(&rpc, "return _G.stopped").await.as_i64() {
+            assert_eq!(n, 0);
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "stop never settled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

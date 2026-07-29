@@ -133,6 +133,84 @@ function nx.json.decode(str)
   return nx._json_decode(str)
 end
 
+-- Which JSON sentinel `v` is — `"null"`, `"object"`, or nil for any other value. The
+-- mark lives in the metatable (the Rust codec reads the same `__nxvim_json` field), so
+-- it survives `nx.tbl.deepcopy`, which preserves metatables. Shared by `nx.json.is_null`
+-- and by `deep_extend`'s merge rule further down this file, which must treat a marked
+-- table as a LEAF rather than as the empty map it otherwise looks like.
+local function json_mark(v)
+  if type(v) ~= "table" then
+    return nil
+  end
+  local mt = getmetatable(v)
+  return mt and rawget(mt, "__nxvim_json") or nil
+end
+
+-- `nx.json.null`: the value that encodes as JSON `null`.
+--
+-- Lua has no way to *say* null: storing `nil` under a key simply removes the key, so
+-- `{ token = nil }` encodes as `{}`, not `{"token": null}`. To a protocol peer those
+-- are different messages — "unset, use your default" versus "explicitly nothing" — and
+-- LSP servers do read them differently (`snyk_ls` expects a null token when there is
+-- none). Put this in the table instead:
+--
+-- ```lua
+-- init_options = { token = nx.env.get("SNYK_TOKEN") or nx.json.null }
+-- ```
+--
+-- Identify it on the way back out with `nx.json.is_null(value)`, **not** `value ==
+-- nx.json.null`: every path that stores it copies it (`nx.tbl.deepcopy`, and so the
+-- `nx.tbl.deep_extend` behind `nx.lsp.config`), and a copy carries the mark but is a
+-- different table.
+--
+-- `nx.json.decode` still turns an incoming `null` into `nil` (there is nowhere else for
+-- it to go in a Lua table), so this is a write-side value.
+nx.json.null = setmetatable({}, {
+  __nxvim_json = "null",
+  __tostring = function()
+    return "nx.json.null"
+  end,
+})
+
+-- `nx.json.empty_object()` -> a table that encodes as JSON `{}` rather than `[]`.
+--
+-- The other thing Lua can't say: an empty table is both an empty array and an empty
+-- object, and nxvim's codec — like neovim's — has to pick one, so it picks `[]`. A
+-- server given `[]` where its schema says object either rejects the message or
+-- silently ignores the field, and the resulting "the server started but does nothing"
+-- is exactly the kind of quiet wrongness worth a sentinel.
+--
+-- ```lua
+-- init_options = { memory = { file_store = nx.json.empty_object() } }
+-- ```
+--
+-- A fresh table each call, and the mark answers "array or object?" rather than
+-- standing in for the contents: fill it in afterwards and it is still an object, with
+-- everything you put in it (integer keys become the string keys JSON objects take).
+--
+-- Its sibling is the value `nx.json.null`, which encodes as JSON `null` — the other
+-- thing a Lua table cannot carry, since a `nil` value simply removes the key.
+function nx.json.empty_object()
+  return setmetatable({}, { __nxvim_json = "object" })
+end
+
+-- `nx.json.is_null(value)` -> is `value` the JSON-null sentinel?
+--
+-- The read side of `nx.json.null`. It answers on a *copy* of the sentinel as well as on
+-- the sentinel itself, which is what makes it the right test: a config's value has
+-- almost always been through `nx.tbl.deep_extend` by the time anyone reads it back, and
+-- that copies. Everything else — including `nx.json.empty_object()`, a bare `{}`, and
+-- `nil` — is false.
+--
+-- ```lua
+-- if nx.json.is_null(cfg.init_options.token) then
+--   -- the user said "explicitly no token", not "I forgot to set one"
+-- end
+-- ```
+function nx.json.is_null(value)
+  return json_mark(value) == "null"
+end
+
 vim.json = nx.json
 
 -- ----- nx.shada.plugin: opt-in isolated plugin storage ----------------------
@@ -528,8 +606,15 @@ end
 -- Is `t` mergeable — a table that is a *map* rather than a list? An empty table
 -- counts (nothing distinguishes `{}` the empty map from `{}` the empty list, and
 -- merging into it is lossless).
+--
+-- A JSON sentinel (`nx.json.null` / `nx.json.empty_object()`) is the one exception: it
+-- IS an empty table, so without this it merged like an empty map — contributing no keys
+-- and silently leaving whatever it was meant to override in place. `nx.lsp.config`
+-- merges a user's config over a preset's, so "explicitly null this out" landed as
+-- "keep the preset", with a wrong configuration on the wire and no error anywhere. The
+-- sentinel is a *value*, so it replaces rather than merges, in both directions.
 local function mergeable(t)
-  return type(t) == "table" and (next(t) == nil or not is_list(t))
+  return type(t) == "table" and json_mark(t) == nil and (next(t) == nil or not is_list(t))
 end
 
 -- `nx.tbl.deep_extend(behavior, ...)` [alias `vim.tbl_deep_extend`]: Merge `...` maps into one. `behavior` is `"force"` | `"keep"` | `"error"`. Nested
@@ -540,6 +625,10 @@ end
 -- list index-by-index fuses two unrelated entries and leaves a stale tail, so a
 -- re-registered tool list (`nx.lsp.config`'s `settings.languages.<ft>`) would keep
 -- the dropped tool's keys on entry 1 and its old entry 2 — a config nobody wrote.
+--
+-- The JSON sentinels are values, not maps: `nx.json.null` and `nx.json.empty_object()`
+-- REPLACE whatever they are merged over (and are replaced by a later real value), so
+-- "explicitly nothing" written over a preset's table means what it says.
 function nx.tbl.deep_extend(behavior, ...)
   local result = {}
   local function merge(dst, src)

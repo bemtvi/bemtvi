@@ -129,6 +129,20 @@ pub(crate) fn stringify(lua: &Lua, value: &mlua::Value) -> String {
     }
 }
 
+/// The metatable field `nx.json.null` / `nx.json.empty_object()` mark themselves with.
+/// Lua cannot say either shape on its own — a `nil` value simply isn't a table entry,
+/// and an empty table is indistinguishable from an empty array — so the two JSON values
+/// a protocol peer *can* distinguish need a carrier. Both are single tables with a
+/// marked metatable, checked before the array-vs-object rule ever runs.
+const JSON_MARK: &str = "__nxvim_json";
+
+/// Which marked JSON value `value` is, if any.
+fn json_mark(value: &mlua::Value) -> Option<String> {
+    let t = value.as_table()?;
+    let meta = t.metatable()?;
+    meta.get::<Option<String>>(JSON_MARK).ok().flatten()
+}
+
 /// The shape of a Lua table once classified: a sequence (every key an integer in
 /// `1..=len`) or a map (anything else). `Map` keeps the keys *raw* so each caller
 /// coerces them into its own key space ([`lua_to_rmpv`] vs [`json_key`]); the
@@ -346,15 +360,30 @@ fn lua_to_json_at(value: &mlua::Value, depth: usize) -> mlua::Result<serde_json:
         L::Integer(i) => serde_json::Value::from(*i),
         L::Number(n) => serde_json::Value::from(*n),
         L::String(s) => serde_json::Value::from(s.to_str()?.to_string()),
-        L::Table(t) => match classify_table(t, |v| lua_to_json_at(v, depth + 1))? {
-            LuaTable::Array(items) => serde_json::Value::Array(items),
-            LuaTable::Map(pairs) => {
+        L::Table(t) => match json_mark(value).as_deref() {
+            Some("null") => serde_json::Value::Null,
+            // Marked an object, so it stays one however it is filled in afterwards —
+            // the mark is the answer to "array or object?", not a stand-in for the
+            // table's contents. Dropping the entries here would silently lose whatever
+            // a caller added to it.
+            Some("object") => {
                 let mut map = serde_json::Map::new();
-                for (k, v) in pairs {
-                    map.insert(json_key(&k)?, v);
+                for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+                    let (k, v) = pair?;
+                    map.insert(json_key(&k)?, lua_to_json_at(&v, depth + 1)?);
                 }
                 serde_json::Value::Object(map)
             }
+            _ => match classify_table(t, |v| lua_to_json_at(v, depth + 1))? {
+                LuaTable::Array(items) => serde_json::Value::Array(items),
+                LuaTable::Map(pairs) => {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in pairs {
+                        map.insert(json_key(&k)?, v);
+                    }
+                    serde_json::Value::Object(map)
+                }
+            },
         },
         _ => serde_json::Value::Null,
     })

@@ -2030,6 +2030,10 @@ fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob, local: bool) -> serde_json::V
             put("op", "realpath".into());
             put("path", path.clone().into());
         }
+        FsJob::Which { name } => {
+            put("op", "which".into());
+            put("name", name.clone().into());
+        }
         FsJob::HashFile { path, algo } => {
             put("op", "hash_file".into());
             put("path", path.clone().into());
@@ -2686,8 +2690,9 @@ pub unsafe extern "C" fn eh_take_lsp_requests(h: *mut WasmEditHost) -> *mut c_ch
                 program,
                 args,
                 cwd,
+                env,
             } => spawn.push(
-                serde_json::json!({ "id": id, "program": program, "args": args, "cwd": cwd }),
+                serde_json::json!({ "id": id, "program": program, "args": args, "cwd": cwd, "env": env }),
             ),
             WireOp::Stdin { id, bytes } => {
                 stdin.push(serde_json::json!({ "id": id, "bytes": bytes }))

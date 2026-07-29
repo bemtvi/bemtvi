@@ -100,7 +100,7 @@
 //!
 //! | direction | method | params |
 //! | --- | --- | --- |
-//! | edit-host → daemon | `lsp_spawn` | `[id, program, args, cwd]` |
+//! | edit-host → daemon | `lsp_spawn` | `[id, program, args, cwd, env]` |
 //! | edit-host → daemon | `lsp_stdin` | `[id, bytes]` |
 //! | edit-host → daemon | `lsp_kill`  | `[id]` |
 //! | daemon → edit-host | `lsp_stdout` | `[id, bytes]` |
@@ -195,7 +195,7 @@ const TERM_EXIT: &str = "term_exit";
 // language server's stdio stays open for its whole life, with JSON-RPC flowing both
 // ways and stdout consumed incrementally — so the wire streams raw stdin/stdout/stderr
 // chunks correlated by a per-spawn `id`, never a single buffered result.
-const LSP_SPAWN: &str = "lsp_spawn"; // edit-host → daemon: [id, program, args, cwd]
+const LSP_SPAWN: &str = "lsp_spawn"; // edit-host → daemon: [id, program, args, cwd, env]
 const LSP_STDIN: &str = "lsp_stdin"; // edit-host → daemon: [id, bytes]
 const LSP_KILL: &str = "lsp_kill"; // edit-host → daemon: [id]
 const LSP_STDOUT: &str = "lsp_stdout"; // daemon → edit-host: [id, bytes]
@@ -2567,6 +2567,9 @@ impl LspTransport for RemoteLspTransport {
         let inflight = self.inflight.clone();
         let program = spec.program.clone();
         let args = spec.args.clone();
+        // The config's `cmd_env` rides to the daemon, where the process actually
+        // runs — a remote session must configure a server exactly as a local one does.
+        let env = spec.env.clone();
         let cwd = root.to_string_lossy().into_owned();
         Box::pin(async move {
             let (stdout_tx, stdout_rx) = unbounded_channel::<Vec<u8>>();
@@ -2593,6 +2596,11 @@ impl LspTransport for RemoteLspTransport {
                     Value::from(program),
                     Value::Array(args.into_iter().map(Value::from).collect()),
                     Value::from(cwd),
+                    Value::Array(
+                        env.into_iter()
+                            .map(|(k, v)| Value::Array(vec![Value::from(k), Value::from(v)]))
+                            .collect(),
+                    ),
                 ],
             );
             Ok(LspChannel {
@@ -2766,7 +2774,7 @@ pub async fn serve_lsp_daemon_on(
         };
         match method.as_str() {
             LSP_SPAWN => {
-                if let Some((id, program, args, cwd)) = decode_lsp_spawn(params) {
+                if let Some((id, program, args, cwd, env)) = decode_lsp_spawn(params) {
                     let (stdin_tx, stdin_rx) = unbounded_channel::<Vec<u8>>();
                     let (kill_tx, kill_rx) = oneshot::channel();
                     stdins.insert(id, stdin_tx);
@@ -2776,6 +2784,7 @@ pub async fn serve_lsp_daemon_on(
                         program,
                         args,
                         cwd,
+                        env,
                         stdin_rx,
                         kill_rx,
                         rpc.clone(),
@@ -2810,11 +2819,13 @@ pub async fn serve_lsp_daemon_on(
 /// stdout/stderr onto the wire and feeding its stdin from `stdin_rx`. Joins the
 /// stdout/stderr pumps *before* sending `lsp_exited`, so the edit-host (which EOFs its
 /// reader on exit) never loses trailing output.
+#[allow(clippy::too_many_arguments)]
 async fn serve_one_lsp(
     id: u64,
     program: String,
     args: Vec<String>,
     cwd: String,
+    env: Vec<(String, String)>,
     mut stdin_rx: UnboundedReceiver<Vec<u8>>,
     mut kill_rx: oneshot::Receiver<()>,
     rpc: Rpc,
@@ -2822,6 +2833,9 @@ async fn serve_one_lsp(
     let mut command = tokio::process::Command::new(&program);
     command
         .args(&args)
+        // Layered over the daemon's own environment, exactly as the local transport
+        // layers it over the editor's — `cmd_env` adds, never replaces.
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2922,8 +2936,14 @@ fn lsp_exit_code_signal(status: Option<std::process::ExitStatus>) -> (Option<i32
     }
 }
 
-/// `lsp_spawn` params → `(id, program, args, cwd)`, or `None` on a malformed frame.
-fn decode_lsp_spawn(mut params: Vec<Value>) -> Option<(u64, String, Vec<String>, String)> {
+/// `lsp_spawn` params → `(id, program, args, cwd, env)`, or `None` on a malformed
+/// frame. `env` is the trailing `[[name, value], …]` element carrying the config's
+/// `cmd_env`; an older peer that doesn't send it yields an empty environment, which
+/// is exactly what a config with no `cmd_env` means.
+#[allow(clippy::type_complexity)]
+fn decode_lsp_spawn(
+    mut params: Vec<Value>,
+) -> Option<(u64, String, Vec<String>, String, Vec<(String, String)>)> {
     if params.len() < 4 {
         return None;
     }
@@ -2937,7 +2957,20 @@ fn decode_lsp_spawn(mut params: Vec<Value>) -> Option<(u64, String, Vec<String>,
         _ => return None,
     };
     let cwd = params[3].as_str().unwrap_or("").to_string();
-    Some((id, program, args, cwd))
+    let env = match params.get_mut(4).map(|v| std::mem::replace(v, Value::Nil)) {
+        Some(Value::Array(pairs)) => pairs
+            .into_iter()
+            .filter_map(|pair| match pair {
+                Value::Array(kv) if kv.len() >= 2 => Some((
+                    kv[0].as_str()?.to_string(),
+                    kv[1].as_str().unwrap_or("").to_string(),
+                )),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some((id, program, args, cwd, env))
 }
 
 /// `[id, bytes]` → `(id, bytes)`, moving the (potentially large) payload out. Used by

@@ -100,10 +100,15 @@ impl LspTransport for LocalLspTransport {
     ) -> Pin<Box<dyn Future<Output = io::Result<LspChannel>> + Send>> {
         let program = spec.program.clone();
         let args = spec.args.clone();
+        let env = spec.env.clone();
         let root = root.to_path_buf();
         Box::pin(async move {
             let mut child = Command::new(&program)
                 .args(&args)
+                // Layered on top of the inherited environment (`envs`, not
+                // `env_clear` + `envs`): a language server needs `$PATH` to find its
+                // own toolchain, so `cmd_env` adds to the environment, never replaces it.
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .current_dir(&root)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

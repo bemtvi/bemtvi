@@ -2460,6 +2460,18 @@ impl EditHost {
                 path: self.abs_against_cwd(&path),
                 algo,
             },
+            // `which` takes a NAME, not a path: a bare `gopls` must stay bare so the
+            // executor searches `$PATH` for it (absolutizing it against the cwd would
+            // turn the search into a lookup of one non-existent file). Only the
+            // explicit-path form — anything containing a separator — is a real path
+            // and gets the same cwd treatment as every other op.
+            FsJob::Which { name } => FsJob::Which {
+                name: if name.contains('/') {
+                    self.abs_against_cwd(&name)
+                } else {
+                    name
+                },
+            },
         }
     }
 

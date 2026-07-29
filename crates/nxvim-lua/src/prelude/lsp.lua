@@ -77,32 +77,121 @@ local function nonempty(t)
   return nil
 end
 
--- Upward `root_markers` search from the buffer's file, walking the project tree
--- through the async `nx.fs` seam (local on native-bare, the daemon's `luafs_op` over
--- the wire otherwise — so this works on every front end with NO editor-thread block).
--- `nx.async` makes this an async *function* (the Lua analogue of a JS
--- `async function`): calling `find_root(bufnr, markers)` runs the body as a coroutine and
--- returns a PROMISE of the first ancestor directory holding one of `markers`, or nil
--- (the server then falls back to the file's directory). Each `nx.fs.readdir` that
--- rejects (an unreadable / non-directory ancestor) is treated as "no markers here" and
--- the walk continues upward. The caller invokes it normally and `:next`s the result.
-local find_root = nx.async(function(bufnr, markers)
+-- Build the promise an async `nx.lsp` op returns: `issue(cb_id)` queues the op with a
+-- fresh callback id, and the server settles it by running
+-- `nx._cb_fns[cb_id](nil, result)` once the effect is applied. **Resolve-only** (the
+-- `err` arg is always nil), so a bare keymap use — `nx.keymap.set("n", "gd",
+-- nx.lsp.definition)`, the common case — can't raise an unhandled-rejection warning.
+-- Shared by `nx.lsp.stop` and every language verb below.
+local function lsp_promise(issue)
+  return nx.promise.new(function(fulfil)
+    local id = nx._next_cb_id()
+    nx._cb_fns[id] = function(_err, result)
+      fulfil(result)
+    end
+    issue(id)
+  end)
+end
+
+-- Normalize a `root_markers` value to a list of PRIORITY TIERS. The flat form
+-- (`{ ".git", "Cargo.toml" }`) is one tier of equals; the nested form
+-- (`{ { "package-lock.json", "yarn.lock" }, { ".git" } }`) is several, and the
+-- distinction is load-bearing — see `find_root`. Every marker must be a string, so a
+-- half-nested list (`{ { "a" }, "b" }`) fails loud here instead of silently matching
+-- nothing at spawn time.
+local function marker_tiers(markers, name)
+  if type(markers) ~= "table" or #markers == 0 then
+    error("nx.lsp: '" .. name .. "' root_markers must be a non-empty list", 0)
+  end
+  local tiers = type(markers[1]) == "table" and markers or { markers }
+  for i, tier in ipairs(tiers) do
+    if type(tier) ~= "table" then
+      error(
+        string.format(
+          "nx.lsp: '%s' root_markers mixes plain markers with priority tiers "
+            .. "(entry %d is a %s) — use either a flat list of names or a list of "
+            .. "lists, not both",
+          name,
+          i,
+          type(tier)
+        ),
+        0
+      )
+    end
+    for _, m in ipairs(tier) do
+      if type(m) ~= "string" then
+        error("nx.lsp: '" .. name .. "' root_markers must contain strings", 0)
+      end
+    end
+  end
+  return tiers
+end
+
+-- `nx.lsp.find_root(bufnr, markers)` -> promise of the workspace root: the nearest
+-- ancestor directory of the buffer's file holding one of `markers`, or nil.
+--
+-- The upward search behind the declarative `root_markers` config key, public because
+-- a config whose root depends on something the declarative form can't express —
+-- "the lockfile root, unless a Deno config is nearer" — needs to run the same search
+-- by hand inside its `root_dir`. It walks the project tree through the async `nx.fs`
+-- seam (local on native-bare, the daemon's `luafs_op` over the wire otherwise), so it
+-- works on every front end with NO editor-thread block: the `nx.async` body runs as a
+-- coroutine and the caller `:next`s the result (or `nx.await`s it). Each
+-- `nx.fs.readdir` that rejects — an unreadable or non-directory ancestor — is treated
+-- as "no markers here" and the walk continues upward.
+--
+-- `markers` may carry PRIORITY TIERS — a list of lists rather than a flat list of
+-- names. A tier is exhausted over the WHOLE tree before the next one is tried
+-- anywhere, which is the entire point of the form: with
+-- `{ { "package-lock.json" }, { ".git" } }` a lockfile six directories up beats a
+-- nested `.git` one directory up, so a package inside a monorepo attaches at the
+-- monorepo root rather than at its own sub-repo. A flat list is one tier, where the
+-- nearest directory holding *any* marker wins.
+--
+-- ```lua
+-- root_dir = function(bufnr, on_dir)
+--   nx.lsp.find_root(bufnr, { { "package-lock.json" }, { ".git" } }):next(on_dir)
+-- end
+-- ```
+--
+-- Each level's listing is read once and memoized, so a second tier re-walks the
+-- cached entries instead of re-reading the tree — N directory listings for any
+-- number of tiers, not N per tier.
+nx.lsp.find_root = nx.async(function(bufnr, markers, name)
   local file = nx.buf.name(bufnr)
   if type(file) ~= "string" or file == "" then
     return nil
   end
-  for dir in nx.utils.ancestors(file) do
-    local present = {}
-    local entries = nx.await(nx.fs.readdir(dir):catch(function()
-      return {}
-    end))
-    for _, e in ipairs(entries) do
-      present[e.name] = true
-    end
-    for _, m in ipairs(markers) do
-      if present[m] then
-        return dir
+  local tiers = marker_tiers(markers, name or "?")
+  local levels, walk, walked_out = {}, nx.utils.ancestors(file), false
+  for _, tier in ipairs(tiers) do
+    local i = 1
+    while true do
+      if i > #levels then
+        if walked_out then
+          break -- this tier saw every ancestor and matched none
+        end
+        local dir = walk()
+        if not dir then
+          walked_out = true
+          break
+        end
+        local present = {}
+        local entries = nx.await(nx.fs.readdir(dir):catch(function()
+          return {}
+        end))
+        for _, e in ipairs(entries) do
+          present[e.name] = true
+        end
+        levels[#levels + 1] = { dir = dir, present = present }
       end
+      local level = levels[i]
+      for _, m in ipairs(tier) do
+        if level.present[m] then
+          return level.dir
+        end
+      end
+      i = i + 1
     end
   end
   return nil
@@ -152,12 +241,38 @@ end
 -- (exactly neovim's `tbl_deep_extend("force", …)`). Computed here, in Lua, so the
 -- `LspOp::Start` seam underneath receives one already-resolved config.
 local function resolve(name)
-  return vim.tbl_deep_extend(
+  return nx.tbl.deep_extend(
     "force",
     nx.lsp._config["*"] or {},
     base_config(name) or {},
     nx.lsp._config[name] or {}
   )
+end
+
+-- `nx.lsp.get_config(name)` -> the fully-resolved config for `name` — the `"*"` base,
+-- the runtimepath `lsp/<name>.lua` preset, and every `nx.lsp.config(name, …)` override
+-- so far, deep-merged. This is exactly what a server would start with right now, so it
+-- is the honest answer to "what is this server configured as?" (neovim's indexable
+-- `vim.lsp.config[name]`, as a function — nxvim's `nx.lsp.config` is call-only).
+--
+-- Reads through the same cached preset loader the dispatcher uses, so there is one
+-- copy of the "source a preset off the runtimepath" logic and a caller can't observe a
+-- config the dispatcher wouldn't use. Returns a fresh table each call: mutating it
+-- changes nothing, which is what `nx.lsp.config` is for.
+--
+-- ```lua
+-- local cfg = nx.lsp.get_config("gopls")
+-- if cfg.filetypes and nx.tbl.contains(cfg.filetypes, "go") then … end
+-- ```
+--
+-- A name with no preset and no override resolves to an empty table (`{}`), not nil —
+-- "configured as nothing" rather than "unknown", since a config can be built up
+-- purely from `nx.lsp.config` calls with no bundled preset behind it at all.
+function nx.lsp.get_config(name)
+  if type(name) ~= "string" or name == "" then
+    error("nx.lsp.get_config: name must be a non-empty string", 2)
+  end
+  return resolve(name)
 end
 
 -- `nx.lsp.config(name, opts)`: accumulate `opts` into `name`'s override layer
@@ -172,16 +287,109 @@ function nx.lsp.config(name, opts)
     error("nx.lsp.config: opts must be a table", 2)
   end
   local prev = nx.lsp._config[name] or {}
-  nx.lsp._config[name] = vim.tbl_deep_extend("force", prev, opts or {})
+  nx.lsp._config[name] = nx.tbl.deep_extend("force", prev, opts or {})
+end
+
+-- ----- the config schema -----------------------------------------------------
+
+-- Every key `nx.lsp` reads off a resolved config. The set is closed so that a key
+-- outside it is *reported* rather than silently dropped — a config whose typo'd
+-- `filetype` (singular) never matches anything looks exactly like a server that
+-- won't start, and the difference is an hour of debugging.
+local KNOWN_KEYS = {
+  cmd = true,
+  cmd_env = true,
+  filetypes = true,
+  root_dir = true,
+  root_markers = true,
+  workspace_required = true,
+  init_options = true,
+  settings = true,
+  capabilities = true,
+  commands = true,
+  name = true,
+  get_language_id = true,
+  before_init = true,
+  on_init = true,
+  on_attach = true,
+  on_exit = true,
+  offset_encoding = true,
+}
+
+-- Keys nxvim knows about and deliberately does NOT act on, each with the reason and
+-- the consequence. These are neovim concepts a ported config may still carry; saying
+-- what will happen instead beats both a hard error (which would make an otherwise
+-- working server unusable over one unused field) and silence.
+local UNSUPPORTED_KEYS = {
+  handlers = "nxvim does not route server-initiated messages into Lua, so these "
+    .. "handlers never run; the messages are logged and ignored",
+  reuse_client = "nxvim always reuses one client per (config name, root), which is "
+    .. "what this predicate is computing in every known config",
+}
+
+-- Report a config's unknown / unsupported keys, once per (config, key) — the check
+-- runs on every FileType dispatch, and a repeated warning on every buffer open would
+-- be worse than none. Never fatal: the server still starts on the keys that ARE read.
+nx.lsp._warned_keys = nx.lsp._warned_keys or {}
+local function warn_config_keys(name, cfg)
+  local seen = nx.lsp._warned_keys[name]
+  if not seen then
+    seen = {}
+    nx.lsp._warned_keys[name] = seen
+  end
+  for key in pairs(cfg) do
+    if not KNOWN_KEYS[key] and not seen[key] then
+      seen[key] = true
+      local why = UNSUPPORTED_KEYS[key]
+      nx.notify(
+        why and ("nx.lsp: '" .. name .. "' sets `" .. key .. "` — " .. why)
+          or (
+            "nx.lsp: '"
+            .. name
+            .. "' sets `"
+            .. key
+            .. "`, which nx.lsp does not read — if this config's own cmd / before_init / "
+            .. "on_attach doesn't consume it, it has no effect (a misspelled key?)"
+          ),
+        vim.log.levels.WARN
+      )
+    end
+  end
 end
 
 -- ----- enable / the engine-side FileType -> Start dispatch --------------------
 
--- Resolve `cfg.cmd` to an argv. A function `cmd` is neovim's `cmd(dispatchers, config)`
--- builder (the many `node_modules/.bin` resolvers); nxvim does its own
--- stdio spawn, so the dispatchers are a stub and `vim.lsp.rpc.start` (below)
--- returns the argv it is handed. A throwing builder yields `nil, reason`.
-local function resolve_cmd(cfg, root)
+-- The client name a config starts its server under: `cfg.name` when it sets one,
+-- else the registry key. They are the same for almost every config; `name` exists for
+-- the few that register under one key and want the server (and `nx.lsp.clients`,
+-- `:LspRestart`, the log) to report another.
+local function client_name(name, cfg)
+  return type(cfg.name) == "string" and cfg.name ~= "" and cfg.name or name
+end
+
+-- client name -> the registry key its config lives under. Only differs when a config
+-- sets `name`; without it the lifecycle hooks — which resolve a config from the name
+-- the SERVER reports — would look up the wrong (empty) config and silently skip a
+-- renamed config's `on_attach` / `on_init` / `commands`.
+nx.lsp._config_key = nx.lsp._config_key or {}
+
+-- The resolved config behind a live client's reported name.
+local function config_of_client(name)
+  return resolve(nx.lsp._config_key[name] or name)
+end
+
+-- Resolve `cfg.cmd` to an argv. A function `cmd` is the config's own builder, called
+-- as neovim calls it — `cmd(dispatchers, config)`, with `config.root_dir` filled in —
+-- except that nxvim owns the stdio spawn, so the dispatchers are a stub and the
+-- builder simply **returns the argv** (there is no `vim.lsp.rpc.start` to wrap it in).
+--
+-- The builder may return the argv directly OR a **promise** of one. That is what keeps
+-- the common shape — "use the project-local `node_modules/.bin` copy if it exists,
+-- else the one on `$PATH`" — non-blocking: the lookup is `nx.fs.which`, which is I/O,
+-- and blocking the editor on it is exactly what nxvim doesn't do.
+--
+-- Resolves `{ cmd = argv }`, or `{ err = reason }` when the builder throws or rejects.
+local resolve_cmd = nx.async(function(cfg, root)
   local cmd = cfg.cmd
   if type(cmd) == "function" then
     local config = {}
@@ -191,56 +399,230 @@ local function resolve_cmd(cfg, root)
     config.root_dir = root
     local ok, result = pcall(cmd, {}, config)
     if not ok then
-      return nil, "cmd builder errored: " .. tostring(result)
+      return { err = "cmd builder errored: " .. tostring(result) }
+    end
+    -- `nx.await` passes a plain value straight through, so this covers both the
+    -- synchronous and the promise-returning builder with one path.
+    ok, result = pcall(nx.await, result)
+    if not ok then
+      return { err = "cmd builder rejected: " .. tostring(result) }
     end
     cmd = result
   end
-  return cmd
+  return { cmd = cmd }
+end)
+
+-- Run a config's `before_init(init_params, config)` — its last chance to shape what
+-- crosses at `initialize`, now that the root is known. It mutates `config` in place
+-- (rust-analyzer mirrors `settings["rust-analyzer"]` into the initialization options
+-- this way; the typescript-adjacent servers compute a `tsdk` path), and nxvim reads
+-- `init_options` / `settings` / `capabilities` back off it afterwards. Writing through
+-- `init_params.initializationOptions` works too, and wins.
+--
+-- It may return a promise, awaited before the spawn — so a hook that has to run a tool
+-- (`nx.run`) or read a file (`nx.fs`) to decide does it without blocking, which is the
+-- whole reason the upstream `vim.system(…):wait()` versions can't be carried over.
+--
+-- Returns the config to start from, or nil when the hook failed (reported loud — a
+-- server started with half-applied options is worse than one that visibly didn't).
+local run_before_init = nx.async(function(name, cfg, root)
+  if type(cfg.before_init) ~= "function" then
+    return cfg
+  end
+  local start_cfg = {}
+  for k, v in pairs(cfg) do
+    start_cfg[k] = v
+  end
+  start_cfg.root_dir = root
+  local init_params = {
+    initializationOptions = start_cfg.init_options,
+    rootUri = root and ("file://" .. root) or nil,
+  }
+  local ok, ret = pcall(cfg.before_init, init_params, start_cfg)
+  if ok then
+    ok, ret = pcall(nx.await, ret)
+  end
+  if not ok then
+    nx.notify(
+      "nx.lsp: '" .. name .. "' before_init failed: " .. tostring(ret),
+      vim.log.levels.ERROR
+    )
+    return nil
+  end
+  if init_params.initializationOptions ~= nil then
+    start_cfg.init_options = init_params.initializationOptions
+  end
+  return start_cfg
+end)
+
+-- The LSP `languageId` for this buffer's `didOpen` — the filetype, unless the config
+-- maps it. `get_language_id(bufnr, filetype)` exists because a handful of servers name
+-- a language differently from vim (`objc` -> `objective-c`, `cuda` -> `cuda-cpp`), and
+-- sending the wrong id makes a server ignore the document entirely. A hook that throws
+-- or returns a non-string is reported and the plain filetype used.
+local function language_id_for(name, cfg, bufnr, ft)
+  ft = ft or ""
+  if type(cfg.get_language_id) ~= "function" then
+    return ft
+  end
+  local ok, id = pcall(cfg.get_language_id, bufnr, ft)
+  if not ok then
+    nx.notify(
+      "nx.lsp: '" .. name .. "' get_language_id failed: " .. tostring(id),
+      vim.log.levels.ERROR
+    )
+    return ft
+  end
+  if type(id) ~= "string" or id == "" then
+    nx.notify(
+      string.format(
+        "nx.lsp: '%s' get_language_id returned %s, expected a non-empty string — "
+          .. "using the filetype '%s'",
+        name,
+        type(id),
+        ft
+      ),
+      vim.log.levels.WARN
+    )
+    return ft
+  end
+  return id
 end
 
--- Queue a start for `bufnr` from a resolved config (root already computed). A cmd
--- that isn't a spawnable argv is reported loud (the server enabled but unspawnable
--- is visible, never a silent no-op) and skipped — it never errors the whole enable.
-local function start_resolved(name, cfg, bufnr, ft, root)
-  local cmd, reason = resolve_cmd(cfg, root)
-  if not is_argv(cmd) then
+-- Normalize `cmd_env` to the `{ NAME = "value" }` string map the spawn takes. Numbers
+-- and booleans are accepted and stringified (configs write `NODE_OPTIONS = 4096` and
+-- `DEBUG = true`); anything else is dropped with a warning, since an environment entry
+-- silently missing is a server that misbehaves for no visible reason.
+local function env_map(name, cmd_env)
+  if cmd_env == nil then
+    return nil
+  end
+  if type(cmd_env) ~= "table" then
+    nx.notify("nx.lsp: '" .. name .. "' cmd_env must be a table (ignored)", vim.log.levels.WARN)
+    return nil
+  end
+  local out, any = {}, false
+  for k, v in pairs(cmd_env) do
+    local t = type(v)
+    if type(k) ~= "string" then
+      nx.notify(
+        "nx.lsp: '" .. name .. "' cmd_env keys must be strings (dropped one)",
+        vim.log.levels.WARN
+      )
+    elseif t == "string" or t == "number" then
+      out[k] = tostring(v)
+      any = true
+    elseif t == "boolean" then
+      out[k] = v and "1" or "0"
+      any = true
+    else
+      nx.notify(
+        "nx.lsp: '" .. name .. "' cmd_env." .. k .. " is a " .. t .. " (dropped)",
+        vim.log.levels.WARN
+      )
+    end
+  end
+  return any and out or nil
+end
+
+-- Queue a start for `bufnr` from a resolved config (root already computed): build the
+-- argv, run `before_init`, then hand the whole spawn across `nx._lsp_start`. A cmd that
+-- isn't a spawnable argv is reported loud (a server enabled but unspawnable is visible,
+-- never a silent no-op) and skipped — it never errors the whole enable.
+local start_resolved = nx.async(function(name, cfg, bufnr, ft, root)
+  local built = nx.await(resolve_cmd(cfg, root))
+  if built.err then
+    nx.notify("nx.lsp: not starting '" .. name .. "': " .. built.err, vim.log.levels.WARN)
+    return
+  end
+  if not is_argv(built.cmd) then
     nx.notify(
-      "nx.lsp: not starting '" .. name .. "': " .. (reason or "cmd is not a spawnable argv"),
+      "nx.lsp: not starting '" .. name .. "': cmd is not a spawnable argv",
       vim.log.levels.WARN
     )
     return
   end
+  local start_cfg = nx.await(run_before_init(name, cfg, root))
+  if start_cfg == nil then
+    return
+  end
+  local reported = client_name(name, cfg)
+  nx.lsp._config_key[reported] = name
   nx._lsp_start(
-    name,
-    cmd,
+    reported,
+    built.cmd,
     root,
-    ft or "",
+    language_id_for(name, cfg, bufnr, ft),
     bufnr,
-    nonempty(cfg.init_options),
-    nonempty(cfg.settings),
-    nonempty(cfg.capabilities)
+    nonempty(start_cfg.init_options),
+    nonempty(start_cfg.settings),
+    nonempty(start_cfg.capabilities),
+    env_map(name, start_cfg.cmd_env)
   )
-end
+end)
 
--- Resolve `cfg`'s root and start the server for `bufnr`. `root_dir` may be a
--- string, a `function(bufnr, done)` (the async escape hatch — it calls `done(dir)`,
--- or never, to decline a buffer), or absent with `root_markers` driving the upward
--- fs-seam search. With none of those, the root is nil (the server uses the file's
--- directory).
+-- Resolve `cfg`'s root and start the server for `bufnr`. `root_dir` may be:
+--
+--   * a string — used as-is;
+--   * a `function(bufnr, on_dir)` — the async escape hatch, which calls `on_dir(dir)`,
+--     or **never calls it at all** to decline the buffer outright (how a config says
+--     "this file belongs to a different server": ts_ls stepping aside for a Deno tree);
+--   * a `function(bufnr)` returning a **promise** of the directory — the same thing in
+--     the shape the rest of `nx.*` speaks. Resolving nil means "no root found" (not a
+--     decline), so `workspace_required` decides what happens next;
+--   * absent, with `root_markers` driving the upward fs-seam search.
+--
+-- With none of those the root is nil and the server uses the file's directory.
+--
+-- `workspace_required` gates the last step: a server that resolves its configuration
+-- and imports from the workspace is useless without one, so a buffer with no root is
+-- DECLINED rather than served by a rootless instance that answers confidently and
+-- wrongly (eslint linting with no config, tailwindcss completing no classes).
 local function start_for(name, cfg, bufnr, ft)
+  local function go(root)
+    if cfg.workspace_required and (root == nil or root == "") then
+      return
+    end
+    start_resolved(name, cfg, bufnr, ft, root)
+  end
   local rd = cfg.root_dir
   if type(rd) == "function" then
-    rd(bufnr, function(root)
-      start_resolved(name, cfg, bufnr, ft, root)
-    end)
+    -- Accept both shapes at once. `fired` keeps a config that calls `on_dir` AND
+    -- returns a promise from starting the server twice.
+    local fired = false
+    local function once(root)
+      if fired then
+        return
+      end
+      fired = true
+      go(root)
+    end
+    local ok, ret = pcall(rd, bufnr, once)
+    if not ok then
+      nx.notify(
+        "nx.lsp: '" .. name .. "' root_dir errored: " .. tostring(ret),
+        vim.log.levels.ERROR
+      )
+      return
+    end
+    if type(ret) == "table" and type(ret.next) == "function" then
+      ret:next(once, function(err)
+        nx.notify(
+          "nx.lsp: '" .. name .. "' root_dir rejected: " .. tostring(err),
+          vim.log.levels.ERROR
+        )
+      end)
+    end
   elseif type(rd) == "string" then
-    start_resolved(name, cfg, bufnr, ft, rd)
+    go(rd)
   elseif cfg.root_markers then
-    find_root(bufnr, cfg.root_markers):next(function(root)
-      start_resolved(name, cfg, bufnr, ft, root)
+    -- A malformed `root_markers` raises out of `marker_tiers`; surface it as this
+    -- config's problem rather than an unhandled rejection with no name attached.
+    nx.lsp.find_root(bufnr, cfg.root_markers, name):next(go, function(err)
+      nx.notify(tostring(err), vim.log.levels.ERROR)
     end)
   else
-    start_resolved(name, cfg, bufnr, ft, nil)
+    go(nil)
   end
 end
 
@@ -269,7 +651,12 @@ local function start_matching(entries, bufnr, ft)
     return
   end
   for _, e in ipairs(entries) do
-    if e.cfg.filetypes and vim.tbl_contains(e.cfg.filetypes, ft) then
+    if e.cfg.filetypes and nx.tbl.contains(e.cfg.filetypes, ft) then
+      -- Report the config's unknown / unsupported keys the first time it is actually
+      -- reached for a filetype it serves — here rather than at registration, so a
+      -- config that never matches anything never nags, and here rather than inside
+      -- `start_for`, so a `workspace_required` decline still names a typo'd key.
+      warn_config_keys(e.name, e.cfg)
       start_for(e.name, e.cfg, bufnr, ft)
     end
   end
@@ -351,7 +738,7 @@ local function ensure_dispatcher()
       if first then
         install_lsp_keymaps(buf)
       end
-      local cfg = resolve(client.name)
+      local cfg = config_of_client(client.name)
       if type(cfg.on_attach) == "function" then
         cfg.on_attach(client, buf)
       end
@@ -429,6 +816,9 @@ end
 
 -- `nx.lsp.disable(names)`: the inverse of `enable` — future buffers won't start the
 -- named servers (already-running servers keep serving until their buffers close).
+--
+-- To shut a server down **now**, use `nx.lsp.stop` — on its own, `disable` closes the
+-- gate without touching what is already through it.
 function nx.lsp.disable(names)
   if type(names) == "string" then
     names = { names }
@@ -436,6 +826,36 @@ function nx.lsp.disable(names)
   for _, n in ipairs(names) do
     nx.lsp._enabled[n] = nil
   end
+end
+
+-- `nx.lsp.stop(name[, opts])`: shut down every running server with config `name`,
+-- detaching it from the buffers it was serving. Returns a promise that resolves with
+-- the NUMBER of servers stopped (0 when nothing by that name was running) — so a
+-- caller can report "no server named X is running" rather than a silent success.
+--
+-- ```lua
+-- nx.lsp.stop("gopls"):next(function(n)
+--   nx.notify(n > 0 and ("stopped " .. n) or "gopls was not running")
+-- end)
+-- ```
+--
+-- A stopped server can come back: the config stays enabled, so the next buffer whose
+-- filetype matches starts a fresh one. Pass `opts.disable = true` to stop it *and*
+-- close the gate (`nx.lsp.disable`), which is what `:LspStop` does — otherwise the
+-- very next matching buffer would silently restart what you just stopped.
+function nx.lsp.stop(name, opts)
+  if type(name) ~= "string" or name == "" then
+    error("nx.lsp.stop: name must be a non-empty string", 2)
+  end
+  if opts ~= nil and type(opts) ~= "table" then
+    error("nx.lsp.stop: opts must be a table", 2)
+  end
+  if opts and opts.disable then
+    nx.lsp.disable(name)
+  end
+  return lsp_promise(function(id)
+    nx._lsp_stop(name, id)
+  end)
 end
 
 -- `nx.lsp.restart(name)`: tear down and respawn every running server with config
@@ -495,20 +915,8 @@ end
 -- with the `{ text, path, row, col }` item list (a 1-element list for a single goto
 -- jump); `hover`/`signature_help` with the shown text; `format`/`rename` with `nil`.
 -- `kind` ints mirror `LspReqKind::as_u16` (crates/nxvim-server/src/lsp/mod.rs) — keep
--- the two in step.
---
--- Build the promise a verb returns: `issue(cb_id)` queues the op with the callback id;
--- the server settles it by running `nx._cb_fns[cb_id](nil, result)` once the effect is
--- applied. Resolve-only (the `err` arg is always nil), matching the contract above.
-local function lsp_promise(issue)
-  return nx.promise.new(function(fulfil)
-    local id = nx._next_cb_id()
-    nx._cb_fns[id] = function(_err, result)
-      fulfil(result)
-    end
-    issue(id)
-  end)
-end
+-- the two in step. Each is built with `lsp_promise` (defined up with the helpers,
+-- since `nx.lsp.stop` above needs it too).
 
 function nx.lsp.definition()
   return lsp_promise(function(id)
@@ -755,26 +1163,175 @@ end
 
 -- ----- client handles, introspection & escape hatch --------------------------
 
+-- The `server_capabilities` key that decides whether a client answers a method.
+-- Only the methods nxvim actually mirrors a provider flag for are listed; anything
+-- else — a server's OWN extension (`textDocument/switchSourceHeader`,
+-- `ocamllsp/switchImplIntf`, `deno/virtualTextDocument`) — is not describable by a
+-- standard capability at all, and `supports_method` answers **true** for it: those
+-- are exactly the requests a per-server config exists to make, and a blanket false
+-- would refuse every one of them.
+local METHOD_CAPABILITY = {
+  ["textDocument/definition"] = "definitionProvider",
+  ["textDocument/declaration"] = "declarationProvider",
+  ["textDocument/typeDefinition"] = "typeDefinitionProvider",
+  ["textDocument/implementation"] = "implementationProvider",
+  ["textDocument/references"] = "referencesProvider",
+  ["textDocument/hover"] = "hoverProvider",
+  ["textDocument/signatureHelp"] = "signatureHelpProvider",
+  ["textDocument/completion"] = "completionProvider",
+  ["textDocument/formatting"] = "documentFormattingProvider",
+  ["textDocument/rangeFormatting"] = "documentFormattingProvider",
+  ["textDocument/rename"] = "renameProvider",
+  ["textDocument/codeAction"] = "codeActionProvider",
+  ["textDocument/semanticTokens/full"] = "semanticTokensProvider",
+  ["textDocument/inlayHint"] = "inlayHintProvider",
+  ["textDocument/documentSymbol"] = "documentSymbolProvider",
+  ["workspace/symbol"] = "workspaceSymbolProvider",
+}
+
+local client_handle = {}
+
+-- `client:request(method, params, handler[, bufnr])`: issue a generic LSP request;
+-- the reply runs `handler(err, result)` off-tick (err a message string on failure,
+-- result the server's value on success — exactly one set). An unimplemented or
+-- uncapable method fails loud through `err`, never a silent no-op.
+--
+-- `bufnr` is accepted for source compatibility with neovim's fourth argument and
+-- has no effect: the request is addressed to THIS client, and nxvim cancels a
+-- client's in-flight requests when the client goes away rather than per buffer.
+function client_handle:request(method, params, handler, _bufnr)
+  local cb_id = nx._next_cb_id()
+  nx._cb_fns[cb_id] = handler or function() end
+  nx._lsp_client_request(self.id, method, params, cb_id)
+end
+
+-- `client:notify(method, params)`: fire-and-forget a generic LSP notification.
+function client_handle:notify(method, params)
+  nx._lsp_client_notify(self.id, method, params)
+end
+
+-- `client:supports_method(method)` -> boolean: does this server answer `method`?
+--
+-- Read from what the server advertised at `initialize`
+-- (`client.server_capabilities`), so a config guards its own commands against a
+-- server build that lacks the feature instead of firing a request that comes back
+-- as an error the user has to interpret. A method nxvim maps no capability for is
+-- **supported** — see `METHOD_CAPABILITY`.
+function client_handle:supports_method(method)
+  local cap = METHOD_CAPABILITY[method]
+  if not cap then
+    return true
+  end
+  return self.server_capabilities[cap] and true or false
+end
+
+-- `client:exec_cmd(command[, context[, handler]])`: run an LSP `Command`
+-- (`{ title, command, arguments }`) — the verb behind a code action that carries a
+-- command, and the one a per-server `:Lsp…` command uses to drive its server's own
+-- vocabulary (`deno.cache`, `texlab.cleanArtifacts`, `_typescript.goToSourceDefinition`).
+--
+-- Resolved in precedence order, which is the same order an applied code action
+-- takes:
+--
+-- ```
+-- 1. the OFFERING config's own `commands` table   (this client's config)
+-- 2. the global `nx.lsp.commands` registry
+-- 3. `workspace/executeCommand` on this client
+-- ```
+--
+-- A client-side handler (1 or 2) is called as `handler(command, ctx)` and the round
+-- trip never happens — that is the whole point of registering one. Otherwise the
+-- command goes to the server and `handler(err, result, ctx)` receives the reply.
+-- `ctx` carries `{ client_id, bufnr, params }`, so a failing handler can report
+-- *which* arguments failed.
+--
+-- `context.bufnr` names the buffer the command acts on (`0`/nil = current). Unlike
+-- neovim, a command the server did not list in `executeCommandProvider` is still
+-- sent: nxvim reports whatever the server answers rather than refusing locally, since
+-- servers under-advertise this list routinely and a local refusal reads as "the
+-- command did nothing".
+function client_handle:exec_cmd(command, context, handler)
+  local name = type(command) == "table" and command.command or nil
+  if type(name) ~= "string" then
+    nx.notify(
+      "client:exec_cmd: command must be a table with a `command` string",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+  context = context or {}
+  local params = { command = name, arguments = command.arguments }
+  local ctx = { client_id = self.id, bufnr = cur_bufnr(context.bufnr), params = params }
+  local commands = config_of_client(self.name).commands
+  local fn = (type(commands) == "table" and commands[name]) or nx.lsp.commands[name]
+  if fn then
+    local ok, err = pcall(fn, command, ctx)
+    if not ok then
+      nx.notify("nx.lsp.commands['" .. name .. "']: " .. tostring(err), vim.log.levels.ERROR)
+    end
+    return
+  end
+  self:request("workspace/executeCommand", params, function(err, result)
+    if handler then
+      handler(err, result, ctx)
+    elseif err then
+      nx.notify("nx.lsp: '" .. name .. "' failed: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end, ctx.bufnr)
+end
+
+-- The handle's metatable. `offset_encoding` is the one field that is not a plain
+-- value: reading it yields the encoding negotiated at `initialize`, and ASSIGNING it
+-- re-negotiates the live client (`LspOp::SetOffsetEncoding`) rather than just
+-- relabelling the handle.
+--
+-- The write path exists for one real shape — a config's `on_init` reading an
+-- encoding the server reported outside `capabilities.positionEncoding`, which is how
+-- clangd answers (a top-level `offsetEncoding` the protocol doesn't define). If the
+-- assignment only landed in Lua, the handle would report utf-8 while every column on
+-- the wire stayed utf-16: wrong only on lines holding a multi-byte character, and
+-- silently so.
+local client_mt = {
+  __index = function(self, key)
+    if key == "offset_encoding" then
+      return rawget(self, "_offset_encoding")
+    end
+    return client_handle[key]
+  end,
+  __newindex = function(self, key, value)
+    if key == "offset_encoding" then
+      if type(value) ~= "string" then
+        error("client.offset_encoding must be a string, got " .. type(value), 2)
+      end
+      rawset(self, "_offset_encoding", value)
+      nx._lsp_set_offset_encoding(rawget(self, "id"), value)
+      return
+    end
+    rawset(self, key, value)
+  end,
+}
+
 -- Build the snapshot handle mirrored into `nx.lsp._clients[id]`. It carries the
--- server's resolved capabilities and the generic `:request` / `:notify` escape
--- hatch (engine Decision 3: callback-shaped, a generation token, stale replies
--- dropped server-side). `on_attach` / `on_init` receive this same handle.
-local function make_client(id, name, capabilities)
-  local client = { id = id, name = name, server_capabilities = capabilities or {} }
-  -- `client:request(method, params, handler)`: issue a generic LSP request; the
-  -- reply runs `handler(err, result)` off-tick (err a message string on failure,
-  -- result the server's value on success — exactly one set). An unimplemented or
-  -- uncapable method fails loud through `err`, never a silent no-op.
-  function client:request(method, params, handler)
-    local cb_id = nx._next_cb_id()
-    nx._cb_fns[cb_id] = handler or function() end
-    nx._lsp_client_request(self.id, method, params, cb_id)
-  end
-  -- `client:notify(method, params)`: fire-and-forget a generic LSP notification.
-  function client:notify(method, params)
-    nx._lsp_client_notify(self.id, method, params)
-  end
-  return client
+-- server's resolved capabilities, its negotiated position encoding, and the generic
+-- `:request` / `:notify` escape hatch (engine Decision 3: callback-shaped, a
+-- generation token, stale replies dropped server-side). `on_attach` / `on_init`
+-- receive this same handle.
+local function make_client(id, name, capabilities, offset_encoding)
+  return setmetatable({
+    id = id,
+    name = name,
+    server_capabilities = capabilities or {},
+    -- Read back through `__index` as `offset_encoding`; set directly here so
+    -- mirroring a client does NOT queue a re-negotiation of what it already agreed to.
+    _offset_encoding = offset_encoding or "utf-16",
+  }, client_mt)
+end
+
+-- `nx.lsp.client_by_id(id)`: the handle for client `id`, or nil once its server has
+-- exited. The lookup behind a handler that is handed a `client_id` (a code-action
+-- `ctx`, an `LspAttach` autocmd's `args.data.client_id`) rather than a handle.
+function nx.lsp.client_by_id(id)
+  return nx.lsp._clients[id]
 end
 
 -- `nx.lsp.clients(filter)`: a snapshot list of active clients, narrowable by
@@ -826,6 +1383,194 @@ function nx.lsp.notify(method, params, bufnr)
   client:notify(method, params)
 end
 
+-- ----- hand-built request params ---------------------------------------------
+-- Everything nxvim asks a server itself is built engine-side, in Rust, against the
+-- rope. These exist for the other direction: a per-server config issuing one of its
+-- server's OWN requests (`textDocument/switchSourceHeader`, `textDocument/build`)
+-- has to hand over a document reference and a cursor position, and getting the
+-- column convention wrong is silent — the request succeeds and answers about the
+-- wrong character.
+
+-- `byte -> column in `encoding``, over one line's text. nxvim columns are byte
+-- offsets; LSP counts utf-16 code units by default, so on any line holding a
+-- multi-byte character the two numbers differ. Malformed utf-8 (a file nxvim
+-- transcoded, a buffer mid-edit) falls back to the byte count rather than raising:
+-- a slightly-off position beats a config that errors on one bad line.
+local function byte_to_encoded_col(line, byte_col, encoding)
+  if encoding == "utf-8" then
+    return math.min(byte_col, #line)
+  end
+  local prefix = line:sub(1, byte_col)
+  local ok, count = pcall(function()
+    local n = 0
+    for _, cp in utf8.codes(prefix) do
+      -- utf-16 needs a surrogate PAIR for anything past the BMP; utf-32 counts
+      -- codepoints, which is what the loop already does.
+      n = n + ((encoding == "utf-16" and cp >= 0x10000) and 2 or 1)
+    end
+    return n
+  end)
+  return ok and count or #prefix
+end
+
+-- The inverse: a `character` counted in `encoding` -> the byte offset into `line`.
+-- Used when a *server's* position comes back to be turned into something nxvim
+-- addresses by byte (a quickfix column).
+local function encoded_col_to_byte(line, character, encoding)
+  if encoding == "utf-8" then
+    return math.min(character, #line)
+  end
+  local ok, byte = pcall(function()
+    local units, i = 0, 1
+    while i <= #line do
+      if units >= character then
+        return i - 1
+      end
+      local cp = utf8.codepoint(line, i)
+      units = units + ((encoding == "utf-16" and cp >= 0x10000) and 2 or 1)
+      i = utf8.offset(line, 2, i) or (#line + 1)
+    end
+    return #line
+  end)
+  return ok and byte or math.min(character, #line)
+end
+
+-- The position encoding to count a buffer's columns in: the one the buffer's own
+-- server negotiated. With several servers attached the first is taken — a caller who
+-- means a specific server passes `opts.encoding = client.offset_encoding`, which is
+-- what every per-server config does (it already holds the handle).
+local function buffer_encoding(bufnr)
+  local client = nx.lsp.clients({ bufnr = bufnr })[1]
+  return client and client.offset_encoding or "utf-16"
+end
+
+-- `nx.lsp.text_document_params([bufnr])` -> `{ uri = … }`, the LSP
+-- `TextDocumentIdentifier` for buffer `bufnr` (`0`/nil = current) — the params of
+-- every request that names a document and nothing else.
+function nx.lsp.text_document_params(bufnr)
+  return { uri = nx.utils.uri_from_buf(cur_bufnr(bufnr)) }
+end
+
+-- `nx.lsp.position_params([opts])` -> `{ textDocument = { uri }, position = { line,
+-- character } }`, the LSP `TextDocumentPositionParams` for the cursor — the params
+-- shape most requests take.
+--
+-- opts:
+--   * `win` — the window whose cursor to read (`0`/nil = current).
+--   * `bufnr` — the document to name (default: `win`'s buffer).
+--   * `encoding` — the position encoding to count `character` in. **Pass the
+--     answering client's `offset_encoding`**; the default is whatever the buffer's
+--     first attached server negotiated, which is only right by luck when two servers
+--     with different encodings share a buffer.
+--
+-- ```lua
+-- local params = nx.lsp.position_params({ encoding = client.offset_encoding })
+-- client:request("textDocument/build", params, on_reply)
+-- ```
+function nx.lsp.position_params(opts)
+  opts = opts or {}
+  local win = opts.win or 0
+  local bufnr = cur_bufnr(opts.bufnr or nx.win.buf(win))
+  local pos = nx.cursor.get(win)
+  local row, col = pos[1], pos[2]
+  local line = nx.buf.lines(bufnr, row - 1, row, false)[1] or ""
+  return {
+    textDocument = { uri = nx.utils.uri_from_buf(bufnr) },
+    position = {
+      line = row - 1,
+      character = byte_to_encoded_col(line, col, opts.encoding or buffer_encoding(bufnr)),
+    },
+  }
+end
+
+-- The lines of the document a location names, for the `text` of its quickfix entry:
+-- from the mirror when the file is already open (which is both cheaper and *correct*
+-- for unsaved edits), else read off disk. Never rejects — a location into a file that
+-- has since been deleted still deserves its entry, just without the line's text.
+local location_lines = nx.async(function(path)
+  for _, bufnr in ipairs(nx.buf.list()) do
+    if nx.fname.modify(nx.buf.name(bufnr), ":p") == path then
+      return nx.buf.lines(bufnr, 0, -1, false)
+    end
+  end
+  local text = nx.await(nx.fs.read_text(path):catch(function()
+    return nil
+  end))
+  return type(text) == "string" and nx.str.split(text, "\n") or {}
+end)
+
+-- `nx.lsp.locations_to_items(locations[, opts])` -> a PROMISE of quickfix items,
+-- one per location, sorted by file then position — the bridge from a server's
+-- `Location[]` / `LocationLink[]` to the shape `nx.qf.setqflist` takes
+-- (`{ filename, lnum, col, end_lnum, end_col, text }`, all 1-based).
+--
+-- ```lua
+-- nx.lsp.locations_to_items(refs, { encoding = client.offset_encoding })
+--   :next(function(items)
+--     nx.qf.setqflist({}, " ", { title = "References", items = items })
+--     nx.qf.open()
+--   end)
+-- ```
+--
+-- A promise, not a value, and that is not incidental: each item's `text` is the
+-- source line it points at, and a location into a file no buffer holds means reading
+-- that file. neovim reads them synchronously; nxvim does no blocking I/O anywhere, so
+-- the conversion is async and the *editor* keeps running while a 900-reference result
+-- resolves.
+--
+-- `opts.encoding` is the position encoding the server counted its columns in
+-- (default `"utf-16"`, the protocol's) — columns come out as nxvim's own bytes.
+-- Locations naming a non-`file://` document are dropped: a quickfix entry addresses a
+-- path, and a `deno:`/`jdt:` URI has none.
+nx.lsp.locations_to_items = nx.async(function(locations, opts)
+  opts = opts or {}
+  local encoding = opts.encoding or "utf-16"
+  local by_path, order = {}, {}
+  for _, loc in ipairs(locations or {}) do
+    local uri = loc.uri or loc.targetUri
+    local path = nx.utils.uri_to_path(uri)
+    local range = loc.range or loc.targetSelectionRange or loc.targetRange
+    if path and type(range) == "table" then
+      path = nx.utils.normalize(path)
+      if not by_path[path] then
+        by_path[path] = {}
+        order[#order + 1] = path
+      end
+      table.insert(by_path[path], range)
+    end
+  end
+  table.sort(order)
+  local items = {}
+  for _, path in ipairs(order) do
+    local lines = nx.await(location_lines(path))
+    local ranges = by_path[path]
+    table.sort(ranges, function(a, b)
+      if a.start.line ~= b.start.line then
+        return a.start.line < b.start.line
+      end
+      return a.start.character < b.start.character
+    end)
+    for _, range in ipairs(ranges) do
+      local row = range.start.line
+      local text = lines[row + 1] or ""
+      local end_row = (range["end"] or range.start).line
+      items[#items + 1] = {
+        filename = path,
+        lnum = row + 1,
+        col = encoded_col_to_byte(text, range.start.character, encoding) + 1,
+        end_lnum = end_row + 1,
+        end_col = encoded_col_to_byte(
+          lines[end_row + 1] or "",
+          (range["end"] or range.start).character,
+          encoding
+        ) + 1,
+        text = text,
+      }
+    end
+  end
+  return items
+end)
+
 -- ----- code-action commands --------------------------------------------------
 
 -- `nx.lsp.commands[name] = function(command, ctx)`: client-side handlers for the
@@ -850,9 +1595,22 @@ end
 -- ```
 nx.lsp.commands = nx.lsp.commands or {}
 
--- Run a code action's `command` (called by the engine when an action is applied):
--- a registered `nx.lsp.commands` handler if there is one, else
--- `workspace/executeCommand` on the client that OFFERED the action.
+-- Run a code action's `command` (called by the engine when an action is applied),
+-- in precedence order: the OFFERING config's own `commands` table, then the global
+-- `nx.lsp.commands`, then `workspace/executeCommand` on the client that offered it.
+--
+-- The per-config table wins because a command name is one server's private
+-- vocabulary: two servers on the same buffer can both offer `applyFix` meaning
+-- different things, and the config that shipped the handler is the one that knows
+-- which. A config declares it exactly like the global registry:
+--
+-- ```lua
+-- nx.lsp.config("ts_ls", {
+--   commands = {
+--     ["editor.action.showReferences"] = function(command, ctx) … end,
+--   },
+-- })
+-- ```
 --
 -- `client_id` is the offering server, not the buffer's first: a command's name and
 -- arguments are that server's own vocabulary, so executing ruff's `source.fixAll`
@@ -867,6 +1625,17 @@ function nx.lsp._dispatch_command(client_id, command)
     nx.notify("nx.lsp: code action carried a malformed command", vim.log.levels.ERROR)
     return
   end
+  local client = nx.lsp._clients[client_id]
+  if client then
+    -- One implementation of the precedence, shared with the `client:exec_cmd` a
+    -- config's own command calls — two copies would drift, and the difference
+    -- (does MY handler run, or does the server?) is invisible until it misfires.
+    client:exec_cmd(command)
+    return
+  end
+  -- No client left, so only a client-side handler can still act. A global one is
+  -- reachable without the handle; a per-config one is not (the config is found
+  -- through the client's name), which is itself worth saying.
   local handler = nx.lsp.commands[name]
   if handler then
     local ok, err = pcall(handler, command, { client_id = client_id })
@@ -875,22 +1644,10 @@ function nx.lsp._dispatch_command(client_id, command)
     end
     return
   end
-  local client = nx.lsp._clients[client_id]
-  if not client then
-    nx.notify(
-      "nx.lsp: no client to execute '" .. name .. "' (its server is gone)",
-      vim.log.levels.ERROR
-    )
-    return
-  end
-  client:request("workspace/executeCommand", {
-    command = name,
-    arguments = command.arguments,
-  }, function(err)
-    if err then
-      nx.notify("nx.lsp: '" .. name .. "' failed: " .. tostring(err), vim.log.levels.ERROR)
-    end
-  end)
+  nx.notify(
+    "nx.lsp: no client to execute '" .. name .. "' (its server is gone)",
+    vim.log.levels.ERROR
+  )
 end
 
 -- ----- engine -> Lua mirror hooks (called by nxvim-server) -------------------
@@ -899,9 +1656,19 @@ end
 -- keep `nx.lsp._clients` in sync and run the config's lifecycle hooks.
 
 -- A server finished `initialize`: mirror its handle with the translated provider
--- capabilities (the `*Provider` booleans neovim configs probe).
-function nx.lsp._set_client(id, name, capabilities)
-  nx.lsp._clients[id] = make_client(id, name, capabilities)
+-- capabilities (the `*Provider` booleans neovim configs probe) and the position
+-- encoding the two sides settled on.
+--
+-- A config that names an `offset_encoding` overrides the negotiated one here, right
+-- after the handle exists — the same write an `on_init` would do, applied for the
+-- config that would rather state the encoding than probe for it.
+function nx.lsp._set_client(id, name, capabilities, offset_encoding)
+  local client = make_client(id, name, capabilities, offset_encoding)
+  nx.lsp._clients[id] = client
+  local forced = config_of_client(name).offset_encoding
+  if type(forced) == "string" and forced ~= "" and forced ~= client.offset_encoding then
+    client.offset_encoding = forced
+  end
 end
 
 -- A server exited: forget its handle and drop it from every buffer's attach set.
@@ -920,7 +1687,7 @@ function nx.lsp._run_on_init(id, result)
   if not client then
     return
   end
-  local cfg = resolve(client.name)
+  local cfg = config_of_client(client.name)
   if type(cfg.on_init) == "function" then
     cfg.on_init(client, result)
   end
@@ -933,7 +1700,7 @@ function nx.lsp._run_on_exit(id, code, signal)
   if not client then
     return
   end
-  local cfg = resolve(client.name)
+  local cfg = config_of_client(client.name)
   if type(cfg.on_exit) == "function" then
     cfg.on_exit(code, signal, client)
   end
@@ -1301,7 +2068,7 @@ vim.lsp.get_clients = function(filter)
   return nx.lsp.clients(filter)
 end
 vim.lsp.get_client_by_id = function(id)
-  return nx.lsp._clients[id]
+  return nx.lsp.client_by_id(id)
 end
 -- Semantic tokens & inlay hints keep neovim's table shape (start/stop/get_at_pos,
 -- enable/is_enabled/get) — the same tables, so a config written either way agrees.

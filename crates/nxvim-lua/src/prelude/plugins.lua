@@ -1600,13 +1600,24 @@ function M.recommend(specs)
   return specs
 end
 
--- nxvim's BUILT-IN default recommended set — a small, nx.*-native starting point
--- offered on a brand-new setup when the user's config registers no set of its own.
+-- The reference page for the built-in recommended set — the ONE place that describes
+-- what each plugin is, what it needs installed, and how to pick a subset. The welcome
+-- screen links here (`?`) instead of listing every plugin inline, so the offer stays
+-- short and the detail lives where it can be read properly. Keep in sync with the book
+-- page's path (`docs/recommended-plugins.md` -> `book/src/guide/recommended-plugins.md`).
+M.RECOMMENDED_DOC_URL = "https://davidrios.github.io/nxvim/guide/recommended-plugins.html"
+
+-- nxvim's BUILT-IN default recommended set — the nx.*-native starting point offered on
+-- a brand-new setup when the user's config registers no set of its own.
 -- It is NOT active by default: the interactive binary opts in by calling
 -- `M._use_default_recommended()` at boot (ServerInit.offer_default_recommended) before
 -- `init.lua` runs, so a config's own `recommend{...}` still overrides it and declaring
 -- any plugin skips the welcome. Tests never opt in, so it can't disrupt the headless
 -- suites. String-form hooks only (the chosen subset is serialized into plugins.lua).
+--
+-- A spec carries `config` only when the plugin needs one: the plugins that ship a
+-- `plugin/` file (help, snippets, editorconfig, markdown-preview) register themselves
+-- off the runtimepath, so a `setup()` line here would only repeat what they already do.
 -- (A plugin spec is intentionally a mixed table — `[1]` source + named fields — which
 -- is the manager's declared format; suppress selene's mixed_table for this literal.)
 -- selene: allow(mixed_table)
@@ -1618,9 +1629,9 @@ M._default_recommended = {
     config = [[ vim.cmd("colorscheme catppuccin") ]],
   },
   {
-    "nxvim/nxvim-keys-helper",
-    desc = "Popup of available keybindings as you type (which-key)",
-    config = [[ require("nxvim-keys-helper").setup() ]],
+    "nxvim/nxvim-line",
+    desc = "Configurable statusline (lualine)",
+    config = [[ require("nxvim-line").setup() ]],
   },
   {
     "nxvim/nxvim-tree",
@@ -1629,19 +1640,42 @@ M._default_recommended = {
     config = [[ require("nxvim-tree").setup() ]],
   },
   {
+    "nxvim/nxvim-keys-helper",
+    desc = "Popup of available keybindings as you type (which-key)",
+    config = [[ require("nxvim-keys-helper").setup() ]],
+  },
+  {
+    "nxvim/nxvim-help",
+    desc = "Vim-style :help, with the plugins' own docs",
+  },
+  {
     "nxvim/nxvim-lspconfig",
-    desc = "Quickstart configs for the built-in LSP client",
+    desc = "Ready-made configs for the built-in LSP client",
     config = [[ require("nxvim-lspconfig").setup() ]],
   },
   {
-    "nxvim/nxvim-line",
-    desc = "Configurable statusline (lualine)",
-    config = [[ require("nxvim-line").setup() ]],
+    "nxvim/nxvim-efmls-configs",
+    desc = "Linters & formatters over efm-langserver",
+    config = [[ require("nxvim-efmls-configs").setup({ languages = "*defaults" }) ]],
+  },
+  {
+    "nxvim/nxvim-snippets",
+    desc = "Snippet engine + the friendly-snippets collection",
+    dependencies = { "rafamadriz/friendly-snippets" },
+  },
+  {
+    "nxvim/nxvim-editorconfig",
+    desc = "Apply a project's .editorconfig to its buffers",
   },
   {
     "nxvim/nxvim-diff",
-    desc = "Diff & merge-conflict visualizer",
-    config = [[ require("nxvim-diff").setup() ]],
+    desc = "Diff & merge-conflict visualizer (:DiffGit)",
+    cmd = { "DiffGit", "DiffConflict" },
+    config = [[ require("nxvim-diff").setup({}) ]],
+  },
+  {
+    "nxvim/nxvim-markdown-preview",
+    desc = "Live markdown preview in your browser (:MarkdownPreview)",
   },
   {
     "nxvim/nxvim-dap",

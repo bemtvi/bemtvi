@@ -4,9 +4,11 @@
 -- component, prelude/component.lua) over the manager's own state — no buffer
 -- mutation, no manual tick-dance:
 --
---   * the WELCOME checklist (`M.ui.welcome`) — the first-run offer. nxvim ships
---     minimal; on a fresh setup it presents the recommended set pre-ticked, each item
---     untickable, and resolves to the chosen subset (driven from `M.bootstrap`).
+--   * the WELCOME offer (`M.ui.welcome`) — the first-run ask. nxvim ships minimal; on
+--     a fresh setup it offers the recommended set as ONE decision (install / skip),
+--     with `c` opening the customize CHECKLIST behind it (every plugin pre-ticked and
+--     untickable) and `?` opening the set's reference page in a browser. Either screen
+--     resolves the same promise with the chosen subset (driven from `M.bootstrap`).
 --   * the MANAGER (`:Plugins` / `M.ui.open`) — the dashboard: every declared plugin
 --     grouped by load state, with LIVE per-plugin progress (a spinner while a clone /
 --     pull runs, a ✓/✗ on finish) wired through `M.on_change` + `M._tasks`, and the
@@ -59,13 +61,81 @@ local function spec_source(s)
   return s.src or s.url or s[1] or s.dir or ""
 end
 
--- ----- the welcome checklist --------------------------------------------------
+-- Where a source comes FROM, one step up from the repository itself:
+-- `nxvim/nxvim-tree` -> `github.com/nxvim`, `https://git.sr.ht/~u/p` -> `git.sr.ht/~u`,
+-- a path or `file://` -> its parent directory. The offer screen shows the distinct
+-- origins of the set instead of listing every source, so the *trust* question ("whose
+-- code is this?") is still answerable there — the exact per-plugin sources are one `c`
+-- away on the checklist.
+local function spec_origin(s)
+  local src = spec_source(s)
+  if src == "" then
+    return ""
+  end
+  local host, path = src:match("^%a[%w+.-]*://([^/]+)/(.*)$")
+  if host then
+    -- A URL: keep the host plus its first path segment (the owner), dropping the repo.
+    local owner = path:match("^([^/]+)/")
+    if owner and path:match("^[^/]+/[^/]+/?$") then
+      return host .. "/" .. owner
+    end
+    -- Not an owner/repo shape (a file:// path, a deep URL): the containing directory.
+    return (src:gsub("/+$", ""):gsub("/[^/]*$", ""))
+  end
+  local owner = src:match("^([%w._-]+)/[%w._-]+$")
+  if owner then
+    return "github.com/" .. owner -- the manager's own default for `owner/repo`
+  end
+  return (src:gsub("/+$", ""):gsub("/[^/]*$", "")) -- a plain path: its parent
+end
+
+-- The distinct origins of a recommended set, in first-seen order. Recurses into each
+-- spec's `dependencies`: a dependency is fetched and run exactly like a top-level
+-- plugin, so an origin the user never chose directly still belongs in the summary.
+local function set_origins(specs)
+  local seen, out = {}, {}
+  local function walk(list)
+    for _, s in ipairs(list) do
+      local o = spec_origin(s)
+      if o ~= "" and not seen[o] then
+        seen[o] = true
+        out[#out + 1] = o
+      end
+      local deps = type(s) == "table" and (s.dependencies or s.deps)
+      if deps then
+        walk(deps)
+      end
+    end
+  end
+  walk(specs)
+  return out
+end
+
+-- ----- the customize checklist ------------------------------------------------
 
 -- The lines before the first checklist item (the two intro lines + a blank
 -- separator) — fixed so the cursor↔item math is exact.
 local WELCOME_HEADER = 3
 
-local Welcome = nx.view.component({
+-- Hand a URL to the platform opener, reporting either way — the `?` key on both
+-- welcome screens. A remote/headless session may have no opener at all, which is why
+-- the URL is also rendered as plain text for copying.
+local function open_doc()
+  local url = nx.plugins.RECOMMENDED_DOC_URL
+  nx.ui
+    .open(url)
+    :next(function()
+      nx.notify("opened " .. url)
+    end)
+    :catch(function(err)
+      nx.notify(
+        "nx.plugins: could not open " .. url .. " (" .. tostring(err and err.message or err) .. ")",
+        3
+      )
+    end)
+end
+
+local Customize = nx.view.component({
   setup = function(ctx, props)
     local items = {}
     for _, raw in ipairs(props.recommended) do
@@ -137,6 +207,14 @@ local Welcome = nx.view.component({
       props.on_done(chosen)
     end, { desc = "Install selected" })
 
+    ctx.keymap_set("n", "?", open_doc, { desc = "Open the reference page for the set" })
+
+    -- `c` is what got the user HERE from the offer screen, so it is deliberately inert
+    -- rather than unbound: a repeated press (this screen mounts a tick after the key)
+    -- would otherwise reach the `c` operator and leave the view in operator-pending,
+    -- swallowing the next keys.
+    ctx.keymap_set("n", "c", function() end, { desc = "Customize (already here)" })
+
     local function skip()
       ctx.close()
       props.on_done({}) -- {} = skipped / installed nothing
@@ -175,8 +253,8 @@ local Welcome = nx.view.component({
       end
     end
 
-    add("nxvim ships minimal by design — no bundled plugins.", "NxPluginsDim")
-    add("These are recommended to get you started — untick any you don't want:", "NxPluginsDim")
+    add("Untick anything you don't want — each row is fetched from the", "NxPluginsDim")
+    add("source shown, then declared in your config.", "NxPluginsDim")
     add("")
 
     local selected = 0
@@ -223,7 +301,7 @@ local Welcome = nx.view.component({
 
     add(
       string.format(
-        "%d of %d selected · <Space> toggle · a all · <CR> install · <Esc> skip",
+        "%d of %d selected · <Space> toggle · a all · <CR> install · ? reference · <Esc> skip",
         selected,
         #view.items
       ),
@@ -233,21 +311,160 @@ local Welcome = nx.view.component({
   end,
 })
 
+-- Mount the customize checklist over a recommended set; `on_done` receives the chosen
+-- raw specs ({} on skip). Reached from the offer screen's `c`, never mounted directly
+-- by the bootstrap — the first ask is the one-decision offer below.
+local function mount_customize(recommended, on_done)
+  -- Size to the CONTENT, not to the item count: rows wrap (`wrap = true`, so a
+  -- source + description past the inner width takes a second display row), and a set
+  -- of a dozen wrapping rows silently loses its last items — and the hint line —
+  -- below the bottom edge otherwise. Estimate the wrapped rows the same way the
+  -- renderer builds them, then clamp both axes to the screen.
+  local cols, rows_avail = nx.o.columns, nx.o.lines
+  local width = math.max(40, math.min(88, cols - 6))
+  local inner = width - 4 -- the border's 2 columns + `padding = "1 2"` on each side
+  local rows = WELCOME_HEADER + 2 -- the header block + the (wrapping) hint line
+  for _, raw in ipairs(recommended) do
+    local src = spec_source(raw)
+    local name = src ~= "" and src or spec_label(raw)
+    local desc = (type(raw) == "table" and raw.desc) or ""
+    local text = "☑ " .. name .. (desc ~= "" and (" — " .. desc) or "")
+    rows = rows + math.max(1, math.ceil(nx.str.displaywidth(text) / inner))
+  end
+  Customize.mount({
+    name = "nx-plugins-customize",
+    filetype = "nxpluginscustomize",
+    float = {
+      width = width,
+      -- + the 2 rows the top/bottom `padding` insets, + 1 spare. Past the screen the
+      -- list simply scrolls under `j` / `k`.
+      height = math.min(rows + 3, math.max(10, rows_avail - 4)),
+      align = "center",
+      border = "rounded",
+      title = "  Choose your plugins  ",
+      grab = true,
+    },
+    props = { recommended = recommended, on_done = on_done },
+  })
+end
+
+-- ----- the first-run offer ----------------------------------------------------
+
+-- The offer is ONE decision — install the recommended set, or don't — because the set
+-- is long enough that listing it here would bury the choice. What it still shows is
+-- the size of the set and the ORIGINS its code comes from (the trust question), with
+-- `c` opening the checklist for the exact per-plugin sources and `?` the reference
+-- page describing every plugin.
+local Offer = nx.view.component({
+  setup = function(ctx, props)
+    local function accept()
+      ctx.close()
+      props.on_done(props.recommended)
+    end
+    ctx.keymap_set("n", "<CR>", accept, { desc = "Install the recommended set" })
+    ctx.keymap_set("n", "y", accept, { desc = "Install the recommended set" })
+
+    ctx.keymap_set("n", "c", function()
+      -- Hand off to the checklist on the NEXT tick: mounting a second grabbing float
+      -- in the same tick this one closes races the layer teardown.
+      ctx.close()
+      nx.on_next_tick(function()
+        mount_customize(props.recommended, props.on_done)
+      end)
+    end, { desc = "Customize the set" })
+
+    ctx.keymap_set("n", "?", open_doc, { desc = "Open the reference page for the set" })
+
+    local function skip()
+      ctx.close()
+      props.on_done({}) -- {} = skipped / installed nothing
+    end
+    ctx.keymap_set("n", "<Esc>", skip, { desc = "Skip" })
+    ctx.keymap_set("n", "q", skip, { desc = "Skip" })
+    ctx.keymap_set("n", "n", skip, { desc = "Skip" })
+
+    -- Wrap the long lines rather than clipping them at the border, and inset the
+    -- content from it (both window-local, so they wait for the winid).
+    nx.wait_for(ctx.winid)
+      :next(function()
+        ctx.wo.wrap = true
+        ctx.wo.padding = "1 2"
+      end)
+      :catch(function() end)
+
+    return { recommended = props.recommended }
+  end,
+
+  render = function(view)
+    local lines, decor = {}, {}
+    local function add(text, hl)
+      lines[#lines + 1] = text
+      if hl then
+        decor[#decor + 1] =
+          { line = #lines - 1, col = 0, end_row = #lines - 1, end_col = #text, hl_group = hl }
+      end
+    end
+    -- An action row: the key highlighted, its explanation dim.
+    local function action(key, what)
+      local text = string.format("  %-7s %s", key, what)
+      lines[#lines + 1] = text
+      local line = #lines - 1
+      local kcol = 2
+      decor[#decor + 1] = {
+        line = line,
+        col = kcol,
+        end_row = line,
+        end_col = kcol + #key,
+        hl_group = "NxPluginsHeader",
+      }
+      decor[#decor + 1] = {
+        line = line,
+        col = kcol + #key,
+        end_row = line,
+        end_col = #text,
+        hl_group = "NxPluginsDim",
+      }
+    end
+
+    add("nxvim ships minimal by design — no bundled plugins.", "NxPluginsDim")
+    add("")
+    add("Install the recommended set?", "NxPluginsHeader")
+    -- The size and the ORIGINS on their own row: together with the question they run
+    -- past the float width and would wrap mid-word.
+    add(
+      string.format(
+        "%d plugins from %s.",
+        #view.recommended,
+        table.concat(set_origins(view.recommended), ", ")
+      ),
+      "NxPluginsDim"
+    )
+    add("")
+    action("<CR>", "Install all of them")
+    action("c", "Customize — see every plugin and pick individually")
+    action("?", "What's in the set — opens the page below in your browser")
+    action("<Esc>", "Skip — :PluginsWelcome reopens this any time")
+    add("")
+    add(nx.plugins.RECOMMENDED_DOC_URL, "NxPluginsDim")
+    return { lines = lines, decor = decor }
+  end,
+})
+
 -- M.ui.welcome(recommended) -> promise resolving to the chosen raw specs ({} on
--- skip/cancel). Backs the first-run flow in M.bootstrap.
+-- skip/cancel). Backs the first-run flow in M.bootstrap: the offer screen, with the
+-- customize checklist one `c` behind it (both resolve this one promise).
 function M.ui.welcome(recommended)
   return nx.promise.new(function(resolve)
-    Welcome.mount({
+    Offer.mount({
       name = "nx-plugins-welcome",
       filetype = "nxpluginswelcome",
       float = {
         width = 74,
-        -- Exact fit: the header lines (WELCOME_HEADER) + one row per item + the hint,
-        -- plus the 2 rows the top/bottom `padding` insets, plus 4 spare rows so the
-        -- longer descriptions (which now wrap as real text onto a second display row
-        -- at this width — e.g. the debugger entry) aren't pushed below the float's
+        -- The offer's layout is fixed (11 rows), plus the 2 rows the top/bottom
+        -- `padding` insets and 1 spare so a long origins list (or an action line, on a
+        -- narrow terminal) can take a second display row without falling off the
         -- bottom edge.
-        height = #recommended + WELCOME_HEADER + 7,
+        height = 14,
         align = "center",
         border = "rounded",
         title = "  Welcome to nxvim  ",
@@ -608,7 +825,7 @@ nx.command("Plugins", function()
   M.ui.open()
 end, { desc = "Open the nx.plugins manager UI (lazy-style dashboard)." })
 
--- :PluginsWelcome — open the first-run welcome checklist ON DEMAND, ignoring the
+-- :PluginsWelcome — open the first-run welcome offer ON DEMAND, ignoring the
 -- ask-once marker and the "no plugins declared yet" gate that `M.bootstrap` checks.
 -- Confirming runs the same accept path as first-run (persist the chosen subset to the
 -- managed `<config>/lua/plugins.lua`, declare them, and sync), so it both lets a user

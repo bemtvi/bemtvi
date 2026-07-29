@@ -51,6 +51,8 @@ browsable in this repository under
 
 ## See also
 
+- [Recommended plugins](recommended-plugins.md) — the same plugins from the *user's*
+  side: what nxvim offers on first run, what each gives you, and how to pick a subset.
 - [Writing plugins](plugin-authoring.md) — the authoring guide these implement.
 - [Testing plugins](plugin-testing.md) — how their test suites are structured.
 - [The nx.* model](nx-model.md) — the five rules they all obey; the **nx.\* API

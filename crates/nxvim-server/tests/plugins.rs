@@ -589,9 +589,9 @@ async fn setup_root_and_config(rpc: &Rpc, tag: &str) -> (std::path::PathBuf, std
     (root, cfg)
 }
 
-// On a fresh setup the first-run flow opens the WELCOME checklist; confirming it
-// (items pre-ticked) writes the chosen set to the user's config (a separate
-// plugins.lua that init.lua requires) and installs+loads it now.
+// On a fresh setup the first-run flow opens the WELCOME offer; accepting it (the whole
+// recommended set) writes it to the user's config (a separate plugins.lua that init.lua
+// requires) and installs+loads it now.
 #[tokio::test]
 async fn first_run_offers_recommended_and_persists_on_yes() {
     let (rpc, _i) = start().await;
@@ -610,15 +610,15 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
     )
     .await;
 
-    // The welcome checklist view appears (after the async marker check) and grabs
-    // focus — the current buffer becomes the welcome view.
+    // The welcome offer appears (after the async marker check) and grabs focus — the
+    // current buffer becomes the welcome view.
     assert!(
         poll_true(&rpc, "return nx.plugins._prompting == true").await,
         "the recommended-set welcome should appear on a fresh setup"
     );
     assert!(
         poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
-        "the welcome checklist view should be focused"
+        "the welcome offer view should be focused"
     );
     // The welcome view wraps long lines so its intro / hint stay fully readable, and
     // insets its content from the border via the 'padding' window option.
@@ -635,7 +635,7 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
         "the welcome view should set a 'padding' margin"
     );
 
-    // <CR> confirms the pre-ticked set → install + load + persist.
+    // <CR> accepts the whole offered set → install + load + persist.
     assert!(
         feed_until(&rpc, "<CR>", "return nx.plugins._loaded.zeta == true").await,
         "confirming the welcome installs and loads the recommended set"
@@ -666,7 +666,7 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
 }
 
 // The first-run flow must not install silently in the background: confirming the
-// welcome checklist OPENS THE MANAGER DASHBOARD, and the chosen set installs THERE
+// welcome offer OPENS THE MANAGER DASHBOARD, and the chosen set installs THERE
 // with live per-plugin status. (Regression: bootstrap used to `await M.sync()` with
 // no UI, so the welcome vanished and installs ran invisibly.)
 #[tokio::test]
@@ -795,9 +795,91 @@ async fn vim_enter_triggers_the_first_run_prompt() {
     );
 }
 
+// ----- the offer screen: one decision, with the list behind `c` --------------
+
+/// Wait for the first-run OFFER, then `c` into the customize checklist — the path to
+/// every per-plugin assertion now that the offer itself lists nothing.
+async fn open_customize(rpc: &Rpc) -> bool {
+    poll_true(rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await
+        && feed_until(rpc, "c", "return vim.bo.filetype == 'nxpluginscustomize'").await
+}
+
+// The offer is ONE decision: it must NOT enumerate the set (that's what made it too
+// long to read), but it must still answer "whose code is this?" — so it names the
+// distinct ORIGINS of the sources, and the count of what's being offered.
+#[tokio::test]
+async fn welcome_offer_summarizes_instead_of_listing_the_set() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_offer_src");
+    let repo1 = make_repo(&src, "alpha");
+    let repo2 = make_repo(&src, "beta");
+    let _cfg = setup_root_and_config(&rpc, "plug_offer").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{r1}\", name = \"alpha\" }},\n\
+               {{ \"file://{r2}\", name = \"beta\" }} }})\n\
+             nx.plugins.bootstrap()",
+            r1 = q(&repo1),
+            r2 = q(&repo2)
+        ),
+    )
+    .await;
+
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+
+    // The offer names the count and the shared origin (the temp dir both repos sit in).
+    let origin = format!("file://{}", q(&src));
+    let mut summarized = false;
+    for _ in 0..200 {
+        let ls = lines(&rpc).await;
+        if ls
+            .iter()
+            .any(|l| l.contains("2 plugins from") && l.contains(&origin))
+        {
+            summarized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        summarized,
+        "the offer should summarize the set (count + origins); got {:?}",
+        lines(&rpc).await
+    );
+
+    // …and it must not enumerate it: no per-plugin checklist rows on this screen.
+    let ls = lines(&rpc).await;
+    assert!(
+        !ls.iter().any(|l| l.contains('☑') || l.contains('☐')),
+        "the offer must not list the individual plugins; got {ls:?}"
+    );
+
+    // `c` is the way to the full list — and the per-plugin sources are there.
+    assert!(
+        feed_until(&rpc, "c", "return vim.bo.filetype == 'nxpluginscustomize'").await,
+        "`c` should open the customize checklist"
+    );
+    let needle = format!("file://{}", repo1.display());
+    let mut listed = false;
+    for _ in 0..200 {
+        if lines(&rpc)
+            .await
+            .iter()
+            .any(|l| l.contains('☑') && l.contains(&needle))
+        {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(listed, "the customize checklist should list every source");
+}
+
 // ----- partial selection: unticking excludes a plugin ------------------------
 
-// The headline of the welcome checklist: the user can untick the plugins they don't
+// The headline of the customize checklist: the user can untick the plugins they don't
 // want. With two recommended, unticking the second installs + persists only the first.
 #[tokio::test]
 async fn welcome_untick_excludes_a_plugin() {
@@ -819,9 +901,9 @@ async fn welcome_untick_excludes_a_plugin() {
     )
     .await;
 
-    // Welcome up and rendered with both items pre-ticked. Rendered content ⇒ the
-    // component's setup ran and its buffer-local maps are bound.
-    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+    // Offer up, `c` into the checklist, rendered with both items pre-ticked. Rendered
+    // content ⇒ the component's setup ran and its buffer-local maps are bound.
+    assert!(open_customize(&rpc).await);
     let mut rendered = false;
     for _ in 0..200 {
         let ls = lines(&rpc).await;
@@ -831,7 +913,10 @@ async fn welcome_untick_excludes_a_plugin() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(rendered, "welcome should render both items pre-ticked");
+    assert!(
+        rendered,
+        "the checklist should render both items pre-ticked"
+    );
 
     // Jump to the second item (line 5 = 2 intro lines + a blank + item #2) with the
     // builtin `5G` motion (not remapped), then untick it with <Space>.
@@ -866,7 +951,7 @@ async fn welcome_untick_excludes_a_plugin() {
     );
 }
 
-// On mount the welcome must land the cursor ON the first item, not above the list:
+// On mount the checklist must land the cursor ON the first item, not above the list:
 // otherwise `move()` clamps the off-list cursor to row 1 and the very first `j`
 // jumps straight to the SECOND item, skipping the first. The placement has to
 // survive the float grab, which lands a tick after mount.
@@ -890,7 +975,7 @@ async fn welcome_starts_cursor_on_first_item() {
     )
     .await;
 
-    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+    assert!(open_customize(&rpc).await);
 
     // The first item is at 1-based line WELCOME_HEADER + 1 = 4 (2 intro + 1 blank).
     let mut landed = false;
@@ -903,7 +988,7 @@ async fn welcome_starts_cursor_on_first_item() {
     }
     assert!(
         landed,
-        "the welcome cursor should start on the first item (line 4); got {:?}",
+        "the checklist cursor should start on the first item (line 4); got {:?}",
         cursor(&rpc).await
     );
 
@@ -912,11 +997,11 @@ async fn welcome_starts_cursor_on_first_item() {
     assert_eq!(
         cursor(&rpc).await.0,
         4,
-        "the welcome cursor should rest on the first item, not drift off the list"
+        "the checklist cursor should rest on the first item, not drift off the list"
     );
 }
 
-// ----- the welcome checklist is a trust gate: it must show the full source ----
+// ----- the customize checklist is a trust gate: it must show the full source -
 
 // Ticking a recommendation fetches and runs that code, so the checklist has to show
 // the EXACT clone target (owner/repo / url / dir), never just a friendly name + a
@@ -942,7 +1027,7 @@ async fn welcome_shows_the_full_source_not_just_name_and_desc() {
     )
     .await;
 
-    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+    assert!(open_customize(&rpc).await);
 
     // The rendered checklist line carries the FULL source path, not just "friendly".
     let needle = format!("file://{repo}", repo = repo.display());
@@ -957,13 +1042,13 @@ async fn welcome_shows_the_full_source_not_just_name_and_desc() {
     }
     assert!(
         shown,
-        "the welcome checklist must render the full source ({needle}) on the ticked item, \
+        "the customize checklist must render the full source ({needle}) on the ticked item, \
          not hide it behind the name/desc"
     );
 }
 
 // A long plugin description must be REAL buffer text, not an end-of-line virt_text
-// decoration: only real text wraps with the window (the welcome sets wrap=true), so a
+// decoration: only real text wraps with the window (the checklist sets wrap=true), so a
 // description longer than the float width would otherwise be truncated at the right
 // edge instead of flowing onto a continuation row. Asserting the desc lands in
 // nvim_buf_get_lines proves it is wrappable buffer content rather than virtual text.
@@ -987,7 +1072,7 @@ async fn welcome_long_description_is_wrappable_real_text() {
     )
     .await;
 
-    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+    assert!(open_customize(&rpc).await);
 
     // The description text must show up in the BUFFER LINES, not only as a virt_text
     // decoration — that is what lets wrap=true reflow it instead of clipping it.
@@ -1001,7 +1086,7 @@ async fn welcome_long_description_is_wrappable_real_text() {
     }
     assert!(
         shown,
-        "the welcome description must be real buffer text (so wrap can reflow it), \
+        "the checklist description must be real buffer text (so wrap can reflow it), \
          not an end-of-line virt_text decoration that gets clipped at the float edge"
     );
 }
@@ -1220,7 +1305,7 @@ async fn one_esc_dismisses_the_restart_notice() {
     );
 }
 
-// `:PluginsWelcome` opens the welcome checklist ON DEMAND, ignoring the first-run
+// `:PluginsWelcome` opens the welcome offer ON DEMAND, ignoring the first-run
 // ask-once marker (and the "no plugins declared" gate), then installs + persists the
 // chosen set — the way to re-pick the recommended set after first-run is over.
 #[tokio::test]
@@ -1246,7 +1331,7 @@ async fn plugins_welcome_command_reopens_after_marker() {
     exec_lua(&rpc, "vim.cmd('PluginsWelcome')").await;
     assert!(
         poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
-        ":PluginsWelcome should open the checklist even after the marker exists"
+        ":PluginsWelcome should open the offer even after the marker exists"
     );
     assert!(
         feed_until(&rpc, "<CR>", "return nx.plugins._loaded.kappa == true").await,
@@ -1300,11 +1385,52 @@ async fn built_in_default_recommended_offers_when_config_registers_none() {
         poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
         "a fresh setup with the default offered shows the welcome"
     );
+
+    // The offer summarizes the REAL built-in set: its size, and the origins its code
+    // comes from — including `rafamadriz` (friendly-snippets), which is only reachable
+    // as a dependency, so this also proves dependencies count toward the trust summary.
+    let n = exec_lua(&rpc, "return #nx.plugins._recommended").await;
+    let n = n.as_i64().expect("recommended count");
+    let want = format!("{n} plugins from github.com/nxvim, github.com/rafamadriz.");
+    let mut summarized = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.iter().any(|l| l.contains(&want)) {
+            summarized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        summarized,
+        "the offer should summarize the built-in set as {want:?}; got {:?}",
+        lines(&rpc).await
+    );
+
+    // `c` lists every one of them, each with its exact clone source.
+    assert!(feed_until(&rpc, "c", "return vim.bo.filetype == 'nxpluginscustomize'").await);
+    let mut listed = false;
+    for _ in 0..200 {
+        let ls = lines(&rpc).await;
+        if ls.iter().filter(|l| l.contains('☑')).count() == n as usize
+            && ls.iter().any(|l| l.contains("nxvim/nxvim-tree"))
+        {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        listed,
+        "the checklist should list all {n} built-in recommendations with their sources; \
+         got {:?}",
+        lines(&rpc).await
+    );
+
     // Skip it — no clone, hermetic.
     feed_until(
         &rpc,
         "<Esc>",
-        "return vim.bo.filetype ~= 'nxpluginswelcome'",
+        "return vim.bo.filetype ~= 'nxpluginscustomize'",
     )
     .await;
 }

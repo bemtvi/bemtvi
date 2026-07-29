@@ -7,6 +7,7 @@ src/api/
 src/features/
 src/architecture/
 src/appendix/
+src/guide/recommended-plugins.md
 src/plugins/nx-model.md
 src/plugins/first-party.md
 src/plugins/authoring.md

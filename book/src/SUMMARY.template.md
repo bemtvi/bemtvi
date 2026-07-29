@@ -18,6 +18,7 @@
 
 - [Getting started](guide/getting-started.md)
 - [Configuration](guide/configuration.md)
+- [Recommended plugins](guide/recommended-plugins.md)
 
 # Beyond vim
 

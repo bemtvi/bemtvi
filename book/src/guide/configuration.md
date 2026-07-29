@@ -89,11 +89,12 @@ ex-commands:
 | `:PluginLock` | Record every installed plugin's commit to the lockfile |
 | `:PluginRestore` | Check out every plugin at the commit the lockfile records |
 | `:PluginList` | Print a one-line status (installed / loaded / missing) per plugin |
-| `:PluginsWelcome` | Reopen the first-run welcome checklist of recommended plugins |
+| `:PluginsWelcome` | Reopen the first-run offer of recommended plugins |
 
-nxvim ships minimal; on a fresh setup the welcome checklist offers a recommended
-first-party set pre-ticked. See [Writing plugins](../plugins/authoring.md) for
-authoring your own.
+nxvim ships minimal; on a fresh setup it offers a recommended first-party set as
+one decision, with `c` opening a checklist to pick individually — see
+[Recommended plugins](recommended-plugins.md) for what's in it. See
+[Writing plugins](../plugins/authoring.md) for authoring your own.
 
 ### The lockfile
 

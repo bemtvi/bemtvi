@@ -75,6 +75,7 @@ IMPORTS = [
     ("docs/browser-editor.md", "features/browser-editor.md"),
     ("docs/edit-host-split.md", "features/edit-host-split.md"),
     ("docs/architecture.md", "architecture/overview.md"),
+    ("docs/recommended-plugins.md", "guide/recommended-plugins.md"),
     ("docs/nx-model.md", "plugins/nx-model.md"),
     ("docs/first-party-plugins.md", "plugins/first-party.md"),
     ("docs/plugin-authoring.md", "plugins/authoring.md"),

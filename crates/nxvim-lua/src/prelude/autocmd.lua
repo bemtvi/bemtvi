@@ -841,6 +841,126 @@ arm_settle = function(ctx, cursor, waits, round, on_done)
   end)
 end
 
+-- ----- the startup announce window --------------------------------------------
+
+-- Plugins load **asynchronously**. `nx.plugins` awaits a spec's directory before
+-- sourcing it, and a spec's `config` may `nx.await` on its own — so a plugin's `config`,
+-- and every autocmd that config registers, lands several ticks into startup, *after* the
+-- file named on the command line has been read. Painting before the plugins are up is
+-- deliberate (it is what makes `nxvim file.txt` open instantly), so the read genuinely
+-- happens first — and a plugin whose behavior hangs off `BufReadPost` therefore does
+-- nothing at all for that file, while `:e` on the same file later in the same session
+-- works. Restored session windows have the same gap for the same reason.
+--
+-- The fix is the guarantee the settle protocol already gives *within* one fire — "late
+-- subscribers still get the event" — widened to the plugin-load boundary. Every
+-- first-announce event fired before the plugins are ready is RECORDED here; when
+-- `PluginsLoaded` closes the window, each record is re-dispatched to the handlers that
+-- registered inside it. Nothing is delayed (the built-in `FileType` consumers —
+-- treesitter, LSP attach — still fire on the read, so the file colours immediately) and
+-- nothing fires twice: delivery is filtered by the same registration watermark that
+-- guards the async replay, and the two share one cursor per fire, so a handler either
+-- path has already served is never re-run by the other.
+--
+-- Only the **first-announce** events are replayable. They fire once per read and carry
+-- no pairing semantics, so re-delivering one is unambiguous. `BufEnter` / `BufWinEnter`
+-- are deliberately NOT here: they mean "became current" / "became displayed", which may
+-- no longer be true when the window closes, and a `BufEnter` replayed without its
+-- `BufLeave` twin would be a lie about editor state.
+local REPLAYABLE_TO_PLUGINS = {
+  BufReadPost = true,
+  BufNewFile = true,
+  FileType = true,
+}
+
+-- Open until `PluginsLoaded` (`nx._replay_startup_announces`), which happens exactly
+-- once per session. While open, every replayable fire is recorded below; once closed,
+-- recording stops for good and a read announces to its handlers and no one else.
+local startup_window_open = true
+-- The recorded announces in fire order, plus a `(event, buffer)` -> position index that
+-- keeps the list deduped: a buffer re-read (`:e!`) or a filetype changed during startup
+-- replays only its LATEST state, in the position its first announce took — so a record
+-- pair stays in `BufReadPost` → `FileType` order.
+local startup_announces = {}
+local startup_index = {}
+
+-- Record one replayable fire. `cursor` is the fire's shared delivered-up-to box (see
+-- `arm_settle`), held by reference rather than copied: if the fire is still settling
+-- when the window closes, both replay paths read and advance the same watermark.
+local function record_startup_announce(ctx, cursor)
+  local key = ctx.event .. "\0" .. tostring(ctx.buf)
+  local rec = { ctx = ctx, cursor = cursor }
+  local at = startup_index[key]
+  if at then
+    startup_announces[at] = rec
+  else
+    startup_announces[#startup_announces + 1] = rec
+    startup_index[key] = #startup_announces
+  end
+end
+
+-- Close the startup announce window and hand every recorded announce to the handlers
+-- that registered while it was open — the plugins. Called once, by the plugin manager,
+-- as `PluginsLoaded` fires (`prelude/plugins.lua`).
+--
+-- Each record is dispatched with its own watermark as `min_id`, so a handler that
+-- already received the event (your `init.lua`'s, which was registered before the read)
+-- is skipped and a plugin's is served. A replayed handler may itself register more
+-- handlers, so the pass repeats while the registry keeps growing, bounded by
+-- `REPLAY_MAX_ROUNDS` like the async replay. A buffer closed since its announce is
+-- dropped rather than announced under a dead id — read from the live `nx._bufs` mirror
+-- each round, since a replayed handler can itself delete a buffer. Returns how many
+-- handler invocations it made, for the tests.
+function nx._replay_startup_announces()
+  if not startup_window_open then
+    return 0
+  end
+  startup_window_open = false
+  local records = startup_announces
+  startup_announces, startup_index = {}, {}
+  local delivered = 0
+  for _ = 1, REPLAY_MAX_ROUNDS do
+    local grew = false
+    for _, rec in ipairs(records) do
+      local ctx, cursor = rec.ctx, rec.cursor
+      local next_hw = autocmd_seq
+      -- A nil mirror means "not published yet", not "no buffers": never let a missing
+      -- mirror silently swallow every replay.
+      local bufs = nx._bufs
+      if next_hw > cursor.hw and (ctx.buf == nil or bufs == nil or bufs[ctx.buf] ~= nil) then
+        au_dispatch(ctx.event, ctx.pattern, ctx.buf, function(au)
+          local cb = au.opts.callback
+          if type(cb) == "function" then
+            -- Nothing is sequenced behind a replay, so a returned promise is tracked
+            -- (its rejection still surfaces, named for the event) but not awaited.
+            track_au_promise(
+              cb({
+                id = au.id,
+                event = ctx.event,
+                match = ctx.pattern,
+                buf = ctx.buf,
+                file = ctx.file or ctx.pattern,
+                data = ctx.data,
+              }),
+              ctx.event
+            )
+            delivered = delivered + 1
+          elseif type(au.opts.command) == "string" then
+            vim.cmd(au.opts.command)
+            delivered = delivered + 1
+          end
+        end, nil, cursor.hw)
+        cursor.hw = next_hw
+        grew = true
+      end
+    end
+    if not grew then
+      break
+    end
+  end
+  return delivered
+end
+
 -- `nx.autocmd.pending()` -> the autocmd handler promises still in flight past their
 -- settle budget, as `{ event, buf, site, elapsed_ms, budget }` entries. A handler that
 -- hangs forever never settles and so never warns on completion — this is where it stays
@@ -905,16 +1025,28 @@ function nx._fire(event, pattern, buf, file, data, group)
       any = true
     end
   end, group)
+  -- A first-announce event fired before the plugins are up is recorded for replay when
+  -- they land (see `record_startup_announce`). Only editor-triggered fires: a manual
+  -- `nx.autocmd.exec(..., { group = … })` is scoped to one group by intent, and
+  -- re-delivering it to every subscriber later would break that scoping.
+  local replayable = startup_window_open and group == nil and REPLAYABLE_TO_PLUGINS[event]
   -- Only a fire that actually went async pays for the settle protocol; with no pending
   -- promise this returns exactly as it always did — same tick, no timer, no bookkeeping
   -- — which is the overwhelmingly common case and every case on the hot path.
-  if waits then
-    arm_settle(
-      { event = event, pattern = pattern, buf = buf, file = file, data = data, group = group },
-      { hw = watermark },
-      waits,
-      1
-    )
+  if waits or replayable then
+    local ctx =
+      { event = event, pattern = pattern, buf = buf, file = file, data = data, group = group }
+    -- The delivered-up-to watermark, shared by the async settle's replay rounds and the
+    -- startup-window replay so neither re-runs a handler the other already served. A
+    -- fire that stayed synchronous has reached every handler registered so far — even
+    -- one a handler added mid-pass — so its cursor starts at the current id instead.
+    local cursor = { hw = waits and watermark or autocmd_seq }
+    if waits then
+      arm_settle(ctx, cursor, waits, 1)
+    end
+    if replayable then
+      record_startup_announce(ctx, cursor)
+    end
   end
   return any
 end
@@ -973,18 +1105,24 @@ function nx._fire_gated(event, pattern, buf, file, gate_id, data)
       track_au_promise(ret, event)
     end
   end)
+  -- The read chain's stages come through here, so this is where the startup file's
+  -- `BufReadPost` / `FileType` get recorded for the plugins that were not loaded yet.
+  local replayable = startup_window_open and REPLAYABLE_TO_PLUGINS[event]
+  if not waits and not replayable then
+    return true
+  end
+  local ctx = { event = event, pattern = pattern, buf = buf, file = file, data = data }
+  -- One shared watermark per fire — see the twin in `nx._fire`.
+  local cursor = { hw = waits and watermark or autocmd_seq }
+  if replayable then
+    record_startup_announce(ctx, cursor)
+  end
   if not waits then
     return true
   end
-  arm_settle(
-    { event = event, pattern = pattern, buf = buf, file = file, data = data },
-    { hw = watermark },
-    waits,
-    1,
-    function()
-      nx._au_gate_done(gate_id)
-    end
-  )
+  arm_settle(ctx, cursor, waits, 1, function()
+    nx._au_gate_done(gate_id)
+  end)
   return false
 end
 

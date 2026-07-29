@@ -67,6 +67,10 @@ plugin's `config` runs (possibly `nx.await`-ing), it registers its own `FileType
 handler — and that handler still fires for the buffer that woke it. Nothing fires
 twice: delivery is filtered by registration order, not replayed wholesale.
 
+**Plugins loading late still get the startup file's events.** This is the same
+guarantee widened to the plugin-load boundary — see
+[Plugins and the startup file](#plugins-and-the-startup-file).
+
 **The read sequence is ordered.** `BufReadPost` → `FileType` → `BufEnter` →
 `BufWinEnter` advances one stage at a time, each waiting for the previous stage's async
 handlers to finish. So a `BufReadPost` handler that detects the filetype asynchronously
@@ -96,7 +100,7 @@ A handler that never settles at all never reports completion, so it stays listed
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `BufAdd` | A buffer is added to the buffer list — before its `BufReadPost` (a file open into a fresh buffer adds it, then reads it). | Fires with the *added* buffer as `<afile>` (`buf` / `file`), so a `:badd` that never enters the buffer still carries it. The startup buffer never fires it (it is the baseline, like `WinNew`/`TabNew` skip the initial window/tab); only buffers created **after** startup do. `BufCreate` is an accepted alias (see [Event aliases](#event-aliases)). |
-| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). Fires for **every** buffer that lands in a window, not only the focused one — so a session/workspace restore announces each restored file rather than leaving background splits uninitialised until you focus them. `buf` / `file` set. `BufRead` is an accepted alias (see [Event aliases](#event-aliases)). |
+| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). Fires for **every** buffer that lands in a window, not only the focused one — so a session/workspace restore announces each restored file rather than leaving background splits uninitialised until you focus them. `buf` / `file` set. `BufRead` is an accepted alias (see [Event aliases](#event-aliases)). A handler registered while the plugins were still loading is **replayed** the reads that happened before it — see [Plugins and the startup file](#plugins-and-the-startup-file). |
 | `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
 | `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. On the first announce it is ordered behind `BufReadPost`'s handlers, including async ones — see [What happens when a handler is async](#what-happens-when-a-handler-is-async). |
 | `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. Hot-path, so handlers must be synchronous. On a buffer's first announce it is ordered last, after `BufReadPost` and `FileType` have settled. Restoring a session does **not** fire it for background windows — nothing became current there. |
@@ -105,6 +109,45 @@ A handler that never settles at all never reports completion, so it stays listed
 | `BufDelete` | Just before a buffer is deleted (`:bdelete`), while its state still exists. | `buf` / `file` set. |
 
 Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter` → `BufWinEnter`, and an async handler does not reorder it — see [What happens when a handler is async](#what-happens-when-a-handler-is-async).
+
+### Plugins and the startup file
+
+Plugins load **asynchronously**. `nx.plugins` awaits a spec's directory before sourcing
+it, and a spec's `config` may `nx.await` on its own — so a plugin's `config`, and every
+autocmd that config registers, lands several ticks into startup. The file you named on
+the command line has already been read by then. Painting before the plugins are up is
+deliberate: it is what makes `nxvim file.txt` open instantly.
+
+You do not have to work around it. Every first-announce event fired before the plugins
+were ready is **replayed** to the handlers that registered while they were loading, when
+`PluginsLoaded` fires:
+
+```
+BufReadPost   -> the handlers that exist now (your init.lua's, the built-in
+FileType         treesitter / LSP attach) — so the file colours immediately
+BufEnter
+VimEnter
+  <plugin configs run, registering their own BufReadPost / FileType handlers>
+PluginsLoaded -> BufReadPost / FileType replayed to exactly those handlers
+```
+
+So a plugin registers a plain `BufReadPost` handler and sees the startup file, with the
+buffer and the match it was read with. There is no separate event to hook and no sweep
+of `nx.buf.list()` to write. Restored session windows are covered the same way.
+
+Three things worth knowing:
+
+- **Nothing fires twice.** Delivery is filtered by registration order, the same
+  watermark the async replay above uses. A handler registered *before* the read — one
+  from your `init.lua` — receives it on the read and is never replayed to.
+- **Only `BufReadPost`, `BufNewFile` and `FileType` are replayed.** They fire once per
+  read and carry no pairing semantics, so re-delivering one is unambiguous. `BufEnter`
+  and `BufWinEnter` are not: they mean "became current" / "became displayed", which may
+  no longer be true by the time the plugins land, and a `BufEnter` replayed without its
+  `BufLeave` twin would misreport editor state.
+- **The window is a startup one.** It closes at `PluginsLoaded` and never reopens, so a
+  handler registered later — by a lazy plugin, or by you at the `:` prompt — gets the
+  reads that follow it and nothing from before.
 
 ## Writing
 
@@ -194,7 +237,7 @@ Fired by the built-in plugin manager (`nx.plugins`). See [Writing nxvim plugins]
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
-| `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. |
+| `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. It is also the point the startup announce window closes — see [Plugins and the startup file](#plugins-and-the-startup-file). |
 | `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `nx.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |
 
 ## User

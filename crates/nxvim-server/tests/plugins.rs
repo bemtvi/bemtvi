@@ -1657,6 +1657,198 @@ async fn plugins_loaded_event_fires_after_all_eager_settle() {
     );
 }
 
+// ----- the startup announce window: a plugin still sees the startup file ------
+
+// The gap this closes. `nx.plugins` activates an eager spec asynchronously (it awaits the
+// spec's dir before sourcing it), so the plugin's `config` — and every autocmd that config
+// registers — lands several ticks into startup, after the startup file's `BufReadPost` has
+// come and gone. A plugin whose behavior hangs off the read event would therefore do
+// nothing at all for `nxvim file.txt`, while `:e file.txt` in the same session works.
+//
+// The fix is a replay, not a delay: the read fires on time (built-in `FileType` consumers
+// still colour the file immediately), and it is re-announced to the handlers registered
+// while the plugins were loading. This test registers BOTH handlers from an ASYNC config
+// and asserts each one saw the startup file, with the buffer and match it was read with.
+#[tokio::test]
+async fn startup_read_is_replayed_to_a_plugin_that_loaded_after_it() {
+    let base = temp_dir("plug_late_read");
+
+    // The file the editor opens on the command line — read before any plugin loads.
+    let startup = base.join("startup.rs");
+    std::fs::write(&startup, "fn main() {}\n").unwrap();
+
+    // A local plugin dir whose module has real content, so the async config below
+    // genuinely settles a few ticks after the load starts.
+    let plugin_dir = base.join("tardy");
+    std::fs::create_dir_all(plugin_dir.join("lua").join("tardy")).unwrap();
+    let module = plugin_dir.join("lua").join("tardy").join("init.lua");
+    std::fs::write(&module, "return { marker = true }\n").unwrap();
+
+    let config = base.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("init.lua"),
+        format!(
+            "nx.plugins {{ {{ name = \"tardy\", dir = \"{dir}\", config = function()\n\
+               local txt = nx.await(nx.fs.read_text(\"{f}\"))\n\
+               _G.tardy_cfg = #txt > 0\n\
+               nx.on(\"BufReadPost\", {{}}, function(a)\n\
+                 _G.read = a.file\n\
+                 _G.read_buf = a.buf\n\
+                 _G.read_after_cfg = _G.tardy_cfg == true\n\
+               end)\n\
+               nx.on(\"FileType\", {{}}, function(a) _G.ft = a.match end)\n\
+             end }} }}\n",
+            dir = q(&plugin_dir),
+            f = q(&module)
+        ),
+    )
+    .unwrap();
+
+    let init = ServerInit {
+        file: Some(startup.to_string_lossy().into_owned()),
+        config_dir: Some(config.clone()),
+        runtimepath: vec![config.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+
+    assert!(
+        poll_true(&rpc, "return _G.read ~= nil").await,
+        "a plugin's BufReadPost must reach the startup file even though the plugin \
+         loaded after the read"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.read").await.as_str(),
+        Some(startup.to_string_lossy().as_ref()),
+        "the replay names the file that was actually read"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.read_buf == vim.api.nvim_get_current_buf()").await,
+        Some(true),
+        "and carries that buffer's own id"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.read_after_cfg == true").await,
+        Some(true),
+        "the replay lands only after the plugin's async config had settled"
+    );
+    // `FileType` is replayed too — this is what makes an ftplugin-shaped plugin work
+    // on the startup file.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.ft").await.as_str(),
+        Some("rust"),
+        "FileType is replayed with the buffer's filetype as the match"
+    );
+}
+
+// The replay must not double-deliver. The config's OWN handler is registered before the
+// startup read, so it receives the event once, on the read — and the replay, which is
+// filtered by the same registration watermark the async settle uses, must skip it.
+#[tokio::test]
+async fn the_startup_replay_does_not_redeliver_to_handlers_that_already_saw_it() {
+    let base = temp_dir("plug_replay_once");
+    let startup = base.join("startup.rs");
+    std::fs::write(&startup, "fn main() {}\n").unwrap();
+
+    let plugin_dir = base.join("tardy");
+    std::fs::create_dir_all(plugin_dir.join("lua").join("tardy")).unwrap();
+    let module = plugin_dir.join("lua").join("tardy").join("init.lua");
+    std::fs::write(&module, "return {}\n").unwrap();
+
+    let config = base.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("init.lua"),
+        format!(
+            "_G.cfg_reads, _G.cfg_fts = 0, 0\n\
+             nx.on(\"BufReadPost\", {{}}, function() _G.cfg_reads = _G.cfg_reads + 1 end)\n\
+             nx.on(\"FileType\", {{}}, function() _G.cfg_fts = _G.cfg_fts + 1 end)\n\
+             nx.plugins {{ {{ name = \"tardy\", dir = \"{dir}\", config = function()\n\
+               nx.await(nx.fs.read_text(\"{f}\"))\n\
+               _G.plugin_reads = 0\n\
+               nx.on(\"BufReadPost\", {{}}, function() _G.plugin_reads = _G.plugin_reads + 1 end)\n\
+             end }} }}\n",
+            dir = q(&plugin_dir),
+            f = q(&module)
+        ),
+    )
+    .unwrap();
+
+    let init = ServerInit {
+        file: Some(startup.to_string_lossy().into_owned()),
+        config_dir: Some(config.clone()),
+        runtimepath: vec![config.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+
+    assert!(
+        poll_true(&rpc, "return _G.plugin_reads == 1").await,
+        "the plugin's handler gets the startup read exactly once"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.cfg_reads").await.as_i64(),
+        Some(1),
+        "the config's handler saw the read on the read itself, and must NOT be replayed to"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.cfg_fts").await.as_i64(),
+        Some(1),
+        "same for FileType"
+    );
+}
+
+// The window is a STARTUP one: it closes at `PluginsLoaded` and never reopens. A handler
+// registered afterwards (a lazy plugin's, a `:lua` at the prompt) gets the reads that
+// follow it and nothing from before — otherwise every later registration would replay the
+// startup file forever.
+#[tokio::test]
+async fn the_startup_replay_window_closes_at_plugins_loaded() {
+    let base = temp_dir("plug_replay_closed");
+    let startup = base.join("startup.rs");
+    std::fs::write(&startup, "fn main() {}\n").unwrap();
+    let later = base.join("later.rs");
+    std::fs::write(&later, "fn later() {}\n").unwrap();
+
+    let config = base.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("init.lua"), "_G.booted = true\n").unwrap();
+
+    let init = ServerInit {
+        file: Some(startup.to_string_lossy().into_owned()),
+        config_dir: Some(config.clone()),
+        runtimepath: vec![config.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+    // With no plugins declared, `PluginsLoaded` fires at `VimEnter` — so by the time we
+    // can run anything over RPC the window is already shut.
+    assert!(poll_true(&rpc, "return nx.plugins._plugins_loaded_fired == true").await);
+
+    let _ = exec_lua(
+        &rpc,
+        "_G.seen = {}\n\
+         nx.on('BufReadPost', {}, function(a) _G.seen[#_G.seen+1] = a.file end)\n\
+         return true",
+    )
+    .await;
+    // Registering did not replay the startup file at it.
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.seen").await.as_i64(),
+        Some(0),
+        "a handler registered after PluginsLoaded is not replayed the startup read"
+    );
+    // But it does get everything from here on.
+    feed(&rpc, &format!(":edit {}<CR>", later.display()));
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.seen[1]").await.as_str(),
+        Some(later.to_string_lossy().as_ref()),
+        "and still receives ordinary reads"
+    );
+}
+
 // ----- PluginLoaded: per-plugin, fires when a specific plugin loads -----------
 
 // `PluginLoaded` lets a config hook a SPECIFIC plugin's load — including a lazy one,

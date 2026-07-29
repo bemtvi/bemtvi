@@ -541,6 +541,13 @@ local function maybe_fire_plugins_loaded()
     return
   end
   M._plugins_loaded_fired = true
+  -- Close the startup announce window FIRST: every buffer read before the plugins
+  -- existed (the startup file, a restored session's windows) is re-announced to the
+  -- handlers the plugins just registered, so a plugin's `BufReadPost` / `FileType`
+  -- sees the file you named on the command line and not only the next one you open.
+  -- Before `PluginsLoaded` itself, because those reads happened earlier in time —
+  -- a handler on both sees the file, then "everything is ready".
+  nx._replay_startup_announces()
   nx.autocmd.exec("PluginsLoaded", {})
 end
 nx._maybe_fire_plugins_loaded = maybe_fire_plugins_loaded

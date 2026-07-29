@@ -2747,9 +2747,11 @@ impl Editor {
     /// front, then hand the remaining file argument to [`ex_edit_file`](Self::ex_edit_file)
     /// with the forced encoding armed for that one read.
     ///
-    /// `:e ++enc=<encoding>` with no filename re-edits the *current* file — the
-    /// "I opened this and it decoded wrong" fix, forcing a specific encoding instead of
-    /// reordering `'fileencodings'`. A bogus encoding fails loud (`E474`).
+    /// With **no filename** it re-edits the *current* file: bare `:e` reloads it from
+    /// disk, `:e!` reloads discarding unsaved changes (vim's revert), and
+    /// `:e ++enc=<encoding>` reloads forcing an encoding — the "I opened this and it
+    /// decoded wrong" fix, instead of reordering `'fileencodings'`. Only a buffer with
+    /// no name at all is an `E32`. A bogus encoding fails loud (`E474`).
     fn ex_edit(&mut self, args: &str, bang: bool) {
         let (forced_enc, file) = match parse_edit_plusplus(args) {
             Ok(parsed) => parsed,
@@ -2759,9 +2761,10 @@ impl Editor {
             }
         };
 
-        // An empty filename after the options re-edits the current file when an encoding
-        // was forced (`:e ++enc=…`); with no options at all it's the usual E32.
-        let file = if file.is_empty() && forced_enc.is_some() {
+        // An empty filename re-edits the current file, whatever the options — `:e` /
+        // `:e!` (vim's reload/revert) as much as `:e ++enc=…`. `E32` is for a buffer that
+        // genuinely has no name, not for the argument being absent.
+        let file = if file.is_empty() {
             match self.current_file_name() {
                 Some(name) => name,
                 None => {
@@ -2799,6 +2802,33 @@ impl Editor {
         // cwd-aware: `:e <abs path of the current relative buffer>` reloads in
         // place too, rather than stranding a duplicate buffer.
         if self.current_buffer_is(&path) {
+            // …*unless* this window was created a moment ago by a split and inherited
+            // exactly this buffer — `:split <the file you are already editing>`. vim takes
+            // `do_ecmd`'s old-buffer path there and reads nothing: the window already
+            // shows the file, so re-reading it would discard unsaved changes (or refuse
+            // with `E37`) and re-root the undo tree, on a command that only asked for a
+            // second view. Consuming the inherit record is what makes the split a
+            // *display* rather than a silent inherit, so `BufWinEnter` still fires for the
+            // new window — which is the half of vim's behavior that is not a no-op.
+            //
+            // A forced `++enc` is the exception: `:split ++enc=… <current file>` asks for
+            // the file to be decoded again, which is a read by definition. Short-circuiting
+            // it would swallow the one thing the command was typed for.
+            let cur_win = self.windows.current;
+            let cur_buf = self.cur_buffer();
+            let inherited = self
+                .forced_read_encoding
+                .is_none()
+                .then(|| {
+                    self.inherited_windows
+                        .iter()
+                        .position(|&(w, b)| w == cur_win && b == cur_buf)
+                })
+                .flatten();
+            if let Some(i) = inherited {
+                self.inherited_windows.remove(i);
+                return;
+            }
             if self.buffer().modified && !bang {
                 self.echo("E37: No write since last change (add ! to override)");
                 return;

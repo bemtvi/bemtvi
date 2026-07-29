@@ -1381,9 +1381,9 @@ async fn editing_a_new_file_into_the_reused_noname_buffer_fires_bufnewfile() {
 #[tokio::test]
 async fn reediting_the_current_file_refires_bufreadpost() {
     // `:e! <file>` re-reads the current file in place; neovim re-fires BufReadPost on
-    // every read, so re-editing the current file fires it again. (The bare `:e!` with
-    // no path is a separate gap — nxvim's `:edit` requires a file argument — out of
-    // scope for this bug.)
+    // every read, so re-editing the current file fires it again. (The bare `:e!` reloads
+    // the same way — see `rereading_the_current_buffer_fires_the_enter_sequence` and
+    // `reediting_with_no_argument_reloads_the_current_file` in `tests/buffers.rs`.)
     let dir = temp_dir("au_reedit_read");
     let file = dir.join("main.rs");
     std::fs::write(&file, "fn main() {}\n").expect("write source file");
@@ -1410,7 +1410,13 @@ async fn reediting_the_current_file_refires_bufreadpost() {
 #[tokio::test]
 async fn switching_buffers_fires_bufleave_for_the_old_buffer() {
     // `:edit b` fires BufLeave for the buffer we leave, then BufEnter for the new
-    // one (vim's BufLeave → BufEnter bracket).
+    // one (vim's BufLeave → BufEnter bracket), and the *read* of the buffer we arrive at
+    // happens between them — neovim leaves first, then reads: `BufLeave` → `BufReadPost`
+    // → `BufEnter` (verified against 0.12.2).
+    //
+    // Regression: `BufLeave` fired after the announce, so a plugin saving the outgoing
+    // buffer's state on the way out ran *after* the incoming buffer's `BufReadPost` had
+    // restored state for the new one — the two handlers of one plugin, inverted.
     let dir = temp_dir("au_bufleave");
     let a = dir.join("a.rs");
     let b = dir.join("b.rs");
@@ -1423,13 +1429,15 @@ async fn switching_buffers_fires_bufleave_for_the_old_buffer() {
          vim.api.nvim_create_autocmd('BufLeave', {\n\
          \x20 callback = function(x) _G.log[#_G.log+1] = 'leave' .. x.buf end })\n\
          vim.api.nvim_create_autocmd('BufEnter', {\n\
-         \x20 callback = function(x) _G.log[#_G.log+1] = 'enter' .. x.buf end })\n",
+         \x20 callback = function(x) _G.log[#_G.log+1] = 'enter' .. x.buf end })\n\
+         vim.api.nvim_create_autocmd('BufReadPost', {\n\
+         \x20 callback = function(x) _G.log[#_G.log+1] = 'read' .. x.buf end })\n",
     )
     .await;
     lua_message(&rpc, &mut incoming, "_G.log = {}").await; // drop startup events
     redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
     let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
-    assert_eq!(msg, "leave1,enter2");
+    assert_eq!(msg, "leave1,read2,enter2");
 }
 
 #[tokio::test]
@@ -1742,10 +1750,10 @@ const BWE_INIT: &str = "_G.bwe = {}\n\
 
 #[tokio::test]
 async fn bufwinenter_fires_once_per_file_when_first_shown_in_a_window() {
-    // BufWinEnter fires for the startup file (like BufReadPost), then once for a
-    // second file when it's first displayed in a window. A no-arg `:split` (the
-    // buffer is already displayed) and merely switching focus between windows do
-    // NOT re-fire it — it tracks a buffer's window-visibility going 0 -> >=1.
+    // BufWinEnter fires for the startup file (like BufReadPost), then for a second file
+    // when a window displays it. A no-arg `:split` — whose new window *inherits* the
+    // buffer it was split off rather than being given one — and merely switching focus
+    // between windows display nothing, so neither fires.
     let dir = temp_dir("au_bwe_basic");
     let a = dir.join("a.rs");
     let b = dir.join("b.rs");
@@ -1811,6 +1819,353 @@ async fn bufwinenter_fires_for_a_buffer_shown_in_a_non_current_window() {
     .unwrap();
     let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await;
     assert_eq!(msg, "a.rs,noname");
+}
+
+#[tokio::test]
+async fn bufwinenter_fires_for_a_second_window_showing_an_already_shown_buffer() {
+    // neovim fires `BufWinEnter` per *window display*, not once per buffer: opening a
+    // buffer in a second window fires again, because `do_ecmd` fires unconditionally for
+    // an already-loaded buffer. (`:h BufWinEnter` still claims `:split` with a file
+    // already open in a window doesn't trigger — stale; nvim 0.12.2 fires.)
+    //
+    // Regression: the model was a per-buffer visibility edge (0 -> >=1 windows), so the
+    // second window showing an already-displayed buffer was silently swallowed — a
+    // per-window plugin (a statusline, a scrollbar) never initialised in that window.
+    let dir = temp_dir("au_bwe_second_win");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    std::fs::write(&b, "fn b() {}\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(&dir, a.to_str().unwrap(), BWE_INIT).await;
+    // A split onto a different file: a fresh display, fires (this much always worked).
+    redraw_after(&rpc, &mut incoming, &format!(":vsplit {}<CR>", b.display())).await;
+    // A split onto a.rs, which the startup window is *already* showing. A second window
+    // now displays it, so it fires again.
+    redraw_after(&rpc, &mut incoming, &format!(":vsplit {}<CR>", a.display())).await;
+    // …and a *tab* onto it is the same story: a new window, a new display. (`:tabnew`
+    // reaches the buffer through the find-or-load kernel rather than a split, so it is a
+    // genuinely separate path through the diff.)
+    redraw_after(&rpc, &mut incoming, &format!(":tabnew {}<CR>", a.display())).await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await;
+    assert_eq!(msg, "a.rs,b.rs,a.rs,a.rs");
+}
+
+#[tokio::test]
+async fn bufwinenter_fires_every_time_a_window_changes_buffer() {
+    // Displaying a buffer in a window fires *every time*, including switching back to one
+    // this window showed a moment ago — neovim's `enter_buffer` fires unconditionally for
+    // an already-loaded buffer, so `:b#`-style ping-ponging fires on each hop. Under the
+    // old per-buffer visibility model the return trip was silent whenever the buffer was
+    // still displayed somewhere.
+    //
+    // One window throughout: `:b <name>` routes focus to a window already showing that
+    // buffer when there is one (nxvim's own `:drop`-like behavior), which would move
+    // focus rather than change any window's buffer — a different case, covered by the
+    // navigation assertions in `tab_switch_fires_no_window_lifecycle_events`.
+    let dir = temp_dir("au_bwe_switch");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    std::fs::write(&b, "fn b() {}\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(&dir, a.to_str().unwrap(), BWE_INIT).await;
+    redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
+    redraw_after(&rpc, &mut incoming, ":b a.rs<CR>").await;
+    redraw_after(&rpc, &mut incoming, ":b b.rs<CR>").await;
+    assert_eq!(
+        lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await,
+        "a.rs,b.rs,a.rs,b.rs"
+    );
+}
+
+#[tokio::test]
+async fn bufwinenter_fires_again_when_the_displayed_buffer_is_reread() {
+    // `:e!` re-reads the file into the same bufnr in the same window: no window changed
+    // which buffer it holds, but neovim fires `BufWinEnter` off the read itself
+    // (`open_buffer`, after the modelines). A visibility-edge model saw nothing change
+    // and stayed silent, so anything that sets up window-local state from buffer content
+    // never re-ran after a reload.
+    let dir = temp_dir("au_bwe_reread");
+    let a = dir.join("a.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    let (rpc, mut incoming) = start_with_file_and_config(&dir, a.to_str().unwrap(), BWE_INIT).await;
+    redraw_after(&rpc, &mut incoming, ":e!<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await;
+    assert_eq!(msg, "a.rs,a.rs");
+}
+
+#[tokio::test]
+async fn rereading_the_current_buffer_fires_the_enter_sequence() {
+    // A re-read of the buffer that is already current runs neovim's whole enter
+    // sequence over the fresh read — `BufReadPost` → `BufEnter` → `BufWinEnter` — and no
+    // `BufLeave`, because nothing was left. (Measured on nvim 0.12.2: `:e!` logs exactly
+    // `BufReadPost, BufEnter, BufWinEnter`.)
+    //
+    // Regression: `BufEnter` was derived purely from the current-buffer id *changing*, so
+    // a reload — which by definition changes nothing — was silent, while its `BufReadPost`
+    // and `BufWinEnter` siblings both fired. A handler that sets a buffer up on entry
+    // (the `BufEnter`-registered half of a plugin whose other half runs on the read) never
+    // re-ran after `:e!`, leaving state derived from the *old* contents in place.
+    let dir = temp_dir("au_reread_enter");
+    let a = dir.join("a.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.log = {}\n\
+         for _, e in ipairs({ 'BufReadPost', 'BufLeave', 'BufEnter', 'BufWinEnter' }) do\n\
+         \x20 nx.on(e, function() _G.log[#_G.log+1] = e end)\n\
+         end\n",
+    )
+    .await;
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await; // drop the startup sequence
+    redraw_after(&rpc, &mut incoming, ":e!<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "BufReadPost,BufEnter,BufWinEnter");
+}
+
+#[tokio::test]
+async fn splitting_onto_the_current_file_displays_without_reading() {
+    // `:vsplit <the file this window already shows>` gives the new window something it
+    // wasn't showing, so it *enters* and *displays* — but it reads nothing, because the
+    // buffer is right there. nvim 0.12.2 logs exactly `BufEnter, BufWinEnter`.
+    //
+    // Regression: nxvim ran the command through the ordinary `:edit` reload, so it also
+    // re-read the file from disk (`BufReadPost`, plus the undo tree re-rooted and an
+    // `E37` on a modified buffer — see `splitting_onto_the_file_you_are_already_editing_
+    // reads_nothing` in `tests/buffers.rs`). Firing `BufWinEnter` off that spurious read
+    // made the display look correct while it was riding the wrong signal entirely.
+    let dir = temp_dir("au_split_same");
+    let a = dir.join("a.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.log = {}\n\
+         for _, e in ipairs({ 'BufReadPost', 'BufLeave', 'BufEnter', 'BufWinEnter' }) do\n\
+         \x20 nx.on(e, function() _G.log[#_G.log+1] = e end)\n\
+         end\n",
+    )
+    .await;
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await; // drop the startup sequence
+    redraw_after(&rpc, &mut incoming, &format!(":vsplit {}<CR>", a.display())).await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "BufEnter,BufWinEnter");
+}
+
+#[tokio::test]
+async fn bufwinenter_fires_with_the_displaying_window_current() {
+    // `BufWinEnter` is about a *window*, and neovim has entered that window by the time a
+    // handler runs — so per-window setup (the whole reason it fires per window) has to
+    // address the window that displayed, not whichever one happens to be focused. Here a
+    // *background* window is filled while another has focus: `:bdelete` rebinds the windows
+    // showing the deleted buffer onto a survivor.
+    //
+    // The two windows carry different `'colorcolumn'` values, so reading it inside the
+    // handler distinguishes them: seeing the background window's `42` means the handler
+    // really ran in that window's context, and `7` would mean it read the focused one.
+    // The editor's own focus must not move — running a handler is not a reason to take the
+    // user's cursor somewhere else.
+    let dir = temp_dir("au_bwe_win_ctx");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    std::fs::write(&b, "fn b() {}\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.seen = {}\n\
+         nx.on('BufWinEnter', function(a)\n\
+         \x20 _G.seen[#_G.seen+1] = tostring(nx.win.current()) .. '/cc=' ..\n\
+         \x20   tostring(nx.wo.colorcolumn) .. '/' ..\n\
+         \x20   ((a.file ~= nil and a.file ~= '') and a.file:match('[^/]+$') or '(noname)')\n\
+         end)\n",
+    )
+    .await;
+    // Window 2 shows b.rs and is focused; give the two windows distinguishable state.
+    redraw_after(&rpc, &mut incoming, &format!(":vsplit {}<CR>", b.display())).await;
+    exec_lua(
+        &rpc,
+        "nx.wo[2].colorcolumn = '42'; nx.wo[1].colorcolumn = '7'; return 1",
+    )
+    .await;
+    // …then move focus to window 1, leaving 2 in the background.
+    redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.win.current()").await.as_u64(),
+        Some(1),
+        "window 1 has focus before the background display"
+    );
+
+    exec_lua(&rpc, "_G.seen = {}").await;
+    redraw_after(&rpc, &mut incoming, ":bdelete b.rs<CR>").await;
+    assert_eq!(
+        lua_message(&rpc, &mut incoming, "print(table.concat(_G.seen, ','))").await,
+        "2/cc=42/a.rs",
+        "the fire runs in the window that displayed — its id, and its window-local options"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.win.current()").await.as_u64(),
+        Some(1),
+        "and the editor's own focus never moved"
+    );
+}
+
+#[tokio::test]
+async fn a_mutation_bound_to_the_current_window_raises_in_a_background_fire() {
+    // The other half of the contract. The window context is the *mirror* one, so reads and
+    // explicit-handle writes retarget but a mutation that binds to "current" only when it
+    // drains — an ex-command, feedkeys — would still land in the focused window. nxvim
+    // cannot retarget those, so it raises, naming the fire: a handler is told its `nx.cmd`
+    // went nowhere rather than silently editing the wrong window.
+    //
+    // The lock is only on while the two differ. Everything the user types displays into the
+    // window they are in, so the ordinary path is unlocked — asserted here too, or this
+    // guard would be indistinguishable from banning `nx.cmd` in the handler outright.
+    let dir = temp_dir("au_bwe_win_lock");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    std::fs::write(&b, "fn b() {}\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.err = 'never ran'\n\
+         nx.on('BufWinEnter', function()\n\
+         \x20 local ok, e = pcall(function() nx.cmd('normal! gg') end)\n\
+         \x20 _G.err = ok and 'allowed' or tostring(e)\n\
+         end)\n",
+    )
+    .await;
+    // Focused window: the display is into the window running the handler, so nothing locks.
+    redraw_after(&rpc, &mut incoming, &format!(":vsplit {}<CR>", b.display())).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err").await.as_str(),
+        Some("allowed"),
+        "a fire for the focused window is the plain path — no lock"
+    );
+
+    // Background window: locked, and the message names the event and the window.
+    redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    exec_lua(&rpc, "_G.err = 'never ran'").await;
+    redraw_after(&rpc, &mut incoming, ":bdelete b.rs<CR>").await;
+    let err = exec_lua(&rpc, "return _G.err")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        err.contains("the BufWinEnter fire for window 2") && err.contains("nx.cmd"),
+        "a drain-time mutation in a background fire must raise, naming the fire and what \
+         was blocked; got {err:?}"
+    );
+}
+
+/// Log every window/tab lifecycle event by name. Shared init for the tab-switch tests.
+const WINEV_INIT: &str = "_G.ev = {}\n\
+     for _, e in ipairs({ 'BufWinEnter', 'WinNew', 'WinClosed', 'WinResized',\n\
+     \x20                 'WinEnter', 'BufEnter', 'TabNew', 'TabEnter' }) do\n\
+     \x20 nx.autocmd.create(e, { callback = function() _G.ev[#_G.ev+1] = e end })\n\
+     end\n";
+
+/// The names logged into `_G.ev` so far, as exact tokens (`WinEnter` must not match
+/// inside `BufWinEnter`).
+async fn win_events(rpc: &Rpc) -> Vec<String> {
+    exec_lua(rpc, "return table.concat(_G.ev, ' ')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn tab_switch_fires_no_window_lifecycle_events() {
+    // Switching tabs moves focus between windows that all continue to exist, so neovim
+    // fires only the focus events — `WinEnter` / `TabEnter` / `BufEnter` — and nothing
+    // is created, closed, resized, or newly displayed.
+    //
+    // Regression: the lifecycle diff enumerated `Editor::window_ids()`, which walks only
+    // the *active* tab of each layer, so leaving a tab read as "those windows closed"
+    // and arriving as "these windows are new". One `:tabnext` fired
+    // `WinNew WinClosed BufWinEnter WinResized` on top of the three real events — a
+    // window-tracking plugin saw its windows destroyed and recreated on every `gt`.
+    let dir = temp_dir("au_tabswitch_quiet");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    std::fs::write(&b, "fn b() {}\n").expect("write b");
+    let (rpc, mut incoming) =
+        start_with_file_and_config(&dir, a.to_str().unwrap(), WINEV_INIT).await;
+    // A second tab, single window like the first — so the switch below cannot legitimately
+    // resize anything. Its own events are not under test.
+    redraw_after(&rpc, &mut incoming, &format!(":tabnew {}<CR>", b.display())).await;
+    exec_lua(&rpc, "_G.ev = {}").await;
+
+    redraw_after(&rpc, &mut incoming, ":tabnext<CR>").await;
+    let ev = win_events(&rpc).await;
+    for real in ["WinEnter", "TabEnter", "BufEnter"] {
+        assert!(
+            ev.iter().any(|e| e == real),
+            "the switch must still fire {real}; got {ev:?}"
+        );
+    }
+    for spurious in ["WinNew", "WinClosed", "WinResized", "BufWinEnter"] {
+        assert!(
+            !ev.iter().any(|e| e == spurious),
+            "nothing was created/closed/resized/newly-displayed by a tab switch, but \
+             {spurious} fired; got {ev:?}"
+        );
+    }
+
+    // Switching back is symmetric — the *arriving* tab's windows are equally not new.
+    exec_lua(&rpc, "_G.ev = {}").await;
+    redraw_after(&rpc, &mut incoming, ":tabnext<CR>").await;
+    let ev = win_events(&rpc).await;
+    for spurious in ["WinNew", "WinClosed", "WinResized", "BufWinEnter"] {
+        assert!(
+            !ev.iter().any(|e| e == spurious),
+            "switching back fired {spurious}; got {ev:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tabnew_and_tabclose_still_fire_win_new_and_closed() {
+    // The guard on the test above: spanning every tab must suppress only the *spurious*
+    // create/close pairs a switch invented, not the real ones. A new tab genuinely adds a
+    // window (`TabNew` + `WinNew`) and closing it genuinely destroys one (`WinClosed`).
+    let dir = temp_dir("au_tabnew_winnew");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    std::fs::write(&b, "fn b() {}\n").expect("write b");
+    let (rpc, mut incoming) =
+        start_with_file_and_config(&dir, a.to_str().unwrap(), WINEV_INIT).await;
+
+    redraw_after(&rpc, &mut incoming, &format!(":tabnew {}<CR>", b.display())).await;
+    let ev = win_events(&rpc).await;
+    for real in ["TabNew", "WinNew"] {
+        assert!(
+            ev.iter().any(|e| e == real),
+            ":tabnew creates a tab and a window, so {real} must fire; got {ev:?}"
+        );
+    }
+
+    exec_lua(&rpc, "_G.ev = {}").await;
+    redraw_after(&rpc, &mut incoming, ":tabclose<CR>").await;
+    let ev = win_events(&rpc).await;
+    assert!(
+        ev.iter().any(|e| e == "WinClosed"),
+        ":tabclose destroys the tab's window, so WinClosed must fire; got {ev:?}"
+    );
+    // The surviving tab's window is landed *on*, not filled: it goes on showing the
+    // buffer it has shown all along, so — as in neovim — closing a tab displays nothing.
+    assert!(
+        !ev.iter().any(|e| e == "BufWinEnter"),
+        ":tabclose returns to a window already showing its buffer, so BufWinEnter must \
+         not fire; got {ev:?}"
+    );
 }
 
 #[tokio::test]
@@ -2884,6 +3239,121 @@ async fn bufwinenter_is_sequenced_after_the_chains_gates_too() {
     )
     .await;
     assert_eq!(n.as_i64(), Some(1), "BufWinEnter fired exactly once");
+}
+
+/// Config for the two deferred-tail tests below: once armed, the read chain parks on a
+/// `BufReadPost` promise the test resolves by hand (`release_read`), so "while the chain is
+/// parked" is a state the test *holds* rather than a timer it races — a `delay()` here
+/// settles under load before the driving commands land. Armed by the test rather than from
+/// the start, so the startup file's own read (which may beat the config that would gate it)
+/// can't be the one parked. `BufWinEnter` logs the window it ran in.
+const PARKED_READ: &str = "_G.log = {}\n\
+     _G.gate = false\n\
+     nx.autocmd.create('BufReadPost', { callback = function()\n\
+     \x20 if not _G.gate then return end\n\
+     \x20 return nx.promise.new(function(resolve) _G.release = resolve end)\n\
+     end })\n\
+     nx.on('BufWinEnter', function() _G.log[#_G.log+1] = nx.win.current() end)\n";
+
+/// Arm [`PARKED_READ`]'s gate and drop whatever the startup sequence logged, so the next
+/// read parks and the log describes only what the test drives.
+async fn arm_parked_read(rpc: &Rpc) {
+    exec_lua(rpc, "_G.gate = true _G.log = {} return 1").await;
+}
+
+/// Release [`PARKED_READ`]'s parked read and wait for the chain to complete (its deferred
+/// `BufWinEnter` tail lands a tick later, off the promise drain).
+async fn release_read(rpc: &Rpc) -> bool {
+    exec_lua(rpc, "_G.release() return 1").await;
+    poll_true(rpc, "return #_G.log > 0").await
+}
+
+#[tokio::test]
+async fn every_window_that_displayed_while_the_chain_was_parked_fires() {
+    // The deferred tail carries the window the fire is *about*, and a parked chain can
+    // collect more than one: while an async `BufReadPost` handler is still settling, a
+    // `:vsplit` gives a *second* window the same buffer. Both windows displayed it, so
+    // both owe a `BufWinEnter` — that is the whole per-window rule, and per-window setup
+    // skipped for one of them is exactly the bug the per-window model exists to fix.
+    //
+    // Regression: the tail was a single `Option<WindowId>`, so the second display
+    // overwrote the first and window 1's fire was dropped outright — nothing re-detects
+    // it, since by then the baseline already records the buffer as shown there.
+    let dir = temp_dir("au_chain_bwe_multi");
+    let file = dir.join("main.rs");
+    let other = dir.join("other.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    std::fs::write(&other, "fn other() {}\n").expect("write second source file");
+    let (rpc, _incoming) =
+        start_with_file_and_config(&dir, file.to_str().unwrap(), PARKED_READ).await;
+    // Read a file with the gate armed: its chain parks, so its own `BufWinEnter` for
+    // window 1 is deferred. Then split a second window onto the same file before it
+    // settles, so both displays are pending on the one chain.
+    arm_parked_read(&rpc).await;
+    feed(&rpc, &format!(":edit {}<CR>", other.display()));
+    barrier(&rpc).await;
+    feed(&rpc, &format!(":vsplit {}<CR>", other.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return table.concat(_G.log, ',')")
+            .await
+            .as_str(),
+        Some(""),
+        "the read is still parked, so both displays are pending on the one chain"
+    );
+    assert!(
+        release_read(&rpc).await,
+        "the chain completed once the read was released; got {:?}",
+        exec_lua(&rpc, "return table.concat(_G.log, ',')").await
+    );
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("1,2"),
+        "one fire per window that displayed, in the order they displayed"
+    );
+}
+
+#[tokio::test]
+async fn a_window_closed_while_the_chain_was_parked_does_not_fire() {
+    // The other edge of the deferred tail: an async read handler runs for as long as it
+    // takes, and the window that displayed can be gone by the time the chain completes.
+    // neovim fires `BufWinEnter` from *inside* the window, so a window that no longer
+    // shows the buffer has no display left to announce — and firing anyway would install a
+    // dead window id as "current", pointing a handler's per-window setup at nothing.
+    let dir = temp_dir("au_chain_bwe_closed");
+    let file = dir.join("main.rs");
+    let other = dir.join("other.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    std::fs::write(&other, "fn other() {}\n").expect("write second source file");
+    let (rpc, _incoming) =
+        start_with_file_and_config(&dir, file.to_str().unwrap(), PARKED_READ).await;
+    // Two windows displayed it while the chain was parked; close the second before the
+    // read settles, so only one of the two deferred fires still has a window.
+    arm_parked_read(&rpc).await;
+    feed(&rpc, &format!(":edit {}<CR>", other.display()));
+    barrier(&rpc).await;
+    feed(&rpc, &format!(":vsplit {}<CR>", other.display()));
+    barrier(&rpc).await;
+    feed(&rpc, ":quit<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return table.concat(_G.log, ',')")
+            .await
+            .as_str(),
+        Some(""),
+        "the read is still parked, so nothing has fired yet"
+    );
+    assert!(
+        release_read(&rpc).await,
+        "the chain completed once the read was released"
+    );
+    let log = exec_lua(&rpc, "return table.concat(_G.log, ',')").await;
+    assert_eq!(
+        log.as_str(),
+        Some("1"),
+        "only the window still displaying the buffer fired"
+    );
 }
 
 #[tokio::test]

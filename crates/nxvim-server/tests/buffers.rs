@@ -361,6 +361,93 @@ async fn reediting_the_same_file_honors_the_modified_guard() {
 }
 
 #[tokio::test]
+async fn splitting_onto_the_file_you_are_already_editing_reads_nothing() {
+    // `:split <the file this window is already showing>` is vim's `do_ecmd` old-buffer
+    // path: the new window inherits the buffer, so there is nothing to read. nxvim routed
+    // it through the ordinary `:edit` reload instead, which cost two things a command
+    // asking only for a second view has no business costing —
+    //
+    //   * on a modified buffer it hit the reload's `E37` guard and refused to split at
+    //     all, and
+    //   * on a clean one it re-rooted the undo tree at the fresh read, so every undo
+    //     step taken before the split was gone.
+    //
+    // The split is still a *display* (the new window shows something it wasn't showing),
+    // which is the half that isn't a no-op — `BufWinEnter`, covered in `autocmds.rs`.
+    let a = temp_file("split_same", "a1\na2\n");
+    let (rpc, mut incoming) = start().await;
+    command(&rpc, &format!("e {}", name(&a))).await;
+
+    // Modified: the split goes through, keeping the unsaved change.
+    feed(&rpc, "oDIRTY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a1", "DIRTY", "a2"]);
+    command(&rpc, &format!("vsplit {}", name(&a))).await;
+    assert_eq!(
+        message(&rpc, &mut incoming).await,
+        "",
+        "a split onto the current file reads nothing, so the modified guard has nothing \
+         to refuse"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a1", "DIRTY", "a2"],
+        "the unsaved change survives the split"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.api.nvim_list_wins()")
+            .await
+            .as_u64(),
+        Some(2),
+        "and the window it asked for is there"
+    );
+
+    // Clean: the undo history survives too (the reload used to discard it).
+    command(&rpc, "w").await;
+    command(&rpc, &format!("split {}", name(&a))).await;
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a1", "a2"],
+        "undo still reaches back past the split"
+    );
+
+    std::fs::remove_file(&a).ok();
+}
+
+#[tokio::test]
+async fn reediting_with_no_argument_reloads_the_current_file() {
+    // Bare `:e` / `:e!` re-edit the *current* file — vim's reload, and `:e!` its revert.
+    // Regression: only `:e ++enc=…` fell back to the current file name, so a plain `:e!`
+    // answered `E32: No file name` on a perfectly well-named buffer and left the unsaved
+    // changes in place — the standard "throw this away and reload" gesture did nothing.
+    let a = temp_file("a", "a1\na2\n");
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    feed(&rpc, "oDIRTY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a1", "DIRTY", "a2"]);
+
+    // No bang, modified: the guard applies to the no-argument form too.
+    command(&rpc, "e").await;
+    assert_eq!(
+        message(&rpc, &mut incoming).await,
+        "E37: No write since last change (add ! to override)"
+    );
+    assert_eq!(lines(&rpc).await, vec!["a1", "DIRTY", "a2"]);
+
+    // With the bang: reverted to what's on disk.
+    command(&rpc, "e!").await;
+    assert_eq!(lines(&rpc).await, vec!["a1", "a2"]);
+
+    // A buffer that really has no name is still `E32` — that's what the error is for.
+    command(&rpc, "enew").await;
+    command(&rpc, "e").await;
+    assert_eq!(message(&rpc, &mut incoming).await, "E32: No file name");
+
+    std::fs::remove_file(&a).ok();
+}
+
+#[tokio::test]
 async fn undoing_every_edit_clears_the_modified_flag() {
     // Editing and then undoing back to the on-disk text must leave the buffer
     // unmodified — the modified flag tracks divergence from disk, not whether any

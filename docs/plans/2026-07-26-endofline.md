@@ -225,3 +225,29 @@ from the `OptionInfo` table.
 - Relaxing the trailing-newline rope invariant.
 - `'binary'` (vim's `:set binary` implies no-eol preservation plus much else) — a
   natural neighbor, out of scope.
+
+## Follow-up: the out-of-range LSP row landed a line short
+
+Found while reviewing the window-event work, and fixed there: a whole-document
+`textDocument/formatting` reply corrupted every buffer whose `'endofline'` was off.
+
+Servers spell "format everything" as a range ending at `{ line: <line count>,
+character: 0 }` — one row past the last one, which is exactly the position that
+addresses the end of a *terminated* document (the rope's phantom row). On an
+unterminated document that row does not exist, and `lsp_pos_to_byte_in` clamped the row
+to `line_count - 1` and then resolved `character` against it — landing at the **start of
+the last row**, a whole line short of the document's end. The formatter's replacement
+went over line 1 and the rest of the file dangled after it: `let a = 1 / let b = 2`
+formatted to `let a = 1 / let b = 3let b = 2`.
+
+The clamp is now a document-end short-circuit: past the last row *is* the end, which for
+a terminated buffer is the byte the old code already produced (so nothing else moves) and
+for an unterminated one is `document_len_bytes()`. Guarded by
+`formatting_replaces_the_whole_document_when_it_has_no_trailing_newline` in
+`crates/nxvim/tests/lsp_features.rs`, which also asserts a second format is a no-op.
+
+The bug had hidden behind the tests' own shape: three of this feature's LSP tests
+re-issued `nx.lsp.format()` on a 25 ms timer until the result appeared, so a second
+request could carry the *first* one's now-stale range and mangle the formatted text — a
+different test failing on each run. They now issue once and await the promise, which is
+the idiom the rest of the file already used, and the suite is stable across repeated runs.

@@ -3152,6 +3152,26 @@ impl LuaRuntime {
         fire.call((event, pattern, buf, file))
     }
 
+    /// [`fire_autocmd_buf`](Self::fire_autocmd_buf) with `win` installed as the
+    /// **current window** for the duration — the per-window events (`BufWinEnter`) fire
+    /// about a window, and neovim has entered it by the time a handler runs, so `nx.wo` /
+    /// `nx.win.current()` / the cursor reads must address *that* window and not whichever
+    /// one happens to be focused. See `nx._fire_in_win`: it is the mirror context
+    /// `nx.win.call` swaps, so a handler's drain-time mutation raises rather than landing
+    /// in the focused window, and a fire for the already-focused window (everything the
+    /// user types) is byte-for-byte the plain path.
+    pub fn fire_autocmd_buf_in_win(
+        &self,
+        win: u64,
+        event: &str,
+        pattern: &str,
+        buf: u64,
+        file: &str,
+    ) -> mlua::Result<()> {
+        let fire: mlua::Function = self.nx()?.get("_fire_in_win")?;
+        fire.call((win, event, pattern, buf, file))
+    }
+
     /// Fire an **awaited** buffer autocmd (currently `BufWritePre`): run every matching
     /// handler like [`fire_autocmd_buf`](Self::fire_autocmd_buf), but a handler may
     /// return a promise the caller must wait on before proceeding. Returns `true` when

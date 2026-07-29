@@ -1,0 +1,15 @@
+Window lifecycle events — sample buffer.
+
+Open this file with the config in this directory, then work through the
+numbered sections in init.lua. Each one is a couple of commands and a
+`:Events` to read back what fired.
+
+The short version:
+
+  BufWinEnter  a WINDOW started displaying a buffer
+  BufEnter     a BUFFER became the current one
+  WinNew       a window was created
+
+A window is not a buffer, and displaying is not focusing. Splitting onto
+this same file fires BufWinEnter again; walking between the splits with
+<C-w>w fires neither.

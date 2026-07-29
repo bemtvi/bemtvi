@@ -1630,6 +1630,18 @@ pub struct Editor {
     /// clears `announced` itself when the fetched bytes land, so it does not record
     /// here; only the local in-place read does.
     loaded_in_place: Vec<BufferId>,
+    /// Windows created this tick that **inherited** their buffer from the window they
+    /// were split off, with that buffer — recorded by [`Editor::split`], the only
+    /// creation path that copies rather than assigns (`open_split_window` and the tab
+    /// paths are handed an explicit buffer). Drained by the server with
+    /// [`Editor::take_inherited_windows`], which seeds them as their own `BufWinEnter`
+    /// baseline: a bare `:split` displays nothing that window wasn't already showing and
+    /// must not fire, while `:split file` — this split *then* a load into the new window,
+    /// in the same tick — moves off the inherited buffer and does. The distinction is
+    /// unrecoverable downstream: a window showing what another window shows is exactly
+    /// what `:vsplit <already-shown file>` looks like, and that *does* fire. So the core
+    /// records it where it is known.
+    inherited_windows: Vec<(WindowId, BufferId)>,
     /// A `:wqa` / `:xa` quit deferred until every write its `:wall` enqueued has acked
     /// (off-tick mode), drained by the server with [`Editor::take_pending_quit_all`]. The
     /// single-buffer `:wq` rides [`PendingSave::then_quit`]; the batch quit needs the
@@ -2028,6 +2040,7 @@ impl Editor {
             forced_read_encoding: None,
             pending_open_cursor: None,
             loaded_in_place: Vec::new(),
+            inherited_windows: Vec::new(),
             pending_quit_all: None,
             write_events: Vec::new(),
             pending_checktime: Vec::new(),

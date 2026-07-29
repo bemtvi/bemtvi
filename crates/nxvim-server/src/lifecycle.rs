@@ -142,10 +142,17 @@ impl EditHost {
         // column, and only now is the line's text here to convert it exactly. After the
         // edits above, which may have moved that text.
         self.settle_pending_goto(buffer);
-        self.announced.remove(&buffer);
-        self.fired_filetype.remove(&buffer);
-        // A fresh read re-seeds the encoding baseline silently (no `EncodingChanged`).
-        self.fired_encoding.remove(&buffer);
+        // This is a read landing *in place* — the same fact the synchronous paths record
+        // (`load_into_current` / `load_pending_open`), reported here because the off-tick
+        // read lands in the server rather than in the core. `emit_lifecycle_events` drains
+        // it below and does the rest: drop the buffer from `announced` / `fired_filetype`
+        // / `fired_encoding` so the read re-fires `BufReadPost`/`FileType` (silently
+        // re-seeding the encoding baseline), and fire `BufWinEnter` for a re-read of a
+        // *displayed* buffer — which changes no window's buffer, so nothing else in the
+        // diff would see it. Recording it rather than clearing the three sets by hand is
+        // what keeps the remote tier identical to the local one instead of a near-copy
+        // that drifts.
+        self.editor.mark_loaded_in_place(buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
@@ -330,24 +337,37 @@ impl EditHost {
     /// no-op for the vast majority of keys, which change neither buffer nor mode.
     ///
     /// `BufWinEnter` is the exception that walks **every** window, not just the
-    /// current buffer: it fires once for each buffer whose window-visibility went
-    /// 0 → ≥1 this diff, so a session/workspace restore (which fills non-current
-    /// windows the current-buffer path never visits) fires it per restored file.
+    /// current buffer: it fires for each window whose displayed buffer differs from
+    /// its baseline this diff, so a session/workspace restore (which fills
+    /// non-current windows the current-buffer path never visits) fires it per
+    /// restored window.
     pub(crate) fn emit_lifecycle_events(&mut self) {
         // Buffers the editor read from a file *in place* this tick (a local `:edit`
         // reusing the throwaway `[No Name]`, or a `:e` / `:e!` reload of the current
         // file) keep their bufnr, so they're still "announced" from a prior life. Drop
         // them from `announced` / `fired_filetype` so the read re-fires `BufReadPost`
         // (`BufNewFile`) and `FileType` below — neovim fires those on every read,
-        // regardless of whether the buffer id was seen before. The off-tick read path
-        // clears these itself when its fetched bytes land (`load_replica_bytes`); this
-        // covers the synchronous local read that has no such landing hook.
-        for buf in self.editor.take_loaded_in_place() {
-            self.announced.remove(&buf);
-            self.fired_filetype.remove(&buf);
+        // regardless of whether the buffer id was seen before. The off-tick read reports
+        // itself the same way when its fetched bytes land (`load_replica_bytes` →
+        // `Editor::mark_loaded_in_place`), so both tiers share this one path — including
+        // the `BufWinEnter` a re-read owes, which the window diff below cannot see.
+        let reread = self.editor.take_loaded_in_place();
+        for buf in &reread {
+            self.announced.remove(buf);
+            self.fired_filetype.remove(buf);
             // A re-read re-detects the encoding; drop the baseline so it re-seeds
             // silently rather than firing `EncodingChanged` for the fresh read.
-            self.fired_encoding.remove(&buf);
+            self.fired_encoding.remove(buf);
+        }
+
+        // A window that inherited its buffer from the window it was split off is its own
+        // `BufWinEnter` baseline — nothing was *displayed* there. Seeded here, before the
+        // fast-path guard, so the record can never be left undrained by a tick that
+        // transitions nothing else. A real display into that window in the same tick
+        // (`:split file` is a split *then* a load) moves it off this baseline again, so
+        // the walk below still fires.
+        for (w, b) in self.editor.take_inherited_windows() {
+            self.known_window_buffers.insert(w, b);
         }
 
         let buf = self.editor.current_buffer_id();
@@ -358,9 +378,15 @@ impl EditHost {
         // (the completion docs float refreshes every keystroke) fires no user
         // `WinNew`/`WinClosed` autocmds — the window twin of the doc-float *buffer* being
         // kept out of `:ls`.
+        // `all_window_ids` (every tab of every open layer), **not** `window_ids` (the
+        // active tab only): a window parked in a background tab is live — neovim reports
+        // it, `nvim_list_wins` lists it — so the diff must keep seeing it. Enumerating
+        // the active tab alone made leaving a tab read as "those windows closed" and
+        // arriving as "these windows are new", firing a spurious
+        // `WinNew`/`WinClosed`/`WinResized`/`BufWinEnter` on every `gt`.
         let wins: Vec<WindowId> = self
             .editor
-            .window_ids()
+            .all_window_ids()
             .into_iter()
             .filter(|w| !self.editor.is_doc_float_window(*w))
             .collect();
@@ -560,6 +586,10 @@ impl EditHost {
             && !tab_changed
             && closed_bufs.is_empty()
             && !bufwin_changed
+            // A re-read is already drained off the editor, so returning here would lose
+            // the `BufWinEnter` the walk below owes it (`:e!` changes no window's buffer,
+            // and a reload of a *non-current* buffer moves none of the other signals).
+            && reread.is_empty()
         {
             return; // fast path: nothing transitioned
         }
@@ -619,6 +649,24 @@ impl EditHost {
         if self.startup_bufs_seeded {
             for b in &new_bufs {
                 self.fire_buf_event("BufAdd", *b);
+            }
+        }
+
+        // ----- BufLeave: the buffer we are leaving, *before* the new one is read -----
+        // neovim's order on `:edit other` is `BufLeave` → `BufReadPost` → `BufEnter`:
+        // leaving happens first, and only then does the read of what we arrived at run.
+        // Firing it after the announce below instead put a plugin's "save this buffer's
+        // state on the way out" handler *after* the incoming buffer's `BufReadPost` had
+        // already restored state for the new one. Its `BufEnter` twin stays below, on the
+        // far side of the chain, because entering is what the chain orders.
+        //
+        // The old buffer's name is its own, so it carries that context; `last_buffer_id`
+        // is rebound with the `BufEnter` fire, not here, so nothing between them can read
+        // a half-applied switch.
+        if entered && !pending_open {
+            if let Some(old) = self.last_buffer_id {
+                let old_name = self.editor.buffer_name(old).unwrap_or_default();
+                self.fire_lifecycle("BufLeave", &old_name, old, &old_name);
             }
         }
 
@@ -685,15 +733,30 @@ impl EditHost {
             self.fired_encoding.insert(buf, cur_enc);
         }
 
-        // Fire-every on entry: `BufLeave` for the buffer we're leaving, then
-        // `BufEnter` for the one we entered (both file-backed and [No Name]). vim
-        // brackets a buffer switch as `BufLeave → BufEnter`; the old buffer's name is
-        // its own, so fire it with that context before rebinding `last_buffer_id`.
-        if entered && !pending_open {
-            if let Some(old) = self.last_buffer_id {
-                let old_name = self.editor.buffer_name(old).unwrap_or_default();
-                self.fire_lifecycle("BufLeave", &old_name, old, &old_name);
-            }
+        // Fire-every on entry: `BufEnter` for the buffer we entered (both file-backed and
+        // [No Name]), closing the `BufLeave → … → BufEnter` bracket the read chain sits
+        // inside — its `BufLeave` half fired above, ahead of the announce.
+        //
+        // A re-read of the buffer that is *already* current re-enters it: `:e!` moves no
+        // window and changes no current-buffer id, but neovim's `do_ecmd` runs the whole
+        // enter sequence over the fresh read — `BufReadPost` → `FileType` → `BufEnter` →
+        // `BufWinEnter` — so a handler that sets up from buffer content re-runs on a
+        // reload, which is the point of reloading. The `BufWinEnter` twin is the
+        // `reread` walk below; this is its `BufEnter` half. **No `BufLeave`**: nothing was
+        // left, and neovim fires none (verified against 0.12.2).
+        //
+        // Its sibling: the *focused window* now displays the current buffer and did not
+        // before. neovim fires `BufEnter` from `enter_buffer`, which runs whenever a
+        // window is made to display a buffer — not only when the current buffer *id*
+        // changes — and `:split <the file you are already in>` is exactly the case an
+        // id-diff cannot see: focus moves to a brand-new window that displays the buffer
+        // we were already in. Keyed on the focused window alone, so a *background* window
+        // being rebound onto the current buffer (`:bdelete`'s sweep) stays what it is — a
+        // display, not an entry.
+        let redisplayed_here = self.editor.window_buffer(cur_win) == Some(buf)
+            && self.known_window_buffers.get(&cur_win).copied() != Some(buf);
+        let reentered = !entered && (reread.contains(&buf) || redisplayed_here);
+        if (entered || reentered) && !pending_open {
             self.last_buffer_id = Some(buf);
             // If this buffer's read chain is still in flight (a stage parked on an async
             // handler), hand `BufEnter` to the chain so it lands *after* the gates rather
@@ -738,20 +801,28 @@ impl EditHost {
         // `BufWinEnter` alone. See `announce_displayed_buffers`.
         self.announce_displayed_buffers();
 
-        // ----- BufWinEnter: a buffer first becoming displayed in a window -----
-        // Fires once per buffer whose window-visibility went 0 -> >=1 this diff.
-        // Like the read-lifecycle walk just above (and unlike the current-buffer
-        // `BufEnter`), this walks *every* window, so a session/workspace restore —
-        // which fills non-current windows the current-buffer diff never visits —
-        // fires it for each restored file. A no-arg `:split` (the buffer is already displayed)
-        // and merely focusing another window don't fire it; a buffer hidden then
-        // re-shown does (neovim's "hidden buffer displayed"). The baseline
-        // (`known_window_buffers`) is rebuilt every diff so it stays current even
-        // with no handler; the fire is gated on a registered handler, like
-        // `WinScrolled` — so a no-handler session never enters Lua here.
-        let mut shown: std::collections::HashSet<BufferId> =
-            self.known_window_buffers.values().copied().collect();
-        let mut newly_shown: Vec<BufferId> = Vec::new();
+        // ----- BufWinEnter: a window now displaying a buffer it wasn't -----
+        // neovim's rule is per *window display*, not per buffer: it fires from the
+        // buffer load/switch paths — `open_buffer`, `do_ecmd`'s already-loaded branch,
+        // `enter_buffer` — and from nothing in `window.c`. So navigation (a tab switch,
+        // `<C-w>w`) never fires, while a *second* window opening an already-displayed
+        // buffer does (`:h BufWinEnter` claims otherwise; the doc is stale).
+        //
+        // The equivalent as a diff: fire for each window whose displayed buffer differs
+        // from its baseline. Like the read-lifecycle walk just above (and unlike the
+        // current-buffer `BufEnter`), this walks *every* window, so a session/workspace
+        // restore — which fills windows the current-buffer diff never visits — fires per
+        // restored file. A window created by a bare `:split` was seeded with its
+        // inherited buffer at the top of this function, so it starts out matching and
+        // stays silent. The baseline (`known_window_buffers`) is rebuilt every diff so it
+        // stays current even with no handler; the fire is gated on a registered handler,
+        // like `WinScrolled` — so a no-handler session never enters Lua here.
+        // `(window, buffer)`: the window is what the event is *about*, and it is
+        // installed as the current one for the fire (see `fire_buf_event_in_win`), so a
+        // handler doing per-window setup addresses the window that displayed rather than
+        // whichever one is focused — which for a session restore filling background
+        // windows is not the same thing at all.
+        let mut newly_shown: Vec<(WindowId, BufferId)> = Vec::new();
         let mut new_map: HashMap<WindowId, BufferId> = HashMap::new();
         // `wins` was moved into `known_windows` above; it is the same filtered
         // (doc-floats excluded) list.
@@ -761,24 +832,54 @@ impl EditHost {
                 // content lands later this convergence): it's empty and unnamed now,
                 // so firing `BufWinEnter` here would announce the placeholder — ahead
                 // of `BufReadPost`/`FileType` and against the wrong (pre-load)
-                // filetype. Skip it *and* leave it out of the baseline, so it fires
-                // once, in neovim's order, over the filled buffer on the load diff —
-                // the window-visibility twin of the `pending_open` gate on
-                // `BufReadPost`/`BufEnter` above (which use the *current* buffer's
-                // pending state; here every displayed buffer is checked, so a
-                // background window filled by a session restore is covered too).
+                // filetype. Carry the window's *previous* baseline forward instead of
+                // recording the placeholder, so it fires once, in neovim's order, over
+                // the filled buffer on the load diff — the window twin of the
+                // `pending_open` gate on `BufReadPost`/`BufEnter` above (which use the
+                // *current* buffer's pending state; here every displayed buffer is
+                // checked, so a background window filled by a session restore is covered
+                // too).
                 if self.editor.has_pending_open(b) {
+                    if let Some(prev) = self.known_window_buffers.get(&w).copied() {
+                        new_map.insert(w, prev);
+                    }
                     continue;
                 }
                 new_map.insert(w, b);
-                if shown.insert(b) {
-                    newly_shown.push(b);
+                if self.known_window_buffers.get(&w).copied() != Some(b) {
+                    newly_shown.push((w, b));
                 }
+            }
+        }
+        // A displayed buffer re-read from disk keeps its bufnr in the same window, so no
+        // window changed what it holds — but neovim fires `BufWinEnter` off the read
+        // itself (`open_buffer`, after the modelines), which is what makes `:e!` and a
+        // `:edit` reusing the throwaway `[No Name]` in place fire. Skip one already
+        // queued above, so a re-read that *also* moved into a window fires once.
+        for b in &reread {
+            if newly_shown.iter().any(|(_, x)| x == b) {
+                continue;
+            }
+            // The window the re-read is *about*: the focused one when it is showing the
+            // buffer (`:e!`, and every reload a user drives), else the first window that
+            // displays it — a background reload still has exactly one window's worth of
+            // per-window setup to re-run, and neovim likewise fires once, for the window
+            // the read happened in.
+            let win = Some(cur_win)
+                .filter(|w| new_map.get(w) == Some(b))
+                .or_else(|| {
+                    self.known_windows
+                        .iter()
+                        .copied()
+                        .find(|w| new_map.get(w) == Some(b))
+                });
+            if let Some(w) = win {
+                newly_shown.push((w, *b));
             }
         }
         self.known_window_buffers = new_map;
         if self.au_active_events.contains("BufWinEnter") {
-            for b in newly_shown {
+            for (w, b) in newly_shown {
                 // Sequenced behind an in-flight read chain, exactly like `BufEnter`
                 // above: the buffer became displayed while a stage was still parked on
                 // an async handler, and firing now would land `BufWinEnter` *second* —
@@ -787,8 +888,14 @@ impl EditHost {
                 // chain that completed synchronously — the common case — is already out
                 // of the map, so this fires inline exactly as before.
                 match self.read_chains.get_mut(&b) {
-                    Some(c) => c.deferred_win_enter = true,
-                    None => self.fire_buf_event("BufWinEnter", b),
+                    // Appended, not replaced: a chain stays parked across diffs, so a
+                    // second window displaying the same buffer while it settles adds its
+                    // own fire rather than taking the first one's place. Nothing
+                    // re-detects a dropped one — by then the baseline already records the
+                    // buffer as shown there.
+                    Some(c) if !c.deferred_win_enter.contains(&w) => c.deferred_win_enter.push(w),
+                    Some(_) => {}
+                    None => self.fire_buf_event_in_win("BufWinEnter", b, w),
                 }
             }
         }
@@ -1268,9 +1375,12 @@ impl EditHost {
     }
 
     /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.
+    /// Spans every tab, like the `wins` set in [`EditHost::emit_lifecycle_events`] — a
+    /// snapshot holding only the active tab's windows differs by *membership* across a
+    /// tab switch, which the diff cannot tell from an actual resize.
     pub(crate) fn window_rects_snapshot(&self) -> Vec<WindowRect> {
         self.editor
-            .window_ids()
+            .all_window_ids()
             .into_iter()
             .filter(|w| !self.editor.is_doc_float_window(*w))
             .map(|w| (w, self.editor.window_rect(w).unwrap_or_default()))
@@ -1279,9 +1389,10 @@ impl EditHost {
 
     /// Every window's `(id, topline, leftcol)` in layout order, for the
     /// [`WinScrolled`] diff. Only computed when a `WinScrolled` handler is active.
+    /// Spans every tab, for the same reason as [`EditHost::window_rects_snapshot`].
     pub(crate) fn window_scroll_snapshot(&self) -> Vec<(WindowId, usize, usize)> {
         self.editor
-            .window_ids()
+            .all_window_ids()
             .into_iter()
             .filter(|w| !self.editor.is_doc_float_window(*w))
             .map(|w| {
@@ -1352,6 +1463,25 @@ impl EditHost {
         self.fire_buf_lifecycle(event, &name, buf);
     }
 
+    /// [`fire_buf_event`](Self::fire_buf_event) with `win` installed as the **current
+    /// window** for the fire — the per-window event (`BufWinEnter`) is *about* a window,
+    /// and neovim has entered it by the time a handler runs, so `nx.wo`,
+    /// `nx.win.current()` and the cursor reads inside the handler must address that
+    /// window. Without it, per-window setup for a window a session restore filled landed
+    /// in whichever window happened to be focused — and the whole point of firing per
+    /// window is that each one has its own setup to do.
+    ///
+    /// The context is the *mirror* one (`nx._fire_in_win` → `nx.win.call`), not a real
+    /// focus change: running a handler must not move the user's cursor. Reads and
+    /// explicit-handle writes resolve against `win`; a drain-time mutation (`nx.cmd`,
+    /// feedkeys) raises through `nx._call_ctx_lock` rather than silently landing in the
+    /// focused window. When `win` *is* the focused window — everything the user types —
+    /// nothing is locked and this is the plain path.
+    pub(crate) fn fire_buf_event_in_win(&mut self, event: &str, buf: BufferId, win: WindowId) {
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        self.fire_buf_lifecycle_in(event, &name, buf, Some(win));
+    }
+
     /// [`fire_buf_event`](Self::fire_buf_event) with an explicit `pattern`, for the
     /// buffer events whose `<amatch>` is *not* the buffer's name — `FileType`, whose
     /// pattern is the filetype. Like `fire_buf_event` (and unlike
@@ -1360,6 +1490,17 @@ impl EditHost {
     /// uses: a buffer restored into a *background* window must announce with its own
     /// name and filetype, not the current buffer's.
     fn fire_buf_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId) {
+        self.fire_buf_lifecycle_in(event, pattern, buf, None);
+    }
+
+    /// [`fire_buf_lifecycle`](Self::fire_buf_lifecycle), optionally in `win`'s context.
+    fn fire_buf_lifecycle_in(
+        &mut self,
+        event: &str,
+        pattern: &str,
+        buf: BufferId,
+        win: Option<WindowId>,
+    ) {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
         // The snapshot carries the DISPLAY name (see `set_buf_snapshot`) while the
@@ -1367,7 +1508,10 @@ impl EditHost {
         // surface, and seeding the snapshot from the path blanks it.
         let shown = self.editor.display_name(buf);
         let _ = self.lua.set_buf_snapshot(buf.0, &shown, &ft);
-        self.fire_and_drain(event, pattern, buf.0, &name);
+        match win {
+            Some(w) => self.fire_and_drain_in_win(event, pattern, buf.0, &name, w),
+            None => self.fire_and_drain(event, pattern, buf.0, &name),
+        }
     }
 
     /// Fire a buffer-lifecycle event **gated**, returning whether it settled
@@ -1477,7 +1621,7 @@ impl EditHost {
                 ReadStage::Done => {
                     let done = self.read_chains.remove(&buf);
                     let deferred_enter = done.as_ref().is_some_and(|c| c.deferred_enter);
-                    let deferred_win_enter = done.is_some_and(|c| c.deferred_win_enter);
+                    let deferred_win_enter = done.map(|c| c.deferred_win_enter).unwrap_or_default();
                     // The deferred `BufEnter` / `BufWinEnter`, now correctly ordered
                     // behind the gates and against each other (vim fires `BufWinEnter`
                     // last). Skipped if the buffer went away mid-chain (a handler
@@ -1490,8 +1634,17 @@ impl EditHost {
                         let name = self.editor.buffer_name(buf).unwrap_or_default();
                         self.fire_lifecycle("BufEnter", &name, buf, &name);
                     }
-                    if deferred_win_enter {
-                        self.fire_buf_event("BufWinEnter", buf);
+                    for win in deferred_win_enter {
+                        // A parked chain runs for as long as its async handlers take, and
+                        // one of them may have closed the window or moved it onto
+                        // something else. Fire only for a window that is *still* showing
+                        // this buffer: neovim fires from inside the window, so a window
+                        // that no longer displays it has no display left to announce —
+                        // and installing a dead window id as "current" would point a
+                        // handler's per-window setup at nothing.
+                        if self.editor.window_buffer(win) == Some(buf) {
+                            self.fire_buf_event_in_win("BufWinEnter", buf, win);
+                        }
                     }
                     return;
                 }
@@ -1565,7 +1718,7 @@ impl EditHost {
     /// nothing re-detects them, since by then the buffer is already current and already
     /// in the displayed baseline.
     fn begin_read_chain(&mut self, buf: BufferId) {
-        let (mut deferred_enter, mut deferred_win_enter) = (false, false);
+        let (mut deferred_enter, mut deferred_win_enter) = (false, Vec::new());
         if let Some(old) = self.read_chains.remove(&buf) {
             if let Some(gate) = old.gate {
                 self.chain_gates.remove(&gate);
@@ -1627,6 +1780,25 @@ impl EditHost {
     fn fire_and_drain(&mut self, event: &str, pattern: &str, bufnr: u64, file: &str) {
         self.push_buf_mirror();
         let r = self.lua.fire_autocmd_buf(event, pattern, bufnr, file);
+        self.report_autocmd_err(event, r);
+        self.apply_lua_effects();
+    }
+
+    /// [`fire_and_drain`](Self::fire_and_drain) with `win` current for the fire. The
+    /// mirror push comes first, exactly as above — `nx._fire_in_win` swaps its window
+    /// context on top of a *fresh* mirror, so the window record it reads is this tick's.
+    fn fire_and_drain_in_win(
+        &mut self,
+        event: &str,
+        pattern: &str,
+        bufnr: u64,
+        file: &str,
+        win: WindowId,
+    ) {
+        self.push_buf_mirror();
+        let r = self
+            .lua
+            .fire_autocmd_buf_in_win(win.0, event, pattern, bufnr, file);
         self.report_autocmd_err(event, r);
         self.apply_lua_effects();
     }

@@ -1173,6 +1173,39 @@ function nx._fire_read_cmd(event, path, buf, isdir)
   return claimed
 end
 
+-- Fire an event **in a window's context** — the window the event is *about* is the
+-- current one for the duration, which is how neovim fires the per-window events: it has
+-- genuinely entered the window by the time the handler runs, so `nx.wo`, `nx.win.current()`
+-- and the cursor reads all address it. `BufWinEnter` is the case that needs it: a session
+-- restore fills *background* windows, and a handler placing per-window state there would
+-- otherwise land it in whatever window happened to be focused.
+--
+-- The context is the mirror one (`nx.win.call`), not a real focus change: the editor does
+-- not move the user's cursor to run a handler. That makes every *read* resolve against
+-- `win`, and every explicit-handle write (`nx.wo[win]`, an extmark on a buffer) target the
+-- right place. A mutation that binds to "current" only at drain time — `nx.cmd`, feedkeys —
+-- raises through `nx._call_ctx_lock` while the two differ, rather than silently landing in
+-- the focused window; when they're the same (everything the user types), nothing is locked
+-- and this is exactly the plain fire.
+--
+-- The context covers the handler's SYNCHRONOUS run — it is a mirror swap around one call,
+-- and the mirror is rebuilt by the server every tick. A handler that returns a promise
+-- resumes, past the await, in the ordinary context: `nx.win.current()` is the focused
+-- window again there, so an async tail must capture the window *before* its first await
+-- and write through the explicit handle (`nx.wo[win]`). Documented in
+-- `docs/autocmd-events.md` under `BufWinEnter`; nothing can retarget a continuation that
+-- runs after the fire has returned.
+function nx._fire_in_win(win, event, pattern, buf, file)
+  return nx.win.call(win, function()
+    -- Name the scope in the lock, so a handler that trips it is told about the *event*
+    -- it is in rather than about an `nx.win.call` its author never wrote.
+    if nx._call_ctx_lock == true then
+      nx._call_ctx_lock = ("the %s fire for window %d"):format(event, win)
+    end
+    return nx._fire(event, pattern, buf, file)
+  end)
+end
+
 -- The `FileChangedShell` round-trip the server's file-change reconcile drives
 -- (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → the watch leg). Set
 -- `v:fcs_reason` to `reason` and reset `v:fcs_choice` to `""` (neovim's defaults

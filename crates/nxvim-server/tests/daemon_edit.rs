@@ -215,8 +215,9 @@ async fn edit_reload_refetches_over_the_wire() {
         vec!["local original"]
     );
 
-    // ...and meanwhile the file changed on the daemon. A `:e!` of the current file
-    // must refetch *that* (nxvim's `:edit` needs the path; a bare `:e!` is `E32`).
+    // ...and meanwhile the file changed on the daemon. A `:e!` naming the current file
+    // must refetch *that* (the bare form reloads the same way — see
+    // `reload_over_the_wire_fires_bufwinenter`).
     fake.set("/virtual/note.txt", "changed on the daemon\n");
     feed(&rpc, ":edit! /virtual/note.txt<CR>");
     assert_eq!(
@@ -400,5 +401,51 @@ async fn the_gated_read_chain_orders_and_replays_over_the_wire() {
         "over the wire: the async read handler saw the fetched content, FileType waited \
          for it to settle rather than firing between start and done, and the late \
          subscriber still got the event"
+    );
+}
+
+/// `BufWinEnter` fires on a reload **over the wire**, exactly as it does locally: a
+/// re-read of a displayed buffer keeps its bufnr in the same window, so nothing about the
+/// window changed — the fire hangs off the *read*, and the off-tick read lands in a
+/// different place than the synchronous one. Tier-1: the remote session is not a degraded
+/// mode, so a `:e!` that refetches over the wire owes the same per-window re-init a local
+/// `:e!` does.
+#[tokio::test]
+async fn reload_over_the_wire_fires_bufwinenter() {
+    let fake = DaemonFs::default();
+    fake.set("/virtual/note.txt", "original\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/note.txt").await;
+    await_lines(&rpc, &["original"]).await;
+
+    // Register *after* the startup fire, so the count is the reload's alone.
+    exec_lua(
+        &rpc,
+        "_G.bwe = 0\n\
+         nx.on('BufWinEnter', function() _G.bwe = _G.bwe + 1 end)\n\
+         return 1",
+    )
+    .await;
+
+    fake.set("/virtual/note.txt", "changed on the daemon\n");
+    feed(&rpc, ":e!<CR>");
+    await_lines(&rpc, &["changed on the daemon"]).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.bwe").await.as_u64(),
+        Some(1),
+        "the off-tick re-read must fire BufWinEnter once, like the local `:e!`"
+    );
+
+    // The other half of "once": opening a *different* remote file moves the window off
+    // this buffer, which the window diff sees on its own. The read landing must not fire
+    // a second time on top of it.
+    fake.set("/virtual/other.txt", "other\n");
+    feed(&rpc, ":e /virtual/other.txt<CR>");
+    await_lines(&rpc, &["other"]).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.bwe").await.as_u64(),
+        Some(2),
+        "a remote open fires BufWinEnter exactly once — the window's own change and the \
+         read landing are the same display, not two"
     );
 }

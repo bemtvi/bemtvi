@@ -1,0 +1,4 @@
+A second file, for the sections that need somewhere else to go.
+
+  :split other.txt   a split AND a load — BufWinEnter fires
+  :tabnew other.txt  a new tab, a new window — BufWinEnter fires

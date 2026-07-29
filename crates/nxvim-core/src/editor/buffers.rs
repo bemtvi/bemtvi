@@ -1067,10 +1067,33 @@ impl Editor {
     /// keeping the same bufnr). The server clears each from its `announced` /
     /// `fired_filetype` sets before emitting lifecycle events, so the re-read buffer
     /// fires `BufReadPost` (`BufNewFile`) and `FileType` again — neovim fires those on
-    /// every read, regardless of whether the buffer id was seen before. Empty (a cheap
-    /// no-op) when no in-place read ran this tick.
+    /// every read, regardless of whether the buffer id was seen before. It also fires
+    /// `BufWinEnter` for one that is *displayed*: a re-read moves no window off the
+    /// buffer it holds, so the window diff cannot see it, and neovim fires it off the
+    /// read itself (`open_buffer`). Empty (a cheap no-op) when no in-place read ran this
+    /// tick.
     pub fn take_loaded_in_place(&mut self) -> Vec<BufferId> {
         std::mem::take(&mut self.loaded_in_place)
+    }
+
+    /// Record `buffer` as read from a file *in place* — the off-tick twin of the
+    /// synchronous [`load_into_current`](Self::load_into_current) /
+    /// [`load_pending_open`](Self::load_pending_open) recording, for the daemon and wasm
+    /// read whose bytes land in the **server** (`EditHost::load_replica_bytes`) rather
+    /// than in the core. Same consequences, one drain: see
+    /// [`take_loaded_in_place`](Self::take_loaded_in_place).
+    pub fn mark_loaded_in_place(&mut self, buffer: BufferId) {
+        self.loaded_in_place.push(buffer);
+    }
+
+    /// Drain the windows created this tick that **inherited** their buffer from the
+    /// window they were split off, each with the buffer it inherited. The server seeds
+    /// these as their own `BufWinEnter` baseline, so a bare `:split` (which displays
+    /// nothing that window wasn't already showing) fires nothing, while `:split file` —
+    /// the same split followed by a load into it — fires for the file. Empty (a cheap
+    /// no-op) on a tick with no split.
+    pub fn take_inherited_windows(&mut self) -> Vec<(WindowId, BufferId)> {
+        std::mem::take(&mut self.inherited_windows)
     }
 
     /// Record a completed write of `buffer` to `path` for the server to fire

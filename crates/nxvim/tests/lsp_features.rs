@@ -4488,19 +4488,31 @@ async fn a_formatter_that_terminates_the_file_sets_endofline() {
         "the file was read unterminated"
     );
 
-    // Retry the request until the reply lands (the established pattern in this file:
-    // the first call can beat the server's readiness).
-    let mut formatted = false;
-    for _ in 0..80 {
-        exec_lua(&rpc, "nx.lsp.format()").await;
-        nxvim_test_harness::barrier(&rpc).await;
-        if lines(&rpc).await.get(1).map(String::as_str) == Some("let b = 3") {
-            formatted = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(formatted, "formatting should rewrite the second line");
+    // Issue the request ONCE and wait on its promise. Re-firing it on a timer (the
+    // pattern this test used to share with the older ones) can put two requests in
+    // flight, and the second carries the *first* request's range — computed against the
+    // document as it was before the format — so it applies a stale edit to the formatted
+    // text and mangles it. That is correct behavior for a stale range, and a test that
+    // provokes it fails at random.
+    exec_lua(
+        &rpc,
+        r#"
+        _G.fmt_done = false
+        nx.lsp.format():next(function() _G.fmt_done = true end,
+                             function(e) _G.fmt_done = "error: " .. tostring(e) end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.fmt_done)", "true").await,
+        "the format promise should resolve (got {:?})",
+        exec_lua(&rpc, "return tostring(_G.fmt_done)").await
+    );
+    assert_eq!(
+        lines(&rpc).await.get(1).map(String::as_str),
+        Some("let b = 3"),
+        "formatting should rewrite the second line"
+    );
     assert!(
         await_lua_eq(&rpc, "nx.bo[0].endofline", "true").await,
         "the formatter's trailing newline is the document's, so 'endofline' turns on"
@@ -4551,17 +4563,31 @@ async fn a_formatter_that_strips_the_terminator_clears_endofline() {
         "the file was read terminated"
     );
 
-    let mut formatted = false;
-    for _ in 0..80 {
-        exec_lua(&rpc, "nx.lsp.format()").await;
-        nxvim_test_harness::barrier(&rpc).await;
-        if lines(&rpc).await.get(1).map(String::as_str) == Some("let b = 3") {
-            formatted = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(formatted, "formatting should rewrite the second line");
+    // Issue the request ONCE and wait on its promise. Re-firing it on a timer (the
+    // pattern this test used to share with the older ones) can put two requests in
+    // flight, and the second carries the *first* request's range — computed against the
+    // document as it was before the format — so it applies a stale edit to the formatted
+    // text and mangles it. That is correct behavior for a stale range, and a test that
+    // provokes it fails at random.
+    exec_lua(
+        &rpc,
+        r#"
+        _G.fmt_done = false
+        nx.lsp.format():next(function() _G.fmt_done = true end,
+                             function(e) _G.fmt_done = "error: " .. tostring(e) end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.fmt_done)", "true").await,
+        "the format promise should resolve (got {:?})",
+        exec_lua(&rpc, "return tostring(_G.fmt_done)").await
+    );
+    assert_eq!(
+        lines(&rpc).await.get(1).map(String::as_str),
+        Some("let b = 3"),
+        "formatting should rewrite the second line"
+    );
     assert!(
         await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
         "the formatter's unterminated text clears 'endofline'"
@@ -4619,17 +4645,22 @@ async fn the_tail_edit_is_the_one_that_starts_last_not_the_one_listed_last() {
         "the file was read unterminated"
     );
 
-    let mut formatted = false;
-    for _ in 0..80 {
-        exec_lua(&rpc, "nx.lsp.format()").await;
-        nxvim_test_harness::barrier(&rpc).await;
-        if lines(&rpc).await.first().map(String::as_str) != Some("let a = 1") {
-            formatted = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(formatted, "formatting should rewrite the line");
+    // Once, on the promise — a re-firing retry can land a second, stale-ranged request
+    // over the formatted text (see the note in the whole-document test above).
+    exec_lua(
+        &rpc,
+        r#"
+        _G.fmt_done = false
+        nx.lsp.format():next(function() _G.fmt_done = true end,
+                             function(e) _G.fmt_done = "error: " .. tostring(e) end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.fmt_done)", "true").await,
+        "the format promise should resolve (got {:?})",
+        exec_lua(&rpc, "return tostring(_G.fmt_done)").await
+    );
     assert_eq!(
         lines(&rpc).await,
         vec!["let a = 2;"],
@@ -4645,6 +4676,73 @@ async fn the_tail_edit_is_the_one_that_starts_last_not_the_one_listed_last() {
         std::fs::read(dir.join("a.rs")).expect("re-read"),
         b"let a = 2;\n",
         "the whole formatted document reaches disk"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A formatter's **whole-document** range on a file with no trailing newline replaces the
+/// whole document — not just its first line.
+///
+/// The range servers send for "format everything" ends at `{ line: <line count>,
+/// character: 0 }`: one row past the last one, the position that addresses the end of a
+/// terminated document. On an unterminated document that row does not exist, and clamping
+/// the row alone resolved the position to the *start of the last row* — a whole line short
+/// of the document's end — so the replacement landed over line 1 and the rest of the file
+/// was left dangling after it. `let a = 1 / let b = 2` (unterminated) formatted to
+/// `let a = 1 / let b = 3let b = 2`: silent corruption of the buffer, on the single most
+/// ordinary LSP edit there is, for every file that happens not to end with a newline.
+///
+/// Formatting again is the second half of the guarantee: the same edit over the result is
+/// a no-op, because it really did cover the whole document.
+#[tokio::test]
+async fn formatting_replaces_the_whole_document_when_it_has_no_trailing_newline() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_format_noeol_whole");
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 2, "character": 0 } },
+                  "newText": "let a = 1\nlet b = 3" }
+            ]
+        }"#,
+    );
+    // The file on disk ends without a newline, so 'endofline' is off from the first read.
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the file was read unterminated"
+    );
+
+    for round in 1..=2 {
+        exec_lua(
+            &rpc,
+            r#"
+            _G.fmt_done = false
+            nx.lsp.format():next(function() _G.fmt_done = true end,
+                                 function(e) _G.fmt_done = "error: " .. tostring(e) end)
+            "#,
+        )
+        .await;
+        assert!(
+            await_lua_eq(&rpc, "tostring(_G.fmt_done)", "true").await,
+            "round {round}: the format promise should resolve"
+        );
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["let a = 1", "let b = 3"],
+            "round {round}: the whole document should be replaced"
+        );
+    }
+    // Still unterminated, and it reaches disk that way under 'nofixeol'.
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the formatter's text still ends without a newline"
     );
     std::env::remove_var("NXVIM_LSP_CMD");
 }

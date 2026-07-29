@@ -1521,15 +1521,20 @@ end
 -- mutate the wrong context (the no-silent-stub rule applied to a known gap).
 nx._call_ctx_lock = false
 
+-- The lock may be `true` (an `nx.win.call` / `nx.buf.call` the author wrote) or a string
+-- naming the scope that installed it — a per-window event fire, say, which the handler's
+-- author never asked for and would not recognise as a "call".
 function nx._assert_call_ctx(what)
-  if nx._call_ctx_lock then
+  local lock = nx._call_ctx_lock
+  if lock then
     error(
-      "nvim_buf_call/nvim_win_call: "
+      (type(lock) == "string" and lock or "nvim_buf_call/nvim_win_call")
+        .. ": "
         .. what
-        .. " inside the callback would run "
-        .. "against the real current buffer/window, not the one passed to the "
-        .. "call — nxvim cannot retarget a queued mutation. Run it outside the "
-        .. "call, or use an explicit-handle API.",
+        .. " here would run against the real current buffer/window, not the one this "
+        .. "callback is scoped to — nxvim cannot retarget a queued mutation. Run it "
+        .. "outside, or use an explicit-handle API (nx.wo[win], nx.bo[buf], "
+        .. "nx.win.set_cursor, …).",
       0
     )
   end
@@ -1543,6 +1548,16 @@ end
 -- exist on `nx` to be wrapped.)
 do
   local guards = {
+    -- The `nx.*` funnels themselves, not just their `vim.*` aliases: `nx.cmd` is the
+    -- ex-command entry the prime-directive API points at, and `nx._feedkeys` queues keys
+    -- the editor replays against whatever is current when it drains. Guarding only the
+    -- aliases had it backwards — `vim.cmd("…")` raised inside a call while the `nx.cmd`
+    -- it wraps went through and mutated the focused window. It matters beyond an explicit
+    -- `nx.win.call`: a `BufWinEnter` handler runs in the context of the window that
+    -- *displayed*, which for a session restore filling background windows is not the
+    -- focused one, and its author never wrote a `call` at all.
+    cmd = "an ex-command (nx.cmd)",
+    _feedkeys = "feedkeys",
     _lsp_buf = "an LSP buf request",
     _lsp_buf_format = "nx.lsp.format",
     _lsp_buf_code_action = "nx.lsp.code_action",
@@ -1550,24 +1565,35 @@ do
     _diagnostic_goto = "a diagnostic jump",
     _diagnostic_setloclist = "nx.diagnostic.setloclist",
   }
+  -- The `<expr>` textlock rides the same chokepoint, for the same reason the call-context
+  -- lock does: an `<expr>` mapping RHS must *compute* keys, not change the editor, and
+  -- `vim.cmd` has raised `E5555` on that since the sandbox landed while the `nx.cmd` it
+  -- wraps queued a command the server then silently discarded — so the canonical spelling
+  -- was the one that failed quietly, and the mapping went on to feed its keys as if
+  -- nothing had happened. Only the ex funnel is listed: feedkeys deliberately relies on
+  -- the server's post-fire discard instead (see `expr_map_discards_queued_effects`).
+  local expr_blocked = { cmd = "nx.cmd" }
   for name, what in pairs(guards) do
     local raw = nx[name]
     if raw then
+      local blocked = expr_blocked[name]
       nx[name] = function(...)
+        if blocked and nx._expr_lock then
+          error(
+            "E5555: <expr> mapping must not change the editor (" .. blocked .. " is blocked)",
+            0
+          )
+        end
         nx._assert_call_ctx(what)
         return raw(...)
       end
     end
   end
   -- `nvim_command` is the `vim.api` alias of `nx.cmd` (the Rust-installed ex-command
-  -- funnel, `vim.cmd`'s sibling); it runs against the real current buffer/window, so
-  -- it is installed here with the same call-context guard wrapped on (rather than
-  -- aliased bare in the block at the end of the file).
-  local raw_command = nx.cmd
-  vim.api.nvim_command = function(cmd)
-    nx._assert_call_ctx("an ex-command (nvim_command)")
-    return raw_command(cmd)
-  end
+  -- funnel, `vim.cmd`'s sibling), installed here rather than aliased bare in the block
+  -- at the end of the file so it picks up the guarded `nx.cmd` above — one assertion,
+  -- from the funnel, however it was reached.
+  vim.api.nvim_command = nx.cmd
 end
 
 -- Rust→Lua mirror of the core highlight registry, refreshed by the server

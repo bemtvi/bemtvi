@@ -1234,6 +1234,40 @@ async fn expr_map_sandbox_blocks_editor_mutation() {
     );
 }
 
+/// The same sandbox through the **canonical** funnel. `nx.cmd` is the ex-command
+/// entry the `nx.*` prime directive points at and `vim.cmd` is its alias, so a
+/// textlock that only the alias honors has it backwards: the config written the
+/// recommended way is the one that gets no error. The effect queue is discarded
+/// either way, so the leak was a *silent* no-op — exactly what the fail-loud rule
+/// exists to prevent.
+#[tokio::test]
+async fn expr_map_sandbox_blocks_the_canonical_ex_funnel_too() {
+    let dir = temp_dir("keymap_expr_lock_nx");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'S', function()\n\
+           nx.cmd('normal! dd')\n\
+           return 'x'\n\
+         end, { expr = true })\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    let redraw = redraw_after(&rpc, &mut incoming, "S").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "the sandboxed nx.cmd did not run, and no keys were fed"
+    );
+    assert!(
+        message(&redraw).contains("E5555"),
+        "nx.cmd under the textlock raises like vim.cmd, got {:?}",
+        message(&redraw)
+    );
+}
+
 /// The `<expr>` sandbox discards *every* effect queue, not just the handful the
 /// Lua textlock already blocks. Feedkeys is not stopped by `nx._expr_lock` (it
 /// only queues), so an expr RHS that calls it relies entirely on the server's

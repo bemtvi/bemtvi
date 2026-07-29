@@ -839,7 +839,19 @@ pub(crate) fn lsp_pos_to_byte_in(
     let last_row = buffer
         .line_count()
         .saturating_sub(usize::from(!buffer.options.endofline));
-    let row = (pos.line as usize).min(last_row);
+    // Past the last row, the position is the document's **end** — not the start of the
+    // last row, which is what clamping the row and then resolving `character` against it
+    // gives. On a terminated document the two coincide (the clamp lands on the empty
+    // phantom row, whose start *is* the end), which is why clamping the row alone read as
+    // correct; on an unterminated one they are a whole line apart. That gap corrupted the
+    // single most ordinary LSP edit there is: a formatter's whole-document range ends at
+    // `{ line: <line count>, character: 0 }` — past the last row of a file with no
+    // trailing newline — so `:LspFormat` on such a file replaced only its *first* line
+    // with the whole formatted document and left the rest appended to it.
+    if pos.line as usize > last_row {
+        return buffer.document_len_bytes();
+    }
+    let row = pos.line as usize;
     let line = buffer.line(row);
     buffer.line_start(row) + byte_col(encoding, &line, pos.character as usize)
 }

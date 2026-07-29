@@ -1823,8 +1823,14 @@ impl Editor {
     /// Window `id`'s rect as `(x, y, width, height)` in windows-area cells, or
     /// `None` if there is no such window. `height` includes the status-line row;
     /// the API width/height the server returns derive from this.
+    ///
+    /// Resolves across **tabs** ([`Editor::any_tab_tree_of_window`]), like
+    /// [`window_buffer`](Self::window_buffer) and [`window_scroll`](Self::window_scroll):
+    /// a window parked in another tab is live and has a rect (as of the last time that
+    /// tab was laid out), and answering `None` for it made the server's `WinResized` diff
+    /// read every tab switch as a resize.
     pub fn window_rect(&self, id: WindowId) -> Option<(usize, usize, usize, usize)> {
-        self.tree_of_window(id).map(|(_, t)| {
+        self.any_tab_tree_of_window(id).map(|(_, t)| {
             let w = t.get(id);
             (w.rect.x, w.rect.y, w.rect.width, w.rect.height)
         })
@@ -2229,6 +2235,11 @@ impl Editor {
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
         self.windows.current = new_id;
+        // The new window *inherited* `buffer` rather than being assigned it — the fact
+        // the server's `BufWinEnter` diff needs to tell a bare `:split` (displays nothing
+        // new, fires nothing) from `:split file` (this split, then a load into the new
+        // window, which does fire). See `Editor::take_inherited_windows`.
+        self.inherited_windows.push((new_id, buffer));
         // vim's `'equalalways'` (default on): opening a window re-equalizes the
         // whole tree so the new split and its siblings share the area evenly,
         // rather than the new window carving its space out of one neighbor.
@@ -2993,13 +3004,28 @@ impl Editor {
                     height: bands.bottom.saturating_sub(dock_tab).max(1),
                 },
             };
-            let off = if layer == self.focused_layer {
-                cursor_off
-            } else {
-                (0, 0)
-            };
-            if let Some(t) = self.layer_tree_mut(layer) {
-                t.layout(rect, screen, off);
+            // Every **tab** of the layer, not just the active one: a parked tab's tree
+            // occupies the same region, and laying it out here is what keeps its rects
+            // true while it waits. Skipping it left a background tab sized for whatever
+            // the area was when it was last focused — so the tabline appearing (or a
+            // resize, or a dock opening) reached it only on switch-in, where the server's
+            // `WinResized` diff read the catch-up as a fresh resize and fired on every
+            // `gt`, and `nvim_win_get_height` on a background-tab window read stale.
+            // Neovim resizes every tabpage the same way.
+            let tabs = self.stack(layer).map_or(0, |s| s.tabs.len());
+            let active = self.stack(layer).map_or(0, |s| s.current);
+            for idx in 0..tabs {
+                // The cursor offset is the *live* cursor's, so it is meaningful only for
+                // the focused layer's active tab; every parked tree lays out at (0, 0),
+                // as the doc-comment on `cursor_off` describes.
+                let off = if layer == self.focused_layer && idx == active {
+                    cursor_off
+                } else {
+                    (0, 0)
+                };
+                if let Some(t) = self.layer_tab_tree_mut(layer, idx) {
+                    t.layout(rect, screen, off);
+                }
             }
         }
         self.apply_panel_margin();

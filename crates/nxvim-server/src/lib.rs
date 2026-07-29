@@ -823,7 +823,14 @@ pub(crate) struct ReadChain {
     /// the window walk at that moment would put it *second*, ahead of the very events
     /// the chain exists to order. Set only when a handler is actually registered (the
     /// walk's existing gate), so this stays as cheap as it was.
-    pub(crate) deferred_win_enter: bool,
+    ///
+    /// Carries the **windows** that displayed it: the fire installs each as current, and
+    /// by the time the chain completes the focused window may well be another one. A list
+    /// rather than one window because a parked chain spans many diffs and collects every
+    /// display in them — a `:vsplit` onto the same file while an async read handler is
+    /// still settling gives a *second* window the buffer, and both owe the fire. Held as
+    /// a `Vec` (never more than a couple of entries) to keep the display order.
+    pub(crate) deferred_win_enter: Vec<WindowId>,
 }
 
 pub struct EditHost {
@@ -1136,18 +1143,21 @@ pub struct EditHost {
     /// Every window id seen at the last diff, in layout order. Ids added since
     /// fire `WinNew`; ids gone fire `WinClosed`.
     known_windows: Vec<WindowId>,
-    /// Each (non-doc-float) window's displayed buffer at the last diff. A buffer
-    /// whose window-visibility went from shown-in-no-window to shown fires
-    /// `BufWinEnter` (once per newly-displayed buffer). This is the event a
-    /// session / workspace restore needs: restore fills *non-current* windows,
-    /// which the current-buffer `BufReadPost`/`BufEnter` diff never visits. A
-    /// no-arg `:split` (buffer already displayed) and merely focusing another
-    /// window don't fire it; a buffer hidden then shown again does (matching
-    /// neovim's "hidden buffer displayed"). Rebuilt every diff so the baseline
-    /// stays current even with no handler; the *fire* is gated on a registered
-    /// handler, like `WinScrolled`. Not seeded at boot, so the first emit fires it
-    /// for the startup / restored windows (as `BufReadPost` fires for the startup
-    /// file).
+    /// Each (non-doc-float) window's displayed buffer at the last diff — the
+    /// `BufWinEnter` baseline. A window now holding something else *displayed* it and
+    /// fires, which is neovim's rule (it fires from the buffer load/switch paths and
+    /// from nothing in `window.c`): a switch fires every time, a second window onto an
+    /// already-shown buffer fires again, while a tab switch and `<C-w>w` — which change
+    /// no window's buffer — fire nothing. This is also the event a session / workspace
+    /// restore needs: restore fills *non-current* windows, which the current-buffer
+    /// `BufReadPost`/`BufEnter` diff never visits. Two entries are seeded rather than
+    /// diffed: a window created by a bare `:split` is seeded with the buffer it
+    /// inherited (`Editor::take_inherited_windows`) so the split is silent, and a
+    /// re-read of a displayed buffer (`Editor::take_loaded_in_place`) fires despite
+    /// moving nothing, as neovim's `open_buffer` does. Rebuilt every diff so the
+    /// baseline stays current even with no handler; the *fire* is gated on a registered
+    /// handler, like `WinScrolled`. Not seeded at boot, so the first emit fires it for
+    /// the startup / restored windows (as `BufReadPost` fires for the startup file).
     known_window_buffers: HashMap<WindowId, BufferId>,
     /// Each window's `(id, x, y, w, h)` rect at the last diff; a change fires
     /// `WinResized` (splits, `<C-w>`-resizes, terminal resizes). `None` until the
@@ -1772,7 +1782,10 @@ impl EditHost {
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
         self.push_buf_mirror();
-        self.known_windows = self.editor.window_ids();
+        // Seeded from the same cross-tab enumeration the diff uses
+        // (`emit_lifecycle_events`), or a restore's background-tab windows would all
+        // read as new on the first diff.
+        self.known_windows = self.editor.all_window_ids();
         self.last_window_rects = Some(self.window_rects_snapshot());
         self.known_tabs = self.editor.tab_ids();
         self.known_buffers = self.editor.buffer_ids();
@@ -3835,7 +3848,9 @@ where
     // Pre-seed the window set so the first window doesn't fire `WinNew` (neovim
     // skips it for the initial window); `last_window_id` stays `None` so the
     // first `WinEnter` still fires alongside `BufEnter`, the window analogue.
-    host.known_windows = host.editor.window_ids();
+    // Cross-tab, like the diff's own enumeration: a session restore has already built
+    // every tab by now, and its background-tab windows must not read as new.
+    host.known_windows = host.editor.all_window_ids();
     host.last_window_rects = Some(host.window_rects_snapshot());
     // Pre-seed the tab set so the initial tab doesn't fire `TabNew` (neovim, like
     // for the first window, doesn't); `last_tab_id` stays `None` so a later switch

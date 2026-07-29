@@ -223,6 +223,13 @@ pub(crate) struct LspServerDoc {
     /// matches the buffer again; a full/resync push resets it to the whole text.
     /// (neovim's `prev_lines`.) See [`incremental_changes_against`].
     shadow: String,
+    /// The buffer's `'endofline'` as of the last push — i.e. whether `shadow` is the
+    /// whole rope (`true`) or the rope minus its phantom trailing `\n` (`false`).
+    /// Kept per server because each advances its own shadow, and consulted rather than
+    /// re-read from the buffer so a flip *between* syncs (a `'fixendofline'` write) is
+    /// noticed and bridged instead of silently desynchronizing the two.
+    /// See [`incremental_changes_bridging_eol`].
+    shadow_endofline: bool,
     /// Latest `publishDiagnostics` from this server for this buffer, projected into
     /// the redraw (`diagnostics_for`) and the under-cursor message line.
     diagnostics: Vec<Diagnostic>,
@@ -809,22 +816,98 @@ pub(crate) fn lsp_range_to_bytes_in(
 /// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:
 /// the character offset converted against its line, the row added as a line start.
 ///
-/// The `row` is **clamped** to the buffer's last editable line: a server's
+/// The `row` is **clamped** to the last row of the *document*: a server's
 /// `Position.line` is untrusted, and an out-of-range row would otherwise reach
 /// `buffer.line_start(row)` → ropey's `assert!(line_idx <= len_lines)` and panic
 /// the server thread (a one-line malformed-reply DoS). Clamping mirrors the
 /// column clamp `byte_col` already applies — a past-end position lands at the end
 /// of the document rather than crashing the editor.
+///
+/// The bound is the *document's* last row, not the rope's. The rope's phantom final
+/// row — the empty one after its trailing `\n` — is a real, addressable row of the
+/// document only when `'endofline'` says that newline is genuinely there; in a buffer
+/// read without a final newline it is nxvim bookkeeping the server has never been told
+/// about, and a position resolved onto it would land one byte past the document's end.
 pub(crate) fn lsp_pos_to_byte_in(
     buffer: &Buffer,
     pos: Position,
     encoding: PositionEncoding,
 ) -> usize {
     // `line_count` is the number of editable lines; a valid line index is
-    // `0..=line_count` (the count itself addresses the end of the last line).
-    let row = (pos.line as usize).min(buffer.line_count());
+    // `0..=line_count` (the count itself addresses the phantom row, i.e. the end of
+    // the document) — one less when the document doesn't end with a newline.
+    let last_row = buffer
+        .line_count()
+        .saturating_sub(usize::from(!buffer.options.endofline));
+    let row = (pos.line as usize).min(last_row);
     let line = buffer.line(row);
     buffer.line_start(row) + byte_col(encoding, &line, pos.character as usize)
+}
+
+/// Convert LSP `(range, new_text)` edits into the byte edits
+/// [`Editor::apply_edits_to`](nxvim_core::Editor::apply_edits_to) takes, in **document**
+/// coordinates, plus the `'endofline'` the buffer must carry once they land (`None` when
+/// no edit reached the document's end, so the flag is unaffected).
+///
+/// An LSP range addresses the document; the rope carries one byte more than the document
+/// whenever `'endofline'` is off. So the edit that owns the document's **tail** —
+/// the one reaching its end — is widened to the rope's end, and its replacement
+/// supersedes the phantom newline instead of being inserted before it. Without that, a
+/// server filling an empty document with `fn f() {}\n` leaves a spurious blank last line
+/// (the phantom is still sitting after the inserted text), which is exactly the bug two
+/// `len_bytes() == 1` special cases in [`edit`](super::edit) used to paper over.
+///
+/// Re-deriving `'endofline'` from the tail edit's text is what makes the round trip
+/// honest in both directions: a formatter that appends a trailing newline to an
+/// unterminated file gives the buffer one, and a server appending text *after* the final
+/// newline yields an unterminated document rather than a blank line. It is the only
+/// information available about the tail — the server is telling us, in document terms,
+/// what the document now ends with.
+pub(crate) fn lsp_edits_to_byte_edits<'a>(
+    buffer: &Buffer,
+    edits: impl IntoIterator<Item = (&'a Range, &'a str)>,
+    encoding: PositionEncoding,
+) -> (Vec<(std::ops::Range<usize>, String)>, Option<bool>) {
+    let mut out: Vec<(std::ops::Range<usize>, String)> = edits
+        .into_iter()
+        .map(|(range, text)| {
+            (
+                lsp_range_to_bytes_in(buffer, range, encoding),
+                text.to_string(),
+            )
+        })
+        .collect();
+    let doc_len = buffer.document_len_bytes();
+    // The tail edit is the one whose text ends up rightmost in the result, and it only
+    // counts if that is the document's end. `apply_edits_to` orders by **start** byte
+    // (descending), so among edits reaching the document's end the one that *starts*
+    // latest is the tail — not the one listed last, which is what a server emitting its
+    // edits bottom-up hands over. Ranking by `end` alone and breaking the tie on array
+    // index picks the wrong one there, and since the tail is widened over the rope's
+    // phantom newline, widening the earlier edit stretches it across its sibling and
+    // swallows it (`let a = 1` + `[append ";", replace "1"→"2"]` ⇒ `let a = 2`).
+    // Only a genuine tie — same start *and* same end, the several-edits-share-a-position
+    // case the LSP spec allows — falls back to array order, where `apply_edits_to`
+    // applies same-start edits in reverse input order so the last one lands rightmost.
+    let tail = out
+        .iter()
+        .enumerate()
+        .filter(|(_, (r, _))| r.end >= doc_len)
+        .max_by_key(|(i, (r, _))| (r.end, r.start, *i))
+        .map(|(i, _)| i);
+    let Some(i) = tail else {
+        return (out, None);
+    };
+    let (range, text) = &out[i];
+    let ends_with_newline = match text.is_empty() {
+        // A pure deletion of the tail: the document now ends wherever the range began,
+        // so what precedes that byte decides. (`range.start == 0` ⇒ the document is
+        // emptied, and an empty document ends with no newline.)
+        true => range.start > 0 && matches!(buffer.text.get_char(range.start - 1), Ok('\n')),
+        false => text.ends_with('\n'),
+    };
+    out[i].0.end = buffer.len_bytes();
+    (out, Some(ends_with_newline))
 }
 
 /// A `(row, byte-column)` point in `buffer` as an LSP [`Position`] in `encoding`
@@ -889,6 +972,70 @@ pub(crate) fn incremental_changes_against(
         shadow.replace_range(start..end, &e.text);
     }
     changes
+}
+
+/// [`incremental_changes_against`] for a buffer whose document is not the whole rope
+/// — the `'endofline'`-off case, where the document is the rope minus its phantom
+/// trailing `\n`.
+///
+/// The journal speaks **rope**; the server holds the **document**. A rope-space delta
+/// is not a document-space delta when the two differ: `dd` on the last line of `a\nb`
+/// deletes rope bytes `2..4`, but the document goes `a\nb` → `a`, a delete of `1..3`,
+/// because the byte that preceded the phantom *becomes* the new phantom and so leaves
+/// the document from outside the edit's own range. No endpoint remapping expresses
+/// that.
+///
+/// Bracketing does, exactly and in O(1) extra changes: an LSP `didChange` carries a
+/// *sequence* of edits, each addressing the document as the previous one left it. So
+/// put the phantom on, replay the journal verbatim in the rope coordinates it was
+/// written in, and take the phantom off again. Every intermediate state the server
+/// reaches is one nxvim really passed through, which is what makes this correct
+/// rather than merely plausible.
+///
+/// The two brackets are independent, which is what lets `'endofline'` *change* without
+/// a resync: `was_short` (the shadow is a document, so it needs the phantom back) is
+/// the flag as of the last sync, `is_short` (the new document drops it) the flag now.
+/// A `'fixendofline'` write flipping the buffer to `endofline` therefore syncs as a
+/// lone "append the newline" change.
+///
+/// `None` when the replayed shadow doesn't end in `\n` — the rope invariant would have
+/// to have been violated for that, so rather than emit a delete of some other byte the
+/// caller falls back to pushing the whole document.
+pub(crate) fn incremental_changes_bridging_eol(
+    shadow: &mut String,
+    edits: &[BufferEdit],
+    encoding: PositionEncoding,
+    was_short: bool,
+    is_short: bool,
+) -> Option<Vec<TextDocumentContentChangeEvent>> {
+    // Nothing to say: no edits, and the document's shape didn't change either.
+    if edits.is_empty() && was_short == is_short {
+        return Some(Vec::new());
+    }
+    let mut changes = Vec::with_capacity(edits.len() + 2);
+    if was_short {
+        let at = shadow_position(shadow, shadow.len(), encoding);
+        changes.push(TextDocumentContentChangeEvent {
+            range: Some(Range { start: at, end: at }),
+            range_length: None,
+            text: "\n".to_string(),
+        });
+        shadow.push('\n');
+    }
+    changes.extend(incremental_changes_against(shadow, edits, encoding));
+    if is_short {
+        let cut = shadow.strip_suffix('\n')?.len();
+        changes.push(TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: shadow_position(shadow, cut, encoding),
+                end: shadow_position(shadow, shadow.len(), encoding),
+            }),
+            range_length: None,
+            text: String::new(),
+        });
+        shadow.truncate(cut);
+    }
+    Some(changes)
 }
 
 /// An absolute byte offset in `shadow` as an LSP [`Position`] in `encoding` — the

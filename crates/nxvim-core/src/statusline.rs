@@ -153,6 +153,28 @@ pub struct StatuslineCtx {
     /// Whether the buffer writes a byte-order mark (`'bomb'`); shown as a `[bom]`
     /// suffix on the encoding in the default status line.
     pub bomb: bool,
+    /// Whether the buffer's document ends with a line break (`'endofline'`) — the raw
+    /// option, for `%{&eol}`. The default status line's `[noeol]` marker keys off
+    /// [`unterminated_file`](StatuslineCtx::unterminated_file) instead, which is this
+    /// flag narrowed to the case worth reporting.
+    pub endofline: bool,
+    /// Whether a write supplies the missing final line break (`'fixendofline'`), for
+    /// `%{&fixeol}` — the other half of what a hand-rolled `[noeol]` marker wants to
+    /// know, since under the default `'fixendofline'` the missing terminator is about
+    /// to be supplied rather than preserved.
+    pub fixendofline: bool,
+    /// Whether the buffer holds an unterminated *file*
+    /// ([`Buffer::is_unterminated_document`](crate::Buffer::is_unterminated_document)):
+    /// `'endofline'` off **and** a non-empty document. This — not the bare flag — is
+    /// what the default status line's `[noeol]` marker reports, so an empty document
+    /// (which has no final newline either, honestly) isn't flagged as missing one.
+    pub unterminated_file: bool,
+    /// The buffer's kind as [`Editor::buffer_buftype`](crate::Editor::buffer_buftype)
+    /// reports it (`""` for an ordinary file buffer, else `nofile` / `quickfix` /
+    /// `terminal`) — vim's `%{&buftype}`. The canonical "is this a document or editor
+    /// chrome" signal: file-only markers like `[noeol]` are shown only for `""`, since
+    /// a scratch surface is never written to disk.
+    pub buftype: String,
     /// The buffer number (`%n`).
     pub bufnr: usize,
     /// 1-based cursor line (`%l`).
@@ -1233,6 +1255,10 @@ mod tests {
             filetype: "rust".into(),
             fileencoding: "utf-8".into(),
             bomb: false,
+            endofline: true,
+            fixendofline: true,
+            unterminated_file: false,
+            buftype: String::new(),
             bufnr: 1,
             line: 2,
             line_count: 5,

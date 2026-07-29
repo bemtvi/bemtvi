@@ -1065,6 +1065,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         w,
         file_name: &file_name,
         filetype: &filetype,
+        buftype: ed.buffer_buftype(w.buffer),
         cur_line,
         line_count,
         cursor_screen_col,
@@ -1157,6 +1158,9 @@ struct StatusCtxInputs<'a> {
     /// The buffer's effective treesitter filetype (override or extension), for
     /// `%y` — so `:set ft=…` shows in the status line, not just the extension.
     filetype: &'a str,
+    /// The buffer's kind ([`Editor::buffer_buftype`]), for `%{&buftype}` and to gate
+    /// the file-only `[noeol]` marker off scratch surfaces.
+    buftype: &'a str,
     /// Clamped cursor line (0-based) — the rendered line, matching the ruler.
     cur_line: usize,
     line_count: usize,
@@ -1191,6 +1195,10 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
         filetype: inp.filetype.to_string(),
         fileencoding: inp.buf.options.fileencoding.to_string(),
         bomb: inp.buf.options.bomb,
+        endofline: inp.buf.options.endofline,
+        fixendofline: inp.buf.options.fixendofline,
+        unterminated_file: inp.buf.is_unterminated_document(),
+        buftype: inp.buftype.to_string(),
         bufnr: inp.w.buffer.0 as usize,
         line: inp.cur_line + 1,
         line_count: inp.line_count,

@@ -3099,6 +3099,81 @@ async fn edits_addressed_to_a_renamed_file_reach_the_renamed_buffer() {
     std::env::remove_var("NXVIM_LSP_CMD");
 }
 
+/// A `create` whose target is **already open** with content. The buffer is emptied
+/// first, as one undoable edit, so the create is a create rather than a silent no-op on
+/// stale content — and an emptied buffer holds an *empty document*, which is exactly
+/// what `'endofline'` has to say about it.
+///
+/// If the flag stayed on from the file that was read, the rope's phantom `\n` would
+/// still count as the document's own final newline: the edits that fill the buffer would
+/// no longer reach the document's end, so they would land *before* the phantom and leave
+/// a spurious trailing blank line — the bug the pre-`'endofline'` `len_bytes() == 1`
+/// special case used to paper over for exactly this case.
+#[tokio::test]
+async fn a_create_of_an_already_open_file_empties_its_document_first() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_create_open_buffer");
+    let record = dir.join("rec.jsonl");
+    // The `create` target exists, is terminated, and gets opened below — so the create
+    // takes the empty-an-open-buffer branch rather than minting a fresh buffer.
+    let target = dir.join("helper.rs");
+    std::fs::write(&target, "fn stale() {}\n").expect("write the stale file");
+    arm_mock(&dir, &extract_to_new_file_mock(&dir, &record, ""));
+    let (rpc, _incoming) = open_with_server(&dir, "fn helper() {}\nfn main() {}\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    feed(&rpc, &format!(":e {}<CR>", target.display()));
+    barrier(&rpc).await;
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "true").await,
+        "the stale file was read terminated"
+    );
+    feed(&rpc, &format!(":e {}<CR>", dir.join("a.rs").display()));
+    barrier(&rpc).await;
+
+    exec_lua(&rpc, "nx.lsp.code_action({ apply = true })").await;
+    let mut cut = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        if lines(&rpc).await == vec!["fn main() {}".to_string()] {
+            cut = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(cut, "the edit for the open document should apply");
+
+    feed(&rpc, &format!(":e {}<CR>", target.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["fn helper() {}".to_string()],
+        "the created buffer holds the extracted text and nothing else — no blank line \
+         left over from the emptied document's phantom newline"
+    );
+    // …and the document it now holds really is unterminated-then-terminated by that
+    // text, so a `:w` reproduces it byte for byte.
+    feed(&rpc, ":w<CR>");
+    barrier(&rpc).await;
+    let mut saved = String::new();
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        saved = std::fs::read_to_string(&target).unwrap_or_default();
+        if !saved.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        saved, "fn helper() {}\n",
+        "the saved file matches the edit, with no trailing blank line"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
 /// A `create` may name a file in a directory that doesn't exist yet — a refactor that
 /// extracts into a new module / package directory. `:w` refuses to create one (vim's
 /// `E212`, rightly), so the created buffer has to be written *behind* a recursive
@@ -4153,6 +4228,423 @@ async fn a_confirm_that_rejects_still_answers_the_waiting_server() {
         Some(false),
         "a confirm nobody could answer declines, and the server is told so instead of \
          being left blocked, got {answer:?}"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+// ----- `'endofline'` and the LSP document seam -----
+
+/// The `text` the mock recorded on the first `textDocument/didOpen`, or `None`.
+fn recorded_did_open_text(record: &Path) -> Option<String> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| {
+            v.get("method").and_then(serde_json::Value::as_str) == Some("textDocument/didOpen")
+        })
+        .and_then(|v| {
+            v.pointer("/params/textDocument/text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// Poll until the mock has recorded a `didOpen`, then return its `text`.
+async fn await_did_open_text(rpc: &Rpc, record: &Path) -> String {
+    for _ in 0..200 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(text) = recorded_did_open_text(record) {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the mock never recorded a didOpen");
+}
+
+/// What the editor tells a server a file *contains* is the document, not the rope. A
+/// file read without a trailing newline must not arrive at the server with one — the
+/// rope's phantom `\n` is nxvim bookkeeping standing in for vim's implicit newline after
+/// the last line, and neovim's own `buf_get_full_text` likewise appends the line ending
+/// only `if vim.bo.eol`. Sending it anyway puts the server's idea of the document one
+/// byte (and one line) out of step with the file on disk.
+#[tokio::test]
+async fn did_open_sends_the_document_not_the_rope() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_didopen");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    assert_eq!(
+        await_did_open_text(&rpc, &record).await,
+        "let a = 1\nlet b = 2",
+        "a no-eol file must reach the server unterminated"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// …and an ordinary terminated file still arrives terminated (the same code path must
+/// not start stripping newlines off every document).
+#[tokio::test]
+async fn did_open_keeps_the_trailing_newline_of_an_ordinary_file() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_didopen_normal");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    assert_eq!(
+        await_did_open_text(&rpc, &record).await,
+        "let a = 1\nlet b = 2\n",
+        "a terminated file reaches the server terminated"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// Editing a no-eol buffer must keep the server's document in step — *and* stay
+/// incremental. A rope-space delta is not a document-space delta when the document is
+/// the rope minus its last byte (`dd` on the last line of `a\nb` deletes rope bytes
+/// `2..4` but document bytes `1..3`), so the journal is replayed bracketed by the
+/// phantom newline: put it on, replay in rope coordinates, take it off. Two extra
+/// changes, no whole-document push.
+#[tokio::test]
+async fn edits_to_a_no_eol_buffer_keep_the_server_in_step() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_didchange");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let original = "let a = 1\nlet b = 2";
+    let (rpc, _incoming) = open_with_server(&dir, original).await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    await_did_open_text(&rpc, &record).await;
+
+    // `dd` on the last line — the exact shape rope-space deltas get wrong — then an
+    // ordinary insert, so the replay covers more than the one bad case.
+    feed(&rpc, "Gdd");
+    barrier(&rpc).await;
+    feed(&rpc, "ggIx <Esc>");
+    barrier(&rpc).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    barrier(&rpc).await;
+
+    let (server_view, any_full) = replay_server_changes(original, &record);
+    assert_eq!(
+        server_view, "x let a = 1",
+        "the server's document must match the buffer's document after the edits"
+    );
+    assert!(
+        !any_full,
+        "a no-eol buffer must stay incremental — the bracketed replay exists precisely \
+         so it never falls back to shipping the whole document"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The `'endofline'` a buffer syncs under can *change* under it, and the two brackets
+/// are independent precisely so that costs no resync. A `'fixendofline'` write appends
+/// the newline the file was missing — the document the server should hold grows by a
+/// byte while the rope, and so `changedtick`, never moves. The flip has to reach the
+/// server on its own, as a lone appended-newline change, and the document must still
+/// reconstruct exactly afterwards.
+#[tokio::test]
+async fn a_write_that_terminates_the_file_syncs_the_new_newline() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_write_syncs");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let original = "let a = 1\nlet b = 2";
+    let (rpc, _incoming) = open_with_server(&dir, original).await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    assert_eq!(
+        await_did_open_text(&rpc, &record).await,
+        original,
+        "the document opens unterminated"
+    );
+
+    // `:w` under the default `'fixendofline'` writes the terminator and turns the flag
+    // on — with no edit behind it, so nothing bumped `changedtick`.
+    feed(&rpc, ":w<CR>");
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "true").await,
+        "the write supplied the terminator"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    barrier(&rpc).await;
+
+    let (server_view, any_full) = replay_server_changes(original, &record);
+    assert_eq!(
+        server_view, "let a = 1\nlet b = 2\n",
+        "the server must be told about the newline the write added"
+    );
+    assert!(
+        !any_full,
+        "and told incrementally, not by a whole-document push"
+    );
+
+    // An ordinary edit afterwards still lands correctly — the shadow crossed the flip
+    // rather than drifting a byte out of step with the server.
+    feed(&rpc, "ggIx <Esc>");
+    barrier(&rpc).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    barrier(&rpc).await;
+    let (server_view, _) = replay_server_changes(original, &record);
+    assert_eq!(
+        server_view, "x let a = 1\nlet b = 2\n",
+        "edits after the flip stay in step"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The inverse crossing: a buffer that *loses* its terminator mid-session (a formatter
+/// stripping it, here forced with `:set noeol`) must hand the server a document that
+/// shrinks by that byte, and keep syncing incrementally from there.
+#[tokio::test]
+async fn a_buffer_that_loses_its_terminator_syncs_the_removal() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_loses");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let original = "let a = 1\nlet b = 2\n";
+    let (rpc, _incoming) = open_with_server(&dir, original).await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    assert_eq!(
+        await_did_open_text(&rpc, &record).await,
+        original,
+        "the document opens terminated"
+    );
+
+    feed(&rpc, ":set noeol<CR>");
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the flag is off"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    barrier(&rpc).await;
+    let (server_view, any_full) = replay_server_changes(original, &record);
+    assert_eq!(
+        server_view, "let a = 1\nlet b = 2",
+        "the server's document loses the terminator too"
+    );
+    assert!(!any_full, "incrementally");
+
+    // And a following edit is still in step, now under the bracketed path.
+    feed(&rpc, "Gdd");
+    barrier(&rpc).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    barrier(&rpc).await;
+    let (server_view, _) = replay_server_changes(original, &record);
+    assert_eq!(
+        server_view, "let a = 1",
+        "`dd` on the last line — the case rope-space deltas get wrong — still lands"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A formatter's reply is about the *document*, so its trailing newline (or absence of
+/// one) is the authority on `'endofline'`. Formatting a no-eol file with text that ends
+/// in `\n` means "this file now ends with a newline" — the buffer must record that, and
+/// the next `:w` must honor it even under `'nofixendofline'`.
+#[tokio::test]
+async fn a_formatter_that_terminates_the_file_sets_endofline() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_format_adds");
+    // A whole-document replacement whose text ends with a newline. The range spans the
+    // document (`0:0` to `1:9`, the end of the unterminated last line).
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 1, "character": 9 } },
+                  "newText": "let a = 1\nlet b = 3\n" }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the file was read unterminated"
+    );
+
+    // Retry the request until the reply lands (the established pattern in this file:
+    // the first call can beat the server's readiness).
+    let mut formatted = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.format()").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.get(1).map(String::as_str) == Some("let b = 3") {
+            formatted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(formatted, "formatting should rewrite the second line");
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "true").await,
+        "the formatter's trailing newline is the document's, so 'endofline' turns on"
+    );
+    // The formatted text landed once — no spurious blank line from the phantom.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let a = 1", "let b = 3"],
+        "the replacement must not leave a trailing empty line"
+    );
+    // And it is what reaches disk, even with `'fixendofline'` off (so the newline can
+    // only have come from the flag the formatter set).
+    feed(&rpc, ":set nofixeol<CR>:w<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        std::fs::read(dir.join("a.rs")).expect("re-read"),
+        b"let a = 1\nlet b = 3\n",
+        "the formatted document is written terminated"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The converse: a formatter that strips the trailing newline off a terminated file is
+/// telling us the document no longer ends with one. Under `'nofixendofline'` that has to
+/// reach disk — the previous behavior silently kept the file terminated, because the
+/// phantom newline was indistinguishable from a real one.
+#[tokio::test]
+async fn a_formatter_that_strips_the_terminator_clears_endofline() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_format_strips");
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 2, "character": 0 } },
+                  "newText": "let a = 1\nlet b = 3" }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "true").await,
+        "the file was read terminated"
+    );
+
+    let mut formatted = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.format()").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.get(1).map(String::as_str) == Some("let b = 3") {
+            formatted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(formatted, "formatting should rewrite the second line");
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the formatter's unterminated text clears 'endofline'"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let a = 1", "let b = 3"],
+        "the lines are unchanged in shape"
+    );
+    feed(&rpc, ":set nofixeol<CR>:w<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        std::fs::read(dir.join("a.rs")).expect("re-read"),
+        b"let a = 1\nlet b = 3",
+        "'nofixendofline' honors the formatter's stripped terminator"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// Which edit owns the document's **tail** is decided by where it *starts*, not by its
+/// index in the reply. Two edits can end at the same offset — the document's end — and
+/// then the rightmost one in the result is the one that starts later, whatever order the
+/// server listed them in (plenty of servers emit their edits bottom-up).
+///
+/// Getting that wrong doesn't just mis-set `'endofline'`: the tail edit is the one
+/// widened to swallow the rope's phantom newline, so widening the *earlier* edit
+/// stretches it over its sibling and one of the two is eaten.
+///
+/// Here the document is `let a = 1` (no terminator). The reply appends `;` at the end and
+/// replaces the `1` before it — listed in that order, i.e. tail first.
+#[tokio::test]
+async fn the_tail_edit_is_the_one_that_starts_last_not_the_one_listed_last() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_eol_format_tail_order");
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 0, "character": 9 },
+                             "end": { "line": 0, "character": 9 } },
+                  "newText": ";" },
+                { "range": { "start": { "line": 0, "character": 8 },
+                             "end": { "line": 0, "character": 9 } },
+                  "newText": "2" }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the file was read unterminated"
+    );
+
+    let mut formatted = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.format()").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.first().map(String::as_str) != Some("let a = 1") {
+            formatted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(formatted, "formatting should rewrite the line");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["let a = 2;"],
+        "both edits land: the appended `;` is not swallowed by the replacement before it"
+    );
+    assert!(
+        await_lua_eq(&rpc, "nx.bo[0].endofline", "false").await,
+        "the tail edit's text has no newline, so the document stays unterminated"
+    );
+    feed(&rpc, ":w<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        std::fs::read(dir.join("a.rs")).expect("re-read"),
+        b"let a = 2;\n",
+        "the whole formatted document reaches disk"
     );
     std::env::remove_var("NXVIM_LSP_CMD");
 }

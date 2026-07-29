@@ -358,6 +358,12 @@ pub struct BoMirror {
     /// `nx.bo.fileformat` / `vim.bo.fileformat` read the core's value (set from the
     /// bytes on read or by `:set ff=`).
     pub fileformat: String,
+    /// The buffer's `'endofline'` (whether its document ends with a line break) and
+    /// `'fixendofline'` (whether a write supplies a missing one), mirrored so
+    /// `nx.bo.endofline` / `vim.bo.fixendofline` read the core's values (set from the
+    /// bytes on read, by `:set [no]eol` / `:set [no]fixeol`, or here).
+    pub endofline: bool,
+    pub fixendofline: bool,
     pub modified: bool,
     /// The buffer's filetype (the treesitter language noun) — explicit override
     /// or extension-derived, mirrored so `nx.bo.filetype` / `vim.bo.filetype` read

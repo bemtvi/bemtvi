@@ -55,17 +55,25 @@ impl EditHost {
         }
         let id = self.editor.current_buffer_id();
         let buffer = self.editor.buffer();
-        let byte_edits = edits
-            .iter()
-            .map(|e| {
-                (
-                    lsp_range_to_bytes_in(buffer, &e.range, encoding),
-                    e.new_text.clone(),
-                )
-            })
-            .collect();
+        let (byte_edits, endofline) = lsp_edits_to_byte_edits(
+            buffer,
+            edits.iter().map(|e| (&e.range, e.new_text.as_str())),
+            encoding,
+        );
         self.editor.apply_edits_to(id, byte_edits);
+        // A whole-document format reaches the document's end, so the formatter's own
+        // trailing newline (or lack of one) decides `'endofline'` from here on.
+        self.set_endofline(id, endofline);
         self.sync_lsp_buffer(id);
+    }
+
+    /// Record the `'endofline'` an applied batch of LSP edits implies (see
+    /// [`lsp_edits_to_byte_edits`]); `None` — no edit reached the document's end — leaves
+    /// the flag alone.
+    fn set_endofline(&mut self, id: nxvim_core::BufferId, endofline: Option<bool>) {
+        if let Some(eol) = endofline {
+            self.editor.set_buffer_option_bool(id, "endofline", eol);
+        }
     }
 
     /// Apply a `WorkspaceEdit` handed up from Lua (`nx.lsp.apply_workspace_edit` /
@@ -544,29 +552,21 @@ impl EditHost {
             let Some(buffer) = self.editor.buffer_of(id) else {
                 continue;
             };
-            let mut byte_edits: Vec<(std::ops::Range<usize>, String)> = edits
-                .iter()
-                .map(|e| {
-                    (
-                        lsp_range_to_bytes_in(buffer, &e.range, encoding),
-                        e.new_text.clone(),
-                    )
-                })
-                .collect();
-            // A buffer this same edit just `create`d is an **empty document** to the
-            // server — it authored these edits against a file that does not exist —
-            // while nxvim's rope always carries a trailing phantom newline. Every
-            // position in an empty document maps to byte 0, so the fill would insert
-            // *before* that phantom and leave a spurious blank last line (a pasted
-            // `…}\n` landing as `…}\n\n`). Let the edit whose text ends up last
-            // consume the phantom instead; `normalize` puts one back if the new text
-            // doesn't end in a newline.
-            if filled_bufs.contains(&id) && buffer.len_bytes() == 1 {
-                if let Some((range, _)) = byte_edits.last_mut() {
-                    *range = 0..1;
-                }
-            }
+            // Document coordinates, so the edit that owns the document's tail consumes
+            // the rope's phantom newline rather than being inserted before it. That is
+            // what a buffer this same edit just `create`d needs: it is an **empty
+            // document** to the server — which authored these edits against a file that
+            // does not exist — so every position in it maps to byte 0 and a naive fill
+            // would leave a spurious blank last line (a pasted `…}\n` landing as
+            // `…}\n\n`). The empty document falls out of `'endofline'` being off for a
+            // 0-byte file, so no length probe is needed.
+            let (byte_edits, endofline) = lsp_edits_to_byte_edits(
+                buffer,
+                edits.iter().map(|e| (&e.range, e.new_text.as_str())),
+                encoding,
+            );
             self.editor.apply_edits_to(id, byte_edits);
+            self.set_endofline(id, endofline);
             self.sync_lsp_buffer(id);
             touched += 1;
         }
@@ -1266,29 +1266,20 @@ impl EditHost {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return;
         };
-        let mut byte_edits: Vec<(std::ops::Range<usize>, String)> = pending
-            .edits
-            .iter()
-            .map(|e| {
-                (
-                    lsp_range_to_bytes_in(buf, &e.range, pending.encoding),
-                    e.new_text.clone(),
-                )
-            })
-            .collect();
-        // The landed document is empty — the file this edit is *creating* didn't exist
-        // (or was empty), while nxvim's rope always carries a trailing phantom newline.
-        // Every position in an empty document maps to byte 0, so the fill would insert
-        // *before* the phantom and leave a spurious blank last line. Let the edit whose
-        // text ends up last consume it instead, exactly as the synchronous `create`
-        // path does; `normalize` puts one back when the new text doesn't end in a
-        // newline.
-        if buf.len_bytes() == 1 && self.pending_create_writes.contains_key(&buffer) {
-            if let Some((range, _)) = byte_edits.last_mut() {
-                *range = 0..1;
-            }
-        }
+        // Document coordinates, exactly as the synchronous `create` path uses: the edit
+        // owning the document's tail consumes the rope's phantom newline, so a file this
+        // edit is *creating* (an empty document to the server, whether it didn't exist or
+        // landed empty) is filled without a spurious blank last line.
+        let (byte_edits, endofline) = lsp_edits_to_byte_edits(
+            buf,
+            pending
+                .edits
+                .iter()
+                .map(|e| (&e.range, e.new_text.as_str())),
+            pending.encoding,
+        );
         self.editor.apply_edits_to(buffer, byte_edits);
+        self.set_endofline(buffer, endofline);
         self.sync_lsp_buffer(buffer);
     }
 

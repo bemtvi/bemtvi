@@ -1,0 +1,11 @@
+Trailing-newline playground.
+
+This file is stored WITHOUT a final newline, which is the whole point: open it
+and the status line reads "utf-8[noeol]" while `:set endofline?` echoes
+"noendofline".
+
+With `fixendofline` off (see init.lua) a plain `:w` leaves these bytes exactly as
+they are. With it on — nxvim's default, and vim's — the save appends the missing
+terminator instead.
+
+The last character of this file is the period at the end of this sentence.

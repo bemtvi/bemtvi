@@ -127,6 +127,14 @@ local O_BUF = {
   smartindent = true,
   si = true,
   autopairs = true,
+  -- Whether a write supplies a missing final newline. Routed here so
+  -- `vim.o.fixendofline = false` in an init.lua reaches the buffer rather than
+  -- landing silently in the unmodeled-option store; `'endofline'` rides along for
+  -- symmetry, though it is normally read-detected rather than configured.
+  fixendofline = true,
+  fixeol = true,
+  endofline = true,
+  eol = true,
 }
 -- Global (editor-wide) options: canonical name keyed by name and abbreviation.
 local O_GLOBAL = {
@@ -923,6 +931,13 @@ local BUF_OPT_CANON = {
   -- the core's per-buffer value (set from the bytes on read, or via `:set ff=`).
   fileformat = "fileformat",
   ff = "fileformat",
+  -- Whether the document ends with a line break (`nx.bo.endofline`, set from the
+  -- bytes on read) and whether a write supplies a missing one
+  -- (`nx.bo.fixendofline = false` to round-trip a no-newline file byte for byte).
+  endofline = "endofline",
+  eol = "endofline",
+  fixendofline = "fixendofline",
+  fixeol = "fixendofline",
   -- The comment template `gc`/`gcc` wrap lines with. Reads return the *effective*
   -- value (the buffer override, else the filetype default); a write sets the
   -- per-buffer override (empty falls back to the filetype default).
@@ -972,6 +987,8 @@ local BUF_OPT_DEFAULT = {
   fileencoding = "utf-8",
   bomb = false,
   fileformat = "unix",
+  endofline = false,
+  fixendofline = true,
   commentstring = "",
   modifiable = true,
   foldmethod = "manual",

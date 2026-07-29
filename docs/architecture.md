@@ -442,6 +442,18 @@ invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is
 `"\n"` (one empty line) and the editable line count is `rope.len_lines() - 1`.
 The phantom final line is never displayed or edited.
 
+That phantom `\n` is nxvim's spelling of the implicit newline vim's line model puts
+after *every* line, including the last — the same model, not a different one. It
+follows that the rope cannot say whether the file on disk really ended with one, so
+that fact lives in two buffer-local options instead: `'endofline'` (set from the
+bytes on read) and `'fixendofline'` (on by default, as in vim — a write supplies a
+missing terminator unless you opt out). `Buffer::document_text()` derives **the bytes
+the buffer represents** from the rope plus `'endofline'`, and it is the single
+definition every consumer uses: `to_save_bytes` writes it (so a `'nofixendofline'`
+file round-trips byte for byte, and a 0-byte file stays 0 bytes), and the LSP layer
+sends it as the document text and reads server edit ranges against it. See
+`docs/plans/2026-07-26-endofline.md`.
+
 The rope is **always UTF-8** (mirroring neovim, whose internal encoding is UTF-8);
 the on-disk byte form is a separate concern named by the buffer's `'fileencoding'`.
 All charset conversion lives at the byte↔rope seam (`nxvim-core`'s `encoding`

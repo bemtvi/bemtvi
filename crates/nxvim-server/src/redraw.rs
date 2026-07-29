@@ -776,7 +776,7 @@ impl EditHost {
     ) -> Result<Vec<statusline::Piece>, String> {
         let default;
         let fmt = if statusline_fmt.is_empty() {
-            default = default_statusline(mode_label, &ctx.fileencoding, ctx.bomb);
+            default = default_statusline(mode_label, ctx);
             &default
         } else {
             statusline_fmt
@@ -1324,19 +1324,32 @@ fn segment_value(text: &str, style: Value) -> Value {
 /// the encoding are nxvim additions spliced in as literals — escaped, though
 /// neither a mode name nor an encoding label ever contains `%` — since they are not
 /// `%`-items (neovim has no encoding item; it's conventionally `%{&fenc}`). `enc`
-/// carries the buffer's `'fileencoding'`, with a `[bom]` suffix when `'bomb'` is set.
+/// carries the buffer's `'fileencoding'`, with a `[bom]` suffix when `'bomb'` is set
+/// and a `[noeol]` suffix when the buffer holds an **unterminated file** — the only cue
+/// that the file's last line lacks a line break (and that saving under the default
+/// `'fixendofline'` will supply one).
+///
+/// `[noeol]` is narrower than `!endofline`. The buffer must hold an unterminated *file*
+/// ([`Buffer::is_unterminated_document`](nxvim_core::Buffer::is_unterminated_document),
+/// which excludes the empty document a brand-new or 0-byte file has — vim shows `[New]`
+/// there, never `[noeol]`), and it must be a document rather than editor chrome
+/// (`buftype` `""`: a panel, `nx.view`, quickfix list or terminal is never written to
+/// disk). Without those gates the marker would sit on `[No Name]`, on every listing and
+/// on every new file — noise on exactly the buffers it says nothing about.
 ///
 /// The `%<` before `%f` is the truncation point (vim's `%<%f` idiom): when the line
 /// is too narrow, the *path* is the thing that shrinks (keeping its tail), so the
 /// right-aligned encoding + position stay visible. Without it the cut would default
 /// to the `%=` marker, and a long path would overflow the prefix and drop the whole
 /// right-aligned section — hiding the encoding behind a `>`.
-fn default_statusline(mode_label: &str, fileencoding: &str, bomb: bool) -> String {
-    let enc = if bomb {
-        format!("{fileencoding}[bom]")
-    } else {
-        fileencoding.to_string()
-    };
+fn default_statusline(mode_label: &str, ctx: &nxvim_core::statusline::StatuslineCtx) -> String {
+    let mut enc = ctx.fileencoding.clone();
+    if ctx.bomb {
+        enc.push_str("[bom]");
+    }
+    if ctx.unterminated_file && ctx.buftype.is_empty() {
+        enc.push_str("[noeol]");
+    }
     format!(
         " {}  %<%f%m%={}  %l,%c ",
         mode_label.replace('%', "%%"),
@@ -1354,7 +1367,10 @@ fn statusline_option(ctx: &nxvim_core::statusline::StatuslineCtx, name: &str) ->
     match name {
         "fileencoding" | "fenc" => Some(OptVal::Str(ctx.fileencoding.clone())),
         "filetype" | "ft" => Some(OptVal::Str(ctx.filetype.clone())),
+        "buftype" | "bt" => Some(OptVal::Str(ctx.buftype.clone())),
         "bomb" => Some(OptVal::Int(ctx.bomb as i64)),
+        "endofline" | "eol" => Some(OptVal::Int(ctx.endofline as i64)),
+        "fixendofline" | "fixeol" => Some(OptVal::Int(ctx.fixendofline as i64)),
         "modified" | "mod" => Some(OptVal::Int(ctx.modified as i64)),
         "readonly" | "ro" => Some(OptVal::Int(ctx.readonly as i64)),
         "modifiable" | "ma" => Some(OptVal::Int(ctx.modifiable as i64)),

@@ -62,6 +62,30 @@ async fn await_daemon_content(fake: &DaemonFs, path: &str, want: &str) {
     );
 }
 
+/// Poll the notification stream until a `redraw` carries a message containing `want`,
+/// then assert it arrived. The ack-side counterpart of [`await_daemon_content`]: an
+/// off-tick write's `written` echo is emitted when the daemon acks, several frames
+/// after the `:w`.
+async fn await_message_containing(incoming: &mut UnboundedReceiver<Incoming>, want: &str) {
+    let deadline = Duration::from_millis(2000);
+    let mut seen: Vec<String> = Vec::new();
+    while let Ok(Some(Incoming::Notification { method, params })) =
+        tokio::time::timeout(deadline, incoming.recv()).await
+    {
+        if method != "redraw" {
+            continue;
+        }
+        let msg = message_of(&params);
+        if msg.contains(want) {
+            return;
+        }
+        if !msg.is_empty() {
+            seen.push(msg);
+        }
+    }
+    panic!("no message containing {want:?} arrived; saw {seen:?}");
+}
+
 /// Open `/virtual/a.txt`, edit it dirty, then `:edit /virtual/b.txt` and edit *it* dirty
 /// — leaving two modified file-backed buffers, both loaded over the wire. Returns the
 /// daemon fake and the live client. The edits prepend a marker so the written bytes are
@@ -421,4 +445,50 @@ async fn failing_write_cancels_the_quit_and_keeps_the_buffer_modified() {
         Some("data\n"),
         "the daemon must not hold any bytes from the failed write"
     );
+}
+
+/// `'endofline'` / `'fixendofline'` are tier-1 over the wire: the *document* is
+/// assembled core-side (`Buffer::to_save_bytes`, snapshotted when the save is
+/// enqueued), so a file read without a trailing newline round-trips through the daemon
+/// exactly as it does locally — no per-transport newline handling anywhere.
+#[tokio::test]
+async fn a_no_eol_file_round_trips_over_the_wire() {
+    let fake = DaemonFs::with("/virtual/noeol.txt", "a\nb");
+    let (rpc, mut incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/noeol.txt").await;
+    await_lines(&rpc, &["a", "b"]).await;
+
+    // The off-tick read detected the missing terminator, same as a local open.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.bo[0].endofline").await.as_bool(),
+        Some(false),
+        "a remote read detects the unterminated last line"
+    );
+
+    feed(&rpc, ":set nofixeol<CR>");
+    feed(&rpc, "ggIhello <Esc>");
+    feed(&rpc, ":w<CR>");
+    await_daemon_content(&fake, "/virtual/noeol.txt", "hello a\nb").await;
+    // The ack's echo tags it, exactly as the local write's does — the flag rides on the
+    // snapshot (`PendingSave::noeol`), so the message describes the bytes that crossed
+    // the wire rather than the buffer whenever the ack happened to land.
+    await_message_containing(&mut incoming, "[noeol] 2L, 9B written").await;
+
+    // …and with `'fixendofline'` back on, the daemon receives the terminator.
+    feed(&rpc, ":set fixeol<CR>");
+    feed(&rpc, "GAc<Esc>");
+    feed(&rpc, ":w<CR>");
+    await_daemon_content(&fake, "/virtual/noeol.txt", "hello a\nbc\n").await;
+    await_message_containing(&mut incoming, "\" 2L, 11B written").await;
+}
+
+/// The empty-document case over the wire: a 0-byte remote file must not grow to one
+/// byte on save (the local `ML_EMPTY` behavior, unchanged by the transport).
+#[tokio::test]
+async fn an_empty_remote_file_stays_empty_across_a_write() {
+    let fake = DaemonFs::with("/virtual/empty.txt", "");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/empty.txt").await;
+    await_lines(&rpc, &[""]).await;
+
+    feed(&rpc, ":w<CR>");
+    await_daemon_content(&fake, "/virtual/empty.txt", "").await;
 }

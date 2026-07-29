@@ -456,10 +456,18 @@ impl EditHost {
                 // such server; a *second* server opening later must not discard
                 // deltas the first one still needs, so the drop is guarded on the
                 // batch not having been taken for a `didChange` this sync.
-                let text = self.editor.buffer().text.to_string();
+                // The **document**, not the rope: the phantom trailing `\n` is nxvim's
+                // stand-in for vim's implicit newline after the last line, and it is
+                // only really on disk when `'endofline'` is set. Neovim's
+                // `buf_get_full_text` likewise appends the line ending only
+                // `if vim.bo.eol`, so honoring the flag here *is* the reference
+                // behavior — and it is what makes a file the server believes to be
+                // empty (an LSP `create`d one) actually arrive as empty.
+                let text = self.editor.buffer().document_text();
                 // Seed the sync shadow: this is exactly the text the server now
                 // holds, so later incremental `didChange`s replay their deltas over it.
                 doc.shadow.clone_from(&text);
+                doc.shadow_endofline = self.editor.buffer().options.endofline;
                 doc.version = 1;
                 self.fx.lsp_notify(
                     key.clone(),
@@ -477,16 +485,20 @@ impl EditHost {
                 doc.last_save_tick = cur_save_tick;
                 attached.push(client_id);
                 content_synced = true;
-            } else if cur_tick != doc.last_tick && sync_kind != TextDocumentSyncKind::NONE {
+            } else if (cur_tick != doc.last_tick
+                || doc.shadow_endofline != self.editor.buffer().options.endofline)
+                && sync_kind != TextDocumentSyncKind::NONE
+            {
+                // `'endofline'` is checked alongside `changedtick` because it can flip
+                // *without* an edit: a `'fixendofline'` write appends the newline the
+                // file was missing, which changes the document the server should hold
+                // while leaving the rope — and so the tick — untouched. Left unsynced
+                // the server would sit one byte behind the file until the next real
+                // edit; here it costs one appended-newline change, at once.
                 let batch = batch.get_or_insert_with(|| self.editor.buffer_mut().take_lsp_edits());
                 doc.version += 1;
-                let changes = Self::did_change_content(
-                    self.editor.buffer(),
-                    &mut doc.shadow,
-                    batch,
-                    sync_kind,
-                    encoding,
-                );
+                let changes =
+                    Self::did_change_content(self.editor.buffer(), doc, batch, sync_kind, encoding);
                 self.fx.lsp_notify(
                     key.clone(),
                     LspNotify::DidChange {
@@ -589,8 +601,7 @@ impl EditHost {
             let Some(doc) = self.lsp_states.get_mut(&id).and_then(|s| s.doc_mut(&key)) else {
                 continue;
             };
-            let changes =
-                Self::did_change_content(buffer, &mut doc.shadow, &batch, sync_kind, encoding);
+            let changes = Self::did_change_content(buffer, doc, &batch, sync_kind, encoding);
             doc.version += 1;
             doc.last_tick = cur_tick;
             let version = doc.version;
@@ -618,24 +629,44 @@ impl EditHost {
     /// shortened line's later columns and corrupt the range (`balance`→`aa`⇒`aae`).
     /// A `resync` batch (whole-rope replace) or a server that asked for `FULL` sync
     /// sends the whole text and reseeds `shadow` to it.
+    ///
+    /// A buffer whose `'endofline'` is **off** stays incremental too. Its document is
+    /// the rope minus the phantom trailing `\n`
+    /// ([`Buffer::document_text`](nxvim_core::Buffer::document_text)), so the journal's
+    /// rope coordinates aren't the server's document coordinates — but bracketing the
+    /// replay with the phantom reconciles them exactly, in two extra changes. That is
+    /// [`incremental_changes_bridging_eol`], which also carries the buffer across a
+    /// *change* of `'endofline'` (`shadow_endofline` is the flag the shadow was built
+    /// under). It only falls back to a whole-document push if the replayed shadow
+    /// somehow doesn't end in `\n` — a broken rope invariant, not a routine case.
     fn did_change_content(
         buffer: &nxvim_core::Buffer,
-        shadow: &mut String,
+        doc: &mut LspServerDoc,
         batch: &nxvim_core::EditBatch,
         sync_kind: TextDocumentSyncKind,
         encoding: PositionEncoding,
     ) -> Vec<TextDocumentContentChangeEvent> {
-        if batch.resync || sync_kind == TextDocumentSyncKind::FULL {
-            let text = buffer.text.to_string();
-            shadow.clone_from(&text);
-            vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text,
-            }]
-        } else {
-            incremental_changes_against(shadow, &batch.edits, encoding)
+        let endofline = buffer.options.endofline;
+        if !batch.resync && sync_kind != TextDocumentSyncKind::FULL {
+            if let Some(changes) = incremental_changes_bridging_eol(
+                &mut doc.shadow,
+                &batch.edits,
+                encoding,
+                !doc.shadow_endofline,
+                !endofline,
+            ) {
+                doc.shadow_endofline = endofline;
+                return changes;
+            }
         }
+        let text = buffer.document_text();
+        doc.shadow.clone_from(&text);
+        doc.shadow_endofline = endofline;
+        vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text,
+        }]
     }
 
     /// Fire `LspAttach` for the just-attached current buffer with the server's

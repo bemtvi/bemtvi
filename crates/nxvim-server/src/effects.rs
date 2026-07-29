@@ -1907,6 +1907,8 @@ impl EditHost {
                     fileencoding: o.fileencoding.to_string(),
                     bomb: o.bomb,
                     fileformat: o.fileformat.to_string(),
+                    endofline: o.endofline,
+                    fixendofline: o.fixendofline,
                     modified: b.modified,
                     filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
                     ts_highlight: self.editor.ts_highlight_enabled(id),

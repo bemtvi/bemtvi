@@ -37,6 +37,11 @@ pub struct PendingSave {
     /// echo the server emits on the ack (vim reports what was *written*, not the
     /// buffer's possibly-since-edited current state).
     pub lines: usize,
+    /// Whether the snapshotted bytes leave the file's last line unterminated — the
+    /// `[noeol]` tag in that same echo. Captured here for the same reason `lines` is:
+    /// the message describes the bytes that went over the wire, and the buffer may
+    /// have been edited (or had `'fixendofline'` toggled) before the ack lands.
+    pub noeol: bool,
     /// A quit to replay once this write acks: `Some(bang)` for `:wq` / `:x` (run
     /// `:q` / `:q!`), `None` for a plain `:w`. The editor defers the quit until the
     /// bytes are safely on the remote — an unflushed write is never silently
@@ -246,6 +251,10 @@ impl Editor {
             ob.buffer.options.indentemptylines = value;
         } else if name == "bomb" {
             ob.buffer.options.bomb = value;
+        } else if name == "endofline" {
+            ob.buffer.options.endofline = value;
+        } else if name == "fixendofline" {
+            ob.buffer.options.fixendofline = value;
         } else if name == "modifiable" {
             ob.buffer.options.modifiable = value;
         } else if name == "modified" {
@@ -866,9 +875,15 @@ impl Editor {
     ) -> Option<u64> {
         // Encode at snapshot time so an unrepresentable character fails loud *here*,
         // before anything is enqueued — never a silently-mangled write off the tick.
-        let (bytes, lines) = {
+        let (bytes, lines, noeol) = {
             let buf = &self.buffers.get(buffer).buffer;
-            (buf.to_save_bytes(), buf.line_count())
+            // The snapshot's own `[noeol]`: `'fixendofline'` decides it, and these are
+            // exactly the bytes it decided for.
+            (
+                buf.to_save_bytes(),
+                buf.line_count(),
+                buf.save_is_unterminated(),
+            )
         };
         let bytes = match bytes {
             Ok(bytes) => bytes,
@@ -883,6 +898,7 @@ impl Editor {
             path,
             bytes,
             lines,
+            noeol,
             then_quit,
         });
         Some(seq)
@@ -994,7 +1010,16 @@ impl Editor {
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
-                    self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
+                    // vim tags the write it just did when the file it left on disk has
+                    // no final line break — the moment that actually matters, since it
+                    // means `'nofixendofline'` preserved the missing terminator. The
+                    // buffer's flag is already the *written* one (`Buffer::write`
+                    // updates it from the bytes), so this reports disk, not intent.
+                    let noeol = match self.buffers.get(buffer).buffer.is_unterminated_document() {
+                        true => " [noeol]",
+                        false => "",
+                    };
+                    self.echo(format!("\"{name}\"{noeol} {lines}L, {bytes}B written"));
                 }
                 // Record the completed write so the server fires `BufWritePost` (the
                 // pre-write drain already fired `BufWritePre`).
@@ -1320,6 +1345,10 @@ impl Editor {
             let ob = self.buffers.get_mut(buffer);
             ob.buffer.options.fileencoding = fileencoding;
             ob.buffer.options.bomb = bomb;
+            // Whether the landed bytes terminated their last line (`'endofline'`) — the
+            // off-tick twin of the detection in `Buffer::from_file`, so a remote or wasm
+            // read round-trips a no-eol file exactly like a local one.
+            ob.buffer.options.endofline = crate::buffer::ends_with_line_break(&text);
         }
     }
 
@@ -1968,6 +1997,15 @@ impl Editor {
         }
         if let Some(buffer) = self.buffer_of_mut(id) {
             buffer.modified = true;
+            // A created file is a 0-byte file, so the emptied buffer holds an *empty
+            // document* — and an empty document does not end with a newline, however
+            // the file that was open here used to end. Leaving the flag on would make
+            // the rope's phantom `\n` count as the document's own: the edits that fill
+            // this buffer next would no longer reach the document's end, so they would
+            // land before the phantom and leave a trailing blank line. (Emptying a
+            // buffer by *editing* — `ggdG` — is a different thing and keeps its flag:
+            // that document is one empty line, which vim writes as one byte.)
+            buffer.options.endofline = false;
         }
         id
     }

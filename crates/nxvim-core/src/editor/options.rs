@@ -119,6 +119,8 @@ impl Editor {
             "autopairs" => &mut self.buffer_mut().options.autopairs,
             "indentemptylines" => &mut self.buffer_mut().options.indentemptylines,
             "bomb" => &mut self.buffer_mut().options.bomb,
+            "endofline" => &mut self.buffer_mut().options.endofline,
+            "fixendofline" => &mut self.buffer_mut().options.fixendofline,
             "modifiable" => &mut self.buffer_mut().options.modifiable,
             // A name `resolve_set` accepted as a boolean but no arm above handles is a
             // wiring gap (an option in the `canonical` registry never wired to its

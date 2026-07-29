@@ -265,6 +265,96 @@ async fn statusline_option_comparison_and_concat() {
 }
 
 #[tokio::test]
+async fn statusline_ampersand_buftype_distinguishes_chrome_from_documents() {
+    let (rpc, mut incoming) = start(None).await;
+    // `&buftype` is vim's "is this window a document or editor chrome" signal, and the
+    // canonical one here too (`Editor::buffer_buftype`) — a status line keys off it to
+    // skip its file-only pieces. An ordinary buffer reports `""`.
+    let map = redraw_after(&rpc, &mut incoming, r#":set statusline=[%{&buftype}]<CR>"#).await;
+    assert_eq!(status_text(&map), "[]");
+
+    // A built-in listing is a `nofile` scratch surface, and says so.
+    let map = redraw_after(&rpc, &mut incoming, ":messages<CR>").await;
+    let panel = field(&map, "windows")
+        .and_then(Value::as_array)
+        .expect("a window array")
+        .iter()
+        .filter_map(|w| {
+            let Value::Map(m) = w else { return None };
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("status"))
+                .and_then(|(_, v)| v.as_array())
+        })
+        .flatten()
+        .filter_map(|seg| {
+            let Value::Map(m) = seg else { return None };
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("text"))
+                .and_then(|(_, v)| v.as_str())
+        })
+        .collect::<String>();
+    assert!(
+        panel.contains("[nofile]"),
+        "the panel window reports its buftype, got {panel:?}"
+    );
+}
+
+#[tokio::test]
+async fn statusline_hand_rolled_noeol_marker_matches_the_builtin() {
+    // The two `&option`s together reproduce the default status line's `[noeol]` rule —
+    // the expression `examples/endofline/init.lua` hands users, so it has to evaluate.
+    // Set through `vim.o` as the example does: the `:set` form would need every space
+    // inside `%{…}` backslash-escaped.
+    let path = temp_path("stl_noeol_expr");
+    std::fs::write(&path, b"a\nb").expect("write fixture");
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    exec_lua(
+        &rpc,
+        r#"vim.o.statusline = '%{&endofline || &buftype != "" ? "" : "[noeol]"}'"#,
+    )
+    .await;
+    assert_eq!(
+        status_text(&redraw_after(&rpc, &mut incoming, "<Esc>").await),
+        "[noeol]",
+        "an unterminated file is marked, as the built-in marks it"
+    );
+
+    // A terminated file renders nothing — again matching the built-in.
+    feed(&rpc, ":set eol<CR>");
+    assert_eq!(
+        status_text(&redraw_after(&rpc, &mut incoming, "<Esc>").await),
+        ""
+    );
+}
+
+#[tokio::test]
+async fn statusline_ampersand_fixeol_says_whether_the_write_will_terminate() {
+    // `&endofline` alone can't tell a preserved missing terminator from one that is
+    // about to be supplied — that is `'fixendofline'`, so a hand-rolled marker wanting
+    // to distinguish them needs it to resolve as well as its sibling.
+    let path = temp_path("stl_fixeol_expr");
+    std::fs::write(&path, b"a\nb").expect("write fixture");
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    exec_lua(
+        &rpc,
+        r#"vim.o.statusline = '%{&endofline ? "" : (&fixeol ? "[+eol]" : "[noeol]")}'"#,
+    )
+    .await;
+    assert_eq!(
+        status_text(&redraw_after(&rpc, &mut incoming, "<Esc>").await),
+        "[+eol]",
+        "the default 'fixendofline' means the next write supplies the terminator"
+    );
+
+    feed(&rpc, ":set nofixeol<CR>");
+    assert_eq!(
+        status_text(&redraw_after(&rpc, &mut incoming, "<Esc>").await),
+        "[noeol]",
+        "opted out, the missing terminator is preserved instead"
+    );
+}
+
+#[tokio::test]
 async fn statusline_unknown_option_errors_loudly() {
     let (rpc, mut incoming) = start(None).await;
     // An `&option` the statusline context doesn't carry is not silently empty — it

@@ -1206,6 +1206,32 @@ pub struct BufferOptions {
     /// The line-ending convention (`'fileformat'`): set from the bytes on read and
     /// honored on write (the rope always holds `\n`). Default [`FileFormat::Unix`].
     pub fileformat: FileFormat,
+    /// Whether the buffer's **document** ends with a line break (`'endofline'`,
+    /// vim's `'eol'`). The rope always carries a trailing `\n` — that phantom is the
+    /// implicit newline vim's line model puts after every line — so this is the one
+    /// fact about the file the rope itself cannot express: whether that final
+    /// newline is really *there*. Set from the bytes on read; consumed by
+    /// [`crate::Buffer::document_text`] (and thus by every write and by the LSP
+    /// document seam).
+    ///
+    /// Default `false`, because the default document is **empty** and an empty
+    /// document does not end with a newline. Defining it this way — honestly, off
+    /// the bytes — is what lets one flag distinguish a 0-byte file (document `""`,
+    /// written as 0 bytes, vim's `ML_EMPTY`) from a file holding exactly one
+    /// newline (document `"\n"`, written as 1 byte) without vim's second hidden
+    /// bit. Vim instead reports `'eol'` on for a buffer with no file behind it, so
+    /// `:enew` + `'nofixendofline'` + `:w` writes no trailing newline here and one
+    /// in vim — invisible under the default [`fixendofline`], and the option's
+    /// literal meaning either way.
+    ///
+    /// [`fixendofline`]: BufferOptions::fixendofline
+    pub endofline: bool,
+    /// Whether a write appends the missing final newline (`'fixendofline'`, vim's
+    /// `'fixeol'`). Default `true`, as in vim: a file read without a trailing
+    /// newline gains one when saved unless you opt out. Turn it off to round-trip
+    /// such a file byte-for-byte. Never appends to an *empty* document (which would
+    /// grow a 0-byte file to one byte).
+    pub fixendofline: bool,
     /// How this buffer's folds are defined (`'foldmethod'`). Default
     /// [`FoldMethod::Manual`] (folds built by hand). [`FoldMethod::Indent`] derives
     /// the fold structure from leading indent; the editor recomputes it on edit and
@@ -1259,6 +1285,12 @@ impl Default for BufferOptions {
             bomb: false,
             // \n line endings by default; read detection overrides per buffer.
             fileformat: FileFormat::Unix,
+            // A fresh buffer's document is empty, so it has no final newline; read
+            // detection sets this from the bytes. `fixendofline` on (vim's default)
+            // means a write still terminates the last line, so the flag only shows
+            // when you opt out of it.
+            endofline: false,
+            fixendofline: true,
             // Folds are hand-made out of the box (vim's default); a config or
             // filetype rule opts a buffer into a computed source.
             foldmethod: FoldMethod::Manual,
@@ -1624,6 +1656,20 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Buffer,
             doc: "Line-ending style written when saved: unix, dos, or mac.",
+        },
+        OptionInfo {
+            name: "endofline",
+            abbrev: Some("eol"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Whether the file's last line ends with a line break.",
+        },
+        OptionInfo {
+            name: "fixendofline",
+            abbrev: Some("fixeol"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Add a missing line break to the last line when writing.",
         },
         OptionInfo {
             name: "modifiable",

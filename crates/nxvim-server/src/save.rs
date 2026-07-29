@@ -141,8 +141,9 @@ impl EditHost {
                 self.editor
                     .finalize_save(save.buffer, save.path.clone(), stat);
                 self.editor.echo(format!(
-                    "\"{}\" {}L, {}B written",
+                    "\"{}\"{} {}L, {}B written",
                     save.path.display(),
+                    if save.noeol { " [noeol]" } else { "" },
                     save.lines,
                     bytes_len,
                 ));

@@ -372,6 +372,12 @@ impl Buffer {
             // internal machinery (line counts, byte offsets, marks) sees one convention;
             // `to_save_bytes` converts back to `'fileformat'` on write.
             options.fileformat = detect_fileformat(&decoded);
+            // Whether the file's last line was terminated (`'endofline'`) — the one
+            // fact the rope can't hold, since `ensure_trailing_newline` below is about
+            // to make it end in `\n` either way. An empty file has no final newline,
+            // so it reads as `false` and its document stays empty (a 0-byte file
+            // survives a `:w` at 0 bytes).
+            options.endofline = ends_with_line_break(&decoded);
             Rope::from_str(&normalize_eol(&decoded, options.fileformat))
         } else {
             Rope::new()
@@ -722,14 +728,112 @@ impl Buffer {
         self.disk = fs.stat(&target);
         self.path = Some(target);
         self.modified = false;
+        self.options.endofline = self.written_endofline();
         // Only on a successful write, so a consumer mirroring `save_tick` sees a
         // save exactly when the bytes reached disk (a failed write is no save).
         self.save_tick += 1;
         Ok((bytes.len(), lines))
     }
 
-    /// The exact bytes [`Buffer::write`] would persist — the rope (including its
-    /// maintained trailing newline) encoded back to the buffer's `'fileencoding'`,
+    /// Whether the bytes a write persists right now end with a line break — what
+    /// `'endofline'` becomes once they land. The cheap form of
+    /// `save_text().ends_with('\n')`.
+    ///
+    /// nxvim updates the flag on write; **vim leaves `'eol'` stale** (probed: reading
+    /// `a\nb`, then `:w` under the default `'fixeol'`, writes `a\nb\n` but leaves
+    /// `&eol` at `0`). Keeping it accurate matters here because the LSP sync path keys
+    /// off it — a stale `false` would pin an ordinary buffer to full-text sync forever
+    /// — and because it makes the flag mean what it says.
+    fn written_endofline(&self) -> bool {
+        self.options.endofline || (self.options.fixendofline && !self.is_empty_document())
+    }
+
+    /// The buffer's content **as a document** — the bytes it represents, as opposed to
+    /// the bytes the rope holds. The two differ by exactly the phantom trailing `\n`:
+    /// the rope always ends in one (that phantom is the implicit newline vim's line
+    /// model puts after every line), so when `'endofline'` is off — the file's last
+    /// line was *not* terminated — the document is the rope minus that final byte.
+    ///
+    /// This is the canonical answer to "what does this buffer contain": the write path
+    /// goes through [`save_text`](Buffer::save_text), and the LSP layer sends it as the
+    /// document text (neovim's `buf_get_full_text` appends the line ending only
+    /// `if vim.bo.eol`, so honoring the flag here *is* the reference behavior).
+    pub fn document_text(&self) -> String {
+        let raw = self.text.to_string();
+        match self.options.endofline {
+            true => raw,
+            // The rope invariant guarantees a trailing `\n`, so this never mis-slices.
+            false => {
+                let mut raw = raw;
+                raw.pop();
+                raw
+            }
+        }
+    }
+
+    /// Length in bytes of [`document_text`](Buffer::document_text) — the same number
+    /// without materializing the string. LSP positions address the *document*, so this
+    /// is the bound a document byte offset is clamped to.
+    pub fn document_len_bytes(&self) -> usize {
+        self.len_bytes() - usize::from(!self.options.endofline)
+    }
+
+    /// Whether this buffer's document holds no bytes at all — a 0-byte file, or a
+    /// buffer that has never had content. Not the same as "the rope is empty" (it
+    /// never is) nor "one empty line": a file holding exactly `"\n"` is a one-empty-line
+    /// document that is *not* empty, and must survive a `:w` at one byte.
+    ///
+    /// The canonical signal for the "the server thinks this file does not exist yet"
+    /// case in the LSP workspace-edit path, which used to probe `len_bytes() == 1`.
+    pub fn is_empty_document(&self) -> bool {
+        self.document_len_bytes() == 0
+    }
+
+    /// Whether this buffer holds an **unterminated file**: a non-empty document whose
+    /// last line has no line break. The *reportable* form of `'endofline'`, and the one
+    /// definition behind every `[noeol]` cue (the default status line's marker, the
+    /// `written` echo).
+    ///
+    /// Narrower than `!endofline` on purpose. The flag is honestly off for an *empty*
+    /// document too — it has no final newline — but there is no unterminated line to
+    /// report there, and saying so would put `[noeol]` on `[No Name]` and on every
+    /// brand-new file. Vim, which reports `'eol'` on for a buffer with no file behind
+    /// it, shows `[New]` for those and never `[noeol]`.
+    pub fn is_unterminated_document(&self) -> bool {
+        !self.options.endofline && !self.is_empty_document()
+    }
+
+    /// Whether the bytes a write would persist **right now** leave the last line
+    /// unterminated — [`is_unterminated_document`](Buffer::is_unterminated_document)
+    /// asked one step ahead, through `'fixendofline'`. [`to_save_bytes`]'s companion:
+    /// an off-tick write snapshots both together, so its ack reports the bytes it
+    /// really sent rather than the buffer as it stands whenever the ack lands.
+    ///
+    /// [`to_save_bytes`]: Buffer::to_save_bytes
+    pub fn save_is_unterminated(&self) -> bool {
+        !self.written_endofline() && !self.is_empty_document()
+    }
+
+    /// The document text as a **write** would persist it: [`document_text`] plus the
+    /// line break `'fixendofline'` supplies when the document lacks one. Vim's
+    /// `'fixeol'` defaults on, so a file read without a trailing newline gains one on
+    /// save unless you opt out — turn it off to round-trip such a file byte for byte.
+    ///
+    /// An *empty* document never gains one: appending to it would grow a 0-byte file to
+    /// one byte, where vim writes nothing at all (its `ML_EMPTY` case).
+    ///
+    /// [`document_text`]: Buffer::document_text
+    pub fn save_text(&self) -> String {
+        let mut text = self.document_text();
+        if self.options.fixendofline && !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text
+    }
+
+    /// The exact bytes [`Buffer::write`] would persist — [`save_text`](Buffer::save_text)
+    /// converted to the buffer's `'fileformat'` and encoded back to its
+    /// `'fileencoding'`,
     /// with the BOM re-emitted when `'bomb'` is set. **Fails loud** (`E513`) on a
     /// character the target encoding can't represent rather than silently corrupting
     /// the file (see [`crate::encoding::encode_from_str`]). For an *off-core* write that
@@ -738,7 +842,7 @@ impl Buffer {
     /// paired with [`Buffer::mark_written`] once the write lands.
     pub fn to_save_bytes(&self) -> Result<Vec<u8>> {
         use crate::options::FileFormat;
-        let raw = self.text.to_string();
+        let raw = self.save_text();
         // The rope holds `\n`; convert to the buffer's `'fileformat'` on the way out.
         let text = match self.options.fileformat {
             FileFormat::Unix => raw,
@@ -758,6 +862,11 @@ impl Buffer {
         self.disk = stat;
         self.path = Some(path);
         self.modified = false;
+        // The bytes were snapshotted (`to_save_bytes`) when the save was *enqueued*, so
+        // this re-derives the flag rather than reading it off them; the two differ only
+        // if `'fixendofline'` was toggled, or the document went empty, while the write
+        // was in flight.
+        self.options.endofline = self.written_endofline();
         self.save_tick += 1;
     }
 
@@ -866,6 +975,14 @@ fn strip_eol(s: &str) -> &str {
         Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
         None => s,
     }
+}
+
+/// Whether a decoded file's text ends with a line break in *any* `'fileformat'`
+/// convention — the read-side detection for `'endofline'`. Runs on the text before
+/// [`normalize_eol`], so a Dos file's `\r\n` and a classic-Mac `\r` count too. An
+/// empty file has no final line break, and so opens as a genuinely empty document.
+pub(crate) fn ends_with_line_break(s: &str) -> bool {
+    s.ends_with('\n') || s.ends_with('\r')
 }
 
 fn ensure_trailing_newline(text: &mut Rope) {

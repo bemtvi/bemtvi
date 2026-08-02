@@ -18,7 +18,6 @@
 
 use super::*;
 use crate::buffer::Buffer;
-use crate::WindowOptions;
 use std::path::{Path, PathBuf};
 
 /// How a populate request combines with the existing list.
@@ -784,7 +783,9 @@ impl Editor {
     fn qf_place_in_dock(&mut self, disp: BufferId, height: usize) {
         if self.dock_is_open(DockSide::Bottom) {
             self.focus_dock(DockSide::Bottom);
-            self.new_tab(disp, WindowOptions::default());
+            // Like a dock: a tab minted for the quickfix display has no source window to
+            // copy, so it starts from the global values of the window options.
+            self.new_tab(disp, self.win_opts_global().clone());
         } else {
             self.open_dock(DockSide::Bottom, height, Some(disp));
         }

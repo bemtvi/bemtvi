@@ -109,6 +109,11 @@ local BUILTIN = {
   { "changes", ":changes", "List the change list." },
   { "set", ":set {option}", "Set {option} for all buffers and windows." },
   { "setlocal", ":setlocal {option}", "Set {option} for the current buffer/window only." },
+  {
+    "setglobal",
+    ":setglobal {option}",
+    "Set {option}'s global value — what a new buffer is born from — leaving this one.",
+  },
   { "setfiletype", ":setfiletype {ft}", "Set 'filetype' to {ft} unless already set." },
   { "undo", ":undo [n]", "Undo changes (or jump to undo state [n])." },
   { "redo", ":redo", "Redo a change that was undone." },
@@ -246,16 +251,24 @@ local function command_candidates()
   return out
 end
 
--- The `:set`-family commands whose arguments are option names. All four share the
--- same `ex_set` handler in core (`editor/ex.rs`); `:setfiletype` completes filetypes,
+-- The `:set`-family commands whose arguments are option names. They share the same
+-- `ex_set` handler in core (`editor/ex.rs`), differing only in which tier of a
+-- buffer/window-local option the write lands on; `:setfiletype` completes filetypes,
 -- not options, so it is excluded here and has its own completer (`SETFILETYPE_COMMANDS`).
-local SET_COMMANDS = { set = true, se = true, setlocal = true, setl = true }
+local SET_COMMANDS = {
+  set = true,
+  se = true,
+  setlocal = true,
+  setl = true,
+  setglobal = true,
+  setg = true,
+}
 
 -- Friendlier spellings for the docs pane's metadata line.
 local KIND_LABEL = { bool = "boolean", number = "number", string = "string" }
 local SCOPE_LABEL = { global = "global", window = "window-local", buffer = "buffer-local" }
 
--- The candidate set for an option name (the argument of `:set` / `:setlocal`): every
+-- The candidate set for an option name (the argument of any `SET_COMMANDS` entry): every
 -- option from core's injected catalog (`nx._options_catalog`, the single source of
 -- truth — it can never drift from what `:set` accepts). The canonical name is the
 -- label/insert (vim completes `:set nu` to `number`; the abbreviation still matches

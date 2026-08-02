@@ -2244,6 +2244,24 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._buf_set_option_global(name, value)`: queue a [`BufOp::SetGlobalOption`] — the
+    // *global value* of a buffer-local option, which every new buffer is born from
+    // (vim's `:setglobal`). The prelude (`vim.o` / `vim.go` / `vim.opt_global`) has
+    // canonicalized `name` and written through its own `nx._bo_global` mirror; the core
+    // fails loud on a name that has no global value.
+    let sh = shared.clone();
+    nx.set(
+        "_buf_set_option_global",
+        lua.create_function(move |_, (name, value): (String, mlua::Value)| {
+            if let Some(value) = value_to_option(&value)? {
+                sh.borrow_mut()
+                    .buf_ops
+                    .push(BufOp::SetGlobalOption { name, value });
+            }
+            Ok(())
+        })?,
+    )?;
+
     // `nx._buf_set_lines(bufnr, start, end, lines)`: queue a [`BufOp::SetLines`] for the
     // server to apply via `Editor::api_set_lines` (the lone buffer-text mutation). The
     // prelude (`nx.buf.set_lines` / `nvim_buf_set_lines`) has already validated the shape
@@ -2496,6 +2514,23 @@ pub(crate) fn install_runtime_api(
                 sh.borrow_mut()
                     .window_ops
                     .push(WindowOp::SetOption { win, name, value });
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._win_set_option_global(name, value)`: queue a [`WindowOp::SetGlobalOption`] —
+    // the *global value* of a window-local option (vim's `:setglobal`). The prelude
+    // (`vim.go` / `vim.opt_global`) has canonicalized `name` and written through its own
+    // `nx._wo_global` mirror.
+    let sh = shared.clone();
+    nx.set(
+        "_win_set_option_global",
+        lua.create_function(move |_, (name, value): (String, mlua::Value)| {
+            if let Some(value) = value_to_option(&value)? {
+                sh.borrow_mut()
+                    .window_ops
+                    .push(WindowOp::SetGlobalOption { name, value });
             }
             Ok(())
         })?,

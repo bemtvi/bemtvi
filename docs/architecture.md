@@ -508,6 +508,24 @@ them. `nxvim-core`'s `Editor` separates the two concerns vim keeps apart:
     a split inherits them from the window it splits off, so two windows onto the
     same buffer can show different gutters.
 
+  Both non-global scopes are **global-local**, as in vim: alongside each
+  instance's local value there is a *global* one (`Editor::buf_opts_global` /
+  `win_opts_global`) that `:setglobal` / `vim.go` / `vim.opt_global` read and
+  write, `:set` / `vim.opt` write **together with** the local, and `:setlocal` /
+  `vim.bo` / `vim.wo` leave alone. For buffers the global value is a *seed* —
+  `Editor::add_buffer` (the crate's sole buffer-creation funnel) is what makes a
+  config's `:set tabstop=3` reach files opened later rather than only the buffer
+  that was current while `init.lua` ran. For windows it is not a seed (a split
+  copies the window it came from); it is what seeds a window minted with **no**
+  source to copy — a dock, the quickfix tab. A handful of buffer options carry no
+  global value at all — the four the *read* decides (`fileencoding`, `bomb`,
+  `fileformat`, `endofline`), the `modifiable` marker, and the two nouns derived
+  per buffer (`filetype`, `ts_highlight`) — and `:setglobal` on one fails loud
+  (`E5100`) rather than storing a value nothing reads. `options::has_global_tier`
+  is the single place that question is answered: the ex path rejects by it, and
+  the Lua surfaces derive their routing tables from it through the injected
+  option catalog. See `docs/plans/2026-08-01-global-local-options.md`.
+
 `Editor::buffer()` / `buffer_mut()` resolve the current buffer through the
 store, so the editing code is oblivious to how many buffers are open. There is
 always at least one buffer; deleting the last leaves a fresh `[No Name]`.

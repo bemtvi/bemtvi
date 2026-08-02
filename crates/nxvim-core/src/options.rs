@@ -420,6 +420,38 @@ pub fn option_meta(name: &str) -> Option<(&'static str, OptKind, OptScope)> {
         .map(|o| (o.name, o.kind, o.scope))
 }
 
+/// Whether option `name` (its canonical spelling or its abbreviation) has a **global
+/// value** — vim's `:setglobal` tier, the value a newly created buffer is born from and
+/// a source-less window seeded with. The single source of truth for the question, shared
+/// by the ex `:setglobal` path (which rejects a tier-less option loudly with `E5100`) and
+/// the Lua surfaces (`vim.go` / `vim.opt_global`), which route by it rather than by a
+/// hand-kept name list of their own.
+///
+/// A **global**-scope option is its own global value, and every **window** option carries
+/// a tier. On the **buffer** side four slots are decided by the *read* (`fileencoding`,
+/// `bomb`, `fileformat`, `endofline`), `modifiable` is a per-buffer marker the read-only
+/// scratch listings set at creation, and `filetype` / `ts_highlight` are derived per
+/// buffer — a global value for any of them would be a value nothing reads.
+/// `false` for an unknown name.
+pub fn has_global_tier(name: &str) -> bool {
+    let Some((canon, _, scope)) = option_meta(name) else {
+        return false;
+    };
+    match scope {
+        OptScope::Global | OptScope::Window => true,
+        OptScope::Buffer => !matches!(
+            canon,
+            "fileencoding"
+                | "bomb"
+                | "fileformat"
+                | "endofline"
+                | "modifiable"
+                | "filetype"
+                | "ts_highlight"
+        ),
+    }
+}
+
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
 /// (`option_vars.h`), recognizing gcc/clang, the `make[N]: Entering directory`
 /// stack, the `In file included from` chains, and the quickfix-window save form.
@@ -1305,6 +1337,68 @@ impl Default for BufferOptions {
 }
 
 impl BufferOptions {
+    /// Copy the **settable** buffer-local options from `from`, leaving the ones the read
+    /// decides. Two callers, one classification:
+    ///
+    /// * **A new buffer** takes them from the *global values* (vim's `:setglobal` tier —
+    ///   `Editor::buf_opts_global`), in `Editor::add_buffer`, the crate's sole
+    ///   buffer-creation funnel. This is what makes a config's `:set tabstop=3` reach
+    ///   every file opened afterwards and not just the buffer that happened to be current
+    ///   while `init.lua` ran.
+    /// * **A buffer reloaded in place** (`:e!`, the throwaway reuse, a deferred open's
+    ///   bytes landing) takes them from *its own previous options*, because those paths
+    ///   swap the whole `Buffer` and would otherwise silently reset every option the user
+    ///   set on it — vim keeps a buffer's locals across a reload.
+    ///
+    /// Two classes of slot, and the split is the whole point:
+    ///
+    /// * **settable** — the indent / fold / behavior knobs a user sets. Copied.
+    /// * **read-derived** — left as-is on `self`. `fileencoding`, `bomb`, `fileformat` and
+    ///   `endofline` are *detected from the bytes*, so copying one would clobber a fact
+    ///   about the file; `modifiable` is the per-buffer marker the read-only scratch
+    ///   listings (`:messages`, `:registers`, …) set at creation.
+    ///
+    /// The source is **destructured field by field** rather than read through `self.x =
+    /// from.x` lines, so adding a [`BufferOptions`] field fails to compile here until it
+    /// is deliberately classified into one of the two lists.
+    pub fn inherit_settable(&mut self, from: &BufferOptions) {
+        let BufferOptions {
+            // ---- settable: copied ----
+            tabstop,
+            shiftwidth,
+            softtabstop,
+            expandtab,
+            autoindent,
+            smartindent,
+            autopairs,
+            indentemptylines,
+            regexsyntax,
+            fixendofline,
+            foldmethod,
+            foldnestmax,
+            foldminlines,
+            // ---- read-derived: `self` keeps its own ----
+            fileencoding: _,
+            bomb: _,
+            fileformat: _,
+            endofline: _,
+            modifiable: _,
+        } = *from;
+        self.tabstop = tabstop;
+        self.shiftwidth = shiftwidth;
+        self.softtabstop = softtabstop;
+        self.expandtab = expandtab;
+        self.autoindent = autoindent;
+        self.smartindent = smartindent;
+        self.autopairs = autopairs;
+        self.indentemptylines = indentemptylines;
+        self.regexsyntax = regexsyntax;
+        self.fixendofline = fixendofline;
+        self.foldmethod = foldmethod;
+        self.foldnestmax = foldnestmax;
+        self.foldminlines = foldminlines;
+    }
+
     /// `tabstop`, floored at 1 so a degenerate `0` never divides by zero.
     pub fn effective_tabstop(&self) -> usize {
         self.tabstop.max(1)
@@ -1333,6 +1427,51 @@ impl BufferOptions {
             std::cmp::Ordering::Less => self.effective_shiftwidth(),
             std::cmp::Ordering::Equal => self.effective_tabstop(),
             std::cmp::Ordering::Greater => self.softtabstop as usize,
+        }
+    }
+}
+
+/// Which tier of a **buffer-** or **window-local** option a `:set`-family command
+/// writes — vim's global-local model. Such an option carries a per-instance *local*
+/// value and a *global* value ([`Editor::buf_opts_global`] / [`Editor::win_opts_global`]);
+/// the command word picks which of the two the write lands on.
+///
+/// Global-scope options have a single value and ignore this. For buffers the global value
+/// is a **seed**: every newly created buffer is born from it. For windows it is not — a
+/// split copies the window it came from, as in vim — so there it is what `:setglobal` /
+/// `vim.go` read and write, and what seeds a window minted with no source to copy (a
+/// dock, the quickfix tab). A handful of buffer options carry no tier at all; see
+/// [`has_global_tier`].
+///
+/// [`Editor::buf_opts_global`]: crate::Editor
+/// [`Editor::win_opts_global`]: crate::Editor
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetScope {
+    /// `:set` — write the global value **and** the current buffer's local, as vim does.
+    Both,
+    /// `:setlocal` — write only the current buffer's local value.
+    Local,
+    /// `:setglobal` — write only the global value; the current buffer keeps its own.
+    Global,
+}
+
+impl SetScope {
+    /// Whether this write reaches the current buffer's own value.
+    pub fn writes_local(self) -> bool {
+        matches!(self, SetScope::Both | SetScope::Local)
+    }
+
+    /// Whether this write reaches the global value new buffers are born from.
+    pub fn writes_global(self) -> bool {
+        matches!(self, SetScope::Both | SetScope::Global)
+    }
+
+    /// The command word, for the error a scope-less option echoes.
+    pub fn as_cmd(self) -> &'static str {
+        match self {
+            SetScope::Both => ":set",
+            SetScope::Local => ":setlocal",
+            SetScope::Global => ":setglobal",
         }
     }
 }
@@ -1571,6 +1710,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Window,
             doc: "Comma-separated text columns to highlight (a vertical ruler).",
+        },
+        OptionInfo {
+            name: "winhighlight",
+            abbrev: Some("winhl"),
+            kind: Str,
+            scope: Window,
+            doc: "Per-window highlight-group remap, e.g. \"Normal:NormalSB\".",
         },
         // ---- Buffer-local --------------------------------------------------------
         OptionInfo {

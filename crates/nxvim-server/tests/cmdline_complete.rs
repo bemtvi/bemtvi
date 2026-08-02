@@ -882,6 +882,35 @@ async fn setlocal_arg_completes_option_names() {
 }
 
 #[tokio::test]
+async fn setglobal_completes_as_a_command_and_takes_option_names() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // The command name itself is in the catalog…
+    feed(&rpc, ":setg<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a command menu after :setg<Tab>");
+    assert!(
+        menu_items(&map).contains(&"setglobal".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+    feed(&rpc, "<Esc><Esc>");
+
+    // …and its argument completes option names, like `:set` / `:setlocal`.
+    feed(&rpc, ":setglobal ts<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an option menu after :setglobal ts<Tab>");
+    assert!(
+        menu_items(&map).contains(&"tabstop".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+}
+
+#[tokio::test]
 async fn set_option_docs_show_scope_kind_and_help() {
     let dir = temp_dir("cmdcomplete");
     let (rpc, mut incoming) = start(&dir, INIT).await;

@@ -1380,6 +1380,17 @@ impl EditHost {
                     OptionValue::String(s) => self.editor.set_buffer_option_str(id, &name, &s),
                 }
             }
+            BufOp::SetGlobalOption { name, value } => {
+                // The *global value* of a buffer-local option (the `:setglobal` tier).
+                // Routed through the same core entry points the `:setglobal` ex path
+                // uses, so the validation and the loud "no global value" rejection are
+                // shared rather than re-implemented on the Lua leg.
+                match value {
+                    OptionValue::Number(n) => self.editor.set_buf_global_option_num(&name, n),
+                    OptionValue::Bool(b) => self.editor.set_buf_global_option_bool(&name, b),
+                    OptionValue::String(s) => self.editor.set_buf_global_option_str(&name, &s),
+                }
+            }
             BufOp::SetLines {
                 bufnr,
                 start,
@@ -1609,6 +1620,15 @@ impl EditHost {
             WindowOp::SetHeight { win, height } => {
                 let id = resolve_win(self, win);
                 self.editor.set_window_height(id, height);
+            }
+            WindowOp::SetGlobalOption { name, value } => {
+                // The *global value* of a window-local option (the `:setglobal` tier),
+                // routed through the same core entry points the ex path uses.
+                match value {
+                    OptionValue::Bool(b) => self.editor.set_win_global_option_bool(&name, b),
+                    OptionValue::Number(n) => self.editor.set_win_global_option_num(&name, n),
+                    OptionValue::String(s) => self.editor.set_win_global_option_str(&name, &s),
+                }
             }
             WindowOp::SetOption { win, name, value } => {
                 let id = resolve_win(self, win);
@@ -1915,6 +1935,17 @@ impl EditHost {
                     commentstring: self.editor.effective_commentstring(id),
                     modifiable: o.modifiable,
                     buftype: self.editor.buffer_buftype(id).to_string(),
+                    foldmethod: o.foldmethod.to_string(),
+                    // The *effective* values, like `commentstring` above: a buffer with
+                    // no entry of its own follows the global tier, and `vim.bo` must
+                    // report what folding actually uses.
+                    foldexpr: self.editor.effective_foldexpr(id).to_string(),
+                    foldmarker: {
+                        let (open, close) = self.editor.effective_foldmarker_of(id);
+                        format!("{open},{close}")
+                    },
+                    foldnestmax: o.foldnestmax,
+                    foldminlines: o.foldminlines,
                 });
                 if !b.extmarks.is_empty() {
                     let marks = b
@@ -2052,6 +2083,15 @@ impl EditHost {
                     signcolumn: opts.signcolumn.to_string(),
                     fillchars: opts.fillchars.clone(),
                     padding: opts.padding.to_string(),
+                    breakindent: opts.breakindent,
+                    showbreak: opts.showbreak.clone(),
+                    breakindentopt: opts.breakindentopt.clone(),
+                    sidescroll: opts.sidescroll as u64,
+                    sidescrolloff: opts.sidescrolloff as u64,
+                    foldcolumn: opts.foldcolumn as u64,
+                    foldenable: opts.foldenable,
+                    foldlevel: opts.foldlevel as u64,
+                    winhighlight: opts.winhighlight.clone(),
                     // `winsaveview()` reports `topline` 1-based; `top` is 0-based.
                     topline: (top + 1) as u64,
                     leftcol: leftcol as u64,
@@ -2122,6 +2162,52 @@ impl EditHost {
             .lua
             .set_alt_file(&self.editor.alternate_file_name().unwrap_or_default());
         let _ = self.lua.set_bo_mirror(&bo);
+        // …and the tier those buffers were born from, so `vim.go.tabstop` /
+        // `vim.opt_global` read the core's global value rather than a Lua-side echo.
+        let g = self.editor.buf_opts_global();
+        let _ = self.lua.set_bo_global_mirror(&nxvim_lua::BoGlobalMirror {
+            tabstop: g.tabstop,
+            shiftwidth: g.shiftwidth,
+            softtabstop: g.softtabstop,
+            expandtab: g.expandtab,
+            autoindent: g.autoindent,
+            smartindent: g.smartindent,
+            autopairs: g.autopairs,
+            indentemptylines: g.indentemptylines,
+            fixendofline: g.fixendofline,
+            foldmethod: g.foldmethod.to_string(),
+            foldnestmax: g.foldnestmax,
+            foldminlines: g.foldminlines,
+            commentstring: self.editor.commentstring_global().to_string(),
+            foldexpr: self.editor.foldexpr_global().to_string(),
+            foldmarker: {
+                let (open, close) = self.editor.foldmarker_global();
+                format!("{open},{close}")
+            },
+        });
+        // …and the window tier beside it, for `vim.go.number` / `vim.opt_global.scrolloff`.
+        let w = self.editor.win_opts_global();
+        let _ = self.lua.set_wo_global_mirror(&nxvim_lua::WoGlobalMirror {
+            number: w.number,
+            relativenumber: w.relativenumber,
+            cursorline: w.cursorline,
+            wrap: w.wrap,
+            breakindent: w.breakindent,
+            foldenable: w.foldenable,
+            scrolloff: w.scrolloff,
+            sidescroll: w.sidescroll,
+            sidescrolloff: w.sidescrolloff,
+            numberwidth: w.numberwidth,
+            foldcolumn: w.foldcolumn,
+            foldlevel: w.foldlevel,
+            signcolumn: w.signcolumn.to_string(),
+            colorcolumn: w.colorcolumn.clone(),
+            showbreak: w.showbreak.clone(),
+            breakindentopt: w.breakindentopt.clone(),
+            fillchars: w.fillchars.clone(),
+            padding: w.padding.to_string(),
+            winhighlight: w.winhighlight.clone(),
+        });
         let _ = self.lua.set_extmark_mirror(&extmarks);
         // The highlight registry, mirrored so `nvim_get_hl` reads live group
         // definitions from Lua. Gated on the registry's generation — a colorscheme

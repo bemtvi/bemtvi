@@ -1,0 +1,2 @@
+A file opened after the config ran.
+It inherits the global values, including commentstring.

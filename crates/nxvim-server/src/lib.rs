@@ -887,6 +887,13 @@ pub struct EditHost {
     /// (which only governs capture). From [`ServerInit::restore_session`].
     #[cfg(feature = "native")]
     restore_session: bool,
+    /// The captured session [`shada_load`](Self::shada_load) pulled out of the store,
+    /// held until the config has been sourced — see
+    /// [`apply_pending_session_restore`](Self::apply_pending_session_restore) for why the
+    /// layout must NOT come back before `init.lua` runs. `None` outside a
+    /// `--restore-session` boot, and taken (once) at the restore point.
+    #[cfg(feature = "native")]
+    pending_session: Option<nxvim_core::SessionState>,
     /// The on-daemon shada sync for a `Remote`-config session (Approach A): a handle to
     /// the daemon fs plus the remote file path. `None` for a local-shada session. When
     /// set, [`shada_checkpoint`](Self::shada_checkpoint) uploads the staged store's bytes
@@ -1600,6 +1607,8 @@ impl EditHost {
             workspace_session: false,
             #[cfg(feature = "native")]
             restore_session: false,
+            #[cfg(feature = "native")]
+            pending_session: None,
             #[cfg(feature = "native")]
             remote_shada: None,
             ui: None,
@@ -2948,9 +2957,9 @@ impl EditHost {
         match result {
             Ok(mut state) => {
                 // Pull the workspace session out before import_persist (which only seeds
-                // marks/registers/history); restore the layout eagerly, ONCE at boot, and
-                // only when `--restore-session` asked for it — a `:rshada` re-read must
-                // not re-spawn windows, and a plain namespaced launch must not rearrange.
+                // marks/registers/history); the layout is rebuilt ONCE at boot, and only
+                // when `--restore-session` asked for it — a `:rshada` re-read must not
+                // re-spawn windows, and a plain namespaced launch must not rearrange.
                 let session = state.session.take();
                 // Plugin data lives in the Lua runtime, not the editor model — pull it
                 // out (like the session) and seed the opted-in plugins' stores, so a
@@ -2961,14 +2970,9 @@ impl EditHost {
                 self.lua
                     .plugin_shada_seed(plugin_shada_to_tuples(plugin_data));
                 if self.restore_session {
-                    if let Some(session) = session {
-                        // The session stores buffer paths **relative to the workspace root** (a
-                        // portable shada). A `--workspace` launch has already cd'd into that
-                        // root at boot (see `run_io`), so the restore's synchronous local file
-                        // reads resolve correctly and the buffers keep their relative names (so
-                        // `:ls` reads relative in the workspace) — no path reconciliation here.
-                        self.editor.restore_session(session);
-                    }
+                    // Hold the session until the config has been sourced — the layout is
+                    // rebuilt at `apply_pending_session_restore`, not here.
+                    self.pending_session = session;
                 }
             }
             Err(e) => {
@@ -2977,6 +2981,39 @@ impl EditHost {
                 self.shada = None;
             }
         }
+    }
+
+    /// Rebuild the layout of the session [`shada_load`](Self::shada_load) held back —
+    /// the LAST startup step before the lifecycle seed, run **after** `init.lua` and the
+    /// package `plugin/` scripts have been sourced.
+    ///
+    /// The ordering is load-bearing, not incidental. A restored window/buffer is minted
+    /// by the restore itself, and a window-local option (`'scrolloff'`, `'signcolumn'`,
+    /// `'number'`, …) is set on the *current* window — so restoring before the config ran
+    /// gave every restored window the built-in defaults, and the config's `vim.opt`
+    /// settings applied only to a startup window the restore had already replaced. Worse,
+    /// the Lua mirrors still described the pre-restore ids, so a config-time write was
+    /// addressed to a window/buffer that no longer existed and was dropped on the floor.
+    /// Sourcing first and restoring after fixes both: the config configures the startup
+    /// window, and every window the restore mints inherits it (the `template` in
+    /// [`Editor::restore_session`](nxvim_core::Editor::restore_session)) exactly as a
+    /// `:split` does. It is also neovim's own order — a session is sourced *after* config.
+    ///
+    /// The session stores buffer paths **relative to the workspace root** (a portable
+    /// shada). A `--workspace` launch has already cd'd into that root at boot (see
+    /// `run_io`), so the restore's synchronous local file reads resolve correctly and the
+    /// buffers keep their relative names (so `:ls` reads relative in the workspace) — no
+    /// path reconciliation here. A no-op outside a `--restore-session` boot.
+    pub(crate) fn apply_pending_session_restore(&mut self) {
+        let Some(session) = self.pending_session.take() else {
+            return;
+        };
+        self.editor.restore_session(session);
+        // The restore reminted window ids and swapped the current buffer, so refresh the
+        // Rust→Lua mirrors before anything Lua-facing (the lifecycle events fired next,
+        // and the persisted-view `on_restore` dispatch) reads them.
+        self.refresh_cur_buf_snapshot();
+        self.push_buf_mirror();
     }
 
     /// Arm (re-arm) the one-shot debounce timer through the [`HostEffects`] timer
@@ -3477,8 +3514,10 @@ where
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     // Inject the documented option catalog from core (the single source of truth)
-    // into the Lua runtime, so the bundled `nx.cmdline_complete` source can offer
-    // option names with their docs after `:set`. The server is the integrator here —
+    // into the Lua runtime: the bundled `nx.cmdline_complete` source offers option
+    // names with their docs after `:set`, and the prelude derives its `vim.o` scope
+    // routing + `vim.go` tier tables from the same rows, so neither can drift from
+    // what `:set` accepts. The server is the integrator here —
     // nxvim-lua stays decoupled from editor-core types, so the catalog crosses as
     // plain `OptionCatalogRow` data. Done before any `init.lua` runs.
     let option_rows: Vec<nxvim_lua::OptionCatalogRow> = nxvim_core::options::options_catalog()
@@ -3488,6 +3527,7 @@ where
             abbrev: o.abbrev.map(str::to_string),
             kind: o.kind.as_str().to_string(),
             scope: o.scope.as_str().to_string(),
+            global_tier: nxvim_core::options::has_global_tier(o.name),
             doc: o.doc.to_string(),
         })
         .collect();
@@ -3834,12 +3874,18 @@ where
     // before the lifecycle seed below, so the events fire over the final buffer.)
     host.editor.reconcile_image_preview();
 
-    // Dispatch any persisted-view restores the session reopened: the layout came back at
-    // `shada_load` (before plugins) with each persisted `nx.view` slot reserved as a
-    // placeholder; now that `init.lua` + the plugins are sourced (so their
-    // `nx.view.on_restore` handlers are registered), hand each reserved slot to its owning
-    // plugin to adopt, and collapse any slot left unclaimed. Done BEFORE the window-set
-    // seed below so the placeholder churn fires no spurious `WinNew`/`WinClosed`.
+    // Rebuild the workspace session's layout, now that the config has configured the
+    // startup window/buffer every restored one is minted from (see
+    // `apply_pending_session_restore` for why this can't run at `shada_load`). A no-op
+    // outside a `--restore-session` boot.
+    host.apply_pending_session_restore();
+
+    // Dispatch any persisted-view restores the session reopened: the layout came back
+    // just above with each persisted `nx.view` slot reserved as a placeholder; now that
+    // `init.lua` + the plugins are sourced (so their `nx.view.on_restore` handlers are
+    // registered), hand each reserved slot to its owning plugin to adopt, and collapse any
+    // slot left unclaimed. Done BEFORE the window-set seed below so the placeholder churn
+    // fires no spurious `WinNew`/`WinClosed`.
     host.restore_persisted_views();
 
     // Startup seed: the initial buffer and the config's autocmds both exist now,

@@ -3,9 +3,40 @@
 use super::*;
 use crate::encoding::Encoding;
 use crate::options::{
-    resolve_set, split_set_args, NumOp, OptKind, OptScope, RegexSyntax, SetCmd, SetOp, StrOp,
-    WindowOptions,
+    resolve_set, split_set_args, BufferOptions, NumOp, OptKind, OptScope, RegexSyntax, SetCmd,
+    SetOp, SetScope, StrOp, WindowOptions,
 };
+
+/// The buffer-local options whose value the **read** (or the buffer's identity) decides,
+/// so they carry no global tier: the encoding trio detected from the bytes, and the
+/// `modifiable` marker the read-only scratch listings set at creation. `:set`/`:setlocal`
+/// write them on the current buffer as always; `:setglobal` on one fails loud rather than
+/// storing a value nothing would ever read. Mirrors the buffer-born list in
+/// [`BufferOptions::inherit_settable`].
+///
+/// These are the [`BufferOptions`] *slots* among the tier-less names; the classification
+/// itself lives once in [`crate::options::has_global_tier`], which the Lua surfaces read
+/// too, so this is a `debug_assert`-checked view of it rather than a second list.
+fn is_buffer_born(name: &str) -> bool {
+    let born = matches!(
+        name,
+        "fileencoding" | "bomb" | "fileformat" | "endofline" | "modifiable"
+    );
+    debug_assert!(
+        !born || !crate::options::has_global_tier(name),
+        "{name} is buffer-born here but `has_global_tier` says it has a tier"
+    );
+    born
+}
+
+/// A numeric buffer-local option's read/write pair against a [`BufferOptions`], so the
+/// same accessor reaches either tier. Values cross as `i64` because the slots differ in
+/// type (`softtabstop` is an `isize`, for its `-1` "follow shiftwidth" sentinel).
+type BufNumSlot = (fn(&BufferOptions) -> i64, fn(&mut BufferOptions, i64));
+
+/// The window twin of [`BufNumSlot`] — a numeric window-local option's read/write pair
+/// against a [`WindowOptions`], so one accessor reaches either tier.
+type WinNumSlot = (fn(&WindowOptions) -> i64, fn(&mut WindowOptions, i64));
 
 /// Number of decimal digits in `n` (at least 1, so `0` is one digit).
 fn digit_count(n: usize) -> usize {
@@ -19,20 +50,151 @@ fn digit_count(n: usize) -> usize {
 }
 
 impl Editor {
-    /// Handle `:set {options}` (and `:setlocal`, which is identical here — the
-    /// buffer-local options apply to the current buffer either way). Each
+    /// Handle `:set {options}` and its scoped siblings `:setlocal` / `:setglobal`. Each
     /// whitespace-separated token is a boolean option with the usual `no`/`inv`
     /// prefixes and `!`/`?` suffixes (`:set number`, `:set nonu`, `:set rnu!`) or
     /// a number option with `=value` / `?` (`:set tabstop=4`, `:set ts?`).
-    pub(crate) fn ex_set(&mut self, args: &str) {
+    ///
+    /// `scope` picks which tier of a **buffer-local** option the write lands on (vim's
+    /// global-local model — [`SetScope`]): `:set` writes the global value new buffers are
+    /// born from *and* the current buffer's own, `:setlocal` only the buffer's,
+    /// `:setglobal` only the global. Global-scope options have one value and ignore it.
+    pub(crate) fn ex_set(&mut self, args: &str, scope: SetScope) {
         for tok in split_set_args(args) {
             match resolve_set(&tok) {
-                Some(SetCmd::Bool { name, op }) => self.apply_set_bool(name, op),
-                Some(SetCmd::Num { name, op }) => self.apply_set_num(name, op),
-                Some(SetCmd::Str { name, op }) => self.apply_set_str(name, op),
+                Some(SetCmd::Bool { name, op }) => self.apply_set_bool(name, op, scope),
+                Some(SetCmd::Num { name, op }) => self.apply_set_num(name, op, scope),
+                Some(SetCmd::Str { name, op }) => self.apply_set_str(name, op, scope),
                 None => self.echo(format!("E518: Unknown option: {tok}")),
             }
         }
+    }
+
+    /// Reject a `:setglobal` of an option that has no global value to write, naming the
+    /// option and why — never a silent store into a tier nothing reads. Returns whether
+    /// the caller should stop.
+    ///
+    /// What lands here is exactly what [`has_global_tier`](crate::options::has_global_tier)
+    /// answers `false` for: the **buffer-born** options ([`is_buffer_born`]), decided by
+    /// the read or by the buffer's identity, plus the two nouns derived per buffer
+    /// (`filetype`, `ts_highlight`). Everything else — every window option, and the
+    /// map-backed `commentstring` / `foldexpr` / `foldmarker` — has a real tier.
+    fn reject_scopeless_global(&mut self, name: &str, scope: SetScope, why: &str) -> bool {
+        if scope != SetScope::Global {
+            return false;
+        }
+        self.echo(format!("E5100: {name} has no global value ({why})"));
+        true
+    }
+
+    /// Apply one buffer-local option write to the tiers this command word targets: the
+    /// current buffer's own options, the global values a new buffer is born from, or both.
+    /// `write` runs once per tier with the same value, so `:set` can never leave the two
+    /// disagreeing. Used by the enumerated-string options, whose value is parsed (and
+    /// rejected) by the caller before it gets here; the boolean and numeric paths inline
+    /// the same two-tier write because they also resolve toggles and range checks.
+    fn write_buf_opt_str(&mut self, scope: SetScope, write: impl Fn(&mut BufferOptions)) {
+        if scope.writes_local() {
+            write(&mut self.buffer_mut().options);
+        }
+        if scope.writes_global() {
+            write(&mut self.buf_opts_global);
+        }
+    }
+
+    /// Set the **global value** of a boolean buffer-local option — the `:setglobal` tier
+    /// every newly created buffer is born from — from outside the editor (the Lua
+    /// `vim.o` / `vim.go` / `vim.opt_global` bridge). Routed through the very machinery
+    /// `:setglobal` uses, so the two surfaces share one home: the same name resolution,
+    /// and the same loud rejection for an option whose value the read decides.
+    pub fn set_buf_global_option_bool(&mut self, name: &str, value: bool) {
+        let op = if value { SetOp::On } else { SetOp::Off };
+        self.apply_set_bool(name, op, SetScope::Global);
+    }
+
+    /// The numeric twin of [`Editor::set_buf_global_option_bool`] (`tabstop`,
+    /// `shiftwidth`, `softtabstop`, `foldnestmax`, `foldminlines`). Out-of-range values
+    /// fail loud exactly as on the `:setglobal` path.
+    pub fn set_buf_global_option_num(&mut self, name: &str, value: i64) {
+        self.apply_set_num(name, NumOp::Set(value), SetScope::Global);
+    }
+
+    /// The string twin of [`Editor::set_buf_global_option_bool`] (`regexsyntax`,
+    /// `foldmethod`). An invalid value fails loud (`E474`) as on the `:setglobal` path.
+    pub fn set_buf_global_option_str(&mut self, name: &str, value: &str) {
+        self.apply_set_str(name, StrOp::Set(value.to_string()), SetScope::Global);
+    }
+
+    /// The global values of the buffer-local options — the tier a new buffer is born
+    /// from — for the server to mirror to Lua (`vim.go` / `vim.opt_global` reads).
+    pub fn buf_opts_global(&self) -> &BufferOptions {
+        &self.buf_opts_global
+    }
+
+    /// Apply one `'regexsyntax'` write to the tiers this command word targets. It is the
+    /// one genuinely **global-local** option in the vim sense: a buffer either pins a
+    /// dialect or holds [`RegexSyntax::Inherit`], meaning "follow the global value" — and
+    /// that global value is the editor-wide [`Options::regexsyntax`](crate::Options),
+    /// which every inheriting buffer already resolves through. So the tier here is that
+    /// option, not a separate `buf_opts_global` slot (which would be a *second* global
+    /// nothing resolves against, disagreeing with `vim.o.regexsyntax`).
+    ///
+    /// `label` is the validated `"pcre"` / `"vim"` spelling for the global write; `choice`
+    /// the parsed value for the buffer's own slot.
+    fn write_regexsyntax(&mut self, scope: SetScope, choice: RegexSyntax, label: &str) {
+        if scope.writes_local() {
+            self.buffer_mut().options.regexsyntax = choice;
+        }
+        if scope.writes_global() {
+            self.set_global_option_str("regexsyntax", label);
+        }
+    }
+
+    /// Apply one window-local option write to the tiers this command word targets: the
+    /// focused window, the global values a source-less window is born from, or both. The
+    /// window twin of [`Editor::write_buf_opt_str`].
+    fn write_win_opt(&mut self, scope: SetScope, write: impl Fn(&mut WindowOptions)) {
+        if scope.writes_local() {
+            write(&mut self.windows.cur_mut().options);
+        }
+        if scope.writes_global() {
+            write(&mut self.win_opts_global);
+        }
+    }
+
+    /// The window options a `:set`-family **query** reads: the global values for
+    /// `:setglobal x?`, the focused window's for everything else.
+    fn win_opts_queried(&mut self, scope: SetScope) -> &mut WindowOptions {
+        if scope == SetScope::Global {
+            &mut self.win_opts_global
+        } else {
+            &mut self.windows.cur_mut().options
+        }
+    }
+
+    /// The global values of the window-local options, for the server to mirror to Lua
+    /// (`vim.go` / `vim.opt_global` reads) and to seed a source-less window from.
+    pub fn win_opts_global(&self) -> &WindowOptions {
+        &self.win_opts_global
+    }
+
+    /// Set the **global value** of a window-local option from outside the editor (the Lua
+    /// `vim.go` / `vim.opt_global` bridge), the window twin of
+    /// [`Editor::set_buf_global_option_bool`]. Routed through the `:setglobal` machinery,
+    /// so both surfaces share one home.
+    pub fn set_win_global_option_bool(&mut self, name: &str, value: bool) {
+        let op = if value { SetOp::On } else { SetOp::Off };
+        self.apply_set_bool(name, op, SetScope::Global);
+    }
+
+    /// The numeric twin of [`Editor::set_win_global_option_bool`].
+    pub fn set_win_global_option_num(&mut self, name: &str, value: i64) {
+        self.apply_set_num(name, NumOp::Set(value), SetScope::Global);
+    }
+
+    /// The string twin of [`Editor::set_win_global_option_bool`].
+    pub fn set_win_global_option_str(&mut self, name: &str, value: &str) {
+        self.apply_set_str(name, StrOp::Set(value.to_string()), SetScope::Global);
     }
 
     /// Handle `:setf[iletype] {ft}` — force the current buffer's filetype, i.e.
@@ -52,12 +214,15 @@ impl Editor {
     /// are window-local (they live on the focused window); `expandtab` is
     /// buffer-local (on the current buffer); the rest are global search options on
     /// the editor.
-    fn apply_set_bool(&mut self, name: &str, op: SetOp) {
+    fn apply_set_bool(&mut self, name: &str, op: SetOp, scope: SetScope) {
         // `ts_highlight` is the buffer-local *whether-treesitter-paints* noun —
         // orthogonal to `filetype` (the language). It lives in the per-buffer
         // enable map (`set_ts_highlight`), not a plain `options` bool slot, so it
         // can drop/restore the engine parse; handle it before the slot match.
         if name == "ts_highlight" {
+            if self.reject_scopeless_global(name, scope, "it is a per-buffer engine state") {
+                return;
+            }
             let buf = self.current_buffer_id();
             match op {
                 SetOp::On => self.set_ts_highlight(buf, true),
@@ -106,44 +271,107 @@ impl Editor {
             }
             return;
         }
-        let slot = match name {
-            "number" => &mut self.windows.cur_mut().options.number,
-            "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
-            "cursorline" => &mut self.windows.cur_mut().options.cursorline,
-            "foldenable" => &mut self.windows.cur_mut().options.foldenable,
-            "wrap" => &mut self.windows.cur_mut().options.wrap,
-            "breakindent" => &mut self.windows.cur_mut().options.breakindent,
-            "expandtab" => &mut self.buffer_mut().options.expandtab,
-            "autoindent" => &mut self.buffer_mut().options.autoindent,
-            "smartindent" => &mut self.buffer_mut().options.smartindent,
-            "autopairs" => &mut self.buffer_mut().options.autopairs,
-            "indentemptylines" => &mut self.buffer_mut().options.indentemptylines,
-            "bomb" => &mut self.buffer_mut().options.bomb,
-            "endofline" => &mut self.buffer_mut().options.endofline,
-            "fixendofline" => &mut self.buffer_mut().options.fixendofline,
-            "modifiable" => &mut self.buffer_mut().options.modifiable,
-            // A name `resolve_set` accepted as a boolean but no arm above handles is a
-            // wiring gap (an option in the `canonical` registry never wired to its
-            // slot — the bug `:set imagepreview` was). Fail loud rather than silently
-            // no-op, so the next such gap surfaces the moment it's `:set`.
-            _ => {
-                self.echo(format!("E518: Unknown option: {name}"));
+        // The boolean **buffer-local** options: each lives in a `BufferOptions` slot, so
+        // one accessor reaches it in either tier — the current buffer's own options, or
+        // the global values a new buffer is born from.
+        let buf_slot: Option<fn(&mut BufferOptions) -> &mut bool> = match name {
+            "expandtab" => Some(|o| &mut o.expandtab),
+            "autoindent" => Some(|o| &mut o.autoindent),
+            "smartindent" => Some(|o| &mut o.smartindent),
+            "autopairs" => Some(|o| &mut o.autopairs),
+            "indentemptylines" => Some(|o| &mut o.indentemptylines),
+            "bomb" => Some(|o| &mut o.bomb),
+            "endofline" => Some(|o| &mut o.endofline),
+            "fixendofline" => Some(|o| &mut o.fixendofline),
+            "modifiable" => Some(|o| &mut o.modifiable),
+            _ => None,
+        };
+        if let Some(slot) = buf_slot {
+            if is_buffer_born(name)
+                && self.reject_scopeless_global(name, scope, "the read decides it per buffer")
+            {
                 return;
             }
-        };
-        match op {
-            SetOp::On => *slot = true,
-            SetOp::Off => *slot = false,
-            SetOp::Toggle => *slot = !*slot,
-            SetOp::Query => {
-                let label = if *slot {
+            // `:setglobal x?` reads the tier; every other query reads what this buffer
+            // actually uses.
+            if op == SetOp::Query {
+                let on = if scope == SetScope::Global {
+                    *slot(&mut self.buf_opts_global)
+                } else {
+                    *slot(&mut self.buffer_mut().options)
+                };
+                let label = if on {
                     name.to_string()
                 } else {
                     format!("no{name}")
                 };
                 self.echo(label);
+                return;
             }
+            // A toggle flips whichever tier this command word reads, then BOTH tiers a
+            // `:set` writes take that one value — so `:set invexpandtab` can't leave the
+            // global and the buffer disagreeing about what it just toggled to.
+            let current = if scope == SetScope::Global {
+                *slot(&mut self.buf_opts_global)
+            } else {
+                *slot(&mut self.buffer_mut().options)
+            };
+            let value = match op {
+                SetOp::On => true,
+                SetOp::Off => false,
+                SetOp::Toggle => !current,
+                SetOp::Query => unreachable!("handled above"),
+            };
+            if scope.writes_local() {
+                *slot(&mut self.buffer_mut().options) = value;
+            }
+            // A buffer-born option has no tier to write; under a plain `:set` that half is
+            // simply absent (a `:setglobal` of one was rejected above).
+            if scope.writes_global() && !is_buffer_born(name) {
+                *slot(&mut self.buf_opts_global) = value;
+            }
+            return;
         }
+        // The boolean **window-local** options, reachable in either tier through one
+        // accessor exactly like the buffer booleans above. A new window still copies the
+        // window it came from (vim, and what `Editor::split` does), so the tier is not a
+        // per-split seed — it is what `:setglobal` reads/writes and what seeds a window
+        // minted with no source to copy (a dock, the quickfix tab).
+        let win_slot: Option<fn(&mut WindowOptions) -> &mut bool> = match name {
+            "number" => Some(|o| &mut o.number),
+            "relativenumber" => Some(|o| &mut o.relativenumber),
+            "cursorline" => Some(|o| &mut o.cursorline),
+            "foldenable" => Some(|o| &mut o.foldenable),
+            "wrap" => Some(|o| &mut o.wrap),
+            "breakindent" => Some(|o| &mut o.breakindent),
+            _ => None,
+        };
+        let Some(win_slot) = win_slot else {
+            // A name `resolve_set` accepted as a boolean but no arm above handles is a
+            // wiring gap (an option in the `canonical` registry never wired to its
+            // slot — the bug `:set imagepreview` was). Fail loud rather than silently
+            // no-op, so the next such gap surfaces the moment it's `:set`.
+            self.echo(format!("E518: Unknown option: {name}"));
+            return;
+        };
+        if op == SetOp::Query {
+            let on = *win_slot(self.win_opts_queried(scope));
+            let label = if on {
+                name.to_string()
+            } else {
+                format!("no{name}")
+            };
+            self.echo(label);
+            return;
+        }
+        let current = *win_slot(self.win_opts_queried(scope));
+        let value = match op {
+            SetOp::On => true,
+            SetOp::Off => false,
+            SetOp::Toggle => !current,
+            SetOp::Query => unreachable!("handled above"),
+        };
+        self.write_win_opt(scope, |o| *win_slot(o) = value);
     }
 
     /// Apply one resolved number `:set` operation. The indentation options
@@ -152,7 +380,102 @@ impl Editor {
     /// on the focused window). The assigned value is range-checked per option (vim's
     /// `E487`): `tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`, the scroll
     /// options `≥ 0`.
-    fn apply_set_num(&mut self, name: &str, op: NumOp) {
+    fn apply_set_num(&mut self, name: &str, op: NumOp, scope: SetScope) {
+        // The numeric **buffer-local** options, reachable in either tier through one
+        // accessor pair (see `apply_set_bool`). All five are settable — none is
+        // read-derived — so a `:set tabstop=3` in a config reaches every file opened
+        // afterwards.
+        let buf_num: Option<BufNumSlot> = match name {
+            "tabstop" => Some((|o| o.tabstop as i64, |o, v| o.tabstop = v as usize)),
+            "shiftwidth" => Some((|o| o.shiftwidth as i64, |o, v| o.shiftwidth = v as usize)),
+            "softtabstop" => Some((|o| o.softtabstop as i64, |o, v| o.softtabstop = v as isize)),
+            "foldnestmax" => Some((|o| o.foldnestmax as i64, |o, v| o.foldnestmax = v as usize)),
+            "foldminlines" => Some((
+                |o| o.foldminlines as i64,
+                |o, v| o.foldminlines = v as usize,
+            )),
+            _ => None,
+        };
+        if let Some((get, set)) = buf_num {
+            match op {
+                NumOp::Set(v) => {
+                    let min = if name == "softtabstop" {
+                        -1
+                    } else if name == "shiftwidth" || name == "foldminlines" {
+                        0
+                    } else {
+                        1
+                    };
+                    if v < min {
+                        self.echo(format!("E487: Argument must be positive: {name}={v}"));
+                        return;
+                    }
+                    if scope.writes_local() {
+                        set(&mut self.buffer_mut().options, v);
+                    }
+                    if scope.writes_global() {
+                        set(&mut self.buf_opts_global, v);
+                    }
+                    // The indent-fold structure depends on these — rebuild it. (A pure
+                    // `:setglobal` changed no open buffer, so there is nothing to redo.)
+                    if scope.writes_local() {
+                        self.refresh_folds();
+                    }
+                }
+                NumOp::Query => {
+                    let v = if scope == SetScope::Global {
+                        get(&self.buf_opts_global)
+                    } else {
+                        get(&self.buffer().options)
+                    };
+                    self.echo(format!("{name}={v}"));
+                }
+            }
+            return;
+        }
+        // The numeric **window-local** options, reachable in either tier through one
+        // accessor pair, exactly like the buffer numerics above.
+        let win_num: Option<WinNumSlot> = match name {
+            "sidescroll" => Some((|o| o.sidescroll as i64, |o, v| o.sidescroll = v as usize)),
+            "sidescrolloff" => Some((
+                |o| o.sidescrolloff as i64,
+                |o, v| o.sidescrolloff = v as usize,
+            )),
+            "scrolloff" => Some((|o| o.scrolloff as i64, |o, v| o.scrolloff = v as usize)),
+            "numberwidth" => Some((|o| o.numberwidth as i64, |o, v| o.numberwidth = v as usize)),
+            "foldcolumn" => Some((|o| o.foldcolumn as i64, |o, v| o.foldcolumn = v as usize)),
+            "foldlevel" => Some((|o| o.foldlevel as i64, |o, v| o.foldlevel = v as usize)),
+            _ => None,
+        };
+        if let Some((get, set)) = win_num {
+            match op {
+                NumOp::Set(v) => {
+                    let min = if name == "numberwidth" { 1 } else { 0 };
+                    if v < min {
+                        self.echo(format!("E487: Argument must be positive: {name}={v}"));
+                        return;
+                    }
+                    if scope.writes_global() {
+                        set(&mut self.win_opts_global, v);
+                    }
+                    if scope.writes_local() {
+                        // `foldlevel` re-derives which *computed* folds display closed;
+                        // route the window's own value through the dedicated setter so
+                        // the `:set` and `vim.wo` paths re-fold identically.
+                        if name == "foldlevel" {
+                            self.set_foldlevel(v as usize);
+                        } else {
+                            set(&mut self.windows.cur_mut().options, v);
+                        }
+                    }
+                }
+                NumOp::Query => {
+                    let v = get(self.win_opts_queried(scope));
+                    self.echo(format!("{name}={v}"));
+                }
+            }
+            return;
+        }
         match op {
             NumOp::Set(v) => {
                 // The global numeric options route through the shared setter so the
@@ -166,48 +489,10 @@ impl Editor {
                     self.set_global_option_num(name, v);
                     return;
                 }
-                let min = match name {
-                    "tabstop" | "numberwidth" | "foldnestmax" => 1,
-                    "shiftwidth" | "sidescroll" | "sidescrolloff" | "scrolloff" | "foldcolumn"
-                    | "foldlevel" | "foldminlines" => 0,
-                    "softtabstop" => -1,
-                    // A wiring gap (see `apply_set_bool`): a numeric option `resolve_set`
-                    // accepted but no arm handles. Fail loud, never a silent no-op.
-                    _ => {
-                        self.echo(format!("E518: Unknown option: {name}"));
-                        return;
-                    }
-                };
-                if v < min {
-                    self.echo(format!("E487: Argument must be positive: {name}={v}"));
-                    return;
-                }
-                match name {
-                    "sidescroll" => self.windows.cur_mut().options.sidescroll = v as usize,
-                    "sidescrolloff" => self.windows.cur_mut().options.sidescrolloff = v as usize,
-                    "scrolloff" => self.windows.cur_mut().options.scrolloff = v as usize,
-                    "numberwidth" => self.windows.cur_mut().options.numberwidth = v as usize,
-                    "foldcolumn" => self.windows.cur_mut().options.foldcolumn = v as usize,
-                    // `foldlevel` re-derives which *computed* folds display closed; route
-                    // it through the dedicated setter so the `:set` and `vim.wo` paths
-                    // re-fold identically.
-                    "foldlevel" => self.set_foldlevel(v as usize),
-                    _ => {
-                        let opts = &mut self.buffer_mut().options;
-                        match name {
-                            "tabstop" => opts.tabstop = v as usize,
-                            "shiftwidth" => opts.shiftwidth = v as usize,
-                            "softtabstop" => opts.softtabstop = v as isize,
-                            // Structural knobs for computed folds; a recompute below
-                            // picks up the new value.
-                            "foldnestmax" => opts.foldnestmax = v as usize,
-                            "foldminlines" => opts.foldminlines = v as usize,
-                            _ => {}
-                        }
-                        // The indent-fold structure depends on these — rebuild it.
-                        self.refresh_folds();
-                    }
-                }
+                // A wiring gap (see `apply_set_bool`): a numeric option `resolve_set`
+                // accepted but neither the global setter nor an arm above handles.
+                // Fail loud, never a silent no-op.
+                self.echo(format!("E518: Unknown option: {name}"));
             }
             NumOp::Query => {
                 // Global numerics read through the shared scalar accessor (catalog-driven),
@@ -217,30 +502,8 @@ impl Editor {
                     self.echo(format!("{name}={v}"));
                     return;
                 }
-                let v: i64 = match name {
-                    "sidescroll" => self.windows.cur().options.sidescroll as i64,
-                    "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
-                    "scrolloff" => self.windows.cur().options.scrolloff as i64,
-                    "numberwidth" => self.windows.cur().options.numberwidth as i64,
-                    "foldcolumn" => self.windows.cur().options.foldcolumn as i64,
-                    "foldlevel" => self.windows.cur().options.foldlevel as i64,
-                    _ => {
-                        let opts = &self.buffer().options;
-                        match name {
-                            "tabstop" => opts.tabstop as i64,
-                            "shiftwidth" => opts.shiftwidth as i64,
-                            "softtabstop" => opts.softtabstop as i64,
-                            "foldnestmax" => opts.foldnestmax as i64,
-                            "foldminlines" => opts.foldminlines as i64,
-                            // A wiring gap (see `apply_set_bool`): fail loud, not silent.
-                            _ => {
-                                self.echo(format!("E518: Unknown option: {name}"));
-                                return;
-                            }
-                        }
-                    }
-                };
-                self.echo(format!("{name}={v}"));
+                // A wiring gap (see `apply_set_bool`): fail loud, not silent.
+                self.echo(format!("E518: Unknown option: {name}"));
             }
         }
     }
@@ -250,13 +513,16 @@ impl Editor {
     /// (`mouse` / `mousemodel` / `mousescroll`); each routes through the shared
     /// [`Editor::set_global_option_str`] setter so the `:set` and `vim.o` paths
     /// share one home. `&` resets to the default (empty); `?` echoes the value.
-    fn apply_set_str(&mut self, name: &str, op: StrOp) {
+    fn apply_set_str(&mut self, name: &str, op: StrOp, scope: SetScope) {
         // `filetype` is buffer-local and special: it drives the per-buffer
         // treesitter language override (the same seam as `nx.bo.filetype`), not a
         // global string slot. This is the no-Lua way to force a
         // language onto a buffer the extension table misses — e.g. on the web
         // build, where there is no Lua at all.
         if name == "filetype" {
+            if self.reject_scopeless_global(name, scope, "it is derived per buffer") {
+                return;
+            }
             let buf = self.current_buffer_id();
             match op {
                 // `filetype` is the *language* noun: set it (`""` = no filetype),
@@ -282,8 +548,29 @@ impl Editor {
         if name == "commentstring" {
             let buf = self.current_buffer_id();
             match op {
-                StrOp::Set(value) => self.set_commentstring(buf, &value),
-                StrOp::Reset => self.set_commentstring(buf, ""),
+                StrOp::Set(value) => {
+                    if scope.writes_local() {
+                        self.set_commentstring(buf, &value);
+                    }
+                    if scope.writes_global() {
+                        self.set_commentstring_global(&value);
+                    }
+                }
+                StrOp::Reset => {
+                    if scope.writes_local() {
+                        self.set_commentstring(buf, "");
+                    }
+                    if scope.writes_global() {
+                        self.set_commentstring_global("");
+                    }
+                }
+                // `:setglobal cms?` reads the global value (empty ⇒ none set, so every
+                // buffer falls through to its filetype default); a plain `?` reads what
+                // `gc` actually wraps this buffer with.
+                StrOp::Query if scope == SetScope::Global => {
+                    let cs = self.commentstring_global().to_string();
+                    self.echo(format!("commentstring={cs}"));
+                }
                 StrOp::Query => {
                     let cs = self.effective_commentstring(buf);
                     self.echo(format!("commentstring={cs}"));
@@ -298,17 +585,16 @@ impl Editor {
         if name == "signcolumn" {
             match op {
                 StrOp::Set(value) => match crate::options::SignColumn::parse(&value) {
-                    Some(scl) => self.windows.cur_mut().options.signcolumn = scl,
+                    Some(scl) => self.write_win_opt(scope, |o| o.signcolumn = scl),
                     None => {
                         self.echo(format!("E474: Invalid argument: signcolumn={value}"));
                     }
                 },
-                StrOp::Reset => {
-                    self.windows.cur_mut().options.signcolumn =
-                        crate::options::SignColumn::Auto { min: 1, max: 1 }
-                }
+                StrOp::Reset => self.write_win_opt(scope, |o| {
+                    o.signcolumn = crate::options::SignColumn::Auto { min: 1, max: 1 }
+                }),
                 StrOp::Query => {
-                    let scl = self.windows.cur().options.signcolumn;
+                    let scl = self.win_opts_queried(scope).signcolumn;
                     self.echo(format!("signcolumn={scl}"));
                 }
             }
@@ -330,9 +616,16 @@ impl Editor {
                             return;
                         }
                     };
-                    self.buffer_mut().options.regexsyntax = choice;
+                    self.write_regexsyntax(scope, choice, &value);
                 }
-                StrOp::Reset => self.buffer_mut().options.regexsyntax = RegexSyntax::Inherit,
+                StrOp::Reset => self.write_regexsyntax(scope, RegexSyntax::Inherit, "pcre"),
+                // `:setglobal rxs?` reads the editor-wide dialect a buffer with no
+                // override of its own follows — the same value `:set rxs?` resolves
+                // through for the current buffer.
+                StrOp::Query if scope == SetScope::Global => {
+                    let rs = self.options.regexsyntax.clone();
+                    self.echo(format!("regexsyntax={rs}"));
+                }
                 StrOp::Query => self.echo(format!("regexsyntax={}", self.effective_regexsyntax())),
             }
             return;
@@ -343,6 +636,9 @@ impl Editor {
         // charset. Changing it implies the next write re-encodes, so it marks the
         // buffer modified (vim does the same). `&` resets to UTF-8.
         if name == "fileencoding" {
+            if self.reject_scopeless_global(name, scope, "the read decides it per buffer") {
+                return;
+            }
             match op {
                 StrOp::Set(value) => {
                     let enc = if value.is_empty() {
@@ -374,6 +670,9 @@ impl Editor {
         // loud (E474). Changing it implies the next write re-converts the line endings, so
         // it marks the buffer modified (vim does the same). `&` resets to unix.
         if name == "fileformat" {
+            if self.reject_scopeless_global(name, scope, "the read decides it per buffer") {
+                return;
+            }
             use crate::options::FileFormat;
             match op {
                 StrOp::Set(value) => {
@@ -408,7 +707,7 @@ impl Editor {
             match op {
                 StrOp::Set(value) => match FoldMethod::from_label(&value) {
                     Ok(fdm) => {
-                        self.buffer_mut().options.foldmethod = fdm;
+                        self.write_buf_opt_str(scope, |o| o.foldmethod = fdm);
                         self.refresh_folds();
                     }
                     Err(FoldMethodErr::Unknown) => {
@@ -419,11 +718,15 @@ impl Editor {
                     }
                 },
                 StrOp::Reset => {
-                    self.buffer_mut().options.foldmethod = FoldMethod::Manual;
+                    self.write_buf_opt_str(scope, |o| o.foldmethod = FoldMethod::Manual);
                     self.refresh_folds();
                 }
                 StrOp::Query => {
-                    let fdm = self.buffer().options.foldmethod;
+                    let fdm = if scope == SetScope::Global {
+                        self.buf_opts_global.foldmethod
+                    } else {
+                        self.buffer().options.foldmethod
+                    };
                     self.echo(format!("foldmethod={fdm}"));
                 }
             }
@@ -435,8 +738,26 @@ impl Editor {
         // expr (Phase 5) and rebuilds the structure. `&` clears it.
         if name == "foldexpr" {
             match op {
-                StrOp::Set(value) => self.set_foldexpr(&value),
-                StrOp::Reset => self.set_foldexpr(""),
+                StrOp::Set(value) => {
+                    if scope.writes_local() {
+                        self.set_foldexpr(&value);
+                    }
+                    if scope.writes_global() {
+                        self.set_foldexpr_global(&value);
+                    }
+                }
+                StrOp::Reset => {
+                    if scope.writes_local() {
+                        self.set_foldexpr("");
+                    }
+                    if scope.writes_global() {
+                        self.set_foldexpr_global("");
+                    }
+                }
+                StrOp::Query if scope == SetScope::Global => {
+                    let fde = self.foldexpr_global().to_string();
+                    self.echo(format!("foldexpr={fde}"));
+                }
                 StrOp::Query => {
                     let fde = self.foldexpr().to_string();
                     self.echo(format!("foldexpr={fde}"));
@@ -461,9 +782,25 @@ impl Editor {
                         self.echo(format!("E474: Invalid argument: foldmarker={value}"));
                         return;
                     }
-                    self.set_foldmarker(parts[0], parts[1]);
+                    if scope.writes_local() {
+                        self.set_foldmarker(parts[0], parts[1]);
+                    }
+                    if scope.writes_global() {
+                        self.set_foldmarker_global(parts[0], parts[1]);
+                    }
                 }
-                StrOp::Reset => self.reset_foldmarker(),
+                StrOp::Reset => {
+                    if scope.writes_local() {
+                        self.reset_foldmarker();
+                    }
+                    if scope.writes_global() {
+                        self.reset_foldmarker_global();
+                    }
+                }
+                StrOp::Query if scope == SetScope::Global => {
+                    let (open, close) = self.foldmarker_global();
+                    self.echo(format!("foldmarker={open},{close}"));
+                }
                 StrOp::Query => {
                     let (open, close) = self.effective_foldmarker();
                     self.echo(format!("foldmarker={open},{close}"));
@@ -544,10 +881,13 @@ impl Editor {
             "showbreak" => Some(|o| &mut o.showbreak),
             "breakindentopt" => Some(|o| &mut o.breakindentopt),
             "colorcolumn" => Some(|o| &mut o.colorcolumn),
+            // Stored raw and parsed to a `WinHl` at projection time (like `colorcolumn`);
+            // malformed pairs are dropped there, so there is nothing to reject here.
+            "winhighlight" => Some(|o| &mut o.winhighlight),
             _ => None,
         };
         if let Some(slot) = win_str_slot {
-            self.set_win_str(name, op, slot);
+            self.set_win_str(name, op, scope, slot);
             return;
         }
         // `fillchars` is window-local (like `showbreak`): the `key:char` list
@@ -562,11 +902,11 @@ impl Editor {
                         self.echo(format!("E474: Invalid argument: fillchars={value}"));
                         return;
                     }
-                    self.windows.cur_mut().options.fillchars = value;
+                    self.write_win_opt(scope, |o| o.fillchars = value.clone());
                 }
-                StrOp::Reset => self.windows.cur_mut().options.fillchars.clear(),
+                StrOp::Reset => self.write_win_opt(scope, |o| o.fillchars.clear()),
                 StrOp::Query => {
-                    let v = self.windows.cur().options.fillchars.clone();
+                    let v = self.win_opts_queried(scope).fillchars.clone();
                     self.echo(format!("fillchars={v}"));
                 }
             }
@@ -584,15 +924,21 @@ impl Editor {
                         self.echo(format!("E474: Invalid argument: padding={value}"));
                         return;
                     };
-                    self.windows.cur_mut().options.padding = pad;
-                    self.ensure_visible();
+                    self.write_win_opt(scope, |o| o.padding = pad);
+                    // The focused window's content box grew or shrank — re-clamp its
+                    // viewport. (A pure `:setglobal` touched no live window.)
+                    if scope.writes_local() {
+                        self.ensure_visible();
+                    }
                 }
                 StrOp::Reset => {
-                    self.windows.cur_mut().options.padding = crate::options::Padding::default();
-                    self.ensure_visible();
+                    self.write_win_opt(scope, |o| o.padding = crate::options::Padding::default());
+                    if scope.writes_local() {
+                        self.ensure_visible();
+                    }
                 }
                 StrOp::Query => {
-                    let v = self.windows.cur().options.padding;
+                    let v = self.win_opts_queried(scope).padding;
                     self.echo(format!("padding={v}"));
                 }
             }
@@ -641,12 +987,18 @@ impl Editor {
     /// (the empty-string default), `?` echoes `name=value`. Validated window-local
     /// strings (`fillchars`, `padding`) keep their own arms — they must fail loud
     /// on a bad value instead of storing it.
-    fn set_win_str(&mut self, name: &str, op: StrOp, slot: fn(&mut WindowOptions) -> &mut String) {
+    fn set_win_str(
+        &mut self,
+        name: &str,
+        op: StrOp,
+        scope: SetScope,
+        slot: fn(&mut WindowOptions) -> &mut String,
+    ) {
         match op {
-            StrOp::Set(value) => *slot(&mut self.windows.cur_mut().options) = value,
-            StrOp::Reset => slot(&mut self.windows.cur_mut().options).clear(),
+            StrOp::Set(value) => self.write_win_opt(scope, |o| *slot(o) = value.clone()),
+            StrOp::Reset => self.write_win_opt(scope, |o| slot(o).clear()),
             StrOp::Query => {
-                let v = slot(&mut self.windows.cur_mut().options).clone();
+                let v = slot(self.win_opts_queried(scope)).clone();
                 self.echo(format!("{name}={v}"));
             }
         }

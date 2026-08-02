@@ -1,0 +1,10 @@
+Option scopes — press zo on the folded section below.
+
+Indent something here with <Tab> to see tabstop=3 + expandtab.
+
+section one <<<
+	this line is inside a marker fold
+	so is this one
+>>>
+
+The line above the fold is plain text again.

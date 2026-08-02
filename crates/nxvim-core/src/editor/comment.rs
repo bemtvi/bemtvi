@@ -143,9 +143,23 @@ impl Editor {
             .filter(|s| !s.is_empty())
     }
 
+    /// Set (or, with an empty string, clear) the **global value** of `'commentstring'` —
+    /// the fallback a buffer with no override of its own resolves through. The
+    /// `:setglobal` / `vim.go` half of [`Editor::set_commentstring`].
+    pub(crate) fn set_commentstring_global(&mut self, value: &str) {
+        self.commentstring_global = value.to_string();
+    }
+
+    /// The global value of `'commentstring'` (empty ⇒ none), for the `:setglobal cms?`
+    /// readout and the `vim.go` mirror.
+    pub fn commentstring_global(&self) -> &str {
+        &self.commentstring_global
+    }
+
     /// Set `buf`'s explicit `'commentstring'`. An empty string clears the override
-    /// (the buffer falls back to its filetype default), matching how `:set cms=`
-    /// reads in vim — an empty template is "use the default", not "no comments".
+    /// (the buffer falls back to the global value, then its filetype default), matching
+    /// how `:set cms=` reads in vim — an empty template is "use the default", not "no
+    /// comments".
     pub(crate) fn set_commentstring(&mut self, buf: BufferId, value: &str) {
         if value.is_empty() {
             self.commentstrings.remove(&buf);
@@ -155,12 +169,18 @@ impl Editor {
     }
 
     /// The `'commentstring'` `gc` actually uses for `buf`: the explicit override if
-    /// set, else the filetype's built-in default ([`commentstring_for_language`]),
-    /// else empty. Backs the comment operator, the `:set commentstring?` echo, and
-    /// the `nx.bo.commentstring` mirror.
+    /// set, else the global value (`:setglobal cms=…`), else the filetype's built-in
+    /// default ([`commentstring_for_language`]), else empty. Backs the comment
+    /// operator, the `:set commentstring?` echo, and the `nx.bo.commentstring` mirror.
     pub fn effective_commentstring(&self, buf: BufferId) -> String {
         if let Some(cs) = self.commentstring_override(buf) {
             return cs.to_string();
+        }
+        // The buffer set none of its own: fall back to the global value (`:setglobal
+        // commentstring=…`) before the filetype's built-in template, so a config can
+        // override the default for every buffer without touching each one.
+        if !self.commentstring_global.is_empty() {
+            return self.commentstring_global.clone();
         }
         self.buffer_filetype(buf)
             .and_then(|ft| commentstring_for_language(&ft))

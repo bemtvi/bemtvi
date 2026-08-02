@@ -1150,10 +1150,17 @@ impl Editor {
             "marks" => self.ex_marks(args),
             "ju" | "jum" | "jump" | "jumps" => self.ex_jumps(args),
             "changes" => self.ex_changes(args),
-            // `:setlocal`/`:setl` shares the handler: buffer-local options
-            // (tabstop/shiftwidth/expandtab) live on the current buffer, which is
-            // exactly what `:set` already targets for them.
-            "set" | "se" | "setlocal" | "setl" => self.ex_set(args),
+            // The `:set` family shares one handler, distinguished by which tier of a
+            // buffer-local option it writes (vim's global-local model): `:set` writes the
+            // global value AND the current buffer's, `:setlocal` only the buffer's, and
+            // `:setglobal` only the global value new buffers are born from.
+            "set" | "se" => self.ex_set(args, crate::options::SetScope::Both),
+            "setl" | "setlo" | "setloc" | "setloca" | "setlocal" => {
+                self.ex_set(args, crate::options::SetScope::Local)
+            }
+            "setg" | "setgl" | "setglo" | "setglob" | "setgloba" | "setglobal" => {
+                self.ex_set(args, crate::options::SetScope::Global)
+            }
             // `:setf[iletype] {ft}` forces the buffer's filetype (and thus its
             // treesitter language), equivalent to `:set filetype={ft}`. The
             // no-Lua way to highlight a buffer the extension table misses.

@@ -75,7 +75,8 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   `nx.fs`), and the LSP-config root search runs on the same async `nx.fs` seam.
 - **Broad options surface.** The set of honored options has grown well past the
   indentation knobs (the authoritative list is `crates/nxvim-core/src/options.rs`).
-  `:set` (and `:setlocal` / `vim.bo` / `nvim_{set,get}_option_value`) honors: the
+  `:set` (and `:setlocal` / `:setglobal` / `vim.bo` / `vim.go` /
+  `nvim_{set,get}_option_value`) honors: the
   **search** booleans (`ignorecase` / `smartcase` / `wrapscan` / `hlsearch` /
   `incsearch`); the **window-local rendering** options (`number` /
   `relativenumber` / `cursorline` / `numberwidth` / `signcolumn` / `wrap` /
@@ -86,6 +87,18 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   options (`scrollanim` / `scrollanimduration`, `qfdock`, `imagepreview`,
   `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
   `laststatus` / `showtabline`, …).
+  Buffer- and window-local options are **global-local**, as in vim: each carries a
+  global value (`:setglobal` / `vim.go` / `vim.opt_global`) alongside the per-instance
+  one, `:set` / `vim.opt` write both, and a new buffer is born from the global value —
+  which is what makes a config's `vim.opt.tabstop = 3` reach files opened later. A few
+  buffer options have no global value (the read decides them) and `:setglobal` on one
+  fails loud with `E5100`. One deliberate departure inside that model:
+  `commentstring`, `foldexpr` and `foldmarker` live in a per-buffer map that already
+  spells "unset" as absence, so their global value resolves as a **read-time fallback**
+  rather than a creation seed — a `:setglobal` of one reaches buffers that are already
+  open and carry no value of their own, where vim (which always holds a local value per
+  buffer) would reach only buffers created afterwards. A `:setlocal` still pins a buffer
+  against any later global write.
   nxvim breaks with vim's defaults on indentation: `tabstop` defaults to **4**,
   with `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow
   shiftwidth") so the one `tabstop` knob drives the whole indent width.

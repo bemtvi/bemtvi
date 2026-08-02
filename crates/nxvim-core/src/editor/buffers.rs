@@ -671,7 +671,13 @@ impl Editor {
     }
 
     /// Add a buffer to the store and return its id, without switching to it.
-    pub(crate) fn add_buffer(&mut self, buffer: Buffer) -> BufferId {
+    pub(crate) fn add_buffer(&mut self, mut buffer: Buffer) -> BufferId {
+        // Born from the global values of the buffer-local options (vim's `:setglobal`
+        // tier), so a config's `:set tabstop=3` reaches this buffer even though it was
+        // opened long after `init.lua` ran. The slots the read decides — encoding, BOM,
+        // fileformat, endofline — and the `modifiable` marker are left exactly as the
+        // caller built them; `inherit_global` is where that split is spelled out.
+        buffer.options.inherit_settable(&self.buf_opts_global);
         let id = self.buffers.insert(buffer);
         // A freshly opened file reattaches any shada-restored marks for its path.
         self.seed_pending_file_marks(id);
@@ -829,9 +835,11 @@ impl Editor {
         match read {
             Ok(mut buf) => {
                 let ob = self.buffers.get_mut(buffer);
-                // Carry `save_tick` across the swap — a deferred read landing is
-                // not a save (see `load_into_current`).
+                // Carry `save_tick` and the buffer's own settable options across the
+                // swap — a deferred read landing is not a save, and must not reset the
+                // options the buffer was born with (see `load_into_current`).
                 buf.save_tick = ob.buffer.save_tick;
+                buf.options.inherit_settable(&ob.buffer.options);
                 ob.buffer = buf;
                 ob.undo = UndoTree::new(&ob.buffer);
                 ob.saved_seq = Some(ob.undo.cur_seq());
@@ -1626,6 +1634,12 @@ impl Editor {
                 // buffer's count across so a consumer diffing it (LSP `didSave`)
                 // doesn't read the reload as a save.
                 buf.save_tick = ob.buffer.save_tick;
+                // …and carry the buffer's own settable options across too: this swaps the
+                // whole `Buffer`, so without it every `:setlocal` on this bufnr (and the
+                // global values it was born from) would silently reset to the built-in
+                // defaults on reload. The read still decides encoding / BOM / fileformat /
+                // endofline — that is the split `inherit_settable` draws.
+                buf.options.inherit_settable(&ob.buffer.options);
                 ob.buffer = buf;
                 // Reloaded from disk: discard the old history and start a fresh
                 // tree rooted at the reloaded text — a state that is, by
@@ -1937,6 +1951,38 @@ impl Editor {
             return Some(id);
         }
         self.load_new_buffer(path)
+    }
+
+    /// Find-or-load for a **session restore** ([`Editor::restore_session`]): like
+    /// [`open_buffer`](Self::open_buffer), but it never hands the read to a `BufReadCmd`
+    /// handler — the same carve-out, and for the same reason, as
+    /// [`ensure_buffer_loaded`](Self::ensure_buffer_loaded).
+    ///
+    /// A restore is not a user `:edit`. It runs after the config + plugins are sourced (so
+    /// the layout inherits the config's window options), and by then the always-on
+    /// explorer has registered a `BufReadCmd` — which would defer *every* restored leaf
+    /// into an empty named buffer filled a tick later. That empty window then announces
+    /// the file as `BufNewFile` before its bytes exist, re-announces `BufReadPost` when
+    /// the fill lands, and the fill resets the cursor the session restored. Reading here
+    /// keeps each restored window's content, cursor, and announcement together.
+    ///
+    /// Off-tick (daemon / web) a synchronous read is impossible, so the enqueued replica
+    /// fetch stays the only route — as it already is for every open in that session.
+    /// `None` only on a synchronous load failure (already echoed), which collapses the leaf.
+    pub(crate) fn open_buffer_for_restore(&mut self, path: &Path) -> Option<BufferId> {
+        if let Some(id) = self.find_buffer_by_path(path) {
+            return Some(id);
+        }
+        if self.host_fs_offtick {
+            return Some(self.enqueue_replica_open(path));
+        }
+        match self.read_buffer(path) {
+            Ok(buf) => Some(self.add_buffer(buf)),
+            Err(e) => {
+                self.echo(e.to_string());
+                None
+            }
+        }
     }
 
     /// Find the buffer already open for `path`, or load a fresh one into the buffer

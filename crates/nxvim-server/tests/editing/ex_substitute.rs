@@ -666,11 +666,13 @@ async fn regexsyntax_rejects_unknown_value() {
 
 #[tokio::test]
 async fn regexsyntax_is_buffer_local() {
-    // `:set regexsyntax` sets a BUFFER-LOCAL override (like `:set tabstop`): one
-    // buffer can use vim's dialect while another keeps the pcre default.
+    // `:setlocal regexsyntax` sets a BUFFER-LOCAL override (like `:setlocal tabstop`):
+    // one buffer can use vim's dialect while another keeps the pcre default. (A plain
+    // `:set` writes the global value too, so a *later* buffer would inherit `vim` — see
+    // `set_regexsyntax_reaches_the_next_buffer` below.)
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "isome text<Esc>"); // make buffer 1 non-throwaway so :enew opens a new one
-    feed(&rpc, ":set regexsyntax=vim<CR>"); // buffer 1 -> vim
+    feed(&rpc, ":setlocal regexsyntax=vim<CR>"); // buffer 1 -> vim, this buffer only
     feed(&rpc, ":enew<CR>"); // buffer 2 -> follows the global (pcre)
     let map = redraw_after(&rpc, &mut incoming, ":set regexsyntax?<CR>").await;
     assert_eq!(
@@ -684,6 +686,24 @@ async fn regexsyntax_is_buffer_local() {
         field(&map, "message").and_then(Value::as_str),
         Some("regexsyntax=vim"),
         "buffer 1 kept its own vim override"
+    );
+}
+
+#[tokio::test]
+async fn set_regexsyntax_reaches_the_next_buffer() {
+    // The `:setlocal` twin above: a plain `:set` writes the GLOBAL value of the
+    // buffer-local option as well, so a buffer created afterwards is born on the vim
+    // dialect — vim's global-local model, and what a config's `vim.opt.regexsyntax`
+    // has to mean (`docs/plans/2026-08-01-global-local-options.md`).
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "isome text<Esc>"); // non-throwaway, so `:enew` really opens a new buffer
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    feed(&rpc, ":enew<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set regexsyntax?<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("regexsyntax=vim"),
+        "a buffer opened after `:set regexsyntax=vim` inherits it"
     );
 }
 

@@ -115,6 +115,33 @@ pub struct WindowMirror {
     /// `'fillchars'` as the raw `key:char` list string (empty ⇒ vim's default
     /// look), for `vim.wo`/`vim.o` read-back.
     pub fillchars: String,
+    /// `'breakindent'` — whether soft-wrap continuation rows keep the wrapped line's
+    /// indent (so `vim.wo`/`vim.o` read it back).
+    pub breakindent: bool,
+    /// `'showbreak'` — the marker drawn at the start of a continuation row (empty ⇒
+    /// none), for `vim.wo`/`vim.o` read-back.
+    pub showbreak: String,
+    /// `'breakindentopt'` as its raw comma-separated flag list, for `vim.wo`/`vim.o`
+    /// read-back.
+    pub breakindentopt: String,
+    /// `'sidescroll'` — the minimum horizontal scroll step, for `vim.wo`/`vim.o`
+    /// read-back.
+    pub sidescroll: u64,
+    /// `'sidescrolloff'` — the horizontal margin kept beside the cursor, for
+    /// `vim.wo`/`vim.o` read-back.
+    pub sidescrolloff: u64,
+    /// `'foldcolumn'` — the width of the fold-marker gutter, for `vim.wo`/`vim.o`
+    /// read-back.
+    pub foldcolumn: u64,
+    /// `'foldenable'` — whether closed folds collapse on screen, for `vim.wo`/`vim.o`
+    /// read-back.
+    pub foldenable: bool,
+    /// `'foldlevel'` — the depth below which computed folds display closed, for
+    /// `vim.wo`/`vim.o` read-back.
+    pub foldlevel: u64,
+    /// `'winhighlight'` as its raw `Group:Group` remap list (empty ⇒ no remap), for
+    /// `vim.wo`/`vim.o` read-back.
+    pub winhighlight: String,
     /// `'padding'` in its canonical shorthand string (`""` ⇒ no margin; `"2"`
     /// uniform; `"1 2"` vert/horiz; `"1 2 3 4"` top/right/bottom/left), for
     /// `vim.wo`/`vim.o` read-back.
@@ -386,6 +413,20 @@ pub struct BoMirror {
     /// read the core's value — the neovim-idiomatic "is this a real file buffer"
     /// signal a plugin filters on (e.g. skip git/statusline work on a scratch panel).
     pub buftype: String,
+    /// The buffer's `'foldmethod'` (`"manual"` / `"indent"` / `"expr"` / `"marker"`),
+    /// mirrored so `vim.bo.foldmethod` reads the core's value however it was set.
+    pub foldmethod: String,
+    /// The buffer's *effective* `'foldexpr'` — its own expression, or the global value
+    /// when it has none — mirrored for `vim.bo.foldexpr`. Empty ⇒ no expression.
+    pub foldexpr: String,
+    /// The buffer's *effective* `'foldmarker'` pair as the `open,close` string `:set`
+    /// echoes (vim's `{{{,}}}` when neither the buffer nor the global value sets one),
+    /// mirrored for `vim.bo.foldmarker`.
+    pub foldmarker: String,
+    /// The buffer's `'foldnestmax'` and `'foldminlines'` — the structural bounds on
+    /// computed folds — mirrored for `vim.bo` read-back.
+    pub foldnestmax: usize,
+    pub foldminlines: usize,
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`
@@ -407,6 +448,69 @@ pub struct BufBytesEdit {
     pub new_row: u64,
     pub new_col: u64,
     pub new_byte: u64,
+}
+
+/// The **global values** of the buffer-local options (`nx._bo_global`) — the tier a new
+/// buffer is born from, read by `vim.go` / `vim.opt_global`. Exactly the slots that have
+/// a tier and no more: the read-derived ones (`fileencoding`, `bomb`, `fileformat`,
+/// `endofline`) and `modifiable` have no global value, so mirroring them here would invite
+/// a `vim.go` read of something that does not exist. `'regexsyntax'` is absent for the
+/// opposite reason — its global value is the *editor-wide* option (`nx._go_mirror`), which
+/// an inheriting buffer already resolves through. See
+/// `docs/plans/2026-08-01-global-local-options.md`.
+#[derive(Clone, Debug, Serialize)]
+pub struct BoGlobalMirror {
+    pub tabstop: usize,
+    pub shiftwidth: usize,
+    pub softtabstop: isize,
+    pub expandtab: bool,
+    pub autoindent: bool,
+    pub smartindent: bool,
+    pub autopairs: bool,
+    pub indentemptylines: bool,
+    pub fixendofline: bool,
+    pub foldmethod: String,
+    pub foldnestmax: usize,
+    pub foldminlines: usize,
+    /// The three buffer options stored in a per-buffer map rather than an options slot.
+    /// Empty ⇒ no global value: `commentstring` then falls through to the filetype
+    /// default, `foldexpr` to "no expression", `foldmarker` reads vim's `{{{,}}}`.
+    pub commentstring: String,
+    pub foldexpr: String,
+    pub foldmarker: String,
+}
+
+/// The **global values** of the window-local options (`nx._wo_global`) — the tier
+/// `:setglobal` / `vim.go` read and write, and what a window minted with no source window
+/// to copy (a dock, the quickfix tab) is born from. A split still copies the window it
+/// came from, as in vim.
+///
+/// Every window option in the catalog belongs here — `has_global_tier` says `true` for all
+/// of them — and `every_tiered_option_is_carried_by_the_go_mirror` walks the catalog to
+/// prove it. A field missing here is not a missing *write* (the core tier still moves) but
+/// a permanently stale *read*: the prelude's own echo is wiped by the next push of this
+/// struct, so `vim.go.<name>` falls back to the built-in default forever.
+#[derive(Clone, Debug, Serialize)]
+pub struct WoGlobalMirror {
+    pub number: bool,
+    pub relativenumber: bool,
+    pub cursorline: bool,
+    pub wrap: bool,
+    pub breakindent: bool,
+    pub foldenable: bool,
+    pub scrolloff: usize,
+    pub sidescroll: usize,
+    pub sidescrolloff: usize,
+    pub numberwidth: usize,
+    pub foldcolumn: usize,
+    pub foldlevel: usize,
+    pub signcolumn: String,
+    pub colorcolumn: String,
+    pub showbreak: String,
+    pub breakindentopt: String,
+    pub fillchars: String,
+    pub padding: String,
+    pub winhighlight: String,
 }
 
 /// The wired global options (`nx._go_mirror`) read by `vim.o`. Serialized as one
@@ -1254,6 +1358,10 @@ pub struct OptionCatalogRow {
     pub kind: String,
     /// `"global"` / `"window"` / `"buffer"`.
     pub scope: String,
+    /// Whether the option has a **global value** — vim's `:setglobal` tier. Core's
+    /// `nxvim_core::options::has_global_tier` is the single source of truth; the prelude
+    /// routes `vim.go` / `vim.opt_global` by this rather than by a name list of its own.
+    pub global_tier: bool,
     /// One-line help shown in the `:set` completion docs pane.
     pub doc: String,
 }
@@ -2095,13 +2203,15 @@ impl LuaRuntime {
         run.call((self.lua.create_string(line)?, lua_int(col as i64), refresh))
     }
 
-    /// Populate `nx._options_catalog` with the documented option catalog, so the
-    /// bundled `nx.cmdline_complete` source can offer option names (with docs) after
-    /// `:set`. The server calls this once at startup from core's single source of
+    /// Populate `nx._options_catalog` with the documented option catalog — read by the
+    /// bundled `nx.cmdline_complete` source to offer option names (with docs) after
+    /// `:set`, and by the prelude to derive the scope routing `vim.o` / `vim.opt` use and
+    /// the tier tables `vim.go` / `vim.opt_global` read. The server calls this once at
+    /// startup, before any config runs, from core's single source of
     /// truth (`nxvim_core::options::options_catalog()`); nxvim-lua stays decoupled
     /// from core, so the rows arrive as plain [`OptionCatalogRow`] data rather than
-    /// core types. Each `rows` entry becomes a `{ name, abbrev, kind, scope, doc }`
-    /// Lua table.
+    /// core types. Each `rows` entry becomes a
+    /// `{ name, abbrev, kind, scope, global_tier, doc }` Lua table.
     pub fn set_options_catalog(&self, rows: &[OptionCatalogRow]) -> mlua::Result<()> {
         let nx = self.nx()?;
         let list = self.lua.create_table()?;
@@ -2111,11 +2221,15 @@ impl LuaRuntime {
             row.set("abbrev", r.abbrev.as_deref())?;
             row.set("kind", r.kind.as_str())?;
             row.set("scope", r.scope.as_str())?;
+            row.set("global_tier", r.global_tier)?;
             row.set("doc", r.doc.as_str())?;
             list.set(i + 1, row)?;
         }
-        nx.set("_options_catalog", list)?;
-        Ok(())
+        // Through the prelude rather than a bare `nx._options_catalog = list`: the same
+        // call rebuilds the scope-routing tables `vim.o` / `vim.go` read, so they are
+        // derived from this catalog instead of hand-kept beside it.
+        let set: mlua::Function = nx.get("_set_options_catalog")?;
+        set.call(list)
     }
 
     /// Populate `nx._builtin_colorschemes` with the color scheme names bundled in the
@@ -3495,6 +3609,27 @@ impl LuaRuntime {
         }
         let set: mlua::Function = nx.get("_set_bo_mirror")?;
         set.call(entries)
+    }
+
+    /// Refresh the Rust→Lua mirror of the **global values** of the buffer-local options
+    /// (`nx._bo_global`), which `vim.go` / `vim.opt_global` read — the tier a new buffer
+    /// is born from. Pushed alongside [`Self::set_bo_mirror`], so a read reflects the
+    /// core's current tier whoever moved it (`:set`, `:setglobal`, `vim.o`).
+    pub fn set_bo_global_mirror(&self, g: &BoGlobalMirror) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let entry = self.to_lua(g)?;
+        let set: mlua::Function = nx.get("_set_bo_global")?;
+        set.call(entry)
+    }
+
+    /// Refresh the Rust→Lua mirror of the **global values** of the window-local options
+    /// (`nx._wo_global`), which `vim.go` / `vim.opt_global` read. Pushed beside
+    /// [`Self::set_bo_global_mirror`].
+    pub fn set_wo_global_mirror(&self, g: &WoGlobalMirror) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let entry = self.to_lua(g)?;
+        let set: mlua::Function = nx.get("_set_wo_global")?;
+        set.call(entry)
     }
 
     /// Refresh the Rust→Lua global-option mirror (`nx._go_mirror = { ignorecase,

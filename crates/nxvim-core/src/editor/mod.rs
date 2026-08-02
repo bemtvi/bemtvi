@@ -1134,6 +1134,25 @@ pub struct Editor {
     /// workspace shada and re-applied at load. Empty outside a workspace / before any
     /// override.
     workspace_options: crate::options::WorkspaceOptions,
+    /// The **global values** of the buffer-local options — vim's `:setglobal` tier. Every
+    /// buffer created from here on is born from these
+    /// ([`BufferOptions::inherit_settable`](crate::options::BufferOptions::inherit_settable),
+    /// applied in [`Editor::add_buffer`]), which is what makes a config's `:set tabstop=3`
+    /// reach files opened *after* `init.lua` ran rather than only the buffer that was
+    /// current at the time. `:set` writes this and the current buffer, `:setglobal` only
+    /// this, `:setlocal` only the buffer — see [`SetScope`](crate::options::SetScope) and
+    /// `docs/plans/2026-08-01-global-local-options.md`.
+    ///
+    /// Only the *inherited* slots are meaningful here; the buffer-born ones
+    /// (`fileencoding`, `bomb`, `fileformat`, `endofline`, `modifiable`) are never read
+    /// off this copy — `inherit_settable` names them explicitly.
+    buf_opts_global: crate::options::BufferOptions,
+    /// The **global values** of the window-local options — the `:setglobal` tier for
+    /// `'number'`, `'scrolloff'`, `'signcolumn'`, … A window created by splitting copies
+    /// the window it came from (vim's rule, see [`Editor::split`]), so this is not a
+    /// per-window seed; it is what `:setglobal` / `vim.go` read and write, and what seeds
+    /// a window minted with **no source window to copy** — a dock, or the quickfix tab.
+    win_opts_global: crate::options::WindowOptions,
     /// The global quickfix **list stack**: errors parsed from command output /
     /// ingested text via `'errorformat'`, kept as vim's up-to-10-deep history that
     /// `:colder`/`:cnewer` walk. The per-window location lists live on each
@@ -1537,6 +1556,18 @@ pub struct Editor {
     /// `nx.bo.foldmarker`. Absent ⇒ vim's default `{{{`/`}}}` (see
     /// [`Editor::effective_foldmarker`]).
     foldmarkers: HashMap<BufferId, (String, String)>,
+    /// The **global values** of the three buffer-local options that live in a per-buffer
+    /// map rather than a [`crate::options::BufferOptions`] slot — the `:setglobal` tier
+    /// for `'commentstring'`, `'foldexpr'` and `'foldmarker'`. Unlike the struct slots
+    /// (which a new buffer is *seeded* from in [`Editor::add_buffer`]), these resolve as a
+    /// **fallback at read time**: the maps already encode "unset" as absence, so a buffer
+    /// with no entry of its own follows the global value, and a late `:setglobal` reaches
+    /// buffers that are already open. Each `None`/empty ⇒ no global value, i.e. the
+    /// previous behavior (the filetype default for `commentstring`, no expr, vim's
+    /// `{{{`/`}}}` markers). See `docs/plans/2026-08-01-global-local-options.md`.
+    commentstring_global: String,
+    foldexpr_global: String,
+    foldmarker_global: Option<(String, String)>,
     /// Server-pushed fold data for the *externally-computed* sources — a generic
     /// Lua `'foldexpr'` and LSP `foldingRange`. nxvim-core can't evaluate Lua or
     /// talk to a language server, so the server computes these out-of-band and
@@ -1946,6 +1977,10 @@ impl Editor {
             // a workspace seed or an `nx.wso` write later diverges them via recompute.
             global_base: Options::default(),
             workspace_options: crate::options::WorkspaceOptions::new(),
+            // The buffer-local tier starts at the same defaults a fresh buffer would get,
+            // so an editor whose config sets nothing behaves exactly as before.
+            buf_opts_global: crate::options::BufferOptions::default(),
+            win_opts_global: crate::options::WindowOptions::default(),
             qf: QfStack::default(),
             qf_bufnr: None,
             named_lists: std::collections::HashMap::new(),
@@ -2024,6 +2059,9 @@ impl Editor {
             commentstrings: HashMap::new(),
             foldexprs: HashMap::new(),
             foldmarkers: HashMap::new(),
+            commentstring_global: String::new(),
+            foldexpr_global: String::new(),
+            foldmarker_global: None,
             external_folds: HashMap::new(),
             ts_enabled: HashMap::new(),
             textobject_map: HashMap::new(),

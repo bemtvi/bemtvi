@@ -331,7 +331,11 @@ impl Editor {
         }
         let buf = buf.unwrap_or_else(|| self.add_buffer(Buffer::empty()));
         let win = self.alloc_window_id();
-        let tree = WindowTree::with_window(win, buf, WindowOptions::default());
+        // A dock is minted with no source window to copy from (it is a fresh layer, not
+        // a split), so it starts from the *global values* of the window options — the
+        // `:setglobal` tier a config's `:set` moves. Vim's rule for a new window is
+        // "copy the current one"; with nothing to copy, the tier is that rule's base.
+        let tree = WindowTree::with_window(win, buf, self.win_opts_global().clone());
         // Give the new dock a one-tab stack whose tree is live, park the outgoing
         // layer's active tree into its own slot, install the dock tree as live, and
         // enter it.

@@ -742,13 +742,20 @@ impl Editor {
     /// the startup tab; later tabs are fresh pages. Files that no longer open are skipped
     /// (their split collapses). A no-op for an empty session.
     pub fn restore_session(&mut self, session: SessionState) {
-        use crate::options::WindowOptions;
         use crate::WindowId;
         use std::collections::BTreeMap;
         if session.tabs.is_empty() && session.docks.is_empty() && session.hidden_buffers.is_empty()
         {
             return;
         }
+        // Every window the restore mints is a NEW window, so it inherits the current
+        // window's window-local options — exactly as a `:split` / `:tabnew` does
+        // ([`Editor::split`]). The restore runs after the config is sourced, so this
+        // template is the startup window carrying the user's `vim.opt` window settings
+        // (`scrolloff`, `signcolumn`, `number`, …); without it a restored session came
+        // back with every window at the built-in defaults and the config's window
+        // options silently lost.
+        let template = self.windows.cur().options.clone();
         // Re-add the hidden (windowless) buffers to the buffer list FIRST, before the windows
         // are built — so they exist when `:bnext`/`:ls` enumerate, and a windowed leaf that
         // happens to name the same file finds the already-loaded buffer (no duplicate).
@@ -758,7 +765,7 @@ impl Editor {
         // FULL width and only rescale it once a dock later shrinks the main area — and that
         // second, lossy rescale drifts a balanced split off its saved proportions. With the
         // docks in place up front, each tab is laid out exactly once, at its real width.
-        self.restore_docks(&session.docks);
+        self.restore_docks(&session.docks, &template);
         // `restore_docks` leaves a dock as the focused layer; tab ops (`new_tab` /
         // `install_restored_tree`) must run on the main tree, so cross back first.
         self.ensure_main_layer();
@@ -766,7 +773,7 @@ impl Editor {
         for tab in &session.tabs {
             let mut windows: BTreeMap<WindowId, super::windows::Window> = BTreeMap::new();
             let mut active: Option<WindowId> = None;
-            let root = match self.build_layout(&tab.layout, &mut windows, &mut active) {
+            let root = match self.build_layout(&tab.layout, &template, &mut windows, &mut active) {
                 Some(r) => r,
                 None => continue,
             };
@@ -778,7 +785,7 @@ impl Editor {
             let buf = tree.get(current).buffer;
             // Tab 0 reuses the startup tab's tree; later tabs get a fresh page first.
             if built_any {
-                self.new_tab(buf, WindowOptions::default());
+                self.new_tab(buf, template.clone());
             }
             built_any = true;
             self.install_restored_tree(tree);
@@ -855,8 +862,9 @@ impl Editor {
 
     /// Reopen each saved [`SessionDock`] at its side + size, rebuilding any file-backed
     /// content (a plugin dock reopens empty for its owner to repopulate) and re-hiding a
-    /// dock that was parked.
-    fn restore_docks(&mut self, docks: &[SessionDock]) {
+    /// dock that was parked. `template` is the window-option seed every rebuilt window
+    /// inherits (see [`Editor::restore_session`]).
+    fn restore_docks(&mut self, docks: &[SessionDock], template: &crate::options::WindowOptions) {
         use crate::WindowId;
         use std::collections::BTreeMap;
         for d in docks {
@@ -885,7 +893,7 @@ impl Editor {
             let rebuilt = d.layout.as_ref().and_then(|layout| {
                 let mut windows: BTreeMap<WindowId, super::windows::Window> = BTreeMap::new();
                 let mut active: Option<WindowId> = None;
-                let root = self.build_layout(layout, &mut windows, &mut active)?;
+                let root = self.build_layout(layout, template, &mut windows, &mut active)?;
                 let current = active.or_else(|| windows.keys().next().copied())?;
                 Some(super::windows::WindowTree::from_layout(
                     windows, root, current,
@@ -915,7 +923,7 @@ impl Editor {
             if h.path.as_os_str().is_empty() {
                 continue;
             }
-            if let Some(id) = self.open_buffer(&h.path) {
+            if let Some(id) = self.open_buffer_for_restore(&h.path) {
                 let ob = self.buffers.get_mut(id);
                 ob.saved_cursor = Cursor {
                     line: h.line,
@@ -933,7 +941,7 @@ impl Editor {
     /// opens or a pathless leaf carries no contents.
     fn build_leaf_buffer(&mut self, w: &SessionWindow) -> Option<crate::BufferId> {
         if !w.path.as_os_str().is_empty() {
-            return self.open_buffer(&w.path);
+            return self.open_buffer_for_restore(&w.path);
         }
         let lines = w.unnamed_contents.as_ref()?;
         let id = self.create_buffer();
@@ -947,13 +955,17 @@ impl Editor {
     /// Recursively realise a [`SessionLayout`] into a window map + a [`LayoutNode`]
     /// skeleton: open each leaf's file (minting a fresh window id), drop leaves whose
     /// file is gone, and collapse a split left with one child. `None` if nothing opens.
+    /// Every minted window starts from `template` — the current window's options — so a
+    /// restored layout carries the config's window-local settings (see
+    /// [`Editor::restore_session`]).
     fn build_layout(
         &mut self,
         layout: &SessionLayout,
+        template: &crate::options::WindowOptions,
         windows: &mut std::collections::BTreeMap<crate::WindowId, super::windows::Window>,
         active: &mut Option<crate::WindowId>,
     ) -> Option<super::windows::LayoutNode> {
-        use super::windows::{LayoutNode, WindowTree};
+        use super::windows::{LayoutNode, Window, WindowTree};
         match layout {
             SessionLayout::Leaf(w) => {
                 // A persisted plugin view: reserve the slot with an empty placeholder buffer
@@ -968,7 +980,10 @@ impl Editor {
                         line: w.line,
                         col: w.col,
                     };
-                    let win = WindowTree::tiled_window(buf, cursor, w.top, 0);
+                    let win = Window {
+                        options: template.clone(),
+                        ..WindowTree::tiled_window(buf, cursor, w.top, 0)
+                    };
                     windows.insert(id, win);
                     if w.active {
                         *active = Some(id);
@@ -986,7 +1001,10 @@ impl Editor {
                     line: w.line,
                     col: w.col,
                 };
-                let win = WindowTree::tiled_window(buf, cursor, w.top, 0);
+                let win = Window {
+                    options: template.clone(),
+                    ..WindowTree::tiled_window(buf, cursor, w.top, 0)
+                };
                 windows.insert(id, win);
                 if w.active {
                     *active = Some(id);
@@ -1001,7 +1019,7 @@ impl Editor {
                 let mut kids = Vec::new();
                 let mut kept_sizes = Vec::new();
                 for (i, child) in children.iter().enumerate() {
-                    if let Some(node) = self.build_layout(child, windows, active) {
+                    if let Some(node) = self.build_layout(child, template, windows, active) {
                         kids.push(node);
                         kept_sizes.push(sizes.get(i).copied().unwrap_or(1));
                     }

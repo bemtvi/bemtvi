@@ -39,6 +39,64 @@ A neovim colorscheme reaches for a handful of those aliases (notably the
 `nvim_set_hl` highlight helper) and nothing more.
 
 
+## Option scopes — which buffers a setting reaches
+
+A buffer-local option (`tabstop`, `expandtab`, `foldmethod`, …) has two values: the
+**local** one on each buffer, and the **global** one every newly created buffer is
+born from. Which you write is what decides whether a config line applies to the
+files you open later — the same model as vim:
+
+```lua
+vim.opt.tabstop = 3        -- :set       — this buffer AND the global value
+vim.opt_local.tabstop = 8  -- :setlocal  — this buffer only
+vim.opt_global.tabstop = 2 -- :setglobal — the global value only
+```
+
+`vim.o` and `vim.opt` are the ones a config almost always wants: a `vim.opt.tabstop
+= 3` in `init.lua` sets the buffer you happen to be in *and* the value every file
+opened afterwards starts from. `vim.bo` / `vim.wo` (and `vim.opt_local`) are the
+per-instance surfaces — what a filetype rule uses, so one buffer's indent does not
+become everyone's default:
+
+```lua
+nx.on("FileType", { pattern = "go", callback = function()
+  vim.opt_local.expandtab = false   -- Go files only
+end })
+```
+
+Reads follow the same split: `vim.o.tabstop` / `vim.bo.tabstop` report the current
+buffer's value, `vim.go.tabstop` the global one. The ex commands `:set` /
+`:setlocal` / `:setglobal` are the exact equivalents, and `:setglobal x?` reads the
+global value where `:set x?` reads the buffer's. The by-name API spells the same
+three: `nvim_set_option_value(name, value, {})` is a `:set` (both tiers), and a
+`scope` or a `buf` / `win` target narrows it to one of them.
+
+```lua
+vim.api.nvim_set_option_value("tabstop", 3, {})                    -- :set
+vim.api.nvim_set_option_value("tabstop", 8, { scope = "local" })   -- :setlocal
+vim.api.nvim_set_option_value("tabstop", 2, { scope = "global" })  -- :setglobal
+```
+
+Three buffer options — `commentstring`, `foldexpr` and `foldmarker` — resolve their
+global value as a **fallback when the buffer has none of its own**, rather than
+copying it at creation. So a `:setglobal commentstring=…` reaches buffers that are
+already open, where a `:setglobal tabstop=3` only reaches ones created afterwards. A
+buffer that sets its own with `:setlocal` still wins either way. (This is a
+deliberate departure from vim, where every buffer always holds a local value.)
+
+A few buffer options have **no** global value, because the read decides them —
+`fileencoding`, `bomb`, `fileformat`, `endofline` — as does `modifiable`, a
+per-buffer marker, and the two nouns derived per buffer, `filetype` and
+`ts_highlight`. `:setglobal` on one of those tells you so instead of storing a value
+nothing would read.
+
+Window options (`number`, `scrolloff`, `signcolumn`, …) carry the same two tiers,
+with one extra rule from vim: a **split copies the window it came from**, so your
+`init.lua` settings follow you into new splits whichever tier you wrote. The global
+value is what `:setglobal` / `vim.go` read, and what a window created with no source
+window to copy — a dock, the quickfix tab — is born from.
+
+
 ## Plugins — the built-in `:Plugins` manager
 
 Dropping a checkout under `pack/*/start/*` works, but the ergonomic path is the

@@ -1397,8 +1397,9 @@ impl Editor {
 
     /// Set a boolean window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`). Recognizes `number` / `relativenumber` /
-    /// `cursorline` / `wrap` / `scrollanim`; a no-op for any other name or an unknown
-    /// id. `0` is resolved to the focused window by the caller.
+    /// `cursorline` / `foldenable` / `wrap` / `breakindent` / `scrollanim`; a no-op
+    /// for any other name or an unknown id. `0` is resolved to the focused window by
+    /// the caller.
     pub fn set_window_option_bool(&mut self, id: WindowId, name: &str, value: bool) {
         let Some(t) = self.tree_of_window_mut(id) else {
             return;
@@ -1410,6 +1411,7 @@ impl Editor {
             "cursorline" => w.options.cursorline = value,
             "foldenable" => w.options.foldenable = value,
             "wrap" => w.options.wrap = value,
+            "breakindent" => w.options.breakindent = value,
             // A per-window override of the global `'scrollanim'` (see
             // [`WindowOptions::scrollanim`]); `Some(value)` shadows the global until unset.
             "scrollanim" => w.options.scrollanim = Some(value),
@@ -1420,7 +1422,8 @@ impl Editor {
     /// Set a numeric window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`), the numeric analogue of
     /// [`Editor::set_window_option_bool`]. Recognizes `numberwidth` (clamped to a
-    /// `1` minimum, like the `:set` path); a no-op for any other name or unknown id.
+    /// `1` minimum, like the `:set` path), `scrolloff`, `sidescroll`, `sidescrolloff`,
+    /// `foldcolumn`, `foldlevel` and `padding`; a no-op for any other name or unknown id.
     pub fn set_window_option_num(&mut self, id: WindowId, name: &str, value: i64) {
         let Some(t) = self.tree_of_window_mut(id) else {
             return;
@@ -1436,6 +1439,10 @@ impl Editor {
             if self.windows.current == id {
                 self.ensure_visible();
             }
+        } else if name == "sidescroll" {
+            w.options.sidescroll = value.max(0) as usize;
+        } else if name == "sidescrolloff" {
+            w.options.sidescrolloff = value.max(0) as usize;
         } else if name == "foldcolumn" {
             w.options.foldcolumn = value.max(0) as usize;
         } else if name == "foldlevel" {
@@ -1459,9 +1466,10 @@ impl Editor {
 
     /// Set a string window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`), the string analogue of
-    /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn` and `fillchars`
-    /// (an invalid value is ignored, matching the no-op-on-bad-input contract of the
-    /// other bridge setters); a no-op for any other name or unknown id.
+    /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn`, `fillchars`,
+    /// `winhighlight`, `colorcolumn`, `showbreak`, `breakindentopt` and `padding` (an
+    /// invalid value is ignored, matching the no-op-on-bad-input contract of the other
+    /// bridge setters); a no-op for any other name or unknown id.
     pub fn set_window_option_str(&mut self, id: WindowId, name: &str, value: &str) {
         let Some(t) = self.tree_of_window_mut(id) else {
             return;
@@ -1483,6 +1491,15 @@ impl Editor {
             // is the loud path). A window-local value overrides the dock's, if any —
             // see `Editor::effective_winhighlight`.
             opts.winhighlight = value.to_string();
+        } else if name == "showbreak" {
+            // The soft-wrap continuation prefix (`'showbreak'` / `'sbr'`). Any string
+            // is valid, so there is nothing to reject.
+            opts.showbreak = value.to_string();
+        } else if name == "breakindentopt" {
+            // The `'breakindent'` tweak list (`'briopt'`). Unknown flags are ignored at
+            // read time (`WindowOptions::breakindent_sbr`), matching this bridge's
+            // lenient contract.
+            opts.breakindentopt = value.to_string();
         } else if name == "colorcolumn" {
             // The raw ruler-column list (`'colorcolumn'` / `'cc'`). Stored verbatim
             // and resolved to columns at projection (like `fillchars`/`winhighlight`);

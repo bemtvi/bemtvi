@@ -67,7 +67,8 @@ whitelist of muscle-memory aliases over `nx.*`.**
    primitive with no semantic emulation. The whitelist — this list is
    canonical; the other docs summarize it:
    - **Variables / options / environment:** `vim.g` / `vim.b` / `vim.w`,
-     `vim.o` / `vim.opt` / `vim.opt_local` / `vim.bo` / `vim.wo`, `vim.env`.
+     `vim.o` / `vim.opt` / `vim.opt_local` / `vim.opt_global` / `vim.go` / `vim.bo` /
+     `vim.wo`, `vim.env`.
    - **Dispatch & keymaps:** `vim.cmd`, `vim.keymap.set` / `vim.keymap.del`.
    - **Pure helpers** (shared functions, no editor contact):
      `vim.tbl_extend` / `vim.tbl_deep_extend` / `vim.tbl_contains`,

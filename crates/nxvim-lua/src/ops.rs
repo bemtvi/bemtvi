@@ -1194,6 +1194,17 @@ pub enum BufOp {
         name: String,
         value: OptionValue,
     },
+    /// `vim.o.<opt> = value` / `vim.go.<opt> = value` for a **buffer-local** option —
+    /// write the option's *global value*, the tier every newly created buffer is born
+    /// from (vim's `:setglobal`, and the reason a config's `vim.opt.tabstop = 3` reaches
+    /// files opened later). Carries no `bufnr`: it targets the tier, not a buffer. The
+    /// core rejects, loudly, a name whose value the read decides (see
+    /// `docs/plans/2026-08-01-global-local-options.md`).
+    SetGlobalOption {
+        /// Canonical option name (`tabstop` / `expandtab` / `foldmethod` / …).
+        name: String,
+        value: OptionValue,
+    },
     /// `nx.buf.set_lines(bufnr, start, end, _, lines)` / `nvim_buf_set_lines` — replace
     /// lines `[start, end)` of buffer `bufnr` with `lines`. `start`/`end` are 0-based,
     /// end-exclusive, and already resolved + clamped against the live line count by the
@@ -1616,6 +1627,16 @@ pub enum WindowOp {
     /// `vim.wo[win].<opt> = value` / `nvim_win_set_option(win, name, value)` — set a
     /// window-local option (the number gutter) on window `win`. The prelude has
     /// canonicalized `name`; a boolean rides as [`OptionValue::Bool`].
+    /// `vim.go.<opt> = value` / `vim.opt_global.<opt> = value` for a **window-local**
+    /// option — write the option's *global value* (vim's `:setglobal`). Carries no `win`:
+    /// it targets the tier, not a window. A split still copies the window it came from,
+    /// so this is what `:setglobal` reads/writes and what seeds a window minted with no
+    /// source to copy (a dock, the quickfix tab).
+    SetGlobalOption {
+        /// Canonical option name (`number` / `scrolloff` / `signcolumn` / …).
+        name: String,
+        value: OptionValue,
+    },
     SetOption {
         win: u64,
         name: String,

@@ -1682,3 +1682,64 @@ async fn a_restored_buffer_is_not_announced_twice_when_it_is_later_focused() {
         "while BufEnter did fire on the actual entry, got {after:?}"
     );
 }
+
+/// A config's window-local `vim.opt` settings survive a session restore. The restore
+/// mints a fresh window per saved leaf, so it runs AFTER `init.lua` is sourced and each
+/// window inherits the configured startup window (`scrolloff` / `signcolumn` / …),
+/// exactly as a `:split` does. Restoring before the config (as the boot once did) left
+/// every restored window at the built-in defaults — the config's window options silently
+/// lost — and addressed the config's writes to window ids the restore had already retired.
+#[tokio::test]
+async fn session_restore_keeps_config_window_options() {
+    let dir = temp_dir("session_opts_store");
+    let cfg = temp_dir("session_opts_cfg");
+    std::fs::write(
+        cfg.join("init.lua"),
+        "vim.opt.scrolloff = 8\nvim.opt.signcolumn = \"yes:2\"\nvim.opt.cursorline = true\n",
+    )
+    .expect("write init.lua");
+    let file_a = write_temp("session_opt_a", "txt", "a1\na2\na3\n");
+    let file_b = write_temp("session_opt_b", "txt", "b1\nb2\nb3\n");
+
+    let with_cfg = |file: Option<String>| ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        ..init(&dir, file, true)
+    };
+
+    // Every window's window-local options, as "so=<n> scl=<s> cul=<b>" joined by "|".
+    const READ_WIN_OPTS: &str = r#"
+        local out = {}
+        for _, w in ipairs(nx.win.list()) do
+          out[#out + 1] = "so=" .. tostring(nx.wo[w].scrolloff)
+            .. " scl=" .. tostring(nx.wo[w].signcolumn)
+            .. " cul=" .. tostring(nx.wo[w].cursorline)
+        end
+        return table.concat(out, "|")
+    "#;
+
+    // Session 1: two windows in a vsplit, captured by the exit flush.
+    {
+        let (rpc, incoming) = start_attached(with_cfg(Some(file_a.clone())), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, &format!(":vsplit {file_b}<CR>"));
+        assert_eq!(window_count(&rpc).await, 2, "two windows before quit");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the restored layout comes back wearing the config's window options.
+    {
+        let (rpc, _incoming) = start_attached(with_cfg(None), 80, 25).await;
+        assert_eq!(window_count(&rpc).await, 2, "the layout came back");
+        let opts = exec_lua(&rpc, READ_WIN_OPTS)
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            opts, "so=8 scl=yes:2 cul=true|so=8 scl=yes:2 cul=true",
+            "every restored window carries init.lua's window options"
+        );
+    }
+}

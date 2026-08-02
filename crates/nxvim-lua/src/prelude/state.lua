@@ -84,58 +84,18 @@ vim.b = nx.b
 -- inside its metamethods, which run at config time once every chunk has loaded,
 -- so the forward reference is fine.
 
--- Window- and buffer-local options `vim.o` forwards to `vim.wo` / `vim.bo`. Keyed by
+-- Window- and buffer-local options `vim.o` forwards to `vim.wo` / `vim.bo`, keyed by
 -- both the full name and its abbreviation (the delegate canonicalizes again).
-local O_WIN = {
-  number = true,
-  nu = true,
-  relativenumber = true,
-  rnu = true,
-  cursorline = true,
-  cul = true,
-  -- Soft-wrap is a window option the core fully honors (`:set wrap` / `vim.wo.wrap`).
-  -- It has no abbreviation. Listed here so the `vim.o` / `vim.opt` surfaces forward
-  -- it to `vim.wo` (reaching the core) instead of warn-and-storing it as unmodeled.
-  wrap = true,
-  -- Vertical scroll margin (vim's `'scrolloff'`, abbrev `so`), the analogue of
-  -- `sidescrolloff`. Window-local in nxvim (like `sidescrolloff`); `vim.o.scrolloff`
-  -- forwards to the current window.
-  scrolloff = true,
-  so = true,
-  -- Column rulers (vim's `'colorcolumn'`, abbrev `cc`): a comma-separated column
-  -- list highlighted with the `ColorColumn` group. Window-local.
-  colorcolumn = true,
-  cc = true,
-  numberwidth = true,
-  nuw = true,
-  signcolumn = true,
-  scl = true,
-  fillchars = true,
-  fcs = true,
-}
-local O_BUF = {
-  tabstop = true,
-  ts = true,
-  shiftwidth = true,
-  sw = true,
-  softtabstop = true,
-  sts = true,
-  expandtab = true,
-  et = true,
-  autoindent = true,
-  ai = true,
-  smartindent = true,
-  si = true,
-  autopairs = true,
-  -- Whether a write supplies a missing final newline. Routed here so
-  -- `vim.o.fixendofline = false` in an init.lua reaches the buffer rather than
-  -- landing silently in the unmodeled-option store; `'endofline'` rides along for
-  -- symmetry, though it is normally read-detected rather than configured.
-  fixendofline = true,
-  fixeol = true,
-  endofline = true,
-  eol = true,
-}
+--
+-- DERIVED, not hand-kept: the server injects core's option catalog
+-- (`nx._options_catalog`, built from `nxvim_core::options::options_catalog()` — the same
+-- list `:set` resolves against) before any config runs, and `nx._set_options_catalog`
+-- below fills these from its `scope` column. They used to be hand-written name lists and
+-- drifted: `vim.opt.foldmethod = "marker"` (and nine more) fell into the unmodeled
+-- `nx._o_store` and silently did nothing, while `:set foldmethod=marker` worked.
+local O_WIN = {}
+local O_BUF = {}
+
 -- Global (editor-wide) options: canonical name keyed by name and abbreviation.
 local O_GLOBAL = {
   ignorecase = "ignorecase",
@@ -367,6 +327,31 @@ local function warn_unknown_opt(name)
   )
 end
 
+-- A `vim.go` / `vim.opt_global` write of an option nxvim models perfectly well but which
+-- has NO global value — the four buffer slots the read decides (`fileencoding`, `bomb`,
+-- `fileformat`, `endofline`), the per-buffer marker `modifiable`, and the two nouns
+-- derived per buffer (`filetype`, `ts_highlight`). The ex twin answers `E5100: {opt} has
+-- no global value`; this surface stays lenient (a warning, not an error, so a config
+-- carries on) but must name the SAME reason. Falling into `warn_unknown_opt` said "a
+-- typo, or an option nxvim doesn't model" — false on both counts, and it sent the reader
+-- hunting for a misspelling. The write is rejected rather than stored: `nx._o_store` is
+-- read back, and a value nothing honors reading back as if it took is the silent-stub
+-- failure this codebase forbids.
+local warned_no_tier = {}
+local function warn_no_global_value(name)
+  if warned_no_tier[name] then
+    return
+  end
+  warned_no_tier[name] = true
+  nx.notify(
+    "nxvim: '"
+      .. tostring(name)
+      .. "' has no global value — the vim.go/vim.opt_global write was ignored; it is "
+      .. "decided per buffer (use vim.bo / vim.opt_local). `:setglobal` answers E5100.",
+    nx.log.levels.WARN
+  )
+end
+
 local function o_get(k)
   if O_WIN[k] then
     return vim.wo[k]
@@ -384,13 +369,42 @@ local function o_get(k)
   end
   return nx._o_store[k]
 end
+--- Which scope `nx.o` / `nx.opt` routes option `k` to: `"window"`, `"buffer"`,
+--- `"global"`, or `nil` for a name that falls into the unmodeled `nx._o_store`
+--- catch-all. Introspection only — the guard test that walks the option catalog
+--- asserts every buffer/window option is routed rather than silently stored.
+function nx._o_route(k)
+  if O_GLOBAL[k] then
+    return "global"
+  end
+  if O_WIN[k] then
+    return "window"
+  end
+  if O_BUF[k] then
+    return "buffer"
+  end
+  return nil
+end
+
 local function o_set(k, v)
   if O_WIN[k] then
     vim.wo[k] = v
+    -- …and the option's GLOBAL value, as `:set` does: the tier `:setglobal` reads and
+    -- the one a window minted with no source window to copy (a dock, the quickfix tab)
+    -- is born from. An ordinary split still copies the window it came from, so the
+    -- config carries into new splits either way.
+    nx._wo_global_set(k, v)
     return
   end
   if O_BUF[k] then
     vim.bo[k] = v
+    -- …and the option's GLOBAL value, the tier a newly created buffer is born from —
+    -- what `:set` does in vim, and what makes `vim.opt.tabstop = 3` in an `init.lua`
+    -- reach files opened later instead of only the buffer that was current while the
+    -- config ran. `vim.bo` / `vim.opt_local` are the local-only surfaces. A name whose
+    -- value the read decides (`fileencoding`, `bomb`, `fileformat`, `endofline`,
+    -- `modifiable`) has no tier and the call is a no-op there.
+    nx._bo_global_set(k, v)
     return
   end
   local canon = O_GLOBAL[k]
@@ -692,11 +706,57 @@ local function opt_seed_require(name, entries)
   end
 end
 
+-- Read/write one option in a named scope, the dispatcher every `vim.opt*` table and
+-- every `Option` method flushes through:
+--   * "o"      — `vim.opt` / `vim.o`: vim's `:set`. A buffer-local option moves BOTH its
+--                global value and the current buffer's; a window option, the current
+--                window's.
+--   * "local"  — `vim.opt_local`: `:setlocal`, this buffer/window only.
+--   * "global" — `vim.opt_global`: `:setglobal`, the value a new buffer is born from.
+-- A global-scope option has one value, so every scope reaches the same place for it.
+-- `nx.go` / `vim.bo` / `vim.wo` are indexed at call time (they are defined further down
+-- this chunk), which is fine — these run at config time, once the whole chunk has loaded.
+local function scope_get(scope, k)
+  if scope == "global" then
+    return nx.go[k]
+  end
+  if scope == "local" then
+    if O_WIN[k] then
+      return vim.wo[k]
+    end
+    if O_BUF[k] then
+      return vim.bo[k]
+    end
+  end
+  return o_get(k)
+end
+
+local function scope_set(scope, k, v)
+  if scope == "global" then
+    nx.go[k] = v
+    return
+  end
+  if scope == "local" then
+    if O_WIN[k] then
+      vim.wo[k] = v
+      return
+    end
+    if O_BUF[k] then
+      vim.bo[k] = v
+      return
+    end
+  end
+  o_set(k, v)
+end
+
 local Option = {}
 Option.__index = Option
 
-local function opt_new(name, kind, value)
-  return setmetatable({ _name = name, _kind = kind, _value = value }, Option)
+-- An `Option` handle remembers which scope it came from, so `:append`/`:remove` and a
+-- later assignment flush to the same tier the read used ("o" = vim's `:set`, "local" =
+-- `:setlocal`, "global" = `:setglobal`). Absent ⇒ "o", the plain `vim.opt`.
+local function opt_new(name, kind, value, scope)
+  return setmetatable({ _name = name, _kind = kind, _value = value, _scope = scope }, Option)
 end
 
 -- A scalar option being list-mutated (an unknown comma option) promotes to a list.
@@ -764,7 +824,7 @@ local function opt_mutate(self, op, v, noflush)
     end
   end
   if not noflush then
-    o_set(self._name, opt_encode(self._kind, self._value))
+    scope_set(self._scope, self._name, opt_encode(self._kind, self._value))
   end
   return self
 end
@@ -786,7 +846,7 @@ function Option:get()
 end
 
 local function opt_clone(self)
-  return opt_new(self._name, self._kind, vim.deepcopy(self._value))
+  return opt_new(self._name, self._kind, vim.deepcopy(self._value), self._scope)
 end
 Option.__add = function(self, v)
   return opt_mutate(opt_clone(self), "append", v, true)
@@ -801,39 +861,46 @@ Option.__tostring = function(self)
   return tostring(opt_encode(self._kind, self._value))
 end
 
-local function opt_assign(name, v)
+local function opt_assign(name, v, scope)
   if getmetatable(v) == Option then
-    o_set(name, opt_encode(v._kind, v._value))
+    scope_set(scope, name, opt_encode(v._kind, v._value))
     if v._kind == "list" then
       opt_seed_require(name, v._value)
     end
   elseif type(v) == "table" then
     local kind = opt_kind(name, true)
-    o_set(name, opt_encode(kind, v))
+    scope_set(scope, name, opt_encode(kind, v))
     if kind == "list" then
       opt_seed_require(name, v)
     end
   else
-    o_set(name, v)
+    scope_set(scope, name, v)
   end
 end
 
-nx.opt = setmetatable({}, {
-  __index = function(_, k)
-    local kind = opt_kind(k, false)
-    return opt_new(k, kind, opt_decode(kind, o_get(k)))
-  end,
-  __newindex = function(_, k, v)
-    opt_assign(k, v)
-  end,
-})
+-- One `vim.opt`-shaped table per scope: same Option machinery, different tier.
+local function opt_table(scope)
+  return setmetatable({}, {
+    __index = function(_, k)
+      local kind = opt_kind(k, false)
+      return opt_new(k, kind, opt_decode(kind, scope_get(scope, k)), scope)
+    end,
+    __newindex = function(_, k, v)
+      opt_assign(k, v, scope)
+    end,
+  })
+end
+
+nx.opt = opt_table("o")
 vim.opt = nx.opt
--- nxvim's `nx.o` already routes by scope, so opt_local / opt_global share the
--- same Option machinery (the forced-scope distinction neovim draws is collapsed).
-nx.opt_local = nx.opt
-nx.opt_global = nx.opt
-vim.opt_local = nx.opt
-vim.opt_global = nx.opt
+-- The scoped twins, as in neovim: `vim.opt_local` writes only the current
+-- buffer/window, `vim.opt_global` only the global value a new buffer is born from
+-- (`:setlocal` / `:setglobal`). A global-scope option has a single value, so all three
+-- reach the same place for it.
+nx.opt_local = opt_table("local")
+nx.opt_global = opt_table("global")
+vim.opt_local = nx.opt_local
+vim.opt_global = nx.opt_global
 
 -- `nx.go`: the *global* value of options (neovim's editor-wide scope). Unlike
 -- `nx.o` it never delegates to the window/buffer scope — reading a window/buffer
@@ -842,6 +909,16 @@ vim.opt_global = nx.opt
 -- (`nx._go_mirror`, the same home `vim.o`'s global branch uses); any other option
 -- lands in the plain `nx._o_store` (observable read/write, not yet honored).
 local function go_get(k)
+  -- A buffer-local option read through `vim.go` means its *global value* — the tier a
+  -- new buffer is born from — not the current buffer's (that is `vim.bo` / `vim.o`).
+  local tiered = nx._bo_global_get(k)
+  if tiered ~= nil then
+    return tiered
+  end
+  tiered = nx._wo_global_get(k)
+  if tiered ~= nil then
+    return tiered
+  end
   local canon = O_GLOBAL[k]
   if canon then
     local v = nx._go_mirror[canon]
@@ -853,10 +930,23 @@ local function go_get(k)
   return nx._o_store[k]
 end
 local function go_set(k, v)
+  -- `vim.go.tabstop = 3` writes the buffer-local option's global value only, leaving
+  -- the current buffer alone — vim's `:setglobal`.
+  if nx._bo_global_set(k, v) or nx._wo_global_set(k, v) then
+    return
+  end
   local canon = O_GLOBAL[k]
   if canon then
     nx._set_global_option(canon, v)
     nx._go_mirror[canon] = v
+    return
+  end
+  -- A name nxvim DOES model, in a scope with no global tier to write (checked after
+  -- `O_GLOBAL`, so `'regexsyntax'` — global-local, whose tier is the editor-wide option —
+  -- is caught above rather than here). Say what is actually wrong instead of the
+  -- typo warning below, and reject the write.
+  if O_BUF[k] or O_WIN[k] then
+    warn_no_global_value(k)
     return
   end
   -- A seeded read-mostly option is modeled — store silently; warn only on a name
@@ -999,6 +1089,49 @@ local BUF_OPT_DEFAULT = {
   modified = false,
 }
 
+-- The buffer-local options that HAVE a global value — the tier a newly created buffer is
+-- born from (`Editor::buf_opts_global`). Canonical name -> true, DERIVED from core's
+-- catalog (`nx._set_options_catalog`), whose `global_tier` column comes straight from
+-- `nxvim_core::options::has_global_tier` — the one place the question is answered, shared
+-- with the ex `:setglobal` path that rejects a tier-less option with `E5100`.
+--
+-- Left out, and why: the four slots the *read* decides (`fileencoding` / `bomb` /
+-- `fileformat` / `endofline`), the per-buffer marker `modifiable`, and the two nouns
+-- derived per buffer (`filetype`, `ts_highlight`). Writing one through `vim.go` would be a
+-- value nothing reads, so the core rejects it loudly and this table keeps the Lua side
+-- from ever asking.
+local BO_GLOBAL_TIER = {}
+
+--- Read the **global value** of buffer-local option `opt` — what a newly created buffer
+--- is born with. `nil` for a name with no global value (see `BO_GLOBAL_TIER`), which is
+--- how `vim.go` / `vim.o` tell "this has a tier" from "this does not".
+function nx._bo_global_get(opt)
+  local canon = BUF_OPT_CANON[opt]
+  if canon == nil or not BO_GLOBAL_TIER[canon] then
+    return nil
+  end
+  local v = nx._bo_global[canon]
+  if v ~= nil then
+    return v
+  end
+  return BUF_OPT_DEFAULT[canon]
+end
+
+--- Write the **global value** of buffer-local option `opt`, leaving every open buffer
+--- alone (vim's `:setglobal`). Returns whether `opt` has a tier at all, so a caller can
+--- fall through to another scope when it does not.
+function nx._bo_global_set(opt, value)
+  local canon = BUF_OPT_CANON[opt]
+  if canon == nil or not BO_GLOBAL_TIER[canon] then
+    return false
+  end
+  -- Queue the change for the core and echo it into the mirror, so a read-after-write
+  -- within this chunk is consistent (the server overwrites it on the next push).
+  nx._buf_set_option_global(canon, value)
+  nx._bo_global[canon] = value
+  return true
+end
+
 local function bo_get(bufnr, opt)
   local canon = BUF_OPT_CANON[opt]
   if canon then
@@ -1131,6 +1264,16 @@ local WIN_OPT_CANON = {
   scl = "signcolumn",
   fillchars = "fillchars",
   fcs = "fillchars",
+  breakindent = "breakindent",
+  bri = "breakindent",
+  showbreak = "showbreak",
+  sbr = "showbreak",
+  breakindentopt = "breakindentopt",
+  briopt = "breakindentopt",
+  sidescroll = "sidescroll",
+  ss = "sidescroll",
+  sidescrolloff = "sidescrolloff",
+  siso = "sidescrolloff",
   padding = "padding",
   pad = "padding",
   winhighlight = "winhighlight",
@@ -1157,6 +1300,11 @@ local WIN_OPT_DEFAULT = {
   numberwidth = 4,
   signcolumn = "auto",
   fillchars = "",
+  breakindent = false,
+  showbreak = "",
+  breakindentopt = "",
+  sidescroll = 1,
+  sidescrolloff = 0,
   padding = "",
   winhighlight = "",
   foldcolumn = 0,
@@ -1166,6 +1314,44 @@ local WIN_OPT_DEFAULT = {
 -- Exposed for this file's nvim_{get,set}_option_value, which classify a name
 -- as window-scoped before routing it through `nx.wo`.
 nx._win_opt_canon = WIN_OPT_CANON
+
+-- The window-local options that have a GLOBAL value — vim's `:setglobal` tier, which
+-- `vim.go` / `vim.opt_global` read and write. Name/abbrev -> canonical name, DERIVED from
+-- core's catalog (`nx._set_options_catalog`) rather than aliased to `WIN_OPT_CANON`: a
+-- *split* still copies the window it came from, so the tier is what seeds a window minted
+-- with no source (a dock, the quickfix tab).
+--
+-- The distinction the alias got wrong is `'scrollanim'`, which is a **global** option with
+-- a per-window override — its global value is the editor-wide one `vim.o` reads, not a
+-- window tier — so `vim.go.scrollanim` answered a tier nothing populates and always said
+-- `true`. Deriving from the catalog's own `scope` column keeps that straight.
+local WO_GLOBAL_TIER = {}
+
+--- Read the **global value** of window-local option `opt`. `nil` when `opt` is not a
+--- window option at all, so `vim.go` can fall through to the other scopes.
+function nx._wo_global_get(opt)
+  local canon = WO_GLOBAL_TIER[opt]
+  if canon == nil then
+    return nil
+  end
+  local v = nx._wo_global[canon]
+  if v ~= nil then
+    return v
+  end
+  return WIN_OPT_DEFAULT[canon]
+end
+
+--- Write the **global value** of window-local option `opt`, leaving every open window
+--- alone (vim's `:setglobal`). Returns whether `opt` is a window option at all.
+function nx._wo_global_set(opt, value)
+  local canon = WO_GLOBAL_TIER[opt]
+  if canon == nil then
+    return false
+  end
+  nx._win_set_option_global(canon, value)
+  nx._wo_global[canon] = value
+  return true
+end
 
 local function wo_get(win, opt)
   local canon = WIN_OPT_CANON[opt]
@@ -1437,6 +1623,24 @@ function nx._set_bo_mirror(entries)
   nx._bo_mirror = entries or {}
 end
 
+-- Rust→Lua mirror of the GLOBAL values of the buffer-local options (the tier a newly
+-- created buffer is born from), refreshed by the server beside `nx._bo_mirror`. Read by
+-- `vim.go` / `vim.opt_global`; only the options that have a tier appear (see
+-- `BO_GLOBAL_TIER`).
+nx._bo_global = nx._bo_global or {}
+
+function nx._set_bo_global(entry)
+  nx._bo_global = entry or {}
+end
+
+-- The window twin of `nx._bo_global`: the GLOBAL values of the window-local options,
+-- refreshed by the server and read by `vim.go` / `vim.opt_global`.
+nx._wo_global = nx._wo_global or {}
+
+function nx._set_wo_global(entry)
+  nx._wo_global = entry or {}
+end
+
 nx._wins = nx._wins or {}
 nx._win_all = nx._win_all or { 1000 }
 nx._win_order = nx._win_order or { 1000 }
@@ -1706,6 +1910,33 @@ function nx._resolve_win(win)
 end
 local resolve_win = nx._resolve_win
 
+-- Which tier an `nvim_{set,get}_option_value` call targets, from its `opts`. neovim's
+-- `scope` is `"local"` (the window/buffer value) or `"global"` (the `:setglobal` tier);
+-- an unrecognized value fails loud instead of being dropped, since silently treating
+-- `scope = "gloabl"` as local reads the wrong number and looks like it worked.
+--
+-- With no `scope`, the two verbs differ, as in neovim: a *set* matches `:set` — "for
+-- global-local options, both the global and local value are set" — while a *get* reads
+-- the local value. A `buf` / `win` target narrows a set to that instance (neovim: `buf`
+-- implies `scope` is local), so only the untargeted, unscoped set writes both tiers.
+-- Returns `"global"`, `"local"`, or `"both"`.
+local function opt_scope_of(opts, where, setting)
+  local scope = opts.scope
+  if scope == "global" then
+    return "global"
+  end
+  if scope == "local" then
+    return "local"
+  end
+  if scope ~= nil then
+    error(where .. ": invalid scope '" .. tostring(scope) .. "' (expected 'local' or 'global')", 2)
+  end
+  if setting and not opts.buf and not opts.win then
+    return "both"
+  end
+  return "local"
+end
+
 -- `nx.option.set`(name, value, opts) [alias `nvim_set_option_value`]: set an option
 -- in the scope its name implies. A window-local option (number/relativenumber) —
 -- or any option with an explicit `opts.win` — routes through `nx.wo` (the targeted
@@ -1714,29 +1945,25 @@ local resolve_win = nx._resolve_win
 -- lands in the observable per-scope store. (The scoped tables `nx.o` / `nx.bo` / `nx.wo`
 -- are the primary option API; this is the by-name funnel plugins reach for.)
 --
--- `opts.scope` is neovim's local/global selector: `"global"` reads and writes the
--- editor-wide value (`nx.go`'s home) instead of the window/buffer one, `"local"` is
--- the default described above. Any other value fails loud.
--- Validate `opts.scope` and report whether it asks for the GLOBAL value. neovim's
--- scope is `"local"` (the default — the window/buffer value) or `"global"` (the
--- editor-wide one, `nx.go`'s home). An unrecognized value fails loud instead of
--- being dropped: silently treating `scope = "gloabl"` as local reads the wrong
--- number, and looks like it worked.
-local function opt_scope_is_global(opts, where)
-  local scope = opts.scope
-  if scope == nil or scope == "local" then
-    return false
-  end
-  if scope == "global" then
-    return true
-  end
-  error(where .. ": invalid scope '" .. tostring(scope) .. "' (expected 'local' or 'global')", 2)
-end
-
+-- `opts.scope` is neovim's local/global selector over the two tiers a buffer- or
+-- window-local option carries: `"local"` writes only the targeted instance
+-- (`:setlocal`), `"global"` only the value a new buffer is born from (`:setglobal`).
+-- Any other value fails loud. With **no** `opts.scope` and no `opts.buf` / `opts.win`,
+-- this is a plain `:set` and writes **both** — matching neovim, and the reason
+-- `nvim_set_option_value("tabstop", 3, {})` in a config reaches the files you open
+-- afterwards rather than only the buffer that was current while it ran. Naming a
+-- `buf` / `win` narrows it back to that instance.
 function nx.option.set(name, value, opts)
   opts = opts or {}
-  if opt_scope_is_global(opts, "nvim_set_option_value") then
+  local scope = opt_scope_of(opts, "nvim_set_option_value", true)
+  if scope == "global" then
     nx.go[name] = value
+    return
+  end
+  if scope == "both" then
+    -- `nx.o` is the both-tiers funnel: it forwards to the window/buffer scope the
+    -- name implies AND moves that option's global value, exactly as `:set` does.
+    nx.o[name] = value
     return
   end
   if opts.win or nx._win_opt_canon[name] then
@@ -1749,10 +1976,12 @@ end
 
 -- `nx.option.get`(name, opts) [alias `nvim_get_option_value`]: read an option from
 -- the scope its name implies (see `nx.option.set`), so a wired option reflects the
--- core's current value (default until set).
+-- core's current value (default until set). `opts.scope = "global"` reads the
+-- `:setglobal` tier instead; a *read* with no scope is the local value (neovim's
+-- default for the getter, where the setter's is `:set`).
 function nx.option.get(name, opts)
   opts = opts or {}
-  if opt_scope_is_global(opts, "nvim_get_option_value") then
+  if opt_scope_of(opts, "nvim_get_option_value", false) == "global" then
     return nx.go[name]
   end
   if opts.win or nx._win_opt_canon[name] then
@@ -1926,3 +2155,61 @@ function nx.reg.gettype(name)
   return entry and entry.type or "v"
 end
 vim.fn.getregtype = nx.reg.gettype
+
+-- ---------------------------------------------------------------------------
+-- The option catalog, and the routing tables derived from it.
+-- ---------------------------------------------------------------------------
+
+--- Receive core's option catalog and rebuild every table that routes an option name to
+--- its scope. Called once by the server (`LuaRuntime::set_options_catalog`) before any
+--- config runs, from `nxvim_core::options::options_catalog()` — the same list `:set`
+--- resolves against, so the Lua surfaces can no longer disagree with the ex ones about
+--- where an option lives or whether it has a global value.
+---
+--- Each row is `{ name, abbrev, kind, scope, global_tier, doc }`. Four tables come out:
+---
+--- ```
+--- O_WIN / O_BUF         -- which scope `vim.o` / `vim.opt` forwards a write to
+--- WO_GLOBAL_TIER        -- the window options `vim.go` / `vim.opt_global` reach
+--- BO_GLOBAL_TIER        -- the buffer options `vim.go` / `vim.opt_global` reach
+--- ```
+---
+--- `WIN_OPT_CANON` / `BUF_OPT_CANON` (the `vim.wo` / `vim.bo` name maps) are extended
+--- with any catalog name they lack, for the same reason. They keep their own entries the
+--- catalog has no row for — the read-only buffer *state* nouns (`modified`, `buftype`)
+--- and `'winhighlight'`.
+---
+--- `O_GLOBAL` wins the overlap: `'regexsyntax'` is global-local (a buffer may pin a
+--- dialect, or follow the editor-wide one), and `vim.o.regexsyntax` has always meant the
+--- editor-wide value — the only way to move it. `vim.bo.regexsyntax` is the per-buffer
+--- surface.
+function nx._set_options_catalog(rows)
+  nx._options_catalog = rows or {}
+  for _, r in ipairs(nx._options_catalog) do
+    local spellings = { r.name }
+    if r.abbrev then
+      spellings[#spellings + 1] = r.abbrev
+    end
+    for _, spelling in ipairs(spellings) do
+      if not O_GLOBAL[spelling] then
+        if r.scope == "window" then
+          O_WIN[spelling] = true
+          if WIN_OPT_CANON[spelling] == nil then
+            WIN_OPT_CANON[spelling] = r.name
+          end
+          if r.global_tier then
+            WO_GLOBAL_TIER[spelling] = r.name
+          end
+        elseif r.scope == "buffer" then
+          O_BUF[spelling] = true
+          if BUF_OPT_CANON[spelling] == nil then
+            BUF_OPT_CANON[spelling] = r.name
+          end
+        end
+      end
+    end
+    if r.scope == "buffer" and r.global_tier and not O_GLOBAL[r.name] then
+      BO_GLOBAL_TIER[r.name] = true
+    end
+  end
+end

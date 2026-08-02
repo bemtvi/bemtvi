@@ -56,7 +56,7 @@ pub use ops::{
     ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
-    extract_prelude, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete, ExtmarkMirror,
-    FloatMirror, GoMirror, HlDefMirror, JumpMirror, LuaRuntime, OptionCatalogRow, QfMirror,
-    TabMirror, WindowMirror,
+    extract_prelude, BoGlobalMirror, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete,
+    ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror, JumpMirror, LuaRuntime, OptionCatalogRow,
+    QfMirror, TabMirror, WindowMirror, WoGlobalMirror,
 };

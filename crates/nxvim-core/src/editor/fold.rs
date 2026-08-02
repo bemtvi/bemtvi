@@ -912,8 +912,38 @@ impl Editor {
 
     /// The focused buffer's `'foldexpr'` (empty when unset).
     pub(crate) fn foldexpr(&self) -> &str {
-        let buf = self.current_buffer_id();
-        self.foldexprs.get(&buf).map(String::as_str).unwrap_or("")
+        self.effective_foldexpr(self.current_buffer_id())
+    }
+
+    /// `buf`'s *effective* `'foldexpr'`: its own expression, or the global value when it
+    /// has none (empty ⇒ no expression). The per-buffer form [`Editor::foldexpr`] reads
+    /// for the focused buffer and the server mirrors into `vim.bo.foldexpr`.
+    ///
+    /// The global fallback is what makes the usual config pair — `vim.opt.foldmethod =
+    /// "expr"` next to `vim.opt.foldexpr = …` — apply to every buffer rather than only
+    /// the one the config ran in.
+    pub fn effective_foldexpr(&self, buf: BufferId) -> &str {
+        self.foldexprs
+            .get(&buf)
+            .map(String::as_str)
+            .unwrap_or(&self.foldexpr_global)
+    }
+
+    /// Set (or, with an empty string, clear) the **global value** of `'foldexpr'` — the
+    /// fallback a buffer with no expression of its own folds by. The `:setglobal` /
+    /// `vim.go` half of [`Editor::set_foldexpr`]; rebuilds the focused window's folds,
+    /// since the buffer it shows may resolve through this.
+    pub(crate) fn set_foldexpr_global(&mut self, value: &str) {
+        self.foldexpr_global = value.to_string();
+        self.external_folds.clear();
+        self.windows.cur_mut().folds.cache = None;
+        self.refresh_folds();
+    }
+
+    /// The global value of `'foldexpr'` (empty ⇒ none), for the `:setglobal fde?` readout
+    /// and the `vim.go` mirror.
+    pub fn foldexpr_global(&self) -> &str {
+        &self.foldexpr_global
     }
 
     /// Set the focused buffer's `'foldexpr'`. Empty clears it. The expression
@@ -1104,10 +1134,42 @@ impl Editor {
     /// The focused buffer's effective `'foldmarker'` — its `(start, end)` override or
     /// vim's default `{{{`/`}}}` when unset.
     pub(crate) fn effective_foldmarker(&self) -> (String, String) {
-        let buf = self.current_buffer_id();
+        self.effective_foldmarker_of(self.current_buffer_id())
+    }
+
+    /// `buf`'s *effective* `'foldmarker'` pair: its own, else the global value
+    /// (`:setglobal foldmarker=…`), else vim's built-in `{{{`/`}}}`. The per-buffer form
+    /// [`Editor::effective_foldmarker`] reads for the focused buffer and the server
+    /// mirrors into `vim.bo.foldmarker`.
+    pub fn effective_foldmarker_of(&self, buf: BufferId) -> (String, String) {
         self.foldmarkers
             .get(&buf)
             .cloned()
+            .or_else(|| self.foldmarker_global.clone())
+            .unwrap_or_else(default_foldmarker)
+    }
+
+    /// Set the **global value** of `'foldmarker'` — the pair a buffer with none of its
+    /// own folds by. The `:setglobal` / `vim.go` half of [`Editor::set_foldmarker`];
+    /// rebuilds the focused window's folds, which may resolve through it.
+    pub(crate) fn set_foldmarker_global(&mut self, open: &str, close: &str) {
+        self.foldmarker_global = Some((open.to_string(), close.to_string()));
+        self.windows.cur_mut().folds.cache = None;
+        self.refresh_folds();
+    }
+
+    /// Clear the global `'foldmarker'` (back to vim's `{{{`/`}}}`) — `:setglobal fmr&`.
+    pub(crate) fn reset_foldmarker_global(&mut self) {
+        self.foldmarker_global = None;
+        self.windows.cur_mut().folds.cache = None;
+        self.refresh_folds();
+    }
+
+    /// The global `'foldmarker'` pair (vim's default when none was set), for the
+    /// `:setglobal fmr?` readout and the `vim.go` mirror.
+    pub fn foldmarker_global(&self) -> (String, String) {
+        self.foldmarker_global
+            .clone()
             .unwrap_or_else(default_foldmarker)
     }
 

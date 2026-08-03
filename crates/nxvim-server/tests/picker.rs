@@ -962,6 +962,64 @@ nx.picker.source {
 }
 
 #[tokio::test]
+async fn narrowing_a_dynamic_query_to_zero_results_clears_the_stale_rows() {
+    // A dynamic source that matched a broad query ("AAA") and then matches NOTHING
+    // for the narrowed one ("AAA_BBB") must end up showing an EMPTY list — the rows
+    // of the earlier query are stale and must not stay on screen. The rows survive
+    // only *while* the new search is in flight; its completion (`done()`) settles
+    // them away.
+    let dir = temp_dir("picker_narrow_empty");
+    let src = r#"
+nx.picker.source {
+  name = "narrow",
+  dynamic = true,
+  debounce = 10,
+  items = nx.async(function(ctx)
+    if ctx.query == "AAA" then
+      ctx.push { text = "hit-1" }
+      ctx.push { text = "hit-2" }
+    end
+  end),
+  confirm = function(item) end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "nx.picker.open('narrow')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+
+    // The broad query matches.
+    feed(&rpc, "AAA");
+    let mut items = Vec::new();
+    for _ in 0..60 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            items = menu_items(&menu_of(&map));
+            if !items.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(items, vec!["hit-1", "hit-2"], "the broad query matched");
+
+    // Narrow it until nothing matches: the stale rows must go.
+    feed(&rpc, "_BBB");
+    let mut last = Vec::new();
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            last = menu_items(&menu_of(&map));
+            if last.is_empty() {
+                break;
+            }
+        }
+    }
+    assert!(
+        last.is_empty(),
+        "a narrowed query with no results must clear the previous query's rows, got {last:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_closed_pickers_late_push_never_leaks_into_the_next() {
     // A source whose ctx.push is deferred (a timer) and which forgets to register
     // `ctx.on_cancel` keeps "streaming" after its picker closes. Because every
@@ -3203,4 +3261,142 @@ async fn builtin_live_grep_searches_ignored_and_hidden_files() {
             "live_grep is unrestricted, so it matches inside {want}; got {rows:?}"
         );
     }
+}
+
+/// `live_grep`'s fallback chain (`rg` → `grep` → the `nx.fs` walk) must step to the
+/// next leg only when the previous binary **isn't there**, never because it ran and
+/// found nothing. Zero matches is a legitimate answer, and re-searching the whole
+/// tree twice more for it is what left the *previous* query's rows on screen for
+/// however long the pointless re-searches took ("type AAA, get hits; narrow to
+/// AAA_BBB, keep seeing AAA's hits").
+///
+/// Binary-agnostic: the assertion is that a no-match query spawns exactly the same
+/// commands as a matching one, whichever leg the machine lands on.
+#[tokio::test]
+async fn live_grep_stops_at_the_first_working_tool_even_with_no_matches() {
+    let dir = temp_dir("picker_grep_nomatch_cfg");
+    let proj = temp_dir("picker_grep_nomatch");
+    std::fs::write(proj.join("a.txt"), "zqxneedle here\n").expect("write a.txt");
+
+    // Record every binary the source spawns, in order.
+    let init = r#"
+_G.cmds = {}
+local real = nx.run_stream
+nx.run_stream = function(spec)
+  _G.cmds[#_G.cmds + 1] = spec.cmd
+  return real(spec)
+end
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep picker opens");
+
+    // A query that matches: the chain stops at the first tool that works.
+    feed(&rpc, "zqxneedle");
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if !rows.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!rows.is_empty(), "the matching query produced hits");
+    let matched = exec_lua(&rpc, "return table.concat(_G.cmds, ',')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // Narrow it to something nothing contains. Reset the log *before* typing so the
+    // debounced run records only this query's spawns.
+    exec_lua(&rpc, "_G.cmds = {}").await;
+    feed(&rpc, "_absent");
+    for _ in 0..200 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        rows.is_empty(),
+        "a query with no matches clears the previous query's rows; got {rows:?}"
+    );
+    let empty = exec_lua(&rpc, "return table.concat(_G.cmds, ',')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        empty, matched,
+        "no matches must not be read as 'that tool is missing' — the no-match query \
+         spawned [{empty}] where the matching one spawned [{matched}]"
+    );
+}
+
+/// A `live_grep` leg reaped mid-flight (`ctx.on_cancel` — the picker closed, or the
+/// query moved on) must STOP the chain. A kill reports the same `code = -1` a missing
+/// binary does, so reading the status alone would send a superseded run off to grep
+/// the whole tree — and that job is unreapable, since `ctx.on_cancel` no longer
+/// accepts a registration from a dead generation.
+#[tokio::test]
+async fn a_reaped_live_grep_leg_does_not_start_the_next_one() {
+    let dir = temp_dir("picker_grep_reap_cfg");
+    let proj = temp_dir("picker_grep_reap");
+    std::fs::write(proj.join("a.txt"), "zqxneedle here\n").expect("write a.txt");
+
+    // Stand a never-finishing child in for `rg` so the first leg is still in flight
+    // when the picker closes, and log every spawn the source makes.
+    let init = r#"
+_G.cmds = {}
+local real = nx.run_stream
+nx.run_stream = function(spec)
+  _G.cmds[#_G.cmds + 1] = spec.cmd
+  if spec.cmd == "rg" then
+    return real({ cmd = "sh", args = { "-c", "sleep 30" }, cwd = spec.cwd })
+  end
+  return real(spec)
+end
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep picker opens");
+    feed(&rpc, "zqxneedle");
+
+    // Wait for the (stalled) first leg to be spawned.
+    for _ in 0..200 {
+        if exec_lua(&rpc, "return #_G.cmds").await.as_u64() == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        exec_lua(&rpc, "return #_G.cmds").await.as_u64(),
+        Some(1),
+        "the first leg is in flight"
+    );
+
+    // Close the picker: the stalled leg is killed, and nothing may take its place.
+    feed(&rpc, "<Esc>");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return table.concat(_G.cmds, ',')")
+            .await
+            .as_str(),
+        Some("rg"),
+        "a killed leg ends the fallback chain — it must not spawn an unreapable grep"
+    );
 }

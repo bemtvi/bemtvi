@@ -89,6 +89,27 @@ function Stream:kill()
   nx._system_kill(self._id)
 end
 
+-- `stream:exit()`: how the child ENDED — a table `{ code, stderr }` once it has
+-- exited, or `nil` while it is still running (so it is meaningful only after the
+-- `nx.await_each` loop has finished). `code` is the child's real exit status;
+-- **`-1` means the child never ran** — the binary wasn't found, or `:kill()` reaped
+-- it. `stdout` is empty here: it was already delivered through the stream.
+--
+-- The point of the accessor is to tell "the tool ran and its answer was nothing"
+-- apart from "the tool isn't installed", which output alone cannot distinguish. A
+-- fallback chain must branch on the status, not on emptiness — `rg` exits `1` on
+-- zero matches, and re-searching the tree with the next tool for that is pure waste:
+--
+-- ```lua
+-- local stream = nx.run_stream({ cmd = "rg", args = { "--vimgrep", "--", q } })
+-- for batch in nx.await_each(stream) do ... end
+-- local exit = stream:exit()
+-- if exit and exit.code == -1 then ... end  -- no rg here; try the next tool
+-- ```
+function Stream:exit()
+  return self._exit
+end
+
 -- `stream:pid()`: the running child's OS pid, or `nil`. The pid is reported
 -- asynchronously by the event-loop actor (it can't be known synchronously on the
 -- single-threaded runtime) into the `nx._proc_pids` registry this reads — so `nil`
@@ -102,8 +123,8 @@ end
 -- `nx.run_stream { cmd, args, cwd, env }` -> Stream. Spawns a child and streams its
 -- stdout as it arrives, in newline-delimited batches — each batch a list of lines
 -- with the trailing newline stripped. Takes the same spec as `nx.run` minus `stdin`
--- (the child's stdin is closed at spawn). Only stdout is surfaced: stderr and the
--- exit code are not readable through the Stream.
+-- (the child's stdin is closed at spawn). Only stdout streams; the exit status and
+-- stderr land together at the end, on `stream:exit()`.
 --
 -- The streaming twin of `nx.run` — reach for it when output is large or long-lived
 -- and you want to act on lines as they come (the picker / completion sources feed

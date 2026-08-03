@@ -626,8 +626,8 @@ end
 -- `rg --files` (fast) → `find` (any real shell lacking rg) → a transport-agnostic
 -- `nx.fs` walk. The binaries need a real shell, so the pure web client — where a
 -- hostless spawn fails loud with code -1 — lands on the nx.fs walk (which rides the
--- off-tick seam to OPFS / the daemon). Each step runs only when the previous produced
--- nothing.
+-- off-tick seam to OPFS / the daemon). Each step runs only when the previous one
+-- could not RUN (`stream:exit().code == -1`), never merely because it listed nothing.
 --
 -- The search is **unrestricted by default** (`rg -uu` = `--no-ignore --hidden`): a
 -- file you can't find isn't a file, so ignore rules and dotfiles don't hide it. Only
@@ -639,15 +639,17 @@ nx.picker.source({
   layer = "main", -- a picked file opens in the main editor, never a focused dock
   preview = "file", -- the preview pane shows the file's head
   items = nx.async(function(ctx)
-    -- Stream a listing command's stdout as candidates; returns whether any landed.
+    local cancelled = false
+    -- Stream a listing command's stdout as candidates. Returns whether the chain is
+    -- SETTLED here — the tool ran (whatever it listed), or the run was superseded.
     -- `strip` removes `find`'s leading "./" so its paths match rg's relative style.
     local function run(cmd, args, strip)
-      local pushed = false
       local stream = nx.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
       -- Reap the job when the picker closes, so a confirmed/cancelled picker doesn't
       -- leave a process streaming paths into the void. Sequential steps each arm this
       -- for the only stream that can still be running.
       ctx.on_cancel(function()
+        cancelled = true
         stream:kill()
       end)
       for batch in nx.await_each(stream) do
@@ -656,12 +658,15 @@ nx.picker.source({
             l = l:gsub("^%./", "")
           end
           if l ~= "" then
-            pushed = true
             ctx.push({ text = l, path = l })
           end
         end
       end
-      return pushed
+      -- The child's exit status is the canonical "did this tool exist" signal:
+      -- `-1` is a spawn failure (no such binary) or our own `:kill()`. Anything
+      -- else means it ran, so an empty listing is its ANSWER and the chain stops.
+      local exit = stream:exit()
+      return cancelled or exit == nil or exit.code ~= -1
     end
     if run("rg", { "--files", "--color=never", "-uu", "-g", "!.git" }) then
       return
@@ -689,8 +694,11 @@ nx.picker.source({
 -- `grep -rn` (any real shell lacking rg) → a transport-agnostic nx.fs walk + in-Lua
 -- substring match. The binaries need a real shell, so the pure web client — where a
 -- hostless spawn fails loud with code -1 — lands on the nx.fs match (which rides the
--- off-tick seam to OPFS). Each step runs only when the previous found nothing; the
--- superseded job is reaped via ctx.on_cancel.
+-- off-tick seam to OPFS). Each step runs only when the previous one could not RUN
+-- (`stream:exit().code == -1`): zero matches is a legitimate ANSWER, not a missing
+-- binary, and re-searching the tree for it would leave the previous query's rows on
+-- screen for as long as the pointless re-searches took. The superseded job is reaped
+-- via ctx.on_cancel, which also stops the chain dead.
 --
 -- Unrestricted by default, exactly like `files` above: `rg -uu` (`--no-ignore
 -- --hidden`) minus `.git`, so an ignored or dotted file still matches. rg still skips
@@ -706,14 +714,15 @@ nx.picker.source({
       return
     end
     local q = ctx.query
+    local cancelled = false
 
     -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
-    -- rg's `--vimgrep` column. `strip` drops grep's leading "./". Returns whether any
-    -- match landed.
+    -- rg's `--vimgrep` column. `strip` drops grep's leading "./". Returns whether the
+    -- chain is SETTLED here — the tool ran (matches or not), or the run was superseded.
     local function run(cmd, args, has_col, strip)
-      local pushed = false
       local stream = nx.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
       ctx.on_cancel(function()
+        cancelled = true
         stream:kill()
       end)
       for batch in nx.await_each(stream) do
@@ -729,12 +738,16 @@ nx.picker.source({
             col = 1
           end
           if file then
-            pushed = true
             ctx.push({ text = l, path = file, row = tonumber(lnum), col = tonumber(col) })
           end
         end
       end
-      return pushed
+      -- The child's exit status is the canonical "did this tool exist" signal: `-1`
+      -- is a spawn failure (no such binary) or our own `:kill()`. rg/grep exit `1`
+      -- on zero matches — a real answer, so the chain stops and the picker settles
+      -- empty instead of grinding the whole tree twice more.
+      local exit = stream:exit()
+      return cancelled or exit == nil or exit.code ~= -1
     end
 
     if run("rg", { "--vimgrep", "--color=never", "-uu", "-g", "!.git", "--", q }, true, false) then

@@ -311,7 +311,7 @@ async fn nx_run_stream_exit_carries_stderr() {
            local s = nx.run_stream({ cmd = 'sh', args = { '-c',\n\
              '( sleep 0.2; echo oops >&2 ) >/dev/null & exit 3' } })\n\
            for _ in nx.await_each(s) do end\n\
-           _G.exit = s._exit\n\
+           _G.exit = s:exit()\n\
          end)()",
     )
     .await;
@@ -330,6 +330,46 @@ async fn nx_run_stream_exit_carries_stderr() {
             .as_str(),
         Some("oops\n"),
         "the streaming exit result must carry the child's stderr"
+    );
+}
+
+#[tokio::test]
+async fn stream_exit_separates_a_missing_binary_from_a_nonzero_exit() {
+    let (rpc, _incoming) = start().await;
+    // `stream:exit()` is the signal a fallback chain branches on, so the two ways of
+    // producing NO output must stay distinguishable: a binary that isn't there
+    // (`code = -1`) versus one that ran and answered "nothing" (`grep`'s `1`). It is
+    // nil while the child is still running — it only means something after the
+    // `nx.await_each` loop ends.
+    exec_lua(
+        &rpc,
+        "_G.missing, _G.nomatch, _G.inflight = nil, nil, nil\n\
+         nx.async(function()\n\
+           local a = nx.run_stream({ cmd = 'definitely-not-a-real-binary-xyz' })\n\
+           _G.inflight = a:exit()\n\
+           for _ in nx.await_each(a) do end\n\
+           _G.missing = a:exit().code\n\
+           local b = nx.run_stream({ cmd = 'sh', args = { '-c', 'exit 1' } })\n\
+           for _ in nx.await_each(b) do end\n\
+           _G.nomatch = b:exit().code\n\
+         end)()",
+    )
+    .await;
+    poll_true(&rpc, "return _G.nomatch ~= nil").await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.inflight == nil").await,
+        Some(true),
+        "exit() is nil until the child has actually exited"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.missing == -1").await,
+        Some(true),
+        "a binary that isn't there reports code -1"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return _G.nomatch").await,
+        Some(1),
+        "a tool that ran and found nothing reports its own status, not -1"
     );
 }
 

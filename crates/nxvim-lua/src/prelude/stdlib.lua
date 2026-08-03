@@ -129,6 +129,14 @@ end
 
 -- `nx.json.decode(str) -> value`. Parses a JSON document (objects -> string-keyed
 -- tables, arrays -> sequences, `null` -> nil); raises on malformed input.
+--
+-- An EMPTY object decodes to `nx.json.empty_object()` rather than a bare `{}`, so
+-- decode -> edit -> encode (how a plugin rewrites a JSON file it owns) preserves what
+-- the document said: without the mark `{"pylsp":{}}` came back out as `{"pylsp":[]}`,
+-- since a bare empty table is equally an empty array. It reads like any other empty
+-- table (`next(t) == nil`, fill it in and it is an object with those keys); the one
+-- place the mark shows is `nx.tbl.deep_extend`, where — like every JSON sentinel — it
+-- is a VALUE that replaces, so a merged-in `{}` means `{}`.
 function nx.json.decode(str)
   return nx._json_decode(str)
 end
@@ -187,6 +195,10 @@ nx.json.null = setmetatable({}, {
 -- A fresh table each call, and the mark answers "array or object?" rather than
 -- standing in for the contents: fill it in afterwards and it is still an object, with
 -- everything you put in it (integer keys become the string keys JSON objects take).
+--
+-- `nx.json.decode` hands back this same shape for an empty object it read, which is
+-- what makes decode -> encode round-trip a `{}` in a file rather than flattening it
+-- to `[]`.
 --
 -- Its sibling is the value `nx.json.null`, which encodes as JSON `null` — the other
 -- thing a Lua table cannot carry, since a `nil` value simply removes the key.

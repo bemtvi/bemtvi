@@ -302,3 +302,74 @@ async fn is_null_identifies_a_sentinel_that_has_been_copied() {
     .await;
     assert_eq!(recognized.as_bool(), Some(true));
 }
+
+#[tokio::test]
+async fn a_decoded_empty_object_stays_an_object_through_a_round_trip() {
+    let (rpc, _incoming) = start().await;
+
+    // Read-modify-write is the ordinary shape for any JSON a plugin owns (a workspace
+    // `.nxvim/config.json`, a lockfile, an HTTP body): decode, edit, encode back. An
+    // empty JSON object decoded into a bare Lua table is indistinguishable from an
+    // empty array, so `{"pylsp":{}}` came back out as `{"pylsp":[]}` — the file
+    // silently rewritten into a shape its own schema rejects. Decoding marks it, so
+    // what the document said is what it still says on the way out.
+    let round = lua_str(
+        &rpc,
+        r#"return nx.json.encode(nx.json.decode('{"lsps":{"pylsp":{}}}'))"#,
+    )
+    .await;
+    assert_eq!(round, r#"{"lsps":{"pylsp":{}}}"#);
+
+    // Both ends of the ambiguity, so the fix does not just flip which one is wrong: an
+    // empty ARRAY must still round-trip as an array.
+    let array = lua_str(&rpc, r#"return nx.json.encode(nx.json.decode('{"a":[]}'))"#).await;
+    assert_eq!(array, r#"{"a":[]}"#);
+
+    let top = lua_str(&rpc, "return nx.json.encode(nx.json.decode('{}'))").await;
+    assert_eq!(top, "{}");
+    let top_array = lua_str(&rpc, "return nx.json.encode(nx.json.decode('[]'))").await;
+    assert_eq!(top_array, "[]");
+
+    // It is still an ordinary table to read and to fill in — the mark answers "array or
+    // object?", it does not make the value special to a plugin walking the config.
+    let usable = lua_str(
+        &rpc,
+        r#"local c = nx.json.decode('{"lsps":{"pylsp":{}}}')
+           local p = c.lsps.pylsp
+           assert(type(p) == "table" and next(p) == nil, "decoded {} must be an empty table")
+           p.settings = { plugins = {} }
+           return nx.json.encode(c)"#,
+    )
+    .await;
+    assert_eq!(usable, r#"{"lsps":{"pylsp":{"settings":{"plugins":[]}}}}"#);
+}
+
+#[tokio::test]
+async fn a_decoded_empty_object_is_a_value_when_merged() {
+    let (rpc, _incoming) = start().await;
+
+    // The mark decoding attaches is the same one `nx.json.empty_object()` carries, so it
+    // inherits that value's merge rule: `nx.tbl.deep_extend` treats it as a LEAF that
+    // replaces, not as the empty map it otherwise looks like. Pinned here because it is
+    // the visible consequence of the decode-side mark — a config layered over another
+    // (`nx.lsp.config`, a workspace template merged into a project config) reads a
+    // document's `{}` as "an empty object", which is what the document says.
+    let replaced = lua_str(
+        &rpc,
+        r#"local base = { lsps = { pylsp = { settings = { x = 1 } } } }
+           local over = nx.json.decode('{"lsps":{"pylsp":{}}}')
+           return nx.json.encode(nx.tbl.deep_extend("force", base, over))"#,
+    )
+    .await;
+    assert_eq!(replaced, r#"{"lsps":{"pylsp":{}}}"#);
+
+    // And it is replaced by a real value in turn, so nothing gets stuck empty.
+    let refilled = lua_str(
+        &rpc,
+        r#"local base = nx.json.decode('{"lsps":{"pylsp":{}}}')
+           local over = { lsps = { pylsp = { settings = { x = 1 } } } }
+           return nx.json.encode(nx.tbl.deep_extend("force", base, over))"#,
+    )
+    .await;
+    assert_eq!(refilled, r#"{"lsps":{"pylsp":{"settings":{"x":1}}}}"#);
+}

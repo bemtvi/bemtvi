@@ -143,6 +143,15 @@ fn json_mark(value: &mlua::Value) -> Option<String> {
     meta.get::<Option<String>>(JSON_MARK).ok().flatten()
 }
 
+/// Mark `t` as a JSON object — the Rust twin of `nx.json.empty_object()`, for the
+/// decode side. [`json_to_lua`] puts it on an empty object so a decode -> encode
+/// round trip preserves what the document said; without it `{}` comes back `[]`.
+fn mark_json_object(lua: &Lua, t: &Table) -> mlua::Result<()> {
+    let meta = lua.create_table()?;
+    meta.raw_set(JSON_MARK, "object")?;
+    t.set_metatable(Some(meta))
+}
+
 /// The shape of a Lua table once classified: a sequence (every key an integer in
 /// `1..=len`) or a map (anything else). `Map` keeps the keys *raw* so each caller
 /// coerces them into its own key space ([`lua_to_rmpv`] vs [`json_key`]); the
@@ -281,6 +290,10 @@ fn rmpv_to_lua_at(lua: &Lua, value: &rmpv::Value, depth: usize) -> mlua::Result<
 /// sequences, and JSON `null` becomes `nil` (so a null-valued object key reads
 /// back absent — fine for the `cargo metadata` shape the `lsp/<server>.lua`
 /// configs decode, which only index present string/array fields).
+///
+/// An EMPTY object carries the `nx.json.empty_object()` mark, so decoding is the
+/// inverse of [`lua_to_json`] rather than a lossy flattening — see the comment at
+/// the `Object` arm.
 pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value> {
     json_to_lua_at(lua, value, 0)
 }
@@ -309,6 +322,15 @@ fn json_to_lua_at(lua: &Lua, value: &serde_json::Value, depth: usize) -> mlua::R
             let t = lua.create_table_with_capacity(0, map.len())?;
             for (k, v) in map {
                 t.raw_set(k.as_str(), json_to_lua_at(lua, v, depth + 1)?)?;
+            }
+            // An EMPTY object is the one shape Lua cannot carry on its own: `{}` is both
+            // the empty object and the empty array, and the encoder has to pick, so it
+            // picks `[]`. Mark it (the `nx.json.empty_object()` mark) so a decode ->
+            // encode round trip — how every plugin edits a JSON file it owns — writes
+            // back the object the document actually held. A non-empty object needs no
+            // mark: its keys already classify it.
+            if map.is_empty() {
+                mark_json_object(lua, &t)?;
             }
             mlua::Value::Table(t)
         }

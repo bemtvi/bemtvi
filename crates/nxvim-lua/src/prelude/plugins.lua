@@ -429,6 +429,56 @@ function M.load(name)
   end)
 end
 
+-- `nx.plugins.on_loaded(name, fn)` — run `fn` once `name` is fully loaded (its
+-- `plugin/` scripts sourced and its `config` finished, an async `config` awaited).
+-- `fn` is called with the plugin name. Returns an unsubscribe function.
+--
+-- This is the hook to reach for when your config must run *after* someone else's
+-- plugin — it is race-free in the direction the raw `PluginLoaded` event is not.
+-- Registering `nx.on("PluginLoaded", { pattern = name }, …)` only ever hears a
+-- load that happens *later*, so the same code silently does nothing when the
+-- plugin turns out to be eager and already loaded (a plain ordering flip in your
+-- config, or a spec someone else made non-lazy). `on_loaded` closes that: if the
+-- plugin is already loaded it calls `fn` **immediately**, otherwise it waits for
+-- the plugin's `PluginLoaded`. Either way `fn` runs exactly once.
+--
+-- The plugin need not be declared yet — `on_loaded` before the `nx.plugins{…}`
+-- that declares it is fine, and is the usual shape in an `init.lua`.
+--
+-- ```lua
+-- nx.plugins.on_loaded("nxvim-lspconfig", function()
+--   require("nxvim-lspconfig").setup()
+-- end)
+-- ```
+--
+-- For "every eager plugin is ready" (not one named plugin) use the `PluginsLoaded`
+-- event instead: `nx.on("PluginsLoaded", {}, fn)`.
+function M.on_loaded(name, fn)
+  -- Both arguments checked here rather than at fire time: a typo'd argument order
+  -- otherwise fails only when the plugin loads — or never, if it is lazy and its
+  -- trigger is not pressed this session — which reads as "the hook didn't fire".
+  if type(name) ~= "string" or name == "" then
+    error("nx.plugins.on_loaded: expected a plugin name (string), got " .. type(name), 0)
+  end
+  if type(fn) ~= "function" then
+    error("nx.plugins.on_loaded('" .. name .. "'): expected a function, got " .. type(fn), 0)
+  end
+  if M._loaded[name] then
+    fn(name)
+    return function() end -- nothing subscribed; unsubscribing is a no-op
+  end
+  local id = nx.on("PluginLoaded", {
+    pattern = name,
+    once = true, -- one-shot: "finished loading" happens once per plugin
+    desc = "nx.plugins.on_loaded(" .. name .. ")",
+  }, function()
+    fn(name)
+  end)
+  return function()
+    nx.off(id)
+  end
+end
+
 -- Load `name` and report a rejection (uninstalled / load error) on the message
 -- line — the fire-and-forget entry the lazy triggers and eager activation use.
 -- Returns the load promise (already `:catch`ed, so it resolves rather than rejects on a

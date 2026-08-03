@@ -2032,6 +2032,165 @@ async fn plugin_loaded_event_fires_per_plugin_including_lazy() {
     );
 }
 
+// ----- nx.plugins.on_loaded: the race-free per-plugin hook -------------------
+
+// The raw `PluginLoaded` event only ever hears a load that happens LATER, so hooking
+// an already-loaded plugin with it silently never runs. `nx.plugins.on_loaded` closes
+// that hole: when the plugin is already loaded it runs the callback IMMEDIATELY —
+// synchronously, inside the registering chunk, so the config's next line can rely on
+// it — and passes the plugin name.
+#[tokio::test]
+async fn on_loaded_runs_immediately_when_the_plugin_is_already_loaded() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_onload_now");
+    let repo = make_repo(&src, "tau");
+    setup_root(&rpc, "plug_onload_now").await;
+
+    // Eager (no lazy trigger): activation starts at declaration.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"tau\", dir = \"{dir}\" }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded['tau'] == true").await,
+        "the eager plugin should load"
+    );
+
+    // Registering AFTER the load: the callback must already have run by the time the
+    // registering chunk reaches its next statement.
+    let got = exec_lua(
+        &rpc,
+        "nx.plugins.on_loaded(\"tau\", function(n) _G.tau_hook = n end)\n\
+         return tostring(_G.tau_hook)",
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("tau"),
+        "on_loaded on an already-loaded plugin must run the callback immediately, with the name"
+    );
+}
+
+// The other direction: registered BEFORE the plugin is even declared (the usual
+// init.lua shape), it waits — no early fire — and then runs exactly once when the
+// lazy trigger finally loads the plugin.
+#[tokio::test]
+async fn on_loaded_waits_for_a_not_yet_loaded_plugin_then_runs_once() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_onload_wait");
+    let repo = make_repo(&src, "rho");
+    setup_root(&rpc, "plug_onload_wait").await;
+
+    // Hook first — the plugin does not exist to the manager yet.
+    exec_lua(
+        &rpc,
+        "_G.rho_hits = 0\n\
+         nx.plugins.on_loaded(\"rho\", function(n)\n\
+           _G.rho_hits = _G.rho_hits + 1\n\
+           _G.rho_name = n\n\
+           _G.rho_cfg_at_fire = _G.rho_setup == true\n\
+         end)",
+    )
+    .await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"rho\", dir = \"{dir}\", cmd = \"RhoGo\",\n\
+               config = function() require(\"rho\").setup() end }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.rho_hits == 0").await,
+        Some(true),
+        "a lazy plugin has not loaded yet — the hook must not have run"
+    );
+
+    exec_lua(&rpc, "vim.cmd('RhoGo')").await;
+    assert!(
+        poll_true(&rpc, "return _G.rho_hits == 1 and _G.rho_name == \"rho\"").await,
+        "the hook should run exactly once, with the plugin name, when the trigger loads it"
+    );
+    // Snapshotted INSIDE the hook: the plugin's own config had already run when it
+    // fired — "loaded" means ready, not merely "the load began".
+    assert_eq!(
+        lua_bool(&rpc, "return _G.rho_cfg_at_fire == true").await,
+        Some(true),
+        "on_loaded must run after the plugin's config, not merely after the load began"
+    );
+}
+
+// The returned unsubscribe really drops the pending hook — the plugin loads, and the
+// callback does not run.
+#[tokio::test]
+async fn on_loaded_unsubscribe_drops_the_pending_hook() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_onload_unsub");
+    let repo = make_repo(&src, "psi");
+    setup_root(&rpc, "plug_onload_unsub").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.psi_hit = false\n\
+             local unsub = nx.plugins.on_loaded(\"psi\", function() _G.psi_hit = true end)\n\
+             nx.plugins {{ {{ name = \"psi\", dir = \"{dir}\", cmd = \"PsiGo\" }} }}\n\
+             unsub()",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+
+    exec_lua(&rpc, "vim.cmd('PsiGo')").await;
+    // The load itself must really happen — otherwise this test would pass for the
+    // wrong reason (nothing loaded, so nothing could fire).
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded['psi'] == true").await,
+        "the trigger should still load the plugin"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.psi_hit == false").await,
+        Some(true),
+        "an unsubscribed hook must not run when the plugin loads"
+    );
+}
+
+// A bad argument raises at REGISTRATION, naming the helper — not at fire time, which
+// for a lazy plugin may be never, and would read as "my hook didn't fire".
+#[tokio::test]
+async fn on_loaded_bad_arguments_raise_at_registration() {
+    let (rpc, _i) = start().await;
+    let got = exec_lua(
+        &rpc,
+        "local ok, err = pcall(nx.plugins.on_loaded, \"tau\", \"not a function\")\n\
+         return tostring(ok) .. '|' .. tostring(err)",
+    )
+    .await;
+    let got = got.as_str().unwrap_or_default();
+    assert!(
+        got.starts_with("false|") && got.contains("on_loaded"),
+        "a non-function callback must raise, naming the helper: {got}"
+    );
+
+    let got = exec_lua(
+        &rpc,
+        "local ok, err = pcall(nx.plugins.on_loaded, function() end)\n\
+         return tostring(ok) .. '|' .. tostring(err)",
+    )
+    .await;
+    let got = got.as_str().unwrap_or_default();
+    assert!(
+        got.starts_with("false|") && got.contains("on_loaded"),
+        "a swapped argument order must raise, naming the helper: {got}"
+    );
+}
+
 // ----- the lockfile (Phase 1: record + read) ---------------------------------
 //
 // The manager supports pinning but never RECORDED what an unpinned plugin resolved to,

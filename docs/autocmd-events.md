@@ -240,6 +240,18 @@ Fired by the built-in plugin manager (`nx.plugins`). See [Writing nxvim plugins]
 | `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. It is also the point the startup announce window closes — see [Plugins and the startup file](#plugins-and-the-startup-file). |
 | `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `nx.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |
 
+To hook one named plugin, prefer **`nx.plugins.on_loaded(name, fn)`** over subscribing to
+`PluginLoaded` yourself. The event only reports a load that happens *later*, so the raw
+subscription silently never runs if that plugin turns out to be eager and already loaded;
+`on_loaded` runs `fn` immediately in that case and waits otherwise, so it fires exactly
+once either way:
+
+```lua
+nx.plugins.on_loaded("nxvim-lspconfig", function()
+  require("nxvim-lspconfig").setup()
+end)
+```
+
 ## User
 
 `User` is the freeform event namespace: any plugin (or nxvim itself) fires one with

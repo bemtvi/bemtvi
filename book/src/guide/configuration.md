@@ -134,9 +134,12 @@ manager owns.
 
 Run `:Plugins` to open the **dashboard** — a lazy.nvim-style floating UI listing
 every declared plugin grouped by load state, with live per-plugin progress (a
-spinner while a clone/pull runs, ✓/✗ on finish) and verb keymaps: `I` install ·
-`U` update · `S` sync · `R` restore · `X` clean. The same operations are available as
-ex-commands:
+spinner while a clone/pull runs, ✓/✗ on finish) and verb keymaps in two scopes.
+**Upper-case acts on everything**: `I` install · `U` update · `S` sync · `R`
+restore · `X` clean (plus `<C-r>` refresh, `<CR>` details, `q` quit).
+**Lower-case acts on the plugin under the cursor**: `i` install · `u` update ·
+`s` sync · `r` restore · `x` remove (delete just that clone — `x` then `i` is the
+"give me a fresh copy" move). The same operations are available as ex-commands:
 
 | Command | Action |
 | --- | --- |
@@ -148,6 +151,18 @@ ex-commands:
 | `:PluginRestore` | Check out every plugin at the commit the lockfile records |
 | `:PluginList` | Print a one-line status (installed / loaded / missing) per plugin |
 | `:PluginsWelcome` | Reopen the first-run offer of recommended plugins |
+
+Every verb command above (all but `:PluginList` / `:PluginsWelcome`) takes an
+**optional plugin list** — `:PluginUpdate nxvim-tree`, `:PluginSync nxvim-dap
+nxvim-line` — and `<Tab>` completes the declared names. Scoped that way it acts on
+those plugins (and their dependencies, which a plugin needs to load at all) and
+leaves every other plugin's checkout *and its lockfile entry* exactly as they were:
+you get the one fix you were waiting for, not eleven other people's changes. The
+same scope is a `plugins` option on the Lua verbs —
+`nx.plugins.update({ plugins = "nxvim-tree" })`. `:PluginClean` is the one verb
+whose scope does *not* pull in dependencies (deleting a checkout nobody named is
+destruction by inference), and it refuses outright to delete a local `dir`
+plugin's checkout — that is your own working tree, not a managed clone.
 
 nxvim ships minimal; on a fresh setup it offers a recommended first-party set as
 one decision, with `c` opening a checklist to pick individually — see

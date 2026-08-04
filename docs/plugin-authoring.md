@@ -78,6 +78,13 @@ Then `:PluginSync` (realize the declared + locked state), `:PluginInstall`,
 (check out the locked commits), `:PluginLock`, `:PluginClean`, `:PluginList`, or the
 `:Plugins` dashboard. Cloned plugins live under `stdpath("data")/plugins/<name>`.
 
+Each of those verbs takes an optional plugin list — `:PluginUpdate my-plugin`,
+`<Tab>`-completed — and then touches only those plugins (and their dependencies),
+leaving every other checkout and lockfile entry alone; in the dashboard the
+lower-case keys (`i` `u` `s` `r` `x`) do the same for the row under the cursor. When
+you are developing one plugin, that is the verb you want: re-cloning or updating the
+whole set to test one change is how a working editor turns into a bisect.
+
 Every install/update records each plugin's resolved commit in
 `<config>/nxvim-lock.json`, and installing reproduces those commits — so a config plus
 its lockfile pins the exact plugin tree. `:PluginSync` therefore does *not* move a

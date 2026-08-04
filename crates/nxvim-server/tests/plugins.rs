@@ -20,7 +20,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, map_get,
-    poll_true, q, spawn, start_attached, temp_dir,
+    message_after, poll_true, q, spawn, start_attached, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -3864,5 +3864,483 @@ async fn ft_lazy_plugin_with_an_async_config_still_gets_the_filetype_event() {
     assert!(
         seen.as_str().unwrap_or_default().ends_with("sample.py"),
         "and it saw the triggering buffer, got {seen:?}"
+    );
+}
+
+// ----- scoped verbs: one plugin at a time ------------------------------------
+//
+// Every management verb takes an optional `plugins` scope — `nx.plugins.update{ plugins
+// = "beta" }`, `:PluginUpdate beta`, or the lower-case dashboard keys on the row under
+// the cursor. The whole point is what it must NOT touch: a scoped run leaves every other
+// plugin's checkout and its lockfile entry exactly as they were, so pulling in the one
+// fix you want doesn't also pull in eleven other people's changes.
+
+/// Declare `alpha` + `beta` (two throwaway repos) under a temp root, returning the
+/// install root and the two source repos. Nothing is installed yet.
+async fn declare_two(rpc: &Rpc, tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let src = temp_dir(&format!("{tag}_src"));
+    let alpha = make_repo(&src, "alpha");
+    let beta = make_repo(&src, "beta");
+    let (root, cfg) = setup_root_and_config(rpc, tag).await;
+    std::fs::create_dir_all(&cfg).unwrap();
+    exec_lua(
+        rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{a}\", name = \"alpha\" }},\n\
+                           {{ \"file://{b}\", name = \"beta\" }} }}",
+            a = q(&alpha),
+            b = q(&beta)
+        ),
+    )
+    .await;
+    (root, cfg, alpha, beta)
+}
+
+/// Kick a manager verb and park its outcome on `_G.done` / `_G.err`.
+async fn run_verb(rpc: &Rpc, lua: &str) {
+    exec_lua(
+        rpc,
+        &format!(
+            "_G.done, _G.err = nil, nil\n\
+             {lua}:next(function(v) _G.done = v == nil and true or v end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)"
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn install_scoped_to_one_plugin_leaves_the_others_alone() {
+    let (rpc, _i) = start().await;
+    let (root, _cfg, _a, _b) = declare_two(&rpc, "plug_scope_install").await;
+
+    run_verb(&rpc, "nx.plugins.install({ plugins = 'alpha' })").await;
+    assert!(
+        poll_true(&rpc, "return _G.done == 1").await,
+        "one plugin should have been installed; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(root.join("alpha").join(".git").exists());
+    assert!(
+        !root.join("beta").exists(),
+        "a scoped install must not clone a plugin it was not given"
+    );
+}
+
+#[tokio::test]
+async fn update_scoped_to_one_plugin_moves_only_it() {
+    let (rpc, _i) = start().await;
+    let (root, cfg, alpha, beta) = declare_two(&rpc, "plug_scope_update").await;
+
+    run_verb(&rpc, "nx.plugins.install()").await;
+    assert!(
+        poll_true(&rpc, "return _G.done == 2").await,
+        "both plugins should install first; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    let alpha_first = head_sha(&root.join("alpha"));
+    let beta_first = head_sha(&root.join("beta"));
+
+    // Both remotes move on; only `beta` is asked to follow.
+    add_commit(&alpha, "alpha-moved");
+    let beta_tip = add_commit(&beta, "beta-moved");
+    run_verb(&rpc, "nx.plugins.update({ plugins = 'beta' })").await;
+    assert!(
+        poll_true(&rpc, "return _G.done == 1").await,
+        "exactly one checkout should have moved; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+
+    assert_eq!(head_sha(&root.join("beta")), beta_tip);
+    assert_eq!(
+        head_sha(&root.join("alpha")),
+        alpha_first,
+        "a scoped update must leave every other checkout where it was"
+    );
+    // And the lockfile still pins `alpha` at the commit it was installed on: a scoped
+    // update that silently re-recorded the untouched plugins would hand the user a
+    // lockfile describing changes they never asked for.
+    let lock = std::fs::read_to_string(cfg.join("nxvim-lock.json")).unwrap();
+    assert!(
+        lock.contains(&alpha_first),
+        "alpha's lock entry should be untouched ({alpha_first}); lockfile was:\n{lock}"
+    );
+    assert!(
+        lock.contains(&beta_tip),
+        "beta's entry should have advanced"
+    );
+    assert!(!lock.contains(&beta_first));
+}
+
+#[tokio::test]
+async fn a_scoped_verb_installs_the_named_plugins_dependencies() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_scope_deps_src");
+    let alpha = make_repo(&src, "alpha");
+    let beta = make_repo(&src, "beta");
+    let gamma = make_repo(&src, "gamma");
+    let (root, _cfg) = setup_root_and_config(&rpc, "plug_scope_deps").await;
+
+    // `alpha` depends on `beta`; `gamma` is unrelated.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{a}\", name = \"alpha\",\n\
+                             dependencies = {{ {{ \"file://{b}\", name = \"beta\" }} }} }},\n\
+                           {{ \"file://{g}\", name = \"gamma\" }} }}",
+            a = q(&alpha),
+            b = q(&beta),
+            g = q(&gamma)
+        ),
+    )
+    .await;
+    run_verb(&rpc, "nx.plugins.install({ plugins = 'alpha' })").await;
+    assert!(
+        poll_true(&rpc, "return _G.done == 2").await,
+        "the named plugin AND its dependency should install; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(root.join("alpha").exists());
+    assert!(
+        root.join("beta").exists(),
+        "a dependency comes with the plugin that needs it — installing alpha alone \
+         would leave it declaring a beta that is not on disk, and its load would fail"
+    );
+    assert!(
+        !root.join("gamma").exists(),
+        "an unrelated plugin is still out of scope"
+    );
+}
+
+#[tokio::test]
+async fn a_scoped_verb_rejects_an_unknown_plugin_name() {
+    let (rpc, _i) = start().await;
+    let (root, _cfg, _a, _b) = declare_two(&rpc, "plug_scope_unknown").await;
+
+    run_verb(&rpc, "nx.plugins.update({ plugins = 'ghost' })").await;
+    assert!(
+        poll_true(&rpc, "return _G.err ~= nil").await,
+        "an unknown plugin name must fail loud, not quietly update nothing"
+    );
+    let err = exec_lua(&rpc, "return _G.err").await;
+    let err = err.as_str().unwrap_or_default().to_string();
+    assert!(
+        err.contains("unknown plugin 'ghost'"),
+        "the message should name the typo, got {err:?}"
+    );
+    assert!(!root.join("alpha").exists() && !root.join("beta").exists());
+}
+
+// The ex-commands take the same scope as an optional argument list, and offer the
+// declared names to `<Tab>`.
+#[tokio::test]
+async fn the_plugin_commands_take_an_optional_plugin_name() {
+    let (rpc, _i) = start().await;
+    let (root, _cfg, _a, _b) = declare_two(&rpc, "plug_scope_cmd").await;
+
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "local c = nx.user_command.get()\n\
+             return type(c.PluginUpdate.complete) == 'function'\n\
+               and type(c.PluginInstall.complete) == 'function'\n\
+               and type(c.PluginSync.complete) == 'function'\n\
+               and type(c.PluginRestore.complete) == 'function'\n\
+               and type(c.PluginClean.complete) == 'function'\n\
+               and type(c.PluginLock.complete) == 'function'"
+        )
+        .await,
+        Some(true),
+        "every scoped command should complete the declared plugin names"
+    );
+    // The completer offers the declared names.
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "local cands = nx.user_command.get().PluginUpdate.complete({})\n\
+             local seen = {}\n\
+             for _, c in ipairs(cands) do seen[c.label or c] = true end\n\
+             return seen.alpha == true and seen.beta == true"
+        )
+        .await,
+        Some(true)
+    );
+
+    exec_lua(&rpc, "vim.cmd('PluginInstall beta')").await;
+    let mut landed = false;
+    for _ in 0..200 {
+        if root.join("beta").join(".git").exists() {
+            landed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(landed, ":PluginInstall beta should clone that plugin");
+    assert!(
+        !root.join("alpha").exists(),
+        "and only that plugin — the argument is the scope"
+    );
+}
+
+#[tokio::test]
+async fn scoped_clean_removes_just_that_clone() {
+    let (rpc, _i) = start().await;
+    let (root, _cfg, _a, _b) = declare_two(&rpc, "plug_scope_clean").await;
+
+    run_verb(&rpc, "nx.plugins.install()").await;
+    assert!(poll_true(&rpc, "return _G.done == 2").await);
+    assert!(root.join("alpha").exists() && root.join("beta").exists());
+
+    // A scoped clean removes a DECLARED plugin's clone — the "this checkout is wrong,
+    // give me a fresh one" move that the unscoped verb (which only prunes undeclared
+    // dirs) can't express.
+    run_verb(&rpc, "nx.plugins.clean({ plugins = 'alpha' })").await;
+    assert!(
+        poll_true(
+            &rpc,
+            "return type(_G.done) == 'table' and _G.done[1] == 'alpha'"
+        )
+        .await,
+        "err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(!root.join("alpha").exists());
+    assert!(
+        root.join("beta").exists(),
+        "a scoped clean must not touch the plugins it was not given"
+    );
+    // It is still declared, so a following install brings it straight back.
+    run_verb(&rpc, "nx.plugins.install({ plugins = 'alpha' })").await;
+    assert!(poll_true(&rpc, "return _G.done == 1").await);
+    assert!(root.join("alpha").join(".git").exists());
+}
+
+// A dev `dir` plugin's checkout is the USER's working tree, outside the manager's root.
+// No verb may delete it — a `clean` that "worked" there would destroy uncommitted work.
+#[tokio::test]
+async fn scoped_clean_refuses_to_delete_a_dev_dir_checkout() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_scope_devclean_src");
+    let repo = make_repo(&src, "delta");
+    setup_root_and_config(&rpc, "plug_scope_devclean").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"delta\", dir = \"{dir}\" }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    run_verb(&rpc, "nx.plugins.clean({ plugins = 'delta' })").await;
+    assert!(
+        poll_true(&rpc, "return _G.err ~= nil").await,
+        "cleaning a dev `dir` plugin must fail loud"
+    );
+    let err = exec_lua(&rpc, "return _G.err").await;
+    assert!(
+        err.as_str().unwrap_or_default().contains("local `dir`"),
+        "the message should say why, got {err:?}"
+    );
+    assert!(
+        repo.join("plugin").exists(),
+        "the user's own checkout must still be there"
+    );
+}
+
+// The dashboard's lower-case verbs act on the plugin whose row the cursor is on — the
+// reason to open it is usually ONE plugin, so the per-row scope is the point.
+#[tokio::test]
+async fn the_dashboard_row_verbs_act_on_the_plugin_under_the_cursor() {
+    let (rpc, _i) = start().await;
+    let (root, _cfg, _a, _b) = declare_two(&rpc, "plug_scope_ui").await;
+
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+    let mut rendered = Vec::new();
+    for _ in 0..200 {
+        let body = lines(&rpc).await;
+        if body.iter().any(|l| l.contains("i install"))
+            && body.iter().any(|l| l.trim_end().ends_with("beta"))
+        {
+            rendered = body;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !rendered.is_empty(),
+        "the dashboard should render both rows and the per-row key hints"
+    );
+    let row = rendered
+        .iter()
+        .position(|l| l.trim_end().ends_with("beta"))
+        .expect("a row for beta")
+        + 1;
+
+    feed(&rpc, &format!("{row}G"));
+    assert!(
+        poll_true(&rpc, &format!("return vim.fn.line('.') == {row}")).await,
+        "the cursor should land on beta's row"
+    );
+    feed(&rpc, "i");
+
+    let mut landed = false;
+    for _ in 0..250 {
+        if root.join("beta").join(".git").exists() {
+            landed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(landed, "`i` on beta's row should install beta");
+    assert!(
+        !root.join("alpha").exists(),
+        "and only beta — the cursor's row is the scope"
+    );
+}
+
+// `clean` is the only verb that turns a caller's string into a path it then deletes
+// RECURSIVELY, so a name carrying a separator escapes the install root: `:PluginClean
+// ../..` resolved to `<root>/../..` and wiped the data directory two levels up. A plugin
+// name is a directory basename by construction, so anything else must be refused before
+// it reaches the filesystem.
+#[tokio::test]
+async fn scoped_clean_refuses_a_name_that_escapes_the_install_root() {
+    let (rpc, _i) = start().await;
+    let (root, _cfg, _a, _b) = declare_two(&rpc, "plug_scope_escape").await;
+
+    run_verb(&rpc, "nx.plugins.install()").await;
+    assert!(poll_true(&rpc, "return _G.done == 2").await);
+    // A sibling of the install root, standing in for whatever else lives in the data
+    // dir — it must still be there afterwards.
+    let sibling = root.parent().unwrap().join("precious");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("keep.txt"), "do not delete\n").unwrap();
+
+    for name in ["..", "../precious", "..\\precious", ".", ""] {
+        run_verb(&rpc, &format!("nx.plugins.clean({{ plugins = '{name}' }})")).await;
+        assert!(
+            poll_true(&rpc, "return _G.err ~= nil").await,
+            "clean should refuse the name {name:?}"
+        );
+        let err = exec_lua(&rpc, "return _G.err").await;
+        assert!(
+            err.as_str()
+                .unwrap_or_default()
+                .contains("must be a single directory name"),
+            "the message should say why, got {err:?}"
+        );
+    }
+
+    assert!(
+        sibling.join("keep.txt").exists(),
+        "nothing outside the install root may be deleted"
+    );
+    assert!(
+        root.join("alpha").exists() && root.join("beta").exists(),
+        "and the real clones are untouched"
+    );
+}
+
+// A scoped verb that passes over the plugin it was NAMED must say so. Unscoped, skipping
+// a disabled or uninstalled plugin is routine; scoped, a silent "0 plugin(s)" is
+// indistinguishable from "already up to date".
+#[tokio::test]
+async fn a_scoped_verb_says_why_it_skipped_the_plugin_you_named() {
+    let (rpc, mut incoming) = start().await;
+    let src = temp_dir("plug_scope_skip_src");
+    let repo = make_repo(&src, "alpha");
+    let (root, _cfg) = setup_root_and_config(&rpc, "plug_scope_skip").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{a}\", name = \"alpha\", enabled = false }} }}",
+            a = q(&repo)
+        ),
+    )
+    .await;
+    run_verb(&rpc, "nx.plugins.install({ plugins = 'alpha' })").await;
+    assert!(poll_true(&rpc, "return _G.done == 0").await);
+    assert!(!root.join("alpha").exists());
+    let msg = message_after(&rpc, &mut incoming, "").await;
+    assert!(
+        msg.contains("installed 0 plugin(s)")
+            && msg.contains("skipped 'alpha'")
+            && msg.contains("disabled"),
+        "a disabled plugin named outright should be reported alongside the summary \
+         (a separate notify would be overwritten by it), got {msg:?}"
+    );
+
+    // Same for a plugin that is enabled but not on disk: `:PluginUpdate` has nothing to
+    // fast-forward, which is not the same fact as "already current".
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{a}\", name = \"beta\" }} }}",
+            a = q(&repo)
+        ),
+    )
+    .await;
+    run_verb(&rpc, "nx.plugins.update({ plugins = 'beta' })").await;
+    assert!(poll_true(&rpc, "return _G.done == 0").await);
+    let msg = message_after(&rpc, &mut incoming, "").await;
+    assert!(
+        msg.contains("updated 0 plugin(s)")
+            && msg.contains("skipped 'beta'")
+            && msg.contains("not installed"),
+        "an uninstalled plugin named outright should be reported alongside the summary, \
+         got {msg:?}"
+    );
+}
+
+// Refresh moved from `r` to `<C-r>` when `r` became the per-row restore, so the new key
+// has to actually reach the dashboard's map. The control: unmapped, `<C-r>` is redo,
+// which on this view (nothing to redo) reports "Already at newest change" — so an empty
+// message line is proof the mapping swallowed the key.
+#[tokio::test]
+async fn the_dashboard_binds_both_verb_scopes_including_the_moved_refresh() {
+    let (rpc, mut incoming) = start().await;
+    let src = temp_dir("plug_scope_keys_src");
+    let repo = make_repo(&src, "alpha");
+    setup_root_and_config(&rpc, "plug_scope_keys").await;
+
+    // A local `dir` plugin loads eagerly with no clone, so the dashboard has a row at once.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"alpha\", dir = \"{dir}\" }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+    let mut ready = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.join("\n").contains("i install") {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "the dashboard should render its per-row hints");
+
+    // Both scopes are bound buffer-local: the whole-set verbs and their per-row twins.
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "local want = { I=1, U=1, S=1, R=1, X=1, i=1, u=1, s=1, r=1, x=1, ['<C-r>']=1 }\n\
+             for _, m in ipairs(nx.keymap.buf_get(0, 'n')) do want[m.lhs] = nil end\n\
+             return next(want) == nil"
+        )
+        .await,
+        Some(true),
+        "every verb key (both scopes) should be a buffer-local mapping"
+    );
+
+    let msg = message_after(&rpc, &mut incoming, "<C-r>").await;
+    assert!(
+        !msg.contains("newest change"),
+        "<C-r> should reach the refresh mapping, not fall through to redo; got {msg:?}"
     );
 }

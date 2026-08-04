@@ -19,8 +19,11 @@
 --   NXVIM_CONFIG=examples/plugins cargo run -p nxvim
 --   :Plugins        -- the lazy-style dashboard: every plugin grouped by load state,
 --                      LIVE clone/pull progress, and the action keys —
+--                      UPPER-case acts on EVERYTHING:
 --                      I install · U update · S sync · R restore · X clean ·
---                      <CR> details · q quit
+--                      <C-r> refresh · <CR> details · q quit
+--                      lower-case acts on the plugin UNDER THE CURSOR:
+--                      i install · u update · s sync · r restore · x remove
 --   :PluginsWelcome -- re-open the first-run recommended-set checklist on demand
 --   :PluginSync     -- clone what's missing, at the LOCKED commits (needs network)
 --   :PluginList     -- show install / load state, incl. DRIFTED (text dump)
@@ -28,6 +31,24 @@
 --   :PluginRestore  -- check every plugin out at the commit the lockfile records
 --   :PluginLock     -- (re)record the installed commits to the lockfile
 --   :PluginClean    -- remove clones no spec declares
+--
+-- ONE PLUGIN AT A TIME. Every verb above takes an optional plugin list, `<Tab>`-
+-- completed from the declared names — so you can take the fix you are waiting for
+-- without dragging eleven other people's changes in with it:
+--
+--   :PluginUpdate catppuccin        -- fast-forward JUST that plugin; every other
+--                                      checkout AND lockfile entry is untouched
+--   :PluginSync nx-files            -- install/realize one plugin (its dependencies
+--                                      come with it — a plugin whose dependency is
+--                                      missing does not load)
+--   :PluginRestore catppuccin       -- roll back only the plugin that broke
+--   :PluginClean catppuccin         -- delete just that clone; :PluginInstall
+--                                      catppuccin then gives you a fresh copy
+--   :PluginLock catppuccin          -- pin the one plugin you have finished testing
+--
+-- Same thing from Lua: `nx.plugins.update({ plugins = "catppuccin" })` (a name or a
+-- list of names). Same thing in the dashboard: put the cursor on a row and press the
+-- lower-case key.
 --
 -- THE LOCKFILE. After the first `:PluginSync` you'll find `nxvim-lock.json` in this
 -- example dir (the config dir) recording the exact commit each plugin resolved to.

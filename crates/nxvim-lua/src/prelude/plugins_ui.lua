@@ -12,7 +12,9 @@
 --   * the MANAGER (`:Plugins` / `M.ui.open`) — the dashboard: every declared plugin
 --     grouped by load state, with LIVE per-plugin progress (a spinner while a clone /
 --     pull runs, a ✓/✗ on finish) wired through `M.on_change` + `M._tasks`, and the
---     verb keymaps (I install · U update · S sync · R restore · X clean).
+--     verb keymaps in two scopes: UPPER-case for the whole set (I install · U update ·
+--     S sync · R restore · X clean) and lower-case for the plugin under the cursor
+--     (i · u · s · r · x, each passing `{ plugins = name }` to the same verb).
 --
 -- Loaded AFTER prelude/plugins.lua: it reads the manager's `M.list` / `M.status` /
 -- `M._tasks` / `M._specs` and subscribes via `M.on_change`, and it builds on
@@ -584,6 +586,10 @@ local Manager = nx.view.component({
       end)
     end
 
+    -- UPPER-CASE verbs act on the whole declared set; the lower-case twins below act on
+    -- the plugin under the cursor. (A row is the obvious unit of work here — you open
+    -- the dashboard because ONE plugin needs installing or updating — so the same verbs
+    -- have to be reachable per row, not only wholesale.)
     ctx.keymap_set("n", "I", function()
       run_installing(M.install())
     end, { desc = "Install missing" })
@@ -601,7 +607,47 @@ local Manager = nx.view.component({
       -- shared rather than re-worded here so the two surfaces can't drift apart.
       run(M.restore():next(M._restore_notify))
     end, { desc = "Restore to the lockfile" })
-    ctx.keymap_set("n", "r", function()
+
+    -- The plugin whose row the cursor is on, or nil — reported on the message line
+    -- rather than silently doing nothing, so a verb pressed on a header / blank / the
+    -- hint line says why it did not run.
+    local function under_cursor(verb)
+      local name = line_to_name[ctx.line()]
+      if not name then
+        nx.notify("nx.plugins: no plugin under the cursor to " .. verb, 3)
+      end
+      return name
+    end
+    -- Bind a lower-case per-row verb: resolve the row, then run `fn(name)`.
+    local function row_verb(key, verb, fn)
+      ctx.keymap_set("n", key, function()
+        local name = under_cursor(verb)
+        if name then
+          fn(name)
+        end
+      end, { desc = verb:sub(1, 1):upper() .. verb:sub(2) .. " this plugin" })
+    end
+    row_verb("i", "install", function(name)
+      run_installing(M.install({ plugins = name }))
+    end)
+    row_verb("u", "update", function(name)
+      run(M.update({ plugins = name }))
+    end)
+    row_verb("s", "sync", function(name)
+      run_installing(M.sync({ plugins = name }))
+    end)
+    row_verb("r", "restore", function(name)
+      run(M.restore({ plugins = name }):next(M._restore_notify))
+    end)
+    row_verb("x", "remove", function(name)
+      -- Deletes this plugin's clone (never a dev `dir` checkout — `clean` fails loud on
+      -- one). The pair with `i` is the "give me a fresh copy" move.
+      run(M.clean({ plugins = name }))
+    end)
+
+    -- Refresh lives on `<C-r>` because `r` is the per-row restore above, matching the
+    -- upper/lower split of every other verb.
+    ctx.keymap_set("n", "<C-r>", function()
       refresh_status()
       state.tick = state.tick + 1
     end, { desc = "Refresh" })
@@ -788,8 +834,14 @@ local Manager = nx.view.component({
     section("Not loaded", ready, "○", "NxPluginsInstalled")
     section("Missing", missing, "○", "NxPluginsMissing")
 
+    -- Two hint lines, because there are two scopes: the upper-case verbs act on
+    -- everything, their lower-case twins on the row under the cursor.
     add(
-      "I install · U update · S sync · R restore · X clean · r refresh · <CR> details · q quit",
+      "all:  I install · U update · S sync · R restore · X clean · <C-r> refresh · q quit",
+      "NxPluginsDim"
+    )
+    add(
+      "this: i install · u update · s sync · r restore · x remove · <CR> details",
       "NxPluginsDim"
     )
     return { lines = lines, decor = decor }

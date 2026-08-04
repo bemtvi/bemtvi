@@ -10,6 +10,13 @@
 -- `plugin/` + `after/plugin/` scripts, and runs its `config` — either EAGERLY at
 -- startup or LAZILY on a trigger (`cmd` / `event` / `ft` / `keys`).
 --
+-- Every management verb works on the whole declared set OR on named plugins alone:
+-- `nx.plugins.update{ plugins = "nxvim-tree" }`, `:PluginUpdate nxvim-tree` (`<Tab>`
+-- completes the names), or the lower-case keys on the dashboard row under the cursor.
+-- One plugin is the usual unit of work — you want the fix in *that* plugin, not eleven
+-- other people's changes at the same time — so a scoped run leaves every other plugin's
+-- checkout AND its lockfile entry exactly as they were. See `plugin_scope`.
+--
 -- Nothing blocks (ADR 0002 rule 3): every install/source step is a promise, so the
 -- UI paints before plugins finish loading. Loaded LAST in the prelude — it builds
 -- on nx.git / nx.fs / nx.promise / nx.async / nx.command / nx.keymap / nx.on /
@@ -996,6 +1003,125 @@ function M._update(name, opts)
   end)()
 end
 
+-- ----- targeting: a verb can act on ONE plugin, not the whole set -------------
+
+-- Resolve a verb's `opts.plugins` to the ordered list of names it acts on, plus
+-- whether the call was SCOPED at all. `nil` (the unscoped call) is every declared
+-- plugin in declaration order — what every verb has always done. A name, or a list
+-- of names, narrows to those plugins.
+--
+-- A scoped set is expanded with each named plugin's transitive DEPENDENCIES, because
+-- a dependency is not a separate thing you asked for — it is part of making that
+-- plugin work. Installing `nxvim-snippets` alone would leave it declaring a
+-- `friendly-snippets` that is not on disk, and the load would then fail loud on a
+-- plugin the user just installed on purpose. (The one verb that does NOT expand is
+-- `clean`: deleting a checkout nobody named is destruction by inference.)
+--
+-- The result keeps DECLARATION order regardless of the order the names were given, so
+-- a dependency is still installed/updated before its dependent.
+--
+-- An unknown name fails LOUD (rejects, since every caller resolves this inside its
+-- async body): a typo'd `:PluginUpdate nxvim-tre` that quietly updated nothing is the
+-- "broken looks like working" failure — the user would believe the plugin is current.
+local function plugin_scope(opts)
+  local want = opts ~= nil and (opts.plugins or opts.plugin) or nil
+  if want == nil then
+    return M._order, false
+  end
+  if type(want) == "string" then
+    want = { want }
+  end
+  if type(want) ~= "table" then
+    error("nx.plugins: `plugins` must be a plugin name or a list of names, got " .. type(want), 0)
+  end
+  local set = {}
+  local function take(name)
+    if type(name) ~= "string" then
+      error("nx.plugins: a plugin name must be a string, got " .. type(name), 0)
+    end
+    if set[name] then
+      return
+    end
+    local spec = M._specs[name]
+    if not spec then
+      local e = {
+        code = "ENOPLUGIN",
+        message = "nx.plugins: unknown plugin '"
+          .. name
+          .. "' — :PluginList shows the declared set",
+      }
+      error(e, 0)
+    end
+    set[name] = true
+    for _, dep in ipairs(spec._deps) do
+      take(dep)
+    end
+  end
+  for _, name in ipairs(want) do
+    take(name)
+  end
+  local names = {}
+  for _, name in ipairs(M._order) do
+    if set[name] then
+      names[#names + 1] = name
+    end
+  end
+  return names, true
+end
+
+-- The `" — alpha, beta"` tail a SCOPED verb appends to its summary, so a targeted run
+-- says which plugins it actually considered ("installed 0 plugin(s)" is a different
+-- fact when it means "the one you named" than when it means "all of them").
+local function scope_suffix(names, scoped)
+  if not scoped then
+    return ""
+  end
+  return " — " .. table.concat(names, ", ")
+end
+
+-- Fold "passed over the plugin you named, because …" notices into a verb's own summary
+-- line. A verb acting on the whole set skips disabled / uninstalled plugins as a matter
+-- of course, but naming one and getting a bare "0 plugin(s)" back is the failure that
+-- looks like success — there is nothing to tell it apart from "already up to date".
+--
+-- They have to ride the SUMMARY rather than be their own `nx.notify`: the summary fires
+-- immediately after the loop and the message line only ever shows the latest message, so
+-- a separate warning would be overwritten in the same tick it was raised — visible to a
+-- test that captured every notify, and to no one else.
+local function with_skips(summary, skips)
+  if #skips == 0 then
+    return summary
+  end
+  local lines = { summary }
+  for _, s in ipairs(skips) do
+    lines[#lines + 1] = "  skipped '" .. s.name .. "' — " .. s.why
+  end
+  return table.concat(lines, "\n")
+end
+
+-- The `{ plugins = … }` scope an ex-command's arguments name: bare `:PluginUpdate`
+-- acts on everything, `:PluginUpdate alpha beta` on those plugins (and their
+-- dependencies). `nil` for no arguments, so the verb takes its unscoped path.
+local function cmd_scope(o)
+  local args = o ~= nil and o.fargs or nil
+  if not args or #args == 0 then
+    return nil
+  end
+  return { plugins = args }
+end
+
+-- `<Tab>` in a plugin command's argument completes the declared plugin names (core
+-- fuzzy-ranks the list against the partial word), each documented with the author's
+-- own `desc` when the spec carries one.
+local function complete_plugin_names()
+  local out = {}
+  for _, name in ipairs(M._order) do
+    local spec = M._specs[name]
+    out[#out + 1] = { label = name, insert = name, doc = spec and spec.desc or nil }
+  end
+  return out
+end
+
 -- ----- the lockfile -----------------------------------------------------------
 --
 -- `<config>/nxvim-lock.json` records the commit every MANAGED plugin resolved to, so a
@@ -1140,32 +1266,35 @@ end
 -- more is dropped: that is a real answer to "is this entry still wanted?", where an
 -- uninstalled-here plugin is no answer at all.
 --
--- `realized` (a name set, or nil for "all") is the other half of that: it names the
--- plugins this run actually put where the spec and lockfile say they belong. A plugin
--- OUTSIDE it is carried over untouched rather than re-recorded from its checkout, because
--- its checkout is not yet evidence of anything — the classic case being `sync`'s install
--- pass, which touches nothing but would otherwise overwrite an incoming lockfile with the
--- commits the tree happens to sit on, one step before the update pass was going to realize
--- it. `nil` (an explicit `:PluginLock`) means "make the file describe the tree", and then
--- the `tag` is carried instead: HEAD is whatever the user left there, so we cannot attest
--- that the spec's current tag produced it.
-local function resolve_lock(prev, realized)
+-- `record` (a name set, or nil for "all") is the other half of that: it names the
+-- plugins whose checkout this write may read. A plugin OUTSIDE it is carried over
+-- untouched rather than re-recorded from its checkout, because its checkout is not yet
+-- evidence of anything — the classic case being `sync`'s install pass, which touches
+-- nothing but would otherwise overwrite an incoming lockfile with the commits the tree
+-- happens to sit on, one step before the update pass was going to realize it. It is
+-- also what makes a SCOPED `:PluginLock alpha` record just that plugin.
+--
+-- `attest` says whether the spec's `tag` may be recorded as the pin that produced the
+-- commit. Only a verb that just REALIZED the plugin can claim that; an explicit
+-- `:PluginLock` merely describes whatever HEAD the user left there, so it carries the
+-- previous entry's tag instead of inventing an attestation.
+local function resolve_lock(prev, record, attest)
   prev = prev or {}
   return nx.async(function()
     local lock = {}
     for _, name in ipairs(M._order) do
       local spec = M._specs[name]
       local resolved = nil
-      local record = realized == nil or realized[name] == true
-      if record and spec.dir == nil and nx.await(lfs.exists(spec._dir)) then
+      local recording = record == nil or record[name] == true
+      if recording and spec.dir == nil and nx.await(lfs.exists(spec._dir)) then
         local ok, head = pcall(nx.await, lgit.head(spec._dir))
         if ok and type(head.sha) == "string" and head.sha ~= "" then
           -- Which pin produced this commit. Attested from the spec when this run realized
-          -- it (`realized`), carried otherwise. Spelled as a statement rather than an
-          -- `and`/`or` chain because the attested value is legitimately nil — a spec that
-          -- DROPPED its tag must clear the record, not fall through to the old one.
+          -- it, carried otherwise. Spelled as a statement rather than an `and`/`or` chain
+          -- because the attested value is legitimately nil — a spec that DROPPED its tag
+          -- must clear the record, not fall through to the old one.
           local tag
-          if realized ~= nil then
+          if attest then
             tag = spec.tag
           else
             tag = (prev[name] or {}).tag
@@ -1215,12 +1344,31 @@ end
 -- what is already on disk, so a no-op sync leaves the file (and the user's git status)
 -- untouched.
 --
--- `opts.realized` (internal) narrows the re-record to the plugins a verb just put in
--- place, carrying every other entry over verbatim — see `resolve_lock`. The public call
--- takes no options and re-records everything installed, which is `:PluginLock`'s job.
+-- `opts.plugins` (a name, or a list of names — plus their dependencies) records just
+-- those plugins, carrying every other entry over verbatim: `:PluginLock alpha` pins the
+-- one plugin you have finished testing without also freezing everything else at
+-- whatever it happens to sit on today.
+--
+-- `opts.realized` (internal) narrows the re-record the same way for the plugins a verb
+-- just put in place — the difference being that a realized plugin's spec `tag` is
+-- ATTESTED as the pin that produced its commit, which a hand-typed `:PluginLock` cannot
+-- claim. See `resolve_lock`.
 function M.lock(opts)
   local realized = opts ~= nil and opts.realized or nil
   return nx.async(function()
+    -- Which entries this write may re-read from the tree, and whether the spec's `tag`
+    -- may be recorded alongside. An internal `realized` set attests; an explicit
+    -- (possibly scoped) `:PluginLock` only describes.
+    local record, attest = realized, realized ~= nil
+    if record == nil then
+      local names, scoped = plugin_scope(opts)
+      if scoped then
+        record = {}
+        for _, name in ipairs(names) do
+          record[name] = true
+        end
+      end
+    end
     -- Read the FILE first, not `M._lock`, so an externally-edited lockfile is reconciled
     -- rather than assumed to match our last write — and so `resolve_lock` can carry over
     -- the tracked branch of a plugin now sitting on a detached (lock-installed) HEAD.
@@ -1232,7 +1380,7 @@ function M.lock(opts)
     if #M._order == 0 and next(on_disk) ~= nil then
       return on_disk
     end
-    local resolved = nx.await(resolve_lock(on_disk, realized))
+    local resolved = nx.await(resolve_lock(on_disk, record, attest))
     if lock_eq(resolved, on_disk) then
       M._lock = resolved
       return resolved
@@ -1293,11 +1441,16 @@ end
 -- worse than none, since the user would stop looking for the real problem. The promise
 -- still resolves (so the other plugins' outcomes survive) and `:PluginRestore` reports
 -- the failures loud.
-function M.restore()
+--
+-- `opts.plugins` (a name, or a list of names — plus their dependencies) rolls back only
+-- those plugins: the update that broke your editor is usually one plugin, and there is
+-- no reason to un-do the twelve that are working.
+function M.restore(opts)
   return nx.async(function()
+    local names = plugin_scope(opts)
     local lock = nx.await(M._read_lock())
     local out = { restored = {}, current = {}, failed = {} }
-    for _, name in ipairs(M._order) do
+    for _, name in ipairs(names) do
       local spec = M._specs[name]
       local want = (lock[name] or {}).commit
       if want and spec.dir == nil and nx.await(lfs.exists(spec._dir)) then
@@ -1356,17 +1509,27 @@ local MOVED = { updated = true, relocked = true, repinned = true }
 -- it: install does not check where it sits, so overwriting its entry from the checkout
 -- would throw away a lockfile the user just pulled in — the very thing the next `sync`
 -- pass is about to realize.
-function M.install()
+--
+-- `opts.plugins` (a name, or a list of names) installs only those — plus their
+-- dependencies, since a plugin whose dependency is missing does not load. Every other
+-- declared plugin is left exactly as it is, lockfile entry included.
+function M.install(opts)
   return nx.async(function()
+    local names, scoped = plugin_scope(opts)
     local n = 0
-    local installed = {}
+    local installed, skips = {}, {}
     local ok, failure = pcall(function()
-      for _, name in ipairs(M._order) do
+      for _, name in ipairs(names) do
         if enabled(M._specs[name]) then
           if nx.await(M._install(name)) == "installed" then
             n = n + 1
             installed[name] = true
           end
+        elseif scoped then
+          -- You asked for THIS plugin by name and it is switched off, so the run ends
+          -- with "installed 0" and nothing on disk. Unscoped that is routine (the whole
+          -- point of `enabled = false`); scoped it is indistinguishable from a failure.
+          skips[#skips + 1] = { name = name, why = "it is disabled (`enabled = false`)" }
         end
       end
     end)
@@ -1375,7 +1538,13 @@ function M.install()
     if not ok then
       error(failure, 0)
     end
-    nx.notify("nx.plugins: installed " .. n .. " plugin(s)", n > 0 and 2 or 3)
+    nx.notify(
+      with_skips(
+        "nx.plugins: installed " .. n .. " plugin(s)" .. scope_suffix(names, scoped),
+        skips
+      ),
+      (n > 0 and #skips == 0) and 2 or 3
+    )
     return n
   end)()
 end
@@ -1385,22 +1554,36 @@ end
 -- the lock, moving a locked plugin onto (or leaving it at) the recorded commit; that is
 -- what `sync` passes. Returns a promise of the count of plugins whose checkout MOVED.
 -- Records the lock even when a plugin fails, for the reason `install` does.
+--
+-- `opts.plugins` (a name, or a list of names — plus their dependencies) updates only
+-- those: the usual reason to update at all is one plugin whose fix you are waiting for,
+-- and pulling in eleven other people's changes at the same time is how a working editor
+-- becomes a bisect. Every other plugin keeps its checkout AND its lockfile entry.
 function M.update(opts)
   local advance = not (opts ~= nil and opts.advance == false)
   return nx.async(function()
+    local names, scoped = plugin_scope(opts)
     local n = 0
     -- Every plugin this pass settles is realized: it was moved onto its pin / lock / branch
     -- tip, or found already there. Only "missing" and "local" (a dev `dir`) are not, and
     -- neither is recordable anyway.
-    local realized = {}
+    local realized, skips = {}, {}
     local ok, failure = pcall(function()
-      for _, name in ipairs(M._order) do
+      for _, name in ipairs(names) do
         if enabled(M._specs[name]) then
           local status = nx.await(M._update(name, { advance = advance }))
           realized[name] = status ~= "missing" and status ~= "local"
           if MOVED[status] then
             n = n + 1
           end
+          if scoped and status == "missing" then
+            -- Same reasoning as the disabled case below: "updated 0" for a plugin you
+            -- named reads as "already current", when in fact there is nothing on disk.
+            skips[#skips + 1] =
+              { name = name, why = "it is not installed — :PluginInstall " .. name }
+          end
+        elseif scoped then
+          skips[#skips + 1] = { name = name, why = "it is disabled (`enabled = false`)" }
         end
       end
     end)
@@ -1408,7 +1591,10 @@ function M.update(opts)
     if not ok then
       error(failure, 0)
     end
-    nx.notify("nx.plugins: updated " .. n .. " plugin(s)", 2)
+    nx.notify(
+      with_skips("nx.plugins: updated " .. n .. " plugin(s)" .. scope_suffix(names, scoped), skips),
+      #skips == 0 and 2 or 3
+    )
     return n
   end)()
 end
@@ -1426,20 +1612,106 @@ end
 -- the update pass and then thrown away, which is no lockfile at all.
 -- (Locking is inherited from the two halves — `install` records the fresh clones and
 -- `update` records the rest, after convergence. No third write here.)
-function M.sync()
+--
+-- `opts.plugins` (a name, or a list of names — plus their dependencies) realizes only
+-- those, by handing the same scope to both halves.
+function M.sync(opts)
+  local scoped = opts ~= nil and (opts.plugins or opts.plugin) or nil
   return nx.async(function()
-    local installed = nx.await(M.install())
-    nx.await(M.update({ advance = false }))
+    local installed = nx.await(M.install({ plugins = scoped }))
+    nx.await(M.update({ advance = false, plugins = scoped }))
     nx.notify("nx.plugins: sync complete", 2)
     return installed
+  end)()
+end
+
+-- Delete the clone of every NAMED plugin — the scoped half of `clean`, and the
+-- "this checkout is wrong, give me a fresh one" verb (delete, then install). A name
+-- may be a declared plugin or a leftover directory under the install root, which is
+-- what makes it usable on both halves of the dashboard.
+--
+-- Unlike every other scoped verb this does NOT expand dependencies: deleting a
+-- checkout the user did not name is destruction by inference. A dev `dir` plugin fails
+-- LOUD instead — its checkout is the user's own working tree, living outside the
+-- manager's root, and no plugin verb may ever delete that.
+--
+-- The shada namespace is dropped only for a name nothing declares any more. A declared
+-- plugin being re-cloned still wants its cross-session data when it comes back.
+--
+-- Every name is checked to be a single path SEGMENT first. This verb is the only one
+-- that turns a caller's string into a path it then deletes recursively, so a name
+-- carrying a separator would escape the install root entirely: `:PluginClean ../..`
+-- resolved to `<root>/../..` and wiped the data directory two levels up. A plugin name
+-- is a directory basename by construction (`normalize` derives it from the source's
+-- basename), so anything else is a typo or an attack, and either way must not reach
+-- `lfs.remove`.
+local function clean_named(want)
+  if type(want) == "string" then
+    want = { want }
+  end
+  return nx.async(function()
+    local removed = {}
+    for _, name in ipairs(want) do
+      if type(name) ~= "string" then
+        error("nx.plugins.clean: a plugin name must be a string, got " .. type(name), 0)
+      end
+      if name == "" or name == "." or name == ".." or name:find("[/\\]") then
+        error(
+          "nx.plugins.clean: '"
+            .. name
+            .. "' is not a plugin name — it must be a single directory name, with no path separators",
+          0
+        )
+      end
+      local spec = M._specs[name]
+      if spec ~= nil and spec.dir ~= nil then
+        error(
+          "nx.plugins: '"
+            .. name
+            .. "' is a local `dir` plugin ("
+            .. spec.dir
+            .. ") — the manager never deletes your own checkout",
+          0
+        )
+      end
+      local dir = spec and spec._dir or (root() .. "/" .. name)
+      if nx.await(lfs.exists(dir)) then
+        set_task(name, "clean", "running", "removing")
+        nx.await(lfs.remove(dir, { recursive = true }))
+        if spec == nil then
+          nx.shada.forget(name)
+        end
+        set_task(name, "clean", "done", "removed")
+        removed[#removed + 1] = name
+      end
+    end
+    notify_change()
+    nx.notify(
+      "nx.plugins: removed " .. #removed .. " plugin(s) — " .. table.concat(want, ", "),
+      #removed > 0 and 2 or 3
+    )
+    return removed
   end)()
 end
 
 -- Remove cloned plugin directories under the install root that no plugin declares
 -- (a dev `dir` plugin lives outside the root and is never touched). Returns a
 -- promise of the removed names.
-function M.clean()
+--
+-- `opts.plugins` (a name, or a list of names) instead removes EXACTLY those clones,
+-- whether or not a spec still declares them — the "this checkout is wrong, give me a
+-- fresh one" verb (remove, then install). Unlike every other scoped verb it does not
+-- pull in dependencies: deleting a checkout you did not name is destruction by
+-- inference. A local `dir` plugin fails LOUD instead of being deleted — that is your
+-- own working tree, not a managed clone. A plugin still declared keeps its
+-- `nx.shada.plugin` data (it is coming back); only a name nothing declares any more has
+-- its namespace forgotten.
+function M.clean(opts)
+  local want = opts ~= nil and (opts.plugins or opts.plugin) or nil
   return nx.async(function()
+    if want ~= nil then
+      return nx.await(clean_named(want))
+    end
     local declared = {}
     for _, name in ipairs(M._order) do
       if M._specs[name].dir == nil then
@@ -1462,6 +1734,7 @@ function M.clean()
         nx.shada.forget(e.name)
       end
     end
+    notify_change() -- an open dashboard repaints the rows that just went missing
     nx.notify("nx.plugins: removed " .. #removed .. " plugin(s)", #removed > 0 and 2 or 3)
     return removed
   end)()
@@ -1956,22 +2229,38 @@ local function report(promise)
   end)
 end
 
-nx.command("PluginSync", function()
-  report(M.sync())
+-- Every verb command takes an OPTIONAL plugin list: bare, it acts on the whole declared
+-- set (what it has always done); with names, on those plugins alone (`<Tab>` completes
+-- the declared names). So the manager is usable one plugin at a time — updating the one
+-- plugin whose fix you want, without dragging eleven others' changes in with it.
+nx.command("PluginSync", function(o)
+  report(M.sync(cmd_scope(o)))
 end, {
-  desc = "Realize the declared + locked state: install missing, check out what the lockfile pins, fast-forward the rest (nx.plugins.sync).",
+  desc = "Realize the declared + locked state: install missing, check out what the lockfile pins, fast-forward the rest (nx.plugins.sync). Names limit it to those plugins.",
+  usage = "[plugin ...]",
+  complete = complete_plugin_names,
 })
-nx.command("PluginInstall", function()
-  report(M.install())
-end, { desc = "Clone any declared plugin not yet on disk (nx.plugins.install)." })
-nx.command("PluginUpdate", function()
-  report(M.update())
+nx.command("PluginInstall", function(o)
+  report(M.install(cmd_scope(o)))
 end, {
-  desc = "Fast-forward every unpinned plugin, advancing past the lockfile (nx.plugins.update).",
+  desc = "Clone any declared plugin not yet on disk (nx.plugins.install). Names limit it to those plugins.",
+  usage = "[plugin ...]",
+  complete = complete_plugin_names,
 })
-nx.command("PluginClean", function()
-  report(M.clean())
-end, { desc = "Remove cloned plugin dirs no spec declares (nx.plugins.clean)." })
+nx.command("PluginUpdate", function(o)
+  report(M.update(cmd_scope(o)))
+end, {
+  desc = "Fast-forward every unpinned plugin, advancing past the lockfile (nx.plugins.update). Names limit it to those plugins.",
+  usage = "[plugin ...]",
+  complete = complete_plugin_names,
+})
+nx.command("PluginClean", function(o)
+  report(M.clean(cmd_scope(o)))
+end, {
+  desc = "Remove cloned plugin dirs no spec declares (nx.plugins.clean). Names delete exactly those clones instead.",
+  usage = "[plugin ...]",
+  complete = complete_plugin_names,
+})
 -- Report a `restore()` outcome on the message line. Shared by `:PluginRestore` and the
 -- dashboard's `R` verb so both say the same thing. The failures go out LOUD (level 4) and
 -- separately from the summary: a rollback that silently skipped a plugin is the one case
@@ -1991,18 +2280,41 @@ function M._restore_notify(r)
   return r
 end
 
-nx.command("PluginRestore", function()
-  report(M.restore():next(M._restore_notify))
-end, { desc = "Check out every plugin at the commit the lockfile records (nx.plugins.restore)." })
-nx.command("PluginLock", function()
-  report(M.lock():next(function(lock)
+nx.command("PluginRestore", function(o)
+  report(M.restore(cmd_scope(o)):next(M._restore_notify))
+end, {
+  desc = "Check out every plugin at the commit the lockfile records (nx.plugins.restore). Names roll back only those plugins.",
+  usage = "[plugin ...]",
+  complete = complete_plugin_names,
+})
+nx.command("PluginLock", function(o)
+  local scope = cmd_scope(o)
+  report(M.lock(scope):next(function(lock)
     local n = 0
     for _ in pairs(lock) do
       n = n + 1
     end
-    nx.notify("nx.plugins: locked " .. n .. " plugin(s)", 2)
+    -- `lock` is the WHOLE file (a scoped run re-records its names and carries the rest),
+    -- so the count is what the lockfile now holds — not what this run touched. Say that
+    -- when names were given, rather than claiming to have locked twelve plugins.
+    if scope then
+      nx.notify(
+        "nx.plugins: locked "
+          .. table.concat(scope.plugins, ", ")
+          .. " ("
+          .. n
+          .. " in the lockfile)",
+        2
+      )
+    else
+      nx.notify("nx.plugins: locked " .. n .. " plugin(s)", 2)
+    end
   end))
-end, { desc = "Record every installed plugin's commit to the lockfile (nx.plugins.lock)." })
+end, {
+  desc = "Record every installed plugin's commit to the lockfile (nx.plugins.lock). Names re-record only those plugins.",
+  usage = "[plugin ...]",
+  complete = complete_plugin_names,
+})
 nx.command("PluginList", function()
   M.status():next(function(rows)
     local lines = { "nx.plugins — " .. #rows .. " declared:" }

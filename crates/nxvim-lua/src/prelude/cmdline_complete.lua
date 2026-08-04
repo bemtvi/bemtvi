@@ -159,22 +159,59 @@ local BUILTIN = {
     "Run {cmd}, suppressing its messages (errors still show; `!` hides those too).",
   },
   { "tab", ":tab {cmd}", "Run {cmd} so a window it opens becomes a new tab page." },
-  -- LSP (the `:Lsp*` verbs).
+  -- LSP (the `:Lsp*` verbs). Each request verb takes an optional `[server]` — the
+  -- config name of the attached client to route to, when a buffer carries several.
   { "LspInfo", ":LspInfo", "Show the LSP clients attached to the buffer." },
-  { "LspHover", ":LspHover", "Show hover information for the symbol under the cursor." },
-  { "LspDefinition", ":LspDefinition", "Jump to the definition of the symbol under the cursor." },
+  {
+    "LspHover",
+    ":LspHover [server]",
+    "Show hover information for the symbol under the cursor (from [server]).",
+  },
+  {
+    "LspDefinition",
+    ":LspDefinition [server]",
+    "Jump to the definition of the symbol under the cursor (asking [server]).",
+  },
   {
     "LspDeclaration",
-    ":LspDeclaration",
-    "Jump to the declaration of the symbol under the cursor.",
+    ":LspDeclaration [server]",
+    "Jump to the declaration of the symbol under the cursor (asking [server]).",
   },
-  { "LspTypeDefinition", ":LspTypeDefinition", "Jump to the type definition of the symbol." },
-  { "LspImplementation", ":LspImplementation", "Jump to the implementation of the symbol." },
-  { "LspReferences", ":LspReferences", "List references to the symbol under the cursor." },
-  { "LspSignatureHelp", ":LspSignatureHelp", "Show signature help for the call under the cursor." },
-  { "LspRename", ":LspRename [name]", "Rename the symbol under the cursor to [name]." },
-  { "LspCodeAction", ":LspCodeAction", "Choose a code action for the cursor position." },
-  { "LspFormat", ":LspFormat", "Format the current buffer with the language server." },
+  {
+    "LspTypeDefinition",
+    ":LspTypeDefinition [server]",
+    "Jump to the type definition of the symbol (asking [server]).",
+  },
+  {
+    "LspImplementation",
+    ":LspImplementation [server]",
+    "Jump to the implementation of the symbol (asking [server]).",
+  },
+  {
+    "LspReferences",
+    ":LspReferences [server]",
+    "List references to the symbol under the cursor (from [server] alone).",
+  },
+  {
+    "LspSignatureHelp",
+    ":LspSignatureHelp [server]",
+    "Show signature help for the call under the cursor (from [server]).",
+  },
+  {
+    "LspRename",
+    ":LspRename [name] [server]",
+    "Rename the symbol under the cursor to [name] (through [server]).",
+  },
+  {
+    "LspCodeAction",
+    ":LspCodeAction [server]",
+    "Choose a code action for the cursor position (from [server] alone).",
+  },
+  {
+    "LspFormat",
+    ":LspFormat [server]",
+    "Format the current buffer with the language server [server].",
+  },
   { "LspDiagnostics", ":LspDiagnostics", "List the buffer's diagnostics in the location list." },
   -- Tree-sitter parser management.
   { "TSInstall", ":TSInstall {lang}", "Install the tree-sitter parser for {lang}." },
@@ -420,6 +457,45 @@ end
 -- commands take MULTIPLE space-separated languages, so the completer is NOT first-arg
 -- gated — every argument word completes a language.
 local TS_COMMANDS = { TSInstall = true, TSUpdate = true }
+
+-- ----- `:Lsp*` server routing argument ---------------------------------------
+-- Every `:Lsp*` request verb takes an optional trailing `[server]` — the config name
+-- of the attached client to route to. The names come from the buffer's own clients,
+-- so the completion is exactly the set the command can accept.
+--
+-- The slot differs by command: `:LspRename` takes the new identifier first, so its
+-- server is the SECOND argument; the rest take it as the first.
+local LSP_SERVER_COMMANDS = {
+  LspHover = 1,
+  LspDefinition = 1,
+  LspDeclaration = 1,
+  LspTypeDefinition = 1,
+  LspImplementation = 1,
+  LspReferences = 1,
+  LspSignatureHelp = 1,
+  LspCodeAction = 1,
+  LspFormat = 1,
+  LspRename = 2,
+}
+
+-- The candidate set for a `[server]` argument: the config names of the clients
+-- attached to the current buffer, deduplicated and sorted. Empty (so the wildmenu
+-- stays closed) when no server is attached — there is nothing to route to.
+local function lsp_server_candidates()
+  local names, seen = {}, {}
+  for _, client in ipairs(nx.lsp.clients({ bufnr = 0 })) do
+    if client.name and not seen[client.name] then
+      seen[client.name] = true
+      names[#names + 1] = client.name
+    end
+  end
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    out[#out + 1] = { label = name, insert = name }
+  end
+  return out
+end
 
 -- ----- autocmd events / augroups, registers, addresses (first-argument completers) --
 -- These commands complete a name in their FIRST argument slot only — an event, an
@@ -905,6 +981,15 @@ local function arg_list(before)
   return args
 end
 
+-- Which argument slot the cursor sits in, 1-based: the number of *completed* argument
+-- words before it, plus one. `:LspHover p|` and `:LspHover |` are both slot 1;
+-- `:LspRename Foo p|` is slot 2. The gate for a command whose routing argument is not
+-- the first (`on_first_arg` covers only the first).
+local function arg_slot(before)
+  local n = #arg_list(before)
+  return before:match("%s$") and n + 1 or math.max(n, 1)
+end
+
 -- `nx._cmdline_complete_run(line, col)`: the candidate source the server calls
 -- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
 -- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
@@ -997,6 +1082,12 @@ function nx._cmdline_complete_run(line, col)
     -- take several), sharing the filetype names (a filetype IS the language name here).
     if cmd and TS_COMMANDS[cmd] then
       return filetype_candidates()
+    end
+    -- The `:Lsp*` verbs' optional `[server]` route, in its own slot (the second for
+    -- `:LspRename`, whose first argument is the new identifier).
+    local lsp_slot = cmd and LSP_SERVER_COMMANDS[cmd]
+    if lsp_slot then
+      return arg_slot(before) == lsp_slot and lsp_server_candidates() or {}
     end
     -- First-argument name completers (event / group / register / address). Gated on
     -- `on_first_arg` so they fire only for their own slot, not a later word.

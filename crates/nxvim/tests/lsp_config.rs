@@ -545,17 +545,18 @@ async fn enable_alpha_beta(rpc: &Rpc) {
     );
 }
 
-/// Fire `nx.lsp.code_action()` until the chooser menu carries at least `want` rows,
-/// and return its titles. The request is a fan-out round, so the menu only opens
-/// once every capable server has answered.
+/// Fire `trigger` (a code-action Lua verb) until the chooser menu carries at least
+/// `want` rows, and return its titles. The request is a fan-out round, so the menu
+/// only opens once every asked server has answered.
 async fn code_action_rows(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
+    trigger: &str,
     want: usize,
 ) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     for _ in 0..200 {
-        exec_lua(rpc, "nx.lsp.code_action()").await;
+        exec_lua(rpc, trigger).await;
         nxvim_test_harness::barrier(rpc).await;
         if let Some(map) = drain_to_latest_redraw(incoming, |m| {
             map_get(m, "menu").map(|v| !matches!(v, Value::Nil)) == Some(true)
@@ -741,7 +742,7 @@ async fn code_actions_merge_from_every_capable_server() {
     );
 
     // The chooser lists both servers' actions.
-    let rows = code_action_rows(&rpc, &mut incoming, 2).await;
+    let rows = code_action_rows(&rpc, &mut incoming, "nx.lsp.code_action()", 2).await;
 
     std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
     std::env::remove_var("NXVIM_LSP_CMD_BETA");
@@ -807,6 +808,189 @@ async fn format_selects_the_named_server() {
         unknown.as_str(),
         Some("false"),
         "an unmodelled option still fails loud"
+    );
+}
+
+// ----- routing a request to a NAMED client -----------------------------------
+// `nx.lsp.hover{ name = … }` / `:LspHover <server>`: which of a buffer's attached
+// servers answers. The default pick is the first, in name order, that advertises the
+// feature — fine until two servers both do, when the one you want may be second.
+
+/// Run `cmd` as an ex-command and return the message line it left. Each assertion
+/// below expects a *different* message, so a stale frame can't pass by accident.
+async fn message_after_cmd(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    cmd: &str,
+) -> String {
+    command(rpc, cmd).await;
+    nxvim_test_harness::barrier(rpc).await;
+    drain_to_latest_redraw(incoming, |m| !nxvim_test_harness::message(m).is_empty())
+        .map(|m| nxvim_test_harness::message(&m))
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_request_routes_to_the_named_server() {
+    // Both servers advertise hover and answer differently. `alpha` sorts first, so
+    // the DEFAULT pick is alpha — which is what makes naming `beta` prove the route:
+    // an ignored name renders FROM-ALPHA and the poll never sees FROM-BETA.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-route-by-name");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "hover": { "contents": "FROM-ALPHA" } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "hover": { "contents": "FROM-BETA" } }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    // The Lua option routes past the default pick…
+    let named = await_float(
+        &rpc,
+        &mut incoming,
+        "nx.lsp.hover({ name = 'beta' })",
+        "FROM-BETA",
+    )
+    .await;
+    // …and the ex-command's bare argument is the same route, back to the other one
+    // (so this leg can't pass by the float simply lingering).
+    let ex = await_float(
+        &rpc,
+        &mut incoming,
+        "nx.cmd('LspHover alpha')",
+        "FROM-ALPHA",
+    )
+    .await;
+
+    // …and the argument completes from the buffer's own clients, in its own slot —
+    // `:LspRename` takes the new identifier first, so its route is the SECOND word.
+    let completions = exec_lua(
+        &rpc,
+        "local function at(line)\n\
+         \x20 local out = {}\n\
+         \x20 for _, c in ipairs(nx._cmdline_complete_run(line, #line)) do\n\
+         \x20   out[#out + 1] = c.insert\n\
+         \x20 end\n\
+         \x20 return table.concat(out, ',')\n\
+         end\n\
+         return at('LspHover ') .. '/' .. at('LspRename Foo ') .. '/' .. at('LspRename ')",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert_eq!(
+        completions.as_str(),
+        Some("alpha,beta/alpha,beta/"),
+        "the `[server]` argument completes the attached clients in its own slot"
+    );
+
+    assert!(
+        !named.join(" ").contains("FROM-ALPHA"),
+        "the named hover came from beta alone, got {named:?}"
+    );
+    assert!(
+        !ex.join(" ").contains("FROM-BETA"),
+        ":LspHover alpha came from alpha alone, got {ex:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_named_route_that_cannot_be_honored_says_why() {
+    // The three ways a route fails are three different fixes, so they must not
+    // collapse into one message — and none of them may fall back to another server,
+    // which is the whole point of naming one.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-route-errors");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "capabilities": { "hoverProvider": false },
+             "hover": { "contents": "FROM-ALPHA" } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "hover": { "contents": "FROM-BETA" } }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    let unattached = message_after_cmd(&rpc, &mut incoming, "LspHover nosuch").await;
+    let incapable = message_after_cmd(&rpc, &mut incoming, "LspHover alpha").await;
+    let trailing = message_after_cmd(&rpc, &mut incoming, "LspHover alpha beta").await;
+    // The Lua verb reports the same way (it settles `nil` rather than hovering).
+    let lua_unattached = exec_lua(
+        &rpc,
+        "nx.lsp.hover({ name = 'nosuch' })\n\
+         return tostring(pcall(nx.lsp.hover, { bogus = 1 }))",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        unattached.contains("No LSP client named 'nosuch'"),
+        "an unattached name is reported by name, got {unattached:?}"
+    );
+    assert!(
+        incapable.contains("'alpha' does not provide hover"),
+        "an attached server that withholds the provider says so — not \
+         'no client named alpha', and not beta's hover; got {incapable:?}"
+    );
+    assert!(
+        trailing.contains("E488"),
+        "a second server name is a typo, not a second route; got {trailing:?}"
+    );
+    assert_eq!(
+        lua_unattached.as_str(),
+        Some("false"),
+        "an unmodelled option on a routed verb still fails loud"
+    );
+}
+
+#[tokio::test]
+async fn a_named_code_action_round_asks_only_that_server() {
+    // The merge is the default and the right one — but "run eslint's fixes" needs to
+    // exclude the other server's actions, not just prefer them.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-route-ca");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "code_action": [ { "title": "ALPHA-FIX", "kind": "quickfix" } ] }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "code_action": [ { "title": "BETA-REFACTOR", "kind": "refactor" } ] }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    enable_alpha_beta(&rpc).await;
+
+    let rows = code_action_rows(
+        &rpc,
+        &mut incoming,
+        "nx.lsp.code_action({ name = 'beta' })",
+        1,
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    let joined = rows.join(" | ");
+    assert!(
+        joined.contains("BETA-REFACTOR") && !joined.contains("ALPHA-FIX"),
+        "the routed round listed beta's actions ALONE, got {joined:?}"
     );
 }
 
@@ -1089,7 +1273,7 @@ async fn a_code_action_request_carries_each_servers_own_diagnostics() {
         "beta's diagnostic reached the editor"
     );
 
-    let rows = code_action_rows(&rpc, &mut incoming, 2).await;
+    let rows = code_action_rows(&rpc, &mut incoming, "nx.lsp.code_action()", 2).await;
 
     std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
     std::env::remove_var("NXVIM_LSP_CMD_BETA");

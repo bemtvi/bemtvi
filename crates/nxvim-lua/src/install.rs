@@ -2647,21 +2647,22 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_buf(kind)`: queue a position-family `vim.lsp.buf.*` request
-    // ([`LspOp::BufRequest`]) or one of the edit ops (`Format`/`CodeAction`),
+    // `nx._lsp_buf(kind, cb_id, name?)`: queue a position-family `vim.lsp.buf.*`
+    // request ([`LspOp::BufRequest`]) or one of the edit ops (`Format`/`CodeAction`),
     // selected by the `LspReqKind::as_u16` the prelude passes. The single Rust
     // entry the bare `vim.lsp.buf` functions route through (rename has its own,
     // below, since it carries an argument).
     // `cb_id` (`0` = fire-and-forget) settles the verb's promise when the reply
     // lands — the async `nx.lsp.*` verbs pass a real `nx._cb_fns` id so a `:next`
-    // chain runs after the effect is applied/presented.
+    // chain runs after the effect is applied/presented. `name` (nil = the default
+    // capability pick) routes the request to one attached client by config name.
     let sh = shared.clone();
     nx.set(
         "_lsp_buf",
-        lua.create_function(move |_, (kind, cb_id): (u16, u64)| {
+        lua.create_function(move |_, (kind, cb_id, name): (u16, u64, Option<String>)| {
             sh.borrow_mut()
                 .lsp_ops
-                .push(LspOp::BufRequest { kind, cb_id });
+                .push(LspOp::BufRequest { kind, cb_id, name });
             Ok(())
         })?,
     )?;
@@ -2679,19 +2680,27 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_buf_code_action(cb_id, only, apply, range)`: queue [`LspOp::CodeAction`].
+    // `nx._lsp_buf_code_action(cb_id, only, apply, range, name?)`: queue [`LspOp::CodeAction`].
     // `cb_id` (`0` = fire-and-forget) settles the promise once the picked (or
     // one-shot-applied) action's edit applies. `only` is the kind filter the prelude
     // extracted from `opts.context.only` (an empty list = no filter) and `apply` asks
     // for the chooser to be skipped when exactly one action survives it. `range` is the
     // prelude-validated `opts.range` flattened to `{ s_row, s_col, e_row, e_col }` (nil
     // ⇒ the live selection, else the cursor); any other length is a prelude bug, so it
-    // errors rather than silently requesting the wrong span.
+    // errors rather than silently requesting the wrong span. `name` (nil = every
+    // capable server, merged) asks only that client for actions.
     let sh = shared.clone();
     nx.set(
         "_lsp_buf_code_action",
         lua.create_function(
-            move |_, (cb_id, only, apply, range): (u64, Vec<String>, bool, Option<Vec<usize>>)| {
+            move |_,
+                  (cb_id, only, apply, range, name): (
+                u64,
+                Vec<String>,
+                bool,
+                Option<Vec<usize>>,
+                Option<String>,
+            )| {
                 let range = match range.as_deref() {
                     None => None,
                     Some(&[s_row, s_col, e_row, e_col]) => Some((s_row, s_col, e_row, e_col)),
@@ -2707,6 +2716,7 @@ pub(crate) fn install_runtime_api(
                     only,
                     apply,
                     range,
+                    name,
                 });
                 Ok(())
             },
@@ -2727,17 +2737,22 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_buf_rename(name, cb_id)`: queue [`LspOp::Rename`]. The prelude requires
-    // the argument (echoing `E471` on nil), so a name always arrives here.
+    // `nx._lsp_buf_rename(new_name, cb_id, name?)`: queue [`LspOp::Rename`]. The prelude
+    // requires the new identifier (echoing `E471` on nil), so it always arrives here;
+    // `name` (nil = the default pick) routes the request to one attached client.
     let sh = shared.clone();
     nx.set(
         "_lsp_buf_rename",
-        lua.create_function(move |_, (new_name, cb_id): (String, u64)| {
-            sh.borrow_mut()
-                .lsp_ops
-                .push(LspOp::Rename { new_name, cb_id });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (new_name, cb_id, name): (String, u64, Option<String>)| {
+                sh.borrow_mut().lsp_ops.push(LspOp::Rename {
+                    new_name,
+                    cb_id,
+                    name,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._diagnostic_goto(forward, severity)`: queue [`LspOp::DiagnosticGoto`]
@@ -3014,18 +3029,21 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_workspace_symbol(query, cb_id)`: queue [`LspOp::WorkspaceSymbol`] —
-    // `nx.lsp.workspace_symbol(query)` requests `workspace/symbol` for the fuzzy
-    // query and opens the matching symbols in `nx.picker`.
+    // `nx._lsp_workspace_symbol(query, cb_id, name?)`: queue [`LspOp::WorkspaceSymbol`]
+    // — `nx.lsp.workspace_symbol(query)` requests `workspace/symbol` for the fuzzy
+    // query and opens the matching symbols in `nx.picker`. `name` (nil = every capable
+    // server, merged) searches only that client's index.
     let sh = shared.clone();
     nx.set(
         "_lsp_workspace_symbol",
-        lua.create_function(move |_, (query, cb_id): (String, u64)| {
-            sh.borrow_mut()
-                .lsp_ops
-                .push(LspOp::WorkspaceSymbol { query, cb_id });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (query, cb_id, name): (String, u64, Option<String>)| {
+                sh.borrow_mut()
+                    .lsp_ops
+                    .push(LspOp::WorkspaceSymbol { query, cb_id, name });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._ui_input(prompt, default, cb_id, history?)`: queue a `vim.ui.input` prompt

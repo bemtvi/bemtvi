@@ -20,7 +20,11 @@ impl EditHost {
     /// the same kind, or the cursor moving before the reply lands, invalidates
     /// it. No-op (with a brief message) if the current buffer has no server that
     /// has finished `initialize`, since the negotiated encoding isn't known yet.
-    pub(crate) fn request_lsp(&mut self, kind: LspReqKind, cb_id: u64) {
+    ///
+    /// `name` routes the request to one attached client by config name
+    /// (`:LspHover pyright`, `nx.lsp.hover{ name = "pyright" }`); `None` takes the
+    /// capability-ordered default. See [`lsp_route`](Self::lsp_route).
+    pub(crate) fn request_lsp(&mut self, kind: LspReqKind, cb_id: u64, name: Option<&str>) {
         // Kinds that don't have the uniform `{uri, position}` shape have their own
         // issue functions — because they carry an argument the cursor can't supply
         // (a new name, a query), or they are whole-buffer background refreshes. A
@@ -31,11 +35,11 @@ impl EditHost {
             // Code actions do fan out, but with a range, a context and options the
             // generic path has no way to build — hand them to their own issuer.
             LspReqKind::CodeAction => {
-                self.request_lsp_code_action(cb_id, CodeActionOpts::default(), None);
+                self.request_lsp_code_action(cb_id, CodeActionOpts::default(), None, name);
                 return;
             }
             LspReqKind::Formatting => {
-                self.request_lsp_format(cb_id, None);
+                self.request_lsp_format(cb_id, name);
                 return;
             }
             LspReqKind::Rename
@@ -72,8 +76,12 @@ impl EditHost {
                 lsp_position_in(buf, PositionEncoding::Utf16, row, col),
                 lsp_position_in(buf, PositionEncoding::Utf32, row, col),
             );
-            let asked =
-                self.open_lsp_fanout(kind, cb_id, CodeActionOpts::default(), |_, uri, enc| {
+            let asked = self.open_lsp_fanout(
+                kind,
+                cb_id,
+                CodeActionOpts::default(),
+                name,
+                |_, uri, enc| {
                     let position = match enc {
                         PositionEncoding::Utf8 => p8,
                         PositionEncoding::Utf16 => p16,
@@ -93,17 +101,18 @@ impl EditHost {
                         // one — a code-action ask issuing `documentSymbol`.
                         other => unreachable!("{other:?} does not ride the cursor fan-out"),
                     }
-                });
+                },
+            );
             if asked.is_empty() {
-                self.editor.echo("No language server attached");
                 self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             }
             return;
         }
         // Routed by capability: the first attached server, in key order, that
-        // advertises this feature. On a `pyright` + `ruff` buffer a hover must reach
-        // pyright, not whichever name happens to sort first.
-        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(kind) else {
+        // advertises this feature — unless `name` names one outright. On a
+        // `pyright` + `ruff` buffer a hover must reach pyright, not whichever name
+        // happens to sort first.
+        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(kind, name) else {
             // No capable server: the request never goes, so settle the promise now
             // (resolve `nil`) rather than leave it hanging for a reply that
             // won't come.
@@ -167,7 +176,7 @@ impl EditHost {
             return;
         }
         if self.current_buffer_has_signature_trigger() {
-            self.request_lsp(LspReqKind::SignatureHelp, 0);
+            self.request_lsp(LspReqKind::SignatureHelp, 0, None);
         } else {
             self.editor.end_signature_session();
         }
@@ -414,30 +423,9 @@ impl EditHost {
     /// A `name` not attached to this buffer is reported by name rather than quietly
     /// formatting with someone else: asking for ruff and silently getting pyright's
     /// formatting is exactly the failure this option exists to prevent.
-    pub(crate) fn request_lsp_format(&mut self, cb_id: u64, name: Option<String>) {
-        let target = match &name {
-            Some(want) => {
-                self.sync_lsp();
-                let buffer = self.editor.current_buffer_id();
-                let found = self
-                    .lsp_states
-                    .get(&buffer)
-                    .and_then(|s| s.servers().find(|(k, _)| &k.name == want).map(|(k, _)| k))
-                    .cloned()
-                    .and_then(|key| {
-                        let uri = self.lsp_states.get(&buffer)?.uri.clone()?;
-                        let encoding = self.lsp_servers.get(&key)?.encoding;
-                        Some((key, uri, encoding))
-                    });
-                if found.is_none() {
-                    self.editor
-                        .echo(format!("No LSP client named '{want}' on this buffer"));
-                }
-                found
-            }
-            None => self.lsp_target_for_or_echo(LspReqKind::Formatting),
-        };
-        let Some((key, uri, _encoding)) = target else {
+    pub(crate) fn request_lsp_format(&mut self, cb_id: u64, name: Option<&str>) {
+        let Some((key, uri, _encoding)) = self.lsp_target_for_or_echo(LspReqKind::Formatting, name)
+        else {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
@@ -463,27 +451,36 @@ impl EditHost {
     /// only the first silently halves the picker. Merging is as well defined here as
     /// for document symbols — the result is a *list*, and duplicates collapse on
     /// their resolved position.
-    pub(crate) fn request_lsp_workspace_symbol(&mut self, query: &str, cb_id: u64) {
+    ///
+    /// `name` narrows the round to one client, for the same reason the merge exists:
+    /// when two servers index the project, "search only ts_ls's symbols" is a real
+    /// ask, and the merged picker can't express it.
+    pub(crate) fn request_lsp_workspace_symbol(
+        &mut self,
+        query: &str,
+        cb_id: u64,
+        name: Option<&str>,
+    ) {
         self.sync_lsp();
         let query = query.to_string();
         let asked = self.open_lsp_fanout(
             LspReqKind::WorkspaceSymbol,
             cb_id,
             CodeActionOpts::default(),
+            name,
             |_, _uri, _enc| LspRequest::WorkspaceSymbol {
                 query: query.clone(),
             },
         );
         if asked.is_empty() {
-            self.editor.echo("No language server attached");
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
         }
     }
 
-    /// `:LspRename {newname}` — request `textDocument/rename` at the cursor with
-    /// the new name. On reply the returned `WorkspaceEdit` is applied across the
-    /// open buffers it touches.
-    pub(crate) fn request_lsp_rename(&mut self, new_name: &str, cb_id: u64) {
+    /// `:LspRename {newname} [server]` — request `textDocument/rename` at the cursor
+    /// with the new name. On reply the returned `WorkspaceEdit` is applied across the
+    /// open buffers it touches. `name` routes the request to one attached client.
+    pub(crate) fn request_lsp_rename(&mut self, new_name: &str, cb_id: u64, name: Option<&str>) {
         let new_name = new_name.trim();
         if new_name.is_empty() {
             self.editor
@@ -491,7 +488,8 @@ impl EditHost {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         }
-        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(LspReqKind::Rename) else {
+        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(LspReqKind::Rename, name)
+        else {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
@@ -527,11 +525,17 @@ impl EditHost {
     /// With neither, the request is a point at the cursor. The range matters: the
     /// refactor kinds (`refactor.extract`, `refactor.inline`) are exactly the actions a
     /// server gates on a non-empty one.
+    ///
+    /// `name` routes the round to one attached client (`:LspCodeAction eslint`,
+    /// `nx.lsp.code_action{ name = "eslint" }`) instead of merging every capable
+    /// server's actions — the way to run *that* linter's fixes when two servers both
+    /// offer some.
     pub(crate) fn request_lsp_code_action(
         &mut self,
         cb_id: u64,
         opts: CodeActionOpts,
         range: Option<(usize, usize, usize, usize)>,
+        name: Option<&str>,
     ) {
         self.sync_lsp();
         let selection = range.or_else(|| self.editor.selection_extent());
@@ -587,21 +591,26 @@ impl EditHost {
         // chooser — this is the fan-out that matters most in practice: a linter's
         // quick-fixes and a type-checker's refactors are both things you want offered,
         // and asking only one server silently hides half the menu.
-        let asked = self.open_lsp_fanout(LspReqKind::CodeAction, cb_id, opts, |key, uri, enc| {
-            let range = ranges
-                .iter()
-                .find(|(e, _)| *e == enc)
-                .map(|(_, r)| *r)
-                .unwrap_or_default();
-            LspRequest::CodeAction {
-                uri,
-                range,
-                diagnostics: diagnostics.get(key).cloned().unwrap_or_default(),
-                only: only.clone(),
-            }
-        });
+        let asked = self.open_lsp_fanout(
+            LspReqKind::CodeAction,
+            cb_id,
+            opts,
+            name,
+            |key, uri, enc| {
+                let range = ranges
+                    .iter()
+                    .find(|(e, _)| *e == enc)
+                    .map(|(_, r)| *r)
+                    .unwrap_or_default();
+                LspRequest::CodeAction {
+                    uri,
+                    range,
+                    diagnostics: diagnostics.get(key).cloned().unwrap_or_default(),
+                    only: only.clone(),
+                }
+            },
+        );
         if asked.is_empty() {
-            self.editor.echo("No language server attached");
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
         }
     }
@@ -635,47 +644,109 @@ impl EditHost {
         Some((key, uri, encoding))
     }
 
-    /// [`lsp_target_for`](Self::lsp_target_for) on the current buffer, echoing the
-    /// same "no server" message [`lsp_target_or_echo`](Self::lsp_target_or_echo)
-    /// does when nothing can answer.
+    /// The servers on `buffer` that should answer a request of `kind`, honoring an
+    /// explicit **route by name** — `:LspHover pyright`, `nx.lsp.hover{ name = … }`.
+    ///
+    /// `None` is the default routing: every attached server advertising the provider,
+    /// in [`ServerKey`] order (a single-target caller takes the first, a fan-out takes
+    /// them all). `Some(want)` narrows that to the client configured under `want`,
+    /// which is what makes a multi-server buffer *addressable*: with `ts_ls` + `eslint`
+    /// both advertising code actions, or `pyright` + `ruff` both advertising hover,
+    /// "ask this one" is otherwise unsayable — the default pick is by key order, and
+    /// the one you want is not always first.
+    ///
+    /// Every way the route can come up empty is echoed **here**, the one place that
+    /// knows *why*, so callers only settle their promise. A named client that isn't
+    /// attached never falls back to a different server: silently answering from
+    /// pyright when ruff was named is exactly the failure naming one prevents.
+    pub(crate) fn lsp_route(
+        &mut self,
+        buffer: BufferId,
+        kind: LspReqKind,
+        name: Option<&str>,
+    ) -> Vec<(ServerKey, PositionEncoding)> {
+        let capable = self.lsp_capable_servers(buffer, kind);
+        let Some(want) = name else {
+            if capable.is_empty() {
+                self.editor.echo("No language server attached");
+            }
+            return capable;
+        };
+        let routed: Vec<_> = capable
+            .into_iter()
+            .filter(|(key, _)| key.name == want)
+            .collect();
+        if !routed.is_empty() {
+            return routed;
+        }
+        // Empty for one of three distinct reasons, and they call for different fixes:
+        // a typo'd/unstarted name, a server still initializing (retry in a moment),
+        // or a server that simply doesn't do this (use another one).
+        let attached = self
+            .lsp_states
+            .get(&buffer)
+            .is_some_and(|s| s.servers().any(|(key, _)| key.name == want));
+        let initialized = attached && self.lsp_servers.keys().any(|key| key.name == want);
+        let msg = match (attached, initialized) {
+            (false, _) => format!("No LSP client named '{want}' on this buffer"),
+            (true, false) => format!("LSP client '{want}' has not finished initializing"),
+            (true, true) => format!("LSP client '{want}' does not provide {}", kind.label()),
+        };
+        self.editor.echo(msg);
+        Vec::new()
+    }
+
+    /// The single server a cursor request of `kind` goes to on the **current** buffer:
+    /// the first of [`lsp_route`](Self::lsp_route), with the buffer's document `uri`.
+    /// `name` routes it to one client by config name (`None` = the capability-ordered
+    /// default). Syncs pending edits first, and every empty case is already echoed by
+    /// `lsp_route`, so the caller only settles its promise.
     pub(crate) fn lsp_target_for_or_echo(
         &mut self,
         kind: LspReqKind,
+        name: Option<&str>,
     ) -> Option<(ServerKey, Url, PositionEncoding)> {
         self.sync_lsp();
-        let target = self.lsp_target_for(self.editor.current_buffer_id(), kind);
-        if target.is_none() {
-            self.editor.echo("No language server attached");
-        }
-        target
+        let buffer = self.editor.current_buffer_id();
+        let (key, encoding) = self.lsp_route(buffer, kind, name).into_iter().next()?;
+        // A server attached to a buffer whose document uri never resolved can't be
+        // asked about a document — say so rather than dropping the request silently.
+        let Some(uri) = self.lsp_states.get(&buffer).and_then(|s| s.uri.clone()) else {
+            self.editor
+                .echo("nx.lsp: the buffer has no file path to ask about");
+            return None;
+        };
+        Some((key, uri, encoding))
     }
 
     /// Open a fan-out round for `kind`: issue `make` to **every** attached server
     /// that advertises the capability, and register the round so their replies merge.
+    /// `name` routes the round to a single client by config name — a fan-out of one,
+    /// so "just eslint's code actions" merges nothing and lists only its own.
     ///
-    /// Returns the servers asked (empty when none can answer, in which case the
-    /// caller settles its promise — no silent nothing). Any round already open for
-    /// this kind is superseded: its promise settles `nil` rather than hanging, and
-    /// its still-outstanding replies are dropped on arrival (their generations are
-    /// gone from the new round).
+    /// Returns the servers asked (empty when none can answer — [`lsp_route`] has
+    /// already echoed why, and the caller settles its promise: no silent nothing).
+    /// Any round already open for this kind is superseded: its promise settles `nil`
+    /// rather than hanging, and its still-outstanding replies are dropped on arrival
+    /// (their generations are gone from the new round).
     pub(crate) fn open_lsp_fanout(
         &mut self,
         kind: LspReqKind,
         cb_id: u64,
         code_action: CodeActionOpts,
+        name: Option<&str>,
         make: impl Fn(&ServerKey, Url, PositionEncoding) -> LspRequest,
     ) -> Vec<ServerKey> {
         let buffer = self.editor.current_buffer_id();
-        let Some(state) = self.lsp_states.get(&buffer) else {
-            return Vec::new();
-        };
-        let Some(uri) = state.uri.clone() else {
-            return Vec::new();
-        };
-        let targets = self.lsp_capable_servers(buffer, kind);
+        let targets = self.lsp_route(buffer, kind, name);
         if targets.is_empty() {
             return Vec::new();
         }
+        let Some(uri) = self.lsp_states.get(&buffer).and_then(|s| s.uri.clone()) else {
+            self.editor
+                .echo("nx.lsp: the buffer has no file path to ask about");
+            return Vec::new();
+        };
         // Supersede any open round for this kind before issuing the new one.
         if let Some(prev) = self.lsp_fanouts.remove(&kind) {
             if prev.cb_id != 0 {

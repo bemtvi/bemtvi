@@ -78,6 +78,27 @@
 --      `No LSP client named 'nosuch' on this buffer`: naming a server that cannot
 --      format REPORTS rather than quietly formatting with a different one, which
 --      is the failure the option exists to prevent.
+--   8. Naming a server is not special to formatting — EVERY verb takes it, because
+--      every verb has the same ambiguity once two servers can answer. Cursor on
+--      `Printf` again:
+--        * `:LspHover gopls`  →  the same hover as `K`, asked for outright.
+--        * `<leader>lh` (`hover{ name = "golangci_lint" }`)  →  `LSP client
+--          'golangci_lint' does not provide hover`. Attached, but it advertises no
+--          `hoverProvider` (step 5) — so the route says THAT, rather than the
+--          misleading "no client named…" or, worse, quietly answering from gopls.
+--        * `:LspHover nosuch`  →  `No LSP client named 'nosuch' on this buffer`.
+--      Three failures, three different fixes, three different messages — and none
+--      of them falls back to another server.
+--   9. `:LspHover <Tab>`.  →  the wildmenu offers `golangci_lint` and `gopls`: the
+--      argument completes from the clients actually on this buffer. (`:LspRename`
+--      takes the new identifier first, so ITS server slot is the second word:
+--      `:LspRename Foo <Tab>`.)
+--  10. `:LspReferences gopls` vs `<leader>lr`. References, symbols and code actions
+--      normally FAN OUT and merge; a name narrows the round to one client, so it is
+--      how you say "just this server's list" when two servers both index the
+--      project. With this pair the results match — only gopls is capable — which is
+--      the point: naming the server that would have been picked anyway changes
+--      nothing, so it is safe to be explicit.
 --
 -- If only one of the two binaries is installed the config still works — the other
 -- simply never attaches, and every routed request goes to the one that did. That
@@ -138,6 +159,20 @@ end)
 -- quietly getting pyright's formatting is exactly what the option prevents.
 nx.keymap.set("n", "<leader>lF", function()
   nx.lsp.format({ name = "nosuch" })
+end)
+
+-- …and `name` is not a formatting option, it is a ROUTING one: every language verb
+-- takes it, and the ex-commands take it as a bare argument (`:LspHover gopls`).
+-- Route to a server that is attached but does not advertise the feature and it says
+-- so — it does not fall through to the server that does.
+nx.keymap.set("n", "<leader>lh", function()
+  nx.lsp.hover({ name = "golangci_lint" })
+end)
+
+-- The merging verbs take it too, where it means "this client's list ALONE" instead
+-- of every capable server's merged. `:LspReferences gopls` is the ex twin.
+nx.keymap.set("n", "<leader>lr", function()
+  nx.lsp.references({ name = "gopls" })
 end)
 
 --------------------------------------------------------------------------------

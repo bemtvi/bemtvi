@@ -1223,13 +1223,16 @@ async fn lsp_format_accepts_async_and_a_bare_call() {
 #[tokio::test]
 async fn lsp_rename_rejects_options_it_cannot_honor() {
     let (rpc, _incoming) = start().await;
+    // `name` is modeled — it routes the rename to one of the buffer's attached
+    // clients, neovim's own meaning for the key, as on `format`. `filter`/`bufnr`
+    // still raise rather than being quietly dropped.
     let got = reject_report(
         &rpc,
         "vim.lsp.buf.rename('NewName', o)",
         &["filter", "bufnr", "name"],
     )
     .await;
-    assert_eq!(got, "filter=false bufnr=false name=false");
+    assert_eq!(got, "filter=false bufnr=false name=true");
     let ok = exec_lua(
         &rpc,
         "return tostring(pcall(vim.lsp.buf.rename, 'NewName')) ..\n\

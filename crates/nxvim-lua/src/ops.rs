@@ -294,6 +294,12 @@ pub enum LspOp {
         /// chain can run after the jump/picker/float is presented; see
         /// [`CallbackArgs::LspReply`].
         cb_id: u64,
+        /// `opts.name`: route the request to the attached client of THIS config name
+        /// rather than the capability-ordered default pick. `None` = the default.
+        /// A buffer can carry several servers that all answer a kind (`pyright` +
+        /// `ruff` both hover), and the one you want is not always the one key order
+        /// picks; a name that isn't attached reports so rather than falling back.
+        name: Option<String>,
     },
     /// `nx.lsp.format(opts)` — request `textDocument/formatting`.
     Format {
@@ -315,6 +321,8 @@ pub enum LspOp {
         /// The `nx._cb_fns` id that settles the promise once the workspace edit
         /// applies (`0` = fire-and-forget).
         cb_id: u64,
+        /// `opts.name`: route the rename to THIS client (see [`LspOp::BufRequest`]).
+        name: Option<String>,
     },
     /// `nx.lsp.code_action(opts)` — request `textDocument/codeAction` over `range`,
     /// the live Visual / Select selection, or (with neither) a point at the cursor.
@@ -336,6 +344,9 @@ pub enum LspOp {
         /// end-exclusive (the `nx.win.select_range` convention). `None` falls back to
         /// the live selection, then to a point at the cursor.
         range: Option<(usize, usize, usize, usize)>,
+        /// `opts.name`: ask only THIS client for actions instead of merging every
+        /// capable server's (see [`LspOp::BufRequest`]).
+        name: Option<String>,
     },
     /// `nx.lsp.signature_help_autotrigger(enable)` — opt into (or out of) auto-showing
     /// signature help as you type a call, driven by the server's advertised trigger
@@ -515,6 +526,9 @@ pub enum LspOp {
         /// The `nx._cb_fns` id that settles the promise with the matched symbol items
         /// once the reply lands (`0` = fire-and-forget).
         cb_id: u64,
+        /// `opts.name`: search only THIS client's index instead of merging every
+        /// capable server's (see [`LspOp::BufRequest`]).
+        name: Option<String>,
     },
 }
 

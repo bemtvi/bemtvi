@@ -93,6 +93,29 @@ local function lsp_promise(issue)
   end)
 end
 
+-- Validate the `{ name = "<client>" }` option every language verb accepts and return
+-- the name (nil when there is none). `verb` names the caller in the error messages.
+-- Unsupported keys fail loud — a quietly-dropped option would silently ask the wrong
+-- server, which is the whole thing naming one exists to prevent. `extra` lists the
+-- verb's OWN option keys (`nx.lsp.code_action` validates those itself).
+local function route_name(opts, verb, extra)
+  if opts == nil then
+    return nil
+  end
+  if type(opts) ~= "table" then
+    error(verb .. ": opts must be a table, got " .. type(opts), 3)
+  end
+  for k in pairs(opts) do
+    if k ~= "name" and not (extra and extra[k]) then
+      error(verb .. ": unsupported option '" .. tostring(k) .. "'", 3)
+    end
+  end
+  if opts.name ~= nil and type(opts.name) ~= "string" then
+    error(verb .. ": opts.name must be a server-name string", 3)
+  end
+  return opts.name
+end
+
 -- Normalize a `root_markers` value to a list of PRIORITY TIERS. The flat form
 -- (`{ ".git", "Cargo.toml" }`) is one tier of equals; the nested form
 -- (`{ { "package-lock.json", "yarn.lock" }, { ".git" } }`) is several, and the
@@ -917,40 +940,83 @@ end
 -- `kind` ints mirror `LspReqKind::as_u16` (crates/nxvim-server/src/lsp/mod.rs) — keep
 -- the two in step. Each is built with `lsp_promise` (defined up with the helpers,
 -- since `nx.lsp.stop` above needs it too).
+--
+-- Every verb takes an optional `{ name = "<client>" }` that **routes** the request to
+-- the attached client of that config name:
+--
+-- ```lua
+-- nx.lsp.hover({ name = "pyright" })          -- not ruff, whatever key order says
+-- nx.lsp.references({ name = "ts_ls" })       -- one server's list, not the merge
+-- nx.keymap.set("n", "K", function() return nx.lsp.hover({ name = "pyright" }) end)
+-- ```
+--
+-- A buffer carries **every** server enabled for its filetype, and the default pick is
+-- the first, in name order, that advertises the feature — which is not always the one
+-- you meant. For the merging verbs (`references`, `document_symbol`,
+-- `workspace_symbol`, `code_action`) a name narrows the round to that one client
+-- instead of merging them all. A name that isn't attached to the buffer reports so on
+-- the message line and resolves `nil`; it never falls back to a different server. The
+-- ex-commands take the same route as a bare argument (`:LspHover pyright`).
 
-function nx.lsp.definition()
+-- `nx.lsp.definition([opts])`: jump to the definition of the symbol under the cursor
+-- (many results open `nx.picker`), resolving with the `{ text, path, row, col }` item
+-- list. `opts.name` routes the request to that attached client.
+function nx.lsp.definition(opts)
+  local name = route_name(opts, "nx.lsp.definition")
   return lsp_promise(function(id)
-    nx._lsp_buf(0, id)
+    nx._lsp_buf(0, id, name)
   end)
 end
-function nx.lsp.declaration()
+-- `nx.lsp.declaration([opts])`: the `definition` twin for `textDocument/declaration`
+-- (C headers, `extern` declarations). `opts.name` routes it.
+function nx.lsp.declaration(opts)
+  local name = route_name(opts, "nx.lsp.declaration")
   return lsp_promise(function(id)
-    nx._lsp_buf(1, id)
+    nx._lsp_buf(1, id, name)
   end)
 end
-function nx.lsp.type_definition()
+-- `nx.lsp.type_definition([opts])`: jump to the definition of the *type* of the symbol
+-- under the cursor. `opts.name` routes it.
+function nx.lsp.type_definition(opts)
+  local name = route_name(opts, "nx.lsp.type_definition")
   return lsp_promise(function(id)
-    nx._lsp_buf(2, id)
+    nx._lsp_buf(2, id, name)
   end)
 end
-function nx.lsp.implementation()
+-- `nx.lsp.implementation([opts])`: the implementations of the interface / trait method
+-- under the cursor. `opts.name` routes it.
+function nx.lsp.implementation(opts)
+  local name = route_name(opts, "nx.lsp.implementation")
   return lsp_promise(function(id)
-    nx._lsp_buf(3, id)
+    nx._lsp_buf(3, id, name)
   end)
 end
-function nx.lsp.references()
+-- `nx.lsp.references([opts])`: the references to the symbol under the cursor, opened in
+-- `nx.picker`. Fans out to **every** capable server and merges (two servers indexing one
+-- project each know references the other does not); `opts.name` narrows the round to
+-- that one client's list.
+function nx.lsp.references(opts)
+  local name = route_name(opts, "nx.lsp.references")
   return lsp_promise(function(id)
-    nx._lsp_buf(4, id)
+    nx._lsp_buf(4, id, name)
   end)
 end
-function nx.lsp.hover()
+-- `nx.lsp.hover([opts])`: the hover documentation for the symbol under the cursor, in a
+-- float, resolving with the shown text. `opts.name` asks that client instead of the
+-- first attached one advertising `hoverProvider` — the `pyright` beside `ruff` case.
+function nx.lsp.hover(opts)
+  local name = route_name(opts, "nx.lsp.hover")
   return lsp_promise(function(id)
-    nx._lsp_buf(5, id)
+    nx._lsp_buf(5, id, name)
   end)
 end
-function nx.lsp.signature_help()
+-- `nx.lsp.signature_help([opts])`: the signature of the call under the cursor, in a
+-- float. `opts.name` routes it; see `nx.lsp.signature_help_autotrigger` for showing it
+-- as you type instead of on demand.
+function nx.lsp.signature_help(opts)
+  local name = route_name(opts, "nx.lsp.signature_help")
   return lsp_promise(function(id)
-    nx._lsp_buf(6, id)
+    nx._lsp_buf(6, id, name)
   end)
 end
 
@@ -976,21 +1042,7 @@ end
 -- silently using the wrong formatter is the failure the option exists to prevent.
 -- Any other key is rejected loudly (as in `nx.lsp.code_action`).
 function nx.lsp.format(opts)
-  local name
-  if opts ~= nil then
-    if type(opts) ~= "table" then
-      error("nx.lsp.format: opts must be a table, got " .. type(opts), 2)
-    end
-    for k in pairs(opts) do
-      if k ~= "name" then
-        error("nx.lsp.format: unsupported option '" .. tostring(k) .. "'", 2)
-      end
-    end
-    if opts.name ~= nil and type(opts.name) ~= "string" then
-      error("nx.lsp.format: opts.name must be a server-name string", 2)
-    end
-    name = opts.name
-  end
+  local name = route_name(opts, "nx.lsp.format")
   return lsp_promise(function(id)
     nx._lsp_buf_format(id, name)
   end)
@@ -1041,6 +1093,9 @@ end
 --                `nx.win.select_range` convention). All four fields are
 --                required, and it wins over both a live selection and the
 --                cursor — the non-interactive way to act on a computed span.
+-- name           ask only the attached client of this config name, instead of
+--                merging every capable server's actions into one chooser — "run
+--                eslint's fixes", not ts_ls's refactors as well.
 -- ```
 --
 -- Anything else in `opts` (neovim's `filter`, `context.diagnostics`,
@@ -1048,15 +1103,9 @@ end
 -- doesn't model it yet, and a quietly-dropped filter would silently do the wrong thing.
 function nx.lsp.code_action(opts)
   local only, apply, range = {}, false, nil
+  local name =
+    route_name(opts, "nx.lsp.code_action", { context = true, apply = true, range = true })
   if opts ~= nil then
-    if type(opts) ~= "table" then
-      error("nx.lsp.code_action: opts must be a table, got " .. type(opts), 2)
-    end
-    for k in pairs(opts) do
-      if k ~= "context" and k ~= "apply" and k ~= "range" then
-        error("nx.lsp.code_action: unsupported option '" .. tostring(k) .. "'", 2)
-      end
-    end
     if opts.range ~= nil then
       local r = opts.range
       local shape = "opts.range must be a table "
@@ -1106,48 +1155,65 @@ function nx.lsp.code_action(opts)
     end
   end
   return lsp_promise(function(id)
-    nx._lsp_buf_code_action(id, only, apply, range)
+    nx._lsp_buf_code_action(id, only, apply, range, name)
   end)
 end
 
--- `nx.lsp.document_symbol()`: the symbols defined in the current document, opened in
--- `nx.picker` (kind 16 mirrors `LspReqKind::DocumentSymbol::as_u16`). Resolves with the
--- symbol `{ text, path, row, col }` item list.
-function nx.lsp.document_symbol()
+-- `nx.lsp.document_symbol([opts])`: the symbols defined in the current document,
+-- opened in `nx.picker` (kind 16 mirrors `LspReqKind::DocumentSymbol::as_u16`).
+-- Resolves with the symbol `{ text, path, row, col }` item list. `opts.name` lists
+-- only that client's symbols instead of merging every capable server's.
+function nx.lsp.document_symbol(opts)
+  local name = route_name(opts, "nx.lsp.document_symbol")
   return lsp_promise(function(id)
-    nx._lsp_buf(16, id)
+    nx._lsp_buf(16, id, name)
   end)
 end
 
--- `nx.lsp.workspace_symbol(query)`: symbols across the workspace matching `query`,
--- opened in `nx.picker`. With no query, prompt for one via `nx.ui.input` (non-blocking)
--- — an empty/cancelled prompt resolves `nil`. Returns a promise of the matched symbol
--- item list.
-function nx.lsp.workspace_symbol(query)
+-- `nx.lsp.workspace_symbol([query], [opts])`: symbols across the workspace matching
+-- `query`, opened in `nx.picker`. With no query, prompt for one via `nx.ui.input`
+-- (non-blocking) — an empty/cancelled prompt resolves `nil`. Returns a promise of the
+-- matched symbol item list. `opts.name` searches only that client's index instead of
+-- merging every capable server's; since a query is always a string, the options table
+-- may take the first argument's place when you want the prompt *and* a route
+-- (`nx.lsp.workspace_symbol({ name = "ts_ls" })`).
+function nx.lsp.workspace_symbol(query, opts)
+  if type(query) == "table" and opts == nil then
+    query, opts = nil, query
+  end
+  local name = route_name(opts, "nx.lsp.workspace_symbol")
   if type(query) == "string" then
     return lsp_promise(function(id)
-      nx._lsp_workspace_symbol(query, id)
+      nx._lsp_workspace_symbol(query, id, name)
     end)
   end
   return nx.ui.input({ prompt = "Workspace symbol: " }):next(function(q)
     if type(q) == "string" and q ~= "" then
       return lsp_promise(function(id)
-        nx._lsp_workspace_symbol(q, id)
+        nx._lsp_workspace_symbol(q, id, name)
       end)
     end
   end)
 end
 
--- `nx.lsp.rename(new_name)`: rename the symbol under the cursor. With a name, request
--- it straight away; with none (the bare
+-- `nx.lsp.rename([new_name], [opts])`: rename the symbol under the cursor. With a
+-- name, request it straight away; with none (the bare
 -- `nx.keymap.set("n", "<leader>rn", nx.lsp.rename)` case), prompt for it via
 -- `nx.ui.input` (non-blocking promise), prefilled with the symbol under the cursor, and
 -- rename on confirm. Returns a promise that resolves `nil` once the rename applies (or
 -- immediately, `nil`, on an empty / cancelled prompt).
-function nx.lsp.rename(new_name)
+--
+-- `opts.name` routes the request to one attached client. A new name is always a
+-- string, so the options table may take the first argument's place when you want the
+-- prompt *and* a route (`nx.lsp.rename({ name = "ts_ls" })`).
+function nx.lsp.rename(new_name, opts)
+  if type(new_name) == "table" and opts == nil then
+    new_name, opts = nil, new_name
+  end
+  local server = route_name(opts, "nx.lsp.rename")
   if type(new_name) == "string" and new_name ~= "" then
     return lsp_promise(function(id)
-      nx._lsp_buf_rename(new_name, id)
+      nx._lsp_buf_rename(new_name, id, server)
     end)
   end
   -- Prefill with the identifier under the cursor — `nx.expand("<cword>")` (vimfn.lua,
@@ -1155,7 +1221,7 @@ function nx.lsp.rename(new_name)
   return nx.ui.input({ prompt = "New Name: ", default = nx.expand("<cword>") }):next(function(name)
     if type(name) == "string" and name ~= "" then
       return lsp_promise(function(id)
-        nx._lsp_buf_rename(name, id)
+        nx._lsp_buf_rename(name, id, server)
       end)
     end
   end)
@@ -1362,25 +1428,46 @@ function nx.lsp.clients(filter)
   return out
 end
 
--- `nx.lsp.request(method, params, handler, bufnr)`: sugar resolving the buffer's
--- primary client and issuing `client:request`. No attached client fails loud.
-function nx.lsp.request(method, params, handler, bufnr)
-  local client = nx.lsp.clients({ bufnr = bufnr or 0 })[1]
-  if not client then
-    nx.notify("nx.lsp.request: no LSP client attached to the buffer", vim.log.levels.ERROR)
-    return
+-- Resolve the client a `nx.lsp.request` / `nx.lsp.notify` goes to. `target` is a
+-- bufnr (`0`/nil = current) or a `{ bufnr =, name = }` table — `name` routes to that
+-- config's client rather than "whichever attached one comes first", which on a
+-- multi-server buffer is not the one a server-specific method belongs to. Returns nil
+-- after a loud notify when nothing matches (the caller adds no fallback).
+local function request_client(verb, target)
+  local filter = { bufnr = 0 }
+  if type(target) == "table" then
+    filter.bufnr = target.bufnr or 0
+    filter.name = target.name
+  elseif target ~= nil then
+    filter.bufnr = target
   end
-  client:request(method, params, handler)
+  local client = nx.lsp.clients(filter)[1]
+  if not client then
+    local which = filter.name and (" named '" .. filter.name .. "'") or ""
+    nx.notify(verb .. ": no LSP client" .. which .. " attached to the buffer", vim.log.levels.ERROR)
+    return nil
+  end
+  return client
 end
 
--- `nx.lsp.notify(method, params, bufnr)`: the fire-and-forget sibling of `request`.
-function nx.lsp.notify(method, params, bufnr)
-  local client = nx.lsp.clients({ bufnr = bufnr or 0 })[1]
-  if not client then
-    nx.notify("nx.lsp.notify: no LSP client attached to the buffer", vim.log.levels.ERROR)
-    return
+-- `nx.lsp.request(method, params, handler, target)`: sugar resolving one of the
+-- buffer's clients and issuing `client:request`. `target` is a bufnr (`0`/nil =
+-- current) or `{ bufnr =, name = }`, where `name` picks the attached client by config
+-- name instead of taking the first. No matching client fails loud.
+function nx.lsp.request(method, params, handler, target)
+  local client = request_client("nx.lsp.request", target)
+  if client then
+    client:request(method, params, handler)
   end
-  client:notify(method, params)
+end
+
+-- `nx.lsp.notify(method, params, target)`: the fire-and-forget sibling of `request`,
+-- with the same `target` routing.
+function nx.lsp.notify(method, params, target)
+  local client = request_client("nx.lsp.notify", target)
+  if client then
+    client:notify(method, params)
+  end
 end
 
 -- ----- hand-built request params ---------------------------------------------
@@ -2045,24 +2132,26 @@ end
 vim.lsp.buf.code_action = function(opts)
   return nx.lsp.code_action(opts)
 end
--- As with `format`: `nx.lsp.rename` renames the symbol under the cursor through the
--- current buffer's server, so neovim's `filter` / `name` / `bufnr` have nothing to
--- select and are rejected rather than quietly ignored.
-vim.lsp.buf.rename = function(name, opts)
+-- As with `format`: `opts.name` is **modeled** — it routes the rename to one of the
+-- buffer's attached clients by config name, neovim's own meaning for the key. Its
+-- `filter` / `bufnr` are not, and are rejected rather than quietly ignored (nxvim
+-- renames the symbol under the cursor in the current buffer).
+vim.lsp.buf.rename = function(new_name, opts)
   if opts ~= nil then
     if type(opts) ~= "table" then
       error("vim.lsp.buf.rename: opts must be a table, got " .. type(opts), 2)
     end
-    local k = next(opts)
-    if k ~= nil then
-      error("vim.lsp.buf.rename: unsupported option '" .. tostring(k) .. "'", 2)
+    for k in pairs(opts) do
+      if k ~= "name" then
+        error("vim.lsp.buf.rename: unsupported option '" .. tostring(k) .. "'", 2)
+      end
     end
   end
-  return nx.lsp.rename(name)
+  return nx.lsp.rename(new_name, opts)
 end
 vim.lsp.buf.document_symbol = nx.lsp.document_symbol
-vim.lsp.buf.workspace_symbol = function(query)
-  return nx.lsp.workspace_symbol(query)
+vim.lsp.buf.workspace_symbol = function(query, opts)
+  return nx.lsp.workspace_symbol(query, opts)
 end
 vim.lsp.get_clients = function(filter)
   return nx.lsp.clients(filter)

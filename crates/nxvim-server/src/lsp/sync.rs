@@ -38,9 +38,9 @@ impl EditHost {
                 self.settle_lsp_promise(cb_id, serde_json::json!(stopped));
                 return;
             }
-            LspOp::BufRequest { kind, cb_id } => {
+            LspOp::BufRequest { kind, cb_id, name } => {
                 match LspReqKind::from_u16(kind) {
-                    Some(kind) => self.request_lsp(kind, cb_id),
+                    Some(kind) => self.request_lsp(kind, cb_id, name.as_deref()),
                     // An unknown kind can't be issued — settle its promise (resolve
                     // `nil`) rather than leak it.
                     None => self.settle_lsp_promise(cb_id, serde_json::Value::Null),
@@ -48,11 +48,15 @@ impl EditHost {
                 return;
             }
             LspOp::Format { cb_id, name } => {
-                self.request_lsp_format(cb_id, name);
+                self.request_lsp_format(cb_id, name.as_deref());
                 return;
             }
-            LspOp::Rename { new_name, cb_id } => {
-                self.request_lsp_rename(&new_name, cb_id);
+            LspOp::Rename {
+                new_name,
+                cb_id,
+                name,
+            } => {
+                self.request_lsp_rename(&new_name, cb_id, name.as_deref());
                 return;
             }
             LspOp::CodeAction {
@@ -60,8 +64,14 @@ impl EditHost {
                 only,
                 apply,
                 range,
+                name,
             } => {
-                self.request_lsp_code_action(cb_id, CodeActionOpts { only, apply }, range);
+                self.request_lsp_code_action(
+                    cb_id,
+                    CodeActionOpts { only, apply },
+                    range,
+                    name.as_deref(),
+                );
                 return;
             }
             LspOp::SignatureAutoTrigger { enable } => {
@@ -71,8 +81,8 @@ impl EditHost {
                 self.refresh_signature_autotrigger();
                 return;
             }
-            LspOp::WorkspaceSymbol { query, cb_id } => {
-                self.request_lsp_workspace_symbol(&query, cb_id);
+            LspOp::WorkspaceSymbol { query, cb_id, name } => {
+                self.request_lsp_workspace_symbol(&query, cb_id, name.as_deref());
                 return;
             }
             LspOp::DiagnosticGoto { forward, severity } => {

@@ -153,30 +153,42 @@ impl EditHost {
                 Some(entries) => self.editor.open_location_list(entries, "LSP diagnostics"),
                 None => self.editor.echo("No diagnostics"),
             },
-            // Phase-3: go-to / references as ex-commands (the keymap-free path;
-            // the reply jumps the cursor or opens a panel location list).
-            // The ex-command path is fire-and-forget (no Lua promise), so each
-            // passes `cb_id = 0`.
-            "LspDefinition" => self.request_lsp(LspReqKind::Definition, 0),
-            "LspDeclaration" => self.request_lsp(LspReqKind::Declaration, 0),
-            "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition, 0),
-            "LspImplementation" => self.request_lsp(LspReqKind::Implementation, 0),
-            "LspReferences" => self.request_lsp(LspReqKind::References, 0),
-            // Phase-4: hover docs into the panel, signature help on the message
-            // line (the keymap-free path for `K` / `<C-k>`).
-            "LspHover" => self.request_lsp(LspReqKind::Hover, 0),
-            "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp, 0),
-            // Phase-6: buffer-mutating features. Format/code-action take no
-            // argument; rename reads the new name the dispatcher split off — or,
-            // with no name, prompts for it through `vim.lsp.buf.rename()`
+            // Phase-3/4: go-to / references / hover / signature help as ex-commands
+            // (the keymap-free path; the reply jumps the cursor, opens a panel
+            // location list, or floats the docs). The ex-command path is
+            // fire-and-forget (no Lua promise), so each passes `cb_id = 0`.
+            //
+            // Each takes an optional `[server]` — the config name of the attached
+            // client to route to (`:LspHover pyright`), the ex twin of
+            // `nx.lsp.hover{ name = … }`. Without it the request goes to the
+            // capability-ordered default pick, which on a two-server buffer is not
+            // always the one you meant.
+            "LspDefinition" | "LspDeclaration" | "LspTypeDefinition" | "LspImplementation"
+            | "LspReferences" | "LspHover" | "LspSignatureHelp" => {
+                let kind = match name {
+                    "LspDefinition" => LspReqKind::Definition,
+                    "LspDeclaration" => LspReqKind::Declaration,
+                    "LspTypeDefinition" => LspReqKind::TypeDefinition,
+                    "LspImplementation" => LspReqKind::Implementation,
+                    "LspReferences" => LspReqKind::References,
+                    "LspHover" => LspReqKind::Hover,
+                    _ => LspReqKind::SignatureHelp,
+                };
+                match lsp_server_arg(args) {
+                    Ok(server) => self.request_lsp(kind, 0, server),
+                    Err(msg) => self.editor.echo(msg),
+                }
+            }
+            // Phase-6: buffer-mutating features. Format/code-action take only the
+            // optional `[server]`; rename reads the new name the dispatcher split
+            // off — or, with no name, prompts for it through `vim.lsp.buf.rename()`
             // (`vim.ui.input`, Phase 8) instead of erroring.
             // `:LspFormat [server]` — the optional argument picks which attached
             // server formats (the ex twin of `nx.lsp.format{ name = … }`).
-            "LspFormat" => {
-                let name = args.trim();
-                let name = (!name.is_empty()).then(|| name.to_string());
-                self.request_lsp_format(0, name)
-            }
+            "LspFormat" => match lsp_server_arg(args) {
+                Ok(server) => self.request_lsp_format(0, server),
+                Err(msg) => self.editor.echo(msg),
+            },
             "LspRename" if args.trim().is_empty() => {
                 if let Err(e) = self.lua.exec("vim.lsp.buf.rename()") {
                     self.editor
@@ -184,18 +196,33 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
-            "LspRename" => self.request_lsp_rename(args, 0),
+            // `:LspRename {newname} [server]` — the new identifier is the first word
+            // (an identifier never holds a space), so a second one is the client to
+            // route to, as on every other `:Lsp*` verb.
+            "LspRename" => {
+                let args = args.trim();
+                let new_name = args.split_whitespace().next().unwrap_or("");
+                match lsp_server_arg(&args[new_name.len()..]) {
+                    Ok(server) => self.request_lsp_rename(new_name, 0, server),
+                    Err(msg) => self.editor.echo(msg),
+                }
+            }
             // The ex-command is always the interactive, unfiltered form — the kind
             // filter / one-shot apply are `nx.lsp.code_action(opts)` options. An
             // address (`:'<,'>LspCodeAction`, typed straight off a Visual selection)
             // scopes the request to those **whole lines** — an ex address is a line,
             // not a column, so the range runs to the end of the last addressed one.
             // With no address the request falls back to the cursor (or, called from a
-            // Lua keymap, to the live selection).
-            "LspCodeAction" => {
-                let range = range.map(|(lo, hi)| (lo, 0, hi, self.editor.buffer().line_len(hi)));
-                self.request_lsp_code_action(0, Default::default(), range)
-            }
+            // Lua keymap, to the live selection). `[server]` asks only that client
+            // instead of merging every capable server's actions into one chooser.
+            "LspCodeAction" => match lsp_server_arg(args) {
+                Ok(server) => {
+                    let range =
+                        range.map(|(lo, hi)| (lo, 0, hi, self.editor.buffer().line_len(hi)));
+                    self.request_lsp_code_action(0, Default::default(), range, server)
+                }
+                Err(msg) => self.editor.echo(msg),
+            },
             // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
             // an optional `!`) drive the Lua autocmd registry. The core defers
             // them here; the prelude parses the argument line so the `:`-command
@@ -770,6 +797,23 @@ fn builtin_colorscheme(name: &str) -> Option<&'static str> {
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, src)| *src)
+}
+
+/// The optional `[server]` argument every `:Lsp*` verb takes: the config name of
+/// the attached client to route the request to (`:LspHover pyright`), or `None`
+/// when the argument is absent and the default capability pick applies.
+///
+/// A *second* word is an error, not a second server — these commands route to one
+/// client, so `:LspHover pyright ruff` is a typo that must say so rather than
+/// silently asking pyright. (`E488` is vim's trailing-characters error, what
+/// `:command -nargs=?` reports for an extra argument.)
+fn lsp_server_arg(args: &str) -> Result<Option<&str>, String> {
+    let mut words = args.split_whitespace();
+    let server = words.next();
+    match words.next() {
+        Some(extra) => Err(format!("E488: Trailing characters: {extra}")),
+        None => Ok(server),
+    }
 }
 
 /// `:sil[ent]` and its abbreviations (`sil`, `sile`, `silen`, `silent`). The

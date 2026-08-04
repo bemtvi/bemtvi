@@ -637,6 +637,33 @@ impl LspReqKind {
             LspReqKind::FoldingRange => "No folding ranges",
         }
     }
+
+    /// The feature's name in prose, for the message a **routed** request
+    /// ([`EditHost::lsp_route`]) echoes when the client it names is attached but
+    /// doesn't advertise the provider — "'ruff' does not provide hover".
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            LspReqKind::Definition => "definition",
+            LspReqKind::Declaration => "declaration",
+            LspReqKind::TypeDefinition => "type definition",
+            LspReqKind::Implementation => "implementation",
+            LspReqKind::References => "references",
+            LspReqKind::Hover => "hover",
+            LspReqKind::SignatureHelp => "signature help",
+            LspReqKind::Completion => "completion",
+            LspReqKind::Formatting => "formatting",
+            LspReqKind::Rename => "rename",
+            LspReqKind::CodeAction => "code actions",
+            LspReqKind::ResolveCodeAction => "code-action resolve",
+            LspReqKind::CompletionResolve => "completion resolve",
+            LspReqKind::SemanticTokens => "semantic tokens",
+            LspReqKind::InlayHints => "inlay hints",
+            LspReqKind::ResolveInlayHint => "inlay-hint resolve",
+            LspReqKind::DocumentSymbol => "document symbols",
+            LspReqKind::WorkspaceSymbol => "workspace symbols",
+            LspReqKind::FoldingRange => "folding ranges",
+        }
+    }
 }
 
 /// A request in flight, kept per [`LspReqKind`] so a reply can be matched to it

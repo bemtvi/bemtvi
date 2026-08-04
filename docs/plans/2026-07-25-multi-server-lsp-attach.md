@@ -418,6 +418,48 @@ request to the reply and convert with *its* encoding; never re-derive one from t
 buffer. The buffer's first server is the right answer only when there is no
 producing server at all.
 
+### Phase 8 — every verb routes by name (done)
+
+Phase 5 gave `format` a `name`, because a buffer with two servers has no other way to
+say "ruff, not pyright". That argument is not special to formatting: *any* verb
+answered by more than one capable server has the same ambiguity, and the default —
+first in `ServerKey` order that advertises the provider — is a stable pick, not
+necessarily the intended one.
+
+So `name` is now a property of routing rather than of one verb. The single selector
+is `EditHost::lsp_route(buffer, kind, name)`: capable servers for `kind`, narrowed to
+one config name when given, and the **only** place a failed selection is echoed. That
+made `lsp_target_for_or_echo` (single-target) and `open_lsp_fanout` (merging rounds)
+thin wrappers over it, and deleted the bespoke by-name lookup Phase 5 grew inside
+`request_lsp_format`.
+
+- **Ex-commands.** `:LspHover [server]`, and the same optional trailing argument on
+  `:LspDefinition` / `:LspDeclaration` / `:LspTypeDefinition` / `:LspImplementation` /
+  `:LspReferences` / `:LspSignatureHelp` / `:LspCodeAction` (which asks that client
+  alone instead of merging), plus `:LspRename {newname} [server]` — an identifier
+  never holds a space, so the second word is the route. A *second* server name is
+  `E488`, not a silently-ignored typo. The argument completes from the buffer's own
+  attached clients (`cmdline_complete.lua`), in its own slot.
+- **Lua.** Every language verb takes `{ name = … }`: `hover`, `definition`,
+  `declaration`, `type_definition`, `implementation`, `references`, `signature_help`,
+  `document_symbol`, `workspace_symbol`, `rename`, `code_action`, alongside the
+  existing `format`. `LspOp::{BufRequest, Rename, CodeAction, WorkspaceSymbol}` carry
+  it. `nx.lsp.request`/`notify` take `{ bufnr =, name = }` in place of a bare bufnr,
+  so a server's own method reaches *that* server rather than the first attached one.
+  `vim.lsp.buf.rename{ name = … }` / `workspace_symbol(query, opts)` are the aliases —
+  `name` is neovim's own meaning for the key, so it stops being a rejected option.
+- **Failing loud, precisely.** The three ways a route can fail are three different
+  fixes and get three different messages: not attached (`No LSP client named 'x' on
+  this buffer`), attached but still initializing, and attached but withholding the
+  provider (`LSP client 'x' does not provide hover`). None of them falls back to
+  another server — the fallback is the failure the option exists to prevent.
+
+Covered by `a_request_routes_to_the_named_server`,
+`a_named_route_that_cannot_be_honored_says_why` and
+`a_named_code_action_round_asks_only_that_server` in
+`crates/nxvim/tests/lsp_config.rs`, over the same `alpha`/`beta` mock pair: `alpha`
+sorts first, so naming `beta` fails the moment the route is ignored.
+
 ## Testing
 
 Per repo convention every phase is black-box through the running server. The mock

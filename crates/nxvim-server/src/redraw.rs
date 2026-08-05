@@ -1992,6 +1992,34 @@ impl EditHost {
                 }),
             ));
         }
+        // The include/exclude filter boxes (`{ include, exclude, focus, expanded,
+        // badge }`), present only for a picker whose source declared `filter = true`.
+        // Absent ⇒ the client draws exactly the single-prompt box it always has, so
+        // every non-filterable picker's map is byte-for-byte unchanged.
+        //
+        // `expanded` says whether to draw the two rows between the prompt and the
+        // separator (`filter_rows` in the geometry — 2 when set); `focus` says which of
+        // the three lines `query_cursor` belongs to; `badge` is the already-composed
+        // collapsed-state indicator, so no client counts patterns itself.
+        if let Some(f) = &m.filters {
+            let mut fm: Vec<(Value, Value)> = vec![
+                (Value::from("include"), Value::from(f.include.as_str())),
+                (Value::from("exclude"), Value::from(f.exclude.as_str())),
+                (
+                    Value::from("focus"),
+                    Value::from(match f.focus {
+                        nxvim_core::PromptField::Query => "query",
+                        nxvim_core::PromptField::Include => "include",
+                        nxvim_core::PromptField::Exclude => "exclude",
+                    }),
+                ),
+                (Value::from("expanded"), Value::from(f.expanded)),
+            ];
+            if let Some(badge) = &f.badge {
+                fm.push((Value::from("badge"), Value::from(badge.as_str())));
+            }
+            map.push((Value::from("filters"), Value::Map(fm)));
+        }
         // The preview sub-map (`{ lines, first_line, title, loc, width, highlights }`),
         // present only when this picker carries a preview pane. Its presence tells the
         // client to split the box into a list column + this preview column.

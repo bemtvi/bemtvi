@@ -14,10 +14,9 @@ registering your own is a few lines.
 `files` and `live_grep` search **unrestricted** by default — the equivalent of
 `rg -uu` (`--no-ignore --hidden`), so a `.gitignore`d build artifact or a dotfile
 like `.github/workflows/ci.yml` is still findable. The one exclusion is `.git`
-itself. To narrow it, register your own source under the same name (a later
-`nx.picker.source` call with `name = "files"` replaces the shipped one) — see
-[Writing a source](#writing-a-source) and the `examples/telescope-parity` config,
-which builds plain / `-uu` / `-uu` + excludes grep variants from one factory.
+itself. Narrowing a search is the [filter boxes](#include--exclude-filters)' job
+(`<C-g>`) — per-search, so hiding `target/` this time never makes a file
+unfindable the next.
 
 ## Using a picker
 
@@ -144,6 +143,25 @@ nx.picker.source({
 })
 ```
 
+Declaring `filter = true` gives the source the
+[include/exclude boxes](#include--exclude-filters). Every candidate carrying a
+`path` is then tested against them at the single point they all cross, so a source
+gets the filter for free however it enumerates. A source that shells out to a
+ripgrep-compatible tool should *also* splice `ctx.rg_globs` (ready-made `-g`
+argument pairs) into its argv, so the tool prunes the tree instead of streaming
+paths that are about to be dropped — on a `node_modules`-sized directory that is
+the difference between the results arriving and the cap filling with noise. The
+patterns themselves reach the source as `ctx.include` / `ctx.exclude`.
+
+```lua
+items = nx.async(function(ctx)
+  local args = { "--files", "--color=never" }
+  for _, a in ipairs(ctx.rg_globs) do args[#args + 1] = a end
+  local stream = nx.run_stream({ cmd = "rg", args = args, cwd = ctx.cwd })
+  …
+end),
+```
+
 `nx.picker.edit(item, mode)` is the common confirm action: it opens `item.path`
 and, if the item carries a 1-based `row` (and optional `col`), jumps the cursor
 there. The `mode` is the confirm gesture (the picker passes it to
@@ -234,6 +252,8 @@ the source, which in turn overrides the picker default:
 | `multiselect` | Whether `<Tab>` marks rows for a batch action (default `true`); `false` is a single-choice picker. |
 | `layer` | Where a confirmed item opens: `"main"` crosses back to the main editor area first; `"active"` (the default) opens in the focused layer. The shipped `files` / `live_grep` set `"main"`. |
 | `debounce` | Milliseconds before a `dynamic` source re-runs; `0` off. |
+| `include` / `exclude` | Pre-fill the [filter boxes](#include--exclude-filters) — a comma-separated string or a list of globs. A seed, not a lock: the boxes stay editable. |
+| `filters` | `"open"` reveals the filter rows immediately; `"collapsed"` (the default) keeps the picker's single-line shape with a badge. |
 
 ```lua
 -- a snappier live grep, just for this map:
@@ -261,9 +281,92 @@ The actions are `next`, `prev`, `confirm`, `confirm_tab`, `confirm_split`,
 `confirm_vsplit`, `cancel`, `send_to_list`,
 `toggle_select`, `clear_select`, `preview_half_down`, `preview_half_up`,
 `preview_page_down`, `preview_page_up`, `backspace`, `delete`, `left`, `right`,
-`to_start`, `to_end`. The one key that is *not* a map is an
-arbitrary printable char — there is no way to enumerate every char, so an unmapped
-printable just inserts into the query.
+`to_start`, `to_end`, `next_field`, `toggle_filters`. The one key that is *not* a
+map is an arbitrary printable char — there is no way to enumerate every char, so an
+unmapped printable just inserts into whichever line has focus.
+
+## Include / exclude filters
+
+`files` and `live_grep` carry two glob boxes, the way VSCode's search panel does —
+**files to include** and **files to exclude**. `<C-g>` reveals them and steps
+through the three editable lines (query → include → exclude); typing goes to
+whichever has focus.
+
+```
+┌─ Find Files ─────────────────────┐      ┌─ Find Files ─────────────────────┐
+│ > handler               [+1 -2]  │      │ > handler                        │
+├──────────────────────────────────┤ <C-g>│ include  src/**                  │
+│ src/net/handler.rs               │ ───► │ exclude  target/, *.lock         │ ← focus
+│ src/ui/handler.rs                │      ├──────────────────────────────────┤
+└──────────────────────────────────┘      │ src/net/handler.rs               │
+        collapsed, filters active         └──────────────────────────────────┘
+```
+
+Each box holds a **comma-separated** list of globs. A comma inside `{…}` belongs to
+the pattern, so `**/{node_modules,target}/**` is one glob, not two. Collapsing the
+boxes does not turn the filter off — the badge (`[+1 -2]`: one include, two exclude
+patterns) keeps an active filter visible, so a search that is quietly hiding files
+never looks like one that isn't.
+
+### Defaults
+
+`nx.picker.setup` sets the line every filterable picker opens with — the "stop
+showing me build output" knob:
+
+```lua
+nx.picker.setup({
+  exclude = { "target/", "node_modules/", "*.min.js" },
+  history = 20,  -- past lines kept per box for <C-Up>/<C-Down>; 0 disables
+})
+```
+
+### History — `<C-Up>` / `<C-Down>`
+
+Each box remembers the lines you have used, most recent first, and **persists them
+across restarts** (via `nx.shada.plugin`, on the ordinary shada cadence). With a box
+focused, `<C-Up>` walks back into older lines and `<C-Down>` forward again, returning
+to the line you were composing — cmdline history. The two boxes keep separate lists,
+so an include pattern never surfaces in the exclude box where it would mean the
+opposite.
+
+A filterable picker opens pre-filled with the most recent line for each box, so the
+filter you worked out yesterday is already applied rather than retyped.
+
+```lua
+nx.picker.history("exclude")   -- the stored lines, most recent first
+nx.picker.forget_history()     -- drop them all
+```
+
+Precedence, lowest to highest: the source's own default → `nx.picker.setup` → the
+most recent line used → an explicit `nx.picker.open{ include = … }`. History outranks
+the configured default because a line you actually typed is a stronger statement than
+one configured months ago; an explicit open option outranks everything, so a picker
+asked for a scope gets exactly that scope.
+
+Two conveniences make a typed pattern mean what you meant:
+
+| You type | It matches |
+| --- | --- |
+| `*.lock` | any `.lock` file, at any depth |
+| `target` | the `target` entry **and** everything under it, at any depth |
+| `vendor/` | same — a trailing `/` just says "the directory" |
+| `src/**` | taken as written; a pattern with a `/` is anchored at the search root |
+
+A picker can also open already scoped, which is what a dedicated map usually wants:
+
+```lua
+-- "find in sources"
+nx.keymap.set("n", "<leader>fs", function()
+  nx.picker.open("files", { include = { "src/**", "crates/**" } })
+end)
+
+-- grep everything except the vendored trees, with the boxes already showing
+nx.picker.open("live_grep", { exclude = "vendor/, **/*.min.js", filters = "open" })
+```
+
+Any source whose items carry a `path` can have the boxes by declaring
+`filter = true` — see [Writing a source](#writing-a-source). On a source without
+it, `<C-g>` says so rather than presenting boxes that would filter nothing.
 
 ## Try it
 
@@ -275,6 +378,18 @@ NXVIM_CONFIG=examples/ui-picker cargo run -p nxvim -- examples/ui-picker/sample.
 
 It maps the three built-in sources, registers a custom static source, and shows
 the box-size, preview, and debounce overrides.
+
+For the filter boxes there is a second playground,
+[`examples/picker-filters`](https://github.com/davidrios/nxvim/tree/main/examples/picker-filters):
+
+```sh
+NXVIM_CONFIG=examples/picker-filters \
+  cargo run -p nxvim -- examples/picker-filters/sample.txt
+```
+
+It ships the mess a real project has — a `target/` artifact, a `vendor/` lock file,
+a dotfile — and walks through defaults, editing a box, what each pattern shape
+means, the `<C-Up>` history, pre-scoped pickers, and a custom filterable source.
 
 ## How it works (in brief)
 

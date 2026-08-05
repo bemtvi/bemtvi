@@ -246,9 +246,16 @@ pub struct MenuView {
     /// The picker prompt's query text — `Some` for a `nx.picker`, `None` for a
     /// promptless `nx.ui.select`. Presence tells the client to draw a prompt line.
     pub query: Option<String>,
-    /// The picker prompt's text-cursor position, as a count of chars before it
-    /// (the caret column within `query`). `0` for a promptless `nx.ui.select`.
+    /// The picker prompt's text-cursor position, as a count of chars before it — the
+    /// caret column within the **focused** line ([`FilterView::focus`] says which one
+    /// that is; without filters it is always the query). `0` for a promptless
+    /// `nx.ui.select`.
     pub query_cursor: usize,
+    /// The include/exclude glob filter boxes, when this picker's source declared
+    /// `filter = true`. `None` for a `select` / completion / cmdline menu and for a
+    /// picker whose source has nothing to filter (`keymaps`, `marks`, …) — the client
+    /// then draws exactly the single prompt line it always has.
+    pub filters: Option<FilterView>,
     /// Where the picker prompt sits relative to the list
     /// ([`PromptPos`](crate::editor::PromptPos)). `Top` (the default) for a
     /// promptless `nx.ui.select`; only meaningful when `query` is `Some`.
@@ -329,6 +336,46 @@ pub struct MenuView {
     /// The picker box's optional title (`nx.picker.open(name, { title = … })`),
     /// rendered on the top border. `None` for the wildmenu / completion / select.
     pub title: Option<String>,
+}
+
+/// A picker's include / exclude glob filter boxes — VSCode's "files to include" and
+/// "files to exclude", projected for the client to paint.
+///
+/// The two lines are the raw comma-separated text the user typed; the client renders
+/// them verbatim and never has to know what a pattern is. When
+/// [`expanded`](Self::expanded) they are drawn as two rows between the prompt and the
+/// list; when collapsed the picker keeps its original single-line shape and
+/// [`badge`](Self::badge) — already composed — is the only trace, so an active filter
+/// is never invisible.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FilterView {
+    /// The "files to include" line. Empty ⇒ every path is a candidate.
+    pub include: String,
+    /// The "files to exclude" line. Empty ⇒ nothing is filtered out.
+    pub exclude: String,
+    /// Which of the three lines has the caret ([`query_cursor`](MenuView::query_cursor)
+    /// is its column), so the client draws it on the right row.
+    pub focus: crate::editor::PromptField,
+    /// Whether the two rows are drawn. They still filter when collapsed.
+    pub expanded: bool,
+    /// The collapsed-state indicator (`[+2 -1]` — two include, one exclude patterns),
+    /// composed core-side so the clients cannot disagree on the count. `None` when
+    /// expanded (the rows say it) or when nothing is filtering.
+    pub badge: Option<String>,
+}
+
+impl MenuView {
+    /// How many rows the include/exclude boxes occupy — `2` when revealed, `0`
+    /// otherwise. **The single definition of that budget**: the core's box geometry,
+    /// the mouse hit-test and all three clients derive their layout from this, and any
+    /// one of them counting rows for itself would drift the list (and every click on
+    /// it) off by the difference.
+    pub fn filter_rows(&self) -> usize {
+        match &self.filters {
+            Some(f) if f.expanded => 2,
+            _ => 0,
+        }
+    }
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

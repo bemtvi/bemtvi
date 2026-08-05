@@ -18,10 +18,15 @@ use nxvim_view::{
     ScrollAnim,
 };
 use nxvim_view::{
-    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
-    PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View, VirtChunk,
-    VirtPlacement, WindowRegion, WindowView,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuField,
+    MenuPreview, PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View,
+    VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
+
+/// The width of a filter row's `include` / `exclude` label, including its trailing
+/// gap — the column the box's text (and its caret) starts at. Matches the `{:<8}`
+/// the rows are painted with.
+const FILTER_LABEL_W: usize = 8;
 
 /// Convert a neutral [`nxvim_view::Style`] into the ratatui [`Style`] the renderer
 /// paints. `fg`/`bg` become truecolor, `sp` the underline color, and each flag its
@@ -2723,7 +2728,10 @@ fn render_menu(
     // whole box. The prompt sits above the list by default, or below it when the
     // source/open asked for it (telescope-style).
     let has_prompt = menu.query.is_some();
-    let chrome = usize::from(has_prompt) * 2;
+    // With the filter boxes revealed, their two rows sit between the prompt and the
+    // separator. `filter_rows` is the shared count the server sized the box with.
+    let filter_rows = menu.filter_rows();
+    let chrome = usize::from(has_prompt) * 2 + filter_rows;
     let list_rows = inner_h.saturating_sub(chrome);
     // A noselect completion popup highlights no row and scrolls from the top.
     let sel = menu.selected_active.then_some(menu.selected);
@@ -2786,13 +2794,59 @@ fn render_menu(
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
     let prompt_line = || -> Line<'static> {
         let query = menu.query.as_deref().unwrap_or("");
+        // A collapsed filter box shows its badge (`[+2 -1]`) right-aligned on the
+        // prompt row — the picker keeps its usual single-line shape, but a search that
+        // is quietly hiding files never looks like one that isn't.
+        let badge = menu
+            .filters
+            .as_ref()
+            .and_then(|f| f.badge.as_deref())
+            .unwrap_or("");
+        let body_w = width.saturating_sub(2);
+        if badge.is_empty() {
+            return Line::from(vec![
+                Span::styled("> ", prompt_style),
+                Span::styled(
+                    pmenu_row(query, "", body_w),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]);
+        }
+        let badge_w = UnicodeWidthStr::width(badge);
         Line::from(vec![
             Span::styled("> ", prompt_style),
             Span::styled(
-                pmenu_row(query, "", width.saturating_sub(2)),
+                pmenu_row(query, "", body_w.saturating_sub(badge_w)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
+            Span::styled(badge.to_string(), prompt_style),
         ])
+    };
+    // One `include`/`exclude` row: a dim label, then the raw comma-separated line the
+    // user typed. The focused row's label is undimmed so the active box is obvious
+    // even before the caret is spotted.
+    let filter_line = |label: &'static str, text: &str, focused: bool| -> Line<'static> {
+        let label_style = if focused {
+            prompt_style.add_modifier(Modifier::BOLD)
+        } else {
+            prompt_style
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<8}"), label_style),
+            Span::styled(
+                pmenu_row(text, "", width.saturating_sub(FILTER_LABEL_W)),
+                Style::default(),
+            ),
+        ])
+    };
+    let filter_lines = || -> Vec<Line<'static>> {
+        match &menu.filters {
+            Some(f) if f.expanded => vec![
+                filter_line("include", &f.include, f.focus == MenuField::Include),
+                filter_line("exclude", &f.exclude, f.focus == MenuField::Exclude),
+            ],
+            _ => Vec::new(),
+        }
     };
     // The internal division rules (prompt/list horizontal rule, preview vertical
     // rule) take the themed border style — the same `TelescopeBorder`/`FloatBorder`
@@ -2807,18 +2861,36 @@ fn render_menu(
     let sep_line = || -> Line<'static> { Line::from(Span::styled("─".repeat(width), sep_style)) };
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
-    // The prompt row's offset within `inner` (for the caret); `None` when promptless.
-    let mut prompt_row = None;
+    // The row the caret sits on, within `inner`: the prompt, or whichever filter box
+    // has focus. `None` when promptless.
+    let mut caret_row = None;
+    // The filter rows always follow the prompt (above the separator in a top-prompt
+    // layout, below it in a bottom-prompt one) so the three editable lines stay
+    // adjacent and the list keeps one contiguous block.
+    let focus = menu
+        .filters
+        .as_ref()
+        .filter(|f| f.expanded)
+        .map_or(MenuField::Query, |f| f.focus);
+    let caret_offset = |base: usize| -> usize {
+        base + match focus {
+            MenuField::Query => 0,
+            MenuField::Include => 1,
+            MenuField::Exclude => 2,
+        }
+    };
     if has_prompt && menu.prompt_bottom {
         for r in 0..list_rows {
             lines.push(list_line(r));
         }
         lines.push(sep_line());
-        prompt_row = Some(lines.len());
+        caret_row = Some(caret_offset(lines.len()));
         lines.push(prompt_line());
+        lines.extend(filter_lines());
     } else if has_prompt {
-        prompt_row = Some(0);
+        caret_row = Some(caret_offset(0));
         lines.push(prompt_line());
+        lines.extend(filter_lines());
         lines.push(sep_line());
         for r in 0..list_rows {
             lines.push(list_line(r));
@@ -2847,21 +2919,23 @@ fn render_menu(
     // render as real doc-float windows through the normal window path, so nothing to
     // draw here.)
 
-    // The terminal caret sits in the prompt (in the list column), past the `> `
-    // prefix at the query's text-cursor column (clamped inside the column).
+    // The terminal caret sits on the focused line (in the list column), past that
+    // line's prefix at its text-cursor column (clamped inside the column).
     // `query_cursor` is a *char* offset (the server's `cursor_chars()`); the caret
     // column is display cells, so measure the painted width of the chars before it
     // (a wide CJK char in the query occupies two cells).
-    prompt_row.map(|row| {
-        let qw: usize = menu
-            .query
-            .as_deref()
-            .unwrap_or("")
+    caret_row.map(|row| {
+        let (text, prefix_w) = match (focus, &menu.filters) {
+            (MenuField::Include, Some(f)) => (f.include.as_str(), FILTER_LABEL_W),
+            (MenuField::Exclude, Some(f)) => (f.exclude.as_str(), FILTER_LABEL_W),
+            _ => (menu.query.as_deref().unwrap_or(""), 2),
+        };
+        let qw: usize = text
             .chars()
             .take(menu.query_cursor as usize)
             .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
             .sum();
-        let caret = u16::try_from(2 + qw)
+        let caret = u16::try_from(prefix_w + qw)
             .unwrap_or(u16::MAX)
             .min(list_area.width.saturating_sub(1));
         (list_area.x + caret, list_area.y + row as u16)

@@ -1944,11 +1944,13 @@ impl Editor {
         } else {
             (content_w, None)
         };
-        // The selectable rows sit below the prompt + separator chrome (a picker's
-        // prompt is on top by default, on the bottom when asked); a promptless `select`
-        // / completion popup has none, so the list fills the content height.
+        // The selectable rows sit below the prompt + filter + separator chrome (a
+        // picker's prompt is on top by default, on the bottom when asked); a promptless
+        // `select` / completion popup has none, so the list fills the content height.
+        // The sum must match `menu_geom`'s exactly, or every click lands on the wrong
+        // row by the difference — hence the shared `filter_rows`.
         let prompt_rows = usize::from(m.query.is_some());
-        let chrome = prompt_rows * 2;
+        let chrome = prompt_rows + m.filter_rows() + prompt_rows;
         let prompt_top = prompt_rows > 0 && m.prompt_pos == PromptPos::Top;
         let list_y = content_y.saturating_add(if prompt_top { chrome } else { 0 });
         let list_rows = content_h.saturating_sub(chrome);

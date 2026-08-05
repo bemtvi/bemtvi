@@ -156,13 +156,19 @@ impl UserData for LuaHasher {
 /// `{top=,…}` are all expanded there), so an absent or malformed value is treated
 /// as no margin.
 /// The argument tuple of the `nx._picker_open` bridge: `(dynamic, width, height,
-/// align, margin, prompt_bottom, preview, query, title, multiselect, resumable)` —
-/// width/height/align are raw specs the server parses, `margin` is a `[top, right,
-/// bottom, left]` array, `query` is the initial prompt text (empty for the historical
-/// empty-prompt open), `title` is the optional box title, and `resumable` gates the
-/// `nx.picker.resume()` snapshot (default true; false for the transient cmdline
-/// completer). Aliased to keep clippy's complex-type lint quiet on the closure
-/// signature.
+/// align, margin, prompt_bottom, preview, query, title, multiselect, resumable,
+/// filters)` — width/height/align are raw specs the server parses, `margin` is a
+/// `[top, right, bottom, left]` array, `query` is the initial prompt text (empty for
+/// the historical empty-prompt open), `title` is the optional box title, and
+/// `resumable` gates the `nx.picker.resume()` snapshot (default true; false for the
+/// transient cmdline completer). Aliased to keep clippy's complex-type lint quiet on
+/// the closure signature.
+///
+/// The include/exclude boxes travel as **one table** rather than as positional
+/// arguments (`{ on, include, exclude, open, include_history, exclude_history }`,
+/// read by [`filters_from_table`]): they are six values that grow together, and
+/// mlua caps `create_function` at 16 arguments — the same reason `CompleteSetupArgs`
+/// packs. Anything further about the filters goes in that table, not here.
 type PickerOpenArgs = (
     bool,
     Option<String>,
@@ -175,7 +181,41 @@ type PickerOpenArgs = (
     Option<String>,
     Option<bool>,
     Option<bool>,
+    Option<Table>,
 );
+
+/// Read the `nx._picker_open` filters table into the flat fields [`PickerOpenReq`]
+/// carries. An absent table (or an absent field) is the unfiltered default, so a
+/// source that never opted in — and every caller written before the boxes existed —
+/// opens exactly the picker it always did.
+fn filters_from_table(t: Option<&Table>) -> (bool, String, String, bool, Vec<String>, Vec<String>) {
+    let Some(t) = t else {
+        return (false, String::new(), String::new(), false, vec![], vec![]);
+    };
+    let str_list = |key: &str| -> Vec<String> {
+        t.get::<Option<Vec<String>>>(key)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
+    (
+        t.get::<Option<bool>>("on").ok().flatten().unwrap_or(false),
+        t.get::<Option<String>>("include")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        t.get::<Option<String>>("exclude")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        t.get::<Option<bool>>("open")
+            .ok()
+            .flatten()
+            .unwrap_or(false),
+        str_list("include_history"),
+        str_list("exclude_history"),
+    )
+}
 
 /// The number of `char`s before byte offset `byte` in `s` — to turn the markdown
 /// renderer's byte-anchored spans into the char columns `nx.markdown.render` reports.
@@ -3254,7 +3294,10 @@ pub(crate) fn install_runtime_api(
                 title,
                 multiselect,
                 resumable,
+                filters,
             ) = args;
+            let (filterable, include, exclude, filters_open, include_history, exclude_history) =
+                filters_from_table(filters.as_ref());
             sh.borrow_mut().picker_opens.push(PickerOpenReq {
                 dynamic,
                 width: width.unwrap_or_default(),
@@ -3272,6 +3315,15 @@ pub(crate) fn install_runtime_api(
                 multiselect: multiselect.unwrap_or(true),
                 // Default-on: only an explicit `resumable = false` opts out of resume.
                 resumable: resumable.unwrap_or(true),
+                // Default-OFF, unlike the two above: a source has include/exclude boxes
+                // only by declaring `filter = true`, so every existing source keeps
+                // exactly the picker it had.
+                filterable,
+                include,
+                exclude,
+                filters_open,
+                include_history,
+                exclude_history,
             });
             Ok(())
         })?,
@@ -4224,6 +4276,17 @@ pub(crate) fn install_runtime_api(
         lua.create_function(|_, s: mlua::Value| {
             let s = crate::glob::candidate("nx.glob.is_glob", "value", &s)?;
             Ok(nxvim_core::glob::is_glob(&*s.as_bytes()))
+        })?,
+    )?;
+    // `nx._glob_split(list)` -> a list of patterns: split one comma-separated line of
+    // globs, ignoring commas inside `{…}` alternation. Bridged rather than written in
+    // Lua so the picker's core-side badge count and its Lua-side filter split the same
+    // line the same way.
+    nx.set(
+        "_glob_split",
+        lua.create_function(|_, s: mlua::Value| {
+            let s = crate::glob::candidate("nx.glob.split", "list", &s)?;
+            Ok(nxvim_core::glob::split_patterns(&s.to_string_lossy()))
         })?,
     )?;
 

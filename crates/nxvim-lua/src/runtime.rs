@@ -2152,10 +2152,31 @@ impl LuaRuntime {
     /// the source's per-generation item array, and invokes its `items(ctx, push,
     /// done)`; the `push`es land back as [`PickerPush`](crate::ops::PickerPush)es.
     /// Called on open (`gen 0`, empty query) and on each dynamic query edit.
-    pub fn run_picker_run(&self, gen: u64, query: &str) -> mlua::Result<()> {
+    /// Fold a just-closed picker's filter lines into the persisted history
+    /// (`nx.picker._history_record`). Lua dedupes, caps and writes them to its
+    /// `nx.shada.plugin` store; an empty line records nothing.
+    pub fn run_picker_history_record(&self, include: &str, exclude: &str) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let picker: Table = nx.get("picker")?;
+        let record: mlua::Function = picker.get("_history_record")?;
+        record.call::<()>((include.to_string(), exclude.to_string()))
+    }
+
+    pub fn run_picker_run(
+        &self,
+        gen: u64,
+        query: &str,
+        include: &str,
+        exclude: &str,
+    ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_run")?;
-        run.call::<()>((lua_int(gen as i64), query.to_string()))
+        run.call::<()>((
+            lua_int(gen as i64),
+            query.to_string(),
+            include.to_string(),
+            exclude.to_string(),
+        ))
     }
 
     /// Re-render the custom statusline segment `name` for **every** window

@@ -1,0 +1,15 @@
+nx.picker include / exclude filters
+===================================
+
+Open a picker and press <C-g> to reveal the two glob boxes.
+
+  <leader>ff   find files          <C-g>   cycle query / include / exclude
+  <leader>fg   live grep           <C-Up>  recall an older filter line
+  <leader>fs   files in src/       <C-Down> recall a newer one
+  <leader>fS   grep in src/
+
+This directory holds a build artifact and a vendored lock file on purpose, so
+there is something worth filtering out. Read init.lua for the walkthrough.
+
+The word needle appears here and in src/, target/ and vendor/ — grep for it
+with and without an include pattern to see the difference.

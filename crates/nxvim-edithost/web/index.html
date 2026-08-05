@@ -2348,7 +2348,13 @@
       // the server asks (`prompt_pos === "bottom"`).
       const hasPrompt = menu.query !== null && menu.query !== undefined;
       const promptBottom = hasPrompt && menu.prompt_pos === "bottom";
-      const chromeRows = hasPrompt ? 2 : 0;
+      // A picker whose source declared `filter = true` carries the include/exclude glob
+      // boxes. Revealed, they add TWO rows between the prompt and the rule — the same
+      // count the server sized the box with (`MenuView::filter_rows`), so the list
+      // height here has to include them or the box overflows by two rows.
+      const filters = menu.filters || null;
+      const filterRows = filters && filters.expanded ? 2 : 0;
+      const chromeRows = (hasPrompt ? 2 : 0) + filterRows;
       // A preview pane (Phase 3) splits the box into a list column (left) + a 1-col
       // glyph separator + a preview column (right). The list keeps `width - previewW - 1`.
       const hasPreview = menu.preview != null;
@@ -2431,25 +2437,56 @@
       // here but ordered into the box below, so a `prompt_pos === "bottom"` picker can
       // flip them beneath the list (telescope-style).
       let promptEl = null, sepEl = null;
+      const filterEls = [];
       if (hasPrompt) {
-        const text = ("> " + menu.query).slice(0, listW).padEnd(listW);
+        // Which of the three editable lines owns the caret. Collapsed boxes can't hold
+        // it (the core moves focus back to the query when they close), so a stale focus
+        // never strands the cursor on an undrawn row.
+        const focus = filterRows ? filters.focus : "query";
+        // Build one editable line: `prefix` is what precedes the text (`"> "`, or the
+        // 8-cell `include` / `exclude` label), and the caret is drawn only on the line
+        // that has focus — tagged with CURSOR_ID so the IME proxy follows the real
+        // input rather than the hidden buffer.
+        const editableRow = (prefix, text, focused) => {
+          const full = (prefix + text).slice(0, listW).padEnd(listW);
+          const curIdx = focused
+            ? Math.min([...prefix].length + menu.query_cursor, listW - 1)
+            : -1;
+          const chars = [...full];
+          let html = "";
+          for (let i = 0; i < chars.length; i++) {
+            html += i === curIdx
+              ? `<span id="${CURSOR_ID}" class="cur-block">${escapeHtml(chars[i])}</span>`
+              : escapeHtml(chars[i]);
+          }
+          return html;
+        };
+        // A collapsed filter box shows its badge right-aligned on the prompt row, so a
+        // search that is quietly hiding files never looks like one that isn't.
+        const badge = (filters && filters.badge) || "";
+        let promptText = menu.query;
+        if (badge) {
+          const room = Math.max(0, listW - 2 - badge.length);
+          promptText = promptText.slice(0, room).padEnd(room) + badge;
+        }
         promptEl = document.createElement("div");
         promptEl.className = "row" + (sPrompt ? "" : " pmenu-prompt");
         if (sPrompt && sPrompt.fg != null) promptEl.style.color = cssColor(sPrompt.fg);
         promptEl.style.width = listW * cw + "px";
         promptEl.style.fontWeight = "bold";
-        // The query input cursor sits after the `> ` prefix at `query_cursor` (a CHAR
-        // offset, mirroring the cmdline cursor), clamped inside the box. Tag it with
-        // CURSOR_ID so the IME proxy follows the picker input, not the hidden buffer.
-        const curIdx = Math.min(2 + menu.query_cursor, listW - 1);
-        const pchars = [...text];
-        let phtml = "";
-        for (let i = 0; i < pchars.length; i++) {
-          phtml += i === curIdx
-            ? `<span id="${CURSOR_ID}" class="cur-block">${escapeHtml(pchars[i])}</span>`
-            : escapeHtml(pchars[i]);
+        promptEl.innerHTML = editableRow("> ", promptText, focus === "query");
+        // The include / exclude rows, each an 8-cell label then the raw comma-separated
+        // line the user typed.
+        if (filterRows) {
+          for (const name of ["include", "exclude"]) {
+            const el = document.createElement("div");
+            el.className = "row" + (sPrompt ? "" : " pmenu-prompt");
+            if (sPrompt && sPrompt.fg != null) el.style.color = cssColor(sPrompt.fg);
+            el.style.width = listW * cw + "px";
+            el.innerHTML = editableRow(name.padEnd(8), filters[name], focus === name);
+            filterEls.push(el);
+          }
         }
-        promptEl.innerHTML = phtml;
         // A full-width rule between the prompt and the list, themed off the border
         // group (`TelescopeBorder` &c.) when set, else the built-in chrome color.
         sepEl = document.createElement("div");
@@ -2528,9 +2565,11 @@
       if (menu.cmdline) listEls.reverse();
       // Assemble the box: prompt + rule above the list (default), or below it
       // (`prompt_pos === "bottom"`); a promptless select is the bare list.
+      // The filter rows always follow the prompt, keeping the three editable lines
+      // adjacent whichever side of the list the prompt sits on.
       const rows = promptBottom
-        ? [...listEls, sepEl, promptEl]
-        : [promptEl, sepEl, ...listEls];
+        ? [...listEls, sepEl, promptEl, ...filterEls]
+        : [promptEl, ...filterEls, sepEl, ...listEls];
       for (const el of rows) if (el) box.appendChild(el);
       gridEl.appendChild(box);
 

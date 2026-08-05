@@ -1128,3 +1128,79 @@ async fn plugin_namespaces_can_be_listed_and_forgotten() {
         "namespaces() lists both sorted; forget('alpha') drops only alpha"
     );
 }
+
+#[tokio::test]
+async fn picker_filter_history_survives_a_restart() {
+    // The include/exclude glob boxes remember the lines you have used, and that
+    // memory outlives the session — so the exclude you worked out on Friday is one
+    // `<C-Up>` away on Monday. It rides `nx.shada.plugin`, which flushes on the
+    // ordinary shada cadence, so nothing extra is wired into the store.
+    let dir = temp_dir("shada_picker_filters");
+    let cfg = temp_dir("shada_picker_filters_cfg");
+    // A path source with the filter boxes; no process spawn, so this stays hermetic.
+    std::fs::write(
+        cfg.join("init.lua"),
+        r#"
+nx.picker.source {
+  name = "paths",
+  filter = true,
+  items = function(ctx)
+    for _, p in ipairs({ "src/main.rs", "target/junk.rs" }) do
+      ctx.push { text = p, path = p }
+    end
+  end,
+  confirm = function(item) end,
+}
+"#,
+    )
+    .expect("write init.lua");
+    let init = |dir: &Path| ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        shada: Some(Box::new(RedbFileStore::new(dir.to_path_buf()))),
+        ..Default::default()
+    };
+
+    // Session 1: use an exclude line, then quit cleanly (flushing the store).
+    {
+        let (rpc, incoming) = start_attached(init(&dir), 80, 25).await;
+        exec_lua(&rpc, "nx.picker.open('paths', { exclude = 'target/' })").await;
+        feed(&rpc, "<Esc>");
+        // Barrier: let the close (and the history write it triggers) land.
+        assert_eq!(
+            exec_lua(
+                &rpc,
+                r#"return table.concat(nx.picker.history("exclude"), "|")"#
+            )
+            .await
+            .as_str(),
+            Some("target/"),
+            "the line is recorded in-session first"
+        );
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: a fresh server on the same store recalls it — and a filterable
+    // picker opens pre-filled with it, which is the point of persisting at all.
+    {
+        let (rpc, _incoming) = start_attached(init(&dir), 80, 25).await;
+        assert_eq!(
+            exec_lua(
+                &rpc,
+                r#"return table.concat(nx.picker.history("exclude"), "|")"#
+            )
+            .await
+            .as_str(),
+            Some("target/"),
+            "the filter history came back from the previous session"
+        );
+        assert_eq!(
+            exec_lua(&rpc, r#"return #nx.picker.history("include")"#)
+                .await
+                .as_u64(),
+            Some(0),
+            "and the box that was never used stayed empty"
+        );
+    }
+}

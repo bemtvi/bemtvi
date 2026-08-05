@@ -966,3 +966,46 @@ async fn runtime_file_lookup_speaks_the_full_dialect_and_sorts() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ── nx.glob.split ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn split_takes_a_comma_separated_line_without_breaking_brace_alternation() {
+    // The splitter behind a "files to include" text box. Commas separate patterns —
+    // except inside `{…}`, where they belong to a single glob's alternation. One
+    // implementation, shared by the picker's Rust-side badge count and its Lua-side
+    // filter, so the two can never disagree on what a pattern is.
+    let (rpc, _incoming) = start().await;
+
+    assert_eq!(
+        eval(
+            &rpc,
+            r#"table.concat(nx.glob.split("src/**, docs/**"), "|")"#
+        )
+        .await,
+        "src/**|docs/**"
+    );
+    assert_eq!(
+        eval(
+            &rpc,
+            r#"table.concat(nx.glob.split("**/{node_modules,target}/**"), "|")"#
+        )
+        .await,
+        "**/{node_modules,target}/**",
+        "a brace alternation's commas are part of the pattern, not separators"
+    );
+    assert_eq!(
+        eval(
+            &rpc,
+            r#"table.concat(nx.glob.split("  , *.lock ,, a/b "), "|")"#
+        )
+        .await,
+        "*.lock|a/b",
+        "entries are trimmed and blanks dropped"
+    );
+    assert_eq!(
+        eval(&rpc, r#"#nx.glob.split("")"#).await,
+        "0",
+        "an empty line is no patterns at all"
+    );
+}

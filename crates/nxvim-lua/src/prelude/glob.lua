@@ -211,3 +211,20 @@ end
 function nx.glob.is_glob(s)
   return nx._glob_is_glob(s)
 end
+
+-- `nx.glob.split(list)` -> a list of patterns: split one **comma-separated line** of
+-- globs — the shape a "files to include" text box takes — trimming whitespace around
+-- each entry and dropping empty ones.
+--
+-- The comma is not a plain separator: `{...}` alternation puts commas *inside* a
+-- single glob, so only commas at brace depth zero split. That is the whole reason to
+-- call this rather than a hand-rolled `gmatch`.
+--
+-- ```lua
+-- nx.glob.split("src/**, docs/**")   --> { "src/**", "docs/**" }
+-- nx.glob.split("**/{a,b}/**")       --> { "**/{a,b}/**" }   ( one pattern )
+-- nx.glob.split("  , *.lock ,, ")    --> { "*.lock" }
+-- ```
+function nx.glob.split(list)
+  return nx._glob_split(list)
+end

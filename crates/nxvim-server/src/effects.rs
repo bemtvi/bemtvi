@@ -1000,6 +1000,14 @@ impl EditHost {
                 req.title.clone(),
                 req.multiselect,
                 req.resumable,
+                nxvim_core::FilterSeed {
+                    include: req.include.clone(),
+                    exclude: req.exclude.clone(),
+                    expanded: req.filters_open,
+                    filterable: req.filterable,
+                    include_history: req.include_history.clone(),
+                    exclude_history: req.exclude_history.clone(),
+                },
             );
             self.pending_ui_select = None;
             self.picker_active = true;
@@ -1012,7 +1020,12 @@ impl EditHost {
             // picker opens already filtered; empty is the historical empty-prompt run.
             self.editor
                 .picker_query_changes
-                .push((0, req.query.clone()));
+                .push(nxvim_core::PickerRun {
+                    gen: 0,
+                    query: req.query.clone(),
+                    include: req.include.clone(),
+                    exclude: req.exclude.clone(),
+                });
         }
         // `nx.picker.resume()`: replay the last resumable picker's frozen snapshot.
         // Unlike a fresh open, NO gen-0 run is kicked — the snapshot *is* the displayed
@@ -3831,14 +3844,18 @@ impl EditHost {
                     self.apply_lua_effects();
                 }
             }
-            // Picker prompt edits on a **dynamic** source: re-run the source for
-            // the new query. Drained *before* `menu_results` and *before* the
-            // candidate pushes (which `apply_lua_effects` already gated on the live
-            // generation) — the generation was bumped synchronously in core on the
-            // keystroke, so a late push from the superseded run is already dropped.
-            // Running the source reaps the prior job (`on_cancel`) Lua-side.
-            for (gen, query) in std::mem::take(&mut self.editor.picker_query_changes) {
-                if let Err(e) = self.lua.run_picker_run(gen, &query) {
+            // Picker prompt edits needing a source re-run — a query edit on a
+            // **dynamic** source, or an include/exclude edit on any filterable one.
+            // Drained *before* `menu_results` and *before* the candidate pushes (which
+            // `apply_lua_effects` already gated on the live generation) — the generation
+            // was bumped synchronously in core on the keystroke, so a late push from the
+            // superseded run is already dropped. Running the source reaps the prior job
+            // (`on_cancel`) Lua-side.
+            for run in std::mem::take(&mut self.editor.picker_query_changes) {
+                if let Err(e) =
+                    self.lua
+                        .run_picker_run(run.gen, &run.query, &run.include, &run.exclude)
+                {
                     self.editor
                         .echo(format!("E5108: Error in nx.picker source: {e}"));
                 }
@@ -4031,6 +4048,18 @@ impl EditHost {
                     }
                     self.apply_lua_effects();
                 }
+            }
+            // A filterable picker just closed: fold the lines its boxes held into the
+            // persisted history, so they can be recalled next time (and next session).
+            // Driven from the core's capture rather than from the last source run —
+            // a dynamic source's re-run is debounced, so the run may lag the final
+            // keystroke by a pattern or two.
+            if let Some((include, exclude)) = self.editor.picker_closed_filters.take() {
+                if let Err(e) = self.lua.run_picker_history_record(&include, &exclude) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.picker filter history: {e}"));
+                }
+                self.apply_lua_effects();
             }
             // "Send the picker's current results to a list" (the `send_to_list`
             // picker action): the action already closed the picker, so deliver the

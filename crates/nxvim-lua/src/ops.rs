@@ -2178,6 +2178,23 @@ pub struct PickerOpenReq {
     /// internal picker (the cmdline file completer) so it never overwrites the resume
     /// snapshot of the last user-facing picker.
     pub resumable: bool,
+    /// Whether the source declared `filter = true` — i.e. whether this picker has
+    /// include/exclude boxes at all. `false` for a source whose items are not paths
+    /// (`keymaps`, `marks`, …), where the filter keys are an echoed no-op.
+    pub filterable: bool,
+    /// The include / exclude boxes' initial text — raw comma-separated glob lines,
+    /// already resolved Lua-side from the source spec, `nx.picker.setup` defaults, the
+    /// persisted value and this call's own options. Empty ⇒ an empty box.
+    pub include: String,
+    pub exclude: String,
+    /// Whether the filter rows open **revealed** rather than collapsed to the badge
+    /// (`nx.picker.open{ filters = "open" }`). Inert without `filterable`.
+    pub filters_open: bool,
+    /// Each box's previously-used lines, most recent first — the persisted history
+    /// `history_prev` / `history_next` cycle. Resolved Lua-side from the
+    /// `nx.shada.plugin` store and handed over whole, so recall stays synchronous.
+    pub include_history: Vec<String>,
+    pub exclude_history: Vec<String>,
 }
 
 /// Whether a [`StatuslineSetupReq`] sets the **global** segment layout (applies to

@@ -621,9 +621,14 @@ pub struct MenuData {
     /// `None` for a promptless `nx.ui.select`. Presence tells the client to draw a
     /// prompt row, a separator, and the caret.
     pub query: Option<String>,
-    /// The prompt caret's column — a count of chars before it within `query`. `0`
-    /// for a promptless `nx.ui.select`.
+    /// The prompt caret's column — a count of chars before it within the **focused**
+    /// line ([`MenuFilters::focus`] names it; without filters it is always the query).
+    /// `0` for a promptless `nx.ui.select`.
     pub query_cursor: u16,
+    /// The include/exclude glob filter boxes, for a picker whose source declared
+    /// `filter = true`. `None` for every other menu — the client then draws exactly
+    /// the single-prompt box it always has.
+    pub filters: Option<MenuFilters>,
     /// Whether the prompt sits **below** the results list (telescope-style) rather
     /// than above it (the default). `false` for a promptless `nx.ui.select`.
     pub prompt_bottom: bool,
@@ -676,6 +681,51 @@ pub struct MenuData {
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
     /// the list alone, exactly as before.
     pub preview: Option<MenuPreview>,
+}
+
+impl MenuData {
+    /// How many rows the include/exclude boxes take inside the box — `2` when
+    /// revealed, `0` otherwise. Every client computes its list height as
+    /// `inner - (prompt + filter_rows + separator)`; the server sized the box with the
+    /// identical sum (`MenuView::filter_rows`), and a client counting for itself would
+    /// push the list — and every mouse click on it — off by the difference.
+    pub fn filter_rows(&self) -> usize {
+        match &self.filters {
+            Some(f) if f.expanded => 2,
+            _ => 0,
+        }
+    }
+}
+
+/// Which of a picker's three editable lines has the caret.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum MenuField {
+    #[default]
+    Query,
+    Include,
+    Exclude,
+}
+
+/// A picker's include / exclude glob boxes, mirrored from the `menu.filters` redraw
+/// submap — VSCode's "files to include" / "files to exclude".
+///
+/// The two lines are raw text the client paints verbatim; it never has to know what a
+/// glob is. When [`expanded`](Self::expanded) they occupy two rows between the prompt
+/// and the separator — **exactly the count [`MenuData::filter_rows`] reports**, which
+/// is what keeps the client's layout in step with the box height the server sized.
+/// Collapsed, the picker keeps its ordinary shape and [`badge`](Self::badge) is drawn
+/// on the prompt row instead, so an active filter is never invisible.
+#[derive(Clone, Default)]
+pub struct MenuFilters {
+    pub include: String,
+    pub exclude: String,
+    /// Which line [`MenuData::query_cursor`] belongs to.
+    pub focus: MenuField,
+    /// Whether the two rows are drawn. They filter either way.
+    pub expanded: bool,
+    /// The collapsed-state indicator (`[+2 -1]`), composed server-side. `None` when
+    /// expanded or when nothing is filtering.
+    pub badge: Option<String>,
 }
 
 /// The menu/picker widget's themeable colors, resolved server-side from the
@@ -925,6 +975,28 @@ impl View {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 query_cursor: map_u16(m, "query_cursor"),
+                filters: match map_get(m, "filters") {
+                    Some(Value::Map(f)) => Some(MenuFilters {
+                        include: map_get(f, "include")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        exclude: map_get(f, "exclude")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        focus: match map_get(f, "focus").and_then(Value::as_str) {
+                            Some("include") => MenuField::Include,
+                            Some("exclude") => MenuField::Exclude,
+                            _ => MenuField::Query,
+                        },
+                        expanded: map_get(f, "expanded").and_then(Value::as_bool) == Some(true),
+                        badge: map_get(f, "badge")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    }),
+                    _ => None,
+                },
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
                 title: map_get(m, "title")

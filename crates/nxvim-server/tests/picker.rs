@@ -3491,3 +3491,770 @@ end
         "a killed leg ends the fallback chain — it must not spawn an unreapable grep"
     );
 }
+
+// ── include / exclude filter boxes ──────────────────────────────────────────
+// The picker's two glob boxes (VSCode's "files to include" / "files to exclude"),
+// revealed with `<C-g>`. The filtering itself is asserted over a real temp tree
+// through the shipped `files` / `live_grep` sources, so it covers whichever leg of
+// their fallback chain this machine takes — the sink filters every one of them.
+
+/// The `menu.filters` submap, or `None` for a picker whose source isn't filterable.
+fn menu_filters(menu: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    match map_get(menu, "filters") {
+        Some(Value::Map(m)) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+fn filter_str(menu: &[(Value, Value)], key: &str) -> String {
+    menu_filters(menu)
+        .and_then(|f| map_get(&f, key).and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn filters_expanded(menu: &[(Value, Value)]) -> bool {
+    menu_filters(menu)
+        .and_then(|f| map_get(&f, "expanded").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// A source over a fixed path list, filterable — enough to drive the boxes without
+/// spawning anything. Its items carry `path`, which is what the sink filters on.
+const FILTERABLE_SRC: &str = r#"
+nx.picker.source {
+  name = "paths",
+  filter = true,
+  items = function(ctx)
+    for _, p in ipairs({
+      "src/main.rs", "src/net/mod.rs", "target/debug/junk.rs",
+      "vendor/lib.lock", "README.md",
+    }) do
+      ctx.push { text = p, path = p }
+    end
+  end,
+  confirm = function(item) end,
+}
+"#;
+
+/// A temp project the shipped `files` / `live_grep` sources run over: one source
+/// file, one build artifact, one vendored lock file — the shape the boxes exist to
+/// separate.
+fn filter_project(tag: &str) -> std::path::PathBuf {
+    let proj = temp_dir(tag);
+    for (rel, body) in [
+        ("src/main.rs", "fn zqxmain() {}\n"),
+        ("target/debug/junk.rs", "fn zqxmain() {}\n"),
+        ("vendor/lib.lock", "zqxmain\n"),
+        ("README.md", "zqxmain\n"),
+    ] {
+        let p = proj.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).expect("mkdir");
+        std::fs::write(&p, body).expect("write");
+    }
+    proj
+}
+
+/// Poll the picker's rows until `want` holds, returning the last set seen.
+///
+/// A predicate rather than a row count, because a filter edit makes the list *shrink*
+/// — waiting for "enough rows" would return the stale pre-filter list on the first
+/// poll and pass no matter what the filter did. The re-run is asynchronous (the source
+/// respawns and streams), so every filter assertion has to wait for the set it expects.
+async fn rows_until(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        if let Some(m) = poll_menu(rpc, incoming).await {
+            let got = menu_items(&menu_of(&m));
+            if !got.is_empty() {
+                rows = got;
+                if want(&rows) {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    rows
+}
+
+#[tokio::test]
+async fn filter_boxes_are_hidden_until_toggled_then_take_the_typing() {
+    // The picker opens looking exactly as it did before the boxes existed: they are
+    // present in the projection but collapsed. `<C-g>` reveals them and moves focus
+    // to `include`, so the next printable key edits that line and NOT the query.
+    let dir = temp_dir("picker_filter_toggle");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+    exec_lua(&rpc, "nx.picker.open('paths')").await;
+
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert!(
+        menu_filters(&menu).is_some(),
+        "a `filter = true` source projects the boxes"
+    );
+    assert!(
+        !filters_expanded(&menu),
+        "they start collapsed — the picker keeps its usual single-line shape"
+    );
+
+    feed(&rpc, "<C-g>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("revealed"));
+    assert!(filters_expanded(&menu), "<C-g> reveals the rows");
+    assert_eq!(
+        menu_filters(&menu).and_then(|f| map_get(&f, "focus")
+            .and_then(Value::as_str)
+            .map(str::to_string)),
+        Some("include".to_string()),
+        "and moves focus into the include box"
+    );
+
+    feed(&rpc, "src");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("typed"));
+    assert_eq!(filter_str(&menu, "include"), "src", "typing edits that box");
+    assert_eq!(
+        map_get(&menu, "query").and_then(Value::as_str),
+        Some(""),
+        "and never leaks into the query"
+    );
+    assert_eq!(
+        map_get(&menu, "query_cursor").and_then(Value::as_u64),
+        Some(3),
+        "the caret column belongs to the focused line"
+    );
+
+    // Cycling steps include → exclude → query, and each line keeps its own text.
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "out");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("exclude"));
+    assert_eq!(filter_str(&menu, "include"), "src");
+    assert_eq!(filter_str(&menu, "exclude"), "out");
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "q");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("query"));
+    assert_eq!(map_get(&menu, "query").and_then(Value::as_str), Some("q"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "out",
+        "the boxes keep their text"
+    );
+}
+
+#[tokio::test]
+async fn a_source_that_did_not_opt_in_has_no_filter_boxes() {
+    // `filter = true` is what gives a source the boxes. Without it there is nothing
+    // to filter on, so the projection carries no `filters` at all and the picker's
+    // map is byte-for-byte the one it always had.
+    let dir = temp_dir("picker_filter_optin");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert!(menu_filters(&menu).is_none());
+
+    // The key is still bound (it is a default map), but it can only say so.
+    feed(&rpc, "<C-g>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("after"));
+    assert!(
+        menu_filters(&menu).is_none(),
+        "no boxes appear on a source that has nothing to filter"
+    );
+}
+
+#[tokio::test]
+async fn the_exclude_box_drops_matching_paths_and_the_include_box_keeps_only_its_own() {
+    let dir = temp_dir("picker_filter_paths");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+
+    // Exclude: a bare directory name hides everything under it, at any depth.
+    exec_lua(&rpc, "nx.picker.open('paths', { exclude = 'target' })").await;
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().any(|x| x == "README.md") && !r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        !rows.iter().any(|r| r.starts_with("target/")),
+        "`target` excludes the whole directory; got {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r == "src/main.rs"),
+        "and leaves everything else; got {rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+    poll_menu(&rpc, &mut incoming).await;
+
+    // Include: only what matches survives.
+    exec_lua(&rpc, "nx.picker.open('paths', { include = 'src/**' })").await;
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().all(|x| x.starts_with("src/"))
+    })
+    .await;
+    assert!(
+        !rows.is_empty() && rows.iter().all(|r| r.starts_with("src/")),
+        "`src/**` keeps only the src tree; got {rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+    poll_menu(&rpc, &mut incoming).await;
+
+    // An extension pattern with no `/` matches at ANY depth — the normalization that
+    // makes one typed pattern mean the same to nx.glob and to ripgrep's `-g`. Without
+    // it `*.lock` would never match `vendor/lib.lock` (nx.glob's `*` stops at `/`).
+    exec_lua(&rpc, "nx.picker.open('paths', { include = '*.lock' })").await;
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r == ["vendor/lib.lock".to_string()]
+    })
+    .await;
+    assert_eq!(
+        rows,
+        vec!["vendor/lib.lock".to_string()],
+        "a slash-less pattern matches at any depth"
+    );
+}
+
+#[tokio::test]
+async fn editing_a_filter_box_re_runs_a_static_source() {
+    // A query edit on a static source only re-ranks what it already holds. A FILTER
+    // edit changes which paths exist, which no re-ranking can produce — so it must
+    // re-run the source. Asserted through the shipped `files` source over a real
+    // tree: the artifact is listed, then typing into the exclude box drops it.
+    let cfg = temp_dir("picker_filter_rerun_cfg");
+    let proj = filter_project("picker_filter_rerun");
+    let (rpc, mut incoming) = start(&cfg, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('files')").await;
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        rows.iter().any(|r| r.starts_with("target/")),
+        "unfiltered, the build artifact is listed; got {rows:?}"
+    );
+
+    // Two steps to reach the exclude line: query -> include -> exclude.
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "target");
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        !r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        !rows.iter().any(|r| r.starts_with("target/")),
+        "typing into the exclude-side re-runs the source without it; got {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r == "src/main.rs"),
+        "the rest of the tree is still there; got {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_filter_boxes_narrow_live_grep_too() {
+    let cfg = temp_dir("picker_filter_grep_cfg");
+    let proj = filter_project("picker_filter_grep");
+    let (rpc, mut incoming) = start(&cfg, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('live_grep', { include = 'src/**' })").await;
+    feed(&rpc, "zqxmain");
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        !r.is_empty() && r.iter().all(|x| x.starts_with("src/"))
+    })
+    .await;
+    assert!(
+        !rows.is_empty(),
+        "the match inside the included tree is found"
+    );
+    assert!(
+        rows.iter().all(|r| r.starts_with("src/")),
+        "and every hit comes from it — the artifact and the vendor copy are filtered; got {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_collapsed_box_with_active_patterns_shows_a_badge() {
+    // Collapsed, the only trace of a filter is the badge — so a picker that is quietly
+    // hiding files never looks like one that isn't. Revealed, the rows say it instead.
+    let dir = temp_dir("picker_filter_badge");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+    exec_lua(
+        &rpc,
+        "nx.picker.open('paths', { include = 'src/**', exclude = 'a, b' })",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(
+        menu_filters(&menu).and_then(|f| map_get(&f, "badge")
+            .and_then(Value::as_str)
+            .map(str::to_string)),
+        Some("[+1 -2]".to_string()),
+        "one include and two exclude patterns"
+    );
+
+    feed(&rpc, "<C-g>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("revealed"));
+    assert!(
+        menu_filters(&menu)
+            .and_then(|f| map_get(&f, "badge").cloned())
+            .is_none(),
+        "revealed, the rows are the indicator"
+    );
+}
+
+#[tokio::test]
+async fn revealing_the_boxes_costs_two_list_rows() {
+    // The box is a FIXED size, so the two revealed rows come out of the list. Core
+    // geometry, the mouse hit-test and all three clients derive their layout from the
+    // same count; if this drifts, every click on the list lands two rows off.
+    let dir = temp_dir("picker_filter_geom");
+    let src = r#"
+nx.picker.source {
+  name = "many",
+  filter = true,
+  items = function(ctx)
+    for i = 1, 50 do ctx.push { text = string.format("row-%02d", i), path = "p" } end
+  end,
+  confirm = function(item) end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "nx.picker.open('many', { width = 30, height = 12 })").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(
+        menu_items(&menu).len(),
+        10,
+        "collapsed: prompt + separator + 10 list rows"
+    );
+
+    feed(&rpc, "<C-g>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("revealed"));
+    assert_eq!(menu_size(&menu), (30, 12), "the box does not grow");
+    assert_eq!(
+        menu_items(&menu).len(),
+        8,
+        "revealed: prompt + include + exclude + separator + 8 list rows"
+    );
+}
+
+#[tokio::test]
+async fn open_seeds_the_boxes_and_can_reveal_them() {
+    // The programmatic entry point: a keymap opens a picker already scoped. The seed
+    // is a seed — the box stays editable — and `filters = "open"` reveals the rows,
+    // which is what a pre-filtered picker usually wants.
+    let dir = temp_dir("picker_filter_seed");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+    exec_lua(
+        &rpc,
+        "nx.picker.open('paths', { exclude = { 'target', 'vendor' }, filters = 'open' })",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert!(
+        filters_expanded(&menu),
+        "`filters = 'open'` reveals the rows"
+    );
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "target, vendor",
+        "a list seeds the box as the line it would have been typed as"
+    );
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().any(|x| x == "README.md") && !r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        rows.iter().any(|r| r == "src/main.rs") && rows.iter().any(|r| r == "README.md"),
+        "and the picker opens already filtered; got {rows:?}"
+    );
+
+    // The seeded box is editable: clearing it brings the excluded paths back.
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-g>");
+    for _ in 0.."target, vendor".len() {
+        feed(&rpc, "<BS>");
+    }
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        rows.iter().any(|r| r.starts_with("target/")),
+        "a seed is not a lock; got {rows:?}"
+    );
+}
+
+// ── filter defaults, and the recallable line history ────────────────────────
+
+/// Close the open picker and wait for the close to settle Lua-side (the filter
+/// history is recorded on the way out).
+async fn close_picker(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) {
+    feed(rpc, "<Esc>");
+    poll_menu(rpc, incoming).await;
+    // A round-trip, so the close's Lua effects (the history write) have landed
+    // before the next open reads them back.
+    exec_lua(rpc, "return 1").await;
+}
+
+/// Type `text` into the currently focused line.
+fn type_text(rpc: &Rpc, text: &str) {
+    for c in text.chars() {
+        feed(rpc, &c.to_string());
+    }
+}
+
+#[tokio::test]
+async fn a_filter_line_is_remembered_and_recalled_with_ctrl_up_down() {
+    // The boxes keep what you have used before, so a filter you type once is one
+    // keypress away next time instead of a re-type. Most recent first, and walking
+    // forward again lands back on the line you were composing — cmdline history.
+    let dir = temp_dir("picker_filter_history");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+
+    // Two sessions of the picker, each closing with a different exclude line.
+    for line in ["target", "vendor"] {
+        exec_lua(&rpc, "nx.picker.open('paths')").await;
+        poll_menu(&rpc, &mut incoming).await;
+        feed(&rpc, "<C-g>");
+        feed(&rpc, "<C-g>"); // query -> include -> exclude
+                             // Clear whatever the previous session left seeded, then type this line.
+        for _ in 0..20 {
+            feed(&rpc, "<BS>");
+        }
+        type_text(&rpc, line);
+        close_picker(&rpc, &mut incoming).await;
+    }
+
+    let stored = exec_lua(
+        &rpc,
+        r#"return table.concat(nx.picker.history("exclude"), "|")"#,
+    )
+    .await;
+    assert_eq!(
+        stored.as_str(),
+        Some("vendor|target"),
+        "most recent first, and each line recorded once"
+    );
+
+    // Reopening pre-fills from the most recent line…
+    exec_lua(&rpc, "nx.picker.open('paths')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "vendor",
+        "the box opens holding the last line used"
+    );
+
+    // …and <C-Up> walks back to the older one, skipping the identical first entry
+    // (a first press that visibly did nothing would read as a broken key).
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-Up>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("recalled"));
+    assert_eq!(filter_str(&menu, "exclude"), "target");
+
+    // <C-Down> walks forward: back to the most recent, then to the draft the walk
+    // started from.
+    feed(&rpc, "<C-Down>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("newer"));
+    assert_eq!(filter_str(&menu, "exclude"), "vendor");
+    feed(&rpc, "<C-Down>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("draft"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "vendor",
+        "past the newest entry the box holds the line the walk began on"
+    );
+}
+
+#[tokio::test]
+async fn a_recalled_line_actually_filters() {
+    // The recall is not just text in a box: the source re-runs against it, exactly
+    // as if the line had been typed.
+    let dir = temp_dir("picker_filter_history_applies");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+
+    exec_lua(&rpc, "nx.picker.open('paths', { exclude = 'target' })").await;
+    poll_menu(&rpc, &mut incoming).await;
+    close_picker(&rpc, &mut incoming).await;
+
+    // A fresh open explicitly asks for NO filter, so the box starts empty…
+    exec_lua(&rpc, "nx.picker.open('paths', { exclude = '' })").await;
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        rows.iter().any(|r| r.starts_with("target/")),
+        "unfiltered to begin with; got {rows:?}"
+    );
+
+    // …until the stored line is recalled, which re-runs the source without it.
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-Up>");
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        !r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        !rows.iter().any(|r| r.starts_with("target/")) && !rows.is_empty(),
+        "the recalled line filters; got {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn setup_supplies_the_default_filter_and_open_opts_outrank_it() {
+    // `nx.picker.setup` is the "stop showing me target/" knob: every filterable
+    // picker opens with it. An explicit `open` option still wins, so a picker asked
+    // for a scope gets exactly that one.
+    let dir = temp_dir("picker_filter_setup");
+    let src =
+        format!("{FILTERABLE_SRC}\nnx.picker.setup({{ exclude = {{ 'target/', 'vendor/' }} }})\n");
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('paths')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "target/, vendor/",
+        "a list default seeds the box as the line it would have been typed as"
+    );
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        r.iter().any(|x| x == "README.md") && !r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        !rows.iter().any(|r| r.starts_with("target/"))
+            && !rows.iter().any(|r| r.starts_with("vendor/")),
+        "and the default is actually applied; got {rows:?}"
+    );
+    close_picker(&rpc, &mut incoming).await;
+
+    exec_lua(&rpc, "nx.picker.open('paths', { exclude = 'README.md' })").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("override"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "README.md",
+        "an explicit open option outranks the configured default"
+    );
+}
+
+#[tokio::test]
+async fn a_used_line_outranks_the_configured_default() {
+    // History sits above `setup`: a line you actually typed is a stronger statement
+    // than one configured months ago. (An explicit `open` option still beats both —
+    // covered above.)
+    let dir = temp_dir("picker_filter_precedence");
+    let src = format!("{FILTERABLE_SRC}\nnx.picker.setup({{ exclude = 'vendor/' }})\n");
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('paths')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "vendor/",
+        "with no history, the configured default seeds the box"
+    );
+    // Type a different line and close, recording it.
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-g>");
+    for _ in 0..20 {
+        feed(&rpc, "<BS>");
+    }
+    type_text(&rpc, "target");
+    close_picker(&rpc, &mut incoming).await;
+
+    exec_lua(&rpc, "nx.picker.open('paths')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("reopens"));
+    assert_eq!(
+        filter_str(&menu, "exclude"),
+        "target",
+        "the line last used wins over the configured default"
+    );
+}
+
+#[tokio::test]
+async fn history_can_be_turned_off_and_forgotten() {
+    let dir = temp_dir("picker_filter_history_off");
+    let src = format!("{FILTERABLE_SRC}\nnx.picker.setup({{ history = 0 }})\n");
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('paths', { exclude = 'target' })").await;
+    poll_menu(&rpc, &mut incoming).await;
+    close_picker(&rpc, &mut incoming).await;
+    assert_eq!(
+        exec_lua(&rpc, r#"return #nx.picker.history("exclude")"#)
+            .await
+            .as_u64(),
+        Some(0),
+        "`history = 0` records nothing"
+    );
+
+    // Re-enabled, it records again — and `forget_history` clears the lot.
+    exec_lua(&rpc, "nx.picker.setup({ history = 20 })").await;
+    exec_lua(&rpc, "nx.picker.open('paths', { exclude = 'target' })").await;
+    poll_menu(&rpc, &mut incoming).await;
+    close_picker(&rpc, &mut incoming).await;
+    assert_eq!(
+        exec_lua(&rpc, r#"return #nx.picker.history("exclude")"#)
+            .await
+            .as_u64(),
+        Some(1)
+    );
+    exec_lua(&rpc, "nx.picker.forget_history()").await;
+    assert_eq!(
+        exec_lua(&rpc, r#"return #nx.picker.history("exclude")"#)
+            .await
+            .as_u64(),
+        Some(0),
+        "forget_history drops every stored line"
+    );
+}
+
+#[tokio::test]
+async fn history_is_per_box_and_the_query_has_none() {
+    // The two boxes keep separate lists — an include pattern must never surface in
+    // the exclude box, where it would mean the opposite of what you meant.
+    let dir = temp_dir("picker_filter_history_perbox");
+    let (rpc, mut incoming) = start(&dir, FILTERABLE_SRC).await;
+    exec_lua(
+        &rpc,
+        "nx.picker.open('paths', { include = 'src/**', exclude = 'target' })",
+    )
+    .await;
+    poll_menu(&rpc, &mut incoming).await;
+    close_picker(&rpc, &mut incoming).await;
+
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            r#"return table.concat(nx.picker.history("include"), "|")"#
+        )
+        .await
+        .as_str(),
+        Some("src/**")
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            r#"return table.concat(nx.picker.history("exclude"), "|")"#
+        )
+        .await
+        .as_str(),
+        Some("target")
+    );
+
+    // On the query line — which is not a glob line — recall says so rather than
+    // silently doing nothing.
+    exec_lua(&rpc, "nx.picker.open('paths')").await;
+    poll_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-Up>");
+    let m = poll_menu(&rpc, &mut incoming).await.expect("after recall");
+    assert_eq!(
+        map_get(&menu_of(&m), "query").and_then(Value::as_str),
+        Some(""),
+        "the query is untouched by filter history"
+    );
+    assert!(
+        map_get(&m, "message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("filter box"),
+        "and it says why"
+    );
+}
+
+#[tokio::test]
+async fn typing_a_filter_pattern_debounces_the_re_run() {
+    // A filter edit re-runs the source — for a STATIC source too, since the set of
+    // paths that exist has changed. That re-run is a full tree walk, so it has to
+    // coalesce: undebounced, typing `node_modules` into the exclude box would spawn a
+    // dozen `rg` scans of the repo, one per character. The source counts its own runs.
+    let dir = temp_dir("picker_filter_debounce");
+    let src = r#"
+_G.runs = 0
+nx.picker.source {
+  name = "counted",
+  filter = true,
+  items = function(ctx)
+    _G.runs = _G.runs + 1
+    ctx.push { text = "src/a.rs", path = "src/a.rs" }
+    ctx.push { text = "target/b.rs", path = "target/b.rs" }
+  end,
+  confirm = function(item) end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "nx.picker.open('counted', { debounce = 120 })").await;
+    poll_menu(&rpc, &mut incoming).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.runs").await.as_u64(),
+        Some(1),
+        "the initial run is never debounced — the list would just open late"
+    );
+
+    // Six characters typed as fast as the harness can feed them.
+    feed(&rpc, "<C-g>");
+    feed(&rpc, "<C-g>");
+    type_text(&rpc, "target");
+    let rows = rows_until(&rpc, &mut incoming, |r| {
+        !r.iter().any(|x| x.starts_with("target/"))
+    })
+    .await;
+    assert!(
+        !rows.iter().any(|r| r.starts_with("target/")) && !rows.is_empty(),
+        "the pattern still lands; got {rows:?}"
+    );
+    let runs = exec_lua(&rpc, "return _G.runs").await.as_u64().unwrap_or(0);
+    assert!(
+        runs < 7,
+        "six keystrokes coalesced into far fewer runs, not one per character (got {runs})"
+    );
+}
+
+#[tokio::test]
+async fn clicking_a_row_stays_accurate_with_the_filter_rows_revealed() {
+    // The revealed rows shift the list down by two. Core geometry, the mouse hit-test
+    // and the three clients each recompute that budget; if the hit-test drifts from
+    // the rest, every click lands two rows off the row you aimed at.
+    let dir = temp_dir("picker_filter_mouse");
+    let src = r#"
+nx.picker.source {
+  name = "rows",
+  filter = true,
+  items = function(ctx)
+    for i = 1, 20 do
+      ctx.push { text = string.format("row-%02d", i), path = string.format("row-%02d", i) }
+    end
+  end,
+  confirm = function(item) _G.picked = item.text end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(&rpc, "_G.picked = nil; nx.picker.open('rows')").await;
+    poll_menu(&rpc, &mut incoming).await;
+
+    // Reveal the boxes, then click the third visible row.
+    feed(&rpc, "<C-g>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("revealed"));
+    let row0 = menu_u64(&menu, "row");
+    let col = menu_u64(&menu, "col");
+    // border + prompt + include + exclude + separator, then the list.
+    let (r, c) = (row0 + 1 + 1 + 2 + 1 + 2, col + 1);
+    feed_mouse(&rpc, "left", "press", r, c);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("clicked"));
+    assert_eq!(
+        menu_u64(&menu, "selected"),
+        2,
+        "the click hit the third list row, not one two rows off"
+    );
+    assert_eq!(
+        menu_items(&menu).get(2).map(String::as_str),
+        Some("row-03"),
+        "and that row is the one under the pointer"
+    );
+}

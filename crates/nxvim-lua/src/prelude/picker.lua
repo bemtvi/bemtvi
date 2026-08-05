@@ -62,6 +62,10 @@ for _, name in ipairs({
   "send_to_list",
   "toggle_select",
   "clear_select",
+  "toggle_filters",
+  "next_field",
+  "history_prev",
+  "history_next",
 }) do
   nx.picker.actions[name] = function()
     nx._picker_action(name)
@@ -95,8 +99,243 @@ for _, m in ipairs({
   { "<C-q>", "send_to_list", "Send results to a named list" },
   { "<Tab>", "toggle_select", "Toggle multi-select on this row" },
   { "<S-Tab>", "toggle_select", "Toggle multi-select on this row" },
+  -- The include/exclude filter boxes. `<C-g>` reveals them and steps through the
+  -- three lines; `<Tab>` is already multi-select, so it is deliberately not reused.
+  { "<C-g>", "next_field", "Cycle query / include / exclude" },
+  -- Filter-line history, the cmdline-history keys one modifier over: `<Up>`/`<Down>`
+  -- already move the selection, and they keep doing so while a box has focus.
+  { "<C-Up>", "history_prev", "Recall an older filter line" },
+  { "<C-Down>", "history_next", "Recall a newer filter line" },
 }) do
   nx.keymap.set("picker", m[1], nx.picker.actions[m[2]], { default = true, desc = m[3] })
+end
+
+-- ----- include / exclude filters ---------------------------------------------
+-- The picker's two glob boxes (VSCode's "files to include" / "files to exclude").
+-- A filterable source gets them for free: the patterns are compiled once per run and
+-- tested against every candidate's `path` in the sink below, so a source only has to
+-- declare `filter = true` — and, if it shells out to a tool that can prune for
+-- itself, splice `ctx.rg_globs` into its argv.
+
+-- Expand one typed pattern into the glob(s) that match what a person means by it.
+--
+-- Two rules, and both exist to make ONE pattern mean the same thing to `nx.glob` and
+-- to ripgrep's `-g`, which read a bare name differently:
+--
+--   * **No `/` ⇒ any depth.** `*.lock` becomes `**/*.lock`. ripgrep applies
+--     gitignore's basename rule (a slash-less pattern matches at any depth) while
+--     `nx.glob`'s `*` stops at `/`, so an un-anchored pattern would prune different
+--     sets on the `rg` leg and the walk legs. Anchoring it here makes them identical.
+--   * **A plain name is also a directory.** `target` becomes `**/target` *and*
+--     `**/target/**` — candidates are files, so excluding only the directory entry
+--     would leave every file under it. A pattern that already carries a glob
+--     metacharacter (`src/**`, `*.lock`) is taken as written, since the user has said
+--     what they mean.
+--
+-- A trailing `/` (`vendor/`) is dropped first — it only ever meant "the directory".
+local function expand_pattern(pat)
+  pat = pat:gsub("/+$", "")
+  if pat == "" then
+    return {}
+  end
+  local anchored = pat:find("/", 1, true) and pat or ("**/" .. pat)
+  if nx.glob.is_glob(pat) then
+    return { anchored }
+  end
+  return { anchored, anchored .. "/**" }
+end
+
+-- `nx.picker.patterns(line)` -> the glob patterns one filter box's text expands to.
+-- `line` is the raw comma-separated text (`nx.glob.split` splits it, so a `{a,b}`
+-- alternation stays one pattern). A list is accepted too, so a caller passing
+-- `exclude = { "target/", "*.lock" }` need not join it first. Returns an empty list
+-- for empty text — i.e. "no filter".
+--
+-- Each entry is expanded so that one typed pattern means the same set to `nx.glob`
+-- and to ripgrep's `-g`, which read a bare name differently:
+--
+-- ```
+-- *.lock     ->  **/*.lock                 no `/` ⇒ matches at any depth
+-- target     ->  **/target, **/target/**   a plain name is also a directory
+-- vendor/    ->  **/vendor, **/vendor/**   a trailing `/` only meant "directory"
+-- src/**     ->  src/**                    already a glob ⇒ taken as written
+-- ```
+--
+-- ```lua
+-- nx.picker.patterns("target/, *.lock")
+-- --> { "**/target", "**/target/**", "**/*.lock" }
+-- ```
+function nx.picker.patterns(line)
+  local out = {}
+  local entries
+  if type(line) == "table" then
+    entries = {}
+    for _, v in ipairs(line) do
+      for _, e in ipairs(nx.glob.split(tostring(v))) do
+        entries[#entries + 1] = e
+      end
+    end
+  else
+    entries = nx.glob.split(tostring(line or ""))
+  end
+  for _, e in ipairs(entries) do
+    for _, g in ipairs(expand_pattern(e)) do
+      out[#out + 1] = g
+    end
+  end
+  return out
+end
+
+-- Coerce a user-supplied `include` / `exclude` option into the ONE comma-separated
+-- line the box holds. A list joins with ", " so it reads back the way it would have
+-- been typed; a string passes through.
+local function filter_line(value, what)
+  if value == nil then
+    return nil
+  end
+  if type(value) == "string" then
+    return value
+  end
+  if type(value) == "table" then
+    return table.concat(value, ", ")
+  end
+  error("nx.picker: " .. what .. " must be a string or a list of strings", 3)
+end
+
+-- The `-g` argument pairs that hand `patterns` to a ripgrep-compatible tool.
+-- `negate` emits `!pat` (rg's exclusion form). Pruning at the tool is what keeps a
+-- `node_modules`-heavy tree from burning the result cap on paths we would throw away
+-- a moment later — the sink still tests every candidate, so this can only ever remove
+-- what the sink would have removed anyway.
+local function rg_glob_args(patterns, negate)
+  local args = {}
+  for _, p in ipairs(patterns) do
+    args[#args + 1] = "-g"
+    args[#args + 1] = negate and ("!" .. p) or p
+  end
+  return args
+end
+
+-- ----- filter defaults and history -------------------------------------------
+
+-- The `nx.picker.setup` config. Kept as a plain table (not a source spec) because
+-- these are cross-picker defaults, not any one source's business.
+nx.picker._config = nx.picker._config or { include = nil, exclude = nil, history = 20 }
+
+-- The persisted store. The prelude attributes to no runtimepath entry, so the
+-- namespace is passed explicitly — `"picker"` is reserved for exactly this. Opened
+-- lazily so a session that never opens a filterable picker never touches shada.
+local function history_store()
+  return nx.shada.plugin("picker")
+end
+
+-- One box's recallable lines, most recent first. Missing (or a store holding
+-- something other than a list of strings — a hand-edited shada, an older layout)
+-- reads as no history rather than raising: a bad recall list must never stop a
+-- picker from opening.
+local function history_get(field)
+  local ok, list = pcall(function()
+    return history_store():get("filter_history_" .. field)
+  end)
+  if not ok or type(list) ~= "table" then
+    return {}
+  end
+  local out = {}
+  for _, v in ipairs(list) do
+    if type(v) == "string" and v ~= "" then
+      out[#out + 1] = v
+    end
+  end
+  return out
+end
+
+-- `nx.picker.setup(opts)`: cross-picker defaults for the include/exclude boxes.
+--
+--   * `include` / `exclude` — the line every filterable picker opens with, as a
+--     comma-separated string or a list of globs. This is the "stop showing me
+--     `target/`" knob: set it once and every `files` / `live_grep` opens narrowed.
+--   * `history` — how many past lines each box keeps for `<C-Up>` / `<C-Down>`
+--     (default 20). `0` disables the history *and* its persistence.
+--
+-- These are the LOW end of the precedence ladder — a line you actually typed
+-- (recalled from history) and an explicit `nx.picker.open{ include = … }` both win,
+-- so a default never overrides an intent expressed later. Calling it again replaces
+-- only the keys given.
+--
+-- ```lua
+-- nx.picker.setup({
+--   exclude = { "target/", "node_modules/", "*.min.js" },
+-- })
+-- ```
+function nx.picker.setup(opts)
+  if opts ~= nil and type(opts) ~= "table" then
+    error("nx.picker.setup: opts must be a table", 2)
+  end
+  opts = opts or {}
+  if opts.include ~= nil then
+    nx.picker._config.include = filter_line(opts.include, "include")
+  end
+  if opts.exclude ~= nil then
+    nx.picker._config.exclude = filter_line(opts.exclude, "exclude")
+  end
+  if opts.history ~= nil then
+    if type(opts.history) ~= "number" or opts.history < 0 then
+      error("nx.picker.setup: history must be a non-negative number", 2)
+    end
+    nx.picker._config.history = math.floor(opts.history)
+  end
+end
+
+-- nx.picker._history_record(include, exclude): fold a just-closed picker's filter
+-- lines into the persisted history. Called by the server with the lines the boxes
+-- held **at close** (not at the last source run — a dynamic source's re-run is
+-- debounced and can lag the final keystroke).
+--
+-- A recorded line moves to the front rather than being appended again, so cycling
+-- walks distinct patterns instead of a run of duplicates, and the most recent is
+-- always first (which is what a picker pre-fills from). An empty line records
+-- nothing — clearing a box is not a pattern worth recalling.
+function nx.picker._history_record(include, exclude)
+  local cap = nx.picker._config.history or 20
+  if cap <= 0 then
+    return
+  end
+  local store = history_store()
+  for field, line in pairs({ include = include, exclude = exclude }) do
+    if type(line) == "string" and line ~= "" then
+      local list = history_get(field)
+      local out = { line }
+      for _, v in ipairs(list) do
+        if v ~= line and #out < cap then
+          out[#out + 1] = v
+        end
+      end
+      store:set("filter_history_" .. field, out)
+    end
+  end
+end
+
+-- `nx.picker.history(field)` -> the recallable lines for `"include"` / `"exclude"`,
+-- most recent first. The read side of what `<C-Up>` / `<C-Down>` cycle; useful for a
+-- config that wants to seed a picker from a recent filter, or just to see what is
+-- stored.
+--
+-- ```lua
+-- local recent = nx.picker.history("exclude")[1]   -- the last exclude line used
+-- ```
+function nx.picker.history(field)
+  if field ~= "include" and field ~= "exclude" then
+    error('nx.picker.history: field must be "include" or "exclude"', 2)
+  end
+  return history_get(field)
+end
+
+-- `nx.picker.forget_history()`: drop every stored filter line (both boxes). The
+-- escape hatch for a history that has accumulated patterns you don't want back.
+function nx.picker.forget_history()
+  local store = history_store()
+  store:delete("filter_history_include")
+  store:delete("filter_history_exclude")
 end
 
 -- nx.picker.source { name, items = function(ctx), dynamic, confirm, preview }:
@@ -155,6 +394,13 @@ end
 -- fuzzy matcher, so its own match is the only one to show. Both fields are optional:
 -- a plain `text`-only item is a single-column row that truncates path-tail-first.
 --
+-- `filter = true` gives the picker the include/exclude glob boxes (`<C-g>`), and is
+-- what every candidate's `path` is then tested against — declare it on any source
+-- whose items are paths. A source that shells out to `rg` should also splice
+-- `ctx.rg_globs` into its argv so the tool prunes the tree instead of streaming paths
+-- the sink is about to drop. Without it the filter keys are an echoed no-op, since
+-- there would be nothing to filter on.
+--
 -- `resumable = false` opts the source out of `nx.picker.resume()` (`<leader>fr`):
 -- opening it never overwrites the resume slot, so a transient internal picker (the
 -- cmdline file completer) can't shadow the last user-facing one. Defaults to true.
@@ -170,6 +416,9 @@ function nx.picker.source(spec)
   end
   if spec.layer ~= nil and spec.layer ~= "main" and spec.layer ~= "active" then
     error("nx.picker.source('" .. spec.name .. '\'): layer must be "main" or "active"', 2)
+  end
+  if spec.filter ~= nil and type(spec.filter) ~= "boolean" then
+    error("nx.picker.source('" .. spec.name .. "'): filter must be a boolean", 2)
   end
   nx.picker._sources[spec.name] = spec
 end
@@ -190,6 +439,13 @@ end
 --   * `multiselect` — whether `<Tab>` marks rows for a batch action (default true);
 --     `false` is a single-choice picker (no marking).
 --   * `debounce` — ms before a `dynamic` source re-runs on a query edit; `0` off.
+--   * `include` / `exclude` — pre-fill the glob filter boxes, so a keymap can open a
+--     picker already scoped (`nx.picker.open("files", { include = "src/**" })`). Each
+--     takes a comma-separated string or a list of patterns, and is a *seed*: the boxes
+--     stay editable. Only meaningful on a source with `filter = true`.
+--   * `filters` — `"open"` reveals the filter rows immediately (what a pre-filtered
+--     picker usually wants), `"collapsed"` (the default) keeps the picker's ordinary
+--     single-line shape with the active patterns shown as a badge.
 --   * `layer` — where a confirmed item opens: `"main"` crosses back to the main editor
 --     area first (so a file picked while focused in a dock lands in the editor, not
 --     the sidebar), `"active"` opens in the focused layer. Defaults to `"active"`; the
@@ -293,6 +549,38 @@ function nx.picker.open(name, opts)
     nx.picker._last = last
     nx._picker._last = last
   end
+  -- The include/exclude boxes. Only a source that declared `filter = true` has them;
+  -- for anything else the seeds stay empty and the filter keys echo a no-op.
+  --
+  -- Precedence, low to high: the source's own default, then `nx.picker.setup`, then
+  -- the most recent persisted line, then this call's options. History sits above the
+  -- configured defaults because a line you actually typed is a stronger statement
+  -- than one you configured months ago; the explicit `open` option sits above
+  -- everything so a picker asked for a scope gets exactly that scope and is never
+  -- surprised by a stale box. All of them are seeds — the boxes stay editable.
+  local filterable = source.filter == true
+  local hist_include, hist_exclude = {}, {}
+  if filterable and (nx.picker._config.history or 20) > 0 then
+    hist_include, hist_exclude = history_get("include"), history_get("exclude")
+  end
+  local include = filter_line(opts.include, "include")
+    or hist_include[1]
+    or nx.picker._config.include
+    or filter_line(source.include, "include")
+    or ""
+  local exclude = filter_line(opts.exclude, "exclude")
+    or hist_exclude[1]
+    or nx.picker._config.exclude
+    or filter_line(source.exclude, "exclude")
+    or ""
+  if opts.filters ~= nil and opts.filters ~= "open" and opts.filters ~= "collapsed" then
+    error('nx.picker.open: filters must be "open" or "collapsed"', 2)
+  end
+  local filters_open = opts.filters == "open"
+  -- Filters are the source's to honor: they reach it as `ctx.include` / `ctx.exclude`
+  -- and are applied to every pushed path, so remember them for each run.
+  nx._picker.include = include
+  nx._picker.exclude = exclude
   -- The server opens the aligned widget and kicks the initial run (gen 0, query);
   -- `resumable` tells it whether to snapshot this picker when it closes.
   nx._picker_open(
@@ -306,7 +594,17 @@ function nx.picker.open(name, opts)
     query,
     title,
     multiselect == true,
-    source.resumable ~= false
+    source.resumable ~= false,
+    -- The boxes travel as one table: six values that grow together, against mlua's
+    -- 16-argument ceiling on the bridge.
+    {
+      on = filterable,
+      include = include,
+      exclude = exclude,
+      open = filters_open,
+      include_history = hist_include,
+      exclude_history = hist_exclude,
+    }
   )
 end
 
@@ -360,17 +658,28 @@ local function picker_cancel_inflight(p)
   end
 end
 
--- nx._picker_run(gen, query): (re-)run the active source for `query` under `gen`.
--- Called by the server on open (gen 0, `""`) and on each dynamic query edit. A
--- **dynamic** source is DEBOUNCED — a query edit cancels the in-flight job and any
+-- nx._picker_run(gen, query, include, exclude): (re-)run the active source for `query`
+-- under `gen`, filtered by the two glob boxes. Called by the server on open (gen 0)
+-- and on each prompt edit that needs a re-run — a query edit on a **dynamic** source,
+-- or an include/exclude edit on any filterable one (the set of paths that exist has
+-- changed, which no local re-ranking can produce).
+--
+-- A **dynamic** source is DEBOUNCED — a query edit cancels the in-flight job and any
 -- pending run, then schedules the search `debounce` ms later, so a fast typist
 -- spawns one process per pause, not one per keystroke. Static / the initial run
 -- start immediately (no process churn to debounce).
-function nx._picker_run(gen, query)
+function nx._picker_run(gen, query, include, exclude)
   local p = nx._picker
   if not p then
     return
   end
+  -- The boxes are authoritative once the user edits them; the server sends their live
+  -- text with every run, so the seeds recorded at open are only the gen-0 value.
+  -- Whether they *changed* decides the debounce below, so compare before overwriting.
+  local filters_changed = (include ~= nil and include ~= p.include)
+    or (exclude ~= nil and exclude ~= p.exclude)
+  p.include = include or p.include or ""
+  p.exclude = exclude or p.exclude or ""
   -- A new query: stop whatever the previous one started (job + pending debounce).
   -- NOTE: `p.items` is NOT reset — it is append-only with absolute keys, so a result
   -- still displayed from the previous query stays confirmable while the new search
@@ -387,10 +696,26 @@ function nx._picker_run(gen, query)
       return
     end
 
+    -- The filter boxes, expanded once per run: `include` / `exclude` are the compiled
+    -- pattern lists a source may hand to its own tool, `rg_globs` the ready-to-splice
+    -- `-g` argv for a ripgrep-compatible one, and the two globsets below are what the
+    -- sink tests every candidate against.
+    local include_pats = nx.picker.patterns(p.include)
+    local exclude_pats = nx.picker.patterns(p.exclude)
+    local include_set = #include_pats > 0 and nx.glob.set(include_pats) or nil
+    local exclude_set = #exclude_pats > 0 and nx.glob.set(exclude_pats) or nil
+    local rg_globs = rg_glob_args(include_pats, false)
+    for _, a in ipairs(rg_glob_args(exclude_pats, true)) do
+      rg_globs[#rg_globs + 1] = a
+    end
+
     local ctx = {
       query = query,
       cwd = vim.fn.getcwd(),
       gen = gen,
+      include = include_pats,
+      exclude = exclude_pats,
+      rg_globs = rg_globs,
       -- A source registers a reaper for its in-flight job; the next run (or close)
       -- invokes it. Only the *current* run of the *active* picker registers — the
       -- identity check (`nx._picker == p`) drops a registration from a run whose
@@ -440,6 +765,25 @@ function nx._picker_run(gen, query)
       if nx._picker ~= p or p.gen ~= gen then
         return
       end
+      local entry = item
+      if type(entry) ~= "table" then
+        entry = { text = tostring(entry) }
+      end
+      -- The include/exclude boxes, applied at the ONE point every candidate crosses —
+      -- so every filterable source is filtered identically, whether its paths came
+      -- from `rg`, from `find`, or from an `nx.fs` walk, and a source that prunes at
+      -- its tool and one that cannot still enumerate the same set. Dropped candidates
+      -- are dropped *before* the cap below, so a filtered-out `node_modules` can never
+      -- consume the budget the results you asked for need.
+      local path = entry.path
+      if path and path ~= "" then
+        if include_set and not include_set:test(path) then
+          return
+        end
+        if exclude_set and exclude_set:test(path) then
+          return
+        end
+      end
       -- Result cap: a broad query can stream forever — reap the job once this run
       -- has enough (the matched rows the user scrolls are at the top).
       local cap = p.source.max_results or MAX_RESULTS
@@ -449,10 +793,6 @@ function nx._picker_run(gen, query)
         return
       end
       pushed = pushed + 1
-      local entry = item
-      if type(entry) ~= "table" then
-        entry = { text = tostring(entry) }
-      end
       -- `p.nitems` is an O(1) running count (no `#p.items` border-search per item),
       -- and the absolute key into the session-wide `p.items`.
       p.nitems = (p.nitems or 0) + 1
@@ -525,8 +865,17 @@ function nx._picker_run(gen, query)
       :finally(done)
   end
 
+  -- Debounce anything that RE-RUNS the source per keystroke, so a fast typist spawns
+  -- one search per pause rather than one per character.
+  --
+  -- A dynamic source is the original case (every query edit re-runs it). A **filter**
+  -- edit re-runs the source too — for a static source as much as a dynamic one, since
+  -- changing the patterns changes which paths exist — and that re-run is a full tree
+  -- walk: undebounced, typing `node_modules` into the exclude box would spawn a dozen
+  -- `rg` scans of the whole repo, one per character. The initial run (gen 0) is never
+  -- debounced; there is nothing to coalesce yet and the list would just open late.
   local delay = p.debounce_ms or 0
-  if p.source.dynamic and gen > 0 and delay > 0 then
+  if gen > 0 and delay > 0 and (p.source.dynamic or filters_changed) then
     p.debounce = nx.timer(start, delay) -- trailing debounce; a new edit reschedules
   else
     start()
@@ -689,12 +1038,15 @@ end
 -- The search is **unrestricted by default** (`rg -uu` = `--no-ignore --hidden`): a
 -- file you can't find isn't a file, so ignore rules and dotfiles don't hide it. Only
 -- `.git` is excluded (its object store is noise, not source), matching what the
--- `find` / `nx.fs` steps already do. Register your own `files` source to narrow it.
+-- `find` / `nx.fs` steps already do. Narrowing is the **exclude box**'s job (`<C-g>`)
+-- rather than a different default: it is per-search, so hiding `target/` this time
+-- never makes a file unfindable the next.
 nx.picker.source({
   name = "files",
   title = "Find Files",
   layer = "main", -- a picked file opens in the main editor, never a focused dock
   preview = "file", -- the preview pane shows the file's head
+  filter = true, -- items are paths: give it the include/exclude boxes
   items = nx.async(function(ctx)
     local cancelled = false
     -- Stream a listing command's stdout as candidates. Returns whether the chain is
@@ -725,7 +1077,15 @@ nx.picker.source({
       local exit = stream:exit()
       return cancelled or exit == nil or exit.code ~= -1
     end
-    if run("rg", { "--files", "--color=never", "-uu", "-g", "!.git" }) then
+    -- The filter boxes ride along as `-g` arguments so rg prunes the tree rather than
+    -- streaming paths the sink would drop — on a `node_modules`-sized directory that
+    -- is the difference between the results arriving and the cap filling with noise.
+    -- The sink still tests every path, so this only ever removes what it would too.
+    local files_args = { "--files", "--color=never", "-uu", "-g", "!.git" }
+    for _, a in ipairs(ctx.rg_globs) do
+      files_args[#files_args + 1] = a
+    end
+    if run("rg", files_args) then
       return
     end
     if run("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true) then
@@ -767,11 +1127,13 @@ nx.picker.source({
 -- of showing a long line's head and nothing else. The body's leading indentation is
 -- stripped — a deeply-indented hit would otherwise spend the row on whitespace —
 -- and `match` carries the hit's char range so it highlights like a `files` fuzzy hit.
+-- The include/exclude boxes (`<C-g>`) narrow a single search without changing that.
 nx.picker.source({
   name = "live_grep",
   title = "Live Grep",
   layer = "main", -- a grep hit opens in the main editor, never a focused dock
   dynamic = true,
+  filter = true, -- hits carry a path: give it the include/exclude boxes
   preview = "location", -- scroll the pane to the match and range-highlight it
   items = nx.async(function(ctx)
     if ctx.query == "" then
@@ -862,9 +1224,14 @@ nx.picker.source({
       return cancelled or exit == nil or exit.code ~= -1
     end
 
-    if
-      run("rg", { "--vimgrep", "--color=never", "-uu", "-g", "!.git", "--", q }, true, false, re)
-    then
+    -- As in `files`: the boxes prune at rg, and the sink filters every leg's output.
+    local grep_args = { "--vimgrep", "--color=never", "-uu", "-g", "!.git" }
+    for _, a in ipairs(ctx.rg_globs) do
+      grep_args[#grep_args + 1] = a
+    end
+    grep_args[#grep_args + 1] = "--"
+    grep_args[#grep_args + 1] = q
+    if run("rg", grep_args, true, false, re) then
       return
     end
     if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, lit) then

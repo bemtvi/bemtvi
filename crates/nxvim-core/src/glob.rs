@@ -452,3 +452,53 @@ pub fn compile_set(patterns: &[String], opts: &GlobOpts) -> Result<Rc<GlobSet>, 
 pub fn is_match(pattern: &str, path: impl AsRef<[u8]>, opts: &GlobOpts) -> Result<bool, String> {
     Ok(compile(pattern, opts)?.is_match(path))
 }
+
+/// Split a **comma-separated pattern list** — one line of user-typed globs, the way
+/// VSCode's "files to include" box takes them — into its individual patterns,
+/// trimming surrounding whitespace and dropping empty entries.
+///
+/// The comma is not a naive separator here: `{…}` alternation uses commas *inside* a
+/// single glob, so `**/{node_modules,target}/**` is ONE pattern, not two broken ones.
+/// Splitting only at brace depth zero is the whole reason this is a function rather
+/// than a `split(',')` at each call site — and the reason it lives in the glob engine:
+/// the picker counts patterns Rust-side for its filter badge while the Lua filter
+/// compiles them, and a second implementation of this rule would drift from the first.
+///
+/// ```text
+/// "src/**, docs/**"            -> ["src/**", "docs/**"]
+/// "**/{a,b}/**"                -> ["**/{a,b}/**"]     ( one pattern )
+/// "  , *.lock ,, "             -> ["*.lock"]          ( blanks dropped )
+/// ```
+pub fn split_patterns(list: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut escaped = false;
+    for (i, c) in list.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '{' => depth += 1,
+            // Saturating: a stray `}` with no opener is a malformed pattern globset
+            // will reject by name later — it must not wrap the depth into splitting
+            // every following comma inside a brace group.
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let piece = list[start..i].trim();
+                if !piece.is_empty() {
+                    out.push(piece.to_string());
+                }
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let piece = list[start..].trim();
+    if !piece.is_empty() {
+        out.push(piece.to_string());
+    }
+    out
+}

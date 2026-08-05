@@ -35,8 +35,8 @@ use glyphon::{
 };
 use nxvim_view::{
     elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col, Border, DiagSign,
-    DiagSpan, DiagVirt, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View,
-    VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    DiagSpan, DiagVirt, Geometry, InlayHint, MenuField, ResizeCursor, StatusSegment, Style,
+    TabData, View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -69,6 +69,10 @@ const LINE_SPACING: f32 = 1.30;
 /// insert/replace mode, so every multi-cursor decoration reads as one family.
 /// Mirrors the TUI's `MULTICURSOR_ACCENT`.
 const MULTICURSOR_ACCENT: u32 = 0xe5_c0_7b;
+/// The width of a picker filter row's `include` / `exclude` label, including its
+/// trailing gap — the column that box's text and caret start at. The TUI and web
+/// clients use the same width so the three look alike.
+const FILTER_LABEL_W: usize = 8;
 
 /// A cached shaped line: the glyphon buffer plus the frame it was last used in.
 struct CacheEntry {
@@ -2716,21 +2720,32 @@ impl Renderer {
         // fills the rest. The prompt sits above the list by default, or below it
         // (telescope-style) when asked. A promptless `nx.ui.select` has neither.
         let has_prompt = menu.query.is_some();
-        let chrome = u16::from(has_prompt) * 2;
+        // With the include/exclude boxes revealed, their two rows follow the prompt.
+        // `filter_rows` is the shared count the server sized the box with.
+        let filter_rows = menu.filter_rows() as u16;
+        let chrome = u16::from(has_prompt) * 2 + filter_rows;
         let list_rows = menu.height.saturating_sub(chrome);
         // Row offsets within the box content (below the top border at `by + 1`): the
-        // first list row, the prompt row, and the separator row.
+        // first list row, the prompt row, and the separator row. The filter rows always
+        // sit directly under the prompt, so the three editable lines stay adjacent.
         let (list_y0, prompt_y, sep_y) = if !has_prompt {
             (0, 0, 0)
         } else if menu.prompt_bottom {
             (0, list_rows + 1, list_rows)
         } else {
-            (2, 0, 1)
+            (2 + filter_rows, 0, 1 + filter_rows)
         };
 
         if has_prompt {
             let query = menu.query.as_deref().unwrap_or("");
-            let text = pmenu_row(&format!("> {query}"), "", list_w as usize);
+            // A collapsed filter box shows its badge right-aligned on the prompt row,
+            // so a search that is hiding files never looks like one that isn't.
+            let badge = menu
+                .filters
+                .as_ref()
+                .and_then(|f| f.badge.as_deref())
+                .unwrap_or("");
+            let text = pmenu_row(&format!("> {query}"), badge, list_w as usize);
             self.push_plain(
                 items,
                 &text,
@@ -2738,6 +2753,27 @@ impl Renderer {
                 prompt_fg,
                 full,
             );
+            // The include / exclude rows, each a label then the raw comma-separated
+            // line the user typed.
+            if let Some(f) = menu.filters.as_ref().filter(|f| f.expanded) {
+                for (i, (label, line)) in [("include", &f.include), ("exclude", &f.exclude)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let text = pmenu_row(
+                        &format!("{label:<width$}{line}", width = FILTER_LABEL_W),
+                        "",
+                        list_w as usize,
+                    );
+                    self.push_plain(
+                        items,
+                        &text,
+                        self.cell_px(cx, content_y0 + prompt_y + 1 + i as u16),
+                        prompt_fg,
+                        full,
+                    );
+                }
+            }
             // The separator: a `─` glyph rule across the list column — drawn as box
             // glyphs (not a thin quad) so it matches the glyph box border, the `│`
             // preview rule, and the TUI/web clients.
@@ -2749,12 +2785,21 @@ impl Renderer {
                 border,
                 full,
             );
-            // The caret: a thin bar past the `> ` prefix at the query cursor —
-            // display-width based, since `query_cursor` is a char offset and a wide
-            // CJK char in the query occupies two cells (see [`query_caret_col`]).
-            let caret =
-                query_caret_col(query, menu.query_cursor as usize).min(list_w.saturating_sub(1));
-            let (cpx, cpy) = self.cell_px(cx + caret, content_y0 + prompt_y);
+            // The caret: a thin bar on the *focused* line, past that line's prefix at
+            // its text cursor — display-width based, since `query_cursor` is a char
+            // offset and a wide CJK char occupies two cells (see [`query_caret_col`]).
+            let (caret_text, caret_prefix, caret_dy) = match menu.filters.as_ref() {
+                Some(f) if f.expanded && f.focus == MenuField::Include => {
+                    (f.include.as_str(), FILTER_LABEL_W as u16, 1)
+                }
+                Some(f) if f.expanded && f.focus == MenuField::Exclude => {
+                    (f.exclude.as_str(), FILTER_LABEL_W as u16, 2)
+                }
+                _ => (query, 2, 0),
+            };
+            let caret = (caret_prefix + cells_before(caret_text, menu.query_cursor as usize))
+                .min(list_w.saturating_sub(1));
+            let (cpx, cpy) = self.cell_px(cx + caret, content_y0 + prompt_y + caret_dy);
             let c = srgb_to_color_rgba(fg, 0.9);
             quads.push(Quad {
                 x: cpx,

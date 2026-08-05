@@ -300,19 +300,39 @@ pub enum PreviewScroll {
     Right,
 }
 
+/// One of a picker's editable lines. The query is always present; `Include` and
+/// `Exclude` are the glob-pattern filter boxes, reachable only on a source that
+/// opted into filtering ([`PromptSet::filterable`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptField {
+    #[default]
+    Query,
+    Include,
+    Exclude,
+}
+
 /// The picker's input-grab query field — a single editable line, modeled on the
 /// command line ([`Editor::cmdline`]). `col` is the byte offset of the text
-/// cursor within `query`.
+/// cursor within `text`.
 #[derive(Clone, Default)]
 pub(crate) struct Prompt {
-    pub query: String,
+    pub text: String,
     pub col: usize,
 }
 
 impl Prompt {
+    /// A field seeded with `text`, caret at its end — the shape every pre-filled
+    /// line (`open{ query = … }`, a seeded filter box) opens in.
+    fn seeded(text: &str) -> Self {
+        Prompt {
+            col: text.len(),
+            text: text.to_string(),
+        }
+    }
+
     /// Insert `c` at the text cursor and step past it.
     fn insert(&mut self, c: char) {
-        self.query.insert(self.col, c);
+        self.text.insert(self.col, c);
         self.col += c.len_utf8();
     }
 
@@ -320,7 +340,7 @@ impl Prompt {
     /// Returns whether anything changed (so the caller re-queries only on an edit).
     fn backspace(&mut self) -> bool {
         if let Some(prev) = self.prev_boundary() {
-            self.query.remove(prev);
+            self.text.remove(prev);
             self.col = prev;
             true
         } else {
@@ -330,8 +350,8 @@ impl Prompt {
 
     /// Delete the char under the text cursor (`<Del>`); a no-op at the end.
     fn delete(&mut self) -> bool {
-        if self.col < self.query.len() {
-            self.query.remove(self.col);
+        if self.col < self.text.len() {
+            self.text.remove(self.col);
             true
         } else {
             false
@@ -345,13 +365,13 @@ impl Prompt {
     }
 
     fn cursor_right(&mut self) {
-        if let Some(c) = self.query[self.col..].chars().next() {
+        if let Some(c) = self.text[self.col..].chars().next() {
             self.col += c.len_utf8();
         }
     }
 
     fn prev_boundary(&self) -> Option<usize> {
-        self.query[..self.col]
+        self.text[..self.col]
             .char_indices()
             .next_back()
             .map(|(i, _)| i)
@@ -361,7 +381,201 @@ impl Prompt {
     /// within the single-line query, which the client draws the prompt caret at
     /// (the prompt is char-indexed like the menu's match spans).
     fn cursor_chars(&self) -> usize {
-        self.query[..self.col].chars().count()
+        self.text[..self.col].chars().count()
+    }
+}
+
+/// A request to (re-)run a picker's source: the generation the results must be
+/// stamped with, plus every line that shapes the search. Queued on
+/// [`Editor::picker_query_changes`] for the server to forward to `nx._picker_run`.
+///
+/// `include` / `exclude` ride along with the query because a source needs all three
+/// to reproduce a search — they are the raw comma-separated lines, split into
+/// patterns by [`crate::glob::split_patterns`] on the Lua side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerRun {
+    pub gen: u64,
+    pub query: String,
+    pub include: String,
+    pub exclude: String,
+}
+
+/// What a picker's filter boxes open holding — the seed `nx.picker.open` resolves
+/// from the source spec, `nx.picker.setup` defaults, the persisted value and its own
+/// options, handed to the core as already-composed text.
+///
+/// `include` / `exclude` are the raw comma-separated lines the user would have typed
+/// (`crate::glob::split_patterns` is what turns them into patterns), so a seeded box
+/// is editable exactly like a hand-typed one — a seed, never a lock.
+#[derive(Clone, Debug, Default)]
+pub struct FilterSeed {
+    pub include: String,
+    pub exclude: String,
+    /// Open with the rows already revealed rather than collapsed to the badge.
+    pub expanded: bool,
+    /// Whether the source declared `filter = true`. Everything else here is inert
+    /// without it.
+    pub filterable: bool,
+    /// The previously-used lines for each box, **most recent first** — what
+    /// `history_prev` / `history_next` cycle through. Persisted across sessions in
+    /// the Lua `nx.shada.plugin` store and handed over whole at open: the lists are
+    /// capped at a couple of dozen short strings, so carrying them costs nothing and
+    /// cycling stays synchronous instead of a round-trip per keypress.
+    pub include_history: Vec<String>,
+    pub exclude_history: Vec<String>,
+}
+
+/// A picker's editable lines: the fuzzy/search `query` plus the two glob-pattern
+/// filter boxes (`include` / `exclude`, VSCode's "files to include / exclude").
+/// `None` on `Menu` means a promptless `nx.ui.select`.
+///
+/// The filter boxes are **collapsed** by default — the picker looks exactly as it did
+/// before they existed — and `toggle_filters` (`<C-g>`) reveals them. Only the
+/// [`focus`](Self::focus)ed field takes typed text, so one `Prompt` editor serves all
+/// three. A source that did not opt in (`nx.picker.source{ filter = true }`) has
+/// `filterable` clear and can never leave `Query`.
+#[derive(Clone, Default)]
+pub(crate) struct PromptSet {
+    pub query: Prompt,
+    pub include: Prompt,
+    pub exclude: Prompt,
+    /// Which line typed text edits.
+    pub focus: PromptField,
+    /// Whether the include/exclude rows are drawn. Collapsed still *applies* the
+    /// patterns — they surface as the badge rather than as two rows.
+    pub expanded: bool,
+    /// Whether this picker's source declared `filter = true`. Clear ⇒ the filter
+    /// actions fail loud rather than presenting boxes that would filter nothing.
+    pub filterable: bool,
+    /// Each filter box's recallable past lines and where in them it is browsing.
+    pub include_hist: FilterHistory,
+    pub exclude_hist: FilterHistory,
+}
+
+/// One filter box's line history and its browse position — the cmdline-history model
+/// (`<C-Up>` walks back into older lines, `<C-Down>` forward to the one you were
+/// typing).
+///
+/// `idx` is `None` while you are editing your own line, and `Some(i)` while browsing
+/// `entries[i]`; `draft` holds the line browsing started from, so walking all the way
+/// forward restores what you had rather than stranding you on an old pattern.
+#[derive(Clone, Default)]
+pub(crate) struct FilterHistory {
+    /// Past lines, most recent first.
+    pub entries: Vec<String>,
+    pub idx: Option<usize>,
+    pub draft: String,
+}
+
+impl FilterHistory {
+    /// Step to an older entry, returning the line to show. The first step from your
+    /// own text stashes it as the draft and **skips an entry identical to it** — the
+    /// box usually opens pre-filled with the most recent line, and a first press that
+    /// visibly did nothing would read as a broken key.
+    fn older(&mut self, current: &str) -> Option<String> {
+        let next = match self.idx {
+            None => {
+                self.draft = current.to_string();
+                self.entries.iter().position(|e| e != current)?
+            }
+            Some(i) => (i + 1).min(self.entries.len().saturating_sub(1)),
+        };
+        self.idx = Some(next);
+        self.entries.get(next).cloned()
+    }
+
+    /// Step to a newer entry, returning the line to show — or the draft once past the
+    /// most recent one. `None` when not browsing (nothing newer to go to).
+    fn newer(&mut self) -> Option<String> {
+        match self.idx? {
+            0 => {
+                self.idx = None;
+                Some(std::mem::take(&mut self.draft))
+            }
+            i => {
+                self.idx = Some(i - 1);
+                self.entries.get(i - 1).cloned()
+            }
+        }
+    }
+
+    /// Leave browsing without changing the text — called when the box is edited, so
+    /// the next `history_prev` starts from what is now on the line rather than
+    /// resuming a walk the edit invalidated.
+    fn stop_browsing(&mut self) {
+        self.idx = None;
+    }
+}
+
+impl PromptSet {
+    fn field(&self, which: PromptField) -> &Prompt {
+        match which {
+            PromptField::Query => &self.query,
+            PromptField::Include => &self.include,
+            PromptField::Exclude => &self.exclude,
+        }
+    }
+
+    /// The line typed text edits and the caret is drawn on.
+    fn focused(&self) -> &Prompt {
+        self.field(self.focus)
+    }
+
+    fn focused_mut(&mut self) -> &mut Prompt {
+        match self.focus {
+            PromptField::Query => &mut self.query,
+            PromptField::Include => &mut self.include,
+            PromptField::Exclude => &mut self.exclude,
+        }
+    }
+
+    /// The focused box's history, or `None` when the query has focus (which has no
+    /// filter history — it is not a glob line).
+    fn focused_history(&mut self) -> Option<&mut FilterHistory> {
+        match self.focus {
+            PromptField::Query => None,
+            PromptField::Include => Some(&mut self.include_hist),
+            PromptField::Exclude => Some(&mut self.exclude_hist),
+        }
+    }
+
+    /// Replace the focused box's text (a history recall), caret at its end.
+    fn set_focused(&mut self, text: String) {
+        let p = self.focused_mut();
+        p.col = text.len();
+        p.text = text;
+    }
+
+    /// Whether any pattern is in force — what makes the collapsed badge appear, so
+    /// a filtered picker never looks like an unfiltered one.
+    fn filtering(&self) -> bool {
+        !crate::glob::split_patterns(&self.include.text).is_empty()
+            || !crate::glob::split_patterns(&self.exclude.text).is_empty()
+    }
+
+    /// The collapsed-state badge — `[+2 -1]` for two include and one exclude
+    /// pattern, `None` when nothing is filtering or the rows are already shown (the
+    /// rows *are* the indicator then). Composed here rather than in each client so
+    /// the TUI, GUI and web can't disagree on what a pattern is; the count comes
+    /// from the same [`crate::glob::split_patterns`] the filter itself compiles.
+    fn badge(&self) -> Option<String> {
+        if self.expanded || !self.filtering() {
+            return None;
+        }
+        let inc = crate::glob::split_patterns(&self.include.text).len();
+        let exc = crate::glob::split_patterns(&self.exclude.text).len();
+        let mut s = String::from("[");
+        if inc > 0 {
+            s.push_str(&format!("+{inc}"));
+        }
+        if exc > 0 {
+            if inc > 0 {
+                s.push(' ');
+            }
+            s.push_str(&format!("-{exc}"));
+        }
+        s.push(']');
+        Some(s)
     }
 }
 
@@ -404,7 +618,7 @@ pub(crate) struct Menu {
     selected_active: bool,
     placement: MenuPlacement,
     /// The input-grab query field — `Some` for a picker, `None` for `select`.
-    prompt: Option<Prompt>,
+    prompt: Option<PromptSet>,
     /// The match query for a [`MenuKind::Complete`] menu: the word prefix left of
     /// the cursor. Completion has no input-grab [`Prompt`] (the buffer *is* the
     /// query), so the prefix is stored here and [`Menu::match_query`] reads it in
@@ -531,9 +745,41 @@ impl Menu {
     /// Empty for a `select` (no prompt, no prefix), keeping it in passthrough.
     fn match_query(&self) -> &str {
         match &self.prompt {
-            Some(p) => p.query.as_str(),
+            Some(p) => p.query.text.as_str(),
             None => self.complete_prefix.as_str(),
         }
+    }
+
+    /// This menu's current run request — the generation plus every line the source
+    /// needs to reproduce the search. A promptless `select` never reaches here, so the
+    /// absent-prompt case reads as empty text rather than failing.
+    fn picker_run(&self) -> PickerRun {
+        let p = self.prompt.as_ref();
+        PickerRun {
+            gen: self.generation,
+            query: p.map_or(String::new(), |p| p.query.text.clone()),
+            include: p.map_or(String::new(), |p| p.include.text.clone()),
+            exclude: p.map_or(String::new(), |p| p.exclude.text.clone()),
+        }
+    }
+
+    /// Drop the displayed results and adopt `gen` as the generation on show — the
+    /// atomic swap when a newer run's first batch lands (or when it completes empty).
+    ///
+    /// The view mode is re-derived rather than forced to passthrough: a **static**
+    /// source with a live query must resume in *filtered* mode, exactly as
+    /// [`Editor::open_picker`] seeds it, so the re-run's items are ranked against the
+    /// query as they stream (`extend_view` is a no-op in passthrough, which would show
+    /// them unranked). Before include/exclude filters this could only ever fire for a
+    /// dynamic source — which self-filters and so wants passthrough — and forcing
+    /// `None` was equivalent; a filter edit re-runs a static source too.
+    fn reset_items(&mut self, gen: u64) {
+        let refilter = !self.dynamic && !self.match_query().is_empty();
+        self.all_items.clear();
+        self.filtered = refilter.then(Vec::new);
+        self.match_spans.clear();
+        self.items_gen = gen;
+        self.cursor = 0;
     }
 
     /// Recompute the ranked view from scratch against the current query (a static
@@ -718,7 +964,8 @@ impl Editor {
     /// (`nx.picker.open(name, { query = … })`) with the caret at its end, so the
     /// list opens already filtered against it; empty ⇒ the historical empty-prompt
     /// open. The server invokes the source's initial run after opening with this
-    /// `query` (generation `0`).
+    /// `query` (generation `0`). `filters` seeds the include/exclude boxes and says
+    /// whether this source has them at all ([`FilterSeed`]).
     #[allow(clippy::too_many_arguments)]
     pub fn open_picker(
         &mut self,
@@ -734,10 +981,25 @@ impl Editor {
         title: Option<String>,
         multiselect: bool,
         resumable: bool,
+        filters: FilterSeed,
     ) {
-        let prompt = Prompt {
-            col: query.len(),
-            query: query.to_string(),
+        let prompt = PromptSet {
+            query: Prompt::seeded(query),
+            include: Prompt::seeded(&filters.include),
+            exclude: Prompt::seeded(&filters.exclude),
+            focus: PromptField::Query,
+            // Only a filterable picker can show the rows; `expanded` on a source that
+            // never opted in would draw two boxes that filter nothing.
+            expanded: filters.filterable && filters.expanded,
+            filterable: filters.filterable,
+            include_hist: FilterHistory {
+                entries: filters.include_history,
+                ..FilterHistory::default()
+            },
+            exclude_hist: FilterHistory {
+                entries: filters.exclude_history,
+                ..FilterHistory::default()
+            },
         };
         // A non-empty seed on a STATIC source opens in *filtered* mode (an empty
         // ranked view), so the items the source streams in are matched against the
@@ -950,12 +1212,8 @@ impl Editor {
             return;
         };
         if gen > menu.items_gen {
-            // First result of a newer query — swap the old results out now.
-            menu.all_items.clear();
-            menu.filtered = None;
-            menu.match_spans.clear();
-            menu.items_gen = gen;
-            menu.cursor = 0;
+            // First result of a newer run — swap the old results out now.
+            menu.reset_items(gen);
         }
         let new_start = menu.all_items.len();
         menu.all_items.extend(items);
@@ -979,11 +1237,7 @@ impl Editor {
             return;
         };
         if gen > menu.items_gen {
-            menu.all_items.clear();
-            menu.filtered = None;
-            menu.match_spans.clear();
-            menu.items_gen = gen;
-            menu.cursor = 0;
+            menu.reset_items(gen);
         }
     }
 
@@ -1348,13 +1602,20 @@ impl Editor {
             return;
         }
         self.message.clear();
-        {
+        let field = {
             let Some(menu) = self.menu.as_mut() else {
                 return;
             };
-            menu.prompt.as_mut().unwrap().insert(c);
-        }
-        self.on_query_changed();
+            let p = menu.prompt.as_mut().unwrap();
+            p.focused_mut().insert(c);
+            // Typing ends a history walk: the line is yours again, so the next recall
+            // starts from it rather than resuming a walk this edit invalidated.
+            if let Some(h) = p.focused_history() {
+                h.stop_browsing();
+            }
+            p.focus
+        };
+        self.on_prompt_changed(field);
     }
 
     /// Snapshot a closing **resumable** picker for `nx.picker.resume()` (`<leader>fr`)
@@ -1449,6 +1710,16 @@ impl Editor {
                 | "send_to_list"
         ) {
             self.picker_resume_keys = self.snapshot_picker_for_resume();
+            // The filter lines as they stand at close, for Lua to fold into the
+            // persisted history. Captured HERE, not from the last source run: a
+            // dynamic source's re-run is debounced, so closing within the debounce
+            // would otherwise record the line as it was a keystroke or two ago.
+            self.picker_closed_filters = self
+                .menu
+                .as_ref()
+                .and_then(|m| m.prompt.as_ref())
+                .filter(|p| p.filterable)
+                .map(|p| (p.include.text.clone(), p.exclude.text.clone()));
         }
         match action {
             "confirm" | "confirm_tab" | "confirm_split" | "confirm_vsplit" => {
@@ -1534,14 +1805,17 @@ impl Editor {
             _ => {}
         }
 
-        // Navigation / preview / query-edit mutate the open menu; the query-edit ones
-        // report whether the query changed so we can re-rank after the borrow ends.
+        // Navigation / preview / prompt-edit mutate the open menu; the prompt-edit ones
+        // report **which field** changed so we can react after the borrow ends — a
+        // query edit re-ranks locally, a filter edit re-runs the source.
+        let mut unfilterable = false;
+        let mut no_history = false;
         let query_changed = {
             let Some(menu) = self.menu.as_mut() else {
                 return Ok(());
             };
             let last = menu.view_len().saturating_sub(1);
-            let mut query_changed = false;
+            let mut query_changed: Option<PromptField> = None;
             match action {
                 "next" => menu.cursor = (menu.cursor + 1).min(last),
                 "prev" => menu.cursor = menu.cursor.saturating_sub(1),
@@ -1564,22 +1838,101 @@ impl Editor {
                 // A preview gesture with no preview pane is a no-op, not an error.
                 "preview_half_down" | "preview_half_up" | "preview_page_down"
                 | "preview_page_up" | "preview_left" | "preview_right" => {}
-                "backspace" => query_changed = menu.prompt.as_mut().unwrap().backspace(),
-                "delete" => query_changed = menu.prompt.as_mut().unwrap().delete(),
-                "left" => menu.prompt.as_mut().unwrap().cursor_left(),
-                "right" => menu.prompt.as_mut().unwrap().cursor_right(),
-                "to_start" => menu.prompt.as_mut().unwrap().col = 0,
-                "to_end" => {
+                // A deletion is an edit like typing: it ends any history walk, so the
+                // next recall starts from what is now on the line.
+                "backspace" => {
                     let p = menu.prompt.as_mut().unwrap();
-                    p.col = p.query.len();
+                    let field = p.focus;
+                    query_changed = p.focused_mut().backspace().then_some(field);
+                    if query_changed.is_some() {
+                        if let Some(h) = p.focused_history() {
+                            h.stop_browsing();
+                        }
+                    }
+                }
+                "delete" => {
+                    let p = menu.prompt.as_mut().unwrap();
+                    let field = p.focus;
+                    query_changed = p.focused_mut().delete().then_some(field);
+                    if query_changed.is_some() {
+                        if let Some(h) = p.focused_history() {
+                            h.stop_browsing();
+                        }
+                    }
+                }
+                "left" => menu.prompt.as_mut().unwrap().focused_mut().cursor_left(),
+                "right" => menu.prompt.as_mut().unwrap().focused_mut().cursor_right(),
+                "to_start" => menu.prompt.as_mut().unwrap().focused_mut().col = 0,
+                "to_end" => {
+                    let p = menu.prompt.as_mut().unwrap().focused_mut();
+                    p.col = p.text.len();
+                }
+                // Reveal / hide the include-exclude rows, and step through the three
+                // fields. On a source that never declared `filter = true` these are a
+                // no-op with a word about why — the same shape as a preview gesture on
+                // a preview-less picker, since the action is implemented and it is the
+                // *source* that has nothing to filter.
+                "toggle_filters" => {
+                    let p = menu.prompt.as_mut().unwrap();
+                    if p.filterable {
+                        p.expanded = !p.expanded;
+                        // Collapsing must not strand the caret on a row that is no
+                        // longer drawn — typed text would vanish into an invisible box.
+                        p.focus = if p.expanded {
+                            PromptField::Include
+                        } else {
+                            PromptField::Query
+                        };
+                    } else {
+                        unfilterable = true;
+                    }
+                }
+                "next_field" => {
+                    let p = menu.prompt.as_mut().unwrap();
+                    if p.filterable {
+                        // Cycling reveals the rows, so `next_field` alone is enough to
+                        // reach the boxes without knowing about `toggle_filters`.
+                        p.expanded = true;
+                        p.focus = match p.focus {
+                            PromptField::Query => PromptField::Include,
+                            PromptField::Include => PromptField::Exclude,
+                            PromptField::Exclude => PromptField::Query,
+                        };
+                    } else {
+                        unfilterable = true;
+                    }
+                }
+                // Recall a past line for the focused box. Only the filter boxes have
+                // history — the query is not a glob line — so on the prompt this says
+                // so rather than silently doing nothing.
+                "history_prev" | "history_next" => {
+                    let p = menu.prompt.as_mut().unwrap();
+                    let current = p.focused().text.clone();
+                    let older = action == "history_prev";
+                    match p.focused_history() {
+                        None => no_history = true,
+                        Some(h) => {
+                            let recalled = if older { h.older(&current) } else { h.newer() };
+                            if let Some(text) = recalled {
+                                p.set_focused(text);
+                                query_changed = Some(p.focus);
+                            }
+                        }
+                    }
                 }
                 other => return Err(format!("unknown picker action {other:?}")),
             }
             query_changed
         };
 
-        if query_changed {
-            self.on_query_changed();
+        if unfilterable {
+            self.echo("this picker has no include/exclude filters".to_string());
+        }
+        if no_history {
+            self.echo("history is per filter box — <C-g> to one first".to_string());
+        }
+        if let Some(field) = query_changed {
+            self.on_prompt_changed(field);
         }
         Ok(())
     }
@@ -1665,26 +2018,33 @@ impl Editor {
         let _ = self.apply_picker_action(action);
     }
 
-    /// React to a picker query edit: a dynamic source bumps the generation and
-    /// emits the new `(generation, query)` onto [`Editor::picker_query_changes`]
-    /// for the server to re-run the source; a static source just re-ranks locally.
-    /// A dynamic edit **keeps the current results displayed** — they are swapped out
-    /// only when the new search's first result (or its completion) arrives
+    /// React to an edit of one of the picker's prompt lines.
+    ///
+    /// Which line was edited decides the work, because the two kinds of text mean
+    /// different things to a source:
+    ///
+    /// * **The query** is what it has always been — a *dynamic* source bumps the
+    ///   generation and emits a run onto [`Editor::picker_query_changes`] for the
+    ///   server to forward; a *static* source just re-ranks the candidates it already
+    ///   holds ([`Menu::refilter`]), no re-run.
+    /// * **A filter pattern** (include / exclude) changes which paths *exist* for this
+    ///   search, which no amount of local re-ranking can produce. It re-runs the
+    ///   source — static sources included — so `rg` is re-spawned with the new `-g`
+    ///   arguments and the walk legs re-enumerate.
+    ///
+    /// Either way the edit **keeps the current results displayed**: they are swapped
+    /// out only when the new run's first result (or its completion) arrives
     /// ([`Editor::menu_push`] / [`Editor::menu_finish`]), so the list never flashes
     /// empty while a debounced search runs.
-    fn on_query_changed(&mut self) {
+    fn on_prompt_changed(&mut self, field: PromptField) {
         let signal = {
             let Some(menu) = self.menu.as_mut() else {
                 return;
             };
-            if menu.dynamic {
+            let rerun = menu.dynamic || field != PromptField::Query;
+            if rerun {
                 menu.generation += 1;
-                let gen = menu.generation;
-                let query = menu
-                    .prompt
-                    .as_ref()
-                    .map_or(String::new(), |p| p.query.clone());
-                Some((gen, query))
+                Some(menu.picker_run())
             } else {
                 menu.refilter();
                 None
@@ -1714,8 +2074,19 @@ impl Editor {
                 selected: m.cursor,
                 total: m.view_len(),
                 placement: m.placement,
-                query: m.prompt.as_ref().map(|p| p.query.clone()),
-                query_cursor: m.prompt.as_ref().map_or(0, |p| p.cursor_chars()),
+                query: m.prompt.as_ref().map(|p| p.query.text.clone()),
+                // The caret belongs to whichever line has focus; `filters.focus` tells
+                // the client which row to draw it on.
+                query_cursor: m.prompt.as_ref().map_or(0, |p| p.focused().cursor_chars()),
+                filters: m.prompt.as_ref().filter(|p| p.filterable).map(|p| {
+                    crate::view::FilterView {
+                        include: p.include.text.clone(),
+                        exclude: p.exclude.text.clone(),
+                        focus: p.focus,
+                        expanded: p.expanded,
+                        badge: p.badge(),
+                    }
+                }),
                 prompt_pos: m.prompt_pos,
                 has_preview: m.preview,
                 preview: m.selected_preview().cloned(),
@@ -1877,10 +2248,11 @@ impl Editor {
             editor_h,
         } = metrics;
         // A picker carries a prompt line plus a separator row between it and the
-        // list; `nx.ui.select` carries neither. Both count toward the box height
-        // (`chrome`), the prompt's text toward the width.
+        // list — and, with the filter boxes revealed, the include/exclude rows above
+        // that separator; `nx.ui.select` carries none of it. All of them count toward
+        // the box height (`chrome`), their text toward the width.
         let prompt_rows = usize::from(m.query.is_some());
-        let chrome = prompt_rows * 2;
+        let chrome = prompt_rows + m.filter_rows() + prompt_rows;
         let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
 
         // The box rect, the scroll offset of the first visible row, the windowed

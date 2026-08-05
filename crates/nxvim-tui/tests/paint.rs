@@ -1890,3 +1890,86 @@ fn server_supplied_escape_sequences_never_reach_the_terminal() {
         "the printable residue of the buffer line still renders"
     );
 }
+
+#[test]
+fn revealed_filter_boxes_paint_two_rows_and_hold_the_caret() {
+    // The include/exclude boxes render as two labelled rows between the prompt and
+    // the separator, and the caret follows the FOCUSED line — so typing lands where
+    // the user is looking. `query_cursor` is that line's column, not the query's.
+    let menu = Value::Map(vec![
+        (Value::from("items"), Value::Array(vec![Value::from("one")])),
+        (Value::from("selected"), Value::from(0u64)),
+        (Value::from("row"), Value::from(0u64)),
+        (Value::from("col"), Value::from(0u64)),
+        (Value::from("width"), Value::from(24u64)),
+        (Value::from("height"), Value::from(8u64)),
+        (Value::from("query"), Value::from("hand")),
+        (Value::from("query_cursor"), Value::from(6u64)),
+        (
+            Value::from("filters"),
+            Value::Map(vec![
+                (Value::from("include"), Value::from("src/**")),
+                (Value::from("exclude"), Value::from("target")),
+                (Value::from("focus"), Value::from("include")),
+                (Value::from("expanded"), Value::from(true)),
+            ]),
+        ),
+    ]);
+    let v = view(vec![("lines", lines(&["x"])), ("menu", menu)]);
+    let (buf, cursor) = paint_with_cursor(&v, 40, 14);
+
+    let (iy, ix) = find_text(&buf, "include").expect("the include row is painted");
+    let (ey, _) = find_text(&buf, "exclude").expect("the exclude row is painted");
+    assert_eq!(ey, iy + 1, "the two rows are adjacent, under the prompt");
+    let (qy, _) = find_text(&buf, "hand").expect("the query row is painted");
+    assert_eq!(iy, qy + 1, "and follow the prompt line");
+    // Each row shows its own raw text at the shared label column.
+    assert_eq!(
+        run_text(&buf, ix as u16 + 8, iy, 6),
+        "src/**",
+        "the include box's text starts past its label"
+    );
+    assert_eq!(run_text(&buf, ix as u16 + 8, ey, 6), "target");
+    // The caret sits on the focused (include) row, at label width + 6 chars.
+    assert_eq!(
+        cursor,
+        Some((ix as u16 + 8 + 6, iy)),
+        "the caret belongs to the focused line, not the query"
+    );
+}
+
+#[test]
+fn a_collapsed_filter_box_shows_its_badge_on_the_prompt_row() {
+    // Collapsed, the picker keeps its single-line shape — but an active filter must
+    // still be visible, or a search that is hiding files looks like one that isn't.
+    let menu = Value::Map(vec![
+        (Value::from("items"), Value::Array(vec![Value::from("one")])),
+        (Value::from("selected"), Value::from(0u64)),
+        (Value::from("row"), Value::from(0u64)),
+        (Value::from("col"), Value::from(0u64)),
+        (Value::from("width"), Value::from(24u64)),
+        (Value::from("height"), Value::from(8u64)),
+        (Value::from("query"), Value::from("hand")),
+        (Value::from("query_cursor"), Value::from(4u64)),
+        (
+            Value::from("filters"),
+            Value::Map(vec![
+                (Value::from("include"), Value::from("src/**")),
+                (Value::from("exclude"), Value::from("target")),
+                (Value::from("focus"), Value::from("query")),
+                (Value::from("expanded"), Value::from(false)),
+                (Value::from("badge"), Value::from("[+1 -1]")),
+            ]),
+        ),
+    ]);
+    let v = view(vec![("lines", lines(&["x"])), ("menu", menu)]);
+    let (buf, _cursor) = paint_with_cursor(&v, 40, 14);
+
+    let (qy, _) = find_text(&buf, "hand").expect("the prompt row is painted");
+    let (by, _) = find_text(&buf, "[+1 -1]").expect("the badge is painted");
+    assert_eq!(by, qy, "the badge rides the prompt row");
+    assert!(
+        find_text(&buf, "include").is_none(),
+        "collapsed, the rows themselves stay hidden"
+    );
+}

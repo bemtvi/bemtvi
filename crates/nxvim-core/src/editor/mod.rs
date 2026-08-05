@@ -79,8 +79,8 @@ pub(crate) use self::command::{
 pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
 pub use self::menu::{
-    CmdlineCandidate, Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll,
-    PreviewTarget, PromptPos, RowLayout,
+    CmdlineCandidate, Extent, FilterSeed, MenuGeom, MenuItem, MenuMetrics, MenuPlacement,
+    PickerRun, PreviewScroll, PreviewTarget, PromptField, PromptPos, RowLayout,
 };
 pub use self::mouse::{ClickSurface, MouseClick, MousePos, StatuslineClick, WheelGesture};
 pub(crate) use self::multicursor::PlacementSnapshot;
@@ -1011,11 +1011,20 @@ pub struct Editor {
     /// the selection shifts the signature and re-places it. `None` when the float is
     /// closed. See [`float`](crate::editor::float).
     completion_docs_sig: Option<float::CompletionDocsSig>,
-    /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
-    /// query)`. A *static* source never appends here — the local fuzzy matcher
-    /// handles its query edits in core. Drained by the server, which stamps the
-    /// generation onto the source run + its pushes so a stale response is dropped.
-    pub picker_query_changes: Vec<(u64, String)>,
+    /// Picker prompt edits awaiting a source re-run — each a [`PickerRun`] (the
+    /// generation plus the query and the two filter lines). Drained by the server,
+    /// which stamps the generation onto the source run + its pushes so a stale
+    /// response is dropped.
+    ///
+    /// A *query* edit appends only for a **dynamic** source; a static one re-ranks
+    /// what it already holds. An *include/exclude* edit appends for **every**
+    /// filterable source — the set of paths that exist has changed, which local
+    /// re-ranking cannot produce.
+    pub picker_query_changes: Vec<PickerRun>,
+    /// The `(include, exclude)` lines a filterable picker held when it closed, for
+    /// the server to hand to Lua's persisted filter history. `None` for a picker
+    /// without filter boxes, and taken by the server on each close.
+    pub picker_closed_filters: Option<(String, String)>,
     /// Status-line clicks awaiting the server's `%@handler@…%X` resolution. The
     /// core hit-tests a status-line press to a window + column (it can't run the
     /// Lua handler), pushes a [`StatuslineClick`] here, and the server drains it
@@ -1963,6 +1972,7 @@ impl Editor {
             picker_resume_keys: Vec::new(),
             content_float: None,
             picker_query_changes: Vec::new(),
+            picker_closed_filters: None,
             statusline_clicks: Vec::new(),
             mouse_clicks: Vec::new(),
             complete_config: complete::CompleteConfig::default(),

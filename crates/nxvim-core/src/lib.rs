@@ -38,13 +38,13 @@ pub use editor::{
     CmdlineCandidate, CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus,
     CommitOutcome, CompleteConfig, CompleteKeys, Cursor, DecorViewport, DeferredCmd, Editor,
     Extent, FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry,
-    FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry, JumpPos,
-    LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos,
-    NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry,
-    PluginNamespace, PreWrite, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList,
-    QfStack, QfWhich, RegisterEntry, RowLayout, SessionDock, SessionState, SessionTab,
-    SessionWindow, ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView,
-    WheelGesture, WindowConfigSpec, WindowId, WriteEvent, WriteScope,
+    FilterSeed, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry,
+    JumpPos, LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick,
+    MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PickerRun,
+    PluginEntry, PluginNamespace, PreWrite, PreviewScroll, PreviewTarget, PromptField, PromptPos,
+    QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry, RowLayout, SessionDock,
+    SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId, TerminalOp,
+    UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId, WriteEvent, WriteScope,
 };
 pub use encoding::Encoding;
 pub use extmark::{

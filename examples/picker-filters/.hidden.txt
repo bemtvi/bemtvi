@@ -1,0 +1,1 @@
+A dotfile — still findable, because the picker searches unrestricted. needle

@@ -30,16 +30,23 @@
 --
 --   * diagnostics MERGE — every server's set renders, none replaces another, and
 --     each carries the `client_id` that published it;
---   * requests ROUTE BY CAPABILITY — the first attached server, in name order,
---     that advertises the feature. Here that is always gopls, decided by what the
+--   * requests ROUTE BY CAPABILITY first — only a server that advertises the
+--     feature is a candidate. Here that is always gopls, decided by what the
 --     servers said at `initialize` rather than by anything in this config;
---   * references, symbols and code actions FAN OUT to every *capable* server and
---     merge. With this pair only gopls is capable of any of them, so the merge has
---     one contributor — the mechanism is the same, the pairing is what is
---     one-sided. Pair gopls with a second server that offers code actions (efm
---     running a fixer, say) and the chooser fills from both;
---   * `format{ name = … }` picks WHICH server formats — see step 7 for why that
---     option only starts meaning something once a buffer has several servers.
+--   * among the candidates, `priority` (section 5) decides who leads, and the
+--     config name alphabetically breaks a tie. Capability is the filter, priority
+--     is the preference;
+--   * EVERY cursor verb FANS OUT to the capable servers and merges — hover,
+--     signature help, references, symbols, code actions, and the goto family. With
+--     this pair only gopls is capable of any of them, so each merge has one
+--     contributor: the mechanism is the same, the pairing is what is one-sided. Pair
+--     gopls with a second server that offers code actions (efm running a fixer, say)
+--     and the chooser fills from both. A goto whose merged list holds ONE place
+--     still jumps — the picker appears only when servers disagree;
+--   * the verbs that ACT — `format`, `rename` — still pick one server, because two
+--     servers' edits cannot both be applied to one buffer;
+--   * `{ name = … }` on any verb, or a bare `:LspHover <server>`, overrides all of
+--     that for one call — see steps 7-10.
 --
 -- Type this / see that:
 --
@@ -99,6 +106,27 @@
 --      project. With this pair the results match — only gopls is capable — which is
 --      the point: naming the server that would have been picked anyway changes
 --      nothing, so it is safe to be explicit.
+--  11. Hover MERGES: `K` asks every server that advertises `hoverProvider` and
+--      composes one float, each section headed with the client that wrote it. Here
+--      only gopls does (step 5), so you get one unheaded section — the merge is
+--      invisible until a second server has something to say, which is the right
+--      default. Pair gopls with a server that hovers (a second type-checker, an efm
+--      instance surfacing docs) and the float grows a `# name` heading per server.
+--      Signature help does the same, one line per server prefixed with its name. Put
+--      the cursor on `name` — the second argument of the `Printf` call on line 13 —
+--      and run `:LspSignatureHelp`.  →  `Printf(format string, a ...any) (n int, err
+--      error)    [a ...any]`, the bracket naming the argument you are on. (gopls
+--      answers per position, and declines on the opening quote of the first argument;
+--      that is the server's judgement, not a route that failed.)
+--      `gd` on the `count` inside `fmt.Println(…)` (line 23) merges too — but its
+--      merged list holds one place, so it JUMPS, to the `count := 1` on line 21. The
+--      picker only appears when two servers disagree about where the definition is,
+--      which is information you want rather than a silent coin-flip.
+--  12. `:LspInfo` again, now reading the `priority:` lines — section 5 below ranks
+--      gopls above the linter.  →  gopls is listed FIRST, `priority: 10`, and
+--      golangci_lint second, `priority: 0  (default)`. The listing is in the order
+--      requests actually route, so "who answered?" is read top-down: the first
+--      server listed that advertises the feature is the one that did.
 --
 -- If only one of the two binaries is installed the config still works — the other
 -- simply never attaches, and every routed request goes to the one that did. That
@@ -113,6 +141,10 @@ nx.lsp.config("gopls", {
   cmd = { "gopls" },
   filetypes = { "go" },
   root_markers = { "go.mod", ".git" },
+  -- The stated preference (section 5): rank gopls above the linter, so it leads
+  -- wherever both could answer — instead of "whichever config name sorts first",
+  -- which is the only thing the editor can guess on its own.
+  priority = 10,
 })
 
 --------------------------------------------------------------------------------
@@ -240,4 +272,35 @@ nx.keymap.set("n", "<leader>ld", function()
   else
     nx.print(table.concat(rows, "   |   "))
   end
+end)
+
+--------------------------------------------------------------------------------
+-- 5. Priority — the DEFAULT route, stated rather than guessed.
+--
+-- `name` (section 3) answers "which server, this call". `priority` answers "which
+-- server, when nobody says": an integer per config, higher first, `0` by default.
+-- Without it the order is the config name alphabetically — `golangci_lint` before
+-- `gopls`, which is a fact about spelling, not a preference. gopls is ranked 10 up in
+-- section 1, so it leads every decision the two could share:
+--
+--   * a single-target verb (hover, goto, rename, format) asks the highest-ranked
+--     server that ADVERTISES the feature — priority orders the candidates, it never
+--     promotes a server that cannot answer;
+--   * the merged surfaces present in that order — hover sections, code-action rows,
+--     reference and symbol lists;
+--   * `:LspInfo` lists in that order too, with each `priority:` line, so the listing
+--     reads as the explanation of what just happened.
+--
+-- Here the pairing is one-sided enough that capability already decides everything, so
+-- the rank changes no outcome — which is exactly when you want it in the config
+-- anyway: it is the line that keeps working when the second server grows a feature
+-- the first one has, and stops the answer from silently moving.
+nx.keymap.set("n", "<leader>lp", function()
+  local rows = {}
+  for _, c in ipairs(nx.lsp.clients({ bufnr = 0 })) do
+    local cfg = nx.lsp.get_config(c.name)
+    rows[#rows + 1] = c.name .. " priority=" .. tostring(cfg.priority or 0)
+  end
+  table.sort(rows)
+  nx.print(table.concat(rows, "   |   "))
 end)

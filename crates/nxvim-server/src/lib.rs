@@ -951,6 +951,17 @@ pub struct EditHost {
     /// runtime, so a crash can't strand a spinner. Mirrored to
     /// `nx.lsp._progress[client_id]` for `nx.lsp.progress()`.
     lsp_progress: HashMap<ServerKey, Vec<ProgressEntry>>,
+    /// The `nx.lsp.config{ priority = … }` **routing rank** of each config name
+    /// (absent ⇒ `0`, the default). Higher ranks first: this is what decides which of
+    /// a buffer's attached servers a single-target verb asks by default, and the order
+    /// the merged surfaces (the hover float, the code-action chooser) present them in.
+    ///
+    /// Keyed by config **name** rather than [`ServerKey`] because the rank is the
+    /// config's stated preference — it holds for every root that config serves, and
+    /// survives a respawn under a new key. Read through
+    /// [`EditHost::lsp_priority_of`], never indexed directly, so the `0` default lives
+    /// in one place.
+    lsp_priorities: HashMap<String, i64>,
     /// Whether the user opted into the **signature-help auto-trigger**
     /// (`nx.lsp.signature_help_autotrigger(true)`). It's the latch the per-buffer
     /// trigger set hangs off: when set, an attaching server's advertised trigger chars
@@ -1629,6 +1640,7 @@ impl EditHost {
             lsp_states: HashMap::new(),
             lsp_servers: HashMap::new(),
             lsp_progress: HashMap::new(),
+            lsp_priorities: HashMap::new(),
             signature_auto: false,
             lsp_ensured: HashSet::new(),
             lsp_spawns: HashMap::new(),

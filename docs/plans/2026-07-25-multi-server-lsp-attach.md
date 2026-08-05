@@ -460,6 +460,81 @@ Covered by `a_request_routes_to_the_named_server`,
 `crates/nxvim/tests/lsp_config.rs`, over the same `alpha`/`beta` mock pair: `alpha`
 sorts first, so naming `beta` fails the moment the route is ignored.
 
+### Phase 9 — a stated preference, and hover stops picking one (done)
+
+Phase 8 let a *call* name its server. What a call could not say is which server should
+answer when nobody names one — that was the `ServerKey` order, i.e. the config name
+alphabetically. Deterministic, and a fine tiebreak, but as a *preference* it is
+arbitrary: `pyright` beats `ruff` for hover because of how the two words sort.
+
+- **`nx.lsp.config{ priority = <int> }`** (default `0`, higher first) is that
+  preference, stated. It rides `LspOp::Start` (and `Restart`, so
+  `nx.lsp.restart(name)` applies a changed rank to a running server) into
+  `EditHost::lsp_priorities`, keyed by config **name** — the rank is the config's, so
+  it holds across roots and survives a respawn under a new key.
+- **One comparator.** `lsp_routing_order` (priority desc, then key) is used by
+  `lsp_capable_servers`, by the merged hover's presentation, and by `:LspInfo`'s
+  listing — so the surface that explains routing cannot disagree with the routing.
+  `lsp_target_for` is now literally the first element of `lsp_capable_servers`,
+  which removes the second, subtly-different selection walk it used to carry.
+  Capability still decides *whether* a server is asked; priority only decides
+  *who first* among those that can.
+- **Hover joins the fan-out.** `vim.lsp.buf.hover` asks every client and composes one
+  float; nxvim now does the same, for the reason every other merge exists — on a
+  two-server buffer each server knows something the other doesn't, and answering from
+  one silently hides the other. Sections are headed `# <client>` and separated by
+  `---`, **only** when more than one server contributed (a heading naming the only
+  server there is would be noise on every hover in the common one-server case). Empty
+  hovers are dropped as they arrive, so "did anyone answer" and "does this need
+  headings" are the same count. Order is `priority`, where neovim's is an unordered
+  `pairs()` walk.
+- Because hover always fans out now, its single-target reply arm is `unreachable!`
+  (the `CodeActions` precedent), not dead code that would quietly render an unmerged
+  float.
+
+Covered by `hover_merges_every_capable_server_in_priority_order` (both servers in one
+float, higher rank leading, each section headed) and
+`priority_picks_the_default_server_for_a_single_target_verb` (an unnamed `format`
+reaches the ranked server, and `:LspInfo` lists in routing order with each rank,
+marking the ones nobody set).
+
+### Phase 10 — signature help and the goto family merge too (done)
+
+The last two kinds that picked one server. Both had the same hole hover did: the
+answer is *information*, and a second server's is not a worse copy of the first's.
+
+- **The goto family** (`definition` / `declaration` / `typeDefinition` /
+  `implementation`) merges into the existing `apply_lsp_locations`, which references
+  already used — including its dedup on *converted byte* positions, which is what
+  makes two servers naming one place collapse to one item even when they negotiated
+  different encodings. The behavior that had to survive: a merged list of one still
+  **jumps**, so `gd` on a one-server buffer is unchanged and the picker appears only
+  when servers genuinely disagree.
+- **Signature help** asks every capable server and shows the signatures together, one
+  line each, prefixed `<client>: ` when more than one answered. This is a deliberate
+  **divergence from neovim**, which shows one at a time as `(1/3)` with `<C-s>` to
+  cycle: cycling needs a focusable, key-grabbing float with session state, while
+  nxvim's is a passive doc float the next keystroke dismisses — and a signature is one
+  short line, so there is nothing to page through. Both editors ask every server; only
+  the presentation differs. The auto-trigger's per-buffer gate now asks whether *any*
+  capable server wants the typed character, which is exactly the condition under which
+  the round has a recipient.
+
+With that, **every cursor-anchored kind is a fan-out** and `request_lsp` is one path
+instead of two — the single-target tail, its per-kind request builder and its
+`LspReply` arms are gone, and those arms are now `unreachable!` next to the
+`CodeActions` one. Two pieces of state died with them: `PendingLspReq.cursor` (cursor
+staleness is `LspFanout`'s to judge — what is left on the single-slot path acts on the
+document or browses a list) and the second, subtly-different server-selection walk
+inside `lsp_target_for`.
+
+What stays single-target is the kinds that *act* — `Formatting`, `Rename` — where two
+servers' edits cannot both be applied to one buffer, and the resolve/decoration kinds
+that belong to the server that produced their item.
+
+Covered by `signature_help_merges_every_capable_server`, `goto_merges_both_servers_places`
+and `goto_still_jumps_when_the_merged_list_holds_one_place`.
+
 ## Testing
 
 Per repo convention every phase is black-box through the running server. The mock

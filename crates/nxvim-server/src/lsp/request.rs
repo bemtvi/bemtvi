@@ -15,15 +15,22 @@ use super::*;
 use crate::EditHost;
 
 impl EditHost {
-    /// Issue a language-feature request of `kind` at the cursor, recording its
-    /// generation so a stale reply is dropped (Decision 3): a newer request of
-    /// the same kind, or the cursor moving before the reply lands, invalidates
-    /// it. No-op (with a brief message) if the current buffer has no server that
-    /// has finished `initialize`, since the negotiated encoding isn't known yet.
+    /// Issue a language-feature request of `kind` at the cursor as a **fan-out round**:
+    /// every capable server is asked and their answers merge on arrival, with the
+    /// round's generation dropping a stale reply (Decision 3) — a newer round of the
+    /// same kind, or the cursor moving before the replies land, invalidates it.
+    /// No-op (with a brief message) if no attached server that finished `initialize`
+    /// advertises the feature.
     ///
-    /// `name` routes the request to one attached client by config name
-    /// (`:LspHover pyright`, `nx.lsp.hover{ name = "pyright" }`); `None` takes the
-    /// capability-ordered default. See [`lsp_route`](Self::lsp_route).
+    /// Every cursor-anchored kind rides this path: the lists (references, symbols),
+    /// the documents (hover, signature help) and the goto family alike. A round of one
+    /// — the ordinary single-server buffer, or `name` naming a client — merges nothing
+    /// and behaves exactly as a single-target request did.
+    ///
+    /// `name` routes the round to one attached client by config name
+    /// (`:LspHover pyright`, `nx.lsp.hover{ name = "pyright" }`); `None` asks every
+    /// capable server, in [routing order](Self::lsp_capable_servers). See
+    /// [`lsp_route`](Self::lsp_route).
     pub(crate) fn request_lsp(&mut self, kind: LspReqKind, cb_id: u64, name: Option<&str>) {
         // Kinds that don't have the uniform `{uri, position}` shape have their own
         // issue functions — because they carry an argument the cursor can't supply
@@ -63,83 +70,56 @@ impl EditHost {
         // fired during input — ahead of `redraw`'s own `sync_lsp` — so without
         // this the server would answer a stale document (e.g. completion ranges
         // computed against text the user already changed).
-        // Kinds whose answers MERGE go to every capable server at once.
-        if LspFanout::is_fanout(kind) {
-            self.sync_lsp();
-            let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
-            // The cursor in each encoding a server might have negotiated, resolved up
-            // front: the closure below cannot borrow the buffer while the fan-out
-            // borrows `self`, and there are only three.
-            let buf = self.editor.buffer();
-            let (p8, p16, p32) = (
-                lsp_position_in(buf, PositionEncoding::Utf8, row, col),
-                lsp_position_in(buf, PositionEncoding::Utf16, row, col),
-                lsp_position_in(buf, PositionEncoding::Utf32, row, col),
-            );
-            let asked = self.open_lsp_fanout(
-                kind,
-                cb_id,
-                CodeActionOpts::default(),
-                name,
-                |_, uri, enc| {
-                    let position = match enc {
-                        PositionEncoding::Utf8 => p8,
-                        PositionEncoding::Utf16 => p16,
-                        PositionEncoding::Utf32 => p32,
-                    };
-                    match kind {
-                        LspReqKind::References => LspRequest::References {
-                            uri,
-                            position,
-                            include_declaration: false,
-                        },
-                        LspReqKind::DocumentSymbol => LspRequest::DocumentSymbol { uri },
-                        // The other fan-out kinds are routed away above: code
-                        // actions to their own issuer, workspace symbols rejected
-                        // (they need a query). Falling back to *some* request here
-                        // is how a mis-routed kind used to become a silently wrong
-                        // one — a code-action ask issuing `documentSymbol`.
-                        other => unreachable!("{other:?} does not ride the cursor fan-out"),
-                    }
-                },
-            );
-            if asked.is_empty() {
-                self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-            }
-            return;
-        }
-        // Routed by capability: the first attached server, in key order, that
-        // advertises this feature — unless `name` names one outright. On a
-        // `pyright` + `ruff` buffer a hover must reach pyright, not whichever name
-        // happens to sort first.
-        let Some((key, uri, encoding)) = self.lsp_target_for_or_echo(kind, name) else {
-            // No capable server: the request never goes, so settle the promise now
-            // (resolve `nil`) rather than leave it hanging for a reply that
-            // won't come.
-            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-            return;
-        };
+        self.sync_lsp();
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
-        let position = self.lsp_position(encoding, row, col);
-        let token = self.register_lsp_request_to(kind, cb_id, &key);
-        let req = match kind {
-            LspReqKind::Definition => LspRequest::Definition { uri, position },
-            LspReqKind::Declaration => LspRequest::Declaration { uri, position },
-            LspReqKind::TypeDefinition => LspRequest::TypeDefinition { uri, position },
-            LspReqKind::Implementation => LspRequest::Implementation { uri, position },
-            LspReqKind::References => LspRequest::References {
-                uri,
-                position,
-                include_declaration: false,
+        // The cursor in each encoding a server might have negotiated, resolved up
+        // front: the closure below cannot borrow the buffer while the fan-out
+        // borrows `self`, and there are only three.
+        let buf = self.editor.buffer();
+        let (p8, p16, p32) = (
+            lsp_position_in(buf, PositionEncoding::Utf8, row, col),
+            lsp_position_in(buf, PositionEncoding::Utf16, row, col),
+            lsp_position_in(buf, PositionEncoding::Utf32, row, col),
+        );
+        let asked = self.open_lsp_fanout(
+            kind,
+            cb_id,
+            CodeActionOpts::default(),
+            name,
+            |_, uri, enc| {
+                let position = match enc {
+                    PositionEncoding::Utf8 => p8,
+                    PositionEncoding::Utf16 => p16,
+                    PositionEncoding::Utf32 => p32,
+                };
+                match kind {
+                    LspReqKind::Definition => LspRequest::Definition { uri, position },
+                    LspReqKind::Declaration => LspRequest::Declaration { uri, position },
+                    LspReqKind::TypeDefinition => LspRequest::TypeDefinition { uri, position },
+                    LspReqKind::Implementation => LspRequest::Implementation { uri, position },
+                    LspReqKind::References => LspRequest::References {
+                        uri,
+                        position,
+                        include_declaration: false,
+                    },
+                    LspReqKind::Hover => LspRequest::Hover { uri, position },
+                    LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
+                    LspReqKind::DocumentSymbol => LspRequest::DocumentSymbol { uri },
+                    // The remaining fan-out kinds are routed away above: code actions
+                    // to their own issuer (they carry a range and a context), workspace
+                    // symbols rejected (they need a query). Falling back to *some*
+                    // request here is how a mis-routed kind used to become a silently
+                    // wrong one — a code-action ask issuing `documentSymbol`.
+                    other => unreachable!("{other:?} does not ride the cursor fan-out"),
+                }
             },
-            LspReqKind::Hover => LspRequest::Hover { uri, position },
-            LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
-            // `documentSymbol` and `references` fan out and were handled above; every
-            // remaining kind was routed to its own issuer — or rejected by name — by
-            // the guard at the top of this function, so nothing else can arrive here.
-            other => unreachable!("{other:?} is not a single-target cursor request"),
-        };
-        self.fx.lsp_request(key, token, req);
+        );
+        if asked.is_empty() {
+            // Nobody could answer (`lsp_route` has echoed why), so the request never
+            // went: settle the promise now (resolve `nil`) rather than leave it
+            // hanging for a reply that won't come.
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
+        }
     }
 
     /// Recompute core's signature-help **auto-trigger** set from the opt-in flag and
@@ -182,7 +162,7 @@ impl EditHost {
         }
     }
 
-    /// Whether the current buffer has an (initialized) server advertising
+    /// Whether the current buffer has **any** (initialized) server advertising
     /// signature-help trigger characters — the per-buffer gate for the auto-trigger
     /// drain.
     ///
@@ -191,15 +171,17 @@ impl EditHost {
     /// wants the typed character. Resolving the gate to the buffer's *first* server
     /// then dropped it on every buffer whose first server has no signature help —
     /// `eslint` ahead of `ts_ls` — swallowing every `(` the second server would have
-    /// answered.
+    /// answered. Now that the request itself fans out, "any capable server wants this
+    /// character" is also exactly the condition under which the round has a recipient.
     fn current_buffer_has_signature_trigger(&self) -> bool {
-        self.lsp_target_for(self.editor.current_buffer_id(), LspReqKind::SignatureHelp)
-            .and_then(|(key, _, _)| self.lsp_servers.get(&key))
-            .is_some_and(|rt| !rt.signature_trigger_chars.is_empty())
+        self.lsp_capable_servers(self.editor.current_buffer_id(), LspReqKind::SignatureHelp)
+            .into_iter()
+            .filter_map(|(key, _)| self.lsp_servers.get(&key))
+            .any(|rt| !rt.signature_trigger_chars.is_empty())
     }
 
     /// Bump the request generation and register the in-flight request for `kind`
-    /// (buffer/cursor/`changedtick` at issue time), returning its [`ReqToken`].
+    /// (buffer / `changedtick` at issue time), returning its [`ReqToken`].
     /// The single home for the staleness bookkeeping every issue function shares.
     /// `cb_id` (`0` = fire-and-forget) settles the issuing verb's promise; a new
     /// request of the same `kind` **supersedes** the one it replaces, so that
@@ -220,7 +202,6 @@ impl EditHost {
             PendingLspReq {
                 generation,
                 buffer: self.editor.current_buffer_id(),
-                cursor: (self.editor.cursor.line, self.editor.cursor.col),
                 tick: self.editor.buffer().changedtick,
                 cb_id,
                 server: Some(server.clone()),
@@ -277,14 +258,38 @@ impl EditHost {
         }
     }
 
+    /// The `nx.lsp.config{ priority = … }` routing rank of the config `name`, or `0`
+    /// when it set none. The one place the default lives.
+    pub(crate) fn lsp_priority_of(&self, name: &str) -> i64 {
+        self.lsp_priorities.get(name).copied().unwrap_or(0)
+    }
+
+    /// Compare two servers in **routing order**: `priority` descending, then
+    /// [`ServerKey`] ascending. The single comparator behind every ordered view of a
+    /// buffer's servers — who a single-target verb asks, what order a merged surface
+    /// presents, and the order `:LspInfo` lists — so the listing can't disagree with
+    /// the routing it is meant to explain.
+    pub(crate) fn lsp_routing_order(&self, a: &ServerKey, b: &ServerKey) -> std::cmp::Ordering {
+        self.lsp_priority_of(&b.name)
+            .cmp(&self.lsp_priority_of(&a.name))
+            .then_with(|| a.cmp(b))
+    }
+
     /// Every attached server on `buffer` that has finished `initialize` and
-    /// advertises the provider answering `kind`, in [`ServerKey`] order, with the
+    /// advertises the provider answering `kind`, **in routing order**, with the
     /// encoding each negotiated.
     ///
-    /// The plural of [`lsp_target_for`](Self::lsp_target_for): the selector for the
-    /// surfaces that ask *all* capable servers — the fan-out rounds (references,
-    /// symbols, code actions) and the whole-buffer decorations (semantic tokens,
-    /// inlay hints), whose caches are per server.
+    /// The plural of [`lsp_target_for`](Self::lsp_target_for), and the one place the
+    /// order is decided: the fan-out rounds (references, symbols, code actions, hover)
+    /// present in it, the whole-buffer decorations (semantic tokens, inlay hints)
+    /// concatenate in it, and every single-target verb takes its **first** element.
+    ///
+    /// Routing order is `priority` descending, then [`ServerKey`] ascending. The key
+    /// order alone — config name, then root — is deterministic but arbitrary as a
+    /// *preference*: it makes `pyright` beat `ruff` for hover because of how the two
+    /// are spelled. `priority` is how a config states the preference outright, and the
+    /// key stays as the tiebreak so servers that don't set one keep the old stable
+    /// order.
     pub(crate) fn lsp_capable_servers(
         &self,
         buffer: BufferId,
@@ -293,7 +298,7 @@ impl EditHost {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return Vec::new();
         };
-        state
+        let mut capable: Vec<(ServerKey, PositionEncoding)> = state
             .servers()
             .filter_map(|(key, _)| {
                 let rt = self.lsp_servers.get(key)?;
@@ -302,7 +307,9 @@ impl EditHost {
                     Some(false) => None,
                 }
             })
-            .collect()
+            .collect();
+        capable.sort_by(|(a, _), (b, _)| self.lsp_routing_order(a, b));
+        capable
     }
 
     /// Route a per-server reply (a whole-buffer decoration, or one server's share of
@@ -615,15 +622,16 @@ impl EditHost {
         }
     }
 
-    /// The server on `buffer` that should answer a request of `kind`: the **first**
-    /// attached one, in [`ServerKey`] order, that has finished `initialize` and
-    /// advertises the matching provider.
+    /// The server on `buffer` that should answer a request of `kind`: the **first** in
+    /// [routing order](Self::lsp_capable_servers) — highest `priority`, then
+    /// [`ServerKey`] — that has finished `initialize` and advertises the matching
+    /// provider.
     ///
     /// This is what makes a two-server buffer behave. With `pyright` + `ruff`, a
     /// hover must go to pyright because ruff advertises none — picking by position
     /// in the map (as every path did before) would send it to whichever name sorts
-    /// first and get nothing back. Ordering by key rather than by hash keeps the
-    /// choice stable, so a config that works once works every time.
+    /// first and get nothing back. Capability decides *who can*; `priority` decides
+    /// *who first* when several can.
     ///
     /// Kinds with no modelled provider flag ([`LspReqKind::provider`] → `None`) fall
     /// back to the first initialized server: failing open beats answering nothing.
@@ -632,15 +640,8 @@ impl EditHost {
         buffer: BufferId,
         kind: LspReqKind,
     ) -> Option<(ServerKey, Url, PositionEncoding)> {
-        let state = self.lsp_states.get(&buffer)?;
-        let uri = state.uri.clone()?;
-        let (key, encoding) = state.servers().find_map(|(key, _)| {
-            let rt = self.lsp_servers.get(key)?;
-            match kind.provider(&rt.providers) {
-                Some(true) | None => Some((key.clone(), rt.encoding)),
-                Some(false) => None,
-            }
-        })?;
+        let uri = self.lsp_states.get(&buffer)?.uri.clone()?;
+        let (key, encoding) = self.lsp_capable_servers(buffer, kind).into_iter().next()?;
         Some((key, uri, encoding))
     }
 
@@ -762,6 +763,8 @@ impl EditHost {
             code_action,
             locations: Vec::new(),
             symbols: Vec::new(),
+            hovers: Vec::new(),
+            signatures: Vec::new(),
             actions: Vec::new(),
         };
         let mut asked = Vec::new();
@@ -817,6 +820,23 @@ impl EditHost {
             LspReply::CodeActions(actions) => round
                 .actions
                 .extend(actions.iter().map(|a| (server.clone(), a.clone()))),
+            // Hover payloads are markdown, so an empty one is a server saying "I know
+            // nothing here" — dropped now rather than at present time, so the "was
+            // anything found at all" test and the "does this need a heading" count
+            // are the same number.
+            LspReply::Hover(lines) if !lines.is_empty() => {
+                round.hovers.push((server.clone(), lines.clone()))
+            }
+            // As with hover, a server with nothing to say is dropped on arrival rather
+            // than carried as an empty slot to the presentation.
+            LspReply::SignatureHelp {
+                signature: Some(signature),
+                active_parameter,
+            } => {
+                round
+                    .signatures
+                    .push((server.clone(), signature.clone(), active_parameter.clone()))
+            }
             // A kind that fans out can only reply with one of the above; anything
             // else means the server answered off-protocol. Drop its slot (already
             // removed) and let the round finish on the others.
@@ -838,12 +858,21 @@ impl EditHost {
         let cursor_moved = round.cursor != (self.editor.cursor.line, self.editor.cursor.col);
         let tick_changed = round.tick != self.editor.buffer().changedtick;
         match kind {
-            LspReqKind::References => {
+            // The goto family merges with references: the answers are all locations,
+            // and `apply_lsp_locations` still jumps when the MERGED list holds exactly
+            // one place — so `gd` on a one-server buffer, or on two servers that agree,
+            // jumps exactly as before and only opens the picker when the servers
+            // genuinely disagree about where the definition is.
+            LspReqKind::References
+            | LspReqKind::Definition
+            | LspReqKind::Declaration
+            | LspReqKind::TypeDefinition
+            | LspReqKind::Implementation => {
                 if buffer_changed || cursor_moved {
                     self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
                     return;
                 }
-                // Two servers reporting the same reference show it once —
+                // Two servers reporting the same location show it once —
                 // `apply_lsp_locations` drops the duplicate *after* converting each
                 // to a byte column, which is the only place the two spellings of one
                 // position (utf-8 vs utf-16 `character`) are comparable.
@@ -860,6 +889,34 @@ impl EditHost {
                     return;
                 }
                 let result = self.apply_lsp_symbols(kind, round.symbols);
+                self.lsp_dirty = true;
+                self.settle_lsp_promise(round.cb_id, result);
+            }
+            // One float, every server that had something to say, in routing order.
+            // The round already arrives in that order (`open_lsp_fanout` issues over
+            // `lsp_capable_servers`), but replies land in whatever order the servers
+            // answer, so the accumulated list is re-sorted here.
+            LspReqKind::Hover => {
+                if buffer_changed || cursor_moved {
+                    self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
+                    return;
+                }
+                let mut hovers = round.hovers;
+                hovers.sort_by(|(a, _), (b, _)| self.lsp_routing_order(a, b));
+                let result = self.show_merged_hover(hovers);
+                self.lsp_dirty = true;
+                self.settle_lsp_promise(round.cb_id, result);
+            }
+            // Signature help follows the cursor while you type the call, so it retires
+            // on the same cursor/buffer gate the single-target path used.
+            LspReqKind::SignatureHelp => {
+                if buffer_changed || cursor_moved {
+                    self.settle_lsp_promise(round.cb_id, serde_json::Value::Null);
+                    return;
+                }
+                let mut signatures = round.signatures;
+                signatures.sort_by(|(a, ..), (b, ..)| self.lsp_routing_order(a, b));
+                let result = self.show_merged_signature_help(signatures);
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(round.cb_id, result);
             }
@@ -925,7 +982,12 @@ impl EditHost {
             return;
         }
         let buffer_changed = pending.buffer != self.editor.current_buffer_id();
-        let cursor_moved = pending.cursor != (self.editor.cursor.line, self.editor.cursor.col);
+        // No cursor gate here: every kind that is *anchored* to the cursor — the goto
+        // family, hover, signature help, references — merges across servers now, so it
+        // retires on `PendingLspReq.cursor`'s twin inside `present_fanout`. What is
+        // left on this path acts on the document (edits, a workspace edit) or browses a
+        // list (symbols), and neither cares where the cursor drifted to.
+        //
         // An apply reply (formatting/rename/codeAction) carries whole-document
         // edits computed against the request-time text, so a content change since
         // then must drop it — applying stale edits would corrupt the buffer. A
@@ -952,18 +1014,11 @@ impl EditHost {
             LspReply::Completion { .. } => {
                 unreachable!("completion replies are routed in on_multi_target_reply")
             }
-            LspReply::Locations(locations) => {
-                if buffer_changed || cursor_moved {
-                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-                    return;
-                }
-                // At the ANSWERING server's encoding: a goto routes by capability,
-                // so on a two-server buffer the server that replied need not be the
-                // first one listed.
-                let located = locations.into_iter().map(|l| (l, reply_encoding)).collect();
-                let result = self.apply_lsp_locations(kind, located);
-                self.lsp_dirty = true;
-                self.settle_lsp_promise(cb_id, result);
+            // Every kind that answers with locations — the goto family and references
+            // alike — merges across servers, so those replies are folded into their
+            // round by `absorb_fanout_reply` and never reach this single-slot path.
+            LspReply::Locations(_) => {
+                unreachable!("location replies are routed in absorb_fanout_reply")
             }
             LspReply::Symbols(symbols) => {
                 // A symbol list is browsed, not anchored to the cursor — drop it
@@ -978,26 +1033,14 @@ impl EditHost {
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(cb_id, result);
             }
-            LspReply::Hover(lines) => {
-                if buffer_changed || cursor_moved {
-                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-                    return;
-                }
-                let result = self.show_hover(lines);
-                self.lsp_dirty = true;
-                self.settle_lsp_promise(cb_id, result);
+            // Hover merges across servers, so its replies are folded into their round
+            // by `absorb_fanout_reply` and never reach the single-slot kind path (see
+            // the `CodeActions` arm below, and `LspFanout::is_fanout`).
+            LspReply::Hover(_) => {
+                unreachable!("hover replies are routed in absorb_fanout_reply")
             }
-            LspReply::SignatureHelp {
-                signature,
-                active_parameter,
-            } => {
-                if buffer_changed || cursor_moved {
-                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
-                    return;
-                }
-                let result = self.show_signature_help(signature, active_parameter);
-                self.lsp_dirty = true;
-                self.settle_lsp_promise(cb_id, result);
+            LspReply::SignatureHelp { .. } => {
+                unreachable!("signature-help replies are routed in absorb_fanout_reply")
             }
             LspReply::Edits(edits) => {
                 if buffer_changed || tick_changed {
@@ -1111,32 +1154,63 @@ impl EditHost {
     ///
     /// Returns the shown markup as a JSON string an async `hover` promise resolves
     /// with; `Null` when the reply was empty.
-    pub(crate) fn show_hover(&mut self, lines: Vec<String>) -> serde_json::Value {
-        if lines.is_empty() {
+    ///
+    /// Every server that answered contributes, in the order the caller sorted them
+    /// (routing order — `priority`, then key). With more than one contributor each
+    /// section is headed `# <client name>` and the sections are separated by a `---`
+    /// rule: the reader has to know which server said what, since a type-checker's
+    /// signature and a linter's rule explanation are different kinds of claim. A lone
+    /// contributor renders bare — a heading naming the only server there is would be
+    /// noise on every hover in a one-server buffer, the common case. (This is
+    /// `vim.lsp.buf.hover`'s composition; nxvim's order is `priority` rather than
+    /// neovim's unordered `pairs()` walk over its client table.)
+    fn show_merged_hover(&mut self, hovers: Vec<(ServerKey, Vec<String>)>) -> serde_json::Value {
+        if hovers.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return serde_json::Value::Null;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let multi = hovers.len() > 1;
+        for (key, doc) in hovers {
+            if multi {
+                if !lines.is_empty() {
+                    lines.push("---".to_string());
+                }
+                lines.push(format!("# {}", key.name));
+            }
+            lines.extend(doc);
         }
         let text = lines.join("\n");
         self.editor.open_markdown_float("[Hover]", &text);
         serde_json::Value::String(text)
     }
 
-    /// Render a signature-help reply in the cursor-anchored **doc float** (the same
-    /// scrollable float window as the hover, [`Editor::open_doc_float`]): the active
-    /// signature's label, with its active parameter appended in brackets when known
-    /// (the float renders plain lines, so the parameter can't be styled inline yet).
-    /// Triggered manually in insert mode, so it stays out of the way until asked for.
-    /// Empty ⇒ a brief message.
+    /// Render a signature-help round in the cursor-anchored **doc float** (the same
+    /// scrollable float window as the hover, [`Editor::open_doc_float`]): each
+    /// answering server's active signature label, with its active parameter appended
+    /// in brackets when known (the float renders plain lines, so the parameter can't
+    /// be styled inline yet). Triggered manually in insert mode, or by the opt-in
+    /// auto-trigger, so it stays out of the way until asked for.
     ///
-    /// Returns the shown signature line as a JSON string an async `signature_help`
-    /// promise resolves with; `Null` when the reply was empty.
-    pub(crate) fn show_signature_help(
+    /// With several servers answering, each line is prefixed `<client>: ` — otherwise
+    /// two signatures for the same call sit anonymously on top of each other. A lone
+    /// contributor renders bare, so the ordinary one-server float is unchanged.
+    ///
+    /// This is where nxvim **departs from neovim**: `vim.lsp.buf.signature_help` shows
+    /// one client's signature at a time, titled `(1/3)`, and binds `<C-s>` to cycle.
+    /// Cycling needs a focusable, key-grabbing float with session state; nxvim's is a
+    /// passive doc float that the next keystroke dismisses, and a signature is one
+    /// short line, so showing them together says the same thing without a mode to
+    /// leave. (Both editors ask every capable server — only the presentation differs.)
+    ///
+    /// Returns the shown text as a JSON string an async `signature_help` promise
+    /// resolves with; `Null` when no server had a signature.
+    fn show_merged_signature_help(
         &mut self,
-        signature: Option<String>,
-        active_parameter: Option<String>,
+        signatures: Vec<(ServerKey, String, Option<String>)>,
     ) -> serde_json::Value {
-        let Some(signature) = signature else {
-            // An auto-trigger session reaching an empty reply means you left the call
+        if signatures.is_empty() {
+            // An auto-trigger session reaching an empty round means you left the call
             // (typed past the `)`, or the cursor moved out): close the sticky float
             // silently. Only the manual `<C-k>` path echoes "no signature".
             if self.editor.signature_session_active() {
@@ -1145,11 +1219,22 @@ impl EditHost {
                 self.editor.echo(LspReqKind::SignatureHelp.empty_message());
             }
             return serde_json::Value::Null;
-        };
-        let line = match active_parameter {
-            Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
-            _ => signature,
-        };
+        }
+        let multi = signatures.len() > 1;
+        let lines: Vec<String> = signatures
+            .into_iter()
+            .map(|(key, signature, active_parameter)| {
+                let line = match active_parameter {
+                    Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
+                    _ => signature,
+                };
+                if multi {
+                    format!("{}: {line}", key.name)
+                } else {
+                    line
+                }
+            })
+            .collect();
         // Signature help renders a code signature in the source language, so type the
         // popup as the buffer it was invoked from (the staleness gate above guarantees
         // the current buffer is still that one). `""` when that buffer has no filetype.
@@ -1158,8 +1243,8 @@ impl EditHost {
             .buffer_filetype(self.editor.current_buffer_id())
             .unwrap_or_default();
         self.editor
-            .open_doc_float("[Signature]", vec![line.clone()], &filetype);
-        serde_json::Value::String(line)
+            .open_doc_float("[Signature]", lines.clone(), &filetype);
+        serde_json::Value::String(lines.join("\n"))
     }
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;

@@ -1263,7 +1263,8 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
 /// (`name`, `cmd`, `root`, `filetype`, `bufnr`), the Phase-2 config payloads
 /// (`init_options`, `settings`, `capabilities`, each a table or `nil`), the
 /// config's `cmd_env` (a `{ NAME = "value" }` table, already stringified in Lua),
-/// and its `cmd_cwd` (the spawn directory, `nil` for the editor's own).
+/// its `cmd_cwd` (the spawn directory, `nil` for the editor's own), and its routing
+/// `priority` (`nil` ⇒ the default `0`).
 type LspStartArgs = (
     String,
     Vec<String>,
@@ -1275,6 +1276,7 @@ type LspStartArgs = (
     Option<Table>,
     Option<Table>,
     Option<String>,
+    Option<i64>,
 );
 
 /// The per-namespace byte budget for `nx.shada.plugin` storage (1 MiB). A plugin's
@@ -1995,7 +1997,8 @@ pub(crate) fn install_runtime_api(
     )?;
 
     // `nx._lsp_start(name, cmd, root, filetype, bufnr, init_options, settings,
-    // capabilities, cmd_env, cmd_cwd)`: queue an [`LspOp::Start`] for the server to drain. The
+    // capabilities, cmd_env, cmd_cwd, priority)`: queue an [`LspOp::Start`] for the server to
+    // drain. The
     // Lua-facing `vim.lsp.start` wrapper (prelude) resolves the config and root,
     // then calls this. The trailing three are the config's `init_options` /
     // `settings` / `capabilities` tables (each `nil` when unset); they convert
@@ -2016,6 +2019,7 @@ pub(crate) fn install_runtime_api(
                 capabilities,
                 env,
                 cmd_cwd,
+                priority,
             ) = args;
             // `cmd_env` arrives already normalized to string values by the prelude, so
             // a non-string pair here is a caller reaching past `nx.lsp` — skip it
@@ -2038,6 +2042,7 @@ pub(crate) fn install_runtime_api(
                 settings: opt_table_to_json(settings)?,
                 capabilities: opt_table_to_json(capabilities)?,
                 env,
+                priority,
             });
             Ok(())
         })?,
@@ -2056,26 +2061,28 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_restart(name, init_options, settings, capabilities)`: queue an
+    // `nx._lsp_restart(name, init_options, settings, capabilities, priority)`: queue an
     // [`LspOp::Restart`] — respawn every running server with this config name, using
     // the config in force now, so it picks up a change made since it started (backs
-    // `nx.lsp.restart`).
+    // `nx.lsp.restart`). `priority` refreshes the routing rank the same way.
     let sh = shared.clone();
     nx.set(
         "_lsp_restart",
         lua.create_function(
             move |_,
-                  (name, init_options, settings, capabilities): (
+                  (name, init_options, settings, capabilities, priority): (
                 String,
                 Option<Table>,
                 Option<Table>,
                 Option<Table>,
+                Option<i64>,
             )| {
                 sh.borrow_mut().lsp_ops.push(LspOp::Restart {
                     name,
                     init_options: opt_table_to_json(init_options)?,
                     settings: opt_table_to_json(settings)?,
                     capabilities: opt_table_to_json(capabilities)?,
+                    priority,
                 });
                 Ok(())
             },

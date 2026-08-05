@@ -545,6 +545,30 @@ async fn enable_alpha_beta(rpc: &Rpc) {
     );
 }
 
+/// Issue an `nx.lsp.*` verb and poll until its promise settles with a value, which is
+/// returned as a string.
+///
+/// The verb is re-issued only while the promise keeps settling `nil` — the servers may
+/// still be starting — and never *while* a round is open, since a second round
+/// supersedes the first (settling it `nil`) and would race this poll forever. Panics
+/// rather than returning empty, so a broken verb fails loudly here.
+async fn await_verb_result(rpc: &Rpc, verb: &str) -> String {
+    let issue = format!("_G.V = nil ({verb}):next(function(v) _G.V = v or false end)");
+    for _ in 0..40 {
+        exec_lua(rpc, &issue).await;
+        for _ in 0..40 {
+            let got = exec_lua(rpc, "return tostring(_G.V)").await;
+            match got.as_str().unwrap_or_default() {
+                "nil" => tokio::time::sleep(Duration::from_millis(25)).await,
+                // Resolved `nil` — nothing answered yet; issue a fresh round.
+                "false" => break,
+                value => return value.to_string(),
+            }
+        }
+    }
+    panic!("{verb} never resolved with a value");
+}
+
 /// Fire `trigger` (a code-action Lua verb) until the chooser menu carries at least
 /// `want` rows, and return its titles. The request is a fan-out round, so the menu
 /// only opens once every asked server has answered.
@@ -899,6 +923,259 @@ async fn a_request_routes_to_the_named_server() {
     assert!(
         !ex.join(" ").contains("FROM-BETA"),
         ":LspHover alpha came from alpha alone, got {ex:?}"
+    );
+}
+
+#[tokio::test]
+async fn hover_merges_every_capable_server_in_priority_order() {
+    // neovim's `vim.lsp.buf.hover` asks every client and composes one float; nxvim
+    // does the same, because on a `pyright` + `ruff` buffer each server knows
+    // something the other doesn't. `priority` then decides the ORDER — which neovim
+    // has no answer for (it walks an unordered client table).
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-hover-merge");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "hover": { "contents": "FROM-ALPHA" } }"#,
+    );
+    arm_mock_named(
+        dir.as_path(),
+        "beta",
+        r#"{ "hover": { "contents": "FROM-BETA" } }"#,
+    );
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    // beta outranks alpha, so it must lead — the reverse of the alphabetical default.
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' }, priority = 1 })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' }, priority = 9 })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    let lines = await_float(&rpc, &mut incoming, "nx.lsp.hover()", "FROM-ALPHA").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("FROM-BETA"),
+        "one float carries BOTH servers' hovers, got {lines:?}"
+    );
+    let beta_at = joined.find("FROM-BETA").expect("beta section");
+    let alpha_at = joined.find("FROM-ALPHA").expect("alpha section");
+    assert!(
+        beta_at < alpha_at,
+        "the higher-priority server's section leads, got {lines:?}"
+    );
+    // Each section is headed with its client's name, or the reader can't tell which
+    // server made which claim.
+    let heading = |name: &str| lines.iter().any(|l| l.trim() == name);
+    assert!(
+        heading("alpha") && heading("beta"),
+        "each section is headed by its client name, got {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn signature_help_merges_every_capable_server() {
+    // Same argument as hover: two servers can both describe the call under the cursor,
+    // and showing one silently hides the other. nxvim shows them together (one line
+    // each, labelled) where neovim shows one at a time with `<C-s>` to cycle — the
+    // float here is passive, and a signature is one short line.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-sig-merge");
+    let sig = |label: &str| {
+        format!(
+            r#"{{ "signature_help": {{ "signatures": [ {{ "label": "{label}" }} ],
+                 "activeSignature": 0 }} }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &sig("alpha_sig(x)"));
+    arm_mock_named(dir.as_path(), "beta", &sig("beta_sig(y)"));
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' }, priority = 9 })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    // The promise resolves with the shown text, so assert on that rather than on the
+    // float's pixels (`lsp_float.rs` covers the rendering).
+    let shown = await_verb_result(&rpc, "nx.lsp.signature_help()").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        shown.contains("alpha_sig(x)") && shown.contains("beta_sig(y)"),
+        "both servers' signatures are shown, got {shown:?}"
+    );
+    assert!(
+        shown.find("beta_sig").unwrap() < shown.find("alpha_sig").unwrap(),
+        "in priority order (beta outranks alpha), got {shown:?}"
+    );
+    assert!(
+        shown.contains("alpha: ") && shown.contains("beta: "),
+        "each line says which client claimed it, got {shown:?}"
+    );
+}
+
+/// A `"definition"` mock script pointing at 0-based `line` of `uri`.
+fn definition_at(uri: &str, line: u32) -> String {
+    format!(
+        r#"{{ "definition": {{ "uri": "{uri}", "range": {{
+             "start": {{ "line": {line}, "character": 0 }},
+             "end": {{ "line": {line}, "character": 1 }} }} }} }}"#
+    )
+}
+
+#[tokio::test]
+async fn goto_merges_both_servers_places() {
+    // The goto family merges like references: a definition can genuinely live in two
+    // places to two servers (a generated stub and its source, a `.d.ts` and its
+    // implementation), and asking only the first silently hides one of them. Each mock
+    // names a DIFFERENT line, so a round that reached one server resolves 1 item.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-goto-merge");
+    let uri = format!("file://{}", dir.as_path().join("a.rs").display());
+    arm_mock_named(dir.as_path(), "alpha", &definition_at(&uri, 1));
+    arm_mock_named(dir.as_path(), "beta", &definition_at(&uri, 3));
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), "one\ntwo\nthree\nfour\n").await;
+    enable_alpha_beta(&rpc).await;
+
+    let items = await_verb_result(
+        &rpc,
+        "nx.lsp.definition():next(function(i) return i and #i end)",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert_eq!(
+        items, "2",
+        "both servers' definitions are in the merged list"
+    );
+}
+
+#[tokio::test]
+async fn goto_still_jumps_when_the_merged_list_holds_one_place() {
+    // The behavior that must NOT change on the way to merging: when the merged list
+    // holds one place — a one-server buffer, or two servers that agree — `gd` still
+    // jumps rather than opening a picker over a list of one. Both mocks name the same
+    // line, so the dedup (on CONVERTED byte positions) has to collapse them.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-goto-jump");
+    let uri = format!("file://{}", dir.as_path().join("a.rs").display());
+    arm_mock_named(dir.as_path(), "alpha", &definition_at(&uri, 2));
+    arm_mock_named(dir.as_path(), "beta", &definition_at(&uri, 2));
+    let (rpc, _incoming) = open_rust_with(dir.as_path(), "one\ntwo\nthree\nfour\n").await;
+    enable_alpha_beta(&rpc).await;
+
+    let items = await_verb_result(
+        &rpc,
+        "nx.lsp.definition():next(function(i) return i and #i end)",
+    )
+    .await;
+    // `cursor()` is 1-based, so the target's 0-based line 2 reads as row 3.
+    let mut jumped = false;
+    for _ in 0..80 {
+        if nxvim_test_harness::cursor(&rpc).await.0 == 3 {
+            jumped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert_eq!(
+        items, "1",
+        "two servers naming the SAME place merge to one item, not two"
+    );
+    assert!(jumped, "and a single place still jumps the cursor to it");
+}
+
+#[tokio::test]
+async fn priority_picks_the_default_server_for_a_single_target_verb() {
+    // The other half of `priority`: not just presentation order, but WHICH server a
+    // verb that can only go to one asks. Each mock rewrites line 1 to its own marker,
+    // so the buffer text says who formatted. `alpha` sorts first, so an ignored
+    // priority formats with alpha.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-priority-pick");
+    let edit = |marker: &str| {
+        format!(
+            r#"{{ "formatting": [ {{ "range": {{ "start": {{ "line": 0, "character": 0 }},
+                 "end": {{ "line": 0, "character": 15 }} }}, "newText": "{marker}" }} ] }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &edit("BY-ALPHA"));
+    arm_mock_named(dir.as_path(), "beta", &edit("BY-BETA"));
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' }, priority = 10 })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    // No `name`: the pick is the ranking's alone.
+    exec_lua(&rpc, "nx.lsp.format()").await;
+    let formatted = await_lua_eq(&rpc, "nx.buf.lines(0, 0, 1)[1]", "BY-BETA").await;
+    // `:LspInfo` explains the pick — it lists in routing order with the rank. The
+    // command is deferred (it opens a scratch listing), so drain a tick before reading
+    // the buffer it left focused.
+    command(&rpc, "LspInfo").await;
+    let info = exec_lua(&rpc, "return table.concat(nx.buf.lines(0, 0, 20), '\\n')").await;
+    // A non-integer rank is a config that meant something and didn't say it.
+    let bad = exec_lua(
+        &rpc,
+        "return tostring(pcall(nx.lsp.config, 'x', { priority = 'high' }))",
+    )
+    .await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    assert!(
+        formatted,
+        "the highest-priority capable server formatted, not the alphabetical default"
+    );
+    let info = info.as_str().unwrap_or_default();
+    let beta_at = info.find("server:      beta");
+    let alpha_at = info.find("server:      alpha");
+    assert!(
+        beta_at.is_some() && alpha_at.is_some() && beta_at < alpha_at,
+        ":LspInfo lists in routing order, got:\n{info}"
+    );
+    assert!(
+        info.contains("priority:    10") && info.contains("priority:    0  (default)"),
+        ":LspInfo shows each rank and marks the default, got:\n{info}"
+    );
+    assert_eq!(
+        bad.as_str(),
+        Some("true"),
+        "a bad priority is caught at start, not at registration"
     );
 }
 

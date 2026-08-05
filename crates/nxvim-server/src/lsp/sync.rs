@@ -32,7 +32,11 @@ impl EditHost {
                 init_options,
                 settings,
                 capabilities,
+                priority,
             } => {
+                if let Some(priority) = priority {
+                    self.lsp_priorities.insert(name.clone(), priority);
+                }
                 self.restart_lsp_servers(&name, init_options, settings, capabilities);
                 return;
             }
@@ -247,10 +251,20 @@ impl EditHost {
             settings,
             capabilities,
             env,
+            priority,
         } = start
         else {
             unreachable!("non-Start ops returned above");
         };
+        // The routing rank is per **config name**, not per `(name, root)` key: it is
+        // the config's stated preference, so it holds across roots and across
+        // respawns. Recorded before any early return below, so a start that can't
+        // proceed (an unnamed buffer, an unspawnable cmd) still leaves the rank for
+        // the next attempt. A config that states none leaves no entry at all, which is
+        // what lets `:LspInfo` distinguish an unranked server from one ranked `0`.
+        if let Some(priority) = priority {
+            self.lsp_priorities.insert(name.clone(), priority);
+        }
         let buffer = BufferId(bufnr);
         // The buffer must be open and file-backed to host an LSP document.
         let Some(name_str) = self.editor.buffer_name(buffer).filter(|n| !n.is_empty()) else {
@@ -1322,16 +1336,22 @@ impl EditHost {
         let current = self.editor.current_buffer_id();
 
         lines.push("Current buffer".to_string());
-        // EVERY attached server, in key order — a buffer routinely carries several
-        // (`pyright` + `ruff`), each with its own negotiated encoding, sync kind,
-        // document version and diagnostics. Reporting only the first described half
-        // the state with no hint that the rest existed, which is worse than
+        // EVERY attached server, in **routing order** — a buffer routinely carries
+        // several (`pyright` + `ruff`), each with its own negotiated encoding, sync
+        // kind, document version and diagnostics. Reporting only the first described
+        // half the state with no hint that the rest existed, which is worse than
         // incomplete on the surface whose whole job is to say what is attached.
-        let servers: Vec<(&ServerKey, &LspServerDoc)> = self
+        //
+        // Listing in the order requests actually route (priority, then key) rather
+        // than plain key order is what makes this readable as an answer to "why did
+        // *that* server reply?" — the first one listed that advertises the feature is
+        // the one that did, and the `priority` line below says why it is first.
+        let mut servers: Vec<(&ServerKey, &LspServerDoc)> = self
             .lsp_states
             .get(&current)
             .map(|s| s.servers().collect())
             .unwrap_or_default();
+        servers.sort_by(|(a, _), (b, _)| self.lsp_routing_order(a, b));
         if servers.is_empty() {
             lines.push("  (no language server for this buffer)".to_string());
         }
@@ -1364,6 +1384,17 @@ impl EditHost {
                     sync_label(runtime.sync_kind),
                 ));
             }
+            lines.push(format!(
+                "  priority:    {}{}",
+                self.lsp_priority_of(&key.name),
+                // Say when the rank is the default rather than a stated preference:
+                // "0" alone reads like a choice someone made.
+                if self.lsp_priorities.contains_key(&key.name) {
+                    ""
+                } else {
+                    "  (default)"
+                }
+            ));
             lines.push(format!("  version:     {}", doc.version));
             lines.push(format!("  diagnostics: {}", doc.diagnostics.len()));
         }

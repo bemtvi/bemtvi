@@ -667,17 +667,20 @@ impl LspReqKind {
 }
 
 /// A request in flight, kept per [`LspReqKind`] so a reply can be matched to it
-/// and stale ones dropped (Decision 3): the `generation` it was issued under,
-/// and the `buffer`/`cursor` it was issued at (a later reply whose generation
-/// differs, or that arrives after the cursor moved, is discarded).
+/// and stale ones dropped (Decision 3): the `generation` it was issued under and
+/// the `buffer` it was issued in (a later reply whose generation differs, or that
+/// arrives after the buffer changed, is discarded).
+///
+/// No cursor here: every kind *anchored* to the cursor now merges across servers,
+/// and its staleness is [`LspFanout`]'s to judge. What is left on this path acts on
+/// the document or browses a list.
 pub(crate) struct PendingLspReq {
     pub(crate) generation: u64,
     pub(crate) buffer: BufferId,
-    pub(crate) cursor: (usize, usize),
     /// The buffer's `changedtick` when the request was issued, for the
     /// content-version stale-drop of an *apply* reply (formatting/rename/code
     /// action return edits computed against this text; applying them after any
-    /// edit would corrupt the buffer). Unused by the cursor-based kinds.
+    /// edit would corrupt the buffer). Unused by the browsing kinds.
     pub(crate) tick: u64,
     /// The `nx._cb_fns` id that settles the issuing verb's promise, or `0` for a
     /// fire-and-forget request (an internal refresh, an auto-trigger, or a keymap
@@ -734,6 +737,16 @@ pub(crate) struct LspFanout {
     /// producing server's encoding for the same reason as
     /// [`locations`](Self::locations).
     pub(crate) symbols: Vec<(SymbolData, PositionEncoding)>,
+    /// Accumulated hover documents, each tagged with the server that produced it so
+    /// the merged float can head its section with the client's name. Unlike the
+    /// location/symbol accumulators these need no encoding: a hover's payload is
+    /// markdown, not positions.
+    pub(crate) hovers: Vec<(ServerKey, Vec<String>)>,
+    /// Accumulated signature help — `(server, signature label, active parameter)`,
+    /// tagged for the same reason as [`hovers`](Self::hovers): with two servers
+    /// answering, an unlabelled list of signatures says nothing about which language
+    /// tool is claiming what. Also encoding-free (labels, not positions).
+    pub(crate) signatures: Vec<(ServerKey, String, Option<String>)>,
     /// Accumulated code actions, each tagged with the server that produced it.
     ///
     /// The tag is load-bearing: a lazy action is finished with `codeAction/resolve`,
@@ -746,6 +759,25 @@ pub(crate) struct LspFanout {
 impl LspFanout {
     /// Whether `kind`'s replies merge across servers rather than being answered by
     /// one — the routing table, in code.
+    ///
+    /// Hover is here for the same reason as the rest: on a `pyright` + `ruff` buffer
+    /// each server knows something the other doesn't (a type, a lint rationale), and
+    /// answering from one silently hides the other. It merges into a single float with
+    /// a `# <client>` heading per server, which is what neovim's `vim.lsp.buf.hover`
+    /// does. `nx.lsp.hover{ name = … }` still narrows the round to one server.
+    ///
+    /// The **goto family** merges its locations the way references always did — a
+    /// definition can genuinely live in two places to two servers (a generated stub and
+    /// its source, a `.d.ts` and its implementation), and the merged list still *jumps*
+    /// when it holds exactly one place, so the one-server experience is unchanged.
+    /// Duplicates collapse in [`EditHost::apply_lsp_locations`], which compares
+    /// converted byte positions rather than raw LSP ones — necessary here, since two
+    /// servers at different encodings spell one position differently.
+    ///
+    /// **Every** kind whose answer is a list or a document is now a fan-out; what is
+    /// left single-target is the kinds that *act* (`Formatting`, `Rename`), where two
+    /// servers' edits cannot be merged into one buffer, and the resolve/decoration
+    /// kinds that belong to the server that produced their item.
     pub(crate) fn is_fanout(kind: LspReqKind) -> bool {
         matches!(
             kind,
@@ -753,6 +785,12 @@ impl LspFanout {
                 | LspReqKind::DocumentSymbol
                 | LspReqKind::WorkspaceSymbol
                 | LspReqKind::CodeAction
+                | LspReqKind::Hover
+                | LspReqKind::SignatureHelp
+                | LspReqKind::Definition
+                | LspReqKind::Declaration
+                | LspReqKind::TypeDefinition
+                | LspReqKind::Implementation
         )
     }
 }

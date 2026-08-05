@@ -253,6 +253,14 @@ pub enum LspOp {
         /// The config's `cmd_env`, layered over the editor's environment when the
         /// process is spawned. Empty when the config sets none.
         env: Vec<(String, String)>,
+        /// The config's `priority`: the **routing rank** among the servers attached to
+        /// one buffer, higher first, `0` when the config sets none. It decides which
+        /// server a single-target verb asks by default and the order a merged surface
+        /// (the hover float, the code-action chooser) presents them in — replacing the
+        /// alphabetical tiebreak, which is a stable order but an arbitrary preference.
+        /// `None` when the config states none — distinct from `Some(0)`, so `:LspInfo`
+        /// can say "default" rather than report a rank nobody chose.
+        priority: Option<i64>,
     },
     /// `nx.lsp.restart(name)` — tear down and respawn every running server with this
     /// config `name`, so the fresh process picks up a config that changed since it
@@ -272,6 +280,10 @@ pub enum LspOp {
         settings: Option<serde_json::Value>,
         /// The config's `capabilities` now (or `None` to keep the cached ones).
         capabilities: Option<serde_json::Value>,
+        /// The config's `priority` now (or `None` to keep the rank it started with).
+        /// Routing rank is pure client-side bookkeeping, but it is refreshed here so
+        /// the one verb that means "apply the config as it stands" applies all of it.
+        priority: Option<i64>,
     },
     /// `nx.lsp.stop(name)` — shut every running server with this config `name` down
     /// and detach it from the buffers it was serving, with no respawn (`Restart`

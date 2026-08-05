@@ -328,6 +328,26 @@ end
 --   cmd_cwd = nx.workspace.dir(),   -- launch it here, whatever buffer attached
 -- })
 -- ```
+--
+-- `opts.priority` (an integer, default `0`) is the **routing rank** among the servers
+-- attached to one buffer, higher first. A buffer carries every server enabled for its
+-- filetype, and when several can answer the same request the default order is the
+-- config name alphabetically — stable, but an arbitrary preference. `priority` states
+-- the real one:
+--
+-- ```lua
+-- nx.lsp.config("pyright", { priority = 10, … })   -- the type-checker leads
+-- nx.lsp.config("ruff",    { priority = 5,  … })   -- the linter follows
+-- ```
+--
+-- It decides the order the merging verbs present in — the hover float's sections, the
+-- signature lines, the code-action chooser's rows, the reference, symbol and goto
+-- lists — and which server the verbs that ACT (`format`, `rename`) pick, since two
+-- servers' edits cannot both be applied. It does not decide *whether* a server is
+-- asked: that is capability, and a server that doesn't advertise the feature is
+-- skipped whatever its rank. `nx.lsp.hover{ name = … }` / `:LspHover <server>`
+-- override the rank outright for one call. A change takes effect on the next start,
+-- so `nx.lsp.restart(name)` applies it to a server already running.
 function nx.lsp.config(name, opts)
   if type(name) ~= "string" then
     error("nx.lsp.config: name must be a string", 2)
@@ -364,6 +384,7 @@ local KNOWN_KEYS = {
   on_attach = true,
   on_exit = true,
   offset_encoding = true,
+  priority = true,
 }
 
 -- Keys nxvim knows about and deliberately does NOT act on, each with the reason and
@@ -591,6 +612,22 @@ local function cwd_value(name, cmd_cwd)
   return cmd_cwd
 end
 
+-- The config's `priority` — the routing rank among the servers attached to one
+-- buffer, higher first (default `0`). A non-integer is rejected loud rather than
+-- silently ranked `0`: a config that meant to state a preference and didn't would
+-- otherwise look like it worked, and the symptom (the wrong server answers) is a long
+-- way from the cause.
+local function config_priority(name, cfg)
+  local p = cfg.priority
+  if p == nil then
+    return nil
+  end
+  if type(p) ~= "number" or p % 1 ~= 0 then
+    error("nx.lsp: '" .. name .. "' priority must be an integer, got " .. tostring(p), 0)
+  end
+  return p
+end
+
 -- Queue a start for `bufnr` from a resolved config (root already computed): build the
 -- argv, run `before_init`, then hand the whole spawn across `nx._lsp_start`. A cmd that
 -- isn't a spawnable argv is reported loud (a server enabled but unspawnable is visible,
@@ -624,7 +661,8 @@ local start_resolved = nx.async(function(name, cfg, bufnr, ft, root)
     nonempty(start_cfg.settings),
     nonempty(start_cfg.capabilities),
     env_map(name, start_cfg.cmd_env),
-    cwd_value(name, start_cfg.cmd_cwd)
+    cwd_value(name, start_cfg.cmd_cwd),
+    config_priority(name, start_cfg)
   )
 end)
 
@@ -944,7 +982,8 @@ function nx.lsp.restart(name)
     name,
     nonempty(cfg.init_options),
     nonempty(cfg.settings),
-    nonempty(cfg.capabilities)
+    nonempty(cfg.capabilities),
+    config_priority(name, cfg)
   )
 end
 
@@ -994,17 +1033,25 @@ end
 -- nx.keymap.set("n", "K", function() return nx.lsp.hover({ name = "pyright" }) end)
 -- ```
 --
--- A buffer carries **every** server enabled for its filetype, and the default pick is
--- the first, in name order, that advertises the feature — which is not always the one
--- you meant. For the merging verbs (`references`, `document_symbol`,
--- `workspace_symbol`, `code_action`) a name narrows the round to that one client
--- instead of merging them all. A name that isn't attached to the buffer reports so on
--- the message line and resolves `nil`; it never falls back to a different server. The
--- ex-commands take the same route as a bare argument (`:LspHover pyright`).
+-- A buffer carries **every** server enabled for its filetype, and every verb here asks
+-- them all, merging the answers in `priority` order (see `nx.lsp.config`). The goto
+-- family jumps when the merged list holds one place, so a one-server buffer behaves
+-- exactly as before. Only the verbs that *act* on the buffer — `format`, `rename` —
+-- pick a single server, since two servers' edits cannot both be applied; there the
+-- highest-`priority` capable one wins. Naming one overrides either: the single-target
+-- pick, or the round narrowed to that client alone.
+-- A name that isn't attached to the buffer reports so on the message line and resolves
+-- `nil`; it never falls back to a different server. The ex-commands take the same
+-- route as a bare argument (`:LspHover pyright`).
 
--- `nx.lsp.definition([opts])`: jump to the definition of the symbol under the cursor
--- (many results open `nx.picker`), resolving with the `{ text, path, row, col }` item
--- list. `opts.name` routes the request to that attached client.
+-- `nx.lsp.definition([opts])`: jump to the definition of the symbol under the cursor,
+-- resolving with the `{ text, path, row, col }` item list.
+--
+-- Asks **every** capable server and merges: a definition can genuinely live in two
+-- places to two servers (a generated stub and its source, a `.d.ts` and its
+-- implementation). Duplicates collapse, so the merged list holding ONE place still
+-- jumps — the one-server case is unchanged — and only a real disagreement opens
+-- `nx.picker`. `opts.name` narrows the round to that client.
 function nx.lsp.definition(opts)
   local name = route_name(opts, "nx.lsp.definition")
   return lsp_promise(function(id)
@@ -1012,7 +1059,8 @@ function nx.lsp.definition(opts)
   end)
 end
 -- `nx.lsp.declaration([opts])`: the `definition` twin for `textDocument/declaration`
--- (C headers, `extern` declarations). `opts.name` routes it.
+-- (C headers, `extern` declarations). Merges across servers and `opts.name` routes it,
+-- exactly as `nx.lsp.definition` does.
 function nx.lsp.declaration(opts)
   local name = route_name(opts, "nx.lsp.declaration")
   return lsp_promise(function(id)
@@ -1020,7 +1068,8 @@ function nx.lsp.declaration(opts)
   end)
 end
 -- `nx.lsp.type_definition([opts])`: jump to the definition of the *type* of the symbol
--- under the cursor. `opts.name` routes it.
+-- under the cursor. Merges across servers and `opts.name` routes it, exactly as
+-- `nx.lsp.definition` does.
 function nx.lsp.type_definition(opts)
   local name = route_name(opts, "nx.lsp.type_definition")
   return lsp_promise(function(id)
@@ -1028,7 +1077,8 @@ function nx.lsp.type_definition(opts)
   end)
 end
 -- `nx.lsp.implementation([opts])`: the implementations of the interface / trait method
--- under the cursor. `opts.name` routes it.
+-- under the cursor. Merges across servers and `opts.name` routes it, exactly as
+-- `nx.lsp.definition` does.
 function nx.lsp.implementation(opts)
   local name = route_name(opts, "nx.lsp.implementation")
   return lsp_promise(function(id)
@@ -1046,8 +1096,13 @@ function nx.lsp.references(opts)
   end)
 end
 -- `nx.lsp.hover([opts])`: the hover documentation for the symbol under the cursor, in a
--- float, resolving with the shown text. `opts.name` asks that client instead of the
--- first attached one advertising `hoverProvider` — the `pyright` beside `ruff` case.
+-- float, resolving with the shown text.
+--
+-- Asks **every** attached server advertising `hoverProvider` and composes one float:
+-- on a `pyright` + `ruff` buffer each knows something the other doesn't (a type, a lint
+-- rationale), and answering from one silently hides the other. With more than one
+-- contributor each section is headed `# <client name>`, in `priority` order; with one
+-- it renders bare. `opts.name` narrows the round to that client alone.
 function nx.lsp.hover(opts)
   local name = route_name(opts, "nx.lsp.hover")
   return lsp_promise(function(id)
@@ -1057,6 +1112,12 @@ end
 -- `nx.lsp.signature_help([opts])`: the signature of the call under the cursor, in a
 -- float. `opts.name` routes it; see `nx.lsp.signature_help_autotrigger` for showing it
 -- as you type instead of on demand.
+--
+-- Asks every capable server, like `nx.lsp.hover`. With more than one answering, each
+-- line is prefixed `<client>: ` and they are shown together in `priority` order —
+-- where neovim shows one at a time and binds `<C-s>` to cycle. nxvim's float is
+-- passive (the next keystroke dismisses it) and a signature is one short line, so
+-- there is nothing to cycle through and no mode to leave.
 function nx.lsp.signature_help(opts)
   local name = route_name(opts, "nx.lsp.signature_help")
   return lsp_promise(function(id)

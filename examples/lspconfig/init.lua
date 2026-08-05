@@ -129,6 +129,12 @@ nx.lsp.config("*", {
 --      grn  rename          gri  implementation   <leader>ls  workspace symbols
 --      gra  code action     grt  type definition  <leader>lf  format buffer
 --      grr  references      gO   document symbols <leader>lh  toggle inlay hints
+--      <C-]>  go to definition (normal)  <C-s>  signature help (insert/select)
+--
+--    The last two are alternative SPELLINGS of maps the core already has — `<C-]>`
+--    is the tag jump, with a language server standing in for a tags file, and
+--    `<C-s>` is neovim's i_CTRL-S beside nxvim's `<C-k>`. The core's built-in set
+--    stays the small one; the muscle-memory aliases live in the plugin.
 --
 --    All at the OVERRIDABLE rung, so your own mapping for any of them wins —
 --    whether you set it before or after this call.

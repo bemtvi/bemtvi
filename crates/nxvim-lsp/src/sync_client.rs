@@ -218,7 +218,14 @@ impl SyncLspClient {
             id: wire_id,
             program: spawn.program.clone(),
             args: spawn.args.clone(),
-            cwd: key.root.to_string_lossy().into_owned(),
+            // The spawn dir the editor resolved (`cmd_cwd`, else its effective cwd) —
+            // a daemon path, like every path a browser session speaks. Empty = inherit
+            // the daemon's own cwd.
+            cwd: spawn
+                .cwd
+                .as_ref()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             env: spawn.env.clone(),
         });
         let init = init_params(&key.root, &spawn, None, &self.log, &name);

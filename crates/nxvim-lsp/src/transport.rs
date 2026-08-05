@@ -24,7 +24,6 @@
 
 use std::future::Future;
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
 
 use std::process::Stdio;
@@ -75,13 +74,13 @@ pub trait LspProcess: Send {
 /// transport so the server runs on the remote. `Send + Sync` so one transport is
 /// shared across every server the manager supervises.
 pub trait LspTransport: Send + Sync {
-    /// Launch the server described by `spec`, with `root` as its working directory,
-    /// and hand back its byte streams + lifetime handle. An `Err` here is a spawn
-    /// failure the supervisor reports loudly (and the breaker counts).
+    /// Launch the server described by `spec` — including its working directory
+    /// ([`ServerSpawn::cwd`]) — and hand back its byte streams + lifetime handle. An
+    /// `Err` here is a spawn failure the supervisor reports loudly (and the breaker
+    /// counts).
     fn spawn(
         &self,
         spec: &ServerSpawn,
-        root: &Path,
     ) -> Pin<Box<dyn Future<Output = io::Result<LspChannel>> + Send>>;
 }
 
@@ -96,28 +95,32 @@ impl LspTransport for LocalLspTransport {
     fn spawn(
         &self,
         spec: &ServerSpawn,
-        root: &Path,
     ) -> Pin<Box<dyn Future<Output = io::Result<LspChannel>> + Send>> {
         let program = spec.program.clone();
         let args = spec.args.clone();
         let env = spec.env.clone();
-        let root = root.to_path_buf();
+        let cwd = spec.cwd.clone();
         Box::pin(async move {
-            let mut child = Command::new(&program)
+            let mut command = Command::new(&program);
+            command
                 .args(&args)
                 // Layered on top of the inherited environment (`envs`, not
                 // `env_clear` + `envs`): a language server needs `$PATH` to find its
                 // own toolchain, so `cmd_env` adds to the environment, never replaces it.
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                .current_dir(&root)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 // Captured (not null'd) so the server's stderr — panics, RA_LOG
                 // output — reaches the log; the manager drains it so the pipe never
                 // blocks.
                 .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
+                .kill_on_drop(true);
+            // No `cwd` means inherit this process's — which is the editor's own, the
+            // dir a `cmd_cwd`-less config wants the server launched in anyway.
+            if let Some(cwd) = &cwd {
+                command.current_dir(cwd);
+            }
+            let mut child = command.spawn()?;
             let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
                 let _ = child.start_kill();
                 let _ = child.wait().await;

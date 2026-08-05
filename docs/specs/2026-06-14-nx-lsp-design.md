@@ -112,6 +112,12 @@ the engine runs through the fs seam (works under the wasm edit-host), or
 `root_dir = function(bufnr, done) … done(dir) end` for the callback escape
 hatch. `None` ⇒ the file's directory, as today.
 
+**The root is not the spawn directory.** It reaches the server as `rootUri` /
+`workspaceFolders`; the *process* is launched in the editor's own working
+directory, or in `cmd_cwd` when the config pins one (vim's split, for the same
+reason: a `cmd` may care where it was invoked — `uvx` refuses to run with a cwd
+inside its cache, which is exactly where an out-of-tree buffer's root lands).
+
 **Bundled presets ship as pre-registered `config()` data** — an nx-native
 replacement for lspconfig, reusing the existing `lsp/<server>.lua` config-file
 pattern (`nxvim-lua/src/luafs.rs` already sources these). A user only

@@ -1261,8 +1261,9 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
 
 /// The argument tuple of `nx._lsp_start`: the original five
 /// (`name`, `cmd`, `root`, `filetype`, `bufnr`), the Phase-2 config payloads
-/// (`init_options`, `settings`, `capabilities`, each a table or `nil`), and the
-/// config's `cmd_env` (a `{ NAME = "value" }` table, already stringified in Lua).
+/// (`init_options`, `settings`, `capabilities`, each a table or `nil`), the
+/// config's `cmd_env` (a `{ NAME = "value" }` table, already stringified in Lua),
+/// and its `cmd_cwd` (the spawn directory, `nil` for the editor's own).
 type LspStartArgs = (
     String,
     Vec<String>,
@@ -1273,6 +1274,7 @@ type LspStartArgs = (
     Option<Table>,
     Option<Table>,
     Option<Table>,
+    Option<String>,
 );
 
 /// The per-namespace byte budget for `nx.shada.plugin` storage (1 MiB). A plugin's
@@ -1993,7 +1995,7 @@ pub(crate) fn install_runtime_api(
     )?;
 
     // `nx._lsp_start(name, cmd, root, filetype, bufnr, init_options, settings,
-    // capabilities)`: queue an [`LspOp::Start`] for the server to drain. The
+    // capabilities, cmd_env, cmd_cwd)`: queue an [`LspOp::Start`] for the server to drain. The
     // Lua-facing `vim.lsp.start` wrapper (prelude) resolves the config and root,
     // then calls this. The trailing three are the config's `init_options` /
     // `settings` / `capabilities` tables (each `nil` when unset); they convert
@@ -2003,8 +2005,18 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_lsp_start",
         lua.create_function(move |_, args: LspStartArgs| {
-            let (name, cmd, root, filetype, bufnr, init_options, settings, capabilities, env) =
-                args;
+            let (
+                name,
+                cmd,
+                root,
+                filetype,
+                bufnr,
+                init_options,
+                settings,
+                capabilities,
+                env,
+                cmd_cwd,
+            ) = args;
             // `cmd_env` arrives already normalized to string values by the prelude, so
             // a non-string pair here is a caller reaching past `nx.lsp` — skip it
             // rather than spawn with a half-built environment.
@@ -2019,6 +2031,7 @@ pub(crate) fn install_runtime_api(
                 name,
                 cmd,
                 root,
+                cmd_cwd,
                 filetype,
                 bufnr,
                 init_options: opt_table_to_json(init_options)?,

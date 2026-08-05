@@ -237,6 +237,7 @@ impl EditHost {
             name,
             cmd,
             root,
+            cmd_cwd,
             filetype,
             bufnr,
             init_options,
@@ -288,6 +289,19 @@ impl EditHost {
         spawn.settings = settings;
         spawn.capabilities = capabilities;
         spawn.env = env;
+        // Working directory: the config's `cmd_cwd`, else the session's **effective
+        // cwd** — where the user is, not the workspace root. The root is a protocol
+        // fact (`rootUri`); launching the process there instead is what made an
+        // out-of-tree buffer (a jumped-into dependency under `~/.cache/uv`) start its
+        // server in a directory the user never cd'd to — which `uvx` refuses outright.
+        // Resolved here rather than left to the transport so the daemon leg spawns in
+        // the same directory the native one does instead of the daemon's launch dir.
+        spawn.cwd = Some(match cmd_cwd.as_deref() {
+            // `join` with an absolute `cmd_cwd` yields it unchanged, so this both
+            // absolutizes a relative one and passes an absolute one through.
+            Some(dir) => self.session_cwd().join(dir),
+            None => self.session_cwd().to_path_buf(),
+        });
         // Always remember the LATEST spawn for this key — the daemon-reconnect resync
         // and `nx.lsp.restart` both re-`ensure` from it, so it must reflect the config
         // in force now (which may have grown since the server first started), not the
@@ -855,10 +869,19 @@ impl EditHost {
         if path.is_absolute() {
             return path.to_path_buf();
         }
+        self.session_cwd().join(path)
+    }
+
+    /// The **session's** working directory: the current window's effective dir
+    /// (`:lcd` over `:tcd` over `:cd`). Locally this equals the process cwd — the
+    /// lifecycle's `fix_current_dir` keeps it there — but a daemon session's is a
+    /// path on the remote, which this process never `chdir`s to, so anything that
+    /// must mean "where the user is" reads it here rather than from
+    /// `std::env::current_dir()`.
+    pub(crate) fn session_cwd(&self) -> &Path {
         let win = self.editor.current_window_id();
         let tab = self.editor.current_tab_id();
-        let (_, base) = self.dirs.effective(win, tab);
-        base.join(path)
+        self.dirs.effective(win, tab).1
     }
 
     /// The `file://` URI addressing a buffer's document, from its stored path (see

@@ -228,8 +228,13 @@ pub enum LspOp {
         /// with `$NXVIM_LSP_CMD` (the test/mock hook), as the old built-in table did.
         cmd: Vec<String>,
         /// The workspace root, already resolved in Lua (`None` ⇒ the server falls
-        /// back to the file's directory).
+        /// back to the file's directory). It reaches the language server as
+        /// `rootUri` / `workspaceFolders` — it is **not** where the process is
+        /// launched; that is `cmd_cwd`.
         root: Option<String>,
+        /// The config's `cmd_cwd`: the directory to launch the process in, unrelated
+        /// to `root`. `None` ⇒ the editor's own working directory (vim's default).
+        cmd_cwd: Option<String>,
         /// The buffer's filetype, used verbatim as the LSP `languageId`.
         filetype: String,
         /// The buffer to attach, as the `BufferId` the server snapshotted into

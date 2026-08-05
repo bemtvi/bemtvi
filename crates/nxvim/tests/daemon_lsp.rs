@@ -257,3 +257,79 @@ async fn a_server_initiated_apply_edit_lands_over_the_daemon_wire() {
         "the response must travel back down the tunnel: {answered:?}"
     );
 }
+
+/// The **spawn directory** crosses the wire. `cmd_cwd` (and, without it, the
+/// editor's own cwd) is resolved editor-side and shipped to the daemon, which is the
+/// only way a remote session lands the server in the same directory a local one
+/// would: the daemon is stateless — it has no per-session cwd of its own — so a
+/// value it doesn't receive silently becomes "wherever the daemon was launched".
+#[cfg(unix)]
+#[tokio::test]
+async fn the_spawn_directory_reaches_the_daemon_side_child() {
+    let _serial = serial_lock().lock().await;
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _cwd = CwdGuard(std::env::current_dir().expect("cwd"));
+
+    let dir = temp_dir("daemon-lsp-cmd-cwd");
+    let log = dir.as_path().join("rec.log");
+    let pinned = dir.as_path().join("run-here");
+    std::fs::create_dir(&pinned).expect("create the pinned dir");
+    // A "server" that records where it was launched, then blocks on stdin so it stays
+    // alive (a dead child would be respawned and double the record).
+    let script = dir.as_path().join("recorder.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"CWD=$(pwd)\" >> '{}'\ncat >/dev/null\n",
+            log.display()
+        ),
+    )
+    .expect("write recorder");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The daemon side spawns from THIS process (in-process duplex), so put its cwd
+    // somewhere else: a recorded `run-here` can then only have come over the wire.
+    let elsewhere = temp_dir("daemon-lsp-cmd-cwd-elsewhere");
+    std::env::set_current_dir(elsewhere.as_path()).expect("cd elsewhere");
+
+    let file_path = dir.as_path().join("a.rs");
+    std::fs::write(&file_path, "let foo = 1\n").expect("write test file");
+    let (rpc, _incoming) = spawn_with_daemon_lsp(ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.lsp.config('rec', {{ cmd = {{ '{}' }}, filetypes = {{ 'rust' }},\n\
+               cmd_cwd = '{}' }})\n\
+             nx.lsp.enable('rec')",
+            script.display(),
+            pinned.display()
+        ),
+    )
+    .await;
+
+    let mut recorded = String::new();
+    for _ in 0..200 {
+        recorded = std::fs::read_to_string(&log).unwrap_or_default();
+        if !recorded.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let want = std::fs::canonicalize(&pinned).expect("canonicalize the pinned dir");
+    assert_eq!(
+        recorded.trim(),
+        format!("CWD={}", want.display()),
+        "the remote child must run in the editor-resolved directory"
+    );
+}

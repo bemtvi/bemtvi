@@ -30,15 +30,27 @@ pub struct ServerKey {
     pub root: PathBuf,
 }
 
-/// How to launch a server and how to configure it. The working directory is the
-/// key's `root`; `program`/`args` are derived from the resolved Lua config's `cmd`
-/// (or the `NXVIM_LSP_CMD` test override). The three JSON payloads are the
-/// config's `init_options` / `settings` / `capabilities`, forwarded at the
-/// handshake so the server runs *configured*, not on defaults (Phase 2).
+/// How to launch a server and how to configure it. `program`/`args` are derived
+/// from the resolved Lua config's `cmd` (or the `NXVIM_LSP_CMD` test override). The
+/// three JSON payloads are the config's `init_options` / `settings` /
+/// `capabilities`, forwarded at the handshake so the server runs *configured*, not
+/// on defaults (Phase 2).
 #[derive(Clone, Debug, Default)]
 pub struct ServerSpawn {
     pub program: String,
     pub args: Vec<String>,
+    /// The child's **working directory** — the config's `cmd_cwd` if it set one,
+    /// else the editor's effective cwd, resolved by the caller.
+    ///
+    /// Deliberately NOT the key's `root`: the workspace root reaches the server as
+    /// `rootUri` / `workspaceFolders`, and conflating the two launches the process
+    /// somewhere the user never cd'd to — which some tools reject outright (`uvx`
+    /// refuses to run with a cwd inside its own cache, the case that split these
+    /// apart). vim's `cmd_cwd` draws the same line.
+    ///
+    /// `None` inherits the spawning host's cwd, which is only what a spawn built
+    /// outside the config path (a default-constructed spec) can mean.
+    pub cwd: Option<PathBuf>,
     /// Sent verbatim as `initialization_options` at `initialize` (falling back to
     /// `settings` when absent). `None` when the config sets neither.
     pub init_options: Option<serde_json::Value>,

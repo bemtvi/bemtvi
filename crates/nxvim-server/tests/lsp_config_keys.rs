@@ -33,8 +33,11 @@ async fn start(dir: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
 }
 
 /// Write the recording "language server": one `KEY=value` line per fact about the
-/// spawn (argv, cwd, and the `cmd_env` variables under test), then block on stdin so
-/// the process stays alive. Returns its path.
+/// spawn (argv, cwd, and the `cmd_env` variables under test), then append everything
+/// the editor writes to its stdin to the same log — which both keeps the process
+/// alive (it reads to EOF) and captures the `initialize` request, where the resolved
+/// **root** shows up as `rootUri`. Root and working directory are separate facts
+/// since `cmd_cwd` split them, so the log has to carry both. Returns its path.
 fn write_recorder(dir: &Path, log: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("recorder.sh");
@@ -47,8 +50,8 @@ fn write_recorder(dir: &Path, log: &Path) -> PathBuf {
              echo \"CWD=$(pwd)\"\n\
              echo \"MY_VAR=${{MY_VAR:-<unset>}}\"\n\
              echo \"PATH_PRESENT=$(test -n \"$PATH\" && echo yes || echo no)\"\n\
-             }} >> '{}'\n\
-             cat >/dev/null\n",
+             }} >> '{0}'\n\
+             cat >> '{0}'\n",
             log.display()
         ),
     )
@@ -77,6 +80,27 @@ async fn wait_for(log: &Path, key: &str) -> String {
             std::time::Instant::now() < deadline,
             "no {key} line appeared; the record was {:?}",
             record(log)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The filesystem path of the `rootUri` in the `initialize` request the editor sent
+/// the recorder, waiting up to ~5s for it. This — not the child's cwd — is where the
+/// resolved root is observable: the root is a *protocol* fact, while the cwd is the
+/// editor's own directory (or `cmd_cwd`).
+async fn wait_for_root(log: &Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if let Some(rest) = text.split("\"rootUri\":\"file://").nth(1) {
+            if let Some(end) = rest.find('"') {
+                return rest[..end].to_string();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no rootUri appeared in the initialize request; the record was {text:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -157,9 +181,8 @@ async fn nested_root_markers_exhaust_each_tier_over_the_whole_tree() {
     )
     .await;
 
-    let cwd = wait_for(&log, "CWD").await;
     assert_eq!(
-        canonical(&cwd),
+        canonical(&wait_for_root(&log).await),
         canonical(&root.to_string_lossy()),
         "the higher-priority lockfile tier must win over a nearer .git"
     );
@@ -186,9 +209,8 @@ async fn a_flat_root_marker_list_takes_the_nearest_match() {
     )
     .await;
 
-    let cwd = wait_for(&log, "CWD").await;
     assert_eq!(
-        canonical(&cwd),
+        canonical(&wait_for_root(&log).await),
         canonical(&inner.to_string_lossy()),
         "a flat list is one tier of equals — the nearest marker wins"
     );
@@ -250,11 +272,119 @@ async fn without_workspace_required_a_rootless_buffer_still_starts() {
     )
     .await;
 
-    let cwd = wait_for(&log, "CWD").await;
     assert_eq!(
-        canonical(&cwd),
+        canonical(&wait_for_root(&log).await),
         canonical(&dir.as_path().to_string_lossy()),
         "with no root found and no workspace_required, the file's directory is used"
+    );
+}
+
+// ----- the spawn directory (cmd_cwd, and its default) --------------------------
+
+/// Restore the process cwd on drop, even if the test panics mid-way. The cwd tests
+/// below move the *process* cwd (that is what "the editor's cwd" is locally), which
+/// is safe only under the `serial_lock` every test body here already holds.
+struct CwdGuard(PathBuf);
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn the_server_is_spawned_in_the_editor_cwd_not_the_workspace_root() {
+    // Each test holds a live server plus a blocked child process for its whole
+    // body; serialize so this binary's footprint stays one of each rather than
+    // twelve, which is what `serial_lock` is for (\"spawned subprocesses\").
+    let _serial = serial_lock().lock().await;
+    let _cwd = CwdGuard(std::env::current_dir().unwrap());
+    let (dir, root, _inner, file) = monorepo("lsp-spawn-cwd");
+    let log = dir.as_path().join("rec.log");
+    let script = write_recorder(dir.as_path(), &log);
+    // The editor's cwd is somewhere else entirely — as it is whenever a buffer is
+    // opened from outside the tree it belongs to (a jumped-into dependency).
+    let elsewhere = temp_dir("lsp-spawn-cwd-elsewhere");
+    std::env::set_current_dir(elsewhere.as_path()).unwrap();
+
+    let (rpc, _incoming) = start(dir.as_path()).await;
+    command(&rpc, &format!("e {}", file.display())).await;
+    enable(&rpc, &script, "root_markers = { 'package-lock.json' }").await;
+
+    // The root reaches the server as `rootUri` — that part is unchanged…
+    assert_eq!(
+        canonical(&wait_for_root(&log).await),
+        canonical(&root.to_string_lossy()),
+        "the resolved root is still what the server is told its workspace is"
+    );
+    // …but the PROCESS runs where the user is. Launching it at the root instead put
+    // servers in directories nobody cd'd to — `uvx` refuses to run at all with a cwd
+    // inside its own cache, which is where a jumped-into dependency lives.
+    assert_eq!(
+        canonical(&wait_for(&log, "CWD").await),
+        canonical(&elsewhere.as_path().to_string_lossy()),
+        "the spawn directory is the editor's cwd, not the workspace root"
+    );
+}
+
+#[tokio::test]
+async fn cmd_cwd_pins_the_spawn_directory() {
+    // Each test holds a live server plus a blocked child process for its whole
+    // body; serialize so this binary's footprint stays one of each rather than
+    // twelve, which is what `serial_lock` is for (\"spawned subprocesses\").
+    let _serial = serial_lock().lock().await;
+    let _cwd = CwdGuard(std::env::current_dir().unwrap());
+    let dir = temp_dir("lsp-cmd-cwd");
+    let log = dir.as_path().join("rec.log");
+    let script = write_recorder(dir.as_path(), &log);
+    let file = dir.as_path().join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+    let pinned = dir.as_path().join("run-here");
+    std::fs::create_dir(&pinned).unwrap();
+    std::env::set_current_dir(dir.as_path()).unwrap();
+
+    let (rpc, _incoming) = start(dir.as_path()).await;
+    command(&rpc, &format!("e {}", file.display())).await;
+    enable(
+        &rpc,
+        &script,
+        &format!("cmd_cwd = '{}'", pinned.to_string_lossy()),
+    )
+    .await;
+
+    assert_eq!(
+        canonical(&wait_for(&log, "CWD").await),
+        canonical(&pinned.to_string_lossy()),
+        "cmd_cwd wins over the editor's cwd"
+    );
+}
+
+#[tokio::test]
+async fn a_relative_cmd_cwd_resolves_against_the_editor_cwd() {
+    // Each test holds a live server plus a blocked child process for its whole
+    // body; serialize so this binary's footprint stays one of each rather than
+    // twelve, which is what `serial_lock` is for (\"spawned subprocesses\").
+    let _serial = serial_lock().lock().await;
+    let _cwd = CwdGuard(std::env::current_dir().unwrap());
+    let dir = temp_dir("lsp-cmd-cwd-rel");
+    let log = dir.as_path().join("rec.log");
+    let script = write_recorder(dir.as_path(), &log);
+    let file = dir.as_path().join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").unwrap();
+    let pinned = dir.as_path().join("run-here");
+    std::fs::create_dir(&pinned).unwrap();
+    std::env::set_current_dir(dir.as_path()).unwrap();
+
+    let (rpc, _incoming) = start(dir.as_path()).await;
+    command(&rpc, &format!("e {}", file.display())).await;
+    // A relative `cmd_cwd` means what a relative path always means in the editor:
+    // against the session's directory. Resolving it against the *spawning process*
+    // would be the same thing locally and the wrong thing over a daemon.
+    enable(&rpc, &script, "cmd_cwd = 'run-here'").await;
+
+    assert_eq!(
+        canonical(&wait_for(&log, "CWD").await),
+        canonical(&pinned.to_string_lossy()),
+        "a relative cmd_cwd resolves against the editor's cwd"
     );
 }
 

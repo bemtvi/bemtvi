@@ -302,6 +302,28 @@ end
 -- (deep-merged over any prior call — configs compose across files and plugins).
 -- `"*"` is the all-clients base inherited by every server. Function-call form
 -- only: there is no `nx.lsp.config[name] = {…}` table-assignment sugar.
+--
+-- Two keys are easy to confuse, because they are the same word in different worlds:
+--
+-- ```lua
+-- root_dir / root_markers  -- the WORKSPACE root, sent as `rootUri`
+-- cmd_cwd                  -- the directory the server PROCESS is launched in
+-- ```
+--
+-- They are unrelated, exactly as in vim. The root is a protocol fact: it tells the
+-- server which project to index, and resolving it is what `root_markers` does. The
+-- spawn directory defaults to the **editor's own** working directory (`:cd`-aware)
+-- and only matters to a `cmd` that cares where it was invoked from — a launcher
+-- resolving a virtualenv, or `uvx`, which refuses to run at all when its cwd sits
+-- inside its own cache. Set `cmd_cwd` to pin it; a relative value resolves against
+-- the editor's cwd.
+--
+-- ```lua
+-- nx.lsp.config("pylsp", {
+--   cmd = { "uvx", "--from", "python-lsp-server", "pylsp" },
+--   cmd_cwd = nx.workspace.dir(),   -- launch it here, whatever buffer attached
+-- })
+-- ```
 function nx.lsp.config(name, opts)
   if type(name) ~= "string" then
     error("nx.lsp.config: name must be a string", 2)
@@ -322,6 +344,7 @@ end
 local KNOWN_KEYS = {
   cmd = true,
   cmd_env = true,
+  cmd_cwd = true,
   filetypes = true,
   root_dir = true,
   root_markers = true,
@@ -548,6 +571,22 @@ local function env_map(name, cmd_env)
   return any and out or nil
 end
 
+-- The config's `cmd_cwd` as a plain string, or nil for "the editor's own working
+-- directory" (the default, as in vim). It is the directory the SERVER PROCESS is
+-- launched in — unrelated to `root_dir`, which only reaches the server as `rootUri` —
+-- so a tool that cares where it was invoked (uvx, a wrapper script resolving a venv)
+-- can be pinned. A relative value resolves against the editor's cwd server-side.
+local function cwd_value(name, cmd_cwd)
+  if cmd_cwd == nil then
+    return nil
+  end
+  if type(cmd_cwd) ~= "string" then
+    nx.notify("nx.lsp: '" .. name .. "' cmd_cwd must be a string (ignored)", vim.log.levels.WARN)
+    return nil
+  end
+  return cmd_cwd
+end
+
 -- Queue a start for `bufnr` from a resolved config (root already computed): build the
 -- argv, run `before_init`, then hand the whole spawn across `nx._lsp_start`. A cmd that
 -- isn't a spawnable argv is reported loud (a server enabled but unspawnable is visible,
@@ -580,7 +619,8 @@ local start_resolved = nx.async(function(name, cfg, bufnr, ft, root)
     nonempty(start_cfg.init_options),
     nonempty(start_cfg.settings),
     nonempty(start_cfg.capabilities),
-    env_map(name, start_cfg.cmd_env)
+    env_map(name, start_cfg.cmd_env),
+    cwd_value(name, start_cfg.cmd_cwd)
   )
 end)
 

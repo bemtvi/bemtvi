@@ -2560,7 +2560,6 @@ impl LspTransport for RemoteLspTransport {
     fn spawn(
         &self,
         spec: &ServerSpawn,
-        root: &Path,
     ) -> Pin<Box<dyn Future<Output = io::Result<LspChannel>> + Send>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let rpc = self.rpc.clone();
@@ -2570,7 +2569,15 @@ impl LspTransport for RemoteLspTransport {
         // The config's `cmd_env` rides to the daemon, where the process actually
         // runs — a remote session must configure a server exactly as a local one does.
         let env = spec.env.clone();
-        let cwd = root.to_string_lossy().into_owned();
+        // …and so does the working directory. It is a path on the DAEMON's machine
+        // (a remote session's cwd and buffer paths already are), resolved editor-side
+        // so `cmd_cwd` / `:cd` land identically here and locally rather than the
+        // daemon's own launch dir standing in. Empty = inherit the daemon's.
+        let cwd = spec
+            .cwd
+            .as_ref()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Box::pin(async move {
             let (stdout_tx, stdout_rx) = unbounded_channel::<Vec<u8>>();
             let (stderr_tx, stderr_rx) = unbounded_channel::<Vec<u8>>();

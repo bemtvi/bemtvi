@@ -295,12 +295,20 @@ async fn run_server_once(
     log.log(
         LogLevel::Info,
         name,
-        &format!("starting {} in {}", spawn.program, key.root.display()),
+        &format!(
+            "starting {} (root {}, cwd {})",
+            spawn.program,
+            key.root.display(),
+            spawn
+                .cwd
+                .as_deref()
+                .map_or_else(|| "<inherited>".to_string(), |c| c.display().to_string()),
+        ),
     );
     // Spawn through the transport: a real local child by default, or a daemon
     // tunnel for the edit-host split. Either way it hands back the server's stdio
     // streams and a kill/wait handle — the loop below is identical regardless.
-    let channel = match transport.spawn(spawn, &key.root).await {
+    let channel = match transport.spawn(spawn).await {
         Ok(channel) => channel,
         Err(e) => {
             let message = format!("failed to spawn {}: {e}", spawn.program);

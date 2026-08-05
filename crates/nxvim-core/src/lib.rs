@@ -45,6 +45,7 @@ pub use editor::{
     QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry, RowLayout, SessionDock,
     SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId, TerminalOp,
     UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId, WriteEvent, WriteScope,
+    SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT,
 };
 pub use encoding::Encoding;
 pub use extmark::{

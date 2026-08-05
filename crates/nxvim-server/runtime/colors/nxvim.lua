@@ -86,6 +86,8 @@ hl(0, "Folded",       { fg = p.comment, bg = p.cursor_line })
 -- Snippet tabstops: an underlined placeholder, the one you're on highlighted.
 hl(0, "SnippetTabstop",       { underline = true })
 hl(0, "SnippetTabstopActive", { bg = p.visual, underline = true })
+-- The signature-help float's pointer at the parameter the cursor is inside.
+hl(0, "LspSignatureActiveParameter", { fg = p.blue, bold = true })
 
 -- Legacy syntax groups — the terminus of the treesitter capture fallback chain
 -- (`@function.call` -> `@function` -> `Function`), so defining these colors every

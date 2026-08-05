@@ -25,7 +25,7 @@ use nxvim_lsp::lsp_types::{
 };
 use nxvim_lsp::{
     CodeActionData, PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn,
-    SymbolData,
+    SignatureInfo, SymbolData,
 };
 use nxvim_lua::{DiagnosticData, LspServerCapabilities};
 
@@ -195,6 +195,7 @@ mod folding;
 mod inlay;
 mod request;
 mod semantic;
+mod signature;
 mod sync;
 
 /// Per-**(buffer, server)** document-sync state: everything that is negotiated
@@ -742,11 +743,12 @@ pub(crate) struct LspFanout {
     /// location/symbol accumulators these need no encoding: a hover's payload is
     /// markdown, not positions.
     pub(crate) hovers: Vec<(ServerKey, Vec<String>)>,
-    /// Accumulated signature help — `(server, signature label, active parameter)`,
-    /// tagged for the same reason as [`hovers`](Self::hovers): with two servers
-    /// answering, an unlabelled list of signatures says nothing about which language
-    /// tool is claiming what. Also encoding-free (labels, not positions).
-    pub(crate) signatures: Vec<(ServerKey, String, Option<String>)>,
+    /// Accumulated signature help — `(server, active signature)`, tagged for the
+    /// same reason as [`hovers`](Self::hovers): with two servers answering, an
+    /// unlabelled list of signatures says nothing about which language tool is
+    /// claiming what. Also encoding-free (labels and label-relative parameter
+    /// spans, not buffer positions).
+    pub(crate) signatures: Vec<(ServerKey, SignatureInfo)>,
     /// Accumulated code actions, each tagged with the server that produced it.
     ///
     /// The tag is load-bearing: a lazy action is finished with `codeAction/resolve`,

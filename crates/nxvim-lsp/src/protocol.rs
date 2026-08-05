@@ -353,6 +353,57 @@ pub struct ReqToken {
     pub cb_id: u64,
 }
 
+/// The active signature of a `textDocument/signatureHelp` reply, kept
+/// **structural** rather than pre-rendered: the whole label plus the byte range
+/// each parameter occupies *inside* it. That is what lets the editor lay the
+/// parameters out one per line without splitting the label on commas — a guess
+/// that mangles `Vec<(A, B)>`, `dict[str, int]` and `f: Callable[[int], str]`.
+/// The spans come from the protocol's own `ParameterInformation.label` (a string
+/// or a pair of UTF-16 offsets into the signature label), so the layout is
+/// derived from what the server said, not from punctuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureInfo {
+    /// The signature exactly as the server spells it (`fn foo(a: i32, b: i32)`).
+    pub label: String,
+    /// One byte range into [`label`](Self::label) per parameter, in declaration
+    /// order. **Empty** when the server sent no `parameters`, or when any one of
+    /// them could not be located in the label (all-or-nothing: a partial list
+    /// would misalign both the layout and [`active`](Self::active)) — the editor
+    /// then falls back to showing the label as a single line.
+    pub parameters: Vec<(usize, usize)>,
+    /// Index into [`parameters`](Self::parameters) of the one the cursor sits in
+    /// — the server's `activeParameter` (per-signature, else top-level), kept
+    /// only when it addresses a resolved span.
+    pub active: Option<usize>,
+    /// The active parameter's text, resolved from the server's parameter list
+    /// *independently* of the spans, so the degraded single-line rendering can
+    /// still name the parameter you are on when
+    /// [`parameters`](Self::parameters) came back empty.
+    pub active_text: Option<String>,
+}
+
+impl SignatureInfo {
+    /// The byte spans, when they can carry a per-parameter layout: at least two
+    /// parameters, each span in bounds, on a char boundary, and strictly after
+    /// the last. A server that reports overlapping or out-of-order spans gets the
+    /// single-line rendering rather than a scrambled one.
+    pub fn layout_spans(&self) -> Option<&[(usize, usize)]> {
+        if self.parameters.len() < 2 {
+            return None;
+        }
+        let mut prev_end = 0;
+        for &(start, end) in &self.parameters {
+            let ordered = prev_end <= start && start < end && end <= self.label.len();
+            if !ordered || !self.label.is_char_boundary(start) || !self.label.is_char_boundary(end)
+            {
+                return None;
+            }
+            prev_end = end;
+        }
+        Some(&self.parameters)
+    }
+}
+
 /// The distilled result of an [`LspRequest`]. Each variant is already reduced to
 /// what the editor renders, so the protocol's many response shapes never leak
 /// past the manager: goto-family/`references` collapse to a flat location list,
@@ -369,13 +420,10 @@ pub enum LspReply {
     Symbols(Vec<SymbolData>),
     /// Hover contents as plain display lines (empty ⇒ the server had nothing).
     Hover(Vec<String>),
-    /// The active signature's label and, when known, its active parameter's text.
-    /// Both `None` ⇒ no signature help (no signatures, or the server returned
-    /// nothing).
-    SignatureHelp {
-        signature: Option<String>,
-        active_parameter: Option<String>,
-    },
+    /// The active signature, kept structural (see [`SignatureInfo`]) so the editor
+    /// lays its parameters out itself. `None` ⇒ no signature help (no signatures,
+    /// or the server returned nothing).
+    SignatureHelp(Option<SignatureInfo>),
     /// Completion candidates (a `CompletionItem[]` and a `CompletionList` both
     /// normalized to this shape). `is_incomplete` ⇒ the server's list is partial,
     /// so the editor re-requests as the typed prefix narrows rather than

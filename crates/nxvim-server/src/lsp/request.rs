@@ -829,13 +829,8 @@ impl EditHost {
             }
             // As with hover, a server with nothing to say is dropped on arrival rather
             // than carried as an empty slot to the presentation.
-            LspReply::SignatureHelp {
-                signature: Some(signature),
-                active_parameter,
-            } => {
-                round
-                    .signatures
-                    .push((server.clone(), signature.clone(), active_parameter.clone()))
+            LspReply::SignatureHelp(Some(info)) => {
+                round.signatures.push((server.clone(), info.clone()))
             }
             // A kind that fans out can only reply with one of the above; anything
             // else means the server answered off-protocol. Drop its slot (already
@@ -1186,28 +1181,29 @@ impl EditHost {
     }
 
     /// Render a signature-help round in the cursor-anchored **doc float** (the same
-    /// scrollable float window as the hover, [`Editor::open_doc_float`]): each
-    /// answering server's active signature label, with its active parameter appended
-    /// in brackets when known (the float renders plain lines, so the parameter can't
-    /// be styled inline yet). Triggered manually in insert mode, or by the opt-in
-    /// auto-trigger, so it stays out of the way until asked for.
+    /// scrollable float window as the hover, [`Editor::open_signature_float`]): each
+    /// answering server's active signature, laid out one parameter per line with the
+    /// parameter the cursor is in marked (see [`super::signature`]). Triggered
+    /// manually in insert mode, or by the opt-in auto-trigger, so it stays out of the
+    /// way until asked for.
     ///
-    /// With several servers answering, each line is prefixed `<client>: ` — otherwise
-    /// two signatures for the same call sit anonymously on top of each other. A lone
-    /// contributor renders bare, so the ordinary one-server float is unchanged.
+    /// With several servers answering, each signature is labelled with its client —
+    /// otherwise two signatures for the same call sit anonymously on top of each
+    /// other. A lone contributor renders bare, so the ordinary one-server float is
+    /// unchanged.
     ///
     /// This is where nxvim **departs from neovim**: `vim.lsp.buf.signature_help` shows
     /// one client's signature at a time, titled `(1/3)`, and binds `<C-s>` to cycle.
     /// Cycling needs a focusable, key-grabbing float with session state; nxvim's is a
-    /// passive doc float that the next keystroke dismisses, and a signature is one
-    /// short line, so showing them together says the same thing without a mode to
-    /// leave. (Both editors ask every capable server — only the presentation differs.)
+    /// passive doc float that the next keystroke dismisses, so showing them together
+    /// says the same thing without a mode to leave. (Both editors ask every capable
+    /// server — only the presentation differs.)
     ///
     /// Returns the shown text as a JSON string an async `signature_help` promise
     /// resolves with; `Null` when no server had a signature.
     fn show_merged_signature_help(
         &mut self,
-        signatures: Vec<(ServerKey, String, Option<String>)>,
+        signatures: Vec<(ServerKey, SignatureInfo)>,
     ) -> serde_json::Value {
         if signatures.is_empty() {
             // An auto-trigger session reaching an empty round means you left the call
@@ -1221,20 +1217,23 @@ impl EditHost {
             return serde_json::Value::Null;
         }
         let multi = signatures.len() > 1;
-        let lines: Vec<String> = signatures
-            .into_iter()
-            .map(|(key, signature, active_parameter)| {
-                let line = match active_parameter {
-                    Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
-                    _ => signature,
-                };
-                if multi {
-                    format!("{}: {line}", key.name)
-                } else {
-                    line
-                }
-            })
-            .collect();
+        // Each server's signature becomes a block of lines; `marker_rows` collects
+        // where each block's active parameter landed *in the concatenation*, since
+        // that is the coordinate core paints the marker at.
+        let mut lines: Vec<String> = Vec::new();
+        let mut marker_rows: Vec<usize> = Vec::new();
+        for (key, info) in signatures {
+            let layout = super::signature::layout_signature(&info);
+            let layout = if multi {
+                super::signature::with_server_name(layout, &key.name)
+            } else {
+                layout
+            };
+            if let Some(row) = layout.active_row {
+                marker_rows.push(lines.len() + row);
+            }
+            lines.extend(layout.lines);
+        }
         // Signature help renders a code signature in the source language, so type the
         // popup as the buffer it was invoked from (the staleness gate above guarantees
         // the current buffer is still that one). `""` when that buffer has no filetype.
@@ -1243,7 +1242,7 @@ impl EditHost {
             .buffer_filetype(self.editor.current_buffer_id())
             .unwrap_or_default();
         self.editor
-            .open_doc_float("[Signature]", lines.clone(), &filetype);
+            .open_signature_float(lines.clone(), &filetype, &marker_rows);
         serde_json::Value::String(lines.join("\n"))
     }
 

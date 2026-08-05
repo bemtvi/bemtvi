@@ -1113,11 +1113,27 @@ end
 -- float. `opts.name` routes it; see `nx.lsp.signature_help_autotrigger` for showing it
 -- as you type instead of on demand.
 --
--- Asks every capable server, like `nx.lsp.hover`. With more than one answering, each
--- line is prefixed `<client>: ` and they are shown together in `priority` order —
--- where neovim shows one at a time and binds `<C-s>` to cycle. nxvim's float is
--- passive (the next keystroke dismisses it) and a signature is one short line, so
--- there is nothing to cycle through and no mode to leave.
+-- A call with more than one parameter is laid out **one parameter per line**, with a
+-- `▸` marking the parameter the cursor is inside (the `LspSignatureActiveParameter`
+-- highlight group):
+--
+-- ```
+-- def connect(
+--     host: str,
+--   ▸ port: int = 5432,
+--     timeout: float = 30.0,
+-- ) -> Connection
+-- ```
+--
+-- The split reads the server's own parameter ranges, not commas, so
+-- `f(items: dict[str, int])` stays one parameter. A one-parameter call — or a server
+-- whose parameters can't be located in the signature it sent — stays on a single line
+-- with the active parameter named in brackets.
+--
+-- Asks every capable server, like `nx.lsp.hover`. With more than one answering they
+-- are shown together in `priority` order, each labelled with its client — where neovim
+-- shows one at a time and binds `<C-s>` to cycle. nxvim's float is passive (the next
+-- keystroke dismisses it), so there is nothing to cycle through and no mode to leave.
 function nx.lsp.signature_help(opts)
   local name = route_name(opts, "nx.lsp.signature_help")
   return lsp_promise(function(id)

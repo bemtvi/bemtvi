@@ -12,14 +12,14 @@ use lsp_types::{
     CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionResponse,
     CompletionTextEdit, DocumentSymbol, DocumentSymbolResponse, Documentation, FoldingRange,
     GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel,
-    Location, MarkedString, OneOf, ParameterLabel, ResourceOp, SemanticTokensFullDeltaResult,
-    SemanticTokensResult, SignatureHelp, SymbolInformation, SymbolKind, TextEdit, Url,
-    WorkspaceSymbolResponse,
+    Location, MarkedString, OneOf, ParameterInformation, ParameterLabel, ResourceOp,
+    SemanticTokensFullDeltaResult, SemanticTokensResult, SignatureHelp, SymbolInformation,
+    SymbolKind, TextEdit, Url, WorkspaceSymbolResponse,
 };
 
 use crate::protocol::{
     ChangeAnnotationData, CodeActionData, CompletionItemData, FoldRangeData, InlayHintData,
-    LspReply, SemanticTokensData, SymbolData, WorkspaceChange, WorkspaceEditData,
+    LspReply, SemanticTokensData, SignatureInfo, SymbolData, WorkspaceChange, WorkspaceEditData,
 };
 
 /// Reduce a `textDocument/foldingRange` reply to nxvim's whole-line spans: each
@@ -475,20 +475,17 @@ fn marked_string_text(ms: MarkedString) -> String {
     }
 }
 
-/// Distill a `textDocument/signatureHelp` reply into the active signature's label
-/// and active parameter text. The active signature is `activeSignature` (default
-/// the first); the active parameter is the signature's own `activeParameter` when
-/// present, else the top-level one. `None`/no signatures degrades to a "no
-/// signature help" (both fields `None`). The caller unwraps the transport result
-/// (logging a failure as `None`).
+/// Distill a `textDocument/signatureHelp` reply into the active signature: its
+/// label, the byte span of every parameter within that label, and which of them
+/// is active. The active signature is `activeSignature` (default the first); the
+/// active parameter is the signature's own `activeParameter` when present, else
+/// the top-level one. `None`/no signatures degrades to "no signature help"
+/// (`SignatureHelp(None)`). The caller unwraps the transport result (logging a
+/// failure as `None`).
 pub(crate) fn signature_help_reply(help: Option<SignatureHelp>) -> LspReply {
-    let none = LspReply::SignatureHelp {
-        signature: None,
-        active_parameter: None,
-    };
     let help = match help {
         Some(help) => help,
-        None => return none,
+        None => return LspReply::SignatureHelp(None),
     };
     let active = help.active_signature.unwrap_or(0) as usize;
     let Some(sig) = help
@@ -496,19 +493,85 @@ pub(crate) fn signature_help_reply(help: Option<SignatureHelp>) -> LspReply {
         .get(active)
         .or_else(|| help.signatures.first())
     else {
-        return none;
+        return LspReply::SignatureHelp(None);
     };
+    let params = sig.parameters.as_deref().unwrap_or_default();
     // A per-signature `activeParameter` (3.16+) overrides the top-level one.
     let param_idx = sig
         .active_parameter
         .or(help.active_parameter)
         .map(|i| i as usize);
-    let active_parameter = param_idx
-        .and_then(|i| sig.parameters.as_ref()?.get(i))
+    let active_text = param_idx
+        .and_then(|i| params.get(i))
         .map(|p| parameter_text(&p.label, &sig.label));
-    LspReply::SignatureHelp {
-        signature: Some(sig.label.clone()),
-        active_parameter,
+    let parameters = parameter_spans(params, &sig.label);
+    LspReply::SignatureHelp(Some(SignatureInfo {
+        label: sig.label.clone(),
+        // An index only means something against a span list that resolved.
+        active: param_idx.filter(|i| *i < parameters.len()),
+        parameters,
+        active_text,
+    }))
+}
+
+/// Locate every parameter inside the signature label, as byte ranges in
+/// declaration order — what the editor lays a parameter-per-line signature out
+/// from. All-or-nothing: one parameter that cannot be located yields an empty
+/// list (a partial one would misalign the whole layout).
+///
+/// A label given as UTF-16 offsets (LSP's authoritative form) converts directly.
+/// A label given as a *string* is searched for in the signature, each parameter
+/// starting where the previous one ended — so `f(a, b, a)` maps its two `a`s to
+/// their own occurrences rather than both to the first.
+fn parameter_spans(params: &[ParameterInformation], signature: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::with_capacity(params.len());
+    let mut from = 0usize;
+    for param in params {
+        let Some(span) = parameter_span(&param.label, signature, from) else {
+            return Vec::new();
+        };
+        from = span.1;
+        spans.push(span);
+    }
+    spans
+}
+
+/// The byte range one parameter occupies in the signature label, searching from
+/// byte `from`. `None` when a string label does not appear in the label at all,
+/// or when UTF-16 offsets fall outside it.
+fn parameter_span(label: &ParameterLabel, signature: &str, from: usize) -> Option<(usize, usize)> {
+    match label {
+        ParameterLabel::Simple(s) if s.is_empty() => None,
+        ParameterLabel::Simple(s) => {
+            let at = from + signature.get(from..)?.find(s.as_str())?;
+            Some((at, at + s.len()))
+        }
+        ParameterLabel::LabelOffsets([start, end]) => {
+            let (start, end) = (*start as usize, *end as usize);
+            if start >= end {
+                return None;
+            }
+            // The offsets are UTF-16 code units into the label (per LSP); walk the
+            // label once converting both to byte offsets.
+            let (mut unit, mut byte_start, mut byte_end) = (0usize, None, None);
+            for (byte, c) in signature.char_indices() {
+                if unit == start {
+                    byte_start = Some(byte);
+                }
+                if unit == end {
+                    byte_end = Some(byte);
+                    break;
+                }
+                unit += c.len_utf16();
+            }
+            // An `end` at the very end of the label lands past the last char, so
+            // no `char_indices` step ever reports it — only reachable when the walk
+            // ran out of chars, never as an override of what the loop found.
+            if byte_end.is_none() && unit == end {
+                byte_end = Some(signature.len());
+            }
+            Some((byte_start?, byte_end?))
+        }
     }
 }
 

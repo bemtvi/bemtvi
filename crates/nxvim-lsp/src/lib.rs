@@ -58,7 +58,8 @@ pub use protocol::{
     ApplyEditOutcome, ChangeAnnotationData, CodeActionData, CompletionItemData, FoldRangeData,
     InlayHintData, LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ProgressKind,
     ProgressUpdate, ProviderCaps, RefreshKind, ReqToken, SemanticLegend, SemanticTokensData,
-    ServerCaps, ServerKey, ServerSpawn, SymbolData, WorkspaceChange, WorkspaceEditData,
+    ServerCaps, ServerKey, ServerSpawn, SignatureInfo, SymbolData, WorkspaceChange,
+    WorkspaceEditData,
 };
 pub use serde_json;
 

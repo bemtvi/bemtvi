@@ -74,6 +74,17 @@ pub const DOC_MD_NS: u32 = u32::MAX - 4;
 /// [`DOC_MD_NS`].
 pub const SUBST_PREVIEW_NS: u32 = u32::MAX - 5;
 
+/// Reserved namespace for the **signature-help** float's active-parameter marker:
+/// one [`Overlay`](VirtTextPos::Overlay) `virt_text` extmark per marked row,
+/// drawn over the indent of the parameter the cursor sits in (see
+/// [`Editor::open_signature_float`](crate::editor::Editor::open_signature_float)).
+/// It rides an overlay rather than living in the buffer text so the popup's text
+/// stays *valid code* for the tree-sitter pass that colors it — a `▸` spliced into
+/// the line would parse as an error node and take that line's highlighting with
+/// it. Cleared and repainted with each reply, like the other reserved decoration
+/// namespaces. Sits just below [`SUBST_PREVIEW_NS`].
+pub const SIGNATURE_NS: u32 = u32::MAX - 6;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

@@ -80,6 +80,56 @@ fn window_lines(win: &[(Value, Value)]) -> Vec<String> {
     }
 }
 
+/// The rows of a float window carrying an **overlay** `virt_text` placement, as
+/// `(row, screen column, text)` — how the signature float's active-parameter
+/// marker reaches a client. The wire shape per placement is
+/// `[pos, col, hl_mode, [[text, style_id], …]]` with `pos == 2` for an overlay.
+fn overlay_markers(win: &[(Value, Value)]) -> Vec<(usize, u64, String)> {
+    let Some(rows) = map_get(win, "virt_text").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (row, placements) in rows.iter().enumerate() {
+        let Some(placements) = placements.as_array() else {
+            continue;
+        };
+        for p in placements {
+            let Some(a) = p.as_array() else { continue };
+            if a[0].as_u64() != Some(2) {
+                continue;
+            }
+            let col = a[1].as_u64().unwrap_or_default();
+            let text: String = a[3]
+                .as_array()
+                .map(|chunks| {
+                    chunks
+                        .iter()
+                        .filter_map(|c| c.as_array()?[0].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((row, col, text));
+        }
+    }
+    out
+}
+
+/// Paint a captured redraw through the **real client renderer** and return its
+/// rows as strings — the tier-2 check that a wire-level decoration actually lands
+/// on cells a user sees (mirrors `screen.rs`).
+fn painted_rows(redraw: &[(Value, Value)]) -> Vec<String> {
+    let mut view = nxvim_view::View::default();
+    view.update(&[Value::Map(redraw.to_vec())]);
+    let buf = nxvim_tui::paint(&view, 80, 24);
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
 /// A float window's `filetype` from the redraw (the buffer's effective ts type).
 fn window_filetype(win: &[(Value, Value)]) -> &str {
     map_get(win, "filetype")
@@ -106,13 +156,24 @@ async fn await_doc_float_window(
     trigger: &str,
     want: &str,
 ) -> Vec<(Value, Value)> {
+    await_doc_float_redraw(rpc, incoming, trigger, want).await.1
+}
+
+/// [`await_doc_float_window`], also returning the whole redraw the float came in —
+/// what [`painted_rows`] needs to render the frame.
+async fn await_doc_float_redraw(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    trigger: &str,
+    want: &str,
+) -> (Vec<(Value, Value)>, Vec<(Value, Value)>) {
     for _ in 0..200 {
         exec_lua(rpc, trigger).await;
         nxvim_test_harness::barrier(rpc).await;
         if let Some(map) = drain_to_latest_redraw(incoming, |m| floating_window(m).is_some()) {
             let win = floating_window(&map).expect("a floating window");
             if window_lines(&win).iter().any(|l| l.contains(want)) {
-                return win;
+                return (map, win);
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -314,19 +375,14 @@ async fn signature_help_reply_opens_a_float_window() {
     );
     let (rpc, mut incoming) = start(&dir).await;
 
-    // Signature help is the same scrollable doc-float WINDOW as the hover.
-    let win = await_doc_float_window(
-        &rpc,
-        &mut incoming,
-        "nx.lsp.signature_help()",
-        "fn foo(a: i32, b: i32)",
-    )
-    .await;
-    // The active parameter is appended in brackets (the float renders plain lines).
-    assert!(
-        window_lines(&win).iter().any(|l| l.contains("[a: i32]")),
-        "signature float window should mark the active parameter, got {:?}",
-        window_lines(&win)
+    // Signature help is the same scrollable doc-float WINDOW as the hover, with the
+    // call broken one parameter per line so a long signature stays readable.
+    let win =
+        await_doc_float_window(&rpc, &mut incoming, "nx.lsp.signature_help()", "fn foo(").await;
+    assert_eq!(
+        window_lines(&win),
+        vec!["fn foo(", "    a: i32,", "    b: i32,", ")"],
+        "the signature splits into a leader, one line per parameter, and a trailer"
     );
     // Signature help shows a code signature, so the popup inherits the invoking
     // buffer's filetype (the mock opened an `.rs` buffer → `rust`), not `markdown`.
@@ -334,6 +390,182 @@ async fn signature_help_reply_opens_a_float_window() {
         window_filetype(&win),
         "rust",
         "the signature doc-float buffer inherits the invoking buffer's filetype"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The active parameter is pointed at by a marker OVERLAID on its line's indent —
+/// `activeParameter: 0` marks the first parameter's row (row 1, under the leader).
+/// The marker is virtual text, not buffer text, so the popup's lines stay valid
+/// code for the tree-sitter pass that colors them.
+#[tokio::test]
+async fn signature_help_marks_the_active_parameter_line() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_marker");
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "fn foo(a: i32, b: i32)",
+               "parameters": [ { "label": "a: i32" }, { "label": "b: i32" } ] } ],
+             "activeSignature": 0, "activeParameter": 0 } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let (redraw, win) =
+        await_doc_float_redraw(&rpc, &mut incoming, "nx.lsp.signature_help()", "a: i32").await;
+    assert_eq!(
+        overlay_markers(&win),
+        vec![(1, 2, "▸".to_string())],
+        "the marker overlays column 2 of the FIRST parameter's row, got lines {:?}",
+        window_lines(&win)
+    );
+    // The marker never enters the text — the row is still the bare indented parameter.
+    assert_eq!(
+        window_lines(&win).get(1).map(String::as_str),
+        Some("    a: i32,"),
+        "the marked line's buffer text carries no marker glyph"
+    );
+    // Tier 2: the overlay reaches actual painted cells, drawn INTO the indent so the
+    // parameter text keeps its column — not shifted right by a spliced-in glyph.
+    let rows = painted_rows(&redraw);
+    assert!(
+        rows.iter().any(|r| r.contains("  ▸ a: i32,")),
+        "the marker paints on screen over the indent, got {:?}",
+        rows.iter()
+            .filter(|r| r.contains("i32"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("    b: i32,")),
+        "the unmarked parameter keeps the bare indent, aligned with the marked one"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The marker follows the server's `activeParameter`: pointing at the *second*
+/// parameter moves it one row down. Together with the test above (same signature,
+/// different index) this pins the mapping index → row rather than a fixed row.
+#[tokio::test]
+async fn signature_help_marker_follows_the_active_parameter_index() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_marker2");
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "fn foo(a: i32, b: i32)",
+               "parameters": [ { "label": "a: i32" }, { "label": "b: i32" } ] } ],
+             "activeSignature": 0, "activeParameter": 1 } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let win =
+        await_doc_float_window(&rpc, &mut incoming, "nx.lsp.signature_help()", "b: i32").await;
+    assert_eq!(
+        overlay_markers(&win),
+        vec![(2, 2, "▸".to_string())],
+        "the marker follows activeParameter=1 to the SECOND parameter's row, lines {:?}",
+        window_lines(&win)
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// Parameters given as UTF-16 **label offsets** (LSP's other, authoritative form)
+/// split exactly like string labels — the layout reads the server's spans, it does
+/// not re-derive them by splitting on commas. The signature here is deliberately
+/// comma-rich *inside* a parameter (`dict[str, int]`): a comma split would produce
+/// four rows, the structural split produces two.
+#[tokio::test]
+async fn signature_help_splits_on_label_offsets_not_commas() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_offsets");
+    // "def load(cfg: dict[str, int], key: tuple[A, B]) -> None"
+    //           ^9            ^28  ^30           ^45
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "def load(cfg: dict[str, int], key: tuple[A, B]) -> None",
+               "parameters": [ { "label": [9, 28] }, { "label": [30, 46] } ] } ],
+             "activeSignature": 0, "activeParameter": 1 } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let win =
+        await_doc_float_window(&rpc, &mut incoming, "nx.lsp.signature_help()", "def load(").await;
+    assert_eq!(
+        window_lines(&win),
+        vec![
+            "def load(",
+            "    cfg: dict[str, int],",
+            "    key: tuple[A, B],",
+            ") -> None",
+        ],
+        "offset-labelled parameters split structurally, keeping their inner commas"
+    );
+    assert_eq!(
+        overlay_markers(&win),
+        vec![(2, 2, "▸".to_string())],
+        "the marker lands on the offset-resolved second parameter"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A single-parameter call has nothing to lay out vertically — three rows would
+/// say what one already says — so it keeps the compact one-line form, with the
+/// active parameter named in brackets as before.
+#[tokio::test]
+async fn single_parameter_signature_stays_on_one_line() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_one");
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "fn only(a: i32)", "parameters": [ { "label": "a: i32" } ] } ],
+             "activeSignature": 0, "activeParameter": 0 } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let win =
+        await_doc_float_window(&rpc, &mut incoming, "nx.lsp.signature_help()", "fn only").await;
+    assert_eq!(
+        window_lines(&win),
+        vec!["fn only(a: i32)    [a: i32]"],
+        "a one-parameter signature stays on one line"
+    );
+    assert!(
+        overlay_markers(&win).is_empty(),
+        "with nothing split there is no parameter row to point at"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A server whose parameter labels cannot be located in its own signature label
+/// (here: labels that are plain names, not substrings of the label) has no spans
+/// to split on. Rather than guess, the float falls back to the single-line
+/// rendering — and still names the active parameter.
+#[tokio::test]
+async fn unlocatable_parameters_fall_back_to_one_line() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_fallback");
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "fn foo(a: i32, b: i32)",
+               "parameters": [ { "label": "first" }, { "label": "second" } ] } ],
+             "activeSignature": 0, "activeParameter": 1 } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let win =
+        await_doc_float_window(&rpc, &mut incoming, "nx.lsp.signature_help()", "fn foo").await;
+    assert_eq!(
+        window_lines(&win),
+        vec!["fn foo(a: i32, b: i32)    [second]"],
+        "unlocatable parameters degrade to the labelled single line"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");
@@ -409,11 +641,12 @@ async fn autotrigger_floats_signature_on_open_paren_and_stays_while_typing() {
 
     // Type a call on a fresh line: the `(` auto-fires signature help.
     feed(&rpc, "ofoo(");
-    let win = poll_float(&rpc, &mut incoming, "fn foo(a: i32, b: i32)")
+    let win = poll_float(&rpc, &mut incoming, "a: i32")
         .await
         .expect("typing `(` auto-opens the signature float");
-    assert!(
-        window_lines(&win).iter().any(|l| l.contains("[a: i32]")),
+    assert_eq!(
+        overlay_markers(&win),
+        vec![(1, 2, "▸".to_string())],
         "the active parameter is marked, got {:?}",
         window_lines(&win)
     );
@@ -422,9 +655,7 @@ async fn autotrigger_floats_signature_on_open_paren_and_stays_while_typing() {
     // unlike a hover which the next key dismisses.
     feed(&rpc, "x");
     assert!(
-        poll_float(&rpc, &mut incoming, "fn foo(a: i32, b: i32)")
-            .await
-            .is_some(),
+        poll_float(&rpc, &mut incoming, "a: i32").await.is_some(),
         "the signature float survives typing into the call"
     );
 

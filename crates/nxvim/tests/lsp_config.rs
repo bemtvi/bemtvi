@@ -983,12 +983,68 @@ async fn hover_merges_every_capable_server_in_priority_order() {
     );
 }
 
+/// A merged round where each server's signature is laid out **vertically** (both
+/// carry parameters): the compact `<client>: <sig>` prefix cannot survive a split
+/// signature — it would push the parameters out of alignment and repeat the name
+/// on every row — so each block takes a `<client>:` heading row instead.
+#[tokio::test]
+async fn merged_signatures_with_parameters_take_a_client_heading() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-sig-merge-vert");
+    let sig = |name: &str| {
+        format!(
+            r#"{{ "signature_help": {{ "signatures": [
+                 {{ "label": "{name}(x: int, y: int)",
+                    "parameters": [ {{ "label": "x: int" }}, {{ "label": "y: int" }} ] }} ],
+                 "activeSignature": 0, "activeParameter": 0 }} }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &sig("alpha_sig"));
+    arm_mock_named(dir.as_path(), "beta", &sig("beta_sig"));
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    let shown = await_verb_result(&rpc, "nx.lsp.signature_help()").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
+
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "alpha:",
+            "alpha_sig(",
+            "    x: int,",
+            "    y: int,",
+            ")",
+            "beta:",
+            "beta_sig(",
+            "    x: int,",
+            "    y: int,",
+            ")",
+        ],
+        "each split signature is headed by its client, got {shown:?}"
+    );
+}
+
 #[tokio::test]
 async fn signature_help_merges_every_capable_server() {
     // Same argument as hover: two servers can both describe the call under the cursor,
-    // and showing one silently hides the other. nxvim shows them together (one line
-    // each, labelled) where neovim shows one at a time with `<C-s>` to cycle — the
-    // float here is passive, and a signature is one short line.
+    // and showing one silently hides the other. nxvim shows them together (labelled)
+    // where neovim shows one at a time with `<C-s>` to cycle — the float here is
+    // passive, so there is no mode to leave. A parameterless signature like these
+    // stays on one line, keeping the compact `<client>: <sig>` form.
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp-sig-merge");
     let sig = |label: &str| {

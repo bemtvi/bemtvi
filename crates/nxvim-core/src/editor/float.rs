@@ -36,8 +36,27 @@ pub(crate) const COMPLETION_DOC_FLOAT: &str = "[CompletionDocs]";
 /// The surface name of the **cmdline wildmenu docs** doc float — the help sidebar
 /// beside the command-line completion popup. Plain text (no markdown render).
 pub(crate) const CMDLINE_DOC_FLOAT: &str = "[CmdlineDocs]";
+
+/// The indent every parameter line of a signature-help float carries, in the
+/// one-parameter-per-line layout. Wide enough to hold the active-parameter marker
+/// ([`SIGNATURE_MARKER`], overlaid at [`SIGNATURE_MARKER_COL`]) *plus* a space, so
+/// a marked line and an unmarked one align on the same column. Public because the
+/// host builds the lines and core paints the marker over them — one constant so
+/// the two cannot drift.
+pub const SIGNATURE_PARAM_INDENT: &str = "    ";
+
+/// The glyph marking the parameter the cursor is in, drawn over the
+/// [indent](SIGNATURE_PARAM_INDENT) of that line.
+pub const SIGNATURE_MARKER: &str = "▸";
+
+/// The column [`SIGNATURE_MARKER`] is overlaid at — inside the indent, one cell
+/// clear of the parameter text so it reads as a gutter pointer.
+pub const SIGNATURE_MARKER_COL: usize = 2;
+
 use crate::buffer::Buffer;
-use crate::extmark::{VirtChunk, VirtDecor, DEFAULT_PRIORITY, DOC_MD_NS};
+use crate::extmark::{
+    VirtChunk, VirtDecor, VirtTextPos, DEFAULT_PRIORITY, DOC_MD_NS, SIGNATURE_NS,
+};
 use crate::unicode::display_width;
 use crate::view::ContentFloatView;
 
@@ -238,6 +257,57 @@ impl Editor {
         // *stripped* markdown via [`Editor::open_markdown_float`] instead.
         self.set_filetype(buf, filetype);
         self.place_doc_float(name, buf, &lines);
+    }
+
+    /// Open the **signature-help** doc float: [`open_doc_float`](Self::open_doc_float)
+    /// over the `[Signature]` surface, plus the active-parameter marker on each row
+    /// in `marker_rows` (0-based into `lines`; empty when no server named an active
+    /// parameter, and one row per answering server in a merged round).
+    ///
+    /// The marker is an [`Overlay`](VirtTextPos::Overlay) `virt_text` extmark drawn
+    /// over column [`SIGNATURE_MARKER_COL`] of the row — *not* text in the buffer.
+    /// The popup's content is code, typed as the source buffer's filetype so
+    /// tree-sitter colors it; splicing a `▸` into the line would make that line an
+    /// error node and lose its highlighting. Overlaying leaves the text alone: the
+    /// caller indents every parameter line by [`SIGNATURE_PARAM_INDENT`], which
+    /// reserves the cells the marker draws over.
+    pub fn open_signature_float(
+        &mut self,
+        lines: Vec<String>,
+        filetype: &str,
+        marker_rows: &[usize],
+    ) {
+        if lines.is_empty() {
+            return;
+        }
+        self.open_doc_float(SIGNATURE_DOC_FLOAT, lines, filetype);
+        let buf = self.doc_float_buffer(SIGNATURE_DOC_FLOAT);
+        let b = &mut self.buffers.get_mut(buf).buffer;
+        // The scratch buffer is reused across replies, so last round's marker is
+        // still on it — clear before repainting (the markdown float's model).
+        b.extmarks.clear(SIGNATURE_NS, None);
+        for &row in marker_rows {
+            if row >= b.line_count() {
+                continue;
+            }
+            let at = b.line_start(row) + SIGNATURE_MARKER_COL;
+            b.extmarks.set(
+                SIGNATURE_NS,
+                None,
+                at,
+                None,
+                None,
+                DEFAULT_PRIORITY,
+                Some(Box::new(VirtDecor {
+                    virt_text: vec![VirtChunk {
+                        text: SIGNATURE_MARKER.to_string(),
+                        hl_group: Some("LspSignatureActiveParameter".to_string()),
+                    }],
+                    virt_text_pos: VirtTextPos::Overlay,
+                    ..VirtDecor::default()
+                })),
+            );
+        }
     }
 
     /// Render `markdown` in the cursor doc float with its markup *rendered* — the

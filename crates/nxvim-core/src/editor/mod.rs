@@ -69,6 +69,8 @@ mod windows;
 // The command grammar + its normal/visual executor. The parse↔execute contract
 // types stay private to `command`; only the shared vocabulary is re-exported.
 pub use self::cmdcomplete::CmdlineCompleteReq;
+// The signature-help float's shared geometry: the host lays the parameter lines
+// out, core paints the marker over them, so both read the same constants.
 pub use self::command::{
     command_pending_after, command_status, CommandContinuation, CommandPending, CommandStatus,
 };
@@ -78,6 +80,7 @@ pub(crate) use self::command::{
 };
 pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
+pub use self::float::{SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT};
 pub use self::menu::{
     CmdlineCandidate, Extent, FilterSeed, MenuGeom, MenuItem, MenuMetrics, MenuPlacement,
     PickerRun, PreviewScroll, PreviewTarget, PromptField, PromptPos, RowLayout,

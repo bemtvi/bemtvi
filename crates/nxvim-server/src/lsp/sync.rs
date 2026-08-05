@@ -113,25 +113,50 @@ impl EditHost {
                 virt_prefix,
                 signs,
                 sign_text,
+                update_in_insert,
+                insert_debounce_ms,
             } => {
                 self.diag_config.underline = underline;
                 self.diag_config.virtual_text = virtual_text;
                 self.diag_config.virt_prefix = virt_prefix;
                 self.diag_config.signs = signs;
                 self.diag_config.sign_text = sign_text;
+                self.diag_config.update_in_insert = update_in_insert;
+                self.diag_config.insert_debounce_ms = insert_debounce_ms;
+                // A new timing takes effect on what is *already* held, rather than
+                // making the user leave insert once for the setting to mean anything:
+                // "apply at once" flushes now, a new interval restarts the clock from
+                // this moment, and "hold to `InsertLeave`" simply stops the timer.
+                if !self.diagnostics_paused() {
+                    self.commit_pending_diagnostics();
+                } else if update_in_insert {
+                    self.arm_diag_debounce();
+                }
                 self.lsp_dirty = true;
                 return;
             }
             LspOp::SetClientDiagnostics { bufnr, diags } => {
                 let buffer = BufferId(bufnr);
+                // An empty set (a cleared namespace, or every namespace reset) drops
+                // the buffer's entry so it stops projecting entirely; the held form of
+                // that is an empty pending list.
+                let diags: Vec<_> = diags.iter().map(client_diagnostic).collect();
+                if self.diagnostics_paused() {
+                    self.pending_client_diagnostics.insert(buffer, diags);
+                    self.arm_diag_debounce();
+                    return;
+                }
+                // A write that lands now supersedes anything the pause held for this
+                // buffer, so a stale hold can't re-apply itself at `InsertLeave`.
+                self.pending_client_diagnostics.remove(&buffer);
                 if diags.is_empty() {
-                    // An empty set (a cleared namespace, or every namespace reset)
-                    // drops the buffer's entry so it stops projecting entirely.
                     self.client_diagnostics.remove(&buffer);
                 } else {
-                    self.client_diagnostics
-                        .insert(buffer, diags.iter().map(client_diagnostic).collect());
+                    self.client_diagnostics.insert(buffer, diags);
                 }
+                // Re-anchor: from here the buffer's edit choke point keeps these
+                // spans following the text.
+                self.refresh_diagnostic_marks(buffer);
                 self.lsp_dirty = true;
                 return;
             }
@@ -1082,37 +1107,48 @@ impl EditHost {
                 // Per-server is mandatory once a buffer can carry two: `publishDiagnostics`
                 // is a push, so both servers publish independently, and a shared slot
                 // would have each one's set erase the other's on every publish.
+                //
+                // While diagnostics are paused (typing, with `update_in_insert` off)
+                // the publish is parked on the doc instead — a server republishes per
+                // keystroke, and applying that would churn every surface mid-word.
+                // `commit_pending_diagnostics` folds it in at `InsertLeave`.
+                let paused = self.diagnostics_paused();
+                // Set when the publish was parked rather than applied, so the debounce
+                // is (re-)armed below — outside the `lsp_states` borrow.
+                let mut held = false;
                 let buffer = self
                     .lsp_states
                     .iter_mut()
                     .find(|(_, s)| s.uri.as_ref() == Some(&uri))
                     .and_then(|(id, state)| {
                         let doc = state.doc_mut(&key)?;
+                        if paused {
+                            doc.pending_diagnostics = Some(diagnostics);
+                            held = true;
+                            return None;
+                        }
                         doc.diagnostics = diagnostics;
+                        // Nothing held can still be newer than what just landed.
+                        doc.pending_diagnostics = None;
                         Some(*id)
                     });
+                if held {
+                    self.arm_diag_debounce();
+                }
+                // Re-anchor the buffer's whole set against the current text: this
+                // publish replaced one server's half of it, and the anchors are
+                // addressed by position in the merged list.
+                if let Some(id) = buffer {
+                    self.refresh_diagnostic_marks(id);
+                }
                 // The Lua mirror is the buffer's WHOLE set, so it merges across
                 // servers — otherwise `vim.diagnostic.get` would report only
                 // whichever server published last. Each server's set is projected
                 // with ITS OWN `client_id`, so a reader can tell the type-checker's
                 // errors from the linter's; the merged list is otherwise
                 // indistinguishable from one server publishing everything.
-                let mirror = buffer.and_then(|id| {
-                    let state = self.lsp_states.get(&id)?;
-                    let all: Vec<DiagnosticData> = state
-                        .servers()
-                        .flat_map(|(k, d)| {
-                            let client_id = self.lsp_servers.get(k).map(|rt| rt.client_id);
-                            diagnostic_mirror_data(&d.diagnostics, client_id)
-                        })
-                        .collect();
-                    Some((id.0, all))
-                });
-                if let Some((bufnr, data)) = mirror {
-                    self.lsp_dirty = true;
-                    // Mirror into `nx._diagnostics[bufnr]` so the synchronous
-                    // `vim.diagnostic.get` (Slice 2) can read it from pure Lua.
-                    let _ = self.lua.set_diagnostics(bufnr, &data);
+                if let Some(id) = buffer {
+                    self.push_diagnostics_mirror(id);
                 }
             }
             // A generic `client:request` reply (Phase 5) routes to its Lua handler

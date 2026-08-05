@@ -426,6 +426,16 @@ impl EditHost {
         // is still seen after an insert→normal round trip that took the fast path.
         self.last_mode = mode;
 
+        // Leaving insert resumes diagnostics: apply whatever a server (or
+        // `vim.diagnostic.set`) published while `update_in_insert` held it back. Done
+        // here — on the mode *diff*, ahead of the fast-path guard and of the
+        // `InsertLeave` fire below — so it can't be missed by an exit path that emits
+        // no event, and so an `InsertLeave` handler reading diagnostics sees the
+        // resumed set rather than the frozen one. A no-op when nothing was held.
+        if left_insert {
+            self.commit_pending_diagnostics();
+        }
+
         // `ModeChanged` fires on any change to the *reported* `mode()` code — so a
         // Normal↔MultiCursor swap fires `n:m` / `m:n` (MultiCursor reports its own
         // `m`) — with the pattern `old:new` (e.g. "n:i"), matched by a handler's glob (`*:i`, `n:*`,

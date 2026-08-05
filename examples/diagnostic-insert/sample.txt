@@ -1,0 +1,14 @@
+-- a tiny "linted" file — the demo linter below re-runs on EVERY keystroke
+-- and flags any line containing the word `bug` (error) or `todo` (warning).
+local function greet(name)
+  print("hello, " .. name)
+end
+
+-- todo: greet everyone, not just one name
+greet("world")
+
+-- type here: add the word `bug` to this line and watch (or don't watch) it flag
+local answer = 42
+
+-- ... and here
+print(answer)

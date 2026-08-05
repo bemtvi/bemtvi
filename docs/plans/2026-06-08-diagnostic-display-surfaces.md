@@ -5,7 +5,11 @@
 > the inline **virtual text** (Phase 1), and the gutter **sign column** (Phase 2),
 > plus an under-cursor message line, the `:LspDiagnostics` loclist, `[d`/`]d`
 > navigation, and the on-demand **float** (`vim.diagnostic.open_float`, Phase 3).
-> `vim.diagnostic.config` now honors `underline`, `virtual_text`, and `signs`;
+> `vim.diagnostic.config` now honors `underline`, `virtual_text`, `signs`, and —
+> since the follow-up below — `update_in_insert` (the "always on" approximation
+> this document lists is **resolved**: it takes a number of ms as well as neovim's
+> booleans and defaults to `3000`, so an update landing mid-insert is held until
+> typing goes quiet, or until `InsertLeave`, whichever comes first);
 > `open_float` honors the `float` surface (only the `config.float` defaults that
 > pre-style it, and the filter keys, stay stored Lua-side but **inert** — the
 > `INCOMPLETE` tag in `crates/nxvim-lua/src/prelude/diagnostic.lua`). All three
@@ -121,8 +125,8 @@ Runnable demo: `examples/diagnostics/`.
 
 *Known approximations:* the line's most-severe diagnostic wins the one inline
 slot (no per-diagnostic stacking, no `virtual_lines`); `severity_sort` and the
-`virtual_text` `format`/`severity` filters are not applied; `update_in_insert` is
-always on.
+`virtual_text` `format`/`severity` filters are not applied. (`update_in_insert`
+was later implemented — see the status note at the top.)
 
 **Depends on.** Nothing (extends the existing projection).
 
@@ -260,8 +264,13 @@ cursor-anchored bordered popup; `config.float` pre-style defaults are inert.
 
 - **One config, no namespaces.** `vim.diagnostic.config(opts, namespace)` keeps
   ignoring `namespace` (one global config) — inherited from today.
-- **`update_in_insert` is always on.** Diagnostics repaint immediately; nvim can
-  defer redraw until leaving insert mode. Out of scope.
+- ~~**`update_in_insert` is always on.** Diagnostics repaint immediately; nvim can
+  defer redraw until leaving insert mode. Out of scope.~~ **Resolved in a
+  follow-up**: an update landing while insert mode is active is held (per server
+  doc / per buffer for the client-set store) and applied by a debounce once typing
+  goes quiet — `update_in_insert` takes that interval in ms (default `3000`) as
+  well as neovim's `true` (apply at once) and `false` (hold to `InsertLeave`);
+  leaving insert always applies immediately.
 - **Virtual text is one line, end-of-line only.** No `virtual_lines` (the
   below-the-line multiline form), no per-diagnostic stacking — the highest
   severity on the row wins one inline string.

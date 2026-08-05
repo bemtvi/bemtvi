@@ -15,7 +15,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, menu_items,
-    menu_of, message, poll_menu, serial_lock, spawn, temp_dir, window0_field,
+    menu_of, message, mode, poll_menu, serial_lock, spawn, temp_dir, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1163,6 +1163,184 @@ async fn lsp_and_client_set_diagnostics_coexist_on_one_buffer() {
     assert!(
         both,
         "LSP (row 0) and client-set (row 1) diagnostics must paint together"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The 0-based rows carrying an underline span, from the latest frame.
+async fn painted_diag_rows(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Vec<usize> {
+    barrier(rpc).await;
+    let Some(map) = drain_to_latest_redraw(incoming, |_| true) else {
+        return Vec::new();
+    };
+    diag_span_counts(&map)
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, n)| n > 0)
+        .map(|(row, _)| row)
+        .collect()
+}
+
+/// Poll until the painted rows equal `want`, or give up. Returns what was last seen.
+async fn await_painted_rows(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &[usize],
+) -> Vec<usize> {
+    let mut last = Vec::new();
+    for _ in 0..200 {
+        last = painted_diag_rows(rpc, incoming).await;
+        if last == want {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    last
+}
+
+/// A server republishing per keystroke — which is what every real language server
+/// does, since nxvim syncs a `didChange` per key — must not repaint while you type.
+/// The publish is held (here under an interval long enough that only `InsertLeave`
+/// can end the wait) and applied whole on the way back to normal mode.
+#[tokio::test]
+async fn server_publishes_during_insert_are_held_until_insert_leave() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features");
+    arm_mock(
+        &dir,
+        r#"{
+            "diagnostics": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end":   { "line": 0, "character": 4 } },
+                  "severity": 1, "message": "server says no" }
+            ],
+            "diagnostics_on_change": true
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "aaaa bbbb\ncccc dddd\n").await;
+    exec_lua(&rpc, "vim.diagnostic.config({ update_in_insert = 60000 })").await;
+
+    // The `didOpen` publish lands on row 0 while we're in normal mode.
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[0]).await,
+        vec![0],
+        "the server's opening diagnostic should paint on row 0"
+    );
+
+    // Type on line 1. Each key is a `didChange`, and the mock answers each with a
+    // publish naming row 1 — none of which may reach the screen while inserting.
+    feed(&rpc, "jAxyz");
+    for _ in 0..20 {
+        assert_eq!(
+            painted_diag_rows(&rpc, &mut incoming).await,
+            vec![0],
+            "a publish landing mid-insert must not repaint"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // `vim.diagnostic.get` reports the same held set the screen shows, so the two
+    // can't disagree for the length of an insert.
+    let held = exec_lua(&rpc, "return vim.diagnostic.get(0)[1].message").await;
+    assert_eq!(
+        held.as_str(),
+        Some("server says no"),
+        "the mirror stays on the held set too"
+    );
+
+    // Leaving insert applies the newest held publish — the one for the last key.
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[1]).await,
+        vec![1],
+        "`InsertLeave` applies what the server published while typing"
+    );
+    let resumed = await_lua_contains(&rpc, "vim.diagnostic.get(0)[1].message", "typed: z").await;
+    assert!(
+        resumed.contains("typed: z"),
+        "the applied set is the publish for the LAST keystroke, got {resumed:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The default timing, against a real per-keystroke publisher: held while the keys
+/// are coming, then applied by the debounce once typing stops — still in insert
+/// mode, no `<Esc>` needed. (A short interval here; the shipped default is 3s.)
+#[tokio::test]
+async fn a_held_server_publish_applies_once_typing_goes_quiet() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features");
+    arm_mock(
+        &dir,
+        r#"{
+            "diagnostics": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end":   { "line": 0, "character": 4 } },
+                  "severity": 1, "message": "server says no" }
+            ],
+            "diagnostics_on_change": true
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "aaaa bbbb\ncccc dddd\n").await;
+    exec_lua(&rpc, "vim.diagnostic.config({ update_in_insert = 150 })").await;
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[0]).await,
+        vec![0],
+        "the server's opening diagnostic should paint on row 0"
+    );
+
+    feed(&rpc, "jAxyz");
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[1]).await,
+        vec![1],
+        "the debounce applies the publish once the keys stop"
+    );
+    assert_eq!(
+        mode(&rpc).await,
+        "i",
+        "and it did so without leaving insert mode"
+    );
+    let applied = await_lua_contains(&rpc, "vim.diagnostic.get(0)[1].message", "typed: z").await;
+    assert!(
+        applied.contains("typed: z"),
+        "the applied set is the publish for the LAST keystroke, got {applied:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The opt-out: `update_in_insert = true` puts every publish on screen the moment
+/// it lands, mid-insert included.
+#[tokio::test]
+async fn update_in_insert_lets_server_publishes_through_while_typing() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features");
+    arm_mock(
+        &dir,
+        r#"{
+            "diagnostics": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end":   { "line": 0, "character": 4 } },
+                  "severity": 1, "message": "server says no" }
+            ],
+            "diagnostics_on_change": true
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "aaaa bbbb\ncccc dddd\n").await;
+    exec_lua(&rpc, "vim.diagnostic.config({ update_in_insert = true })").await;
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[0]).await,
+        vec![0],
+        "the server's opening diagnostic should paint on row 0"
+    );
+
+    // Still in insert mode, the row-1 publish reaches the screen.
+    feed(&rpc, "jAxyz");
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[1]).await,
+        vec![1],
+        "with `update_in_insert` on, a publish repaints while typing"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

@@ -302,17 +302,56 @@ end
 -- `H` letters), overridden per-severity by the `signs.text` map.
 local DEFAULT_SIGN_TEXT = { "E", "W", "I", "H" }
 
+-- The default quiet gap, in ms, before a diagnostic update that landed while you
+-- were typing is applied (`update_in_insert`'s number form). Mirrors
+-- `DEFAULT_INSERT_DEBOUNCE_MS` server-side, which is the value that actually
+-- applies until a config call overrides it.
+local DEFAULT_INSERT_DEBOUNCE_MS = 3000
+
+-- The stored (merged) config `nx.diagnostic.config` reads and writes. Above the
+-- docstring, not between it and the function: the book generator takes the `--`
+-- block *immediately* above a definition, so anything wedged in between silently
+-- drops the whole doc from the rendered page.
+nx.diagnostic._config = {
+  underline = true,
+  virtual_text = false,
+  signs = true,
+  update_in_insert = DEFAULT_INSERT_DEBOUNCE_MS,
+}
+
 -- `nx.diagnostic.config([opts])`: merge `opts` into the stored config and return
 -- the merged table when called bare. nxvim renders three surfaces — the underline
 -- spans (`underline`), the inline end-of-line message (`virtual_text`), and the
--- gutter sign column (`signs`) — so those keys drive rendering; the rest are
--- stored without behavior until a surface exists.
+-- gutter sign column (`signs`) — so those keys drive rendering; `update_in_insert`
+-- gates *when* an update reaches all three. The rest are stored without behavior
+-- until a surface exists.
+--
+-- `update_in_insert` decides what happens to a diagnostic update that arrives while
+-- you are typing. A language server re-diagnoses after every `didChange` — i.e.
+-- after every keystroke — so applied as they land, the squiggles, signs and inline
+-- messages churn under the cursor over errors that exist only because the line
+-- isn't finished. nxvim takes a **number of milliseconds** here as well as neovim's
+-- two booleans:
+--
+-- ```lua
+-- -- the default: apply the newest update once typing has been quiet for 3s
+-- nx.diagnostic.config({ update_in_insert = 3000 })
+--
+-- nx.diagnostic.config({ update_in_insert = true })   -- apply every update at once
+-- nx.diagnostic.config({ update_in_insert = false })  -- hold everything until InsertLeave
+-- ```
+--
+-- Nothing is ever dropped: while an update is held the *newest* one is kept, and
+-- leaving insert mode applies it immediately whatever the interval is. Nor does
+-- anything drift out of place while you wait — a displayed diagnostic is anchored to
+-- the text it flags, so its squiggle, sign, inline message and `]d` target follow
+-- that text as you edit around it.
+--
 -- INCOMPLETE: `virtual_lines`, `severity_sort`, … are recorded and echoed back
 -- but have no rendering surface yet (`float` is honored by
 -- `nx.diagnostic.open_float`, but the `config.float` defaults that pre-style it
 -- are not). `_namespace` is ignored (one global config). Faithful once those
 -- diagnostic surfaces exist.
-nx.diagnostic._config = { underline = true, virtual_text = false, signs = true }
 function nx.diagnostic.config(opts, _namespace)
   if opts == nil then
     return nx.diagnostic._config
@@ -339,12 +378,19 @@ function nx.diagnostic.config(opts, _namespace)
       end
     end
   end
+  -- `update_in_insert` is false / true / a number of ms; flatten it into the pair
+  -- the server takes — "may an update apply before `InsertLeave`?" and "after how
+  -- long a quiet gap?". A number <= 0 is the same as `true` (no wait).
+  local uii = nx.diagnostic._config.update_in_insert
+  local timed = type(uii) == "number"
   nx._diagnostic_config(
     nx.diagnostic._config.underline ~= false,
     vt ~= false and vt ~= nil,
     prefix,
     signs ~= false and signs ~= nil,
-    sign_text
+    sign_text,
+    timed or uii == true,
+    timed and math.max(0, math.floor(uii)) or 0
   )
 end
 

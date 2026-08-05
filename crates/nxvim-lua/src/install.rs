@@ -2851,25 +2851,31 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._diagnostic_config(underline, virtual_text, virt_prefix, signs, sign_text)`:
-    // queue [`LspOp::DiagnosticConfig`] — the prelude resolves the merged
-    // `underline` / `virtual_text` / `signs` to bools (and the virt-text `prefix` /
-    // the per-severity sign glyphs to strings) and pushes them so the server gates
-    // the squiggle, inline-message, and gutter-sign rendering. `sign_text` is the
-    // four `[error, warn, info, hint]` glyphs in order; anything else is a prelude
-    // bug, so reject it loudly rather than silently rendering the wrong column.
+    // `nx._diagnostic_config(underline, virtual_text, virt_prefix, signs, sign_text,
+    // update_in_insert, insert_debounce_ms)`: queue [`LspOp::DiagnosticConfig`] — the
+    // prelude resolves the merged `underline` / `virtual_text` / `signs` to bools (and
+    // the virt-text `prefix` / the per-severity sign glyphs to strings) and pushes them
+    // so the server gates the squiggle, inline-message, and gutter-sign rendering.
+    // `sign_text` is the four `[error, warn, info, hint]` glyphs in order; anything
+    // else is a prelude bug, so reject it loudly rather than silently rendering the
+    // wrong column. The last two carry the *timing* of an update landing during insert
+    // mode: whether it is applied before `InsertLeave` at all, and after how long a
+    // quiet gap (the prelude flattens the Lua `update_in_insert`'s
+    // `false`/`true`/number forms into that pair).
     let sh = shared.clone();
     nx.set(
         "_diagnostic_config",
         lua.create_function(
             move |_,
-                  (underline, virtual_text, virt_prefix, signs, sign_text): (
-                bool,
-                bool,
-                String,
-                bool,
-                Vec<String>,
-            )| {
+                  (
+                underline,
+                virtual_text,
+                virt_prefix,
+                signs,
+                sign_text,
+                update_in_insert,
+                insert_debounce_ms,
+            ): (bool, bool, String, bool, Vec<String>, bool, u64)| {
                 let sign_text: [String; 4] = sign_text.try_into().map_err(|v: Vec<String>| {
                     mlua::Error::RuntimeError(format!(
                         "nx._diagnostic_config: sign_text must be 4 glyphs, got {}",
@@ -2882,6 +2888,8 @@ pub(crate) fn install_runtime_api(
                     virt_prefix,
                     signs,
                     sign_text,
+                    update_in_insert,
+                    insert_debounce_ms,
                 });
                 Ok(())
             },

@@ -408,6 +408,16 @@ pub enum LspOp {
         /// (`[error, warn, info, hint]`) — the `text` map of the `signs` table, or
         /// the built-in `E`/`W`/`I`/`H` letters. Always exactly four entries.
         sign_text: [String; 4],
+        /// Whether a diagnostic update that lands **while insert mode is active**
+        /// is ever applied before `InsertLeave` (neovim's `update_in_insert`).
+        /// `false` holds the incoming set until you leave insert, so nothing on
+        /// screen moves for the whole insert session.
+        update_in_insert: bool,
+        /// How long typing must be quiet before a held update is applied, in ms —
+        /// nxvim's extension, meaningful only when `update_in_insert` is set (the
+        /// Lua key takes a number for this, `true` meaning `0`). `0` applies each
+        /// update the moment it lands, which is neovim's `update_in_insert = true`.
+        insert_debounce_ms: u64,
     },
     /// `client:request(method, params, handler)` (Phase 5) — issue a generic LSP
     /// request to the client `client_id`'s server and route its reply to the Lua

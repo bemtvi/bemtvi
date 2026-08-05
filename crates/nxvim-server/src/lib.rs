@@ -1066,6 +1066,21 @@ pub struct EditHost {
     /// negotiated encoding, then merges them with the server-pushed set. Kept apart
     /// from `lsp_states[buf].diagnostics` so the two sources never overwrite.
     client_diagnostics: HashMap<BufferId, Vec<nxvim_lsp::lsp_types::Diagnostic>>,
+    /// Client-set diagnostics written while [`EditHost::diagnostics_paused`] held
+    /// (insert mode, `update_in_insert` off), parked here instead of landing in
+    /// `client_diagnostics` so a plugin setting diagnostics per keystroke can't make
+    /// the display churn any more than a language server can. An **empty** held list
+    /// is a pending *clear* — the entry's presence, not its length, is what records
+    /// that a write was held. Folded in by
+    /// [`EditHost::commit_pending_diagnostics`] on `InsertLeave`.
+    pending_client_diagnostics: HashMap<BufferId, Vec<nxvim_lsp::lsp_types::Diagnostic>>,
+    /// How many diagnostics each buffer's [`DIAGNOSTIC_NS`](nxvim_core::extmark::DIAGNOSTIC_NS)
+    /// anchors were placed from ([`EditHost::refresh_diagnostic_marks`]). The anchors
+    /// are addressed by position in the merged set, so this is the guard that makes
+    /// them safe to read: a merged set of a different length means the anchors are
+    /// stale, and the projection falls back to the published ranges (untracked, never
+    /// mis-attributed). Absent for a buffer with no diagnostics.
+    diag_mark_counts: HashMap<BufferId, usize>,
     /// The editor-wide semantic-tokens gate (Phase 3), toggled by
     /// `vim.lsp.semantic_tokens.enable`. Default on; `false` hides the semantic
     /// paint everywhere and stops the refresh requests (the per-buffer
@@ -1663,6 +1678,8 @@ impl EditHost {
             lsp_code_action_servers: Vec::new(),
             diag_config: DiagnosticConfig::default(),
             client_diagnostics: HashMap::new(),
+            pending_client_diagnostics: HashMap::new(),
+            diag_mark_counts: HashMap::new(),
             semantic_tokens_enabled: true,
             snippet_store: HashMap::new(),
             complete_snippets_active: false,
@@ -2147,6 +2164,14 @@ impl EditHost {
             // a Lua callback, so it never reaches `run_callback`.
             if timer.id == WORKSPACE_FS_TIMEOUT_TIMER_ID {
                 self.on_workspace_fs_timeout();
+                self.apply_lua_effects();
+                fired_any = true;
+                continue;
+            }
+            // Likewise the diagnostic-update debounce (the browser twin of the native
+            // run loop's arm): typing went quiet, so apply what the pause held.
+            if timer.id == DIAG_DEBOUNCE_TIMER_ID {
+                self.on_diag_debounce();
                 self.apply_lua_effects();
                 fired_any = true;
                 continue;
@@ -2866,6 +2891,15 @@ pub(crate) const PARSE_RESUME_DELAY: std::time::Duration = std::time::Duration::
 /// gets a truthful `applied: false`.
 pub(crate) const WORKSPACE_FS_TIMEOUT_TIMER_ID: u64 = 1 << 52;
 
+/// The loop id of the **diagnostic-update debounce** — the one-shot that ends a
+/// pause while you are still typing. A language server publishes after every
+/// `didChange`, so each publish landing in insert mode is parked and this timer
+/// re-armed (replacing the pending one, the shada-flush pattern); it fires once
+/// typing has been quiet for `update_in_insert`'s interval, applying the newest
+/// parked set without waiting for `InsertLeave`. Not armed at all when the interval
+/// is `0` (apply at once) or `update_in_insert` is `false` (hold to `InsertLeave`).
+pub(crate) const DIAG_DEBOUNCE_TIMER_ID: u64 = 1 << 53;
+
 /// How long one workspace file operation may take before the watchdog gives up on it.
 /// Generous — a single `rename` / `delete` / `mkdir` is milliseconds locally and one
 /// round trip over a daemon, so this only fires when a leg has genuinely stopped
@@ -2883,6 +2917,13 @@ pub(crate) fn workspace_fs_timeout_ms() -> u64 {
 #[cfg(feature = "native")]
 pub(crate) fn is_workspace_fs_timeout_timer(event: &LoopEvent) -> bool {
     matches!(event, LoopEvent::Timer { id, .. } if *id == WORKSPACE_FS_TIMEOUT_TIMER_ID)
+}
+
+/// Whether `event` is the diagnostic-update debounce firing (vs. a real Lua timer /
+/// the shada or parse-resume wakes).
+#[cfg(feature = "native")]
+pub(crate) fn is_diag_debounce_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == DIAG_DEBOUNCE_TIMER_ID)
 }
 
 /// Whether `event` is the progressive-parse resume timer firing (vs. the shada

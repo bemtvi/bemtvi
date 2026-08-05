@@ -82,9 +82,14 @@ impl EditHost {
         let mut had_real = false;
         let mut shada_due = false;
         let mut resume_due = false;
+        let mut diag_due = false;
         for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             if crate::is_shada_flush_timer(&event) {
                 shada_due = true;
+            } else if crate::is_diag_debounce_timer(&event) {
+                // Typing went quiet: apply the diagnostic update it held. Handled here
+                // like the two above — it is the editor's own timer, not a Lua callback.
+                diag_due = true;
             } else if crate::is_parse_resume_timer(&event) {
                 resume_due = true;
             } else if crate::is_workspace_fs_timeout_timer(&event) {
@@ -102,12 +107,16 @@ impl EditHost {
         if shada_due {
             self.shada_checkpoint();
         }
-        // Repaint when a real event ran, or when a parse-resume wake is due: the latter
-        // changed no editor state by itself, but the redraw it triggers is the whole
-        // point — it resumes the in-flight treesitter parse and paints the new spans
-        // (re-arming the timer if the parse still isn't done). A shada-only wake, by
-        // contrast, touches nothing visible, so it never forces a frame.
-        if had_real || resume_due {
+        if diag_due {
+            self.on_diag_debounce();
+        }
+        // Repaint when a real event ran, or when a parse-resume / diagnostic-debounce
+        // wake is due: neither changed editor state by itself, but the redraw each
+        // triggers is the whole point — resuming the in-flight treesitter parse and
+        // painting its new spans, and painting the diagnostics the debounce just
+        // applied. A shada-only wake, by contrast, touches nothing visible, so it
+        // never forces a frame.
+        if had_real || resume_due || diag_due {
             self.settle_events(true);
         }
     }

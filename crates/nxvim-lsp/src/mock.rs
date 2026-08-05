@@ -21,6 +21,11 @@
 //!   message}`). When set, the mock pushes a `textDocument/publishDiagnostics`
 //!   notification for a document the moment it receives that document's
 //!   `didOpen`, so a test can assert the editor renders them.
+//! - `diagnostics_on_change`: if `true`, the mock also republishes on every
+//!   `textDocument/didChange` — one warning on the changed line reading
+//!   `typed: <the change's text>`, so the published set is derived from the actual
+//!   edit. This is the per-keystroke re-diagnosis a real server does, which is what
+//!   `vim.diagnostic.config({ update_in_insert = … })` gates.
 //! - `progress`: an array of `$/progress` params (`{token, value}`, where `value`
 //!   is a `WorkDoneProgress` — `{kind: "begin", title, …}` / `{kind: "report", …}` /
 //!   `{kind: "end", …}`). Replayed in order, once, on the first `didOpen`, so a test
@@ -339,6 +344,53 @@ pub fn run(script_path: &str) {
                             progress_creates.insert(next_id, token);
                             next_id += 1;
                         }
+                    }
+                }
+            }
+            // `diagnostics_on_change`: re-diagnose the document on every edit, the
+            // way a real server does after each `didChange` — the behavior
+            // `update_in_insert` exists to tame. The published set is derived from
+            // the change itself (its line, and the text that was typed), so a test
+            // can tell *which* keystroke a rendered diagnostic came from rather than
+            // only that some diagnostic exists. Replaces the whole set, as a real
+            // `publishDiagnostics` does.
+            "textDocument/didChange" => {
+                if script
+                    .get("diagnostics_on_change")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    if let Some(uri) = msg
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                    {
+                        let change = msg
+                            .pointer("/params/contentChanges")
+                            .and_then(Value::as_array)
+                            .and_then(|c| c.last());
+                        // A range-less change is a full-document sync: report it on
+                        // line 0, since it names no line of its own.
+                        let line = change
+                            .and_then(|c| c.pointer("/range/start/line"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let text = change
+                            .and_then(|c| c.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        write_message(
+                            &stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": { "uri": uri, "diagnostics": [{
+                                    "range": { "start": { "line": line, "character": 0 },
+                                               "end":   { "line": line, "character": 1 } },
+                                    "severity": 2,
+                                    "message": format!("typed: {text}"),
+                                }] },
+                            }),
+                        );
                     }
                 }
             }

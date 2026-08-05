@@ -1982,6 +1982,7 @@ impl EditHost {
                                 && *ns != nxvim_core::extmark::ANCHOR_NS
                                 && *ns != nxvim_core::extmark::SNIPPET_NS
                                 && *ns != nxvim_core::extmark::SUBST_PREVIEW_NS
+                                && *ns != nxvim_core::extmark::DIAGNOSTIC_NS
                         })
                         .map(|(ns, m)| {
                             let (row, col) = byte_rowcol(b, m.start);

@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
+use nxvim_core::extmark::DIAGNOSTIC_NS;
 use nxvim_core::unicode;
+use nxvim_core::Buffer;
 use nxvim_core::WinHl;
 use nxvim_lsp::lsp_types::Diagnostic;
 use nxvim_lsp::PositionEncoding;
@@ -14,33 +16,216 @@ use super::*;
 use crate::redraw::StyleTable;
 use crate::EditHost;
 
-impl EditHost {
-    /// The diagnostics **`server`** published for the current buffer, with the
-    /// encoding it negotiated — the shape a request that has to *quote* diagnostics
-    /// back to one specific server needs (`textDocument/codeAction`'s
-    /// `context.diagnostics`).
-    ///
-    /// Per server rather than per buffer because a diagnostic is not portable
-    /// between them: its columns are in its publisher's encoding, and its `code` /
-    /// `data` are that server's own handles on the problem. Sending one server's
-    /// diagnostics to another is a wrong request, not a generous one.
-    fn diagnostics_from(&self, server: &ServerKey) -> Option<(&Vec<Diagnostic>, PositionEncoding)> {
-        let state = self.lsp_states.get(&self.editor.current_buffer_id())?;
-        let doc = state.doc(server)?;
-        let encoding = self.lsp_servers.get(server)?.encoding;
-        Some((&doc.diagnostics, encoding))
+/// One diagnostic to project, resolved to where it sits in the buffer **right now**.
+///
+/// A diagnostic arrives as an absolute LSP `(line, character)` range that is only
+/// true of the document the server last saw. Every surface needs where it is *now*,
+/// which is what `start`/`end` carry: byte offsets read from the diagnostic's
+/// [`DIAGNOSTIC_NS`] anchor, so they track the edits made since. Byte offsets also
+/// mean the per-server position encoding is resolved once, at anchor time, instead of
+/// on every row of every frame.
+pub(crate) struct TrackedDiagnostic<'a> {
+    /// The diagnostic as published — its message, severity, `source`/`code`, and the
+    /// original range (which a request quoting it back to its server must use, since
+    /// that range is what the server's own document is indexed by).
+    pub(crate) d: &'a Diagnostic,
+    /// The server that published it, or `None` for a client-set
+    /// (`vim.diagnostic.set`) one. Requests that quote diagnostics back must filter
+    /// on this: a diagnostic is not portable between servers.
+    pub(crate) server: Option<&'a ServerKey>,
+    /// First byte covered, in the current buffer.
+    pub(crate) start: usize,
+    /// One past the last byte covered (`== start` for a zero-width diagnostic, which
+    /// the surfaces widen to one cell so it is still visible).
+    pub(crate) end: usize,
+}
+
+impl TrackedDiagnostic<'_> {
+    /// `1`=error … `4`=hint.
+    fn severity(&self) -> u8 {
+        severity_code(self.d.severity)
     }
 
-    /// Every attached server's diagnostics for `buffer`, each paired with **that
-    /// server's** negotiated encoding.
+    /// The buffer row this diagnostic **starts** on — the line that owns its gutter
+    /// sign and its one inline-message slot.
+    fn start_line(&self, buf: &Buffer) -> usize {
+        buf.byte_to_line(self.start)
+    }
+
+    /// The `[start, end)` **line-local** byte span this diagnostic occupies on buffer
+    /// row `line_idx` (whose text is `line`), or `None` if it does not reach that row.
+    /// A multi-line span is clipped to the row: `0` before its first line, the line
+    /// length after its last.
+    fn row_span(&self, buf: &Buffer, line_idx: usize, line: &str) -> Option<(usize, usize)> {
+        let row_start = buf.byte_at(line_idx, 0);
+        // End-inclusive at both edges: a span ending exactly at end-of-line still
+        // belongs to that row, and a zero-width one resting there is still shown.
+        let row_end = row_start + line.len();
+        if self.end < row_start || self.start > row_end {
+            return None;
+        }
+        let start = self.start.saturating_sub(row_start).min(line.len());
+        let end = self.end.saturating_sub(row_start).min(line.len());
+        Some((start, end.max(start)))
+    }
+
+    /// Whether byte offset `at` rests **on** this diagnostic — the "under the cursor"
+    /// test. A zero-width diagnostic still covers the one cell it rests at.
+    fn covers(&self, at: usize) -> bool {
+        at >= self.start && at < self.end.max(self.start + 1)
+    }
+}
+
+impl EditHost {
+    /// Whether a diagnostic update landing *right now* is **held** instead of
+    /// applied: insert mode is active, and the config asks for either a quiet gap
+    /// first (`update_in_insert = <ms>`, the default) or nothing at all until
+    /// `InsertLeave` (`update_in_insert = false`). A language server republishes
+    /// after every `didChange` — i.e. after every keystroke — so applying each
+    /// publish makes the squiggles, gutter signs and inline messages churn under the
+    /// cursor while you are still mid-word, on errors that exist only because the
+    /// line isn't finished.
+    ///
+    /// Held, not dropped: the newest update is parked
+    /// ([`LspServerDoc::pending_diagnostics`] / [`EditHost::pending_client_diagnostics`])
+    /// and folded in by [`commit_pending_diagnostics`](Self::commit_pending_diagnostics)
+    /// — from the debounce timer once typing goes quiet
+    /// ([`arm_diag_debounce`](Self::arm_diag_debounce)), and unconditionally on
+    /// `InsertLeave`. What stays on screen meanwhile is the last applied set.
+    ///
+    /// Deviation from neovim, deliberate: neovim gates only the *display* handlers,
+    /// leaving `vim.diagnostic.get` fresh mid-insert. nxvim holds the update one
+    /// layer earlier — at the server-side store every surface reads — so the
+    /// squiggles, the signs, the under-cursor message, the statusline counts,
+    /// `]d` navigation and `:LspDiagnostics` all agree on one set instead of
+    /// disagreeing for the duration of an insert. Client-set diagnostics
+    /// (`vim.diagnostic.set`) keep their own Lua-side store, which is never held,
+    /// so `vim.diagnostic.get` still reports those the moment they are set.
+    pub(crate) fn diagnostics_paused(&self) -> bool {
+        self.editor.mode.is_insert()
+            && (!self.diag_config.update_in_insert || self.diag_config.insert_debounce_ms > 0)
+    }
+
+    /// Arm (re-arm) the one-shot that ends a pause while you are still typing.
+    ///
+    /// A true debounce: every held update replaces the pending timer, so a burst of
+    /// keystrokes keeps pushing the deadline out and the display only catches up
+    /// once typing goes quiet for `insert_debounce_ms`. Not armed when the pause has
+    /// no time limit (`update_in_insert = false` — only `InsertLeave` ends that one)
+    /// or no duration (`insert_debounce_ms == 0`, where nothing is ever held).
+    ///
+    /// Routed through [`apply_loop_op`](Self::apply_loop_op) rather than a native
+    /// timer so the browser session debounces on the Worker's wheel identically.
+    pub(crate) fn arm_diag_debounce(&mut self) {
+        if !self.diag_config.update_in_insert || self.diag_config.insert_debounce_ms == 0 {
+            return;
+        }
+        self.apply_loop_op(nxvim_lua::LoopOp::TimerStart {
+            id: crate::DIAG_DEBOUNCE_TIMER_ID,
+            delay_ms: self.diag_config.insert_debounce_ms,
+            repeat_ms: 0,
+        });
+    }
+
+    /// The debounce elapsed: typing has been quiet long enough, so apply what it
+    /// held. Gated on `update_in_insert` because the setting can have flipped to
+    /// "hold until `InsertLeave`" since the timer was armed — the already-scheduled
+    /// wake must not then jump the gun (the `InsertLeave` commit still runs).
+    pub(crate) fn on_diag_debounce(&mut self) {
+        if self.diag_config.update_in_insert {
+            self.commit_pending_diagnostics();
+        }
+    }
+
+    /// Republish `buffer`'s whole LSP diagnostic set into the Lua mirror
+    /// (`nx._diagnostics[bufnr]`, what the synchronous `vim.diagnostic.get` reads)
+    /// and mark the frame dirty so the coalesced repaint picks the change up.
+    ///
+    /// The mirror is the buffer's set **merged across servers** — a per-server push
+    /// would have `vim.diagnostic.get` report only whichever server published last —
+    /// with each server's half tagged by its own `client_id`, so a reader can still
+    /// tell the type-checker's errors from the linter's.
+    pub(crate) fn push_diagnostics_mirror(&mut self, buffer: nxvim_core::BufferId) {
+        let Some(state) = self.lsp_states.get(&buffer) else {
+            return;
+        };
+        let all: Vec<DiagnosticData> = state
+            .servers()
+            .flat_map(|(k, d)| {
+                let client_id = self.lsp_servers.get(k).map(|rt| rt.client_id);
+                diagnostic_mirror_data(&d.diagnostics, client_id)
+            })
+            .collect();
+        self.lsp_dirty = true;
+        let _ = self.lua.set_diagnostics(buffer.0, &all);
+    }
+
+    /// Apply every diagnostic update parked while
+    /// [`diagnostics_paused`](Self::diagnostics_paused) held — both the per-server
+    /// publishes and the client-set (`vim.diagnostic.set`) store. Called when the
+    /// debounce elapses, on the `InsertLeave` edge (before the autocmd fires, so a
+    /// handler reading diagnostics sees the resumed set), and when the timing config
+    /// changes mid-insert.
+    ///
+    /// A no-op — no mirror push, no repaint, no timer touched — when nothing was
+    /// held, which is the case for every insert session during which nothing
+    /// published.
+    pub(crate) fn commit_pending_diagnostics(&mut self) {
+        let mut committed = !self.pending_client_diagnostics.is_empty();
+        let mut refreshed: Vec<nxvim_core::BufferId> = Vec::new();
+        for (id, state) in self.lsp_states.iter_mut() {
+            let mut changed = false;
+            for (_, doc) in state.servers_mut() {
+                if let Some(pending) = doc.pending_diagnostics.take() {
+                    doc.diagnostics = pending;
+                    changed = true;
+                }
+            }
+            if changed {
+                refreshed.push(*id);
+            }
+        }
+        committed |= !refreshed.is_empty();
+        for id in refreshed {
+            self.push_diagnostics_mirror(id);
+            self.refresh_diagnostic_marks(id);
+        }
+
+        // The client-set store's held writes. An empty held list is a *clear* (the
+        // shape `SetClientDiagnostics` gives it), not "nothing held" — the map entry
+        // is what records that something was held.
+        if !self.pending_client_diagnostics.is_empty() {
+            for (buffer, diags) in std::mem::take(&mut self.pending_client_diagnostics) {
+                if diags.is_empty() {
+                    self.client_diagnostics.remove(&buffer);
+                } else {
+                    self.client_diagnostics.insert(buffer, diags);
+                }
+                self.refresh_diagnostic_marks(buffer);
+            }
+            self.lsp_dirty = true;
+        }
+
+        // Nothing is held anymore, so disarm the debounce — an idle session must not
+        // be woken for work that has already landed. Harmless when the commit *was*
+        // the timer firing (a spent one-shot is already gone).
+        if committed {
+            self.apply_loop_op(nxvim_lua::LoopOp::TimerStop {
+                id: crate::DIAG_DEBOUNCE_TIMER_ID,
+            });
+        }
+    }
+
+    /// Every attached server's diagnostics for `buffer`, each paired with the
+    /// server that published it and **that server's** negotiated encoding.
     ///
     /// The pairing is the point: two servers on one buffer may have negotiated
     /// different encodings, so their `character` columns are not comparable and can
     /// only be converted per source. Callers must not flatten this into one encoding.
-    pub(crate) fn lsp_diagnostics_of(
+    fn lsp_diagnostics_of(
         &self,
         buffer: nxvim_core::BufferId,
-    ) -> Vec<(&Diagnostic, PositionEncoding)> {
+    ) -> Vec<(&Diagnostic, Option<&ServerKey>, PositionEncoding)> {
         let Some(state) = self.lsp_states.get(&buffer) else {
             return Vec::new();
         };
@@ -48,36 +233,136 @@ impl EditHost {
             .servers()
             .filter_map(|(key, doc)| {
                 let encoding = self.lsp_servers.get(key)?.encoding;
-                Some(doc.diagnostics.iter().map(move |d| (d, encoding)))
+                Some(
+                    doc.diagnostics
+                        .iter()
+                        .map(move |d| (d, Some(key), encoding)),
+                )
             })
             .flatten()
             .collect()
     }
 
-    /// Every diagnostic to project for `buffer`, each paired with the position
-    /// encoding its `character` columns are authored in. Two sources are merged:
-    /// the LSP server's published set (at the server's *negotiated* encoding) and
-    /// the client-set (`vim.diagnostic.set`) set, which has no server and so is
-    /// already in nxvim's native bytes — tagged [`PositionEncoding::Utf8`] so the
-    /// shared byte-column conversion ([`EditHost::diag_row_span`]) is the identity.
-    /// Unlike [`EditHost::diagnostics_of`] this also yields client-set diagnostics
-    /// for a buffer with *no attached server*, so the render surfaces aren't gated
-    /// on an LSP. Empty when the buffer has neither source.
-    pub(crate) fn diagnostics_merged(
+    /// Every diagnostic to project for `buffer`, **in the canonical merged order**:
+    /// each attached server's published set (servers in [`ServerKey`] order), then
+    /// the client-set (`vim.diagnostic.set`) one. The order is not cosmetic — it is
+    /// the key [`refresh_diagnostic_marks`](Self::refresh_diagnostic_marks) anchors
+    /// against, so both must be derived from this one function.
+    ///
+    /// Unlike a per-server view this also yields client-set diagnostics for a buffer
+    /// with *no attached server*, so the render surfaces aren't gated on an LSP.
+    fn merged_sources(
         &self,
         buffer: nxvim_core::BufferId,
-    ) -> Vec<(&Diagnostic, PositionEncoding)> {
+    ) -> Vec<(&Diagnostic, Option<&ServerKey>, PositionEncoding)> {
         let mut out = self.lsp_diagnostics_of(buffer);
         if let Some(diags) = self.client_diagnostics.get(&buffer) {
-            out.extend(diags.iter().map(|d| (d, PositionEncoding::Utf8)));
+            // Client-set diagnostics have no server, so their columns are already
+            // nxvim's native bytes — `Utf8` makes the shared conversion the identity.
+            out.extend(diags.iter().map(|d| (d, None, PositionEncoding::Utf8)));
         }
         out
     }
 
+    /// Every diagnostic to project for `buffer`, each resolved to the byte span it
+    /// occupies **in the buffer as it is now** — the shape every render and
+    /// cursor-anchored surface reads. Empty when the buffer has no diagnostics.
+    ///
+    /// Resolution goes through the [`DIAGNOSTIC_NS`] anchor placed when the set was
+    /// applied, so a span follows the text you type around it instead of sitting at
+    /// the absolute position a server published minutes (or one held update) ago.
+    /// The published range is the fallback for anything unanchored — a buffer whose
+    /// marks a destructive reload cleared, or a set the mark refresh hasn't caught up
+    /// with — which is exactly the untracked behavior, never a wrong one: the count
+    /// guard means a stale anchor set is ignored wholesale rather than read
+    /// off-by-one.
+    pub(crate) fn diagnostics_merged(
+        &self,
+        buffer: nxvim_core::BufferId,
+    ) -> Vec<TrackedDiagnostic<'_>> {
+        let sources = self.merged_sources(buffer);
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return Vec::new();
+        };
+        // The anchors are addressed by position in the merged list, so they are only
+        // trustworthy while the list is the one they were placed from.
+        let anchored = self.diag_mark_counts.get(&buffer) == Some(&sources.len());
+        sources
+            .into_iter()
+            .enumerate()
+            .map(|(i, (d, server, encoding))| {
+                let span = anchored
+                    .then(|| buf.extmarks.get(DIAGNOSTIC_NS, i as u64))
+                    .flatten()
+                    .map(|m| (m.start, m.end.unwrap_or(m.start)))
+                    .unwrap_or_else(|| {
+                        let r = lsp_range_to_bytes_in(buf, &d.range, encoding);
+                        (r.start, r.end)
+                    });
+                TrackedDiagnostic {
+                    d,
+                    server,
+                    start: span.0,
+                    end: span.1.max(span.0),
+                }
+            })
+            .collect()
+    }
+
     /// [`EditHost::diagnostics_merged`] for the current buffer — the merged set the
     /// cursor-anchored surfaces (under-cursor message, `goto`, float, loclist) read.
-    pub(crate) fn current_diagnostics_merged(&self) -> Vec<(&Diagnostic, PositionEncoding)> {
+    pub(crate) fn current_diagnostics_merged(&self) -> Vec<TrackedDiagnostic<'_>> {
         self.diagnostics_merged(self.editor.current_buffer_id())
+    }
+
+    /// (Re-)anchor `buffer`'s diagnostics: one [`DIAGNOSTIC_NS`] range extmark per
+    /// entry of the merged set, addressed by its position in it. From here on the
+    /// buffer's own edit choke point keeps every span correct as the user types —
+    /// which is the whole reason diagnostics are stored as marks in neovim too.
+    ///
+    /// Must be called after **every** change to what the merged set contains — a
+    /// publish applied, a held update committed, `vim.diagnostic.set`, a server
+    /// detaching — because the anchors are addressed positionally. The recorded count
+    /// is what makes a missed call safe rather than silently wrong: a merged list of a
+    /// different length ignores the anchors and falls back to published ranges.
+    pub(crate) fn refresh_diagnostic_marks(&mut self, buffer: nxvim_core::BufferId) {
+        // Resolved against the *current* text before any mutation, so the spans are
+        // the ones the marks should be placed at.
+        let spans: Vec<(usize, usize)> = {
+            let Some(buf) = self.editor.buffer_of(buffer) else {
+                return;
+            };
+            self.merged_sources(buffer)
+                .iter()
+                .map(|(d, _, encoding)| {
+                    let r = lsp_range_to_bytes_in(buf, &d.range, *encoding);
+                    (r.start, r.end.max(r.start))
+                })
+                .collect()
+        };
+        let Some(buf) = self.editor.buffer_of_mut(buffer) else {
+            return;
+        };
+        buf.extmarks.clear(DIAGNOSTIC_NS, None);
+        for (i, (start, end)) in spans.iter().enumerate() {
+            // Default gravity (start right, end left) — neovim's for diagnostics: text
+            // typed *before* the span carries it along, text typed at its end doesn't
+            // stretch it.
+            buf.extmarks.set(
+                DIAGNOSTIC_NS,
+                Some(i as u64),
+                *start,
+                Some(*end),
+                None,
+                0,
+                None,
+            );
+        }
+        if spans.is_empty() {
+            self.diag_mark_counts.remove(&buffer);
+        } else {
+            self.diag_mark_counts.insert(buffer, spans.len());
+        }
     }
 
     /// Build the per-row `diagnostics` redraw payload from a row→buffer-line
@@ -96,8 +381,8 @@ impl EditHost {
     /// buffer has no language server / no diagnostics.
     pub(crate) fn diag_counts_for(&self, buffer: nxvim_core::BufferId) -> [usize; 4] {
         let mut counts = [0usize; 4];
-        for (d, _) in self.diagnostics_merged(buffer) {
-            let sev = super::severity_code(d.severity); // 1=error … 4=hint
+        for t in self.diagnostics_merged(buffer) {
+            let sev = t.severity(); // 1=error … 4=hint
             if (1..=4).contains(&sev) {
                 counts[(sev - 1) as usize] += 1;
             }
@@ -119,25 +404,24 @@ impl EditHost {
             // stays aligned with `highlights`/`numbers`.
             return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         }
-        let buf = self.editor.buffer_of(buffer);
-        // The LSP-pushed and client-set sets merged; each diagnostic carries the
-        // encoding its columns are in (the client-set ones are native UTF-8).
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
+        };
+        // The LSP-pushed and client-set sets merged, each already resolved to where
+        // it sits in the buffer *now* (its anchor's span, not its published range).
         let diags = self.diagnostics_merged(buffer);
         // Per-frame index built once instead of scanning the whole merged list per
-        // row: each diagnostic intersects every buffer row in `[start.line,
-        // end.line]` (exactly when `diag_row_span` returns `Some`). Single-line
-        // diagnostics — the overwhelming majority — bucket by that one line;
-        // genuinely multi-line ones (rare) stay in a small overflow list scanned
-        // per row. `candidates_for` merges the two back into the original
-        // merged-list order, so the emitted span order per row is identical to the
-        // old `diags.iter().filter_map(...)` scan.
-        let index = DiagLineIndex::build(&diags);
+        // row: each diagnostic intersects every buffer row its span crosses (exactly
+        // when `row_span` returns `Some`). Single-line diagnostics — the overwhelming
+        // majority — bucket by that one line; genuinely multi-line ones (rare) stay in
+        // a small overflow list scanned per row. `candidates_for` merges the two back
+        // into the original merged-list order, so the emitted span order per row is
+        // identical to a full-list scan's.
+        let index = DiagLineIndex::build(&diags, buf);
         // Tab width is the rendered window's buffer's `tabstop` (it may differ
         // from the current buffer's), so the underline columns line up with the
         // text the client paints for that window.
-        let tabstop = buf
-            .map(|b| b.options.effective_tabstop())
-            .unwrap_or(unicode::TABSTOP);
+        let tabstop = buf.options.effective_tabstop();
         let rows = segs
             .iter()
             .map(|seg| {
@@ -145,15 +429,12 @@ impl EditHost {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
-                let Some(text) = buf.map(|b| b.line(line_idx)) else {
-                    return Value::Array(Vec::new());
-                };
+                let text = buf.line(line_idx);
                 let spans = index
                     .candidates_for(line_idx as u32)
                     .filter_map(|&i| {
-                        let (d, encoding) = diags[i];
-                        let (start_byte, end_byte) =
-                            self.diag_row_span(d, encoding, line_idx, &text)?;
+                        let t = &diags[i];
+                        let (start_byte, end_byte) = t.row_span(buf, line_idx, &text)?;
                         let start_col = unicode::virtcol(&text, start_byte, tabstop);
                         let mut end_col = unicode::virtcol(&text, end_byte, tabstop);
                         // A zero-width range (e.g. an empty span at end-of-line)
@@ -164,7 +445,7 @@ impl EditHost {
                         // Clip the underline to this row's wrap segment, rebased to
                         // row-local columns (so it lands on the right continuation row).
                         let (start_col, end_col) = seg.clip(start_col, end_col)?;
-                        let severity = severity_code(d.severity);
+                        let severity = t.severity();
                         let style_id = match self.resolve_winhl(winhl, severity_group(severity)) {
                             Some(style) => Value::from(styles.intern(style) as u64),
                             None => Value::Nil,
@@ -205,13 +486,16 @@ impl EditHost {
             // stays aligned with `numbers`/`diagnostics`.
             return Value::Array(segs.iter().map(|_| Value::Nil).collect());
         }
-        // Merged LSP + client-set; the inline message positions by line only, so
-        // the per-diagnostic encoding isn't needed here.
+        // Merged LSP + client-set, each at its tracked position; the inline message
+        // positions by line only, so only the anchor's start line matters here.
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return Value::Array(segs.iter().map(|_| Value::Nil).collect());
+        };
         let diags = self.diagnostics_merged(buffer);
         // Per-frame index of the diagnostics *starting* on each line, in merged
         // order, so `min_by_key` (which returns the first element reaching the
-        // minimum) picks the same winner as the old per-row `filter`/`min_by_key`.
-        let by_start = DiagStartIndex::build(&diags);
+        // minimum) picks the same winner as a per-row `filter`/`min_by_key` would.
+        let by_start = DiagStartIndex::build(&diags, buf);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -229,13 +513,17 @@ impl EditHost {
                 // line's one inline slot (ties broken by leftmost column).
                 let best = by_start
                     .on_line(line)
-                    .map(|&i| diags[i].0)
-                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
-                let Some(d) = best else {
+                    .map(|&i| &diags[i])
+                    .min_by_key(|t| (t.severity(), t.start));
+                let Some(t) = best else {
                     return Value::Nil;
                 };
-                let severity = severity_code(d.severity);
-                let text = format!("{}{}", self.diag_config.virt_prefix, first_line(&d.message));
+                let severity = t.severity();
+                let text = format!(
+                    "{}{}",
+                    self.diag_config.virt_prefix,
+                    first_line(&t.d.message)
+                );
                 let style_id = match self.resolve_winhl(winhl, severity_virt_group(severity)) {
                     Some(style) => Value::from(styles.intern(style) as u64),
                     None => Value::Nil,
@@ -270,11 +558,15 @@ impl EditHost {
             // stays aligned with `numbers`/`diagnostics`.
             return Value::Array(segs.iter().map(|_| Value::Nil).collect());
         }
-        // Merged LSP + client-set; the gutter sign positions by line only.
+        // Merged LSP + client-set at their tracked positions; the gutter sign
+        // positions by line only.
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return Value::Array(segs.iter().map(|_| Value::Nil).collect());
+        };
         let diags = self.diagnostics_merged(buffer);
         // Same per-frame start-line index as the virtual-text surface: same
         // "starts on line" filter and same `min_by_key` tie-break.
-        let by_start = DiagStartIndex::build(&diags);
+        let by_start = DiagStartIndex::build(&diags, buf);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -291,12 +583,12 @@ impl EditHost {
                 // line's sign cell (ties broken by leftmost column).
                 let best = by_start
                     .on_line(line)
-                    .map(|&i| diags[i].0)
-                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
-                let Some(d) = best else {
+                    .map(|&i| &diags[i])
+                    .min_by_key(|t| (t.severity(), t.start));
+                let Some(t) = best else {
                     return Value::Nil;
                 };
-                let severity = severity_code(d.severity);
+                let severity = t.severity();
                 let glyph = self.diag_config.sign_glyph(severity).to_string();
                 let style_id = match self.resolve_winhl(winhl, severity_sign_group(severity)) {
                     Some(style) => Value::from(styles.intern(style) as u64),
@@ -316,52 +608,20 @@ impl EditHost {
     // signs in `crate::extmarks::sign_width_from_cells` (diagnostic + extmark), so
     // there's no diagnostics-only width function here anymore.
 
-    /// The message of the highest-severity diagnostic whose range covers the
-    /// cursor, for the message line (shown only when no other message is set, so
-    /// `:messages` history stays clean). `None` when the cursor is on no
-    /// diagnostic. Newlines are flattened so it fits one line.
+    /// The message of the highest-severity diagnostic covering the cursor, for the
+    /// message line (shown only when no other message is set, so `:messages` history
+    /// stays clean). `None` when the cursor is on no diagnostic. Newlines are
+    /// flattened so it fits one line.
     pub(crate) fn diagnostic_under_cursor(&self) -> Option<String> {
-        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
-        let line = self.editor.buffer().line(row);
+        let at = self
+            .editor
+            .buffer()
+            .byte_at(self.editor.cursor.line, self.editor.cursor.col);
         self.current_diagnostics_merged()
             .into_iter()
-            .filter(|(d, encoding)| {
-                self.diag_row_span(d, *encoding, row, &line)
-                    // Cover the resting cell of a zero-width range too.
-                    .is_some_and(|(s, e)| col >= s && col < e.max(s + 1))
-            })
-            .min_by_key(|(d, _)| severity_code(d.severity))
-            .map(|(d, _)| first_line(&d.message))
-    }
-
-    /// The `[start, end)` **byte** span a diagnostic occupies on buffer row
-    /// `line_idx` (whose text is `line`), or `None` if it does not reach that
-    /// row. Multi-line ends are clipped to the row: `0` before the range's first
-    /// line, the line length after its last. The LSP character offsets are
-    /// converted to bytes through the negotiated `encoding` (Decision 4).
-    pub(crate) fn diag_row_span(
-        &self,
-        d: &Diagnostic,
-        encoding: PositionEncoding,
-        line_idx: usize,
-        line: &str,
-    ) -> Option<(usize, usize)> {
-        let (s, e) = (d.range.start, d.range.end);
-        let row = line_idx as u32;
-        if row < s.line || row > e.line {
-            return None;
-        }
-        let start = if s.line == row {
-            byte_col(encoding, line, s.character as usize)
-        } else {
-            0
-        };
-        let end = if e.line == row {
-            byte_col(encoding, line, e.character as usize)
-        } else {
-            line.len()
-        };
-        Some((start, end))
+            .filter(|t| t.covers(at))
+            .min_by_key(|t| t.severity())
+            .map(|t| first_line(&t.d.message))
     }
 
     /// Build the `:LspDiagnostics` location list for the current buffer: one
@@ -380,16 +640,15 @@ impl EditHost {
         }
         // A navigable list needs a file to jump into; a no-path buffer can't have one.
         let path = self.editor.buffer().path.clone()?;
-        items.sort_by_key(|(d, _)| (d.range.start.line, d.range.start.character));
+        let buf = self.editor.buffer();
+        items.sort_by_key(|t| t.start);
         let entries = items
             .into_iter()
-            .map(|(d, encoding)| {
-                let row = d.range.start.line as usize;
-                let character = d.range.start.character as usize;
-                let line = self.editor.buffer().line(row);
-                let byte = byte_col(encoding, &line, character);
-                let severity = severity_code(d.severity);
-                let text = format!("{}: {}", severity_short(severity), first_line(&d.message),);
+            .map(|t| {
+                let row = t.start_line(buf);
+                let byte = t.start - buf.byte_at(row, 0);
+                let severity = t.severity();
+                let text = format!("{}: {}", severity_short(severity), first_line(&t.d.message),);
                 // The vim quickfix type char drives the row's severity color
                 // (1=ERROR→`E` … 4=HINT→`N`, matching `vim.diagnostic.toqflist`).
                 let typ = qf_type_char(severity);
@@ -410,17 +669,17 @@ impl EditHost {
         // The cursor line's diagnostics: those *starting* on it (neovim's `lnum`
         // scope), matching the virt-text / sign surfaces. Collected and sorted
         // before any `&mut self` use so the borrow is released for `open_panel`.
-        let row = self.editor.cursor.line as u32;
-        let mut items: Vec<&Diagnostic> = self
+        let row = self.editor.cursor.line;
+        let buf = self.editor.buffer();
+        let mut items: Vec<TrackedDiagnostic> = self
             .current_diagnostics_merged()
             .into_iter()
-            .filter(|(d, _)| d.range.start.line == row)
-            .map(|(d, _)| d)
+            .filter(|t| t.start_line(buf) == row)
             .collect();
-        items.sort_by_key(|d| (severity_code(d.severity), d.range.start.character));
+        items.sort_by_key(|t| (t.severity(), t.start));
         let lines = items
             .iter()
-            .flat_map(|d| diagnostic_float_lines(d))
+            .flat_map(|t| diagnostic_float_lines(t.d))
             .collect::<Vec<_>>();
         if lines.is_empty() {
             self.editor.echo("No diagnostics under cursor");
@@ -432,23 +691,21 @@ impl EditHost {
     /// `vim.diagnostic.goto_next`/`goto_prev`: move the cursor to the next
     /// (`forward`) or previous diagnostic in the current buffer, wrapping around
     /// the ends. `severity` (1=ERROR…4=HINT) restricts the set when set. A no-op
-    /// when the buffer has no (matching) diagnostics. Reuses the same byte-column
-    /// conversion the underline path uses, then `jump_to`s the *current* file so
-    /// the move snaps to a valid resting cell (no file open — same buffer).
+    /// when the buffer has no (matching) diagnostics. Targets each diagnostic's
+    /// *tracked* start — where it sits after the edits since it was published — then
+    /// `jump_to`s the current file so the move snaps to a valid resting cell (no
+    /// file open — same buffer).
     pub(crate) fn diagnostic_goto(&mut self, forward: bool, severity: Option<u8>) {
         // Resolve every (matching) diagnostic to a 0-based (line, byte col) and
         // sort by position, so "next/previous from the cursor" is a list walk.
+        let buf = self.editor.buffer();
         let mut positions: Vec<(usize, usize)> = self
             .current_diagnostics_merged()
             .into_iter()
-            .filter(|(d, _)| severity.is_none_or(|s| severity_code(d.severity) == s))
-            .map(|(d, encoding)| {
-                let row = d.range.start.line as usize;
-                let line = self.editor.buffer().line(row);
-                (
-                    row,
-                    byte_col(encoding, &line, d.range.start.character as usize),
-                )
+            .filter(|t| severity.is_none_or(|s| t.severity() == s))
+            .map(|t| {
+                let row = t.start_line(buf);
+                (row, t.start - buf.byte_at(row, 0))
             })
             .collect();
         if positions.is_empty() {
@@ -490,26 +747,27 @@ impl EditHost {
     /// makes the cursor case "the diagnostics under the cursor"; a zero-width
     /// *diagnostic* is likewise treated as one byte wide, so it can still be hit.
     ///
-    /// Scoped to one server ([`diagnostics_from`](Self::diagnostics_from)): the
-    /// request quotes them straight back, so they must be that server's own.
+    /// Scoped to one server: the request quotes them straight back, so they must be
+    /// that server's own — a diagnostic is not portable between servers (its columns
+    /// are in its publisher's encoding, its `code`/`data` are that server's handles
+    /// on the problem).
+    ///
+    /// Selection is by *tracked* span, so a selection covers the diagnostics that sit
+    /// under it now; what is sent is the **published** range, which is what the
+    /// server's own copy of the document is indexed by.
     pub(crate) fn diagnostics_in_range_from(
         &self,
         server: &ServerKey,
         (s_row, s_col, e_row, e_col): (usize, usize, usize, usize),
     ) -> Vec<Diagnostic> {
-        let Some((diags, encoding)) = self.diagnostics_from(server) else {
-            return Vec::new();
-        };
         let buffer = self.editor.buffer();
         let lo = buffer.byte_at(s_row, s_col);
         let hi = buffer.byte_at(e_row, e_col).max(lo);
-        diags
-            .iter()
-            .filter(|d| {
-                let span = self.lsp_range_to_bytes(&d.range, encoding);
-                span.start < hi.max(lo + 1) && lo < span.end.max(span.start + 1)
-            })
-            .cloned()
+        self.current_diagnostics_merged()
+            .into_iter()
+            .filter(|t| t.server == Some(server))
+            .filter(|t| t.start < hi.max(lo + 1) && lo < t.end.max(t.start + 1))
+            .map(|t| t.d.clone())
             .collect()
     }
 }
@@ -526,10 +784,10 @@ struct DiagStartIndex {
 }
 
 impl DiagStartIndex {
-    fn build(diags: &[(&Diagnostic, PositionEncoding)]) -> Self {
+    fn build(diags: &[TrackedDiagnostic], buf: &Buffer) -> Self {
         let mut by_line: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (i, (d, _)) in diags.iter().enumerate() {
-            by_line.entry(d.range.start.line).or_default().push(i);
+        for (i, t) in diags.iter().enumerate() {
+            by_line.entry(t.start_line(buf) as u32).or_default().push(i);
         }
         Self { by_line }
     }
@@ -555,12 +813,13 @@ struct DiagLineIndex {
 }
 
 impl DiagLineIndex {
-    fn build(diags: &[(&Diagnostic, PositionEncoding)]) -> Self {
+    fn build(diags: &[TrackedDiagnostic], buf: &Buffer) -> Self {
         let mut single: HashMap<u32, Vec<usize>> = HashMap::new();
         let mut multi = Vec::new();
-        for (i, (d, _)) in diags.iter().enumerate() {
-            if d.range.start.line == d.range.end.line {
-                single.entry(d.range.start.line).or_default().push(i);
+        for (i, t) in diags.iter().enumerate() {
+            let start = t.start_line(buf);
+            if start == buf.byte_to_line(t.end) {
+                single.entry(start as u32).or_default().push(i);
             } else {
                 multi.push(i);
             }

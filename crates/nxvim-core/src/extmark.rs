@@ -85,6 +85,23 @@ pub const SUBST_PREVIEW_NS: u32 = u32::MAX - 5;
 /// namespaces. Sits just below [`SUBST_PREVIEW_NS`].
 pub const SIGNATURE_NS: u32 = u32::MAX - 6;
 
+/// Reserved namespace anchoring the **diagnostics** currently on screen. One range
+/// extmark per diagnostic in the buffer's merged (LSP + client-set) set, carrying no
+/// `hl_group` and no decor — it renders nothing itself; the diagnostic projection
+/// reads its span and paints the squiggle, sign and inline message from that.
+///
+/// The point is edit tracking. A diagnostic arrives as an absolute LSP
+/// `(line, character)` range, which goes stale the instant you type: a server only
+/// re-publishes after a `didChange` round trip, and nxvim deliberately holds those
+/// updates while you type (`vim.diagnostic.config({ update_in_insert = … })`), so
+/// between updates the ranges must follow the text themselves. Anchored here they do
+/// — the buffer's single edit choke point ([`ExtmarkStore::shift`]) moves them for
+/// free, exactly as it does for marks and (in neovim, where diagnostics are extmarks
+/// too) for the same reason. Re-placed whenever the applied set changes; like the
+/// other reserved namespaces it is kept out of the user-facing extmark mirror. Sits
+/// just below [`SIGNATURE_NS`].
+pub const DIAGNOSTIC_NS: u32 = u32::MAX - 7;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

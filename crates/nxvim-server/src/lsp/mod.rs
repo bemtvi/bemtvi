@@ -234,6 +234,13 @@ pub(crate) struct LspServerDoc {
     /// Latest `publishDiagnostics` from this server for this buffer, projected into
     /// the redraw (`diagnostics_for`) and the under-cursor message line.
     diagnostics: Vec<Diagnostic>,
+    /// A publish that landed while diagnostics were paused (insert mode, with
+    /// `update_in_insert` off — [`EditHost::diagnostics_paused`](crate::EditHost::diagnostics_paused)),
+    /// held out of `diagnostics` so nothing on screen moves mid-typing. Only the
+    /// newest is kept — a server republishing per keystroke overwrites it — and
+    /// [`EditHost::commit_pending_diagnostics`](crate::EditHost::commit_pending_diagnostics)
+    /// folds it in on `InsertLeave`.
+    pending_diagnostics: Option<Vec<Diagnostic>>,
     /// Latest `semanticTokens/full` result, decoded into the per-line highlight
     /// spans `highlights_for` merges over the treesitter floor (ADR 0001 bridge #2).
     /// Empty until the first reply lands.
@@ -1349,19 +1356,40 @@ pub(crate) fn severity_sign_group(severity: u8) -> &'static str {
     }
 }
 
+/// How long typing must be quiet before a parked diagnostic update is applied, by
+/// default. The compromise the two neovim settings miss: a server re-diagnoses after
+/// every keystroke, which is too noisy to paint live, but waiting for `InsertLeave`
+/// means a long editing session shows nothing at all. Debounced, the squiggles catch
+/// up a moment after you stop typing — and never move while you are mid-word.
+pub(crate) const DEFAULT_INSERT_DEBOUNCE_MS: u64 = 3_000;
+
 /// The subset of `vim.diagnostic.config` keys nxvim has a backing surface for,
 /// threaded from Lua via [`LspOp::DiagnosticConfig`](nxvim_lua::LspOp). `underline`
 /// gates the squiggle spans; `virtual_text` gates the inline end-of-line message
 /// and `virt_prefix` is its leader glyph; `signs` gates the gutter sign column and
 /// `sign_text` holds its per-severity glyphs, indexed by severity code minus one
-/// (`[error, warn, info, hint]`). Defaults match neovim 0.10: underline and signs
-/// on, virtual text off, prefix `■ `, sign glyphs `E`/`W`/`I`/`H`.
+/// (`[error, warn, info, hint]`). `update_in_insert` / `insert_debounce_ms` gate
+/// *when* an update is applied rather than which surface renders it — see
+/// [`EditHost::diagnostics_paused`](crate::EditHost::diagnostics_paused). Defaults
+/// match neovim 0.10 for the render surfaces — underline and signs on, virtual text
+/// off, prefix `■ `, sign glyphs `E`/`W`/`I`/`H` — and diverge deliberately on the
+/// timing: updates *do* land while you type, but debounced by
+/// [`DEFAULT_INSERT_DEBOUNCE_MS`] rather than on every keystroke (neovim's two
+/// choices are per-keystroke or not until `InsertLeave`; both remain reachable, see
+/// the Lua `update_in_insert`).
 pub(crate) struct DiagnosticConfig {
     pub(crate) underline: bool,
     pub(crate) virtual_text: bool,
     pub(crate) virt_prefix: String,
     pub(crate) signs: bool,
     pub(crate) sign_text: [String; 4],
+    /// Whether an update landing during insert mode is ever applied *before*
+    /// `InsertLeave`. `false` holds it until you leave insert (neovim's default).
+    pub(crate) update_in_insert: bool,
+    /// How long typing must be quiet before a parked update is applied, in ms —
+    /// meaningful only when `update_in_insert` is set. `0` applies each update the
+    /// moment it lands (neovim's `update_in_insert = true`).
+    pub(crate) insert_debounce_ms: u64,
 }
 
 impl DiagnosticConfig {
@@ -1385,6 +1413,8 @@ impl Default for DiagnosticConfig {
                 "I".to_string(),
                 "H".to_string(),
             ],
+            update_in_insert: true,
+            insert_debounce_ms: DEFAULT_INSERT_DEBOUNCE_MS,
         }
     }
 }

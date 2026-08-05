@@ -2409,10 +2409,10 @@ impl EditHost {
         if p.is_absolute() {
             return p.to_path_buf();
         }
-        let win = self.editor.current_window_id();
-        let tab = self.editor.current_tab_id();
-        let (_, base) = self.dirs.effective(win, tab);
-        base.join(p)
+        // Through [`session_cwd`](EditHost::session_cwd) — the one place that answers
+        // "where the user is" — so a preview resolves against the same base as `:edit`
+        // and every LSP path, on a daemon session as much as locally.
+        self.session_cwd().join(p)
     }
 
     /// Store the preview `lines` for `path` into [`preview_cache`](EditHost::preview_cache),

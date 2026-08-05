@@ -14,8 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::images::ImageStore;
 use nxvim_view::{
-    arm_scroll, elide_middle, fit_row, gutter_cell, lerp, pmenu_row, pmenu_start, row_head_col,
-    ScrollAnim,
+    arm_scroll, doc_box, elide_middle, fit_row, gutter_cell, lerp, pmenu_row, pmenu_start,
+    row_head_col, CellRect, ScrollAnim,
 };
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuField,
@@ -3260,52 +3260,18 @@ fn popup_rect(text_area: Rect, pmenu: &PmenuData) -> Option<Rect> {
 }
 
 /// The documentation preview box's rect (border included), laid out beside the
-/// `popup` within `text_area`: to its right when there's room, else to its left
-/// (vim's `completeopt=popup` shape), top-aligned with the popup. `None` when
-/// there are no docs or no room either side.
+/// `popup` within `text_area`. The geometry itself is [`nxvim_view::doc_box`] —
+/// shared with the GUI, which paints the same box — and this is just the ratatui
+/// `Rect` conversion around it.
 fn doc_rect(text_area: Rect, popup: Rect, doc: &[String]) -> Option<Rect> {
-    if doc.is_empty() {
-        return None;
-    }
-    // Cap the preview so a long doc block doesn't swallow the screen.
-    const MAX_W: u16 = 50;
-    const MAX_H: u16 = 12;
-    let natural_w = doc.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
-    let want_box_w = natural_w.clamp(1, MAX_W).saturating_add(2);
-
-    // Prefer the right of the popup; fall back to its left. Each side needs the
-    // border plus at least one content cell (3 cells) to be worth drawing.
-    let room_right = text_area.right().saturating_sub(popup.right());
-    let room_left = popup.x.saturating_sub(text_area.x);
-    let (x, box_w) = if room_right >= 3 {
-        (popup.right(), want_box_w.min(room_right))
-    } else if room_left >= 3 {
-        let w = want_box_w.min(room_left);
-        (popup.x.saturating_sub(w), w)
-    } else {
-        return None; // no room either side
-    };
-
-    // Height from the wrapped line count, clamped to the cap and the room below.
-    let content_w = box_w.saturating_sub(2).max(1);
-    let wrapped = doc
-        .iter()
-        .map(|l| (l.chars().count() as u16).max(1).div_ceil(content_w))
-        .sum::<u16>();
-    let content_h = wrapped.clamp(1, MAX_H);
-    let box_h = content_h
-        .saturating_add(2)
-        .min(text_area.bottom().saturating_sub(popup.y));
-    if box_w < 3 || box_h < 3 {
-        return None;
-    }
-    let area = Rect {
-        x,
-        y: popup.y,
-        width: box_w,
-        height: box_h,
-    };
-    Some(area)
+    let cell = |r: Rect| CellRect::new(r.x, r.y, r.width, r.height);
+    let b = doc_box(cell(text_area), cell(popup), doc)?;
+    Some(Rect {
+        x: b.x,
+        y: b.y,
+        width: b.w,
+        height: b.h,
+    })
 }
 
 /// Draw the selected item's documentation in a bordered preview box beside the

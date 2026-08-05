@@ -34,9 +34,9 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col, Border, DiagSign,
-    DiagSpan, DiagVirt, Geometry, InlayHint, MenuField, ResizeCursor, StatusSegment, Style,
-    TabData, View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    doc_box, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col, wrap_chars,
+    Border, CellRect, DiagSign, DiagSpan, DiagVirt, Geometry, InlayHint, MenuField, ResizeCursor,
+    StatusSegment, Style, TabData, View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2503,7 +2503,33 @@ impl Renderer {
         };
         let text_x0 = wx + win.foldcolumn_width + sign_w + gutter;
 
-        let cols = self.grid_size().0;
+        // The focused window's text area — the world the popup and its doc preview
+        // are laid out in, the same rect the TUI hands `render_pmenu`: the window
+        // rect inset past a float's border and its `'padding'`, past the gutters on
+        // the left, minus its status row below. A window with no rect is the sole
+        // full-screen one: the whole grid bar the command row.
+        let (grid_cols, grid_rows) = self.grid_size();
+        let text_area = {
+            let inset = 2 * u16::from(win.floating && win.border.is_some());
+            let pad_w = win.padding.left + win.padding.right;
+            let pad_h = win.padding.top + win.padding.bottom;
+            let (w, h) = match win.rect {
+                Some(r) => (
+                    r.width.saturating_sub(inset + pad_w),
+                    r.height.saturating_sub(inset + pad_h),
+                ),
+                None => (
+                    grid_cols.saturating_sub(pad_w),
+                    grid_rows.saturating_sub(1 + pad_h),
+                ),
+            };
+            CellRect::new(
+                text_x0,
+                wy,
+                w.saturating_sub(text_x0 - wx),
+                h.saturating_sub(u16::from(win.status_visible)),
+            )
+        };
         let popup_bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14);
         let border = lighten(popup_bg, 0x30);
         let sel_bg = lighten(popup_bg, 0x28);
@@ -2549,46 +2575,40 @@ impl Renderer {
             self.push_plain(items, &text, self.cell_px(cx, row), fg, full);
         }
 
-        // The selected item's documentation preview, beside the popup.
-        if !pmenu.doc.is_empty() {
-            const MAX_W: u16 = 50;
-            const MAX_H: u16 = 12;
-            let natural = pmenu
-                .doc
-                .iter()
-                .map(|l| l.chars().count())
-                .max()
-                .unwrap_or(0) as u16;
-            let dcw = natural.clamp(1, MAX_W);
-            let dch = (pmenu.doc.len() as u16).clamp(1, MAX_H);
-            let dbw = dcw + 2;
-            let dbh = dch + 2;
-            // Prefer the right of the popup; fall back to its left when there's no
-            // room (vim's `completeopt=popup` shape), top-aligned with the popup.
-            let dx = if bx + box_w + dbw <= cols {
-                bx + box_w
-            } else {
-                bx.saturating_sub(dbw)
-            };
-            self.fill_rect(quads, dx, by, dbw, dbh, popup_bg);
+        // The selected item's documentation preview, beside the popup — geometry
+        // from the shared `doc_box` (the TUI paints the same box), so the two
+        // clients place and clamp it identically. `None` = no docs, or no room on
+        // either side of the popup, in which case nothing is drawn.
+        let popup_rect = CellRect::new(bx, by, box_w, box_h);
+        if let Some(d) = doc_box(text_area, popup_rect, &pmenu.doc) {
+            self.fill_rect(quads, d.x, d.y, d.w, d.h, popup_bg);
             self.draw_glyph_border(
                 items,
                 Border::Single,
                 None,
-                dx,
-                by,
-                dbw,
-                dbh,
+                d.x,
+                d.y,
+                d.w,
+                d.h,
                 true,
                 true,
                 fg,
                 border,
                 false,
             );
-            for (r, line) in pmenu.doc.iter().take(dch as usize).enumerate() {
-                let text: String = line.chars().take(dcw as usize).collect();
-                let pos = self.cell_px(dx + 1, by + 1 + r as u16);
-                self.push_plain(items, &text, pos, fg, full);
+            // Wrapped to the box's content width — the rows `doc_box` sized it for.
+            // (The GUI has no wrapping text widget of its own; the TUI leaves this
+            // to ratatui's `Paragraph`.) Clipped to the box's content height.
+            let content_w = d.w.saturating_sub(2) as usize;
+            let content_h = d.h.saturating_sub(2) as usize;
+            let rows = pmenu
+                .doc
+                .iter()
+                .flat_map(|l| wrap_chars(l, content_w))
+                .take(content_h);
+            for (r, line) in rows.enumerate() {
+                let pos = self.cell_px(d.x + 1, d.y + 1 + r as u16);
+                self.push_plain(items, &line, pos, fg, full);
             }
         }
     }
@@ -3901,41 +3921,33 @@ pub fn row_segments(
             segments.push(Seg::plain(chars[col..start].iter().collect(), fg));
         }
         let text: String = chars[start..end].iter().collect();
-        match s.3.and_then(|id| styles.get(id)) {
-            Some(st) => {
-                // Reverse swaps fg/bg: the glyph takes the style's background (or the
-                // editor's `Normal` bg) and a foreground-colored quad behind it is
-                // painted by `push_reverse_fills`, so the run reads inverted — its own
-                // `bg` stays unset (the reverse fill is its background). A non-reverse
-                // run keeps its fg and carries its group's `bg` (when set) as a quad
-                // painted behind the glyph by `push_seg_backgrounds` — e.g. a diff line
-                // tint, or any colorscheme group with a background.
-                let (color, bg) = if st.reverse {
-                    (st.bg.unwrap_or(normal_bg), None)
-                } else {
-                    (st.fg.unwrap_or(fg), st.bg)
-                };
-                segments.push(Seg {
-                    text,
-                    fg: color,
-                    bg,
-                    bold: st.bold,
-                    italic: st.italic,
-                });
-            }
-            // No colorscheme resolved this span: fall back to a built-in color for
-            // its capture group, so a buffer still highlights with no theme loaded.
-            None => {
-                let (color, italic) = group_fallback(&s.2, fg);
-                segments.push(Seg {
-                    text,
-                    fg: color,
-                    bg: None,
-                    bold: false,
-                    italic,
-                });
-            }
-        }
+        // The span's style: the one the server interned for it, or — when no
+        // colorscheme resolved it — the built-in fallback for its capture group, so
+        // a buffer still highlights with no theme loaded. Both are a `Style`, so the
+        // run is painted by one body either way.
+        let st =
+            s.3.and_then(|id| styles.get(id))
+                .copied()
+                .unwrap_or_else(|| group_fallback(&s.2));
+        // Reverse swaps fg/bg: the glyph takes the style's background (or the
+        // editor's `Normal` bg) and a foreground-colored quad behind it is
+        // painted by `push_reverse_fills`, so the run reads inverted — its own
+        // `bg` stays unset (the reverse fill is its background). A non-reverse
+        // run keeps its fg and carries its group's `bg` (when set) as a quad
+        // painted behind the glyph by `push_seg_backgrounds` — e.g. a diff line
+        // tint, or any colorscheme group with a background.
+        let (color, bg) = if st.reverse {
+            (st.bg.unwrap_or(normal_bg), None)
+        } else {
+            (st.fg.unwrap_or(fg), st.bg)
+        };
+        segments.push(Seg {
+            text,
+            fg: color,
+            bg,
+            bold: st.bold,
+            italic: st.italic,
+        });
         col = end;
     }
     if col < n {
@@ -4008,11 +4020,15 @@ pub fn apply_search_fg(
 /// resolved it (`style_id` is `None`) — the GUI's truecolor analogue of the TUI's
 /// `group_style`, so a buffer highlights even with no colorscheme loaded. Keys off
 /// the group's major component (before the first `.`), in One Dark hues that match
-/// the `DIAG_*` fallbacks already used here. Returns the foreground and whether the
-/// run is italic (comments); an unmapped group keeps the default `fg`.
-pub fn group_fallback(group: &str, fg: u32) -> (u32, bool) {
+/// the `DIAG_*` fallbacks already used here. An unmapped group returns the default
+/// [`Style`] (everything unset), which leaves the run on the editor's own `fg`.
+///
+/// Returning a `Style` rather than a colour pair is what lets the caller treat a
+/// resolved colorscheme style and this fallback as the same thing — and what lets
+/// an arm carry an attribute (`SpecialKey`'s bold) the way `group_style` does.
+pub fn group_fallback(group: &str) -> Style {
     let major = group.split('.').next().unwrap_or(group);
-    let color = match major {
+    let fg = match major {
         "keyword" | "conditional" | "repeat" | "include" | "exception" | "keyword_operator" => {
             0xc6_78_dd
         } // purple
@@ -4021,12 +4037,33 @@ pub fn group_fallback(group: &str, fg: u32) -> (u32, bool) {
         "string" | "character" => 0x98_c3_79, // green
         "number" | "boolean" | "float" | "constant" => 0x56_b6_c2, // cyan
         "attribute" | "label" | "property" | "field" => 0x56_b6_c2, // cyan
-        "comment" => return (0x5c_63_70, true), // grey, italic
-        "tag" => 0xe0_6c_75,                 // red
+        "comment" => {
+            return Style {
+                fg: Some(0x5c_63_70), // grey, italic
+                italic: true,
+                ..Default::default()
+            };
+        }
+        "tag" => 0xe0_6c_75,                      // red
         "operator" | "punctuation" => 0xab_b2_bf, // grey
-        _ => fg,
+        // The `^X` / `<xx>` overlay on an unprintable control char, when no
+        // colorscheme defines `SpecialKey`: a standout bold foreground so the token
+        // reads as "this isn't ordinary text" (vim's `SpecialKey` look, and what the
+        // bundled colorscheme paints it). The TUI's `group_style` has the same arm —
+        // without it here the same buffer read as plain text in the GUI only.
+        "SpecialKey" => {
+            return Style {
+                fg: Some(0xd6_5d_ff), // bright magenta, bold
+                bold: true,
+                ..Default::default()
+            };
+        }
+        _ => return Style::default(),
     };
-    (color, false)
+    Style {
+        fg: Some(fg),
+        ..Default::default()
+    }
 }
 
 /// The combined cell width of the inlay hints on a row that fall at or before

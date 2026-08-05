@@ -268,3 +268,123 @@ pub fn gutter_cell(
         format!("{value:>field$} ")
     }
 }
+
+/// A rectangle in screen **cells** — the toolkit-neutral spelling of the TUI's
+/// ratatui `Rect` and the GUI's loose `(x, y, w, h)` quadruple, so popup geometry
+/// the two clients must agree on can be expressed once here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl CellRect {
+    pub fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self { x, y, w, h }
+    }
+
+    /// One past the last column the rect covers.
+    pub fn right(self) -> u16 {
+        self.x.saturating_add(self.w)
+    }
+
+    /// One past the last row the rect covers.
+    pub fn bottom(self) -> u16 {
+        self.y.saturating_add(self.h)
+    }
+}
+
+/// The completion popup's documentation-preview box (border included), laid out
+/// beside `popup` within `area`: to the popup's right when there's room, else to
+/// its left (vim's `completeopt=popup` shape), top-aligned with it. `None` when
+/// there are no docs, or no room on either side — a box that would overlap the
+/// popup or hang off the area is not drawn at all.
+///
+/// The box is capped at 50×12 content cells so a long doc block can't swallow the
+/// screen, then clamped to the room actually available: its width to the cells
+/// beside the popup, its height to the rows below the popup's top. Height counts
+/// **wrapped** lines (each doc line occupies `ceil(chars / content width)` rows),
+/// so a long single-line doc gets the rows its wrapped form needs.
+///
+/// Lives here rather than in either client because both paint this same box: hand
+/// -copied into the GUI it had already lost the room clamps (the box overran the
+/// window edge, and drew on top of the popup when neither side had room).
+pub fn doc_box(area: CellRect, popup: CellRect, doc: &[String]) -> Option<CellRect> {
+    if doc.is_empty() {
+        return None;
+    }
+    // Cap the preview so a long doc block doesn't swallow the screen.
+    const MAX_W: u16 = 50;
+    const MAX_H: u16 = 12;
+    // Capped in `usize` before the cast: a pathologically long line would otherwise
+    // wrap around `u16` and read as a *narrow* box.
+    let natural_w = doc
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(1, MAX_W as usize) as u16;
+    let want_box_w = natural_w.saturating_add(2);
+
+    // Prefer the right of the popup; fall back to its left. Each side needs the
+    // border plus at least one content cell (3 cells) to be worth drawing.
+    let room_right = area.right().saturating_sub(popup.right());
+    let room_left = popup.x.saturating_sub(area.x);
+    let (x, box_w) = if room_right >= 3 {
+        (popup.right(), want_box_w.min(room_right))
+    } else if room_left >= 3 {
+        let w = want_box_w.min(room_left);
+        (popup.x.saturating_sub(w), w)
+    } else {
+        return None; // no room either side
+    };
+
+    // Height from the wrapped line count, clamped to the cap and the room below.
+    let content_w = box_w.saturating_sub(2).max(1);
+    // Saturating rather than `sum()`: a huge doc block would overflow `u16` and
+    // panic the client in a debug build, and the total is clamped to `MAX_H` anyway.
+    let wrapped = doc.iter().fold(0u16, |acc, l| {
+        let chars = (l.chars().count().min(u16::MAX as usize) as u16).max(1);
+        acc.saturating_add(chars.div_ceil(content_w))
+    });
+    let content_h = wrapped.clamp(1, MAX_H);
+    let box_h = content_h
+        .saturating_add(2)
+        .min(area.bottom().saturating_sub(popup.y));
+    if box_w < 3 || box_h < 3 {
+        return None;
+    }
+    Some(CellRect {
+        x,
+        y: popup.y,
+        w: box_w,
+        h: box_h,
+    })
+}
+
+/// `line` hard-wrapped to `width` chars per row — the rows [`doc_box`] sized the
+/// preview for, materialized for a client that has no wrapping text widget of its
+/// own. An empty line yields one empty row (it still occupies a row), matching the
+/// `max(1)` in the height math.
+pub fn wrap_chars(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut row = String::new();
+    let mut n = 0;
+    for c in line.chars() {
+        row.push(c);
+        n += 1;
+        if n == width {
+            out.push(std::mem::take(&mut row));
+            n = 0;
+        }
+    }
+    if out.is_empty() || !row.is_empty() {
+        out.push(row);
+    }
+    out
+}

@@ -24,19 +24,41 @@ fn seg_of<'a>(segs: &'a [Seg], needle: &str) -> &'a Seg {
 #[test]
 fn group_fallback_colors_keywords_strings_and_comments_distinctly() {
     // Major component keys the color; comments are italic.
-    assert_ne!(group_fallback("keyword", FG).0, FG);
-    assert_ne!(group_fallback("string", FG).0, FG);
-    assert_ne!(group_fallback("function.call", FG).0, FG); // sub-capture → major "function"
-    let (comment, italic) = group_fallback("comment.line", FG);
-    assert_ne!(comment, FG);
-    assert!(italic, "comments render italic");
+    assert!(group_fallback("keyword").fg.is_some());
+    assert!(group_fallback("string").fg.is_some());
+    assert!(group_fallback("function.call").fg.is_some()); // sub-capture → major "function"
+    let comment = group_fallback("comment.line");
+    assert!(comment.fg.is_some());
+    assert!(comment.italic, "comments render italic");
     // Three different families get three different colors.
-    let kw = group_fallback("keyword", FG).0;
-    let st = group_fallback("string", FG).0;
-    let ty = group_fallback("type", FG).0;
+    let kw = group_fallback("keyword").fg;
+    let st = group_fallback("string").fg;
+    let ty = group_fallback("type").fg;
     assert!(kw != st && st != ty && kw != ty);
-    // An unknown group keeps the default fg (no spurious color).
-    assert_eq!(group_fallback("definitely.not.a.group", FG), (FG, false));
+    // An unknown group sets nothing, so the run keeps the editor's default fg.
+    assert_eq!(group_fallback("definitely.not.a.group"), Style::default());
+}
+
+#[test]
+fn an_unprintable_control_char_falls_back_to_the_special_key_look() {
+    // The regression: the TUI's `group_style` gives `SpecialKey` — the `^X` / `<xx>`
+    // overlay the server paints over an unprintable control char — a standout bold
+    // foreground, but the GUI's hand-copied fallback table had dropped the arm, so
+    // with no colorscheme loaded the same token read as plain text in the GUI only.
+    let special = group_fallback("SpecialKey");
+    assert!(
+        special.fg.is_some(),
+        "the <xx> token must not paint in the default fg"
+    );
+    assert!(special.bold, "SpecialKey is bold, as in the TUI");
+    // And it reaches a row's segments: the server sends the overlay as a span with
+    // no resolved `style_id` when no colorscheme defines the group.
+    let hl: Vec<HlSpan> = vec![(1, 5, "SpecialKey".into(), None)]; // `<81>` in `a<81>b`
+    let segs = row_segments("a<81>b", &hl, &[], FG, BG, 0);
+    let token = seg_of(&segs, "<81>");
+    assert_eq!(token.fg, special.fg.unwrap());
+    assert!(token.bold, "the span's bold attribute reaches the Seg");
+    assert_eq!(color_of(&segs, "a"), FG, "plain text keeps the default fg");
 }
 
 #[test]
@@ -46,7 +68,7 @@ fn row_without_colorscheme_still_colors_spans_from_their_group() {
     let line = "let x";
     let hl: Vec<HlSpan> = vec![(0, 3, "keyword".into(), None)]; // "let"
     let segs = row_segments(line, &hl, &[], FG, BG, 0);
-    let keyword_color = group_fallback("keyword", FG).0;
+    let keyword_color = group_fallback("keyword").fg.unwrap();
     assert_eq!(color_of(&segs, "let"), keyword_color);
     assert_ne!(color_of(&segs, "let"), FG, "keyword must not be default fg");
     // Text outside any span stays default fg.

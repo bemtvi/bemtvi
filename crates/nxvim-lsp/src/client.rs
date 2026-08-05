@@ -23,11 +23,13 @@ use async_lsp::router::Router;
 #[cfg(feature = "native")]
 use async_lsp::{MainLoop, ServerSocket};
 #[cfg(feature = "native")]
-use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
+use lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
 #[cfg(feature = "native")]
-use lsp_types::request::{InlayHintRefreshRequest, SemanticTokensRefresh, WorkspaceConfiguration};
+use lsp_types::request::{
+    InlayHintRefreshRequest, SemanticTokensRefresh, WorkDoneProgressCreate, WorkspaceConfiguration,
+};
 #[cfg(feature = "native")]
-use lsp_types::ApplyWorkspaceEditResponse;
+use lsp_types::{ApplyWorkspaceEditResponse, ProgressParamsValue};
 use lsp_types::{
     ChangeAnnotationWorkspaceEditClientCapabilities, ClientCapabilities,
     CodeActionCapabilityResolveSupport, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
@@ -42,7 +44,8 @@ use lsp_types::{
     SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions,
     SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
-    TokenFormat, Url, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    TokenFormat, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
+    WorkspaceEditClientCapabilities,
 };
 #[cfg(feature = "native")]
 use tokio::sync::mpsc::UnboundedSender;
@@ -65,7 +68,9 @@ use crate::log::{LogLevel, LspLog};
 // Pure helpers (always compiled) return these; the async router/handshake items
 // (gated below) use `LspEvent`/`RefreshKind`/`ServerKey`.
 #[cfg(feature = "native")]
-use crate::protocol::{ApplyEditOutcome, LspEvent, RefreshKind, ServerKey};
+use crate::protocol::{
+    progress_token, progress_update, ApplyEditOutcome, LspEvent, RefreshKind, ServerKey,
+};
 use crate::protocol::{PositionEncoding, ProviderCaps, SemanticLegend, ServerCaps, ServerSpawn};
 
 /// State shared by the client `MainLoop`'s notification handlers: which server
@@ -269,8 +274,40 @@ pub(crate) fn new_client(
             });
             ControlFlow::Continue(())
         });
-        // Be lenient about everything else a server emits (progress, telemetry,
-        // custom notifications/events): ignore rather than break the loop.
+        // `window/workDoneProgress/create`: the server asking permission to report on
+        // a token it just minted. It MUST be acked — this is not one of the optional
+        // requests a server shrugs off. gopls reads the reply, and async-lsp's
+        // method-not-found default made it conclude the client cannot do progress, so
+        // it sent no `$/progress` at all: the whole chain below received nothing while
+        // every layer of it worked. (The wasm `SyncLspClient` acks every unmodelled
+        // request with `null` and so was never affected — the two legs had silently
+        // drifted, which is exactly what the tier-1 rule forbids.)
+        //
+        // The token is not recorded: nxvim keys tasks off the token the `$/progress`
+        // itself carries, which covers both server-minted (`create`) and client-minted
+        // (`workDoneToken` on a request) tokens with one path.
+        router.request::<WorkDoneProgressCreate, _>(|_st: &mut ClientState, _params| ready(Ok(())));
+        // `$/progress`: the server reporting a long-running task (indexing, loading
+        // a workspace). Forwarded as the editor's flattened update — the token
+        // normalized and the payload decoded by the SHARED helpers, so this leg and
+        // the wasm `SyncLspClient` cannot drift on either. The editor holds the
+        // per-token state (a `report` means "patch what I sent"; see
+        // `ProgressUpdate`), so nothing is interpreted here.
+        //
+        // `ProgressParamsValue` is untagged with a single `WorkDone` variant today;
+        // matched (not unwrapped) so a future non-work-done progress kind is a
+        // compile error to handle rather than a silent misread.
+        router.notification::<Progress>(|st, params| {
+            let ProgressParamsValue::WorkDone(value) = &params.value;
+            let _ = st.event_tx.send(LspEvent::Progress {
+                key: st.key.clone(),
+                token: progress_token(&params.token),
+                update: progress_update(value),
+            });
+            ControlFlow::Continue(())
+        });
+        // Be lenient about everything else a server emits (telemetry, custom
+        // notifications/events): ignore rather than break the loop.
         router.unhandled_notification(|_st, _notif| ControlFlow::Continue(()));
         router.unhandled_event(|_st, _event| ControlFlow::Continue(()));
         router
@@ -393,8 +430,19 @@ fn json_merge(dst: &mut serde_json::Value, src: &serde_json::Value) {
 /// `workspaceEdit.documentChanges` so servers offer those features, and
 /// `completion.completionItem` (`documentationFormat` + `resolveSupport`) so
 /// servers send per-item docs / let us resolve them lazily.
+///
+/// `window.workDoneProgress` belongs to the same family of "declare it or the
+/// feature simply never happens" flags: a conforming server sends **no**
+/// `$/progress` at all unless the client has advertised that it handles it. gopls
+/// stays completely silent about its workspace load without this, so the whole
+/// progress chain — store, mirror, `LspProgress`, statusline — receives nothing and
+/// looks like a bug several layers away from the actual cause.
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..Default::default()
+        }),
         general: Some(GeneralClientCapabilities {
             position_encodings: Some(vec![
                 PositionEncodingKind::UTF8,

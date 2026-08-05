@@ -333,3 +333,148 @@ async fn the_spawn_directory_reaches_the_daemon_side_child() {
         "the remote child must run in the editor-resolved directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reconnect: the LSP leg over a link that drops and comes back.
+// ---------------------------------------------------------------------------
+
+/// The future one re-dial produces: the edit-host end of a fresh duplex.
+type DialFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<DialEnds>> + Send>>;
+type DialEnds = (
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+);
+
+/// Stands up a **fully multiplexed** daemon (`run_daemon_io` — fs *and* `lsp_*` over one
+/// ordered stream, what `--connect-daemon` really talks to) per dial, and remembers the
+/// task so the test can sever it. The reconnect suite's [`Dialer`] serves only the fs leg;
+/// this one has to carry LSP, since the resync being tested is the LSP one.
+#[derive(Clone)]
+struct LspDialer {
+    daemons: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl LspDialer {
+    fn new() -> Self {
+        LspDialer {
+            daemons: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Abort the live daemon — the edit-host sees EOF and the supervisor reacts as if the
+    /// network dropped, taking the remote language-server children with it.
+    fn sever(&self) {
+        if let Some(h) = self.daemons.lock().unwrap().last() {
+            h.abort();
+        }
+    }
+
+    fn make(&self) -> impl FnMut() -> DialFut + Send + 'static {
+        let this = self.clone();
+        move || {
+            let this = this.clone();
+            Box::pin(async move {
+                let (eh_end, daemon_end) = tokio::io::duplex(1 << 16);
+                let (dr, dw) = tokio::io::split(daemon_end);
+                let h = tokio::spawn(async move {
+                    let _ = nxvim_server::run_daemon_io(dr, dw).await;
+                });
+                this.daemons.lock().unwrap().push(h);
+                let (er, ew) = tokio::io::split(eh_end);
+                Ok((er, ew))
+            })
+        }
+    }
+}
+
+/// A snappy retry policy so the re-dial lands in milliseconds under test.
+fn fast_policy() -> nxvim_server::ReconnectPolicy {
+    nxvim_server::ReconnectPolicy {
+        max_attempts: 5,
+        base: Duration::from_millis(20),
+        cap: Duration::from_millis(60),
+    }
+}
+
+/// The ids of every client `nx.lsp.clients()` lists, sorted — the shape that shows a
+/// stale handle, which a bare count would too if it were the *only* symptom, but the ids
+/// also say *which* client survived.
+const CLIENT_IDS: &str = r#"
+(function()
+  local ids = {}
+  for _, c in ipairs(nx.lsp.clients()) do ids[#ids + 1] = c.id end
+  table.sort(ids)
+  return table.concat(ids, ",")
+end)()
+"#;
+
+/// A dropped link must leave exactly **one live client**: the respawn, with the pre-drop
+/// one retired.
+///
+/// The retirement is driven by an exit no process reported — the demux clears its inflight
+/// map on the drop, dropping the `exit_tx` so `RemoteLspProcess::wait` resolves
+/// `(None, None)` and the manager raises `ServerExited`. That synthetic exit is what keeps
+/// `resync_lsp_after_reconnect` — the one teardown that drops a server record *without*
+/// `retire_lsp_server` — from ever meeting a live record. Lose it and the resync forgets
+/// the server instead of retiring it: the client id goes in Rust, but `nx.lsp._clients` is
+/// a mirror the server has to *tell*, so the dead handle would stay and the re-`ensure`'s
+/// fresh `Initialized` would add a second one — a buffer reporting two servers with one
+/// process running, the failure `retire_lsp_server`'s own doc comment describes for
+/// `:LspStop`. (The browser twin, where the exit is synthesized furthest from any process
+/// and the same mutation reproduces that leak, is `web/verify-lsp-reconnect.mjs`.)
+#[tokio::test]
+async fn a_reconnect_leaves_exactly_one_live_client() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("daemon_lsp_reconnect");
+    arm_mock_named(&dir, "alpha", "{}");
+    let file = dir.join("a.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write test file");
+
+    let dialer = LspDialer::new();
+    let (client, handle) =
+        nxvim_server::connect_daemon_reconnecting_on(dialer.make(), fast_policy())
+            .await
+            .expect("the initial daemon dial succeeds");
+    let nxvim_server::DaemonClient {
+        host_fs,
+        lsp_transport,
+        ..
+    } = client;
+    let (rpc, _incoming) = nxvim_test_harness::spawn(ServerInit {
+        file: Some(file.to_string_lossy().into_owned()),
+        host_fs_async: Some(Box::new(host_fs)),
+        lsp_transport: Some(Box::new(lsp_transport)),
+        daemon_link: Some(handle),
+        ..Default::default()
+    });
+    nxvim_test_harness::attach(&rpc, 80, 24).await;
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, CLIENT_IDS, "1").await,
+        "one client should be attached before the link drops"
+    );
+
+    // Sever: the remote server child dies with the daemon, and the supervisor re-dials
+    // and resyncs the LSP leg against the fresh link.
+    dialer.sever();
+
+    // The respawn mints client id 2. A leaked handle shows up as `1,2` — the dead
+    // pre-drop client listed alongside the live one.
+    let ids = await_lua_eq(&rpc, CLIENT_IDS, "2").await;
+    let last = exec_lua(&rpc, &format!("return tostring({CLIENT_IDS})"))
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    disarm_mocks();
+    assert!(
+        ids,
+        "after the reconnect only the respawned client should be listed, got {last:?}"
+    );
+}

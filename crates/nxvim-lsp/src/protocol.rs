@@ -835,6 +835,106 @@ pub enum LspEvent {
         label: Option<String>,
         changes: WorkspaceEditData,
     },
+    /// A `$/progress` notification carrying a `WorkDoneProgress` payload: the
+    /// server is reporting a long-running task (indexing, loading a workspace,
+    /// building a crate graph). One task is a `begin` → `report`* → `end` sequence
+    /// sharing a `token`; a server may run several tokens at once.
+    ///
+    /// `token` is already normalized to a `String` (see [`progress_token`]) so the
+    /// editor, the Lua mirror, and the `LspProgress` autocmd payload all key on one
+    /// type regardless of which spelling the server used.
+    Progress {
+        key: ServerKey,
+        token: String,
+        update: ProgressUpdate,
+    },
+}
+
+/// Which phase of a `$/progress` sequence an update is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressKind {
+    Begin,
+    Report,
+    End,
+}
+
+impl ProgressKind {
+    /// The LSP `kind` spelling, which is also the **autocmd pattern** `LspProgress`
+    /// fires under (neovim's contract, so `pattern = "end"` narrows to completions).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgressKind::Begin => "begin",
+            ProgressKind::Report => "report",
+            ProgressKind::End => "end",
+        }
+    }
+}
+
+/// One `$/progress` update, flattened out of `lsp-types`' three-variant
+/// `WorkDoneProgress`.
+///
+/// The `Option`s mean **"the server didn't say"**, which per the spec means *keep the
+/// previous value* — not *clear it*. Only `begin` carries a `title`, and a `report`
+/// that omits `message`/`percentage` leaves whatever the last one set standing. The
+/// editor's store is what applies that rule; this type just preserves the
+/// distinction, which a struct of plain `String`s would have destroyed at the edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgressUpdate {
+    pub kind: ProgressKind,
+    /// Mandatory on `begin` (`"Indexing"`, `"Loading workspace"`), absent otherwise.
+    pub title: Option<String>,
+    /// The detail line (`"3/25 files"`, `"core/src/lib.rs"`).
+    pub message: Option<String>,
+    /// `0..=100`. Absent means the task is of unknown length (an indeterminate
+    /// spinner), or — on a `report` — that the last percentage still stands.
+    pub percentage: Option<u32>,
+    /// Whether the server would honor a `window/workDoneProgress/cancel` for this
+    /// token. Carried so a later phase can offer cancellation; nothing sends it yet.
+    pub cancellable: Option<bool>,
+}
+
+/// Normalize a `$/progress` token to the one string spelling the editor uses.
+///
+/// The wire type is a `NumberOrString` — a server may mint either, and
+/// rust-analyzer/lua_ls disagree — but nothing above the client cares which, and two
+/// token types would mean every store, mirror, and autocmd payload carrying an
+/// untagged union. Numbers become their decimal spelling. **Both clients call this**,
+/// so a token from the native leg and the same token over the wasm/daemon leg key
+/// identically.
+pub fn progress_token(token: &lsp_types::NumberOrString) -> String {
+    match token {
+        lsp_types::NumberOrString::Number(n) => n.to_string(),
+        lsp_types::NumberOrString::String(s) => s.clone(),
+    }
+}
+
+/// Flatten `lsp-types`' tagged `WorkDoneProgress` into the editor's
+/// [`ProgressUpdate`]. The other half of [`progress_token`]'s "both clients decode
+/// identically" guarantee.
+pub fn progress_update(value: &lsp_types::WorkDoneProgress) -> ProgressUpdate {
+    match value {
+        lsp_types::WorkDoneProgress::Begin(b) => ProgressUpdate {
+            kind: ProgressKind::Begin,
+            title: Some(b.title.clone()),
+            message: b.message.clone(),
+            percentage: b.percentage,
+            cancellable: b.cancellable,
+        },
+        lsp_types::WorkDoneProgress::Report(r) => ProgressUpdate {
+            kind: ProgressKind::Report,
+            title: None,
+            message: r.message.clone(),
+            percentage: r.percentage,
+            cancellable: r.cancellable,
+        },
+        lsp_types::WorkDoneProgress::End(e) => ProgressUpdate {
+            kind: ProgressKind::End,
+            title: None,
+            message: e.message.clone(),
+            percentage: None,
+            cancellable: None,
+        },
+    }
 }
 
 /// Which decoration a [`LspEvent::WorkspaceRefresh`] asks the editor to re-query.

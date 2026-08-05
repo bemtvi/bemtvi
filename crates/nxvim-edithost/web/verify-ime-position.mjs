@@ -31,7 +31,7 @@ function chromiumPath() {
   if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
   const home = process.env.HOME || "";
   const pats = [
-    `${home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome`,
+    `${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`,
     `${home}/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/*`,
   ];
   for (const p of pats) {

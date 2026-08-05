@@ -27,7 +27,7 @@ const PORT = 8159;
 function chromiumPath() {
   if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
   const home = process.env.HOME || "";
-  const found = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome`).sort();
+  const found = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`).sort();
   if (found.length) return found[found.length - 1];
   // macOS: fall back to Playwright's own bundled Chromium for Testing.
   return undefined; // let Playwright resolve its installed browser

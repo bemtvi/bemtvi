@@ -23,7 +23,7 @@ function chromiumPath() {
   if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
   const home = process.env.HOME || "";
   const found = [
-    ...globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome`),
+    ...globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`),
     ...globSync(`${home}/Library/Caches/ms-playwright/chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`),
   ].sort();
   return found.length ? found[found.length - 1] : undefined;

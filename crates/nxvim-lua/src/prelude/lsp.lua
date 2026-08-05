@@ -39,6 +39,10 @@ nx.lsp._clients = nx.lsp._clients or {}
 -- bufnr -> { client_id = true } — which clients have attached to which buffer,
 -- maintained by the LspAttach/LspDetach hooks so `nx.lsp.clients({bufnr})` filters.
 nx.lsp._attached = nx.lsp._attached or {}
+-- client id -> the list of `$/progress` tasks that client is running RIGHT NOW
+-- (`nx.lsp._set_progress` replaces the whole list per update; the server clears the
+-- slot when the last task ends and when the server exits). Read by `nx.lsp.progress`.
+nx.lsp._progress = nx.lsp._progress or {}
 
 -- ----- small helpers ---------------------------------------------------------
 
@@ -1468,6 +1472,85 @@ function nx.lsp.clients(filter)
   return out
 end
 
+-- `nx.lsp.progress(filter)`: the `$/progress` work language servers are running
+-- **right now** — what a statusline renders as "lua_ls: Indexing 43%".
+--
+-- Servers report long tasks (indexing, loading a workspace, building a crate graph)
+-- as a `begin` → `report`* → `end` sequence sharing a token; nxvim folds that stream
+-- into settled records, so this returns a flat list of what is in flight, newest
+-- task last:
+--
+-- ```lua
+-- for _, p in ipairs(nx.lsp.progress()) do
+--   print(("%s: %s %s%s"):format(
+--     p.client_name, p.title, p.message or "", p.percentage and (" " .. p.percentage .. "%%") or ""))
+-- end
+-- ```
+--
+-- Each item is:
+--
+-- ```
+-- client_id    the reporting client (resolve with `nx.lsp.client_by_id`)
+-- client_name  its config name (`"lua_ls"`)
+-- token        the task's `$/progress` token, unique within the client
+-- title        the `begin` title (`"Indexing"`); `""` if the server never began
+-- message      the detail line (`"3/25 files"`), or nil
+-- percentage   0-100, or nil for an indeterminate task (show a spinner, not a bar)
+-- cancellable  whether the server would honor a cancel for this token
+-- ```
+--
+-- `filter.client_id` narrows to one client; `filter.bufnr` (`0` = current) narrows to
+-- the clients attached to that buffer, which is what a per-window statusline wants —
+-- a busy server serving some *other* buffer isn't this buffer's status.
+--
+-- The order is STABLE: clients ascending by id (so the longest-running server's work
+-- comes first), and within a client the order the tasks began. A renderer showing only
+-- the first task therefore keeps showing the same one across updates.
+--
+-- The list is EMPTY when nothing is in flight (a finished task is removed, not left
+-- at 100%), and a server that exits mid-task takes its entries with it. Reads the
+-- mirror — no request is issued. `LspProgress` fires on every update, with the kind
+-- (`"begin"` / `"report"` / `"end"`) as the autocmd pattern, so a renderer invalidates
+-- on the event and reads through here rather than polling.
+function nx.lsp.progress(filter)
+  filter = filter or {}
+  local want = nil
+  if filter.bufnr ~= nil then
+    want = nx.lsp._attached[cur_bufnr(filter.bufnr)] or {}
+  end
+  -- `pairs` over the mirror is UNORDERED — it walks a client-id-keyed table, and once
+  -- the ids sit in the hash part (any session where an earlier client has stopped) it
+  -- yields whichever client reported first. Walk the ids sorted instead, so the list
+  -- doesn't reshuffle under a renderer that shows only `[1]`.
+  local ids = {}
+  for id in pairs(nx.lsp._progress) do
+    ids[#ids + 1] = id
+  end
+  table.sort(ids)
+  local out = {}
+  for _, id in ipairs(ids) do
+    local tasks = nx.lsp._progress[id]
+    local client = nx.lsp._clients[id]
+    local keep = client ~= nil
+      and (filter.client_id == nil or filter.client_id == id)
+      and (want == nil or want[id] == true)
+    if keep then
+      for _, t in ipairs(tasks) do
+        out[#out + 1] = {
+          client_id = id,
+          client_name = client.name,
+          token = t.token,
+          title = t.title,
+          message = t.message,
+          percentage = t.percentage,
+          cancellable = t.cancellable,
+        }
+      end
+    end
+  end
+  return out
+end
+
 -- Resolve the client a `nx.lsp.request` / `nx.lsp.notify` goes to. `target` is a
 -- bufnr (`0`/nil = current) or a `{ bufnr =, name = }` table — `name` routes to that
 -- config's client rather than "whichever attached one comes first", which on a
@@ -1798,12 +1881,22 @@ function nx.lsp._set_client(id, name, capabilities, offset_encoding)
   end
 end
 
--- A server exited: forget its handle and drop it from every buffer's attach set.
+-- A server exited: forget its handle, drop it from every buffer's attach set, and
+-- drop whatever it was in the middle of. A dead server's half-finished "Indexing
+-- 40%" would otherwise sit on the statusline forever — its `end` is never coming.
 function nx.lsp._remove_client(id)
   nx.lsp._clients[id] = nil
+  nx.lsp._progress[id] = nil
   for _, set in pairs(nx.lsp._attached) do
     set[id] = nil
   end
+end
+
+-- The server pushed this client's live `$/progress` tasks (the whole list, already
+-- folded from the begin/report/end stream). An empty list clears the slot, so
+-- `nx.lsp.progress()` lists only what is running right now.
+function nx.lsp._set_progress(id, tasks)
+  nx.lsp._progress[id] = (tasks and #tasks > 0) and tasks or nil
 end
 
 -- Right after the client is mirrored: run the config's `on_init(client, result)`

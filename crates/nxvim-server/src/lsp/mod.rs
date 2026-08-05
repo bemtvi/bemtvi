@@ -816,6 +816,31 @@ pub(crate) struct ServerRuntime {
     signature_trigger_chars: Vec<char>,
 }
 
+/// One live `$/progress` task of one server: the accumulated state of a
+/// `begin` → `report`* sequence that has not yet seen its `end`.
+///
+/// Accumulated rather than last-write, because the protocol's fields are
+/// **sticky**: `title` arrives only on `begin`, and a `report` that omits
+/// `message`/`percentage` means "the previous value still stands" — so folding an
+/// update in patches only what it actually carried. A naive overwrite would blank
+/// the title on the first report, which is precisely the frame a statusline renders.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressEntry {
+    /// The `$/progress` token, normalized to a string by the client. Identifies the
+    /// task within its server; unique only per server, so the store is keyed by both.
+    pub token: String,
+    /// The `begin`'s title (`"Indexing"`). Empty for a server that reported without
+    /// ever beginning — accepted rather than dropped, so a non-conforming server
+    /// still shows activity.
+    pub title: String,
+    /// The latest detail line the server sent, `None` if it never sent one.
+    pub message: Option<String>,
+    /// The latest percentage (`0..=100`), `None` for an indeterminate task.
+    pub percentage: Option<u32>,
+    /// Whether the server would honor a cancel for this token.
+    pub cancellable: bool,
+}
+
 /// Human label for a negotiated position encoding (matches the LSP wire names).
 pub(crate) fn encoding_label(encoding: PositionEncoding) -> &'static str {
     match encoding {

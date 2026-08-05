@@ -1927,6 +1927,29 @@ pub struct LspClientData {
     pub offset_encoding: String,
 }
 
+/// One live `$/progress` task mirrored into `nx.lsp._progress[client_id]`, the read
+/// side of `nx.lsp.progress()`.
+///
+/// The server folds the protocol's sticky `begin`/`report` fields into this settled
+/// shape before it crosses, so Lua reads a plain "what is this server doing right
+/// now" record and never has to reconstruct state from a stream of partial updates.
+#[derive(Clone, Debug)]
+pub struct LspProgressData {
+    /// The `$/progress` token, normalized to a string. Identifies the task within
+    /// its client for the lifetime of the `begin` → `end` sequence.
+    pub token: String,
+    /// The `begin`'s title (`"Indexing"`, `"Loading workspace"`); empty when the
+    /// server reported without ever beginning.
+    pub title: String,
+    /// The latest detail line (`"3/25 files"`), `None` when the server sent none.
+    pub message: Option<String>,
+    /// The latest percentage, `0..=100`. `None` means an indeterminate task — a
+    /// renderer shows a spinner rather than a bar.
+    pub percentage: Option<u32>,
+    /// Whether the server would honor a cancel for this token.
+    pub cancellable: bool,
+}
+
 /// The per-feature provider flags of an [`LspClientData`], one bool per feature
 /// nxvim implements. The server fills these from `nxvim_lsp::ProviderCaps`.
 #[derive(Clone, Debug, Default)]

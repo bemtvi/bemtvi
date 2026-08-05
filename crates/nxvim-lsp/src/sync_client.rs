@@ -36,9 +36,9 @@ use std::collections::HashMap;
 
 use lsp_types::{
     CompletionItem, CompletionResponse, ConfigurationParams, DocumentSymbolResponse, FoldingRange,
-    GotoDefinitionResponse, Hover, InitializeResult, InlayHint, Location, PublishDiagnosticsParams,
-    SemanticTokensFullDeltaResult, SemanticTokensResult, ShowMessageParams, SignatureHelp,
-    TextEdit, Url, WorkspaceSymbolResponse,
+    GotoDefinitionResponse, Hover, InitializeResult, InlayHint, Location, ProgressParams,
+    ProgressParamsValue, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
+    SemanticTokensResult, ShowMessageParams, SignatureHelp, TextEdit, Url, WorkspaceSymbolResponse,
 };
 use serde_json::{json, Value};
 
@@ -51,8 +51,8 @@ use crate::convert::{
 };
 use crate::log::LspLog;
 use crate::protocol::{
-    ApplyEditOutcome, LspEvent, LspNotify, LspReply, LspRequest, RefreshKind, ReqToken, ServerKey,
-    ServerSpawn,
+    progress_token, progress_update, ApplyEditOutcome, LspEvent, LspNotify, LspReply, LspRequest,
+    RefreshKind, ReqToken, ServerKey, ServerSpawn,
 };
 
 /// One raw operation the wasm host forwards to the daemon's LSP leg. `Spawn`/`Kill`
@@ -662,8 +662,22 @@ impl SyncLspClient {
                     });
                 }
             }
-            // `window/logMessage`, progress, telemetry, custom notifications: ignore
-            // (the log-only sinks the native client has are absent here).
+            // `$/progress`: a long-running server task (indexing, workspace load).
+            // Decoded through the SAME `progress_token`/`progress_update` helpers the
+            // native router uses, so the browser leg produces byte-identical events —
+            // the tier-1 rule (a remote session is not a degraded one).
+            "$/progress" => {
+                if let Ok(p) = serde_json::from_value::<ProgressParams>(params) {
+                    let ProgressParamsValue::WorkDone(value) = &p.value;
+                    self.events.push(LspEvent::Progress {
+                        key: key.clone(),
+                        token: progress_token(&p.token),
+                        update: progress_update(value),
+                    });
+                }
+            }
+            // `window/logMessage`, telemetry, custom notifications: ignore (the
+            // log-only sinks the native client has are absent here).
             _ => {}
         }
     }

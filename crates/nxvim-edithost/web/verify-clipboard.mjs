@@ -21,13 +21,13 @@ const PORT = 8108;
 const ORIGIN = `http://localhost:${PORT}`;
 
 // Prefer an explicit Chromium (PW_CHROMIUM), else the newest ms-playwright build for this
-// platform (linux `chrome-linux/chrome` or macOS `chrome-mac/Chromium.app/...`), else
+// platform (linux `chrome-linux*/chrome` or macOS `chrome-mac/Chromium.app/...`), else
 // Playwright's bundled default.
 function chromiumPath() {
   if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
   const home = process.env.HOME || "";
   const pats = [
-    `${home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome`,
+    `${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`,
     `${home}/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/*`,
   ];
   for (const p of pats) {

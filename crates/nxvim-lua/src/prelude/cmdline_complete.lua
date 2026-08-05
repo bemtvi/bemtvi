@@ -575,6 +575,7 @@ local AUTOCMD_EVENTS = {
   -- LSP
   "LspAttach",
   "LspDetach",
+  "LspProgress",
   -- Files & environment
   "ColorScheme",
   "DirChanged",

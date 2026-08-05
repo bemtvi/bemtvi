@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 
 use nxvim_core::BufferId;
 use nxvim_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentSyncKind, Url};
-use nxvim_lsp::{LspEvent, LspNotify, LspReply, PositionEncoding, RefreshKind, ServerKey};
-use nxvim_lua::{LspClientData, LspOp};
+use nxvim_lsp::{
+    LspEvent, LspNotify, LspReply, PositionEncoding, ProgressKind, ProgressUpdate, RefreshKind,
+    ServerKey,
+};
+use nxvim_lua::{LspClientData, LspOp, LspProgressData};
 
 use super::*;
 use crate::EditHost;
@@ -349,6 +352,19 @@ impl EditHost {
             self.fx.lsp_shutdown(key.clone());
             self.lsp_ensured.remove(&key);
             self.lsp_servers.remove(&key);
+            // The record goes, so its live tasks go with it. Defence in depth for the
+            // phantom-entry branch this loop exists for: a server whose exit was never
+            // reported is dropped here WITHOUT `retire_lsp_server`, and the store is
+            // keyed by `ServerKey` — which the re-`ensure` below reuses. Left behind,
+            // the dead process's half-finished task would be republished under the
+            // FRESH client id by the `Initialized` mirror push, with its `end` never
+            // coming. Both legs do synthesize an exit on a link drop today (the native
+            // demux drops the `exit_tx`; the Worker pushes a synthetic `lsp_exited`),
+            // so in practice `retire_lsp_server` has already cleared this — but that is
+            // the synthesizers' guarantee, not this teardown's, and this teardown is
+            // the one that runs when they don't. Guarded by
+            // `web/verify-lsp-reconnect.mjs`.
+            self.lsp_progress.remove(&key);
             if let Some(spawn) = self.lsp_spawns.get(&key).cloned() {
                 self.fx.lsp_ensure(key.clone(), spawn);
                 self.lsp_ensured.insert(key);
@@ -427,6 +443,10 @@ impl EditHost {
             self.editor
                 .echo(format!("E5108: Error in LSP on_exit: {e}"));
         }
+        // Whatever the server was in the middle of dies with it: its `end` is never
+        // coming, so a half-finished "Indexing 40%" would sit on the bar forever.
+        // (`remove_lsp_client` clears the Lua mirror slot for the same reason.)
+        self.lsp_progress.remove(key);
         let _ = self.lua.remove_lsp_client(client_id);
     }
 
@@ -1009,6 +1029,11 @@ impl EditHost {
                     offset_encoding: encoding_label(encoding).to_string(),
                 };
                 let _ = self.lua.set_lsp_client(&client);
+                // Publish any progress that arrived before the client id existed (the
+                // `on_lsp_progress` early-return case). Normally a no-op: it pushes an
+                // empty list for a fresh server, which clears the mirror slot — exactly
+                // right for a RESPAWN, whose predecessor's tasks are dead.
+                self.push_lsp_progress_mirror(&key, client_id);
                 // Run the config's on_init(client, result) hook (Phase 3) now that
                 // the client is mirrored — it can read what the server advertised.
                 if let Err(e) = self.lua.run_lsp_on_init(client_id, &init_result) {
@@ -1144,7 +1169,111 @@ impl EditHost {
                 label,
                 changes,
             } => self.on_apply_edit(key, id, label, changes),
+            LspEvent::Progress { key, token, update } => self.on_lsp_progress(key, token, update),
         }
+    }
+
+    /// Fold one `$/progress` update into the server's live-task store, mirror the
+    /// result to Lua, and fire `LspProgress`.
+    ///
+    /// The folding is where the protocol's **sticky-field** rule lives: `title`
+    /// arrives only on `begin`, and an absent `message`/`percentage` on a `report`
+    /// means "unchanged", not "cleared" — so a report patches only the fields it
+    /// actually carried. Getting this wrong blanks the title on the first report,
+    /// which is the frame a statusline spends most of its time rendering.
+    ///
+    /// A `report` for a token with no `begin` is accepted with an empty title rather
+    /// than dropped: some servers in the wild skip the begin, and showing *something*
+    /// beats showing nothing for a server that is visibly busy.
+    fn on_lsp_progress(&mut self, key: ServerKey, token: String, update: ProgressUpdate) {
+        let tasks = self.lsp_progress.entry(key.clone()).or_default();
+        let at = tasks.iter().position(|t| t.token == token);
+        match update.kind {
+            ProgressKind::Begin | ProgressKind::Report => {
+                let entry = match at {
+                    Some(i) => &mut tasks[i],
+                    None => {
+                        tasks.push(ProgressEntry {
+                            token: token.clone(),
+                            title: String::new(),
+                            message: None,
+                            percentage: None,
+                            cancellable: false,
+                        });
+                        tasks.last_mut().expect("just pushed")
+                    }
+                };
+                // `Option::is_some` guards, not `unwrap_or(previous)`: only a field the
+                // server actually sent overwrites the stored one.
+                if let Some(title) = &update.title {
+                    entry.title = title.clone();
+                }
+                if update.message.is_some() {
+                    entry.message = update.message.clone();
+                }
+                if update.percentage.is_some() {
+                    entry.percentage = update.percentage;
+                }
+                if let Some(c) = update.cancellable {
+                    entry.cancellable = c;
+                }
+            }
+            // The task is over: drop it, and drop the server's whole entry once it has
+            // nothing running, so `lsp_progress` doesn't accumulate empty vectors for
+            // every server that ever indexed anything.
+            ProgressKind::End => {
+                if let Some(i) = at {
+                    tasks.remove(i);
+                }
+                if tasks.is_empty() {
+                    self.lsp_progress.remove(&key);
+                }
+            }
+        }
+        let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) else {
+            // A server reporting progress before its `initialize` reply landed has no
+            // client id yet, so there is nothing Lua could key the mirror on. The store
+            // above still holds the task; the next update (or the `Initialized` mirror
+            // push) publishes it.
+            return;
+        };
+        self.push_lsp_progress_mirror(&key, client_id);
+        // Repaint: the statusline segment riding `LspProgress` re-renders on the
+        // coalesced frame rather than one per report (a server can report per file).
+        self.lsp_dirty = true;
+        let r = self.lua.fire_lsp_progress(
+            client_id,
+            &token,
+            update.kind.as_str(),
+            update.title.as_deref(),
+            update.message.as_deref(),
+            update.percentage,
+            update.cancellable.unwrap_or(false),
+            self.editor.current_buffer_id().0,
+        );
+        self.report_autocmd_err("LspProgress", r);
+        self.apply_lua_effects();
+    }
+
+    /// Push one server's live-task list into `nx.lsp._progress[client_id]` (or clear
+    /// the slot when it has none). The read side of `nx.lsp.progress()` — Lua never
+    /// touches the Rust store, exactly as with diagnostics and clients.
+    pub(crate) fn push_lsp_progress_mirror(&self, key: &ServerKey, client_id: u64) {
+        let tasks = self.lsp_progress.get(key);
+        let data: Vec<LspProgressData> = tasks
+            .map(|t| {
+                t.iter()
+                    .map(|e| LspProgressData {
+                        token: e.token.clone(),
+                        title: e.title.clone(),
+                        message: e.message.clone(),
+                        percentage: e.percentage,
+                        cancellable: e.cancellable,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = self.lua.set_lsp_progress(client_id, &data);
     }
 
     /// Honor a server→client `workspace/{inlayHint,semanticTokens}/refresh`: the

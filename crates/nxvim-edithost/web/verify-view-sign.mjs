@@ -17,7 +17,7 @@ const PORT = 8098;
 function chromiumPath() {
   if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
   const home = process.env.HOME || "";
-  const lin = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome`).sort();
+  const lin = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`).sort();
   if (lin.length) return lin[lin.length - 1];
   const mac = globSync(`${home}/Library/Caches/ms-playwright/chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`).sort();
   return mac.length ? mac[mac.length - 1] : undefined;

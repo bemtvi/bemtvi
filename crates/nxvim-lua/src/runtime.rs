@@ -19,8 +19,8 @@ use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
     BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish,
     DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue, GitValue, GlobalOptionOp, HlSet,
-    HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, NamedListOp,
-    PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
+    HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspProgressData,
+    NamedListOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
     SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
     TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
     WindowOp, WorkspaceOptionOp,
@@ -1673,6 +1673,64 @@ impl LuaRuntime {
             caps,
             client.offset_encoding.clone(),
         ))
+    }
+
+    /// Mirror one client's live `$/progress` tasks into `nx.lsp._progress[id]` —
+    /// the whole list, replacing whatever was there, so a task that ended simply
+    /// isn't in the new list. An empty list clears the slot, which is what makes
+    /// `nx.lsp.progress()` mean "busy right now" rather than "was busy once".
+    pub fn set_lsp_progress(&self, id: u64, tasks: &[LspProgressData]) -> mlua::Result<()> {
+        let lsp: Table = self.nx()?.get("lsp")?;
+        let set: mlua::Function = lsp.get("_set_progress")?;
+        let list = self.lua.create_table()?;
+        for (i, t) in tasks.iter().enumerate() {
+            let e = self.lua.create_table()?;
+            e.set("token", t.token.clone())?;
+            e.set("title", t.title.clone())?;
+            // `nil` rather than `""`/`0` for an unsent field: a renderer has to tell
+            // "no detail line" from an empty one, and an indeterminate task (no
+            // percentage) from one genuinely sitting at 0%.
+            e.set("message", t.message.clone())?;
+            e.set("percentage", t.percentage)?;
+            e.set("cancellable", t.cancellable)?;
+            list.set(i + 1, e)?;
+        }
+        set.call((id, list))
+    }
+
+    /// Fire `LspProgress` for one `$/progress` update, with the update's `kind` as
+    /// the autocmd **pattern** (`"begin"` / `"report"` / `"end"`) and the whole
+    /// payload as `args.data`. Neovim's `LspProgress` uses the kind as the pattern
+    /// exactly this way, so `nx.autocmd.create("LspProgress", { pattern = "end", … })`
+    /// — and `nx.statusline`'s `"LspProgress end"` two-word event spelling — narrow
+    /// as a config author expects.
+    ///
+    /// Distinct from [`Self::fire_autocmd_data`], which can only carry a `client_id`.
+    /// `buf` is the current buffer so a handler has the usual `args.buf` context;
+    /// progress is a *server*-wide fact, not a buffer's, so it is context rather than
+    /// the subject.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fire_lsp_progress(
+        &self,
+        client_id: u64,
+        token: &str,
+        kind: &str,
+        title: Option<&str>,
+        message: Option<&str>,
+        percentage: Option<u32>,
+        cancellable: bool,
+        buf: u64,
+    ) -> mlua::Result<()> {
+        let fire: mlua::Function = self.nx()?.get("_fire")?;
+        let data = self.lua.create_table()?;
+        data.set("client_id", client_id)?;
+        data.set("token", token)?;
+        data.set("kind", kind)?;
+        data.set("title", title)?;
+        data.set("message", message)?;
+        data.set("percentage", percentage)?;
+        data.set("cancellable", cancellable)?;
+        fire.call(("LspProgress", kind, buf, "", data))
     }
 
     /// Forget an LSP client (`nx.lsp._clients[id] = nil`) when its server exits,

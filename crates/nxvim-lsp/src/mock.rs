@@ -21,6 +21,13 @@
 //!   message}`). When set, the mock pushes a `textDocument/publishDiagnostics`
 //!   notification for a document the moment it receives that document's
 //!   `didOpen`, so a test can assert the editor renders them.
+//! - `progress`: an array of `$/progress` params (`{token, value}`, where `value`
+//!   is a `WorkDoneProgress` — `{kind: "begin", title, …}` / `{kind: "report", …}` /
+//!   `{kind: "end", …}`). Replayed in order, once, on the first `didOpen`, so a test
+//!   drives a real begin/report/end sequence deterministically: a script that stops
+//!   at a `report` leaves the task *running* (observable via `nx.lsp.progress()`),
+//!   one that includes its `end` leaves the store empty. Several tokens may be
+//!   interleaved in the one array, as a real server does.
 //! - `definition` / `declaration` / `type_definition` / `implementation` /
 //!   `references`: the scripted result returned verbatim for the matching
 //!   `textDocument/*` request (a `Location`, an array of `Location`s, or — for
@@ -172,6 +179,19 @@ pub fn run(script_path: &str) {
     // response is the editor's `{applied, failureReason?}`, which a test reads to
     // prove the edit was really applied (not merely acked).
     let mut apply_req_id: Option<i64> = None;
+    // Whether the `progress` script has been replayed (once per session, on the first
+    // `didOpen`) — see the `textDocument/didOpen` arm.
+    let mut progress_sent = false;
+    // The `window/workDoneProgress/create` requests still awaiting the client's answer,
+    // as request id → token, and the tokens whose create the client REFUSED. A real
+    // server reads that answer: gopls sends no `$/progress` for a token the client
+    // would not create, so the mock doesn't either — that is what makes "did the editor
+    // ack the create?" observable rather than assumed.
+    let mut progress_creates: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::new();
+    let mut progress_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The scripted `$/progress` payloads, held until every create is answered.
+    let mut progress_queue: Vec<Value> = Vec::new();
 
     while let Some(msg) = read_message(&mut reader) {
         // A response to one of our server→client requests (it has an `id` but no
@@ -184,6 +204,31 @@ pub fn run(script_path: &str) {
             }
             if rid.is_some() && rid == apply_req_id {
                 append_record(&script, "_apply_edit_response", msg.get("result"));
+            }
+            // The answer to a `window/workDoneProgress/create`. An `error` reply (what
+            // async-lsp's method-not-found default produces for an unmodelled request)
+            // means the client can't do progress for that token, so its updates are
+            // dropped — the same conclusion gopls draws.
+            if let Some(token) = rid.and_then(|r| progress_creates.remove(&r)) {
+                if msg.get("error").is_some() {
+                    progress_denied.insert(token);
+                }
+                if progress_creates.is_empty() && !progress_queue.is_empty() {
+                    for params in std::mem::take(&mut progress_queue) {
+                        let token = progress_token_key(params.get("token"));
+                        if progress_denied.contains(&token) {
+                            continue;
+                        }
+                        write_message(
+                            &stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "$/progress",
+                                "params": params,
+                            }),
+                        );
+                    }
+                }
             }
             continue;
         }
@@ -252,6 +297,48 @@ pub fn run(script_path: &str) {
                                 "params": { "uri": uri, "diagnostics": diagnostics },
                             }),
                         );
+                    }
+                }
+                // `progress`: replay the scripted `$/progress` sequence, in order, on
+                // the FIRST document opened. Ordered and eager (rather than timed) so
+                // a test observes one deterministic end state: a script that stops at
+                // a `report` leaves the task running and observable, and one that
+                // includes its `end` leaves the store empty. Emitted only once — a
+                // second buffer opening must not restart a finished task.
+                if !progress_sent {
+                    if let Some(items) = script.get("progress").and_then(Value::as_array) {
+                        progress_sent = true;
+                        // Ask permission per distinct token FIRST, exactly as gopls
+                        // does, and hold the updates until the client has answered
+                        // every one. A client that errors a create gets nothing.
+                        // Keyed by the token's canonical spelling, but the create
+                        // carries the token VERBATIM: the wire type is a
+                        // `NumberOrString`, and a mock that stringified a numeric
+                        // token would ask permission for a token it then never
+                        // reports under, so a numeric-token test would exercise a
+                        // shape no real server sends.
+                        let mut tokens: Vec<(String, Value)> = Vec::new();
+                        for params in items {
+                            let raw = params.get("token").cloned().unwrap_or(Value::Null);
+                            let token = progress_token_key(Some(&raw));
+                            if !tokens.iter().any(|(k, _)| *k == token) {
+                                tokens.push((token, raw));
+                            }
+                        }
+                        progress_queue = items.clone();
+                        for (token, raw) in tokens {
+                            write_message(
+                                &stdout,
+                                &json!({
+                                    "jsonrpc": "2.0",
+                                    "id": next_id,
+                                    "method": "window/workDoneProgress/create",
+                                    "params": { "token": raw },
+                                }),
+                            );
+                            progress_creates.insert(next_id, token);
+                            next_id += 1;
+                        }
                     }
                 }
             }
@@ -477,6 +564,19 @@ pub fn run(script_path: &str) {
                 }
             }
         }
+    }
+}
+
+/// The mock's own bookkeeping key for a scripted `$/progress` token — the same
+/// decimal-spelling normalization the editor's `progress_token` applies, so a script
+/// may mint either half of the wire's `NumberOrString` and the "which token did the
+/// client refuse?" tracking still tells two numeric tokens apart. A token the script
+/// omitted keys as `""`.
+fn progress_token_key(token: Option<&Value>) -> String {
+    match token {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
     }
 }
 

@@ -38,6 +38,10 @@ function chromiumPath() {
       for (const rel of [
         "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
         "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        // Playwright renamed the Linux payload dir `chrome-linux` → `chrome-linux64`
+        // (and ships `chrome-linux-arm64`); try each, newest layout first.
+        "chrome-linux64/chrome",
+        "chrome-linux-arm64/chrome",
         "chrome-linux/chrome",
       ]) {
         const p = join(root, b, rel);

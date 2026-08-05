@@ -190,7 +190,7 @@ use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::Keymaps;
 use lsp::{
     DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspFanout, LspReqKind,
-    PendingLspReq, PendingMultiReq, ServerRuntime,
+    PendingLspReq, PendingMultiReq, ProgressEntry, ServerRuntime,
 };
 use nxvim_core::{
     BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, PluginEntry, PluginNamespace,
@@ -944,6 +944,13 @@ pub struct EditHost {
     /// Negotiated runtime state (encoding, sync kind) per started server, learned
     /// from each `initialize` reply.
     lsp_servers: HashMap<ServerKey, ServerRuntime>,
+    /// Live `$/progress` tasks per server, in first-sighting order (a server may run
+    /// several at once — rust-analyzer routinely does). A task is added on `begin`,
+    /// patched on `report`, and removed on `end`, so the list is exactly "what this
+    /// server is busy with right now"; a server that exits drops its entry with its
+    /// runtime, so a crash can't strand a spinner. Mirrored to
+    /// `nx.lsp._progress[client_id]` for `nx.lsp.progress()`.
+    lsp_progress: HashMap<ServerKey, Vec<ProgressEntry>>,
     /// Whether the user opted into the **signature-help auto-trigger**
     /// (`nx.lsp.signature_help_autotrigger(true)`). It's the latch the per-buffer
     /// trigger set hangs off: when set, an attaching server's advertised trigger chars
@@ -1621,6 +1628,7 @@ impl EditHost {
             resolved_ts_langs: HashSet::new(),
             lsp_states: HashMap::new(),
             lsp_servers: HashMap::new(),
+            lsp_progress: HashMap::new(),
             signature_auto: false,
             lsp_ensured: HashSet::new(),
             lsp_spawns: HashMap::new(),

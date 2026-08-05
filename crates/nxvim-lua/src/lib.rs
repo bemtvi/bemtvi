@@ -50,10 +50,10 @@ pub use ops::{
     DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsError, FsJob,
     FsValue, GitError, GitHunk, GitJob, GitStatusEntry, GitValue, GlobalOptionOp, HlSet, HttpError,
     HttpMountError, HttpRequest, HttpResponse, HttpServerReply, HttpServerRequest,
-    InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspServerCapabilities, NamedListOp,
-    OpenTarget, OptionValue, PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq,
-    ViewOp, VirtChunkData, VirtDecorData, WindowOp,
+    InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspProgressData,
+    LspServerCapabilities, NamedListOp, OpenTarget, OptionValue, PanelOp, QfItem, QfSetOp,
+    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp,
+    TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
     extract_prelude, BoGlobalMirror, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete,

@@ -195,6 +195,7 @@ no autocmd listens for them they cost nothing.
 | --- | --- | --- |
 | `LspAttach` | A language server attaches to a buffer. | `data = { client_id = … }`. |
 | `LspDetach` | A language server detaches from a buffer. | `data = { client_id = … }`. |
+| `LspProgress` | A server reports on long-running work (`$/progress`) — indexing, loading a workspace. | The **pattern is the kind** (`begin` / `report` / `end`), so `pattern = "end"` narrows to completions. `data = { client_id, token, kind, title, message, percentage, cancellable }`, with `nil` for a field the server didn't send. Read the settled state with `nx.lsp.progress()` rather than accumulating updates yourself. |
 
 ## Files & environment
 

@@ -56,9 +56,9 @@ pub use lsp_types;
 pub use convert::{normalize_workspace_edit_value, try_normalize_workspace_edit_value};
 pub use protocol::{
     ApplyEditOutcome, ChangeAnnotationData, CodeActionData, CompletionItemData, FoldRangeData,
-    InlayHintData, LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ProviderCaps,
-    RefreshKind, ReqToken, SemanticLegend, SemanticTokensData, ServerCaps, ServerKey, ServerSpawn,
-    SymbolData, WorkspaceChange, WorkspaceEditData,
+    InlayHintData, LspEvent, LspNotify, LspReply, LspRequest, PositionEncoding, ProgressKind,
+    ProgressUpdate, ProviderCaps, RefreshKind, ReqToken, SemanticLegend, SemanticTokensData,
+    ServerCaps, ServerKey, ServerSpawn, SymbolData, WorkspaceChange, WorkspaceEditData,
 };
 pub use serde_json;
 

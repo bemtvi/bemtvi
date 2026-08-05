@@ -205,6 +205,20 @@ impl Editor {
         self.complete_config = config;
     }
 
+    /// Whether the **open** completion popup belongs to a manual session — one an
+    /// explicit trigger started, which therefore keeps following the prefix as the
+    /// user types even with `auto` off. False when no popup is open, so a session can
+    /// never outlive its popup and resurrect a later auto-opened one.
+    pub(crate) fn complete_manual_session(&self) -> bool {
+        self.complete_manual_session && self.completion_active()
+    }
+
+    /// End any manual completion session — called wherever the completion popup
+    /// closes (abort, accept, a typed key that matched nothing, leaving insert).
+    pub(crate) fn end_complete_manual_session(&mut self) {
+        self.complete_manual_session = false;
+    }
+
     /// Whether the docs float should wrap a doc line wider than its width (the
     /// configured `docs_wrap`, default on) rather than truncating at the edge.
     pub fn complete_docs_wrap(&self) -> bool {
@@ -270,6 +284,14 @@ impl Editor {
     /// there, even an empty one (which offers every buffer word). Still a no-op
     /// when the engine is disabled, the LSP pmenu is up, or we are not in insert
     /// mode. No matches closes any open popup.
+    ///
+    /// Opening this way starts a **manual session**: the popup then follows the
+    /// prefix through the edits that follow — narrowing as you type, widening as you
+    /// backspace — even with `auto = false`, until it closes (accept, abort, `<Esc>`,
+    /// or a prefix nothing matches). Each of those refreshes runs back through here,
+    /// so the whole session keeps the manual contract: `min_chars` stays bypassed and
+    /// the top row stays preselected, so a confirm key accepts without a separate
+    /// navigation step.
     pub fn complete_manual_trigger(&mut self) {
         if !self.complete_config.enabled || !self.mode.is_insert() {
             return;
@@ -321,6 +343,11 @@ impl Editor {
             has_async,
             buffer_priority,
         );
+        // A manual open starts (or continues) a manual *session*: the popup follows the
+        // prefix through the edits that follow, even with `auto` off. Derived here from
+        // what actually opened, so a manual trigger that matched nothing leaves no
+        // session behind for the next keystroke to resurrect.
+        self.complete_manual_session = preselect && self.completion_active();
         if has_async && self.completion_active() {
             self.complete_query_changes.push((
                 gen,

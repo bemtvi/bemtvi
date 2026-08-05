@@ -326,6 +326,70 @@ async fn trigger_key_opens_the_popup() {
     assert_eq!(lines(&rpc).await, vec!["hello", "he"]);
 }
 
+/// A manual trigger opens a **session**: with `auto = false` the popup keeps
+/// following the prefix as you type (vim's ins-completion narrows its menu the same
+/// way) instead of dying on the next keystroke with nothing left to reopen it. The
+/// session ends when the popup does — abort it and typing no longer resurrects it.
+#[tokio::test]
+async fn manual_trigger_follows_the_prefix_while_typing() {
+    let dir = temp_dir("complete_manual_sticky");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer' } }, auto = false }",
+    )
+    .await;
+
+    // Two candidates on their own lines, then a fresh line to complete on. With
+    // `auto = false` typing the prefix opens nothing.
+    feed(&rpc, "ihello<CR>helper<CR>he");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
+        "auto = false: typing must not open the popup"
+    );
+
+    feed(&rpc, "<C-Space>");
+    let mut items = menu_items(&menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("the trigger key opens the popup"),
+    ));
+    items.sort();
+    assert_eq!(items, vec!["hello", "helper"]);
+
+    // Typing narrows the SAME session rather than closing it — and the keystrokes
+    // still reach the document (the popup never grabs input).
+    feed(&rpc, "lp");
+    assert_eq!(
+        menu_items(&menu_of(
+            &poll_menu(&rpc, &mut incoming)
+                .await
+                .expect("the manual popup follows the typed prefix")
+        )),
+        vec!["helper"]
+    );
+    assert_eq!(lines(&rpc).await, vec!["hello", "helper", "help"]);
+
+    // Backspacing back to a shorter prefix widens it again (the manual session keeps
+    // bypassing `min_chars`, so a 1-char prefix still completes).
+    feed(&rpc, "<BS><BS><BS>");
+    let mut items = menu_items(&menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("the session survives deleting back to one char"),
+    ));
+    items.sort();
+    assert_eq!(items, vec!["hello", "helper"]);
+
+    // Aborting ends the session: typing on is plain insert again, no popup.
+    feed(&rpc, "<C-e>");
+    feed(&rpc, "el");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
+        "an aborted session must not resurrect on the next keystroke"
+    );
+    assert_eq!(lines(&rpc).await, vec!["hello", "helper", "hel"]);
+}
+
 #[tokio::test]
 async fn abort_closes_the_popup_and_keeps_the_typed_prefix() {
     let dir = temp_dir("complete_abort");

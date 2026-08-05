@@ -142,6 +142,13 @@ impl Editor {
             return;
         }
 
+        // Whether an *open* popup is a manual session, sampled before the block below
+        // closes it: the tail of this fn re-derives that popup instead of leaving the
+        // manual trigger dead after one keystroke. Sampling here (rather than reading
+        // the flag at the tail) is what bounds the session to a popup that was on
+        // screen when this key arrived — an aborted or accepted one stays gone.
+        let manual_session = self.complete_manual_session();
+
         // Native completion popup: while it is open, its control keys navigate /
         // accept / abort and are consumed here; every other key edits the document
         // normally and then re-triggers the engine at the end of this fn. (The
@@ -329,8 +336,11 @@ impl Editor {
         // move, recompute the popup (open / refresh / close based on the new
         // prefix). Cheap when the engine is disabled or the prefix is too short;
         // skipped while arming a `<C-r>` register insert (not a prefix edit).
-        if self.complete_config.auto
-            && !self.awaiting_register
+        // A manual session refreshes on the same edits even with `auto` off — and
+        // through the *manual* path, so the session keeps bypassing `min_chars` and
+        // keeps its preselection rather than degrading to a noselect auto popup
+        // halfway through.
+        if !self.awaiting_register
             && matches!(
                 key.code,
                 KeyCode::Char(_)
@@ -340,7 +350,11 @@ impl Editor {
                     | KeyCode::Right
             )
         {
-            self.complete_trigger();
+            if manual_session {
+                self.complete_manual_trigger();
+            } else if self.complete_config.auto {
+                self.complete_trigger();
+            }
         }
 
         // Signature-help auto-trigger (opt-in): a `(` / `,` (the server's advertised

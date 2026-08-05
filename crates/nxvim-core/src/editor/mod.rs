@@ -1047,6 +1047,15 @@ pub struct Editor {
     /// source dispatch, so a push from a superseded prefix is dropped — the
     /// completion analogue of the picker's per-query generation.
     complete_gen: u64,
+    /// Whether the open completion popup belongs to a **manual session** — one an
+    /// explicit `<C-Space>` / [`nx.complete.trigger()`](Editor::complete_manual_trigger)
+    /// opened rather than the as-you-type auto trigger. It keeps the popup following
+    /// the prefix across the edits that follow (vim's ins-completion narrows its menu
+    /// the same way), so a manual trigger is usable with `auto = false` instead of
+    /// dying on the next keystroke with nothing left to reopen it. Derived state, not
+    /// config: every open recomputes it (`preselect` && something actually opened) and
+    /// every close clears it, so it can never outlive its popup.
+    complete_manual_session: bool,
     /// A completion row whose accept is **delegated to its source** (`MenuItem`'s
     /// `source_accept`): the row's `key`, set by [`Editor::complete_accept`] when
     /// such a row is accepted and drained by the server, which applies the edit core
@@ -1962,6 +1971,7 @@ impl Editor {
             signature_session: false,
             signature_auto_request: false,
             complete_gen: 0,
+            complete_manual_session: false,
             complete_accept_request: None,
             complete_accept_extend_to: None,
             cmdcomplete: cmdcomplete::CmdlineCompleteConfig::default(),

@@ -1247,6 +1247,7 @@ impl Editor {
             source_accept: row.source_accept,
         };
         self.menu = None;
+        self.end_complete_manual_session();
         Some(acc)
     }
 
@@ -1256,6 +1257,7 @@ impl Editor {
     pub(crate) fn close_completion(&mut self) {
         if self.menu_kind() == Some(MenuKind::Complete) {
             self.menu = None;
+            self.end_complete_manual_session();
         }
     }
 

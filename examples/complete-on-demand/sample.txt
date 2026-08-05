@@ -1,0 +1,15 @@
+-- Words for the `buffer` source to complete from. Several share a `co` prefix so
+-- the popup has something to narrow as you type, and several share `conn` so it
+-- keeps narrowing past the third character.
+
+local config = {}
+local connection = nil
+local connect_timeout = 30
+local connection_pool = {}
+local completion = "on demand"
+local collect = function() end
+local counter = 0
+
+-- Put the cursor on the empty line below and follow the TYPE THIS / SEE THAT
+-- steps at the bottom of init.lua.
+

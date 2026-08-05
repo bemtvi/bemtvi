@@ -210,7 +210,10 @@ end
 -- sets the default for sources that don't override it; the popup opens at the *minimum*
 -- across all sources (each then filters by its own). A trigger-char source and a manual
 -- trigger (`nx.complete.trigger()`) bypass the gate. `auto` (default true) completes as
--- you type. `keys` overrides any of
+-- you type. With `auto = false` nothing opens on its own, but a manual trigger still
+-- **follows the prefix**: the popup it opens narrows as you type and widens as you
+-- backspace, until you accept, abort, or type a prefix nothing matches — so on-demand
+-- completion is a session, not a one-shot snapshot. `keys` overrides any of
 -- the four control actions. `accept` (default `"replace"`) decides what the confirm
 -- keys do when the caret is in the *middle* of a word: `"replace"` swaps the whole
 -- word, `"insert"` keeps the suffix past the cursor. `nx.complete.accept{ behavior }`
@@ -352,6 +355,13 @@ end
 -- nx.complete.trigger(): manually open (or refresh) the completion popup at the
 -- cursor, ignoring `auto` / `min_chars` (an explicit request always offers what's
 -- there). A no-op outside insert mode or before `nx.complete.setup{}`.
+--
+-- The popup it opens is a **session**, not a snapshot: it keeps following the prefix
+-- through the edits that follow — narrowing as you type, widening as you backspace —
+-- even with `auto = false`, and ends when it closes (accept, abort, `<Esc>`, or a
+-- prefix nothing matches). The whole session keeps the manual contract: `min_chars`
+-- stays bypassed, and the top row stays preselected so a confirm key
+-- (`<C-y>` / `<CR>`) accepts without a separate navigation step.
 function nx.complete.trigger()
   nx._complete_trigger()
 end

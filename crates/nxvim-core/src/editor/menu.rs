@@ -2298,7 +2298,18 @@ impl Editor {
                 let anchor_col = cursor_screen_col
                     .saturating_sub(leftcol)
                     .saturating_sub(m.anchor_offset);
-                let max_w = text_width.saturating_sub(anchor_col).max(1);
+                // The client draws a one-cell border on each side of this content, and
+                // the top-borderless completion popup additionally shifts one cell LEFT
+                // so its left border doesn't sit on the word (`left_shift` in the
+                // renderers) — recovering a column, unless the anchor is already at the
+                // text area's left edge and the shift saturates. Reserve that chrome so
+                // the whole bordered box fits: without it the content claimed the full
+                // remaining width, the client clamped the box to the window edge, and the
+                // rightmost column — the tail of the aligned kind label — fell off screen.
+                let left_shift = usize::from(m.completion).min(anchor_col);
+                let max_w = (text_width + left_shift)
+                    .saturating_sub(anchor_col + 2)
+                    .max(1);
                 let width = content_w.min(max_w);
                 // Where every kind label starts — just past the widest label, so they
                 // align into one column. Clamped so the kinds still fit if the box was

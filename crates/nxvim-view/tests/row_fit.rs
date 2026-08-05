@@ -193,3 +193,49 @@ fn a_narrow_row_still_shows_the_match() {
         }
     }
 }
+
+#[test]
+fn a_plain_row_keeps_its_head_behind_a_trailing_ellipsis() {
+    // A completion candidate too long for its column: the head — the part you scan and
+    // the part the matcher hit — survives, and the cut is marked. Regression: a plain
+    // (non-path) label came back whole and each client silently head-cut it, so a
+    // truncated candidate looked like a genuinely shorter word butted against the kind.
+    let label = "ab_this_is_a_really_long_completion_candidate_name";
+    let (out, spans) = fit_row(label, &[(0, 6)], 20, None, 0);
+    assert_eq!(out, "ab_this_is_a_really…");
+    assert_eq!(
+        out.chars().count(),
+        20,
+        "the fit never overflows its column"
+    );
+    assert_eq!(
+        highlighted(&out, &spans),
+        "ab_thi",
+        "a surviving span still points at the same chars"
+    );
+    // A span wholly past the cut vanishes rather than pointing into the `…`.
+    let (_, spans) = fit_row(label, &[(30, 40)], 20, None, 0);
+    assert!(spans.is_empty(), "a dropped span is gone: {spans:?}");
+    // A span straddling the cut is clipped to what is still shown.
+    let (_, spans) = fit_row(label, &[(15, 40)], 20, None, 0);
+    assert_eq!(spans, vec![(15, 19)]);
+}
+
+#[test]
+fn a_plain_row_that_fits_is_never_marked() {
+    let label = "abshort";
+    assert_eq!(fit_row(label, &[], 20, None, 0).0, label);
+    // Exactly filling the column is not an overflow — no `…` is spent on it.
+    assert_eq!(fit_row(label, &[], 7, None, 0).0, label);
+    assert_eq!(fit_row(label, &[], 6, None, 0).0, "absho…");
+}
+
+#[test]
+fn a_path_row_still_keeps_its_tail() {
+    // The head-priority cut is for plain labels only: a path row keeps the file name.
+    let (out, _) = fit_row("crates/nxvim-server/src/redraw.rs", &[], 20, None, 0);
+    assert!(
+        out.starts_with('…') && out.ends_with("redraw.rs"),
+        "{out:?}"
+    );
+}

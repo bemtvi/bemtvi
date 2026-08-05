@@ -60,10 +60,11 @@ pub fn elide_middle(s: &str, width: usize) -> String {
 /// the very thing you scan for. `spans` (matched-char char ranges into `label`) are
 /// remapped onto the returned string so highlights still land on the right chars.
 ///
-/// A row that already fits — or a non-path row (no `/`) — is returned unchanged, so
-/// only file paths get the tail-priority treatment; the caller's head-cut still
-/// applies to plain labels. When even the file name alone can't fit, the tail is
-/// kept (the name is truncated only because it's impossible to show whole).
+/// A row that already fits is returned unchanged. A non-path row (no `/`) keeps its
+/// **head** — the identifier you scan for — and marks the cut with a trailing `…`, so
+/// an over-long completion candidate reads as truncated instead of as a shorter word
+/// run flush against the kind column. When even the file name alone can't fit, the
+/// tail is kept (the name is truncated only because it's impossible to show whole).
 pub fn elide_keep_tail(
     label: &str,
     spans: &[(u16, u16)],
@@ -71,8 +72,23 @@ pub fn elide_keep_tail(
 ) -> (String, Vec<(u16, u16)>) {
     let chars: Vec<char> = label.chars().collect();
     let n = chars.len();
-    if n <= width || width == 0 || !label.contains('/') {
+    if n <= width || width == 0 {
         return (label.to_string(), spans.to_vec());
+    }
+    if !label.contains('/') {
+        // Head-priority: keep the first `width - 1` chars and spend the last column on
+        // the `…`. Spans are clipped to what survives; one wholly past the cut vanishes.
+        let keep = width - 1;
+        let mut out: String = chars[..keep].iter().collect();
+        out.push('…');
+        let remapped = spans
+            .iter()
+            .filter_map(|&(s, e)| {
+                let ne = e.min(keep as u16);
+                (s < ne).then_some((s, ne))
+            })
+            .collect();
+        return (out, remapped);
     }
     // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
     let drop = n - (width - 1);

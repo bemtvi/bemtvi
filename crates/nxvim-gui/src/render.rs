@@ -2866,7 +2866,12 @@ impl Renderer {
                 .get(idx)
                 .and_then(Option::as_deref)
                 .filter(|k| !k.is_empty());
-            let label_w = menu.kind_col.map_or(list_w, |kc| kc.min(list_w));
+            // One cell short of the kind column, so a truncated label's `…` keeps a gap
+            // instead of butting against the kind. Unclamped, `kind_col` is already
+            // `widest label + 1`, so nothing that fits is affected.
+            let label_w = menu
+                .kind_col
+                .map_or(list_w, |kc| kc.min(list_w).saturating_sub(1));
             // A row whose source declared a two-column `layout` (live_grep) fits as a
             // location column plus a body windowed around the match instead.
             let layout = menu

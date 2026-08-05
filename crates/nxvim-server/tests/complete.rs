@@ -913,6 +913,56 @@ nx.complete.setup { sources = { { 'k' } }, min_chars = 1 }";
     assert_eq!(map_get(&menu, "width").and_then(Value::as_u64), Some(16));
 }
 
+/// A candidate too long for the remaining width must not push the aligned kind column
+/// off the screen. The projected `width` is the box's **content**; the client draws a
+/// one-cell border each side (and shifts the top-borderless completion popup one cell
+/// left so its left border doesn't sit on the word), then clamps the whole box to the
+/// window. Regression: the content was sized to the *full* remaining text width, so the
+/// clamp ate the last column and the kind label lost its final character
+/// (`Function` → `Functio`).
+#[tokio::test]
+async fn a_too_long_candidate_keeps_the_kind_column_on_screen() {
+    let dir = temp_dir("complete_kind_clamped");
+    let init = "\
+nx.complete.source {\n\
+  name = 'k', debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then\n\
+    ctx.push { text = 'abshort', kind = 'Snippet' }\n\
+    ctx.push { text = 'ab' .. string.rep('x', 120), kind = 'Function' }\n\
+  end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'k' } }, min_chars = 1 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Indent so the popup is anchored mid-line and its left border has a cell to sit in.
+    feed(&rpc, "i        ab");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    let menu = menu_of(&map);
+    let win = focused_window(&map);
+    // The region the box is bounded by — the same quantity `redraw()` passes as
+    // `text_width` (the window minus its number gutter).
+    let text_width = win_rect(&win, "width") - mu64(&win, "number_width");
+
+    let col = mu64(&menu, "col");
+    let width = mu64(&menu, "width");
+    // The completion popup omits its top border and shifts one cell left, so its box
+    // spans `[col - 1, col - 1 + width + 2)`; every column of it must be on screen.
+    let shift = col.min(1);
+    assert!(
+        col - shift + width + 2 <= text_width,
+        "the bordered box fits the text area: col {col} + width {width} + border \
+         vs text_width {text_width}"
+    );
+    // ...and within that box the widest kind (`Function` = 8) still has its own column.
+    let kind_col = map_get(&menu, "kind_col")
+        .and_then(Value::as_u64)
+        .expect("the popup projects an aligned kind column");
+    assert!(
+        kind_col + 8 <= width,
+        "the widest kind fits after kind_col {kind_col} in a {width}-wide box"
+    );
+}
+
 /// A `buffer`-source word carries the `Text` kind in the popup's kind column.
 #[tokio::test]
 async fn buffer_words_carry_the_text_kind() {

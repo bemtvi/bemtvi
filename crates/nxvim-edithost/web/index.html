@@ -222,12 +222,26 @@
     // components behind a single `…` so the file name survives, instead of the head-cut
     // that would hide the very thing you scan for. `spans` (matched-char char ranges)
     // are remapped onto the returned string so highlights stay aligned. A row that fits
-    // — or a non-path row (no `/`) — is returned unchanged. Mirrors the native clients'
-    // `elide_keep_tail`; codepoint-based to match the server's char columns.
+    // is returned unchanged; a non-path row (no `/`) keeps its HEAD — the identifier you
+    // scan for — behind a trailing `…`, so a truncated completion candidate reads as
+    // truncated. Mirrors the native clients' `elide_keep_tail`; codepoint-based to match
+    // the server's char columns.
     function elideKeepTail(label, spans, width) {
       const chars = [...label];
       const n = chars.length;
-      if (n <= width || width === 0 || label.indexOf("/") === -1) return [label, spans];
+      if (n <= width || width === 0) return [label, spans];
+      if (label.indexOf("/") === -1) {
+        // Head-priority: keep the first `width - 1` chars, spend the last column on the
+        // `…`, and clip the spans to what survives.
+        const keep = width - 1;
+        const out = chars.slice(0, keep).join("") + "…";
+        const clipped = [];
+        for (const [s, e] of spans) {
+          const ne = Math.min(e, keep);
+          if (s < ne) clipped.push([s, ne]);
+        }
+        return [out, clipped];
+      }
       // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
       const drop = n - (width - 1);
       // Prefer a clean cut just after a path separator — the smallest `/`-boundary at or
@@ -2520,7 +2534,10 @@
         // kinds sit further right, each touching the edge.
         const kindStr = (menu.kinds && menu.kinds[idx]) || "";
         const hasKindCol = typeof menu.kind_col === "number" && menu.kind_col < listW;
-        const labelW = hasKindCol ? menu.kind_col : listW;
+        // One cell short of the kind column, so a truncated label's `…` keeps a gap
+        // instead of butting against the kind. Unclamped, `kind_col` is already `widest
+        // label + 1`, so nothing that fits is affected.
+        const labelW = hasKindCol ? Math.max(0, menu.kind_col - 1) : listW;
         // A row whose source declared a two-column `layout` (live_grep) fits as a
         // location column plus a body windowed around the match instead.
         const layout = (menu.layouts && menu.layouts[idx]) || null;

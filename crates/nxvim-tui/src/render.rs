@@ -3172,11 +3172,14 @@ fn menu_row_line(
     // further right, each touching the edge. Absent ⇒ the box was too narrow for a kind
     // column, so no kind is drawn (the label fills the row).
     let kind = kind.filter(|k| !k.is_empty());
-    let label_end = kind_col.map_or(width, |kc| kc.min(width));
-    // Path-priority truncation: when the row overflows, keep the file name (the
-    // path tail) on screen by dropping leading directory components behind a `…`,
-    // rather than the plain head-cut below that would hide the name. Rows that fit
-    // — and non-path rows — fall through unchanged; `spans` are remapped to match.
+    // One cell short of the kind column, so a truncated label's `…` keeps a gap
+    // instead of butting against the kind. Unclamped, `kind_col` is already `widest
+    // label + 1`, so this is exactly the widest label: nothing that fits is affected.
+    let label_end = kind_col.map_or(width, |kc| kc.min(width).saturating_sub(1));
+    // Overflow truncation: a path row keeps the file name on screen by dropping
+    // leading directory components behind a `…`; any other row keeps its head and
+    // marks the cut with a trailing `…`. Rows that fit fall through unchanged;
+    // `spans` are remapped to match.
     // A row whose source declared a two-column `layout` (live_grep) instead fits as
     // a location column plus a match-windowed body.
     let (label, spans) = fit_row(

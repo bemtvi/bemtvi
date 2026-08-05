@@ -12,8 +12,9 @@ use crate::parse::{
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
     parse_float_lines, parse_highlights, parse_inlay_hints, parse_line_bg, parse_multi_spans,
     parse_numbers, parse_padding, parse_pair, parse_pmenu_items, parse_spans, parse_status,
-    parse_styles, parse_virt_lines, parse_virt_text, DiagSign, DiagSpan, DiagVirt, HlSpan,
-    IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment, VirtChunk, VirtPlacement,
+    parse_styles, parse_triple, parse_virt_lines, parse_virt_text, DiagSign, DiagSpan, DiagVirt,
+    HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment, VirtChunk,
+    VirtPlacement,
 };
 use crate::style::{Border, Style};
 
@@ -650,6 +651,14 @@ pub struct MenuData {
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
+    /// Per visible row (parallel to `items`), the two-column layout the source
+    /// declared for a `path:line:col: <line>` row (live_grep): the
+    /// `(head, match start, match end)` char offsets into the label — the length of
+    /// the location column, and the source's own match, which the body column keeps
+    /// on screen and the client highlights. `None` for a plain row (which truncates
+    /// path-tail-first); empty when no row declares one — the server omits the
+    /// `layouts` key entirely then. Fed to [`fit_row`](crate::fit_row).
+    pub layouts: Vec<Option<(u16, u16, u16)>>,
     /// Per visible row (parallel to `items`), whether the row is **marked** by the
     /// picker's multi-select (`<Tab>`). All-false (or empty) when nothing is marked.
     pub marked: Vec<bool>,
@@ -925,6 +934,10 @@ impl View {
                 editor_relative: map_get(m, "editor_relative").and_then(Value::as_bool)
                     == Some(true),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
+                layouts: match map_get(m, "layouts") {
+                    Some(Value::Array(a)) => a.iter().map(parse_triple).collect(),
+                    _ => Vec::new(),
+                },
                 marked: match map_get(m, "marked") {
                     Some(Value::Array(a)) => {
                         a.iter().map(|v| v.as_bool().unwrap_or(false)).collect()

@@ -1857,6 +1857,28 @@ impl EditHost {
                 .map(|k| k.map_or(Value::Nil, Value::from))
                 .collect(),
         );
+        // Per-row two-column **layout** (parallel to `items`): the `[head, match start,
+        // match end]` char offsets of a `path:line:col: <line>` row (live_grep), so the
+        // client can fit the head and the body as separate columns — and highlight the
+        // source's own match — instead of head-cutting one string. `Nil` for a plain
+        // row; the key is omitted entirely when no row declares one, so every other
+        // menu's map is byte-for-byte unchanged.
+        let row_layouts = self.editor.menu_layout_window(start, rows.len());
+        let any_layout = row_layouts.iter().any(Option::is_some);
+        let layouts = Value::Array(
+            row_layouts
+                .into_iter()
+                .map(|l| {
+                    l.map_or(Value::Nil, |l| {
+                        Value::Array(vec![
+                            Value::from(l.head as u64),
+                            Value::from(l.match_start as u64),
+                            Value::from(l.match_end as u64),
+                        ])
+                    })
+                })
+                .collect(),
+        );
         // Multi-select: a bool per visible row (parallel to `items`) flagging the
         // user-marked rows (`<Tab>`), so the client can mark them. Always present;
         // all-false when nothing is marked.
@@ -1900,6 +1922,10 @@ impl EditHost {
             (Value::from("match_spans"), match_spans),
             (Value::from("marked"), marked),
         ];
+        // Only grep-shaped picker rows carry a layout; omit the key otherwise.
+        if any_layout {
+            map.push((Value::from("layouts"), layouts));
+        }
         // Only completion popups carry kinds; omit the key when every row is kind-less
         // so `select` / picker / cmdline maps are byte-for-byte unchanged.
         if any_kind {

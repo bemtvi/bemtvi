@@ -1207,6 +1207,15 @@ impl EditHost {
                         path: pv.path,
                         loc: pv.loc,
                     }),
+                    // The source's two-column row shape (live_grep's location head +
+                    // matched line), which the client fits as two columns.
+                    layout: p
+                        .layout
+                        .map(|(head, match_start, match_end)| nxvim_core::RowLayout {
+                            head,
+                            match_start,
+                            match_end,
+                        }),
                     ..nxvim_core::MenuItem::new(p.label, p.key)
                 })
                 .collect();

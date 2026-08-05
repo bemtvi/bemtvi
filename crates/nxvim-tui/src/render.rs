@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::images::ImageStore;
 use nxvim_view::{
-    arm_scroll, elide_keep_tail, elide_middle, gutter_cell, lerp, pmenu_row, pmenu_start,
+    arm_scroll, elide_middle, fit_row, gutter_cell, lerp, pmenu_row, pmenu_start, row_head_col,
     ScrollAnim,
 };
 use nxvim_view::{
@@ -2733,6 +2733,19 @@ fn render_menu(
     // list row (a glyph on marked rows). Only when marks are in play, so a plain
     // picker / `nx.ui.select` / completion popup renders exactly as before.
     let any_marked = menu.marked.iter().any(|&m| m);
+    // Two-column (live_grep-shaped) rows share one head column across the frame, so
+    // the matched lines line up instead of each starting where its own path ended:
+    // the widest visible head, capped at 40% of the list so a long path can't squeeze
+    // the line out. `0` when no row declares a layout (every other menu).
+    let head_col = row_head_col(
+        menu.layouts
+            .iter()
+            .flatten()
+            .map(|&(h, _, _)| h as usize)
+            .max()
+            .unwrap_or(0),
+        width,
+    );
     // Build one list row (or a blank filler past the end of the list).
     let list_line = |r: usize| -> Line<'static> {
         let idx = start + r;
@@ -2742,6 +2755,12 @@ fn render_menu(
                 let spans = menu.match_spans.get(idx).unwrap_or(&empty);
                 let marked = any_marked.then(|| menu.marked.get(idx).copied().unwrap_or(false));
                 let kind = menu.kinds.get(idx).and_then(Option::as_deref);
+                let layout = menu
+                    .layouts
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .map(|(h, s, e)| (h as usize, s as usize, e as usize));
                 menu_row_line(
                     label,
                     spans,
@@ -2752,6 +2771,8 @@ fn render_menu(
                     menu.kind_col.map(usize::from),
                     sel_style,
                     match_style,
+                    layout,
+                    head_col,
                 )
             }
             None => Line::from(" ".repeat(width)),
@@ -3039,6 +3060,8 @@ fn menu_row_line(
     kind_col: Option<usize>,
     sel_style: Option<Style>,
     match_style: Option<Style>,
+    layout: Option<(usize, usize, usize)>,
+    head_col: usize,
 ) -> Line<'static> {
     // The selected row uses the theme's selection group when defined, else
     // reverse-video. A non-selected row is transparent so the box background shows.
@@ -3080,7 +3103,15 @@ fn menu_row_line(
     // path tail) on screen by dropping leading directory components behind a `…`,
     // rather than the plain head-cut below that would hide the name. Rows that fit
     // — and non-path rows — fall through unchanged; `spans` are remapped to match.
-    let (label, spans) = elide_keep_tail(label, spans, label_end.saturating_sub(used));
+    // A row whose source declared a two-column `layout` (live_grep) instead fits as
+    // a location column plus a match-windowed body.
+    let (label, spans) = fit_row(
+        label,
+        spans,
+        label_end.saturating_sub(used),
+        layout,
+        head_col.saturating_sub(used),
+    );
     let (label, spans) = (label.as_str(), spans.as_slice());
     // Coalesce runs of identically-styled chars into one span (the same walk
     // `preview_line` does) instead of a per-char span — a picker frame renders

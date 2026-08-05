@@ -3630,17 +3630,20 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._picker_push(gen, labels, keys, paths, rows, cols)`: queue a BATCH of
-    // streamed picker candidates ([`PickerPush`]) — parallel arrays, stamped with
+    // `nx._picker_push(gen, labels, keys, paths, rows, cols, layouts)`: queue a BATCH
+    // of streamed picker candidates ([`PickerPush`]) — parallel arrays, stamped with
     // the run `gen`eration. Batching keeps a 100k-result stream to ~one bridge
     // crossing per source chunk instead of one per item. `paths` (and, for the
     // `"location"` kind, `rows` / `cols` — all 0-based) are present only when the
     // picker carries a preview pane; an empty `paths[i]` means that row has no
-    // target. The server drops a batch whose `gen` is behind the live query and
-    // feeds the rest into the open picker.
+    // target. `layouts` is present only for a source pushing two-column rows
+    // (live_grep): a flat run of three ints per row — head length, match start, match
+    // end, all char offsets into the label. The server drops a batch whose `gen` is
+    // behind the live query and feeds the rest into the open picker.
     let sh = shared.clone();
-    // `(gen, labels, keys, paths, rows, cols)` — the parallel-array push batch; the
-    // last three are `Some` only for a preview-carrying picker.
+    // `(gen, labels, keys, paths, rows, cols, layouts)` — the parallel-array push
+    // batch; `paths`/`rows`/`cols` are `Some` only for a preview-carrying picker and
+    // `layouts` only for a two-column source.
     type PushArgs = (
         u64,
         Vec<String>,
@@ -3648,36 +3651,50 @@ pub(crate) fn install_runtime_api(
         Option<Vec<String>>,
         Option<Vec<usize>>,
         Option<Vec<usize>>,
+        Option<Vec<u16>>,
     );
     nx.set(
         "_picker_push",
-        lua.create_function(move |_, (gen, labels, keys, paths, rows, cols): PushArgs| {
-            let mut sh = sh.borrow_mut();
-            sh.picker_pushes.reserve(labels.len());
-            for (i, (label, key)) in labels.into_iter().zip(keys).enumerate() {
-                let preview = paths.as_ref().and_then(|ps| {
-                    let path = ps.get(i)?;
-                    if path.is_empty() {
-                        return None;
-                    }
-                    let loc = match (rows.as_ref(), cols.as_ref()) {
-                        (Some(rs), Some(cs)) => Some((*rs.get(i)?, *cs.get(i)?)),
-                        _ => None,
-                    };
-                    Some(PreviewPush {
-                        path: path.clone(),
-                        loc,
-                    })
-                });
-                sh.picker_pushes.push(PickerPush {
-                    gen,
-                    label,
-                    key,
-                    preview,
-                });
-            }
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (gen, labels, keys, paths, rows, cols, layouts): PushArgs| {
+                let mut sh = sh.borrow_mut();
+                sh.picker_pushes.reserve(labels.len());
+                for (i, (label, key)) in labels.into_iter().zip(keys).enumerate() {
+                    let preview = paths.as_ref().and_then(|ps| {
+                        let path = ps.get(i)?;
+                        if path.is_empty() {
+                            return None;
+                        }
+                        let loc = match (rows.as_ref(), cols.as_ref()) {
+                            (Some(rs), Some(cs)) => Some((*rs.get(i)?, *cs.get(i)?)),
+                            _ => None,
+                        };
+                        Some(PreviewPush {
+                            path: path.clone(),
+                            loc,
+                        })
+                    });
+                    // Three ints per row, flat. An all-zero triple is the "plain row"
+                    // sentinel — a source mixing shaped and unshaped rows still ships a
+                    // dense array, and a zero head with a zero-length match says nothing.
+                    let layout = layouts
+                        .as_ref()
+                        .and_then(|ls| {
+                            let at = i * 3;
+                            Some((*ls.get(at)?, *ls.get(at + 1)?, *ls.get(at + 2)?))
+                        })
+                        .filter(|&(h, s, e)| h != 0 || s != 0 || e != 0);
+                    sh.picker_pushes.push(PickerPush {
+                        gen,
+                        label,
+                        key,
+                        preview,
+                        layout,
+                    });
+                }
+                Ok(())
+            },
+        )?,
     )?;
     // `nx._picker_finish(gen)`: the source's `done()` for generation `gen` — the
     // server settles the picker (a query that matched nothing clears its stale

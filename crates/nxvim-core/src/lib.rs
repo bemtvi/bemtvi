@@ -42,9 +42,9 @@ pub use editor::{
     LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos,
     NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry,
     PluginNamespace, PreWrite, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList,
-    QfStack, QfWhich, RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow,
-    ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture,
-    WindowConfigSpec, WindowId, WriteEvent, WriteScope,
+    QfStack, QfWhich, RegisterEntry, RowLayout, SessionDock, SessionState, SessionTab,
+    SessionWindow, ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView,
+    WheelGesture, WindowConfigSpec, WindowId, WriteEvent, WriteScope,
 };
 pub use encoding::Encoding;
 pub use extmark::{

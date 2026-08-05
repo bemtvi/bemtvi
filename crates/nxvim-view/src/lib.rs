@@ -26,7 +26,9 @@ mod style;
 mod view;
 
 pub use anim::{arm_scroll, lerp, ScrollAnim};
-pub use fit::{elide_keep_tail, elide_middle, gutter_cell, pmenu_row, pmenu_start};
+pub use fit::{
+    elide_keep_tail, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col,
+};
 pub use hit_test::{resize_handle_at, Geometry, ResizeCursor};
 pub use keys::{encode_paste, mouse_modifier, notation, Key};
 pub use parse::{

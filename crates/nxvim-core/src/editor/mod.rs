@@ -80,7 +80,7 @@ pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKe
 pub use self::decor::DecorViewport;
 pub use self::menu::{
     CmdlineCandidate, Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll,
-    PreviewTarget, PromptPos,
+    PreviewTarget, PromptPos, RowLayout,
 };
 pub use self::mouse::{ClickSurface, MouseClick, MousePos, StatuslineClick, WheelGesture};
 pub(crate) use self::multicursor::PlacementSnapshot;

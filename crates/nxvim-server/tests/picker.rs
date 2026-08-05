@@ -3263,6 +3263,97 @@ async fn builtin_live_grep_searches_ignored_and_hidden_files() {
     }
 }
 
+/// The per-row two-column `layouts` the picker projects: `(head, match start, match
+/// end)` char offsets, `None` for a plain row. Empty when no row declares one.
+fn menu_layouts(menu: &[(Value, Value)]) -> Vec<Option<(usize, usize, usize)>> {
+    let Some(Value::Array(a)) = map_get(menu, "layouts") else {
+        return Vec::new();
+    };
+    a.iter()
+        .map(|v| match v {
+            Value::Array(t) if t.len() == 3 => Some((
+                t[0].as_u64()? as usize,
+                t[1].as_u64()? as usize,
+                t[2].as_u64()? as usize,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `live_grep` hit is a TWO-COLUMN row, not one `file:line:col:text` string: the
+/// location head and the matched line travel with the char offsets a client fits
+/// them by (so a long line can't squeeze the file name off the row) and with the
+/// hit's own range (so it highlights, like a `files` fuzzy match). The body is the
+/// matched line with its leading indentation stripped — a deeply-indented hit would
+/// otherwise spend the row's width on whitespace.
+///
+/// Binary-agnostic like the other shipped-source tests: every leg of the chain
+/// (`rg` → `grep` → the `nx.fs` walk) goes through the same `emit`, and the head is
+/// asserted by *shape* since only `rg` reports a real column.
+#[tokio::test]
+async fn live_grep_rows_carry_the_location_head_and_the_hit() {
+    let dir = temp_dir("picker_grep_layout_cfg");
+    let proj = temp_dir("picker_grep_layout");
+    // A hit far into a long, deeply indented line — the case that used to render as
+    // the matched text and nothing else.
+    let line = format!("            lead {} zqxneedle tail", "x".repeat(200));
+    std::fs::write(proj.join("deep.txt"), format!("{line}\n")).expect("write file");
+
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "nx.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep picker opens");
+    feed(&rpc, "zqxneedle");
+
+    let (mut rows, mut layouts) = (Vec::new(), Vec::new());
+    for _ in 0..200 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            let menu = menu_of(&m);
+            let now = menu_items(&menu);
+            if !now.is_empty() {
+                rows = now;
+                layouts = menu_layouts(&menu);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 1, "one hit; got {rows:?}");
+    let row = &rows[0];
+    let layout = layouts
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| panic!("the row carries a two-column layout; got {layouts:?}"));
+    let (head, mstart, mend) = layout;
+
+    let chars: Vec<char> = row.chars().collect();
+    let head_str: String = chars[..head].iter().collect();
+    assert!(
+        head_str.starts_with("deep.txt:1:") && head_str.ends_with(": "),
+        "the head is the location column: {head_str:?}"
+    );
+    let body: String = chars[head..].iter().collect();
+    assert!(
+        body.starts_with("lead "),
+        "the body drops the line's leading indentation: {body:?}"
+    );
+    assert_eq!(
+        body.trim_end(),
+        line.trim_start(),
+        "and is otherwise the matched line: {body:?}"
+    );
+    assert_eq!(
+        chars[mstart..mend].iter().collect::<String>(),
+        "zqxneedle",
+        "the hit's own char range is what the client highlights: {row:?}"
+    );
+}
+
 /// `live_grep`'s fallback chain (`rg` → `grep` → the `nx.fs` walk) must step to the
 /// next leg only when the previous binary **isn't there**, never because it ran and
 /// found nothing. Zero matches is a legitimate answer, and re-searching the whole

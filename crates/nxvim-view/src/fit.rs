@@ -96,6 +96,131 @@ pub fn elide_keep_tail(
     (out, remapped)
 }
 
+/// The shared **head column** width for a frame of two-column picker rows (a
+/// `path:line:col: ` head followed by a content body — live_grep's shape): the
+/// widest head in the visible window, capped at 40% of the list width so a long
+/// path can never squeeze the body out, and never wider than it needs to be when
+/// every head is short. Computed once per frame and passed to every [`fit_row`]
+/// call so the bodies line up in one column instead of each row starting wherever
+/// its own path happened to end.
+pub fn row_head_col(max_head: usize, width: usize) -> usize {
+    let cap = (width * 2 / 5).max(1); // the head keeps at least 40% of the row
+    max_head.min(cap).max(1)
+}
+
+/// Fit one picker row `label` into `width` columns, honoring an optional
+/// two-column `layout` — `(head, match_start, match_end)`, all **char** offsets
+/// into `label`: `head` is the length of the leading location column
+/// (`src/foo.rs:12:5: `) and `[match_start, match_end)` is the source's own match
+/// within the body (the text `rg` hit), empty when the source knows only where the
+/// interesting content starts.
+///
+/// Without a layout this is [`elide_keep_tail`] — a plain path row keeps its file
+/// name, everything else head-cuts. With one, the row becomes two columns:
+///
+/// - the head is padded (or `…`-elided keeping its tail, so the file name and the
+///   line number survive) to `head_col`, so bodies align down the list;
+/// - the body fills the rest, **windowed around the match** with a little leading
+///   context behind a `…` — a match 200 columns into a long line is visible
+///   instead of scrolled off the right edge.
+///
+/// `spans` (matched-char char ranges into `label`) are remapped onto the returned
+/// string, splitting across the two columns when a span straddles them. A non-empty
+/// match range joins them, so a source that does its own matching (live_grep, whose
+/// dynamic rows bypass the fuzzy matcher) highlights its hit exactly as `files`
+/// highlights a fuzzy one.
+pub fn fit_row(
+    label: &str,
+    spans: &[(u16, u16)],
+    width: usize,
+    layout: Option<(usize, usize, usize)>,
+    head_col: usize,
+) -> (String, Vec<(u16, u16)>) {
+    let Some((head, match_start, match_end)) = layout else {
+        return elide_keep_tail(label, spans, width);
+    };
+    if width == 0 {
+        return (String::new(), Vec::new());
+    }
+    let chars: Vec<char> = label.chars().collect();
+    let n = chars.len();
+    let head = head.min(n);
+    // Each chunk maps a run of source chars onto the output: `(out_start, src_start,
+    // len)`. The `…` markers and the head padding are literal — they map to nothing,
+    // so a span over dropped chars simply vanishes.
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut take = |out: &mut String, used: &mut usize, src: usize, len: usize| {
+        chunks.push((*used, src, len));
+        out.extend(&chars[src..src + len]);
+        *used += len;
+    };
+
+    // ---- head column: the whole head when it fits, else its tail behind a `…`.
+    let hc = head_col.clamp(1, width);
+    if head <= hc {
+        take(&mut out, &mut used, 0, head);
+    } else {
+        // Reserve one column for the `…`, then prefer a clean cut just past a path
+        // separator — the same tail-priority rule `elide_keep_tail` applies.
+        let drop = head - (hc - 1);
+        let cut = (drop..head).find(|&i| chars[i - 1] == '/').unwrap_or(drop);
+        out.push('…');
+        used += 1;
+        take(&mut out, &mut used, cut, head - cut);
+    }
+    // Pad the head out to its column so every row's body starts at the same cell. A
+    // head-only row (no body) is left ragged — there is nothing to align it with, and
+    // a row with no head at all (a source declaring only a match range) is never
+    // indented into the column.
+    if head > 0 && head < n && used < hc {
+        out.push_str(&" ".repeat(hc - used));
+        used = hc;
+    }
+
+    // ---- body column: the rest of the row, windowed so the match stays visible.
+    let bw = width.saturating_sub(used);
+    if bw > 0 && head < n {
+        let blen = n - head;
+        let f = match_start.clamp(head, n) - head;
+        if blen <= bw {
+            take(&mut out, &mut used, head, blen);
+        } else {
+            // Keep a fifth of the column as leading context before the match, then
+            // slide back so the window still fills the column at the end of the line.
+            let lead = (bw / 5).min(f);
+            let start = (f - lead).min(blen - (bw - 1));
+            if start == 0 {
+                take(&mut out, &mut used, head, bw);
+            } else {
+                out.push('…');
+                used += 1;
+                take(&mut out, &mut used, head + start, bw - 1);
+            }
+        }
+    }
+
+    // Remap each span through the chunks; one straddling the head/body split lands as
+    // two output ranges, and one wholly inside dropped text lands as none. The source's
+    // own match joins the fuzzy spans so it highlights the same way.
+    let declared = (match_end > match_start).then_some((match_start as u16, match_end as u16));
+    let mut remapped = Vec::new();
+    for &(s, e) in spans.iter().chain(declared.iter()) {
+        for &(out_start, src_start, len) in &chunks {
+            let ns = (s as usize).max(src_start);
+            let ne = (e as usize).min(src_start + len);
+            if ns < ne {
+                remapped.push((
+                    (ns - src_start + out_start) as u16,
+                    (ne - src_start + out_start) as u16,
+                ));
+            }
+        }
+    }
+    (out, remapped)
+}
+
 /// Build one `width`-cell gutter cell for a row whose buffer line is `num`
 /// (`None` for a `~` filler): absolute numbers (`number`), distance-from-cursor
 /// (`relativenumber`), or the hybrid — absolute on the cursor line, relative

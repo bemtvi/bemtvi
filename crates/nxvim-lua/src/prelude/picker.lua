@@ -24,6 +24,13 @@ nx._picker = nx._picker or nil
 -- the more specific wins. `0` disables the debounce (re-run on every keystroke).
 nx.picker.debounce = nx.picker.debounce or 250
 
+-- Char length of `s` — the unit the widget's row offsets (`head` / `match`) are in.
+-- Falls back to the byte length when the string isn't valid UTF-8 (a grep hit in a
+-- mis-encoded file); a column off by a byte beats a nil arithmetic error.
+local function charlen(s)
+  return utf8.len(s) or #s
+end
+
 -- ----- rebindable picker keys -----------------------------------------------
 -- Every picker key is an ordinary `picker`-mode keymap, NOT a hardcoded grab: the
 -- server selects the `picker` bucket while a picker owns input, so navigation /
@@ -129,6 +136,24 @@ end
 -- windows its rendering and matches incrementally, so a source can stream 100k+
 -- candidates and stay fast; `max_results` (default 100000) is only a runaway-source
 -- safety bound.
+--
+-- An item may also be a **two-column** row — a location column plus content, as
+-- `live_grep`'s `path:line:col: <the matched line>` is:
+--
+-- ```lua
+-- ctx.push({
+--   head = "src/main.rs:12:5: ",  -- the location column
+--   text = "let x = compute()",   -- the body (the row's label is `head .. text`)
+--   match = { 9, 15 },            -- 1-based INCLUSIVE char range of the hit in `text`
+-- })
+-- ```
+--
+-- The widget then fits the two columns separately: the head keeps at least 40% of the
+-- row (a long line can never squeeze the file name off), and the body is windowed
+-- around `match` so the hit stays on screen instead of scrolling off the right edge.
+-- `match` also highlights, which is what a `dynamic` source wants — it bypasses the
+-- fuzzy matcher, so its own match is the only one to show. Both fields are optional:
+-- a plain `text`-only item is a single-column row that truncates path-tail-first.
 --
 -- `resumable = false` opts the source out of `nx.picker.resume()` (`<leader>fr`):
 -- opening it never overwrites the resume slot, so a transient internal picker (the
@@ -388,10 +413,14 @@ function nx._picker_run(gen, query)
     local paths = pv and {} or nil
     local rows = pv == "location" and {} or nil
     local cols = pv == "location" and {} or nil
+    -- Two-column rows (`push { head = … }`): a flat run of three char offsets per
+    -- item — head length, match start, match end. nil until a row declares one, so a
+    -- plain source's batch is exactly as before.
+    local layouts = nil
     local pushed = 0 -- this run's result count, for the cap (p.items is session-wide)
     local function flush()
       if batched > 0 then
-        nx._picker_push(gen, labels, keys, paths, rows, cols)
+        nx._picker_push(gen, labels, keys, paths, rows, cols, layouts)
         labels, keys, batched = {}, {}, 0
         if paths then
           paths = {}
@@ -399,6 +428,7 @@ function nx._picker_run(gen, query)
         if rows then
           rows, cols = {}, {}
         end
+        layouts = nil
       end
     end
     local function push(item)
@@ -428,7 +458,32 @@ function nx._picker_run(gen, query)
       p.nitems = (p.nitems or 0) + 1
       p.items[p.nitems] = entry
       batched = batched + 1
-      labels[batched] = entry.text or tostring(entry)
+      local text = entry.text or tostring(entry)
+      -- A two-column row (`head`): the label is `head .. text`, and the widget gets the
+      -- head's char length plus the source's own match range (`entry.match`, 1-based
+      -- inclusive char offsets into `text`) so it can fit the two columns separately and
+      -- highlight the hit. A plain row ships the all-zero sentinel when some *other* row
+      -- in this batch declared a layout — the array stays dense and parallel.
+      if entry.head then
+        local h = charlen(entry.head)
+        labels[batched] = entry.head .. text
+        if not layouts then
+          -- Backfill the plain rows already batched, so entry `i` stays at `i*3`.
+          layouts = {}
+          for _ = 1, (batched - 1) * 3 do
+            layouts[#layouts + 1] = 0
+          end
+        end
+        local m = entry.match
+        layouts[#layouts + 1] = h
+        layouts[#layouts + 1] = h + (m and math.max(0, m[1] - 1) or 0)
+        layouts[#layouts + 1] = h + (m and math.max(0, m[2]) or 0)
+      else
+        labels[batched] = text
+        if layouts then
+          layouts[#layouts + 1], layouts[#layouts + 2], layouts[#layouts + 3] = 0, 0, 0
+        end
+      end
       keys[batched] = p.nitems
       if paths then
         -- "" ⇒ this row has no target (e.g. an unnamed buffer): the pane shows a
@@ -535,7 +590,9 @@ end
 
 -- A picker item -> a location-list entry. Only items carrying a `path` make sense
 -- in a list; `row`/`col` are 1-based (the item convention), defaulting to the file
--- head. `text` is the item's display label (e.g. live_grep's `file:line:col:text`).
+-- head. `text` is the item's display text — for a two-column row (`head`) that is the
+-- content column alone (`live_grep`'s matched line), which is exactly what a list wants
+-- beside its own `filename` / `lnum` / `col`.
 local function picker_item_to_qf(item)
   return {
     filename = item.path,
@@ -703,6 +760,13 @@ nx.picker.source({
 -- Unrestricted by default, exactly like `files` above: `rg -uu` (`--no-ignore
 -- --hidden`) minus `.git`, so an ignored or dotted file still matches. rg still skips
 -- binaries (that needs a third `u`), and the `grep -rnI` step keeps the same shape.
+--
+-- Rows are **two-column** (`push { head = … }`): the location (`path:line:col: `)
+-- and the matched line as the body, so the widget can keep the file name on screen
+-- (it never drops below 40% of the list) and window the body around the hit instead
+-- of showing a long line's head and nothing else. The body's leading indentation is
+-- stripped — a deeply-indented hit would otherwise spend the row on whitespace —
+-- and `match` carries the hit's char range so it highlights like a `files` fuzzy hit.
 nx.picker.source({
   name = "live_grep",
   title = "Live Grep",
@@ -716,10 +780,58 @@ nx.picker.source({
     local q = ctx.query
     local cancelled = false
 
+    -- How far each hit RUNS: every leg reports where a match starts, none reports
+    -- where it ends, and the row wants the whole hit highlighted — so the query is
+    -- re-matched against the line to measure it. Which dialect depends on the leg, and
+    -- a mismatched dialect could mark the wrong text: `rg` searches with the Rust
+    -- `regex` crate, so its hits are measured with the same PCRE (`re`); `grep` (a BRE)
+    -- and the `nx.fs` walk (a literal substring) are measured literally (`lit`), which
+    -- agrees with them for any query without metacharacters and simply finds nothing —
+    -- leaving the row unhighlighted rather than mismarked — for one with. Either is nil
+    -- when the query doesn't compile (rg then errored out too).
+    local function matcher(opts)
+      local ok, r = pcall(nx.regex, q, opts)
+      return ok and r or nil
+    end
+    local re, lit = matcher(), matcher({ plain = true })
+
+    -- One parsed hit -> a two-column item: the `path:line:col: ` head, the matched
+    -- line (leading indentation stripped) as the body, and the hit's char range within
+    -- that body, measured with the leg's `find`er. `col` is 1-based and BYTE-based
+    -- (rg's convention) and stays untouched on the item — it is what `confirm` jumps
+    -- to; only the display body is trimmed.
+    local function emit(find, file, lnum, col, line)
+      local body = line:gsub("^%s+", "")
+      local indent = #line - #body
+      local m
+      if find then
+        -- Search from the reported column so a line with several hits highlights the
+        -- one rg pointed at; a pattern that only matches from the line start (`^…`)
+        -- falls back to a search from the beginning rather than losing its highlight.
+        local at = math.max(1, (col or 1) - indent)
+        local s, e = find:find(body, at)
+        if not s and at > 1 then
+          s, e = find:find(body)
+        end
+        if s then
+          m = { charlen(body:sub(1, s - 1)) + 1, charlen(body:sub(1, e)) }
+        end
+      end
+      ctx.push({
+        head = file .. ":" .. lnum .. ":" .. (col or 1) .. ": ",
+        text = body,
+        match = m,
+        path = file,
+        row = tonumber(lnum),
+        col = tonumber(col),
+      })
+    end
+
     -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
-    -- rg's `--vimgrep` column. `strip` drops grep's leading "./". Returns whether the
-    -- chain is SETTLED here — the tool ran (matches or not), or the run was superseded.
-    local function run(cmd, args, has_col, strip)
+    -- rg's `--vimgrep` column. `strip` drops grep's leading "./", and `find` is the
+    -- matcher this tool's dialect is measured with. Returns whether the chain is SETTLED
+    -- here — the tool ran (matches or not), or the run was superseded.
+    local function run(cmd, args, has_col, strip, find)
       local stream = nx.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
       ctx.on_cancel(function()
         cancelled = true
@@ -730,15 +842,15 @@ nx.picker.source({
           if strip then
             l = l:gsub("^%./", "")
           end
-          local file, lnum, col
+          local file, lnum, col, body
           if has_col then
-            file, lnum, col = l:match("^(.-):(%d+):(%d+):")
+            file, lnum, col, body = l:match("^(.-):(%d+):(%d+):(.*)$")
           else
-            file, lnum = l:match("^(.-):(%d+):")
+            file, lnum, body = l:match("^(.-):(%d+):(.*)$")
             col = 1
           end
           if file then
-            ctx.push({ text = l, path = file, row = tonumber(lnum), col = tonumber(col) })
+            emit(find, file, lnum, tonumber(col), body)
           end
         end
       end
@@ -750,10 +862,12 @@ nx.picker.source({
       return cancelled or exit == nil or exit.code ~= -1
     end
 
-    if run("rg", { "--vimgrep", "--color=never", "-uu", "-g", "!.git", "--", q }, true, false) then
+    if
+      run("rg", { "--vimgrep", "--color=never", "-uu", "-g", "!.git", "--", q }, true, false, re)
+    then
       return
     end
-    if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true) then
+    if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true, lit) then
       return
     end
 
@@ -764,12 +878,7 @@ nx.picker.source({
     local ok, matches = pcall(nx.await, nx.fs.grep(ctx.cwd, q, { hidden = true }))
     if ok then
       for _, m in ipairs(matches) do
-        ctx.push({
-          text = m.path .. ":" .. m.row .. ":" .. m.text,
-          path = m.path,
-          row = m.row,
-          col = m.col,
-        })
+        emit(lit, m.path, m.row, m.col, m.text)
       end
     end
   end),

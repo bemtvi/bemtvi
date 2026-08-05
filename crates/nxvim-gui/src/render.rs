@@ -34,9 +34,9 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    elide_keep_tail, elide_middle, gutter_cell, pmenu_row, pmenu_start, Border, DiagSign, DiagSpan,
-    DiagVirt, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
-    VirtPlacement, WindowRegion, WindowView,
+    elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col, Border, DiagSign,
+    DiagSpan, DiagVirt, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View,
+    VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2776,6 +2776,18 @@ impl Renderer {
         // Matched characters use the theme's match group (`CmpItemAbbrMatch` /
         // `TelescopeMatching`) when defined, else a warm built-in accent.
         let match_fg = style_fg(&menu.styles.matched).unwrap_or(0x00E5_C07B);
+        // Two-column (live_grep-shaped) rows share one head column across the frame so
+        // their matched lines line up: the widest visible head, capped at 40% of the
+        // list. Unused when no row declares a layout (every other menu).
+        let head_col = row_head_col(
+            menu.layouts
+                .iter()
+                .flatten()
+                .map(|&(h, _, _)| h as usize)
+                .max()
+                .unwrap_or(0),
+            list_w as usize,
+        );
         for r in 0..list_rows {
             let idx = start + r as usize;
             let Some(label) = menu.items.get(idx) else {
@@ -2810,7 +2822,15 @@ impl Renderer {
                 .and_then(Option::as_deref)
                 .filter(|k| !k.is_empty());
             let label_w = menu.kind_col.map_or(list_w, |kc| kc.min(list_w));
-            let (label, spans) = elide_keep_tail(label, spans, label_w as usize);
+            // A row whose source declared a two-column `layout` (live_grep) fits as a
+            // location column plus a body windowed around the match instead.
+            let layout = menu
+                .layouts
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|(h, s, e)| (h as usize, s as usize, e as usize));
+            let (label, spans) = fit_row(label, spans, label_w as usize, layout, head_col);
             let text = pmenu_row(&label, "", label_w as usize);
             self.push_plain(items, &text, self.cell_px(cx, row), row_fg, full);
             if let (Some(k), Some(kc)) = (kind, menu.kind_col) {

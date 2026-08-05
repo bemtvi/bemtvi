@@ -57,7 +57,12 @@ async function pollPickerItems(page, ms = 8000) {
       `local p = nx._picker\n` +
         `if not p then return "NOPICKER" end\n` +
         `local t = {}\n` +
-        `for i = 1, (p.nitems or 0) do t[#t + 1] = p.items[i].text end\n` +
+        // A live_grep row is two-column: the `path:line:col: ` head plus the matched
+        // line as `text` — the label the widget renders is their concatenation.
+        `for i = 1, (p.nitems or 0) do\n` +
+        `  local it = p.items[i]\n` +
+        `  t[#t + 1] = (it.head or "") .. it.text\n` +
+        `end\n` +
         `return table.concat(t, "\\n")`,
     );
     const s = String(v);
@@ -105,11 +110,39 @@ try {
   await luaResult(page, `nx.picker.open('live_grep')`);
   await page.evaluate(() => window.__nxvim.feed("NEEDLE"));
   const items = await pollPickerItems(page);
-  const hits = String(items).split("\n").filter((l) => /NEEDLE/.test(l));
+  // The lua result arrives as a debug repr, so the joiner shows up as the two-char
+  // escape `\n` rather than a newline — split on either.
+  const hits = String(items).split(/\\n|\n/).filter((l) => /NEEDLE/.test(l));
   check(
     "live_grep falls back to nx.fs.grep and lists the matching lines (no rg/grep)",
     hits.length >= 2 && hits.some((l) => /a\.txt/.test(l)) && hits.some((l) => /b\.txt/.test(l)),
     `hits=${JSON.stringify(hits)}`,
+  );
+
+  // …and RENDERS them as two-column rows: the location head, the matched line, and the
+  // hit bolded. A live_grep row bypasses the fuzzy matcher, so this highlight can only
+  // come from the source's own match range riding the `layouts` projection.
+  const rendered = await page.evaluate(() =>
+    // The list rows only — the prompt row and the preview pane also carry the query.
+    // Matched chars are one span each, so join them back into the highlighted text.
+    [...document.querySelectorAll("#grid .pmenu .row")]
+      .map((r) => ({
+        text: r.textContent,
+        marked: [...r.querySelectorAll(".pmenu-match, span[style]")]
+          .map((s) => s.textContent)
+          .join(""),
+      }))
+      .filter((r) => /\.txt:\d+:\d+:/.test(r.text)),
+  );
+  check(
+    "the rendered rows keep the file name AND the matched line",
+    rendered.length >= 2 && rendered.every((r) => /\.txt:\d+:\d+: +\S.*NEEDLE/.test(r.text)),
+    `rendered=${JSON.stringify(rendered)}`,
+  );
+  check(
+    "the hit itself is highlighted on the row",
+    rendered.length >= 2 && rendered.every((r) => r.marked === "NEEDLE"),
+    `rendered=${JSON.stringify(rendered)}`,
   );
 
   await page.evaluate(() => window.__nxvim.feed("<Esc>"));

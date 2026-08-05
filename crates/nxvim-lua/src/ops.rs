@@ -2381,6 +2381,11 @@ pub struct PickerPush {
     /// preview pane and this row supplied a `path`; `None` otherwise (preview-less
     /// picker, or a row with no path — e.g. an unnamed buffer).
     pub preview: Option<PreviewPush>,
+    /// The row's two-column layout when the source declared one (`push { head = … }`):
+    /// `(head length, match start, match end)` as **char** offsets into `label` — the
+    /// live_grep shape, `path:line:col: ` followed by the matched line. `None` for a
+    /// plain single-column row.
+    pub layout: Option<(u16, u16, u16)>,
 }
 
 /// One mark a `nx.decor` provider published — extmark-shaped, in **buffer**

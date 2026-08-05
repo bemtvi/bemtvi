@@ -146,6 +146,29 @@ impl Extent {
 /// `None`.
 pub type CmdlineCandidate = (String, String, Option<String>, Option<(usize, usize)>);
 
+/// A picker row's **two-column** layout hint, declared by the source
+/// (`ctx.push { head = …, focus = … }`) for rows shaped as a location column plus
+/// a content body — live_grep's `src/foo.rs:12:5: <the matched line>`. Both are
+/// **char** counts into the row's `label`, and both are structural facts only the
+/// source knows: a client must never re-derive them by parsing the label.
+///
+/// Clients fit such a row as two columns (`nxvim_view::fit_row`): the head keeps a
+/// minimum share of the row (so the file name never gets squeezed off by a long
+/// line), the body is windowed around the match so the hit itself stays on screen,
+/// and the match range is highlighted like a fuzzy hit — a *dynamic* source
+/// (live_grep) bypasses the fuzzy matcher, so its own match is the only one there
+/// is. A row without a layout truncates as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowLayout {
+    /// Char length of the leading location column (`"src/foo.rs:12:5: "`).
+    pub head: u16,
+    /// The source's match within the label, as a half-open **char** range. Empty
+    /// (`match_end == match_start`) when the source knows only where the interesting
+    /// content begins — the body still windows around it, nothing is highlighted.
+    pub match_start: u16,
+    pub match_end: u16,
+}
+
 /// One candidate row: its display `label` and the **opaque source key** that
 /// identifies it back to the engine. For `nx.ui.select` the key is the choice's
 /// 0-based index; for a picker it is the 1-based index into the Lua wrapper's
@@ -207,6 +230,11 @@ pub struct MenuItem {
     /// range. The bytes index the line as it was at menu-build time, so preview / accept
     /// restore that line first (see [`Editor::cmdline_complete_preview`]).
     pub replace: Option<(usize, usize)>,
+    /// The row's two-column layout ([`RowLayout`]) when the source declared one
+    /// (`ctx.push { head = …, focus = … }` — live_grep's `path:line:col:` head plus
+    /// the matched line). `None` for every plain single-column row, which truncates
+    /// path-tail-first as before.
+    pub layout: Option<RowLayout>,
 }
 
 impl MenuItem {
@@ -226,6 +254,7 @@ impl MenuItem {
             doc: None,
             resolve: None,
             replace: None,
+            layout: None,
         }
     }
 }
@@ -1791,6 +1820,21 @@ impl Editor {
         let end = start.saturating_add(count).min(m.view_len());
         (start..end)
             .map(|i| m.all_items[m.item_at(i)].kind.clone())
+            .collect()
+    }
+
+    /// The per-row two-column **layout** hint for the visible window
+    /// `[start, start + count)`, parallel to [`Editor::menu_rows`] — the head/focus
+    /// char offsets a client fits a `path:line:col: <line>` row by. `None` for a row
+    /// whose source declared none (every non-grep-shaped row); empty when no menu is
+    /// open.
+    pub fn menu_layout_window(&self, start: usize, count: usize) -> Vec<Option<RowLayout>> {
+        let Some(m) = self.menu.as_ref() else {
+            return Vec::new();
+        };
+        let end = start.saturating_add(count).min(m.view_len());
+        (start..end)
+            .map(|i| m.all_items[m.item_at(i)].layout)
             .collect()
     }
 

@@ -249,6 +249,87 @@
       return [out, remapped];
     }
 
+    // The shared head-column width for a frame of two-column picker rows: the widest
+    // visible head, capped at 40% of the list so a long path can never squeeze the body
+    // out. Mirrors the native clients' `row_head_col`.
+    function rowHeadCol(maxHead, width) {
+      return Math.max(1, Math.min(maxHead, Math.max(1, Math.floor((width * 2) / 5))));
+    }
+
+    // Fit one picker row into `width` cells honoring an optional two-column `layout`
+    // — `[head, matchStart, matchEnd]` char offsets into the label: the length of the
+    // location column (`src/foo.rs:12:5: `) and the source's own match. The head is
+    // padded (or `…`-elided keeping its tail) to `headCol` so bodies align, and the
+    // body is windowed around the match so a hit far into a long line stays on screen;
+    // the match joins `spans` so it highlights like a fuzzy hit. No layout ⇒ plain
+    // `elideKeepTail`. Mirrors the native clients' `fit_row`.
+    function fitRow(label, spans, width, layout, headCol) {
+      if (!layout) return elideKeepTail(label, spans, width);
+      if (width === 0) return ["", []];
+      const [matchStart, matchEnd] = [layout[1], layout[2]];
+      const chars = [...label];
+      const n = chars.length;
+      const head = Math.min(layout[0], n);
+      // Each chunk maps a run of source chars onto the output: `[outStart, srcStart,
+      // len]`. The `…` markers and the head padding map to nothing, so a span over
+      // dropped chars simply vanishes.
+      let out = "";
+      let used = 0;
+      const chunks = [];
+      const take = (src, len) => {
+        chunks.push([used, src, len]);
+        out += chars.slice(src, src + len).join("");
+        used += len;
+      };
+      // Head column: the whole head when it fits, else its tail behind a `…`.
+      const hc = Math.min(Math.max(headCol, 1), width);
+      if (head <= hc) {
+        take(0, head);
+      } else {
+        const drop = head - (hc - 1);
+        let cut = drop;
+        for (let i = drop; i < head; i++) {
+          if (chars[i - 1] === "/") { cut = i; break; }
+        }
+        out += "…";
+        used += 1;
+        take(cut, head - cut);
+      }
+      if (head > 0 && head < n && used < hc) {
+        out += " ".repeat(hc - used);
+        used = hc;
+      }
+      // Body column: the rest of the row, windowed so the match stays visible.
+      const bw = Math.max(0, width - used);
+      if (bw > 0 && head < n) {
+        const blen = n - head;
+        const f = Math.min(Math.max(matchStart, head), n) - head;
+        if (blen <= bw) {
+          take(head, blen);
+        } else {
+          const lead = Math.min(Math.floor(bw / 5), f);
+          const start = Math.min(f - lead, blen - (bw - 1));
+          if (start === 0) {
+            take(head, bw);
+          } else {
+            out += "…";
+            used += 1;
+            take(head + start, bw - 1);
+          }
+        }
+      }
+      const all = matchEnd > matchStart ? [...spans, [matchStart, matchEnd]] : spans;
+      const remapped = [];
+      for (const [s, e] of all) {
+        for (const [outStart, srcStart, len] of chunks) {
+          const ns = Math.max(s, srcStart);
+          const ne = Math.min(e, srcStart + len);
+          if (ns < ne) remapped.push([ns - srcStart + outStart, ne - srcStart + outStart]);
+        }
+      }
+      return [out, remapped];
+    }
+
     // Display width of a Unicode code point in screen cells (0 / 1 / 2), matching the
     // server EXACTLY. The server lays columns out with `unicode-width` (UAX #11), so the
     // DOM renderer must agree codepoint-for-codepoint or the cursor / selection / search /
@@ -2377,6 +2458,12 @@
         sepEl.style.width = listW * cw + "px";
         sepEl.textContent = "─".repeat(listW);
       }
+      // Two-column (live_grep-shaped) rows share one head column across the frame so
+      // their matched lines line up; unused when no row declares a layout.
+      const headCol = rowHeadCol(
+        (menu.layouts || []).reduce((w, l) => (l ? Math.max(w, l[0]) : w), 0),
+        listW,
+      );
       const listEls = [];
       for (let i = 0; i < listRows; i++) {
         const idx = start + i;
@@ -2397,7 +2484,10 @@
         const kindStr = (menu.kinds && menu.kinds[idx]) || "";
         const hasKindCol = typeof menu.kind_col === "number" && menu.kind_col < listW;
         const labelW = hasKindCol ? menu.kind_col : listW;
-        const [elidedLabel, spans] = elideKeepTail(label, rawSpans, labelW);
+        // A row whose source declared a two-column `layout` (live_grep) fits as a
+        // location column plus a body windowed around the match instead.
+        const layout = (menu.layouts && menu.layouts[idx]) || null;
+        const [elidedLabel, spans] = fitRow(label, rawSpans, labelW, layout, headCol);
         const chars = [...elidedLabel].slice(0, labelW);
         if (spans.length === 0) {
           rowEl.textContent = chars.join("").padEnd(labelW);

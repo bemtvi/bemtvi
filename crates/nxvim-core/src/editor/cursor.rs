@@ -68,11 +68,11 @@ impl Editor {
             .max(1)
     }
 
-    /// The focused window's text-area width in screen cells: its rect width minus
-    /// a bordered float's one-cell inset (on each side) and the number gutter. The
-    /// horizontal analog of [`text_height`], feeding the `leftcol` scroll math.
-    /// Matches the `width` `view::window_view` projects, so on-screen and policy
-    /// agree.
+    /// The focused window's text-area width in screen cells: its rect width minus a
+    /// bordered float's one-cell inset (on each side) and every gutter — the fold
+    /// column, the sign column, and the number gutter. The horizontal analog of
+    /// [`text_height`], feeding the `leftcol` scroll math. Subtracts exactly what the
+    /// `width` `view::window_view` projects does, so on-screen and policy agree.
     pub(crate) fn text_width(&self) -> usize {
         let w = self.windows.cur();
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
@@ -85,8 +85,9 @@ impl Editor {
         rect_width
             .saturating_sub(2 * inset)
             .saturating_sub(options.padding.horizontal())
+            .saturating_sub(options.foldcolumn)
+            .saturating_sub(super::windows::signcol_cells(w.sign_width, options))
             .saturating_sub(number_width)
-            .saturating_sub(options.signcolumn.floor_cells())
     }
 
     /// The last real line index (`line_count - 1`, saturating). The rope's phantom

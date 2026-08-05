@@ -12,7 +12,8 @@
 
 use crate::buffer::Buffer;
 use crate::editor::{
-    BorderStyle, BufferId, Cursor, Editor, Fold, MenuPlacement, TabLabel, WindowId, WindowLayout,
+    signcol_cells, BorderStyle, BufferId, Cursor, Editor, Fold, MenuPlacement, TabLabel, WindowId,
+    WindowLayout,
 };
 use crate::extmark::VirtChunk;
 use crate::mode::Mode;
@@ -850,7 +851,16 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     let height = content_height
         .saturating_sub(usize::from(status_visible))
         .max(1);
-    let width = content_width.saturating_sub(number_width);
+    // The text area is the content box minus *every* gutter the client carves off its
+    // left: the fold column, then the sign column, then the number gutter (the order
+    // the clients split them in). Counting only the number gutter here would wrap
+    // segments too wide by the other two, and the client would clip each row's tail
+    // off the right edge — text silently lost on `wrap`, and a `nowrap` line that
+    // looks like it fits.
+    let width = content_width
+        .saturating_sub(w.options.foldcolumn)
+        .saturating_sub(signcol_cells(w.sign_width, &w.options))
+        .saturating_sub(number_width);
     let top = w.top;
     // A stashed cursor may sit past a buffer that shrank while this window was
     // inactive; clamp it for the rendered ruler / cursor row.

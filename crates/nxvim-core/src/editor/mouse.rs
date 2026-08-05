@@ -2059,8 +2059,8 @@ impl Editor {
             .map(|o| o.padding)
             .unwrap_or_default();
         // The gutter the popup box sits behind is the window's *whole* text offset —
-        // the sign column AND the number column — not just the number width, or the
-        // sidebar slides `sign_width` cells left of the popup it butts against.
+        // the fold column, the sign column AND the number column — not just the number
+        // width, or the sidebar slides those cells left of the popup it butts against.
         let gutter = self.window_textoff(win).unwrap_or(0);
         // The popup box's content top-left. The window rect is region-relative, so add
         // the region's screen origin (the dock bands + global chrome) to reach the
@@ -2427,17 +2427,17 @@ impl Editor {
         let buf_id = self.window_buffer(win)?;
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
-        // The full left gutter — number column **plus** the sign column. The sign
-        // width is the window's last-rendered one (`window_textoff`), so a click
-        // skips the same dynamic gutter the client drew; using only the number
-        // width shifts every column right by the sign column (see the
-        // dynamic-sign-column mouse test).
+        // The full left gutter — fold column **plus** sign column **plus** number
+        // column. The sign width is the window's last-rendered one
+        // (`window_textoff`), so a click skips the same dynamic gutter the client
+        // drew; counting any one of the three shifts every column right by the
+        // others (see the per-gutter mouse tests).
         let gutter = self
             .window_textoff(win)
             .unwrap_or_else(|| self.number_width_for(&opts, line_count));
         let ts = buf.options.effective_tabstop();
-        // The soft-wrap text width: the content area past the number gutter (the
-        // same `width` the view wraps into). Under `nowrap` wrapping is skipped, so
+        // The soft-wrap text width: the content area past every gutter (the same
+        // `width` the view wraps into). Under `nowrap` wrapping is skipped, so
         // this is unused; the horizontal `leftcol` scroll applies instead.
         let wrap = opts.wrap;
         let (text_width, _) = self.window_text_area(win)?;

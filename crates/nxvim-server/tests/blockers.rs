@@ -10,7 +10,8 @@
 //! The `start_with_config` / `feed` / `exec_lua` helpers are copied from the
 //! established pattern (integration-test files don't share a module).
 
-use nxvim_test_harness::{exec_lua, feed, start_with_config, temp_dir};
+use nxvim_rpc::Rpc;
+use nxvim_test_harness::{command, exec_lua, feed, start_with_config, temp_dir};
 use rmpv::Value;
 
 fn as_str(v: &Value) -> String {
@@ -165,6 +166,36 @@ async fn screenrow_and_screencol_track_the_cursor() {
         as_ints(&exec_lua(&rpc, "return { vim.fn.screenrow(), vim.fn.screencol() }").await),
         vec![base[0] + 2, base[1] + 2],
     );
+}
+
+/// `screencol` is measured past **every** gutter, not just the number column — the
+/// same text offset the mouse hit-test skips. A popup plugin reads this to check
+/// whether its float would cover the cursor, so a fold column left out of the count
+/// puts the float that many cells off.
+#[tokio::test]
+async fn screencol_counts_the_fold_and_sign_gutters() {
+    let dir = temp_dir("screencol_gutters");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    async fn screencol(rpc: &Rpc) -> i64 {
+        as_ints(&exec_lua(rpc, "return { vim.fn.screencol() }").await)[0]
+    }
+
+    feed(&rpc, "ihello<Esc>gg0");
+
+    // No gutters at all: the cursor on byte 0 sits at 1-based screen column 1.
+    command(
+        &rpc,
+        "set nonumber norelativenumber foldcolumn=0 signcolumn=no",
+    )
+    .await;
+    assert_eq!(screencol(&rpc).await, 1, "no gutter, no offset");
+
+    // Each gutter pushes the text right by its own width, and they stack.
+    command(&rpc, "set foldcolumn=3").await;
+    assert_eq!(screencol(&rpc).await, 4, "past the 3-cell fold column");
+    command(&rpc, "set signcolumn=yes").await; // one 2-cell column
+    assert_eq!(screencol(&rpc).await, 6, "past the fold + sign columns");
 }
 
 // ============================ vim.go / vim.v ================================

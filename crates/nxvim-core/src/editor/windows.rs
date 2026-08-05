@@ -1203,6 +1203,13 @@ pub(crate) struct WindowLayout {
     /// This window's window-local options (the number gutter), so the projection
     /// renders each window's own gutter rather than a single global one.
     pub(crate) options: WindowOptions,
+    /// The sign-column width in cells this window **last rendered**
+    /// ([`Window::sign_width`]). The projection carves it off the text area exactly
+    /// as the client does, so soft-wrap segments end where the screen does. Floored
+    /// at [`SignColumn::floor_cells`] at the read site, like
+    /// [`Editor::window_textoff`] — see that method for why the rendered width (not
+    /// the static policy) is the honest number.
+    pub(crate) sign_width: usize,
     /// Whether this window is a float (drawn on top of the tiled layout at its
     /// absolute `rect`). The client paints floats in a second, on-top pass.
     pub(crate) floating: bool,
@@ -1218,6 +1225,21 @@ pub(crate) struct WindowLayout {
     /// projection can collapse closed folds into placeholder rows. See
     /// [`crate::editor::fold`].
     pub(crate) folds: super::fold::FoldState,
+}
+
+/// The sign-column width in cells a window reserves before its first text cell:
+/// the width it **last rendered** (`sign_width`, pushed by the server's redraw),
+/// since a dynamic `'signcolumn'` grows to fit signs core can't see alone (LSP
+/// diagnostics, `sign_text` extmarks). Floored at the static reservation
+/// [`SignColumn::floor_cells`] so a `signcolumn=yes` window never under-counts
+/// before its first frame lands.
+///
+/// The one place this number is decided, so every consumer agrees with the gutter
+/// the client actually draws: the mouse hit-test ([`Editor::window_textoff`]), the
+/// `nowrap` horizontal-scroll width ([`Editor::text_width`]), and the soft-wrap
+/// width the view projection wraps segments to.
+pub(crate) fn signcol_cells(sign_width: usize, options: &WindowOptions) -> usize {
+    sign_width.max(options.signcolumn.floor_cells())
 }
 
 /// One tab page's label data for the [`View`] tabline: the file name of the
@@ -1768,21 +1790,25 @@ impl Editor {
         })
     }
 
-    /// Window `id`'s text offset — the gutter columns before the first text cell
-    /// (the number gutter plus the sign column). `None` for an unknown id. Feeds the
-    /// mouse hit-test and the server's screen-column math for `vim.fn.screencol`.
+    /// Window `id`'s text offset — every gutter column before the first text cell,
+    /// in the order the clients carve them off the left of the content box: the fold
+    /// column, the sign column, then the number gutter. `None` for an unknown id.
+    /// Feeds the mouse hit-test, the completion popup's anchor, and the server's
+    /// screen-column math for `vim.fn.screencol`.
     ///
-    /// The sign-column width is the one the window **last rendered**
-    /// ([`Window::sign_width`], pushed by the server's redraw), since a dynamic
-    /// `'signcolumn'` grows to fit signs core can't see alone (LSP diagnostics).
-    /// Floored at the static reservation `SignColumn::floor_cells` so a
-    /// `signcolumn=yes` window never under-counts before its first frame lands.
+    /// Its complement is the text width [`window_view`](crate::view) projects —
+    /// the content box past this same offset — so the hit-test wraps into the width
+    /// the frame was laid out at and a click on a continuation row resolves to the
+    /// byte under the pointer.
     pub fn window_textoff(&self, id: WindowId) -> Option<usize> {
         let (_, t) = self.tree_of_window(id)?;
         let w = t.get(id);
         let lines = self.buffers.get(w.buffer).buffer.line_count();
-        let signcol = w.sign_width.max(w.options.signcolumn.floor_cells());
-        Some(self.number_width_for(&w.options, lines) + signcol)
+        Some(
+            w.options.foldcolumn
+                + signcol_cells(w.sign_width, &w.options)
+                + self.number_width_for(&w.options, lines),
+        )
     }
 
     /// Record the sign-column width (in cells) window `id` reserved this frame, so a
@@ -2174,6 +2200,7 @@ impl Editor {
                     rect: w.rect,
                     focused,
                     options: w.options.clone(),
+                    sign_width: w.sign_width,
                     floating,
                     border,
                     title,

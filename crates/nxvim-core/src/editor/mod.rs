@@ -110,7 +110,7 @@ pub use self::windows::{
     place_aligned, Align, BorderStyle, FloatAnchor, FloatConfig, FloatRelative, Margin,
     WindowConfigSpec,
 };
-pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
+pub(crate) use self::windows::{signcol_cells, PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
 pub use self::quickfix::{
     LocListEntry, NamedList, NamedListId, QfAction, QfEntry, QfList, QfStack, QfWhich,

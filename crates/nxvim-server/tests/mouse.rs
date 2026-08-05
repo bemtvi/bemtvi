@@ -208,6 +208,67 @@ async fn left_click_accounts_for_dynamic_sign_column() {
     assert_eq!(cursor(&rpc).await, (2, 3));
 }
 
+/// `'foldcolumn'` is the leftmost gutter the client carves off — ahead of the sign
+/// and number columns — so the hit-test owes it too. With `nonumber` and no signs
+/// it is the *only* gutter; missing it shifts every click `foldcolumn` cells right.
+#[tokio::test]
+async fn left_click_accounts_for_the_fold_column() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set foldcolumn=3").await;
+    // Fold gutter = 3 cells, nothing else. Screen col 6 → text col 6 − 3 = 3, byte 3
+    // of "second line" ('o'). Without skipping the fold column it lands on byte 6.
+    feed_mouse(&rpc, "left", "press", 1, 6);
+    assert_eq!(cursor(&rpc).await, (2, 3));
+    // A click inside the fold gutter itself is click-through to column 0.
+    feed_mouse(&rpc, "left", "press", 0, 1);
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}
+
+/// All three gutters stack: fold column, then sign column, then the number gutter.
+/// The hit-test has to skip their sum, not whichever one it happens to know about.
+#[tokio::test]
+async fn left_click_accounts_for_every_gutter_at_once() {
+    let (rpc, mut incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set foldcolumn=2").await;
+    command(&rpc, "set signcolumn=yes").await; // 2 cells, no sign needed
+                                               // Number gutter is 4 cells for this small buffer (`digit_count + 1`).
+    wait_redraw(&mut incoming, |m| {
+        field(m, "sign_width").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+    // Gutters total 2 + 2 + 4 = 8 cells. Screen col 11 → text col 3, byte 3 of
+    // "second line" ('o').
+    feed_mouse(&rpc, "left", "press", 1, 11);
+    assert_eq!(cursor(&rpc).await, (2, 3));
+}
+
+/// Under `'wrap'`, the hit-test walks the same soft-wrap segments the view projects
+/// — so it has to wrap into the same width, the content box past *every* gutter. Too
+/// wide a width puts its segment boundaries in the wrong place, and a click on a
+/// continuation row resolves to the wrong byte.
+#[tokio::test]
+async fn a_click_on_a_wrapped_row_uses_the_gutter_narrowed_width() {
+    // One 200-char line whose bytes are their own position marker is awkward; use a
+    // repeated 10-char cycle so a resolved byte is unambiguous in the assertion.
+    let long: String = (0..200)
+        .map(|i| char::from(b'0' + (i % 10) as u8))
+        .collect();
+    let (rpc, mut incoming) = start(&long).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set wrap").await;
+    command(&rpc, "set foldcolumn=3").await;
+    command(&rpc, "set signcolumn=yes").await;
+    wait_redraw(&mut incoming, |m| {
+        field(m, "sign_width").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+    // Text width is 80 − 3 (fold) − 2 (sign) = 75, so the second display row starts
+    // at byte 75. Screen row 1, screen col 3 + 2 + 4 → text col 4 → byte 79.
+    feed_mouse(&rpc, "left", "press", 1, 9);
+    assert_eq!(cursor(&rpc).await, (1, 79));
+}
+
 /// Tabs are accounted for: a screen column over a tab-indented line maps back to
 /// the correct byte, using the buffer's `tabstop` (default 4).
 #[tokio::test]

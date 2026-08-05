@@ -691,6 +691,117 @@ async fn overlays_clip_and_rebase_to_the_wrap_segment() {
 }
 
 #[tokio::test]
+async fn signcolumn_narrows_the_wrap_width() {
+    // The sign column is carved out of the same content box the text lives in, so a
+    // soft-wrapped line must wrap into `width - sign_width` cells. Projecting the
+    // full width instead pushes each row's tail past the right edge, where the client
+    // clips it — text silently lost, `sign_width` cells per row.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, ":set signcolumn=yes<CR>"); // one 2-cell sign column
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    assert_eq!(field(&map, "sign_width").and_then(Value::as_u64), Some(2));
+    let lines = view_lines(&map);
+    assert_eq!(
+        lines[0].chars().count(),
+        78,
+        "80-cell content box minus the 2-cell sign column"
+    );
+    assert_eq!(lines[1].chars().count(), 78, "so does every continuation");
+    assert_eq!(
+        lines[0..3].iter().map(|l| l.chars().count()).sum::<usize>(),
+        200,
+        "the whole line is laid out, nothing clipped off the right edge"
+    );
+    // The cursor (last 'a', byte 199) rides the same narrowed segments: rows of 78
+    // put it on row 2 at row-local column 43 (199 - 156).
+    assert_eq!(view_u64(&map, "cursor_row"), 2);
+    assert_eq!(view_u64(&map, "cursor_screen_col"), 43);
+}
+
+#[tokio::test]
+async fn foldcolumn_narrows_the_wrap_width() {
+    // Same story for `'foldcolumn'`: the client carves it off the left of the same
+    // content box (ahead of the sign column), so the wrap width owes it too.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, ":set foldcolumn=3<CR>");
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    assert_eq!(view_u64(&map, "foldcolumn_width"), 3);
+    let lines = view_lines(&map);
+    assert_eq!(
+        lines[0].chars().count(),
+        77,
+        "80-cell content box minus the 3-cell fold gutter"
+    );
+    assert_eq!(
+        lines[0..3].iter().map(|l| l.chars().count()).sum::<usize>(),
+        200,
+        "nothing clipped off the right edge"
+    );
+}
+
+#[tokio::test]
+async fn a_dynamic_sign_column_narrows_the_wrap_width() {
+    // `signcolumn=auto` reserves nothing until a sign appears, then grows to 2 cells.
+    // The rendered width is server-side (core can't see extmark/diagnostic signs), so
+    // the wrap width has to follow the width the window *last rendered*, not just the
+    // static `yes:n` floor.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(field(&map, "sign_width").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        view_lines(&map)[0].chars().count(),
+        80,
+        "no sign, no gutter"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('wrapsign')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { sign_text = '>>' })
+        "#,
+    )
+    .await;
+    // The width core wraps to is the one the previous frame rendered, so let the sign
+    // land in a frame before asserting on the frame that follows it.
+    let _ = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    assert_eq!(field(&map, "sign_width").and_then(Value::as_u64), Some(2));
+    let lines = view_lines(&map);
+    assert_eq!(
+        lines[0].chars().count(),
+        78,
+        "the grown sign column narrows the text area"
+    );
+    assert_eq!(
+        lines[0..3].iter().map(|l| l.chars().count()).sum::<usize>(),
+        200,
+        "nothing clipped off the right edge"
+    );
+}
+
+#[tokio::test]
 async fn showbreak_prefixes_continuation_rows_and_reduces_wrap_width() {
     // `:set showbreak=>>` draws a marker at the start of every soft-wrap continuation
     // row; the marker consumes leading cells, so a continuation wraps into

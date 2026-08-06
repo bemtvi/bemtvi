@@ -33,7 +33,7 @@ fn shutdown_sends_the_shutdown_request_before_exit_and_kill() {
     let mut client = SyncLspClient::new();
     let key = ServerKey {
         name: "mock".into(),
-        root: PathBuf::from("/tmp"),
+        root: Some(PathBuf::from("/tmp")),
     };
     client.ensure_server(
         key.clone(),

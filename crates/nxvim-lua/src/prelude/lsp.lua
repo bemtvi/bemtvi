@@ -682,7 +682,13 @@ end)
 --     decline), so `workspace_required` decides what happens next;
 --   * absent, with `root_markers` driving the upward fs-seam search.
 --
--- With none of those the root is nil and the server uses the file's directory.
+-- With none of those the root stays nil and the server runs **rootless**: it is
+-- initialized with no `rootUri` (the protocol's single-file mode) and every rootless
+-- buffer of that config shares the ONE instance, rather than each file's directory
+-- becoming its own root and its own child. This is neovim's behavior, and it is what
+-- keeps jumping into an out-of-tree file — a stdlib stub under `~/.cache`, a
+-- dependency's source — from starting a second full set of servers and pointing them
+-- at a tree to index that the user never opened.
 --
 -- `workspace_required` gates the last step: a server that resolves its configuration
 -- and imports from the workspace is useless without one, so a buffer with no root is
@@ -1993,9 +1999,15 @@ end
 -- Resolve one registered `globPattern` to an ABSOLUTE glob. The protocol allows
 -- either a plain string (relative to the workspace, or already absolute) or a
 -- `RelativePattern` — `{ baseUri = <uri | WorkspaceFolder>, pattern = "…" }` — which
--- is why `relativePatternSupport` is advertised. Returns nil for a shape we can't
--- read, so the caller can say which watcher was dropped rather than watch the wrong
--- tree.
+-- is why `relativePatternSupport` is advertised. Returns `nil, reason` for anything
+-- it can't resolve, so the caller can say which watcher was dropped, and why, rather
+-- than watch the wrong tree.
+--
+-- `root` is nil for a ROOTLESS client (no workspace was found for the buffer). A
+-- pattern that is already absolute, or a `RelativePattern` carrying its own
+-- `baseUri`, still resolves; a workspace-relative one has nothing to resolve against
+-- and is refused — the alternative is inventing a directory and recursively watching
+-- somebody's home.
 local function absolute_glob(pattern, root)
   local base, relative = root, nil
   if type(pattern) == "string" then
@@ -2011,10 +2023,16 @@ local function absolute_glob(pattern, root)
     end
   end
   if type(relative) ~= "string" or relative == "" then
-    return nil
+    return nil, "unreadable file-watch pattern in a didChangeWatchedFiles registration"
   end
   if relative:sub(1, 1) == "/" or relative:match("^%a:[/\\]") then
     return relative -- already absolute; the base is not ours to impose
+  end
+  if type(base) ~= "string" or base == "" then
+    return nil,
+      "file-watch pattern '"
+        .. relative
+        .. "' is relative to a workspace, and this server has no root"
   end
   return (base:gsub("/$", "")) .. "/" .. relative
 end
@@ -2101,6 +2119,10 @@ end)
 -- Watchers sharing a base directory share ONE `nx.fs.watch` (a server commonly
 -- registers `**/*.py` and `**/*.pyi` over the same root; two recursive watches on
 -- one tree would double every event for nothing).
+--
+-- `root` is nil for a rootless client, where each workspace-relative watcher is
+-- skipped with the reason `absolute_glob` gives (a rootless server is watching
+-- nothing but its open documents, which is what single-file mode means).
 local function arm_file_watches(client_id, root, entry, options)
   local watchers = type(options) == "table" and options.watchers or nil
   if type(watchers) ~= "table" or #watchers == 0 then
@@ -2112,12 +2134,9 @@ local function arm_file_watches(client_id, root, entry, options)
   end
   local by_dir = {}
   for _, w in ipairs(watchers) do
-    local glob = absolute_glob(w.globPattern, root)
+    local glob, why = absolute_glob(w.globPattern, root)
     if glob == nil then
-      nx.notify(
-        "nx.lsp: unreadable file-watch pattern in a didChangeWatchedFiles registration; skipped",
-        vim.log.levels.WARN
-      )
+      nx.notify("nx.lsp: " .. why .. "; skipped", vim.log.levels.WARN)
     else
       local dir = watch_root(glob)
       by_dir[dir] = by_dir[dir] or {}
@@ -2150,7 +2169,8 @@ local function arm_file_watches(client_id, root, entry, options)
 end
 
 -- A server registered capabilities after the handshake (`client/registerCapability`).
--- `root` is its workspace root, used for a relative glob with no `baseUri`;
+-- `root` is its workspace root, used for a relative glob with no `baseUri` (nil for a
+-- rootless client, whose workspace-relative watchers are skipped);
 -- `registrations` are the protocol's `{ id, method, registerOptions }` entries.
 --
 -- Only the two methods nxvim advertises `dynamicRegistration` for can legitimately

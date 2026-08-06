@@ -228,7 +228,7 @@ impl SyncLspClient {
                 .unwrap_or_default(),
             env: spawn.env.clone(),
         });
-        let init = init_params(&key.root, &spawn, None, &self.log, &name);
+        let init = init_params(key.root.as_deref(), &spawn, None, &self.log, &name);
         let params = serde_json::to_value(&init).unwrap_or(Value::Null);
         self.send_request(&key, "initialize", params, Pending::Handshake);
     }
@@ -636,7 +636,7 @@ impl SyncLspClient {
             // helper that builds the `workspaceFolders` we push at `initialize` — the
             // push and the pull must name one folder, whichever leg a session runs on.
             "workspace/workspaceFolders" => {
-                let folders = workspace_folders(&key.root);
+                let folders = workspace_folders(key.root.as_deref());
                 let reply = serde_json::to_value(folders).unwrap_or(Value::Null);
                 self.send_response(key, req_id, reply);
             }

@@ -2081,3 +2081,293 @@ async fn lsp_info_reports_every_server_on_the_buffer() {
         "the current-buffer block names every attached server, not just the first"
     );
 }
+
+/// Open `dir/<sub>/<stem>.rs` as the startup buffer, with the mock armed but no
+/// server enabled yet. Used by the rootless tests, which need the file to sit in a
+/// *subdirectory* so a per-directory root is distinguishable from the temp root.
+async fn open_rust_at(path: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    std::fs::write(path, "let foo = bar()\n").expect("write test file");
+    let init = ServerInit {
+        file: Some(path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
+/// Enable the `mock` config with markers that cannot resolve (nothing named
+/// `.nxvim-marker` exists anywhere above a temp dir), so every buffer takes the
+/// no-root-found path.
+async fn enable_markerless_mock(rpc: &Rpc) {
+    exec_lua(
+        rpc,
+        r#"
+        nx.lsp.config("mock", {
+          cmd = { "placeholder" },
+          filetypes = { "rust" },
+          root_markers = { ".nxvim-marker" },
+        })
+        nx.lsp.enable("mock")
+        "#,
+    )
+    .await;
+}
+
+/// The `Running servers` lines off a fresh `:LspInfo`.
+async fn running_server_lines(rpc: &Rpc) -> Vec<String> {
+    exec_lua(rpc, "nx.cmd('LspInfo')").await;
+    let got = exec_lua(
+        rpc,
+        "return (function()\n\
+         \x20 local out, seen = {}, false\n\
+         \x20 for _, l in ipairs(nx.buf.lines(0, 0, -1)) do\n\
+         \x20   if seen and l:find('mock', 1, true) then out[#out+1] = l end\n\
+         \x20   if l == 'Running servers' then seen = true end\n\
+         \x20 end\n\
+         \x20 return table.concat(out, '\\n')\n\
+         end)()",
+    )
+    .await;
+    got.as_str()
+        .unwrap_or("")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Markerless buffers in DIFFERENT directories share ONE rootless server instead of
+/// getting one instance apiece, rooted at each file's own directory.
+///
+/// nxvim used to substitute the file's parent directory when the `root_markers` walk
+/// came up empty, which made every such directory its own `ServerKey`. Jumping into a
+/// dependency — a stdlib stub under `~/.cache/uv`, say — therefore started a *second*
+/// full set of language servers and handed each one that directory as `rootUri`, so
+/// they indexed a tree the user never opened. neovim leaves `config.root_dir` nil
+/// (`vim.lsp.start`) and `reuse_client_default` reuses any rootless client of the same
+/// name; this is that behavior.
+#[tokio::test]
+async fn markerless_buffers_share_one_rootless_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-cfg-rootless");
+    let rec = dir.join("rec.jsonl");
+    // Every instance records to the SAME file, so counting `initialize` lines counts
+    // instances — which is the claim, and unlike `:LspInfo`'s buffer tally it does not
+    // depend on which buffer happens to be current (`sync_lsp` opens documents for the
+    // current buffer only).
+    arm_mock(
+        dir.as_path(),
+        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+    );
+    let count = |method: &str| {
+        std::fs::read_to_string(&rec)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(&format!(r#""method":"{method}""#)))
+            .count()
+    };
+    let (rpc, _incoming) = open_rust_at(&dir.join("a").join("one.rs")).await;
+    enable_markerless_mock(&rpc).await;
+    // The first buffer must reach `didOpen` while it is still current.
+    for _ in 0..200 {
+        if count("textDocument/didOpen") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // A second markerless buffer, in a different directory.
+    let second = dir.join("b").join("two.rs");
+    std::fs::create_dir_all(second.parent().unwrap()).expect("mkdir b");
+    std::fs::write(&second, "let baz = qux()\n").expect("write second file");
+    exec_lua(&rpc, &format!("nx.cmd('e {}')", second.display())).await;
+    for _ in 0..200 {
+        if count("textDocument/didOpen") == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let opened = count("textDocument/didOpen");
+    let started = count("initialize");
+    let lines = running_server_lines(&rpc).await;
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+
+    assert_eq!(opened, 2, "both buffers should have opened a document");
+    assert_eq!(
+        started, 1,
+        "both markerless buffers share ONE server instance, not one per directory"
+    );
+    assert_eq!(
+        lines.len(),
+        1,
+        "`:LspInfo` lists that single instance once, got {lines:?}"
+    );
+    assert!(
+        !lines[0].contains(&dir.join("a").display().to_string()),
+        "a rootless server must not be rooted at a file's own directory, got {lines:?}"
+    );
+}
+
+/// A rootless server is initialized with **neither** root spelling — no `rootUri` and
+/// no `workspaceFolders`, which is single-file mode: the protocol's way of saying
+/// "there is no workspace here". Sending the file's own directory in either field
+/// tells the server to treat that directory as a project and index it. Both are
+/// asserted because nxvim sends both when there IS a root (pyright reads only
+/// `workspaceFolders`, older servers only `rootUri`), so either one alone leaking a
+/// root would put the server back to indexing a tree nobody opened.
+#[tokio::test]
+async fn a_rootless_server_is_initialized_without_a_root_uri() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-cfg-norooturi");
+    let rec = dir.join("rec.jsonl");
+    arm_mock(
+        dir.as_path(),
+        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+    );
+    let (rpc, _incoming) = open_rust_at(&dir.join("a").join("one.rs")).await;
+    enable_markerless_mock(&rpc).await;
+
+    // Parsed inside the poll, not after it: `initialize` is a long line and the read
+    // can catch the mock mid-append, so a half-written line means "not yet", not a
+    // malformed record.
+    let mut init = None;
+    for _ in 0..200 {
+        init = std::fs::read_to_string(&rec)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(r#""method":"initialize""#))
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok());
+        if init.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+
+    let params = init.expect("the mock should have recorded `initialize`");
+    let empty = |field: &str| {
+        let got = params.pointer(&format!("/params/{field}")).cloned();
+        assert!(
+            matches!(got, None | Some(serde_json::Value::Null)),
+            "a markerless buffer must not hand the server a {field}, got {got:?}"
+        );
+    };
+    empty("rootUri");
+    empty("workspaceFolders");
+}
+
+/// Collapsing rootless buffers onto one instance must not collapse them onto a
+/// *rooted* one: a project server keeps its own root (and its own child), and the
+/// out-of-tree buffer gets the rootless instance beside it. This is the shape of the
+/// real report — a project buffer plus a jumped-into stdlib stub.
+#[tokio::test]
+async fn a_rooted_server_and_a_rootless_one_are_separate_instances() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-cfg-rooted-plus");
+    let rec = dir.join("rec.jsonl");
+    arm_mock(
+        dir.as_path(),
+        &format!(r#"{{ "record": "{}" }}"#, rec.display()),
+    );
+    // `a/` is a project (it holds the marker); `b/` is out of tree.
+    let project = dir.join("a");
+    std::fs::create_dir_all(project.join(".nxvim-marker")).expect("mkdir marker");
+    let (rpc, _incoming) = open_rust_at(&project.join("one.rs")).await;
+    enable_markerless_mock(&rpc).await;
+
+    let inits = |want: usize| {
+        let rec = rec.clone();
+        async move {
+            for _ in 0..200 {
+                let found: Vec<serde_json::Value> = std::fs::read_to_string(&rec)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| l.contains(r#""method":"initialize""#))
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                if found.len() >= want {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Vec::new()
+        }
+    };
+    assert_eq!(inits(1).await.len(), 1, "the project server should start");
+
+    let loose = dir.join("b").join("two.rs");
+    std::fs::create_dir_all(loose.parent().unwrap()).expect("mkdir b");
+    std::fs::write(&loose, "let baz = qux()\n").expect("write loose file");
+    exec_lua(&rpc, &format!("nx.cmd('e {}')", loose.display())).await;
+
+    let found = inits(2).await;
+    std::env::remove_var("NXVIM_LSP_CMD");
+
+    assert_eq!(
+        found.len(),
+        2,
+        "the out-of-tree buffer starts its own server"
+    );
+    let roots: Vec<Option<&str>> = found
+        .iter()
+        .map(|v| v.pointer("/params/rootUri").and_then(|r| r.as_str()))
+        .collect();
+    assert!(
+        roots.iter().any(|r| r.is_none()),
+        "the out-of-tree buffer's server is rootless, got {roots:?}"
+    );
+    assert!(
+        roots
+            .iter()
+            .any(|r| r.is_some_and(|r| r.ends_with(&project.display().to_string()))),
+        "the project server keeps its own root, got {roots:?}"
+    );
+}
+
+/// The `workspace/workspaceFolders` pull from a rootless server is answered with
+/// null, not an invented folder. The push and the pull must agree, and the pull is
+/// the one a server issues precisely when it distrusts what it was pushed — answering
+/// it with the file's directory would hand back the workspace `initialize` just
+/// declined to claim.
+#[tokio::test]
+async fn a_rootless_server_pulling_workspace_folders_gets_none() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-cfg-nofolders");
+    let rec = dir.join("rec.jsonl");
+    arm_mock(
+        dir.as_path(),
+        &format!(
+            r#"{{ "record": "{}", "workspace_folders_pull": true }}"#,
+            rec.display()
+        ),
+    );
+    let (rpc, _incoming) = open_rust_at(&dir.join("a").join("one.rs")).await;
+    enable_markerless_mock(&rpc).await;
+
+    let mut reply = None;
+    for _ in 0..200 {
+        reply = std::fs::read_to_string(&rec)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(r#""method":"_workspace_folders_response""#))
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok());
+        if reply.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+
+    let reply = reply.expect("the client must answer workspace/workspaceFolders");
+    let folders = reply.pointer("/params").cloned();
+    assert!(
+        matches!(folders, None | Some(serde_json::Value::Null)),
+        "a rootless client has no folders to hand back, got {folders:?}"
+    );
+}

@@ -106,6 +106,30 @@ async fn wait_for_root(log: &Path) -> String {
     }
 }
 
+/// The `initialize` request the editor sent the recorder, waiting up to ~5s for it.
+/// Used where the interesting part is what the request does NOT carry (a rootless
+/// start sends `"rootUri":null`), which `wait_for_root` cannot express — it waits for
+/// a root that never comes.
+async fn wait_for_initialize(log: &Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        // The whole frame is one line; `rootUri` is serialized last, so its presence
+        // (as a path or as `null`) means the body has landed in full.
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.contains(r#""method":"initialize""#) && l.contains(r#""rootUri""#))
+        {
+            return line.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no initialize request appeared; the record was {text:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Give a spawn that must NOT happen a fair chance to happen, then assert silence.
 /// The window matches `wait_for`'s successful path with room to spare — a root
 /// search walks the fs seam off-tick, so "nothing yet" needs real wall-clock to mean
@@ -264,7 +288,7 @@ async fn without_workspace_required_a_rootless_buffer_still_starts() {
     let (rpc, _incoming) = start(dir.as_path()).await;
     command(&rpc, &format!("e {}", file.display())).await;
     // The control for the test above: the same unfindable marker, no
-    // `workspace_required` — the server starts, rooted at the file's own directory.
+    // `workspace_required` — the server starts, and starts ROOTLESS.
     enable(
         &rpc,
         &script,
@@ -272,10 +296,14 @@ async fn without_workspace_required_a_rootless_buffer_still_starts() {
     )
     .await;
 
-    assert_eq!(
-        canonical(&wait_for_root(&log).await),
-        canonical(&dir.as_path().to_string_lossy()),
-        "with no root found and no workspace_required, the file's directory is used"
+    // No root found means no `rootUri` — single-file mode, as neovim does it. The
+    // editor must not substitute the file's own directory: that told the server to
+    // index whatever tree the file happened to sit in, and keyed a separate child per
+    // directory, so opening two out-of-tree files started two servers.
+    let init = wait_for_initialize(&log).await;
+    assert!(
+        init.contains(r#""rootUri":null"#),
+        "a rootless start must send no rootUri, got {init:?}"
     );
 }
 

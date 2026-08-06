@@ -20,14 +20,39 @@ use lsp_types::{
 /// lua crate), arbitrary rather than a fixed filetype. nxvim runs at most one child
 /// per key and routes a buffer to its server by it.
 ///
+/// `root` is `None` when the config resolved **no workspace root** — its
+/// `root_markers` walk found nothing above the buffer and it named no `root_dir`.
+/// That is a real state, not a missing value, and it is deliberately NOT filled in
+/// with the file's own directory: doing so minted a distinct key (hence a distinct
+/// child) per directory, so jumping into an out-of-tree file — a stdlib stub under
+/// `~/.cache`, a dependency's source — started a second full set of servers and
+/// handed each one that directory as `rootUri`, telling it to index a tree the user
+/// never opened. A rootless key instead collapses every such buffer onto ONE
+/// instance that is initialized with no `rootUri` (single-file mode), matching
+/// neovim, where `vim.lsp.start` leaves `config.root_dir` nil and
+/// `reuse_client_default` reuses any rootless client of the same name.
+///
 /// `Ord` is derived so a buffer's servers can live in a `BTreeMap` and iterate in a
-/// stable, human-meaningful order — by config `name`, then root. That ordering is
-/// load-bearing: it is what makes "the first server that advertises this feature"
-/// a deterministic choice rather than a hash-order coin flip.
+/// stable, human-meaningful order — by config `name`, then root (rootless first,
+/// `None` sorting below `Some`). That ordering is load-bearing: it is what makes
+/// "the first server that advertises this feature" a deterministic choice rather
+/// than a hash-order coin flip.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServerKey {
     pub name: String,
-    pub root: PathBuf,
+    pub root: Option<PathBuf>,
+}
+
+impl ServerKey {
+    /// The root as a display string for logs and `:LspInfo` — `(no root)` when the
+    /// server runs rootless, which reads as the state it is rather than as an empty
+    /// path or a bare `None`.
+    pub fn root_label(&self) -> String {
+        match &self.root {
+            Some(root) => root.display().to_string(),
+            None => "(no root)".to_string(),
+        }
+    }
 }
 
 /// How to launch a server and how to configure it. `program`/`args` are derived

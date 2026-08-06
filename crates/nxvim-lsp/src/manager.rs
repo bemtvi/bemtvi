@@ -298,7 +298,7 @@ async fn run_server_once(
         &format!(
             "starting {} (root {}, cwd {})",
             spawn.program,
-            key.root.display(),
+            key.root_label(),
             spawn
                 .cwd
                 .as_deref()
@@ -374,7 +374,13 @@ async fn run_server_once(
 
     // Initialize. Race the handshake against the loop ending, so a server that
     // dies mid-handshake is reported rather than hanging the await.
-    let init = init_params(&key.root, spawn, Some(std::process::id()), log, name);
+    let init = init_params(
+        key.root.as_deref(),
+        spawn,
+        Some(std::process::id()),
+        log,
+        name,
+    );
     let init_result = tokio::select! {
         res = socket.initialize(init) => res,
         _ = &mut mainloop_fut => {

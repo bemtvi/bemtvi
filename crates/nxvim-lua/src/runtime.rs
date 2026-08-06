@@ -1759,13 +1759,15 @@ impl LuaRuntime {
     ///
     /// `root` is the client's workspace root, needed because a registration's glob may
     /// be relative with no `baseUri` ("relative to the workspace") and the Lua client
-    /// mirror carries no root. Each registration is the protocol's
-    /// `{ id, method, registerOptions }` verbatim — the options' shape is per-method,
-    /// so the JSON crosses as a plain table rather than a distilled struct.
+    /// mirror carries no root. `None` — a rootless client — crosses as Lua `nil`, and
+    /// a relative pattern is then skipped with a message saying why. Each registration
+    /// is the protocol's `{ id, method, registerOptions }` verbatim — the options'
+    /// shape is per-method, so the JSON crosses as a plain table rather than a
+    /// distilled struct.
     pub fn lsp_register_capability(
         &self,
         id: u64,
-        root: &str,
+        root: Option<&str>,
         registrations: &[serde_json::Value],
     ) -> mlua::Result<()> {
         let lsp: Table = self.nx()?.get("lsp")?;

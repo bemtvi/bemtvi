@@ -297,7 +297,7 @@ pub(crate) fn new_client(
         // would be worse than not declaring it: a server that pulls would get
         // method-not-found and fall back to *no* workspace at all.
         router.request::<WorkspaceFoldersRequest, _>(|st: &mut ClientState, ()| {
-            ready(Ok(workspace_folders(&st.key.root)))
+            ready(Ok(workspace_folders(st.key.root.as_deref())))
         });
         // `client/registerCapability` / `client/unregisterCapability`: the dynamic half
         // of capability negotiation. Forwarded to the editor (and on to
@@ -727,12 +727,16 @@ fn client_capabilities() -> ClientCapabilities {
 
 /// The one [`WorkspaceFolder`] a client serves: its key's `root`, named by the
 /// directory's last component (what an editor shows in a folder list; pyright echoes
-/// it in diagnostics). `None` when the root won't convert to a `file://` URL.
+/// it in diagnostics). `None` when the root won't convert to a `file://` URL — and
+/// `None` for a **rootless** client (see [`ServerKey::root`](crate::ServerKey)),
+/// which has no workspace at all: the protocol's `WorkspaceFolder[] | null` says so
+/// with null, exactly as neovim hands back a nil `client.workspace_folders`.
 ///
 /// Shared by the `initialize` params and the server→client `workspace/workspaceFolders`
 /// pull, so both spell the same folder — a server that reads one and then the other
 /// must not see them disagree.
-pub(crate) fn workspace_folders(root: &std::path::Path) -> Option<Vec<WorkspaceFolder>> {
+pub(crate) fn workspace_folders(root: Option<&std::path::Path>) -> Option<Vec<WorkspaceFolder>> {
+    let root = root?;
     let uri = Url::from_file_path(root).ok()?;
     let name = root
         .file_name()
@@ -754,9 +758,14 @@ pub(crate) fn workspace_folders(root: &std::path::Path) -> Option<Vec<WorkspaceF
 /// `<default workspace root>` and report `File or directory
 /// "/<default workspace root>" does not exist`. Sending both is what neovim does,
 /// and they can't disagree: one root per client.
+///
+/// A `None` root sends **neither** — the protocol's single-file mode: the server has
+/// no workspace to index and answers about the open documents alone. See
+/// [`ServerKey::root`](crate::ServerKey) for why a rootless config must not be given
+/// the buffer's own directory instead.
 #[allow(deprecated)] // root_uri is what a pre-workspaceFolders server still reads
 pub(crate) fn init_params(
-    root: &std::path::Path,
+    root: Option<&std::path::Path>,
     spawn: &ServerSpawn,
     process_id: Option<u32>,
     log: &LspLog,
@@ -764,7 +773,7 @@ pub(crate) fn init_params(
 ) -> InitializeParams {
     InitializeParams {
         process_id,
-        root_uri: Url::from_file_path(root).ok(),
+        root_uri: root.and_then(|root| Url::from_file_path(root).ok()),
         workspace_folders: workspace_folders(root),
         initialization_options: spawn
             .init_options

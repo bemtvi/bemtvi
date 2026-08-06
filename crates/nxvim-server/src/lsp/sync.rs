@@ -300,14 +300,12 @@ impl EditHost {
             return;
         };
         // Root: `$NXVIM_LSP_ROOT` overrides (the test hook), else the root Lua
-        // resolved, else the file's own directory. Rust never re-runs the marker
-        // search — that is the config's job now (`vim.fs.root` in Lua).
-        let root = lsp_root_override()
-            .or_else(|| root.map(|r| absolutize(Path::new(&r))))
-            .unwrap_or_else(|| {
-                let abs = self.abs_buffer_path(&path);
-                abs.parent().map(Path::to_path_buf).unwrap_or(abs)
-            });
+        // resolved — and `None` when the config resolved none, which stays `None`.
+        // Rust never re-runs the marker search — that is the config's job now
+        // (`vim.fs.root` in Lua) — and it never *invents* a root either: substituting
+        // the file's own directory keyed a separate child per directory and told each
+        // one to index it (see `ServerKey::root`).
+        let root = lsp_root_override().or_else(|| root.map(|r| absolutize(Path::new(&r))));
         let key = ServerKey { name, root };
         // A serverless browser session (no daemon) has no process host to run a
         // language server on, so fail *loud* rather than silently no-op (Phase 6e).
@@ -1234,7 +1232,9 @@ impl EditHost {
     ///
     /// The client's `root` rides along because a registration's glob may be relative
     /// with no `baseUri` — "relative to the workspace" — and the Lua mirror of a
-    /// client carries no root of its own.
+    /// client carries no root of its own. It is `None` for a rootless client, where
+    /// "relative to the workspace" names nothing: such a watcher is skipped, loudly,
+    /// rather than resolved against an invented directory.
     fn on_register_capability(
         &mut self,
         key: ServerKey,
@@ -1263,8 +1263,11 @@ impl EditHost {
                 })
             })
             .collect();
-        let root = key.root.to_string_lossy().into_owned();
-        if let Err(e) = self.lua.lsp_register_capability(client_id, &root, &regs) {
+        let root = key.root.as_ref().map(|r| r.to_string_lossy().into_owned());
+        if let Err(e) = self
+            .lua
+            .lsp_register_capability(client_id, root.as_deref(), &regs)
+        {
             self.editor.echo(format!(
                 "E5108: Error in nx.lsp capability registration: {e}"
             ));
@@ -1463,7 +1466,7 @@ impl EditHost {
             lines.push(format!(
                 "  server:      {} ({})",
                 key.name,
-                key.root.display()
+                key.root_label()
             ));
             lines.push(format!(
                 "  status:      {}",
@@ -1515,7 +1518,7 @@ impl EditHost {
                 lines.push(format!(
                     "  {} @ {} — {}, {}, {attached} buffer(s)",
                     key.name,
-                    key.root.display(),
+                    key.root_label(),
                     encoding_label(runtime.encoding),
                     sync_label(runtime.sync_kind),
                 ));

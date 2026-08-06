@@ -439,6 +439,43 @@ fn virt_text_row0(params: &[Value]) -> Vec<(u64, u64, Vec<String>)> {
         .collect()
 }
 
+/// Paint a captured redraw through the **real client renderer** and return its rows
+/// as strings — the tier-2 check that a wire-level decoration lands on cells a user
+/// sees (mirrors the helper in `lsp_float.rs`).
+fn painted_rows(params: &[Value]) -> Vec<String> {
+    let mut view = nxvim_view::View::default();
+    view.update(params);
+    let buf = nxvim_tui::paint(&view, 80, 24);
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// Poll (bounded) for a redraw whose row-0 `virt_text` satisfies `done`, returning
+/// the whole redraw alongside the parsed placements (for a paint check).
+async fn wait_for_redraw_virt_text(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    done: impl Fn(&[(u64, u64, Vec<String>)]) -> bool,
+) -> (Vec<Value>, Vec<(u64, u64, Vec<String>)>) {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            let vt = virt_text_row0(&params);
+            if done(&vt) {
+                return (params, vt);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("virt_text never satisfied the condition within timeout");
+}
+
 /// Poll (bounded) for a redraw whose row-0 `virt_text` satisfies `done`.
 async fn wait_for_virt_text(
     rpc: &Rpc,
@@ -1002,6 +1039,50 @@ async fn a_line_fill_mark_fills_the_row_with_a_glyph() {
     assert!(
         text.len() >= 40 && text.chars().all(|c| c == '-'),
         "the row is filled across its width with the glyph, got {text:?}"
+    );
+}
+
+/// A `line_fill` on a line that carries **text** starts past that text instead of
+/// painting over it: the row reads `─ label ──────…`, the labelled-rule shape the
+/// rendered-markdown doc float heads each hover section with. (On the blank line a
+/// plain rule sits on, "past the text" is column 0 — the test above.) The start column
+/// is a *screen* column, so a wide glyph in the label counts two.
+#[tokio::test]
+async fn a_line_fill_starts_past_the_line_text_so_a_label_survives() {
+    let (rpc, mut incoming) = start().await;
+    // "─ label " — the leading rule glyph and the label are real buffer text.
+    feed(&rpc, "i─ label <Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('labelfill')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { line_fill = { text = '─', hl_group = 'NonText' } })
+        "#,
+    )
+    .await;
+    let (redraw, vt) = wait_for_redraw_virt_text(&rpc, &mut incoming, |vt| {
+        vt.iter().any(|(pos, col, _)| *pos == 2 && *col > 0)
+    })
+    .await;
+    let fill = vt
+        .iter()
+        .find(|(pos, _, _)| *pos == 2)
+        .expect("a line_fill Overlay placement");
+    assert_eq!(
+        fill.1, 8,
+        "the fill starts after the label's 8 screen cells, leaving it visible"
+    );
+    let text = fill.2.first().expect("the fill chunk text");
+    assert!(
+        text.chars().count() >= 40 && text.chars().all(|c| c == '─'),
+        "the rest of the row is filled with the glyph, got {text:?}"
+    );
+    // Tier 2: the label and its rule reach painted cells as one row.
+    let rows = painted_rows(&redraw);
+    assert!(
+        rows.first().is_some_and(|r| r.contains("─ label ────────")),
+        "the labelled rule paints as one row (past the gutter), got {:?}",
+        rows.first()
     );
 }
 

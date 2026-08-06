@@ -271,11 +271,18 @@ impl Editor {
     /// error node and lose its highlighting. Overlaying leaves the text alone: the
     /// caller indents every parameter line by [`SIGNATURE_PARAM_INDENT`], which
     /// reserves the cells the marker draws over.
+    ///
+    /// `header_rows` are the rows carrying a **section header** — one server's name in
+    /// a merged round, already spelled `─ pyright ` by the caller
+    /// ([`crate::markdown::section_header_line`]). Each is finished here the way the
+    /// hover float's sections are: the label styled, and a `─` fill running from it to
+    /// the float's edge, so both surfaces head a contributor's block identically.
     pub fn open_signature_float(
         &mut self,
         lines: Vec<String>,
         filetype: &str,
         marker_rows: &[usize],
+        header_rows: &[usize],
     ) {
         if lines.is_empty() {
             return;
@@ -286,6 +293,47 @@ impl Editor {
         // The scratch buffer is reused across replies, so last round's marker is
         // still on it — clear before repainting (the markdown float's model).
         b.extmarks.clear(SIGNATURE_NS, None);
+        for &row in header_rows {
+            if row >= b.line_count() {
+                continue;
+            }
+            let base = b.line_start(row);
+            let text = b.line(row);
+            let lead = crate::markdown::SECTION_LEAD.len().min(text.len());
+            let label_end = text.trim_end().len();
+            // The leading glyph reads as rule, the label as a title.
+            for (start, end, group) in [
+                (0, lead, crate::markdown::SECTION_RULE_GROUP),
+                (lead, label_end, crate::markdown::SECTION_LABEL_GROUP),
+            ] {
+                if start < end {
+                    b.extmarks.set(
+                        SIGNATURE_NS,
+                        None,
+                        base + start,
+                        Some(base + end),
+                        Some(group.to_string()),
+                        DEFAULT_PRIORITY,
+                        None,
+                    );
+                }
+            }
+            b.extmarks.set(
+                SIGNATURE_NS,
+                None,
+                base,
+                None,
+                None,
+                DEFAULT_PRIORITY,
+                Some(Box::new(VirtDecor {
+                    line_fill: Some(VirtChunk {
+                        text: crate::markdown::SECTION_FILL.to_string(),
+                        hl_group: Some(crate::markdown::SECTION_RULE_GROUP.to_string()),
+                    }),
+                    ..VirtDecor::default()
+                })),
+            );
+        }
         for &row in marker_rows {
             if row >= b.line_count() {
                 continue;
@@ -322,9 +370,27 @@ impl Editor {
     /// The buffer is left untyped so its own filetype tree-sitter pass never repaints
     /// the stripped text. Empty markup shows nothing.
     pub fn open_markdown_float(&mut self, name: &str, markdown: &str) {
+        self.open_markdown_float_rendered(name, crate::markdown::render(markdown));
+    }
+
+    /// [`open_markdown_float`](Self::open_markdown_float) for several **labelled**
+    /// markdown sections: each is headed by a labelled rule (`─ pyright ─────`, drawn
+    /// by [`crate::markdown::render_sections`]) so the reader can tell which contributor
+    /// said what. This is the merged LSP hover — one server per section, in routing
+    /// order.
+    pub fn open_markdown_sections(&mut self, name: &str, sections: &[(String, String)]) {
+        let rendered = crate::markdown::render_sections(
+            sections.iter().map(|(l, s)| (l.as_str(), s.as_str())),
+        );
+        self.open_markdown_float_rendered(name, rendered);
+    }
+
+    /// Place an already-[`Rendered`](crate::markdown::Rendered) markdown document in the
+    /// cursor doc float — the shared tail of the single-document and sectioned entries.
+    fn open_markdown_float_rendered(&mut self, name: &str, rendered: crate::markdown::Rendered) {
         self.close_doc_float(name);
         let buf = self.doc_float_buffer(name);
-        let lines = self.render_markdown_into(buf, name, markdown);
+        let lines = self.render_rendered_into(buf, name, rendered);
         if lines.is_empty() {
             return;
         }
@@ -340,7 +406,18 @@ impl Editor {
     /// the hover ([`open_markdown_float`](Self::open_markdown_float)) and completion-docs
     /// ([`open_completion_docs_float`](Self::open_completion_docs_float)) surfaces.
     fn render_markdown_into(&mut self, buf: BufferId, name: &str, markdown: &str) -> Vec<String> {
-        let rendered = crate::markdown::render(markdown);
+        self.render_rendered_into(buf, name, crate::markdown::render(markdown))
+    }
+
+    /// [`render_markdown_into`](Self::render_markdown_into) over an already-rendered
+    /// document, so a caller that composed one out of several sections
+    /// ([`crate::markdown::render_sections`]) shares the same load + repaint.
+    fn render_rendered_into(
+        &mut self,
+        buf: BufferId,
+        name: &str,
+        rendered: crate::markdown::Rendered,
+    ) -> Vec<String> {
         if rendered.lines.is_empty() {
             return Vec::new();
         }

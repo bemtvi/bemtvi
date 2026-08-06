@@ -556,20 +556,28 @@ impl EditHost {
             .collect()
     }
 
-    /// Augment the per-row `virt_text` payload with whole-line `line_fill` overlays:
-    /// for each row whose line carries a `line_fill` mark, append an `Overlay`
-    /// placement at column 0 whose chunk is the fill text repeated to cover the
-    /// window's text body (`text_width` cells — over-provisioned, the client clips
-    /// it to the body). This reuses the existing `virt_text` wire so no client
-    /// change is needed. The fill shows on the line's first display row only; the
-    /// highest-priority `line_fill` mark on a line wins. A no-op (returns the input
-    /// untouched) when no mark carries a fill.
+    /// Augment the per-row `virt_text` payload with `line_fill` overlays: for each row
+    /// whose line carries a `line_fill` mark, append an `Overlay` placement whose chunk
+    /// is the fill text repeated to cover the window's text body (`text_width` cells —
+    /// over-provisioned, the client clips it to the body). This reuses the existing
+    /// `virt_text` wire so no client change is needed. The fill shows on the line's
+    /// first display row only; the highest-priority `line_fill` mark on a line wins. A
+    /// no-op (returns the input untouched) when no mark carries a fill.
+    ///
+    /// The overlay starts **past the line's own text** (its end-of-line screen column,
+    /// `tabstop`-aware), not at column 0: on the blank line a plain rule sits on that
+    /// is column 0 and the fill spans the row, while a line carrying a label keeps it
+    /// and the fill runs out from it — the labelled rule (`─ pyright ─────`) the doc
+    /// float heads each server's hover section with. Every client already pads an
+    /// overlay anchored past end-of-text to its column, so this needs no client change.
+    #[allow(clippy::too_many_arguments)] // the window's render facts, like its siblings
     pub(crate) fn apply_line_fill(
         &self,
         virt_text: Value,
         buffer: BufferId,
         segs: &[crate::redraw::RowSeg],
         text_width: usize,
+        tabstop: usize,
         winhl: &WinHl,
         styles: &mut StyleTable,
     ) -> Value {
@@ -612,13 +620,18 @@ impl EditHost {
                 Some(f) if !f.text.is_empty() => f,
                 _ => continue,
             };
-            // Repeat the fill text to cover the body width (clipped client-side); a
-            // multi-cell glyph just over-provisions a little.
+            // Start past the line's own text so a label survives (column 0 on the blank
+            // line a plain rule sits on), and repeat the fill text to cover the body
+            // width (clipped client-side); a multi-cell glyph just over-provisions a
+            // little.
+            let line = buf.line(n - 1);
+            let from = nxvim_core::unicode::virtcol(&line, line.len(), tabstop);
             let chunk = VirtChunk {
-                text: fill.text.repeat(text_width),
+                text: fill.text.repeat(text_width.saturating_sub(from).max(1)),
                 hl_group: fill.hl_group.clone(),
             };
-            let placement = self.virt_placement_value(POS_OVERLAY, 0, 0, &[chunk], winhl, styles);
+            let placement =
+                self.virt_placement_value(POS_OVERLAY, from as u64, 0, &[chunk], winhl, styles);
             if let Some(Value::Array(row)) = rows.get_mut(i) {
                 row.push(placement);
             }

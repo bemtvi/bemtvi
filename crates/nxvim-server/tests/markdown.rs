@@ -300,10 +300,54 @@ async fn gfm_table_is_column_aligned() {
 #[tokio::test]
 async fn thematic_break_emits_a_rule_fill() {
     let (rpc, _incoming) = start().await;
-    // "above", a block-gap blank (line 2), then the rule fill (line 3), then "below".
+    // "above", then the rule's own (empty, fill-covered) line 2, then "below".
     assert_eq!(
         fills(&rpc, "above\n\n---\n\nbelow").await,
-        "3:─:@punctuation.special"
+        "2:─:@punctuation.special"
+    );
+}
+
+/// A rule is **tight**: no blank row above or below it. The rule already separates the
+/// blocks it sits between, and a hover float is small — a server that heads its docs
+/// with `<signature>\n---\n<prose>` would otherwise spend three rows on one boundary.
+/// (The rule's own row renders empty in `lines`; the `─` run is the fill above.)
+#[tokio::test]
+async fn a_rule_does_not_pad_itself_with_blank_lines() {
+    let (rpc, _incoming) = start().await;
+    assert_eq!(
+        render_lines(&rpc, "above\n\n---\n\nbelow").await,
+        "above||below"
+    );
+    // Same when the block above is a fenced code block — the LSP hover shape
+    // (signature fence, rule, prose).
+    assert_eq!(
+        render_lines(&rpc, "```rust\nfn f()\n```\n\n---\n\ndocs").await,
+        "fn f()||docs"
+    );
+}
+
+/// A rule that separates **nothing** is dropped. LSP servers emit their docs by
+/// template — `<signature>\n---\n<docs>` — so an item with no docs arrives as a bare
+/// trailing rule and one with no signature as a leading one; drawing that boundary
+/// promises a section that isn't there.
+#[tokio::test]
+async fn a_rule_with_nothing_on_one_side_is_dropped() {
+    let (rpc, _incoming) = start().await;
+    // Trailing: the docs-less completion / hover payload.
+    let payload = "```python\ndef foo()\n```\n---\n";
+    assert_eq!(render_lines(&rpc, payload).await, "def foo()");
+    assert_eq!(
+        fills(&rpc, payload).await,
+        "",
+        "no dangling rule: {payload:?}"
+    );
+    // Leading, and two rules in a row — same argument from the other side.
+    assert_eq!(fills(&rpc, "---\n\ndocs").await, "");
+    assert_eq!(render_lines(&rpc, "---\n\ndocs").await, "docs");
+    assert_eq!(
+        fills(&rpc, "sig\n\n---\n\n---\n\ndocs").await,
+        "2:─:@punctuation.special",
+        "the second rule adds nothing"
     );
 }
 

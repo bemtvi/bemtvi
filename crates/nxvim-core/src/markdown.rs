@@ -12,7 +12,8 @@
 //! - [`Rendered::spans`] — inline highlight ranges (byte offsets *within a line*)
 //!   tagged with a neovim `@markup.*` capture name, so a colorscheme styles them
 //!   (bold/italic attributes and all) with no extra config;
-//! - [`Rendered::fills`] — whole-line fills (thematic breaks → a `─` rule);
+//! - [`Rendered::fills`] — row fills that run from a line's text to the right edge
+//!   (a thematic break → a full-width `─` rule; a section header → a labelled one);
 //! - [`Rendered::code`] — the fenced code blocks, for the caller to syntax-color
 //!   in their own language (the float does this via `preview_highlights`).
 //!
@@ -51,6 +52,22 @@ const LIST: &str = "@markup.list";
 const QUOTE: &str = "@markup.quote";
 const RULE: &str = "@punctuation.special";
 
+/// The glyph a **section header** (and a thematic break) is drawn with, the text that
+/// leads one, and the groups its two parts take: `─ pyright ────────`, a label inset in
+/// a rule — the shape a float's border title has. Public because the signature-help
+/// float, whose content is *code* rather than markdown, heads each contributing
+/// server's block with the same thing and must spell it identically.
+pub const SECTION_FILL: char = '─';
+pub const SECTION_LEAD: &str = "─ ";
+pub const SECTION_RULE_GROUP: &str = RULE;
+pub const SECTION_LABEL_GROUP: &str = HEADING[0];
+
+/// The line text of a section header: the label inset after [`SECTION_LEAD`], with a
+/// trailing space parting it from the fill that runs on to the right edge.
+pub fn section_header_line(label: &str) -> String {
+    format!("{SECTION_LEAD}{label} ")
+}
+
 /// An inline highlight range on one rendered line. `start`/`end` are **byte**
 /// offsets into [`Rendered::lines`]`[line]` (extmarks are byte-anchored); `group`
 /// is one of the `@markup.*` names above.
@@ -62,9 +79,12 @@ pub struct MdSpan {
     pub group: &'static str,
 }
 
-/// A whole-line fill: repeat `ch` across the text area of [`Rendered::lines`]`[line]`
-/// in `group`. Used for a thematic break (`---` → a `─` rule) so the rule spans the
-/// float's actual width without the renderer having to know it.
+/// A row fill: repeat `ch` from the end of [`Rendered::lines`]`[line]`'s own text to
+/// the right edge of the text area, in `group`. Used for a thematic break (`---` → a
+/// `─` rule, on an otherwise empty line, so it spans the float's actual width without
+/// the renderer having to know it) and for a **section header** — a labelled rule
+/// (`─ pyright ─────`), where the line carries the label and the fill continues past
+/// it to the edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MdFill {
     pub line: usize,
@@ -98,12 +118,28 @@ pub struct Rendered {
 /// knows the float's final width) expands them; nothing here needs a width.
 pub fn render(src: &str) -> Rendered {
     let mut r = Renderer::new();
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    for event in Parser::new_ext(src, opts) {
-        r.event(event);
+    r.feed(src);
+    r.finish()
+}
+
+/// Render several **labelled sections** into one document: each `(label, markdown)`
+/// pair is headed by a labelled rule — `─ pyright ────────`, the shape a float's
+/// border title has — and its markdown renders directly under it, with no blank row
+/// between (the rule is the separation; a gap under it would read as a detached
+/// heading). One blank row parts a section from the one above — the first takes none —
+/// and a section's own trailing blank rows / dangling rule are trimmed off at the
+/// boundary, so that gap is exactly one row however the server's markup ended.
+///
+/// This is what the LSP hover uses when more than one server answers: a type-checker's
+/// signature and a linter's rule explanation are different kinds of claim, so the
+/// reader has to see which server made which — and the rule says it without a `#`
+/// heading's markup competing with headings inside a server's own markdown. A section
+/// with an **empty** label takes no rule at all — the lone contributor renders bare.
+pub fn render_sections<'a>(sections: impl IntoIterator<Item = (&'a str, &'a str)>) -> Rendered {
+    let mut r = Renderer::new();
+    for (label, src) in sections {
+        r.section_header(label);
+        r.feed(src);
     }
     r.finish()
 }
@@ -196,13 +232,76 @@ impl Renderer {
         }
     }
 
-    fn finish(mut self) -> Rendered {
+    /// Parse `src` and fold its events into the document built so far. Called once by
+    /// [`render`], once per section by [`render_sections`] — each section parses on its
+    /// own (a fence left open in one server's markup can't swallow the next).
+    fn feed(&mut self, src: &str) {
+        let mut opts = Options::empty();
+        opts.insert(Options::ENABLE_STRIKETHROUGH);
+        opts.insert(Options::ENABLE_TABLES);
+        opts.insert(Options::ENABLE_TASKLISTS);
+        for event in Parser::new_ext(src, opts) {
+            self.event(event);
+        }
+    }
+
+    /// Emit a section header: a labelled rule (`─ pyright ─────`) — the label as real
+    /// line text, the rest of the row filled by the [`MdFill`].
+    ///
+    /// Tight **below**: the content starts on the next row, so the section reads as a
+    /// titled box's body. Parted **above** by one blank row (never above the first
+    /// section) so the previous contributor's last line doesn't run into the next
+    /// title — the previous section's own trailing blanks, and any rule its markup
+    /// ended on, are trimmed off first so the gap is exactly one row. An empty label
+    /// emits nothing at all — the lone contributor renders bare.
+    fn section_header(&mut self, label: &str) {
         self.newline_if_dirty();
-        // Trim trailing blank lines the block-gap logic may have left.
+        self.trim_trailing();
+        self.want_gap = false;
+        if label.is_empty() {
+            return;
+        }
+        if !self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let line = self.lines.len();
+        self.spans.push(MdSpan {
+            line,
+            start: 0,
+            end: SECTION_LEAD.len(),
+            group: SECTION_RULE_GROUP,
+        });
+        self.spans.push(MdSpan {
+            line,
+            start: SECTION_LEAD.len(),
+            end: SECTION_LEAD.len() + label.len(),
+            group: SECTION_LABEL_GROUP,
+        });
+        self.lines.push(section_header_line(label));
+        self.fills.push(MdFill {
+            line,
+            ch: SECTION_FILL,
+            group: SECTION_RULE_GROUP,
+        });
+    }
+
+    /// Drop the trailing blank rows the block-gap logic left — and with them any rule
+    /// they leave dangling (a `---` closing the markup separates nothing; see
+    /// [`rule`](Self::rule), whose *leading* case this is the counterpart of). A
+    /// **labelled** section rule is content — it names its contributor — and its row is
+    /// never blank, so it stays. Run at the end of the document and at each section
+    /// boundary, where a server's markup ends.
+    fn trim_trailing(&mut self) {
         while self.lines.last().is_some_and(|l| l.trim().is_empty()) {
             self.lines.pop();
         }
         self.spans.retain(|s| s.line < self.lines.len());
+        self.fills.retain(|f| f.line < self.lines.len());
+    }
+
+    fn finish(mut self) -> Rendered {
+        self.newline_if_dirty();
+        self.trim_trailing();
         Rendered {
             lines: self.lines,
             spans: self.spans,
@@ -482,6 +581,23 @@ impl Renderer {
         self.started = false;
     }
 
+    /// Whether the document holds anything a rule could separate *from* what follows:
+    /// some content that is not itself a rule / section-header row. Blank rows and
+    /// filled rows don't count, so a leading `---`, and a `---` right under another
+    /// rule or a section header, have nothing above them.
+    fn has_separable_content(&self) -> bool {
+        for (i, line) in self.lines.iter().enumerate().rev() {
+            if self.fills.iter().any(|f| f.line == i) {
+                return false; // a rule / labelled section rule — not content
+            }
+            if !line.trim().is_empty() {
+                return true;
+            }
+        }
+        // A partial line in progress counts (its block hasn't been flushed yet).
+        !self.line.trim().is_empty()
+    }
+
     /// Flush only if a partial line is in progress (no empty line otherwise).
     fn newline_if_dirty(&mut self) {
         if self.started || !self.line.is_empty() {
@@ -548,8 +664,23 @@ impl Renderer {
         });
     }
 
+    /// A thematic break (`---`) — a full-width `─` rule on its own row, **tight**: no
+    /// blank row above or below it. The rule already separates the blocks it sits
+    /// between; padding it with gaps costs three rows for one boundary, and a hover
+    /// float is small (a server that heads its docs with `<signature>\n---\n<prose>`
+    /// wastes a third of a short popup on whitespace).
+    ///
+    /// A rule that separates **nothing** is dropped: one opening the document, or one
+    /// following another rule / a section header. LSP servers emit their markup by
+    /// template — `<signature>\n---\n<docs>` — so an item with no docs arrives as a
+    /// bare trailing rule, and one with no signature as a leading one; drawing that
+    /// boundary line promises a section that isn't there. (The trailing case falls out
+    /// of [`finish`](Self::finish), which pops the rule's own empty row.)
     fn rule(&mut self) {
-        self.block_gap();
+        if !self.has_separable_content() {
+            return;
+        }
+        self.newline_if_dirty();
         let idx = self.lines.len();
         self.lines.push(String::new());
         self.fills.push(MdFill {
@@ -557,7 +688,7 @@ impl Renderer {
             ch: '─',
             group: RULE,
         });
-        self.want_gap = true;
+        self.want_gap = false;
     }
 
     /// Format the accumulated GFM table into aligned, padded lines with a header

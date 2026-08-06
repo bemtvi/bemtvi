@@ -224,6 +224,13 @@ async fn enable_starts_a_server_and_hover_works() {
         lines.iter().any(|l| l.contains("foo")),
         "hover float should carry the markup, got {lines:?}"
     );
+    // The lone contributor renders bare: no `─ mock ────` section rule, which on a
+    // one-server buffer (the common case) would head every hover with the only name
+    // there is.
+    assert!(
+        lines.iter().all(|l| !l.starts_with('─')),
+        "a single server's hover takes no section heading, got {lines:?}"
+    );
 
     std::env::remove_var("NXVIM_LSP_CMD");
 }
@@ -974,19 +981,52 @@ async fn hover_merges_every_capable_server_in_priority_order() {
         beta_at < alpha_at,
         "the higher-priority server's section leads, got {lines:?}"
     );
-    // Each section is headed with its client's name, or the reader can't tell which
-    // server made which claim.
-    let heading = |name: &str| lines.iter().any(|l| l.trim() == name);
+    // Each section is headed by a labelled rule naming its client — `─ alpha ───…`,
+    // the float-title shape — or the reader can't tell which server made which claim,
+    // and the two hovers run together with nothing between them. The trailing `─` run
+    // is a `line_fill` overlay the client draws to the float's width, so the buffer
+    // line is just the label (the `assert` below pins the fill itself).
+    let heading = |name: &str| lines.iter().position(|l| l.trim() == format!("─ {name}"));
+    let (alpha_row, beta_row) = (heading("alpha"), heading("beta"));
     assert!(
-        heading("alpha") && heading("beta"),
-        "each section is headed by its client name, got {lines:?}"
+        alpha_row.is_some() && beta_row.is_some(),
+        "each section is headed by a labelled rule naming its client, got {lines:?}"
+    );
+    // ...and the section's content starts on the very next row: the rule already
+    // separates, so a blank row under it would read as a detached heading.
+    assert_eq!(
+        lines
+            .get(beta_row.expect("beta heading") + 1)
+            .map(String::as_str),
+        Some("FROM-BETA"),
+        "the section's content hugs its rule, got {lines:?}"
+    );
+    let alpha_row = alpha_row.expect("alpha heading");
+    assert_eq!(
+        lines.get(alpha_row + 1).map(String::as_str),
+        Some("FROM-ALPHA"),
+        "the section's content hugs its rule, got {lines:?}"
+    );
+    // Above the rule, though, one blank row parts it from the section before, so the
+    // previous server's last line doesn't run into the next title. The float's own top
+    // border does that job for the first section, which takes none.
+    assert_eq!(
+        lines.get(alpha_row - 1).map(String::as_str),
+        Some(""),
+        "a blank row parts the second section from the first, got {lines:?}"
+    );
+    assert_eq!(
+        beta_row,
+        Some(0),
+        "the first section takes no leading blank"
     );
 }
 
 /// A merged round where each server's signature is laid out **vertically** (both
-/// carry parameters): the compact `<client>: <sig>` prefix cannot survive a split
-/// signature — it would push the parameters out of alignment and repeat the name
-/// on every row — so each block takes a `<client>:` heading row instead.
+/// carry parameters): a `<client>: ` prefix cannot survive a split signature — it
+/// would push the parameters out of alignment and repeat the name on every row — so
+/// each block takes a labelled-rule heading row (`─ alpha `, the hover float's section
+/// header; the `─` run out to the float's edge is a `line_fill` overlay).
 #[tokio::test]
 async fn merged_signatures_with_parameters_take_a_client_heading() {
     let _guard = serial_lock().lock().await;
@@ -1023,12 +1063,13 @@ async fn merged_signatures_with_parameters_take_a_client_heading() {
     assert_eq!(
         lines,
         vec![
-            "alpha:",
+            "─ alpha ",
             "alpha_sig(",
             "    x: int,",
             "    y: int,",
             ")",
-            "beta:",
+            "", // one blank row parts a block from the next; none above the first
+            "─ beta ",
             "beta_sig(",
             "    x: int,",
             "    y: int,",
@@ -1044,7 +1085,7 @@ async fn signature_help_merges_every_capable_server() {
     // and showing one silently hides the other. nxvim shows them together (labelled)
     // where neovim shows one at a time with `<C-s>` to cycle — the float here is
     // passive, so there is no mode to leave. A parameterless signature like these
-    // stays on one line, keeping the compact `<client>: <sig>` form.
+    // stays on one line, headed by its client's labelled rule like any other block.
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp-sig-merge");
     let sig = |label: &str| {
@@ -1083,9 +1124,47 @@ async fn signature_help_merges_every_capable_server() {
         shown.find("beta_sig").unwrap() < shown.find("alpha_sig").unwrap(),
         "in priority order (beta outranks alpha), got {shown:?}"
     );
+    // Each block is headed by its client's labelled rule, on its own row — and the
+    // signature it heads follows immediately, with no blank row between.
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["─ beta ", "beta_sig(y)", "", "─ alpha ", "alpha_sig(x)"],
+        "each signature is headed by its client's rule, got {shown:?}"
+    );
+}
+
+/// A **lone** contributor's signature renders bare: naming the only server there is
+/// would put a rule on every signature popup in the common one-server buffer.
+#[tokio::test]
+async fn a_single_servers_signature_takes_no_client_heading() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-sig-solo");
+    arm_mock_named(
+        dir.as_path(),
+        "alpha",
+        r#"{ "signature_help": { "signatures": [ { "label": "solo_sig(x)" } ],
+             "activeSignature": 0 } }"#,
+    );
+    let (rpc, _incoming) = open_rust(dir.as_path()).await;
+    exec_lua(
+        &rpc,
+        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha' })",
+    )
+    .await;
     assert!(
-        shown.contains("alpha: ") && shown.contains("beta: "),
-        "each line says which client claimed it, got {shown:?}"
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "1").await,
+        "the server attached"
+    );
+
+    let shown = await_verb_result(&rpc, "nx.lsp.signature_help()").await;
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+
+    assert_eq!(
+        shown, "solo_sig(x)",
+        "the lone signature shows bare — no client heading, got {shown:?}"
     );
 }
 

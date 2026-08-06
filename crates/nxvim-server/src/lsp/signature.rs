@@ -33,6 +33,10 @@ pub(crate) struct SignatureLayout {
     /// active parameter, or when the signature stayed on one line (nothing to
     /// point at).
     pub(crate) active_row: Option<usize>,
+    /// Index into [`lines`](Self::lines) of the section-header row naming the server
+    /// ([`with_server_name`]), for the float to draw its rule on. `None` for a lone
+    /// contributor — naming the only server there is would be noise.
+    pub(crate) header_row: Option<usize>,
 }
 
 /// Lay out one signature: one parameter per line when the server gave locatable
@@ -92,6 +96,7 @@ pub(crate) fn layout_signature(info: &SignatureInfo) -> SignatureLayout {
     SignatureLayout {
         lines,
         active_row: info.active.map(|i| first_row + i),
+        header_row: None,
     }
 }
 
@@ -108,29 +113,28 @@ fn single_line(info: &SignatureInfo) -> SignatureLayout {
     SignatureLayout {
         lines: vec![line],
         active_row: None,
+        header_row: None,
     }
 }
 
-/// Prefix a laid-out signature with the name of the server that produced it, for
-/// a merged round where two servers answer and an unlabelled pair of signatures
-/// says nothing about which language tool claims what.
+/// Head a laid-out signature with the name of the server that produced it, for a
+/// merged round where two servers answer and an unlabelled pair of signatures says
+/// nothing about which language tool claims what.
 ///
-/// A single-line signature keeps the compact `pyright: def f(x)` form. A vertical
-/// one takes a `pyright:` heading row instead — prefixing every row would push the
-/// parameters out of alignment with the marker and repeat the name four times.
+/// The heading is a **section header row** — `─ pyright ─────`, the same labelled
+/// rule the hover float parts its per-server sections with (the fill and the styling
+/// are painted by [`Editor::open_signature_float`](nxvim_core::Editor::open_signature_float),
+/// which is why [`header_row`](SignatureLayout::header_row) reports where it landed).
+/// A row of its own even for a one-line signature: a `pyright: def f(x)` prefix reads
+/// as part of the code it heads, and the two forms would then head differently.
 pub(crate) fn with_server_name(layout: SignatureLayout, name: &str) -> SignatureLayout {
-    if layout.lines.len() == 1 {
-        return SignatureLayout {
-            lines: vec![format!("{name}: {}", layout.lines[0])],
-            active_row: None,
-        };
-    }
     let mut lines = Vec::with_capacity(layout.lines.len() + 1);
-    lines.push(format!("{name}:"));
+    lines.push(nxvim_core::markdown::section_header_line(name));
     lines.extend(layout.lines);
     SignatureLayout {
         lines,
         active_row: layout.active_row.map(|row| row + 1),
+        header_row: Some(0),
     }
 }
 

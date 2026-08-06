@@ -432,6 +432,7 @@ impl EditHost {
             win.buffer,
             &segments,
             win.rect.width,
+            win.tabstop,
             &win.winhl,
             styles,
         );

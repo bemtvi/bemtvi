@@ -198,9 +198,12 @@ pub struct VirtDecor {
     /// The highlight group for [`sign_text`](Self::sign_text) (neovim's
     /// `sign_hl_group`); `None` paints the glyph in normal colors.
     pub sign_hl_group: Option<String>,
-    /// An `nx`-native whole-line fill: the [`text`](VirtChunk::text) is repeated
-    /// across the anchored line's text area (e.g. a `-` rule on a blank alignment /
-    /// filler row), in [`hl_group`](VirtChunk::hl_group). Rendered as a full-width
+    /// An `nx`-native row fill: the [`text`](VirtChunk::text) is repeated from the end
+    /// of the anchored line's own text to the right edge of the window's text area, in
+    /// [`hl_group`](VirtChunk::hl_group). On a blank line that is the whole row (a `-`
+    /// rule on an alignment / filler row); on a line that carries text the text stays
+    /// and the fill runs out from it, which is how a labelled rule
+    /// (`─ pyright ──────`, the doc float's section header) is drawn. Rendered as an
     /// overlay so a client needs no new wire field. `None` ⇒ no fill.
     pub line_fill: Option<VirtChunk>,
     /// neovim's `line_hl_group` — a highlight group that backs the **whole line**

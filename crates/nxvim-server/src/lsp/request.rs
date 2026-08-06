@@ -1152,31 +1152,49 @@ impl EditHost {
     ///
     /// Every server that answered contributes, in the order the caller sorted them
     /// (routing order — `priority`, then key). With more than one contributor each
-    /// section is headed `# <client name>` and the sections are separated by a `---`
-    /// rule: the reader has to know which server said what, since a type-checker's
-    /// signature and a linter's rule explanation are different kinds of claim. A lone
-    /// contributor renders bare — a heading naming the only server there is would be
-    /// noise on every hover in a one-server buffer, the common case. (This is
-    /// `vim.lsp.buf.hover`'s composition; nxvim's order is `priority` rather than
-    /// neovim's unordered `pairs()` walk over its client table.)
+    /// section is headed by a **labelled rule** — `─ pyright ────────`, the shape the
+    /// float's own border title has — and its markup renders straight under it: the
+    /// reader has to know which server said what, since a type-checker's signature and
+    /// a linter's rule explanation are different kinds of claim. A rule rather than a
+    /// `# <client>` heading because a heading is markup the *server's own* markdown
+    /// also uses (so the two ranks compete), and it separates nothing — two adjacent
+    /// sections still ran together. A lone contributor renders bare: a title naming the
+    /// only server there is would be noise on every hover in a one-server buffer, the
+    /// common case. (This is `vim.lsp.buf.hover`'s composition; nxvim's order is
+    /// `priority` rather than neovim's unordered `pairs()` walk over its client table.)
+    ///
+    /// The returned string — what an async `hover` promise resolves with — is the
+    /// *markup*, so a section is announced there as the `# <client>` heading a caller
+    /// can parse; the rule is a rendering of it, not text a caller should have to strip.
     fn show_merged_hover(&mut self, hovers: Vec<(ServerKey, Vec<String>)>) -> serde_json::Value {
         if hovers.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return serde_json::Value::Null;
         }
-        let mut lines: Vec<String> = Vec::new();
         let multi = hovers.len() > 1;
-        for (key, doc) in hovers {
-            if multi {
-                if !lines.is_empty() {
-                    lines.push("---".to_string());
+        let sections: Vec<(String, String)> = hovers
+            .into_iter()
+            .map(|(key, doc)| {
+                let label = if multi {
+                    key.name.clone()
+                } else {
+                    String::new()
+                };
+                (label, doc.join("\n"))
+            })
+            .collect();
+        let text = sections
+            .iter()
+            .map(|(label, doc)| {
+                if label.is_empty() {
+                    doc.clone()
+                } else {
+                    format!("# {label}\n\n{doc}")
                 }
-                lines.push(format!("# {}", key.name));
-            }
-            lines.extend(doc);
-        }
-        let text = lines.join("\n");
-        self.editor.open_markdown_float("[Hover]", &text);
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+        self.editor.open_markdown_sections("[Hover]", &sections);
         serde_json::Value::String(text)
     }
 
@@ -1187,10 +1205,10 @@ impl EditHost {
     /// manually in insert mode, or by the opt-in auto-trigger, so it stays out of the
     /// way until asked for.
     ///
-    /// With several servers answering, each signature is labelled with its client —
-    /// otherwise two signatures for the same call sit anonymously on top of each
-    /// other. A lone contributor renders bare, so the ordinary one-server float is
-    /// unchanged.
+    /// With several servers answering, each signature is headed by a labelled rule
+    /// naming its client — `─ pyright ─────`, the hover float's section header — or two
+    /// signatures for the same call sit anonymously on top of each other. A lone
+    /// contributor renders bare, so the ordinary one-server float is unchanged.
     ///
     /// This is where nxvim **departs from neovim**: `vim.lsp.buf.signature_help` shows
     /// one client's signature at a time, titled `(1/3)`, and binds `<C-s>` to cycle.
@@ -1222,6 +1240,7 @@ impl EditHost {
         // that is the coordinate core paints the marker at.
         let mut lines: Vec<String> = Vec::new();
         let mut marker_rows: Vec<usize> = Vec::new();
+        let mut header_rows: Vec<usize> = Vec::new();
         for (key, info) in signatures {
             let layout = super::signature::layout_signature(&info);
             let layout = if multi {
@@ -1229,8 +1248,16 @@ impl EditHost {
             } else {
                 layout
             };
+            // One blank row parts a headed block from the one above (never above the
+            // first), as the hover float parts its sections.
+            if layout.header_row.is_some() && !lines.is_empty() {
+                lines.push(String::new());
+            }
             if let Some(row) = layout.active_row {
                 marker_rows.push(lines.len() + row);
+            }
+            if let Some(row) = layout.header_row {
+                header_rows.push(lines.len() + row);
             }
             lines.extend(layout.lines);
         }
@@ -1242,7 +1269,7 @@ impl EditHost {
             .buffer_filetype(self.editor.current_buffer_id())
             .unwrap_or_default();
         self.editor
-            .open_signature_float(lines.clone(), &filetype, &marker_rows);
+            .open_signature_float(lines.clone(), &filetype, &marker_rows, &header_rows);
         serde_json::Value::String(lines.join("\n"))
     }
 

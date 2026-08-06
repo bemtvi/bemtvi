@@ -28,9 +28,10 @@ nx.markdown = nx.markdown or {}
 -- `@markup.quote`, `@markup.list`, …), so a colorscheme that styles treesitter
 -- markdown styles these identically.
 --
--- `fills` are whole-line rules — a thematic break (`---`) or a GFM table's header
--- separator: each `{ line = <1-based>, char = "─", group = "<@markup.*>" }` means
--- "repeat `char` across the width of `lines[line]`". Render them as a full-width run.
+-- `fills` are row rules — a thematic break (`---`) or a GFM table's header separator:
+-- each `{ line = <1-based>, char = "─", group = "<@markup.*>" }` means "repeat `char`
+-- from the end of `lines[line]`'s text to the right edge". Those lines are blank, so
+-- the rule spans the row; render it as a run out to your surface's width.
 --
 -- `code` are the fenced code blocks, each
 -- `{ first_line = <1-based>, last_line = <1-based, inclusive>, lang = "<fence language>"? }`
@@ -131,11 +132,16 @@ function nx.markdown.to_view(src, opts)
     else
       local f = fill_at[i]
       if f then
-        local rule = string.rep(f.char, rule_width)
+        -- A fill runs from the end of the line's own text to the right edge: blank for a
+        -- thematic break / table separator (so the rule is the whole row), text for a
+        -- labelled section rule (`─ name ─────`), whose label stays and keeps its span.
+        local text = r.lines[i]
+        local chars = utf8.len(text) or #text
+        local rule = text .. string.rep(f.char, math.max(rule_width - chars, 0))
         out_of[i] = push(rule)
         decor[#decor + 1] = {
           line = out_of[i] - 1,
-          col = 0,
+          col = char_to_byte(rule, chars + 1),
           end_row = out_of[i] - 1,
           end_col = #rule,
           hl_group = f.group,

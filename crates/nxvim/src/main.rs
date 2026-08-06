@@ -705,6 +705,9 @@ fn main() -> Result<()> {
         // The local binary runs `nx.fs` against the local disk (the actor's `StdLuaFs`);
         // a daemon-backed `luafs_op` seam is injected here by the edit-host split.
         fs_jobs: None,
+        // Likewise, `nx.fs.watch` watches the local disk; a daemon session arms its
+        // watches on the daemon (`luafs_watch`) instead — see the branch below.
+        fs_watch: None,
         // Likewise `nx.http` runs locally (the actor's `ureq`); a daemon-backed `http_op`
         // seam is injected by the edit-host split (see the daemon-session branch below).
         http_jobs: None,
@@ -1124,6 +1127,10 @@ where
         // `:terminal` opens its PTY on the daemon (where the files are), not locally.
         host_term: Some(client.host_term),
         fs_jobs: Some(client.fs_jobs),
+        // Arm `nx.fs.watch` on the daemon (where the files are) over `luafs_watch`, so a
+        // watch — and everything built on one, the LSP file-watch client included — sees
+        // the remote project rather than this machine's disk.
+        fs_watch: Some(client.fs_watch),
         // Route `nx.http.fetch` to the daemon (which owns the network) over `http_op`.
         http_jobs: Some(client.http),
         // Route session-scoped `nx.git.*` to the daemon (where the repo is) over `git_op`.

@@ -265,17 +265,25 @@ end
 --
 --   { kind = "create"|"modify"|"remove"|"rename", paths = { <abspath>, … } }
 --
--- bursts within a 10 ms window are merged in the server (mixed kinds coarsen to
--- `"modify"`, paths deduped). Want a longer settle? Wrap `nx.utils.debounce` on top.
+-- bursts within a 10 ms window are merged in the server, **one batch per kind**
+-- (paths deduped within each). A burst that mixes kinds therefore yields one batch
+-- each rather than a single coarsened one: writing a new file is a `"create"` plus a
+-- `"modify"`, and folding them together would lose the only signal that says the file
+-- is new. Want a longer settle? Wrap `nx.utils.debounce` on top.
 --
 --   nx.async(function()
 --     local w = nx.fs.watch(dir, { recursive = true })
 --     for ev in nx.await_each(w) do redraw(ev.paths) end   -- until w:stop()
 --   end)()
 --
--- A watch that can't arm (bad path, watch limit) or a build with no native watcher
--- (browser / serverless) REJECTS the first pull — fail loud, never a dead watch.
--- `:stop()` cancels the native watch and ends the iteration.
+-- The watch is armed where the session's files are: locally in a local session, and on
+-- the **daemon** in a daemon session (native or browser) — so a remote project reports
+-- its own changes rather than this machine's. A native daemon link re-arms its watches
+-- after a reconnect, so a live iterator survives an outage.
+--
+-- A watch that can't arm (bad path, watch limit) or a session with no change source at
+-- all (serverless browser) REJECTS the first pull — fail loud, never a dead watch.
+-- `:stop()` cancels the watch and ends the iteration.
 
 -- Persistent per-watch pumps, keyed by stream id (like `nx._stdout_fns` for streams).
 nx._fs_watch_fns = nx._fs_watch_fns or {}

@@ -101,6 +101,7 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             lsp_transport: None,
             host_term: None,
             fs_jobs: None,
+            fs_watch: None,
             http_jobs: None,
             git_jobs: None,
             // Hermetic: no system-plugin tier (the plugin under test is the only rtp entry).

@@ -883,6 +883,25 @@ pub enum LspEvent {
         label: Option<String>,
         changes: WorkspaceEditData,
     },
+    /// A server→client `client/registerCapability`: the server is registering a
+    /// capability *after* the handshake, the dynamic half of the protocol. nxvim
+    /// advertises `dynamicRegistration` for exactly two capabilities
+    /// (`workspace/didChangeConfiguration` and `workspace/didChangeWatchedFiles` —
+    /// see [`client_capabilities`](crate::client)), so those are what arrives here.
+    ///
+    /// Forwarded rather than acted on in the manager: honoring a watch registration
+    /// means arming filesystem watches and matching globs, which is
+    /// `nx.lsp._register_capability`'s job in Lua (one implementation over
+    /// `nx.fs.watch`, so it serves the local, daemon and browser sessions alike).
+    RegisterCapability {
+        key: ServerKey,
+        registrations: Vec<CapabilityRegistration>,
+    },
+    /// A server→client `client/unregisterCapability`: the registration ids named
+    /// here are retired (a watch registration's watches are torn down). Ids the
+    /// client never registered are ignored — the protocol allows a server to
+    /// unregister defensively.
+    UnregisterCapability { key: ServerKey, ids: Vec<String> },
     /// A `$/progress` notification carrying a `WorkDoneProgress` payload: the
     /// server is reporting a long-running task (indexing, loading a workspace,
     /// building a crate graph). One task is a `begin` → `report`* → `end` sequence
@@ -896,6 +915,23 @@ pub enum LspEvent {
         token: String,
         update: ProgressUpdate,
     },
+}
+
+/// One entry of a `client/registerCapability`: the server's own id for the
+/// registration (what a later `client/unregisterCapability` names), the method being
+/// registered, and its `registerOptions` **verbatim**.
+///
+/// The options stay raw JSON because their shape is per-method — a watch
+/// registration's `{ watchers: [{ globPattern, kind }] }` is nothing like a
+/// configuration registration's (absent) options — and because the consumer is Lua,
+/// where the value becomes a plain table. Distilling to a typed struct here would
+/// mean re-encoding it right back on the way out.
+#[derive(Clone, Debug)]
+pub struct CapabilityRegistration {
+    pub id: String,
+    pub method: String,
+    /// `Null` when the server sent no options (a registration that needs none).
+    pub register_options: serde_json::Value,
 }
 
 /// Which phase of a `$/progress` sequence an update is.

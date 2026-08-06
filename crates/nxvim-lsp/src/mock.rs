@@ -105,6 +105,21 @@
 //!   sections (the pull-config model lua_ls/gopls use) and records the editor's
 //!   reply under the synthetic method `_config_response`, so a test can assert the
 //!   client answered each section from the config's `settings`.
+//! - `workspace_folders_pull`: if `true`, the mock sends a server→client
+//!   `workspace/workspaceFolders` request after `initialized` (the pull a server
+//!   that ignores the deprecated `rootUri` uses to find its workspace) and records
+//!   the editor's reply under `_workspace_folders_response`.
+//! - `register_capability`: an array of `Registration` objects
+//!   (`{id, method, registerOptions}`) the mock registers dynamically via a
+//!   server→client `client/registerCapability` right after `initialized` — what
+//!   ruff/lua_ls/gopls do for `workspace/didChangeWatchedFiles`. The editor's answer
+//!   is recorded under `_register_response` (`{result: …}` or `{error: …}`), so a
+//!   test can tell an ack from the method-not-found a server reads as "this client
+//!   cannot do dynamic registration".
+//! - `unregister_after_watch_events`: after this many
+//!   `workspace/didChangeWatchedFiles` notifications from the client, the mock sends
+//!   `client/unregisterCapability` for everything in `register_capability` — the
+//!   teardown half of the watch lifecycle.
 //! - `apply_edit`: a `WorkspaceEdit` the mock pushes back as a server→client
 //!   `workspace/applyEdit` when it receives a `workspace/executeCommand` — gopls's
 //!   exact shape for a refactor delivered as a `command` (the command's own reply is
@@ -180,6 +195,15 @@ pub fn run(script_path: &str) {
     // The id of the `workspace/configuration` pull we sent, so its response can be
     // recorded for the test to assert on.
     let mut config_req_id: Option<i64> = None;
+    // Likewise for the `workspace/workspaceFolders` pull (`workspace_folders_pull`)
+    // and the `client/registerCapability` (`register_capability`): a real server reads
+    // both answers, so recording them is what makes "did the client actually answer?"
+    // observable rather than assumed.
+    let mut folders_req_id: Option<i64> = None;
+    let mut register_req_id: Option<i64> = None;
+    // How many `workspace/didChangeWatchedFiles` notifications the client has sent, so
+    // `unregister_after_watch_events` can retire the registration on the Nth.
+    let mut watch_events = 0u64;
     // Likewise for the `workspace/applyEdit` an `apply_edit` script pushes back: its
     // response is the editor's `{applied, failureReason?}`, which a test reads to
     // prove the edit was really applied (not merely acked).
@@ -209,6 +233,20 @@ pub fn run(script_path: &str) {
             }
             if rid.is_some() && rid == apply_req_id {
                 append_record(&script, "_apply_edit_response", msg.get("result"));
+            }
+            if rid.is_some() && rid == folders_req_id {
+                append_record(&script, "_workspace_folders_response", msg.get("result"));
+            }
+            // A registration the client ERRORED (async-lsp's method-not-found default,
+            // before `client/registerCapability` was answered) is recorded as such: a
+            // real server reads that as "no dynamic registration", which is exactly the
+            // conclusion the watch feature dies on.
+            if rid.is_some() && rid == register_req_id {
+                let outcome = match msg.get("error") {
+                    Some(e) => json!({ "error": e }),
+                    None => json!({ "result": msg.get("result").cloned().unwrap_or(Value::Null) }),
+                };
+                append_record(&script, "_register_response", Some(&outcome));
             }
             // The answer to a `window/workDoneProgress/create`. An `error` reply (what
             // async-lsp's method-not-found default produces for an unmodelled request)
@@ -279,6 +317,77 @@ pub fn run(script_path: &str) {
                             "id": next_id,
                             "method": "workspace/configuration",
                             "params": { "items": items },
+                        }),
+                    );
+                    next_id += 1;
+                }
+                // `workspace_folders_pull`: pull the folder set the way a server that
+                // trusts neither `rootUri` nor the pushed `workspaceFolders` does. The
+                // client's answer is recorded as `_workspace_folders_response`.
+                if script
+                    .get("workspace_folders_pull")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    folders_req_id = Some(next_id);
+                    write_message(
+                        &stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "workspace/workspaceFolders",
+                            "params": Value::Null,
+                        }),
+                    );
+                    next_id += 1;
+                }
+                // `register_capability`: register a capability dynamically, as ruff /
+                // lua_ls / gopls do for `workspace/didChangeWatchedFiles` right after
+                // `initialized`. The script IS the `registrations` array, so a test can
+                // register several watchers (or an unhandled method) verbatim.
+                if let Some(regs) = script.get("register_capability").and_then(Value::as_array) {
+                    register_req_id = Some(next_id);
+                    write_message(
+                        &stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "client/registerCapability",
+                            "params": { "registrations": regs },
+                        }),
+                    );
+                    next_id += 1;
+                }
+            }
+            // The client reporting a watched file changed. With
+            // `unregister_after_watch_events` scripted, the Nth one makes the mock
+            // retire its registrations (`client/unregisterCapability`) — the way a
+            // server drops a watch when its config changes — so a test can prove the
+            // client really tears the watch down instead of leaking it for the session.
+            "workspace/didChangeWatchedFiles" => {
+                watch_events += 1;
+                let after = script
+                    .get("unregister_after_watch_events")
+                    .and_then(Value::as_u64);
+                if after == Some(watch_events) {
+                    let ids: Vec<Value> = script
+                        .get("register_capability")
+                        .and_then(Value::as_array)
+                        .map(|regs| {
+                            regs.iter()
+                                .filter_map(|r| {
+                                    Some(json!({ "id": r.get("id")?, "method": r.get("method")? }))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    write_message(
+                        &stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": next_id,
+                            "method": "client/unregisterCapability",
+                            "params": { "unregisterations": ids },
                         }),
                     );
                     next_id += 1;

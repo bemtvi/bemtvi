@@ -1114,11 +1114,17 @@ pub enum LoopOp {
     /// `handle:close()` on an [`nx.socket`](LoopOp::SockConnect) handle — shut the
     /// connection (a no-op if already closed).
     SockClose { id: u64 },
-    /// `nx.fs.watch(path, opts)` — arm a native filesystem watch on `path` (a
-    /// subtree when `recursive`) that fires the watch stream under `id` with
-    /// coalesced `{ kind, paths }` change batches. Forwarded to the event-loop actor
-    /// ([`LoopCommand::FsEventStart`](../../nxvim_server) — native only; a wasm /
-    /// serverless session has no native watcher and fails the watch loud).
+    /// `nx.fs.watch(path, opts)` — arm a filesystem watch on `path` (a subtree when
+    /// `recursive`) that fires the watch stream under `id` with coalesced
+    /// `{ kind, paths }` change batches, one per change class.
+    ///
+    /// The watch is always armed **where the session's files are**: the event-loop
+    /// actor's local `notify` backend
+    /// ([`LoopCommand::FsEventStart`](../../nxvim_server)) in a local session, and the
+    /// daemon's `luafs_watch` leg in a daemon session — natively via
+    /// [`RemoteFsWatch`](../../nxvim_server) and in the browser via the Worker's
+    /// forward. A serverless (no-daemon) wasm session has no change source at all and
+    /// fails the watch loud rather than arming a watch that never fires.
     FsWatch {
         id: u64,
         path: String,

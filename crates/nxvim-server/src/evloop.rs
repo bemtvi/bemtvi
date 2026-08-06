@@ -386,22 +386,55 @@ pub struct EventLoop {
     /// on local disk). Cloned into the actor when it starts.
     git: GitBackend,
     local_git: GitBackend,
+    /// Where a streaming `nx.fs.watch` is armed: `None` is the local disk (this machine's
+    /// `notify` backend, below), `Some` is the daemon's `luafs_watch` leg — a daemon
+    /// session's files live on the daemon, so watching them locally would watch the wrong
+    /// disk. The `FsBackend`/`GitBackend`/`HttpBackend` split in one `Option`, since a
+    /// watch has no `local`-flagged twin (`nx.fs.watch` has no plugin-manager caller).
+    fs_watch: Option<crate::daemon::RemoteFsWatch>,
     started: bool,
 }
 
+/// Where the actor runs each kind of off-tick work: the **session** seams (local disk, or
+/// the daemon's legs) plus the **local** twins the `nx.plugins` manager needs even in a
+/// daemon session. One struct rather than eight positional parameters — every field is
+/// "some backend", so a caller that transposed two of them (`fs` and `local_fs`, say) would
+/// silently route the plugin manager at the remote.
+pub struct LoopBackends {
+    /// Where child processes are spawned (`nx.run`, `:!`, `vim.system`).
+    pub host_proc: Arc<dyn HostProc>,
+    /// Where off-tick `nx.fs` ops run.
+    pub fs: FsBackend,
+    /// Where `nx.http.fetch` requests run.
+    pub http: HttpBackend,
+    /// Where `nx.git.*` ops run.
+    pub git: GitBackend,
+    /// Where a streaming `nx.fs.watch` is armed: `None` = this machine's `notify` backend,
+    /// `Some` = the daemon's `luafs_watch` leg.
+    pub fs_watch: Option<crate::daemon::RemoteFsWatch>,
+    /// The LOCAL twins of `host_proc` / `fs` / `git`, for `local`-flagged ops — the
+    /// `nx.plugins` manager's git + discovery, which stay on the local disk even in a
+    /// daemon session (plugins load into the local Lua VM).
+    pub local_host_proc: Arc<dyn HostProc>,
+    pub local_fs: FsBackend,
+    pub local_git: GitBackend,
+}
+
 impl EventLoop {
-    /// Create the event loop and the receiver the server loop selects on. Spawns
-    /// child processes through `host_proc` and runs off-tick `nx.fs` ops against
-    /// `lua_fs`. No task is spawned until the first [`EventLoop::send`].
-    pub fn new(
-        host_proc: Arc<dyn HostProc>,
-        fs: FsBackend,
-        http: HttpBackend,
-        local_host_proc: Arc<dyn HostProc>,
-        local_fs: FsBackend,
-        git: GitBackend,
-        local_git: GitBackend,
-    ) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
+    /// Create the event loop and the receiver the server loop selects on, running each kind
+    /// of off-tick work against the matching [`LoopBackends`] seam. No task is spawned until
+    /// the first [`EventLoop::send`].
+    pub fn new(backends: LoopBackends) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
+        let LoopBackends {
+            host_proc,
+            fs,
+            http,
+            git,
+            fs_watch,
+            local_host_proc,
+            local_fs,
+            local_git,
+        } = backends;
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (event_tx, event_rx) = unbounded_channel();
         let evloop = EventLoop {
@@ -414,6 +447,7 @@ impl EventLoop {
             local_fs,
             git,
             local_git,
+            fs_watch,
             started: false,
         };
         (evloop, event_rx)
@@ -435,6 +469,7 @@ impl EventLoop {
                 self.local_fs.clone(),
                 self.git.clone(),
                 self.local_git.clone(),
+                self.fs_watch.clone(),
             ));
             self.started = true;
         }
@@ -453,8 +488,8 @@ impl EventLoop {
 /// timer / process is a child `tokio::spawn`ed task keyed by callback id so it can
 /// be cancelled; finished one-shot handles are pruned opportunistically so the
 /// maps don't grow with every fired `defer_fn` (the no-leak guarantee).
-// One parameter per off-tick backend the actor owns (proc / fs / http / git, each with
-// its local twin); grouping them into a struct would only rename the same fields.
+// One parameter per off-tick backend the actor owns (proc / fs / http / git / watch, each
+// with its local twin) — the destructured [`LoopBackends`] the public constructor takes.
 #[allow(clippy::too_many_arguments)]
 async fn run_evloop(
     mut cmd_rx: UnboundedReceiver<LoopCommand>,
@@ -466,6 +501,7 @@ async fn run_evloop(
     local_fs: FsBackend,
     git: GitBackend,
     local_git: GitBackend,
+    fs_watch: Option<crate::daemon::RemoteFsWatch>,
 ) {
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
@@ -621,6 +657,20 @@ async fn run_evloop(
                 // Re-arming an id replaces its watch: drop the old watcher first
                 // (a fresh :start on a handle).
                 fs_watchers.remove(&id);
+                // A daemon session watches the DAEMON's disk (`luafs_watch`), where its
+                // files actually are — arming a local `notify` watch there would watch
+                // this machine, which is either a missing path or, worse, an unrelated
+                // local directory of the same name. The daemon runs the very same
+                // `start_fs_watch_coalesced` and pushes its batches back as the identical
+                // `LoopEvent::FsEvent`s, so nothing downstream can tell the two apart.
+                //
+                // The internal per-buffer watches never reach this branch: a daemon
+                // session arms those through the `fs_watch` (stat-poll) leg in
+                // `sync_buffer_watches`, not through `FsEventStart`.
+                if let Some(remote) = &fs_watch {
+                    remote.watch(id, path, recursive);
+                    continue;
+                }
                 // The internal per-buffer watch (id ≥ BASE) wants a raw, path-less
                 // event per change — its consumer re-stats. A Lua `nx.fs.watch` (id <
                 // BASE) wants coalesced `{kind, paths}` batches, so it arms the
@@ -650,6 +700,9 @@ async fn run_evloop(
                 }
             }
             LoopCommand::FsEventStop { id } => {
+                if let Some(remote) = &fs_watch {
+                    remote.unwatch(id); // and forget it, so a re-dial doesn't re-arm it
+                }
                 fs_watchers.remove(&id); // dropping the watcher stops it
             }
             LoopCommand::Fs { id, job, local } => {
@@ -820,11 +873,19 @@ fn start_fs_watch(
 
 /// Arm a native filesystem watch for the Lua `nx.fs.watch` surface: like
 /// [`start_fs_watch`], but it carries each change's class and paths, and
-/// **coalesces** a burst into one [`LoopEvent::FsEvent`] over a 10 ms window. The
-/// `notify` backend thread feeds raw `(kind, paths)` (or a backend error) into an
-/// internal channel; a spawned task drains it, accumulating until 10 ms idle, then
-/// emits a single deduped batch. (10 ms only — a plugin that wants a longer settle
-/// composes `nx.utils.debounce` on top.)
+/// **coalesces** a burst into one [`LoopEvent::FsEvent`] **per change class** over a
+/// 10 ms window. The `notify` backend thread feeds raw `(kind, paths)` (or a backend
+/// error) into an internal channel; a spawned task drains it, accumulating until
+/// 10 ms idle, then emits one deduped batch per class. (10 ms only — a plugin that
+/// wants a longer settle composes `nx.utils.debounce` on top.)
+///
+/// Per class, **not** one batch per burst: writing a new file is a `create` followed
+/// by a `modify` within microseconds, and folding the two into one coarse `"modify"`
+/// destroys the only signal that says the file is new. That distinction is the whole
+/// difference between LSP's `Created` and `Changed` (`nx.lsp._register_capability`'s
+/// watcher reports it, and a server adds a *created* file to its program while a
+/// *changed* one it never heard of is ignored). A consumer that only rescans is
+/// unaffected beyond seeing two cheap batches instead of one.
 ///
 /// The task is self-reaping: when the watcher is dropped (`FsEventStop`, a re-arm,
 /// or actor shutdown), its callback closure — and the raw sender it holds — drops,
@@ -861,8 +922,11 @@ pub(crate) fn start_fs_watch_coalesced(
     const WINDOW: Duration = Duration::from_millis(10);
     tokio::spawn(async move {
         while let Some(first) = raw_rx.recv().await {
+            // One entry per change class, in first-seen order (a burst carries at most
+            // the four classes, so a Vec beats a map).
+            let mut groups: Vec<(&'static str, Vec<PathBuf>)> = Vec::new();
             // A backend error ends the watch — forward it and stop draining.
-            let (mut kind, mut paths) = match first {
+            match first {
                 RawFsChange::Error(msg) => {
                     let _ = event_tx.send(LoopEvent::FsEvent {
                         id,
@@ -872,20 +936,13 @@ pub(crate) fn start_fs_watch_coalesced(
                     });
                     break;
                 }
-                RawFsChange::Change(k, p) => (k, dedup_paths(Vec::new(), p)),
-            };
-            // Coalesce everything that arrives within the window into this batch.
+                RawFsChange::Change(k, p) => group_change(&mut groups, k, p),
+            }
+            // Coalesce everything that arrives within the window into these groups.
             let mut errored = None;
             loop {
                 match tokio::time::timeout(WINDOW, raw_rx.recv()).await {
-                    Ok(Some(RawFsChange::Change(k, p))) => {
-                        // Mixed kinds in one burst coarsen to "modify" (the generic
-                        // "something changed" the tree consumer rescans on anyway).
-                        if k != kind {
-                            kind = "modify";
-                        }
-                        paths = dedup_paths(paths, p);
-                    }
+                    Ok(Some(RawFsChange::Change(k, p))) => group_change(&mut groups, k, p),
                     Ok(Some(RawFsChange::Error(msg))) => {
                         errored = Some(msg);
                         break;
@@ -894,12 +951,14 @@ pub(crate) fn start_fs_watch_coalesced(
                     _ => break,
                 }
             }
-            let _ = event_tx.send(LoopEvent::FsEvent {
-                id,
-                error: None,
-                kind: Some(kind),
-                paths,
-            });
+            for (kind, paths) in groups {
+                let _ = event_tx.send(LoopEvent::FsEvent {
+                    id,
+                    error: None,
+                    kind: Some(kind),
+                    paths,
+                });
+            }
             if let Some(msg) = errored {
                 let _ = event_tx.send(LoopEvent::FsEvent {
                     id,
@@ -918,6 +977,21 @@ pub(crate) fn start_fs_watch_coalesced(
 enum RawFsChange {
     Change(&'static str, Vec<PathBuf>),
     Error(String),
+}
+
+/// Fold one raw change into the burst's per-class groups: extend the group for
+/// `kind` (deduping paths) or start it, preserving the order the classes first
+/// appeared — so a `create` + `modify` burst flushes the creation first, which is the
+/// order the events really happened in.
+fn group_change(
+    groups: &mut Vec<(&'static str, Vec<PathBuf>)>,
+    kind: &'static str,
+    more: Vec<PathBuf>,
+) {
+    match groups.iter_mut().find(|(k, _)| *k == kind) {
+        Some((_, acc)) => *acc = dedup_paths(std::mem::take(acc), more),
+        None => groups.push((kind, dedup_paths(Vec::new(), more))),
+    }
 }
 
 /// Append `more` to `acc`, skipping paths already present (bursts are small, so a

@@ -1723,8 +1723,14 @@ the gate). `nxvim-core` stays LSP-free.
 - **Snippets** (`InsertTextFormat.Snippet`) — upgrade completion accept (Phase 5).
 - **Multiple windows** — go-to and diagnostics assume one window onto one
   buffer; revisit when splits land (an open roadmap item).
-- **Workspace features** — `workspace/symbol`, `workspace/didChangeWatchedFiles`,
-  `workspace/executeCommand` beyond single-reply actions: add as needed.
+- **Workspace features** — `workspace/symbol`, `workspace/executeCommand` beyond
+  single-reply actions: add as needed. (`workspace/didChangeWatchedFiles` **is**
+  implemented: the client advertises `dynamicRegistration`, answers
+  `client/registerCapability`, and `nx.lsp._register_capability` turns each
+  registered glob into an `nx.fs.watch` subscription that reports Created/Changed/
+  Deleted back to the server. The workspace root also goes out as `workspaceFolders`
+  — pyright/basedpyright ignore the deprecated `rootUri` and analyse nothing without
+  it. See `crates/nxvim/tests/lsp_watchfiles.rs`.)
 - **Pull diagnostics** (`textDocument/diagnostic`) — the plan uses push
   (`publishDiagnostics`); add the pull model if a target server requires it.
 - **Format-on-save** (descoped from Phase 6) — must invert the `:w` flow: `:w` is

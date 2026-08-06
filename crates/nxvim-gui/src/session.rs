@@ -316,6 +316,7 @@ async fn server_init(
         lsp_transport,
         host_term,
         fs_jobs,
+        fs_watch,
         http_jobs,
         git_jobs,
     ) = match client {
@@ -331,6 +332,7 @@ async fn server_init(
                 config_dir,
                 runtimepath,
                 store,
+                None,
                 None,
                 None,
                 None,
@@ -379,6 +381,10 @@ async fn server_init(
                 // `:terminal` opens its PTY on the daemon (where the files are), not locally.
                 Some(c.host_term),
                 Some(c.fs_jobs),
+                // `nx.fs.watch` arms on the daemon (where the files are), so a watch — and
+                // everything built on one, the LSP file-watch client included — sees the
+                // remote project rather than this machine's disk.
+                Some(c.fs_watch),
                 Some(c.http),
                 Some(c.git_jobs),
             )
@@ -418,6 +424,7 @@ async fn server_init(
         lsp_transport,
         host_term,
         fs_jobs,
+        fs_watch,
         http_jobs,
         git_jobs,
         // The GUI is the interactive editor — offer the built-in default recommended

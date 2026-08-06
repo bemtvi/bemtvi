@@ -26,7 +26,8 @@ use async_lsp::{MainLoop, ServerSocket};
 use lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
 #[cfg(feature = "native")]
 use lsp_types::request::{
-    InlayHintRefreshRequest, SemanticTokensRefresh, WorkDoneProgressCreate, WorkspaceConfiguration,
+    InlayHintRefreshRequest, RegisterCapability, SemanticTokensRefresh, UnregisterCapability,
+    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceFoldersRequest,
 };
 #[cfg(feature = "native")]
 use lsp_types::{ApplyWorkspaceEditResponse, ProgressParamsValue};
@@ -35,6 +36,7 @@ use lsp_types::{
     CodeActionCapabilityResolveSupport, CodeActionClientCapabilities, CodeActionKindLiteralSupport,
     CodeActionLiteralSupport, CompletionClientCapabilities, CompletionItemCapability,
     CompletionItemCapabilityResolveSupport, ConfigurationParams,
+    DidChangeConfigurationClientCapabilities, DidChangeWatchedFilesClientCapabilities,
     DocumentFormattingClientCapabilities, FailureHandlingKind, FoldingRangeClientCapabilities,
     GeneralClientCapabilities, HoverClientCapabilities, InitializeParams, InitializeResult,
     InlayHintClientCapabilities, InlayHintResolveClientCapabilities,
@@ -45,7 +47,7 @@ use lsp_types::{
     SemanticTokensWorkspaceClientCapabilities, ServerCapabilities, TextDocumentClientCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
     TokenFormat, Url, WindowClientCapabilities, WorkspaceClientCapabilities,
-    WorkspaceEditClientCapabilities,
+    WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 #[cfg(feature = "native")]
 use tokio::sync::mpsc::UnboundedSender;
@@ -69,7 +71,8 @@ use crate::log::{LogLevel, LspLog};
 // (gated below) use `LspEvent`/`RefreshKind`/`ServerKey`.
 #[cfg(feature = "native")]
 use crate::protocol::{
-    progress_token, progress_update, ApplyEditOutcome, LspEvent, RefreshKind, ServerKey,
+    progress_token, progress_update, ApplyEditOutcome, CapabilityRegistration, LspEvent,
+    RefreshKind, ServerKey,
 };
 use crate::protocol::{PositionEncoding, ProviderCaps, SemanticLegend, ServerCaps, ServerSpawn};
 
@@ -287,6 +290,51 @@ pub(crate) fn new_client(
         // itself carries, which covers both server-minted (`create`) and client-minted
         // (`workDoneToken` on a request) tokens with one path.
         router.request::<WorkDoneProgressCreate, _>(|_st: &mut ClientState, _params| ready(Ok(())));
+        // `workspace/workspaceFolders`: the server pulling the folder set (the twin of
+        // the `workspaceFolders` we push at `initialize`). Answered from the key's root
+        // through the SHARED [`workspace_folders`] helper, so the pull and the push
+        // can't disagree. Declaring `workspace.workspaceFolders` without answering this
+        // would be worse than not declaring it: a server that pulls would get
+        // method-not-found and fall back to *no* workspace at all.
+        router.request::<WorkspaceFoldersRequest, _>(|st: &mut ClientState, ()| {
+            ready(Ok(workspace_folders(&st.key.root)))
+        });
+        // `client/registerCapability` / `client/unregisterCapability`: the dynamic half
+        // of capability negotiation. Forwarded to the editor (and on to
+        // `nx.lsp._register_capability`) and acked — an ack is required, and until this
+        // existed the request fell to async-lsp's method-not-found, which is what a
+        // server reads as "this client cannot do dynamic registration": ruff logs
+        // "automatic configuration reloading will not be available" and every server
+        // that watches files gives up on `workspace/didChangeWatchedFiles`, serving
+        // stale results after any change made outside the editor.
+        router.request::<RegisterCapability, _>(|st: &mut ClientState, params| {
+            let registrations = params
+                .registrations
+                .into_iter()
+                .map(|r| CapabilityRegistration {
+                    id: r.id,
+                    method: r.method,
+                    register_options: r.register_options.unwrap_or(serde_json::Value::Null),
+                })
+                .collect();
+            let _ = st.event_tx.send(LspEvent::RegisterCapability {
+                key: st.key.clone(),
+                registrations,
+            });
+            ready(Ok(()))
+        });
+        router.request::<UnregisterCapability, _>(|st: &mut ClientState, params| {
+            let ids = params
+                .unregisterations
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>();
+            let _ = st.event_tx.send(LspEvent::UnregisterCapability {
+                key: st.key.clone(),
+                ids,
+            });
+            ready(Ok(()))
+        });
         // `$/progress`: the server reporting a long-running task (indexing, loading
         // a workspace). Forwarded as the editor's flattened update — the token
         // normalized and the payload decoded by the SHARED helpers, so this leg and
@@ -636,18 +684,77 @@ fn client_capabilities() -> ClientCapabilities {
             semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
+            // We send the workspace root as a `workspaceFolders` array at `initialize`
+            // *and* answer the server→client `workspace/workspaceFolders` pull. Both
+            // are needed: `rootUri` is deprecated and pyright/basedpyright ignore it
+            // outright, creating their synthetic `<default workspace root>` and then
+            // reporting `File or directory "/<default workspace root>" does not exist`
+            // for a workspace that is perfectly fine — the whole analysis runs against
+            // nothing. nxvim has exactly one folder per client (the key's root; a
+            // second root is a second client), so the set never changes and no
+            // `didChangeWorkspaceFolders` is ever sent.
+            workspace_folders: Some(true),
+            // Dynamic registration, declared **only** for the two `workspace/*`
+            // capabilities nxvim genuinely honors (`client/registerCapability` is
+            // answered in both clients; the registration is forwarded to
+            // `nx.lsp._register_capability`, which arms the watches):
+            //
+            //   * `didChangeConfiguration` — the "automatic configuration reloading"
+            //     ruff and friends warn about when it is missing.
+            //   * `didChangeWatchedFiles` — without it a server never learns about a
+            //     file changed outside the editor (a `git checkout`, a generated file)
+            //     and serves stale results with no way to notice.
+            //
+            // Every OTHER capability keeps `dynamicRegistration: false` on purpose: a
+            // server may deliver a feature *only* through a registration it thinks the
+            // client honors, so claiming support we don't implement would turn a
+            // working static feature into a silently missing one.
+            did_change_configuration: Some(DidChangeConfigurationClientCapabilities {
+                dynamic_registration: Some(true),
+            }),
+            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                // `RelativePattern` (a `{ baseUri, pattern }` glob rather than a bare
+                // string): declared because we resolve it — the Lua watcher joins the
+                // base to the pattern before matching.
+                relative_pattern_support: Some(true),
+            }),
             ..Default::default()
         }),
         ..Default::default()
     }
 }
 
+/// The one [`WorkspaceFolder`] a client serves: its key's `root`, named by the
+/// directory's last component (what an editor shows in a folder list; pyright echoes
+/// it in diagnostics). `None` when the root won't convert to a `file://` URL.
+///
+/// Shared by the `initialize` params and the server→client `workspace/workspaceFolders`
+/// pull, so both spell the same folder — a server that reads one and then the other
+/// must not see them disagree.
+pub(crate) fn workspace_folders(root: &std::path::Path) -> Option<Vec<WorkspaceFolder>> {
+    let uri = Url::from_file_path(root).ok()?;
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    Some(vec![WorkspaceFolder { uri, name }])
+}
+
 /// The `initialize` request params shared by the async manager and the sync wasm
-/// client: the workspace `root` as `root_uri`, the config's `init_options` (falling
-/// back to `settings`, neovim's behavior), and nxvim's base capabilities with the
-/// config's `capabilities` deep-merged over them. `process_id` is the only thing
-/// that differs between the paths — `Some(pid)` natively, `None` in the browser.
-#[allow(deprecated)] // root_uri is the broadest way to convey the workspace root
+/// client: the workspace `root` as **both** `workspaceFolders` and the deprecated
+/// `root_uri`, the config's `init_options` (falling back to `settings`, neovim's
+/// behavior), and nxvim's base capabilities with the config's `capabilities`
+/// deep-merged over them. `process_id` is the only thing that differs between the
+/// paths — `Some(pid)` natively, `None` in the browser.
+///
+/// Both root spellings go out because servers split on which they read: older ones
+/// only know `rootUri`, while pyright/basedpyright dropped it and use
+/// `workspaceFolders` alone — given only `rootUri` they fall back to a synthetic
+/// `<default workspace root>` and report `File or directory
+/// "/<default workspace root>" does not exist`. Sending both is what neovim does,
+/// and they can't disagree: one root per client.
+#[allow(deprecated)] // root_uri is what a pre-workspaceFolders server still reads
 pub(crate) fn init_params(
     root: &std::path::Path,
     spawn: &ServerSpawn,
@@ -658,6 +765,7 @@ pub(crate) fn init_params(
     InitializeParams {
         process_id,
         root_uri: Url::from_file_path(root).ok(),
+        workspace_folders: workspace_folders(root),
         initialization_options: spawn
             .init_options
             .clone()

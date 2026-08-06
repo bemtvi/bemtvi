@@ -3,15 +3,31 @@
 # doesn't flag them as undefined / unscoped. `any: true` permits arbitrary field
 # reads, writes, and calls (the `vim.*` API is open-ended).
 #
-# Base is `lua51` (the std selene ships reliably); the handful of 5.2+ stdlib
-# functions nxvim's PUC Lua 5.4 prelude actually uses (`table.unpack`,
-# `coroutine.isyieldable`) are declared under `globals` below, since selene's
-# bundled `lua53` std is incomplete (no `coroutine.isyieldable`) and needs a
-# build feature this distribution lacks.
+# Two independent settings, and mixing them up is the whole subtlety here:
+#
+#   * `lua_versions: [lua54]` sets the **grammar** selene parses with — nxvim runs
+#     PUC Lua 5.4, so the prelude may use its syntax (bitwise `&` `|` `~` `<<` `>>`,
+#     floor division `//`, integer division semantics, goto labels). Without this
+#     selene parses as 5.1 and reports a bare `parse_error` on `&`, which reads like
+#     broken code rather than a lint setting.
+#   * `base: lua51` sets the **globals**, and stays 5.1 on purpose: selene's bundled
+#     5.2/5.3 stds are incomplete (no `coroutine.isyieldable`), while the 5.1 one is
+#     complete AND still defines `unpack` / `loadstring` / `getfenv`, which the
+#     prelude legitimately calls (nxvim's runtime keeps them, and `runtime.rs`
+#     shims `loadstring`). The handful of 5.2+ stdlib names the prelude uses on top
+#     of that are declared under `globals` below.
+#
+# The grammar needs a selene built with the matching feature — the default build
+# has it compiled out and would report those parse errors regardless of this file:
+#
+#     cargo install selene --features selene-lib/lua54
+#
 # Referenced as `std = "lua51+nxvim"` from selene.toml — selene resolves the
 # `nxvim` segment to this file (nxvim.yml, alongside selene.toml at the repo root).
 base: lua51
 name: nxvim
+lua_versions:
+  - lua54
 globals:
   # The editor API root. Open-ended: vim.keymap.set, vim.api.*, vim.fn.*, etc.,
   # plus assignment of new submodules (vim.treesitter = require("vim.treesitter")).

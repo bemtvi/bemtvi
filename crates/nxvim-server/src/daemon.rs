@@ -251,10 +251,12 @@ const HTTP_OP: &str = "http_op";
 // a web edit-host use this one leg; a serverless session with no daemon rejects loud.
 const GIT_OP: &str = "git_op";
 
-// The Lua-`nx.fs.watch` streaming leg (`luafs_watch`): the wasm route for the streaming watch
-// (Phase 3b of the off-tick plan). DISTINCT from the buffer-reconcile `fs_watch` leg (a coarse
-// single-path stat-poll keyed by path): this is a recursive, change-classified watch keyed by a
-// stream `id`, reusing the native event-loop actor's coalescing watcher
+// The Lua-`nx.fs.watch` streaming leg (`luafs_watch`) — the route BOTH daemon-backed
+// edit-hosts take: the browser's Worker (Phase 3b of the off-tick plan) and, via
+// [`RemoteFsWatch`], the native `--connect-daemon` session. DISTINCT from the
+// buffer-reconcile `fs_watch` leg (a coarse single-path stat-poll keyed by path): this is a
+// recursive, change-classified watch keyed by a stream `id`, reusing the native event-loop
+// actor's coalescing watcher
 // ([`start_fs_watch_coalesced`](crate::evloop::start_fs_watch_coalesced)). The edit-host arms /
 // disarms by notification; the daemon pushes change batches / a terminal error back.
 const LUAFS_WATCH: &str = "luafs_watch"; // edit-host → daemon: [id, path, recursive]
@@ -486,6 +488,13 @@ struct LinkState {
     proc_inflight: Inflight,
     lsp_inflight: LspInflightMap,
     watch_tx: UnboundedSender<WatchEvent>,
+    /// The stable channel the Control demux decodes `luafs_change`/`luafs_watch_err`
+    /// pushes onto (the streaming `nx.fs.watch` leg). Stable across re-dials, like
+    /// [`watch_tx`](Self::watch_tx) — a watch outlives the connection that armed it.
+    fs_watch_tx: UnboundedSender<LoopEvent>,
+    /// The armed-watch registry + notifier, held here so a re-dial can re-arm every live
+    /// watch on the fresh daemon ([`publish_cells`]).
+    fs_watch: RemoteFsWatch,
     term_event_tx: Sender<crate::terminal::native::TermEvent>,
     /// Taken once to drive the `luafs_op` job server (which survives reconnects via the
     /// swappable Control cell).
@@ -529,6 +538,12 @@ fn build_link() -> (LinkState, DaemonClient) {
     let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
     let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
     let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
+    let (fs_watch_tx, fs_watch_rx) = unbounded_channel::<LoopEvent>();
+    let fs_watch = RemoteFsWatch {
+        rpc: control_rpc.clone(),
+        armed: Arc::new(Mutex::new(HashMap::new())),
+        events_rx: Arc::new(Mutex::new(Some(fs_watch_rx))),
+    };
     let (term_event_tx, term_event_rx) =
         channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
     let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
@@ -552,6 +567,7 @@ fn build_link() -> (LinkState, DaemonClient) {
         },
         host_term: RemoteHostTerm::from_parts(term_rpc.clone(), term_event_rx),
         fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
+        fs_watch: fs_watch.clone(),
         git_jobs: RemoteGitJobs {
             req_tx: git_jobs_tx,
         },
@@ -570,6 +586,8 @@ fn build_link() -> (LinkState, DaemonClient) {
         proc_inflight,
         lsp_inflight,
         watch_tx,
+        fs_watch_tx,
+        fs_watch,
         term_event_tx,
         fs_jobs_rx: Some(fs_jobs_rx),
         http_jobs_rx: Some(http_jobs_rx),
@@ -589,7 +607,11 @@ async fn run_connection(state: &LinkState, conn: DialedConnection) {
     // lifetime (spawned by the caller), so it is not re-run here. The four demuxes are the
     // connection's; they end when its streams EOF.
     tokio::join!(
-        run_control_demux(conn.control.incoming, state.watch_tx.clone()),
+        run_control_demux(
+            conn.control.incoming,
+            state.watch_tx.clone(),
+            state.fs_watch_tx.clone()
+        ),
         run_demux(conn.proc.incoming, state.proc_inflight.clone()),
         run_lsp_demux(conn.lsp.incoming, state.lsp_inflight.clone()),
         run_term_demux(conn.term.incoming, state.term_event_tx.clone()),
@@ -609,6 +631,13 @@ fn publish_cells(state: &LinkState, conn: &DialedConnection) {
     state.proc_rpc.set(Some(conn.proc.rpc.clone()));
     state.lsp_rpc.set(Some(conn.lsp.rpc.clone()));
     state.term_rpc.set(Some(conn.term.rpc.clone()));
+    // Streaming `nx.fs.watch` subscriptions are re-armed on the fresh daemon, which knows
+    // about none of them: a live watch iterator (a file tree, the LSP file-watch client)
+    // otherwise survives the outage as an object that simply never yields again — deaf,
+    // with nothing to say so. Runs on the initial connect too, where nothing is armed and
+    // it is a no-op. The buffer-reconcile `fs_watch` leg is re-armed separately, by the
+    // editor's own `resync_after_reconnect` (it re-sends each path's disk baseline).
+    state.fs_watch.rearm_all();
 }
 
 /// Empty the swappable cells so every subsequent seam op fails loud until the next dial (the
@@ -3333,6 +3362,194 @@ impl RemoteFsJobs {
     }
 }
 
+/// The edit-host side of the **streaming watch** leg (`luafs_watch`) for a native-daemon
+/// session: `nx.fs.watch` arms a recursive, change-classified watch on the *daemon*, where
+/// the files are, instead of on the local disk.
+///
+/// Without it a daemon session watched its own machine — so a watch on a remote workspace
+/// armed on a path that doesn't exist locally (a loud arm failure at best, a watch on an
+/// unrelated local directory at worst). Everything built on `nx.fs.watch` inherits the fix:
+/// the LSP `workspace/didChangeWatchedFiles` client
+/// (`nx.lsp._register_capability`), file-tree plugins, config reloaders.
+///
+/// Shape follows the `fs_changed` watch leg rather than the request/response `luafs_op` one:
+/// arming is a notification and changes come back as daemon→edit-host pushes, decoded by
+/// [`run_control_demux`] into the very [`LoopEvent::FsEvent`]s the local `notify` watcher
+/// produces — so the server's landing site cannot tell the two apart, and the coalescing
+/// happens daemon-side in the *same* [`start_fs_watch_coalesced`](crate::evloop) both
+/// sessions use.
+///
+/// **Re-dial**: a re-dialed daemon is a fresh process that lost every watch, so
+/// [`publish_cells`] re-arms the whole set from `armed` — a live `nx.fs.watch` iterator
+/// survives an outage rather than going quietly deaf (`sync_buffer_watches`'s re-arm, for
+/// streams). The wasm/browser leg does not do this yet: its Worker ends each watch stream
+/// with a `luafs_watch_err` when the link drops, so a browser session's watches must be
+/// re-created by their consumer.
+#[derive(Clone)]
+pub struct RemoteFsWatch {
+    rpc: LinkRpc,
+    /// Every watch armed on the daemon, `id -> (path, recursive)`, kept so a re-dial can
+    /// re-arm them. Entries live until `nx.fs.watch`'s `:stop()` (`unwatch`) — a dropped
+    /// link does NOT clear them, which is what makes the re-arm possible.
+    armed: Arc<Mutex<HashMap<u64, (String, bool)>>>,
+    /// The receiver of decoded `luafs_change` / `luafs_watch_err` pushes, taken once by the
+    /// server loop (the [`RemoteHostFs::take_watch_events`] pattern — a `&self` accessor
+    /// that can only hand it out once).
+    events_rx: Arc<Mutex<Option<UnboundedReceiver<LoopEvent>>>>,
+}
+
+impl RemoteFsWatch {
+    /// Connect to a daemon over `reader`/`writer` as a standalone leg (a dedicated link
+    /// thread whose demux decodes the change pushes) — the watch twin of
+    /// [`RemoteFsJobs::connect`], for driving the `luafs_watch` leg in isolation (tests).
+    /// The multiplexed [`connect_daemon`] builds a `RemoteFsWatch` directly instead,
+    /// sharing one link across all legs — and only that path re-arms across a re-dial (a
+    /// single-leg link never re-dials).
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteFsWatch
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (event_tx, event_rx) = unbounded_channel::<LoopEvent>();
+        let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<LinkRpc>();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                let (rpc, mut incoming) = connect(reader, writer);
+                if rpc_tx.send(LinkRpc::fixed(rpc)).is_err() {
+                    return;
+                }
+                // The whole point of this leg is its pushes, so the drain decodes them
+                // rather than discarding the stream like `spawn_leg_thread` does.
+                while let Some(msg) = incoming.recv().await {
+                    let Incoming::Notification { method, params } = msg else {
+                        continue;
+                    };
+                    let ev = match method.as_str() {
+                        LUAFS_CHANGE => decode_luafs_change(params),
+                        LUAFS_WATCH_ERR => decode_luafs_watch_err(params),
+                        _ => None,
+                    };
+                    if let Some(ev) = ev {
+                        if event_tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        });
+        RemoteFsWatch {
+            // A failed handshake leaves an empty cell: every arm is then dropped and the
+            // consumer's watch simply never fires — the same as a dropped link.
+            rpc: rpc_rx.recv().unwrap_or_else(|_| LinkRpc::empty()),
+            armed: Arc::new(Mutex::new(HashMap::new())),
+            events_rx: Arc::new(Mutex::new(Some(event_rx))),
+        }
+    }
+
+    /// Arm (or re-arm) watch `id` on the daemon. Fire-and-forget: changes arrive as
+    /// [`LoopEvent::FsEvent`]s on [`take_events`](Self::take_events), and an arm failure
+    /// comes back on the same channel as an `error` event — never a silent dead watch.
+    pub fn watch(&self, id: u64, path: String, recursive: bool) {
+        self.armed
+            .lock()
+            .unwrap()
+            .insert(id, (path.clone(), recursive));
+        self.rpc.notify(
+            LUAFS_WATCH,
+            vec![Value::from(id), Value::from(path), Value::from(recursive)],
+        );
+    }
+
+    /// Stop watch `id` (`:stop()`), and forget it so a later re-dial doesn't resurrect it.
+    pub fn unwatch(&self, id: u64) {
+        self.armed.lock().unwrap().remove(&id);
+        self.rpc.notify(LUAFS_UNWATCH, vec![Value::from(id)]);
+    }
+
+    /// Take the push stream — the server loop's `select!` arm feeds each event straight to
+    /// the same handler the local actor's events land in. `None` after the first call.
+    pub fn take_events(&self) -> Option<UnboundedReceiver<LoopEvent>> {
+        self.events_rx.lock().unwrap().take()
+    }
+
+    /// Re-send every armed watch to a freshly-dialed daemon (which knows about none of
+    /// them). Called from [`publish_cells`] after the new connection's cells are live; a
+    /// no-op on the initial connect, where nothing is armed yet.
+    fn rearm_all(&self) {
+        let armed: Vec<(u64, (String, bool))> = self
+            .armed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, w)| (*id, w.clone()))
+            .collect();
+        for (id, (path, recursive)) in armed {
+            self.rpc.notify(
+                LUAFS_WATCH,
+                vec![Value::from(id), Value::from(path), Value::from(recursive)],
+            );
+        }
+    }
+}
+
+/// `luafs_change [id, kind, [path, …]]` → the [`LoopEvent::FsEvent`] the local watcher
+/// would have produced. The wire `kind` is mapped back onto the `&'static str` change
+/// classes rather than leaked as a `String`: the four classes are the whole vocabulary
+/// (the peer is the same build), and an unrecognised one is surfaced as a loud watch
+/// error instead of being silently coerced into `"modify"`, which would report a deletion
+/// as an edit.
+fn decode_luafs_change(params: Vec<Value>) -> Option<LoopEvent> {
+    let id = params.first()?.as_u64()?;
+    let kind = params.get(1)?.as_str()?;
+    let kind = match kind {
+        "create" => "create",
+        "modify" => "modify",
+        "remove" => "remove",
+        "rename" => "rename",
+        other => {
+            return Some(LoopEvent::FsEvent {
+                id,
+                error: Some(format!(
+                    "nx.fs.watch: daemon sent unknown change kind '{other}'"
+                )),
+                kind: None,
+                paths: Vec::new(),
+            })
+        }
+    };
+    let paths = params
+        .get(2)?
+        .as_array()?
+        .iter()
+        .filter_map(|p| p.as_str().map(std::path::PathBuf::from))
+        .collect();
+    Some(LoopEvent::FsEvent {
+        id,
+        error: None,
+        kind: Some(kind),
+        paths,
+    })
+}
+
+/// `luafs_watch_err [id, message]` → the terminal error event, identical to the one the
+/// local actor emits when a watch can't arm.
+fn decode_luafs_watch_err(params: Vec<Value>) -> Option<LoopEvent> {
+    let id = params.first()?.as_u64()?;
+    let message = params.get(1)?.as_str()?.to_string();
+    Some(LoopEvent::FsEvent {
+        id,
+        error: Some(message),
+        kind: None,
+        paths: Vec::new(),
+    })
+}
+
 /// The edit-host side of the `git_op` leg for a **native-daemon** session — the actor sends
 /// a whole [`GitJob`](nxvim_lua::GitJob) here and `await`s its typed result. The git twin of
 /// [`RemoteFsJobs`]; `Clone` so each `nx.git` op can be driven concurrently, `Send + Sync`
@@ -3649,6 +3866,20 @@ pub async fn serve_http_daemon_on(
     Ok(())
 }
 
+/// Run the daemon end of the streaming `nx.fs.watch` leg over `reader`/`writer` — the
+/// single-leg form of [`serve_luafs_watch_daemon_on`], the twin of
+/// [`serve_luafs_daemon`], for driving the `luafs_watch` leg in isolation (tests). The
+/// real daemon multiplexes it onto the Control group instead. Returns when the connection
+/// closes (dropping every watcher it armed).
+pub async fn serve_luafs_watch_daemon<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, incoming) = connect(reader, writer);
+    serve_luafs_watch_daemon_on(rpc, incoming).await
+}
+
 /// The `nx.fs.watch` streaming leg's connection-agnostic core. Arms a recursive,
 /// change-classified watch per stream `id` (reusing the event-loop actor's coalescing watcher,
 /// [`start_fs_watch_coalesced`](crate::evloop::start_fs_watch_coalesced) — the same 10 ms-coalesced
@@ -3953,6 +4184,11 @@ pub struct DaemonClient {
     /// The async `nx.fs` seam (`luafs_op`) — whole-job, decomposed daemon-side. The
     /// event-loop actor `await`s it off the editor tick (no thread park).
     pub fs_jobs: RemoteFsJobs,
+    /// The streaming `nx.fs.watch` seam (`luafs_watch`) — recursive watches armed on the
+    /// daemon, whose coalesced change batches push back as [`LoopEvent::FsEvent`]s. Without
+    /// it a daemon session watched the *local* disk, so nothing built on `nx.fs.watch`
+    /// (the LSP file-watch client included) saw a remote change.
+    pub fs_watch: RemoteFsWatch,
     /// The async `nx.git` seam (`git_op`) — the whole op runs daemon-side (git runs where
     /// the files are). The event-loop actor `await`s it off the editor tick.
     pub git_jobs: RemoteGitJobs,
@@ -4113,17 +4349,34 @@ pub(crate) async fn serve_daemon_link_inner(
 async fn run_control_demux(
     mut incoming: UnboundedReceiver<Incoming>,
     watch_tx: UnboundedSender<WatchEvent>,
+    fs_watch_tx: UnboundedSender<LoopEvent>,
 ) {
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue; // the daemon speaks only notifications; ignore stray requests
         };
-        if method == FS_CHANGED {
-            if let Some(ev) = decode_fs_changed(params) {
-                // The server may not have taken the watch receiver yet at startup; a send
-                // that finds no receiver is harmlessly dropped.
-                let _ = watch_tx.send(ev);
+        // Two watch legs land here, and they are NOT the same thing: `fs_changed` is the
+        // per-buffer stat-poll the editor reconciles (`:checktime`), `luafs_change` is a
+        // streaming `nx.fs.watch` batch keyed by stream id.
+        match method.as_str() {
+            FS_CHANGED => {
+                if let Some(ev) = decode_fs_changed(params) {
+                    // The server may not have taken the watch receiver yet at startup; a
+                    // send that finds no receiver is harmlessly dropped.
+                    let _ = watch_tx.send(ev);
+                }
             }
+            LUAFS_CHANGE => {
+                if let Some(ev) = decode_luafs_change(params) {
+                    let _ = fs_watch_tx.send(ev);
+                }
+            }
+            LUAFS_WATCH_ERR => {
+                if let Some(ev) = decode_luafs_watch_err(params) {
+                    let _ = fs_watch_tx.send(ev);
+                }
+            }
+            _ => {}
         }
     }
 }

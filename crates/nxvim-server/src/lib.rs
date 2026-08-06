@@ -128,10 +128,11 @@ pub use daemon::{
     serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_dproc_daemon_on,
     serve_fs_daemon, serve_fs_daemon_on, serve_git_daemon, serve_git_daemon_on, serve_http_daemon,
     serve_http_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
-    serve_luafs_daemon_on, serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on,
-    DaemonClient, DaemonStatus, FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy,
-    RemoteConfig, RemoteFsJobs, RemoteGitJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm,
-    RemoteHttp, RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
+    serve_luafs_daemon_on, serve_luafs_watch_daemon, serve_luafs_watch_daemon_on,
+    serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, DaemonStatus,
+    FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs,
+    RemoteFsWatch, RemoteGitJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteHttp,
+    RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
 };
 /// The parsed `nx_session_reconnect` spec (§B): the client-persistent session-swap request
 /// both native front ends decode and act on. See [`reconnect`].
@@ -353,6 +354,15 @@ pub struct ServerInit {
     /// (boxed) so it rides [`ServerInit`] onto the server thread, where `run_server` turns
     /// it into the actor's [`FsBackend`](crate::evloop::FsBackend).
     pub fs_jobs: Option<RemoteFsJobs>,
+    /// The streaming `nx.fs.watch` daemon seam. `None` (the default) arms watches on the
+    /// local disk (the actor's `notify` backend); a daemon session injects a
+    /// [`RemoteFsWatch`](crate::daemon::RemoteFsWatch) so a watch is armed on the *daemon*,
+    /// where the session's files are — otherwise `nx.fs.watch` (and everything on it: the
+    /// LSP `workspace/didChangeWatchedFiles` client, file trees, config reloaders) watched
+    /// this machine and never saw a remote change. `run_server` hands it to the actor and
+    /// takes its push stream for the `fs_watch_rx` `select!` arm.
+    #[cfg(feature = "native")]
+    pub fs_watch: Option<crate::daemon::RemoteFsWatch>,
     /// The async `nx.http` daemon seam. `None` (the default) runs `nx.http.fetch` on the
     /// local machine (the event-loop actor's `ureq` on its blocking pool); the edit-host
     /// split injects a daemon-backed [`RemoteHttp`] so a request runs on the *daemon* (which
@@ -3683,15 +3693,32 @@ where
     // The plugin manager's `nx.git_local` always runs on the local disk (its repos live
     // there), so the local git twin is always `Local` — even in a daemon session.
     let local_git_backend = evloop::GitBackend::Local;
-    let (evloop, mut loop_events) = EventLoop::new(
+    // Where a streaming `nx.fs.watch` is armed: the daemon's `luafs_watch` leg in a daemon
+    // session (its files live there), else the actor's local `notify` backend. The daemon's
+    // change pushes are forwarded into one always-present channel (the `watch_rx` idiom) so
+    // the `select!` arm below is valid — and idle — in a local session too.
+    let fs_watch = init.fs_watch;
+    let (remote_fs_watch_tx, mut remote_fs_watch_rx) = unbounded_channel::<evloop::LoopEvent>();
+    if let Some(mut rx) = fs_watch.as_ref().and_then(|w| w.take_events()) {
+        let tx = remote_fs_watch_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                if tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let (evloop, mut loop_events) = EventLoop::new(evloop::LoopBackends {
         host_proc,
-        fs_backend,
-        http_backend,
+        fs: fs_backend,
+        http: http_backend,
+        git: git_backend,
+        fs_watch,
         local_host_proc,
-        local_fs_backend,
-        git_backend,
-        local_git_backend,
-    );
+        local_fs: local_fs_backend,
+        local_git: local_git_backend,
+    });
     // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
     // output back on `term_events`. Lazily started on the first open (the `EventLoop`
     // pattern), so a session with no terminal spawns nothing.
@@ -4017,6 +4044,13 @@ where
             // matching Lua callback runs here; the shada debounce-timer also wakes this
             // arm, and `on_loop_events` sorts its flush out from the real callbacks.
             Some(event) = loop_events.recv() => host.on_loop_events(event, &mut loop_events),
+            // A streaming `nx.fs.watch` change from the **daemon** (`luafs_change`): the
+            // same `LoopEvent::FsEvent` the local watcher produces, so it lands in the same
+            // handler — a watch behaves identically whether its files are here or across
+            // the wire. Idle for a local/bare session (nothing ever sends here).
+            Some(event) = remote_fs_watch_rx.recv() => {
+                host.on_loop_events(event, &mut remote_fs_watch_rx)
+            }
             // A `:terminal` child wrote output or exited: feed the bytes to its vt100
             // emulator (refreshing the buffer's mirrored screen) or record the exit.
             Some(event) = term_events.recv() => host.on_term_events(event, &mut term_events),

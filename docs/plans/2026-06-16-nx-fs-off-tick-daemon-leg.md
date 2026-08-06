@@ -270,6 +270,13 @@ unchanged; only the timing moves from "resolved-already" to "resolved next tick"
     lands the `luafs_change`/`luafs_watch_err` pushes. `liveFsWatches` joins the
     async-park gate so the WebTransport reader stays live to receive change pushes
     (the same treatment armed watches / in-flight procs get).
+  - **Native edit-host** (added later, closing the native-daemon half): `RemoteFsWatch`
+    (`daemon.rs`) arms/disarms over the same leg and the Control demux decodes the pushes
+    back into the very `LoopEvent::FsEvent`s the local `notify` watcher produces, so the
+    actor routes `FsEventStart`/`FsEventStop` there whenever the session has one. It also
+    **re-arms** every live watch on a re-dial (a fresh daemon knows about none of them) —
+    the browser leg still ends its streams with `luafs_watch_err` on a drop instead.
+    Tests: `crates/nxvim-server/tests/daemon_fs_watch.rs`.
   - **Test** (`web/verify-fs-watch.mjs`, Playwright + real daemon): a file Node creates
     on the daemon's disk surfaces in the browser watch stream (kind + path); a missing
     path rejects the stream loud; `:stop()` ends the iteration. (Debug note: the test

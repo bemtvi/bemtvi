@@ -5,8 +5,12 @@
 # Bypass in an emergency:  git commit --no-verify
 #
 # Install the runner with one of:  pipx install pre-commit | brew install pre-commit
-# The Lua hooks need stylua + selene on PATH:  brew install stylua selene
-# (or `cargo install stylua selene`).
+# The Lua hooks need stylua + selene on PATH:
+#     cargo install stylua
+#     cargo install selene --features selene-lib/lua54
+# selene's default build (and the brew one) parses Lua 5.1 syntax only, and reports
+# every 5.4 bitwise operator in the prelude as `unexpected character &`; the feature
+# compiles in the 5.4 grammar `nxvim.yml` asks for.
 repos:
   - repo: local
     hooks:

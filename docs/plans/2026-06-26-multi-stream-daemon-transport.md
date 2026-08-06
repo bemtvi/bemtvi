@@ -96,7 +96,11 @@ demux uses, partitioned by group.
   - `host_fs` / `fs_jobs` / `config` → Control `Rpc`; `run_fs_jobs` over Control.
   - `host_proc` → Proc `Rpc`.
   - `lsp_transport` → Lsp `Rpc`.
-  - (`term`, `luafs_watch` seams: browser-only — N/A for the native client.)
+  - `fs_watch` (the streaming `nx.fs.watch` seam, `RemoteFsWatch`) → Control `Rpc`; its
+    `luafs_change`/`luafs_watch_err` pushes land in the Control demux. (Browser-only when
+    this was written; the native client took the leg later, so a daemon session watches the
+    daemon's disk rather than its own.)
+  - (`term` seam: browser-only — N/A for the native client.)
 - Split `run_client_demux` into a per-group demux (each group's `incoming` carries only
   its own notifications): Control→`fs_changed`→`watch_tx`; Proc→`proc_*`→inflight;
   Lsp→`lsp_*`→inflight. The single-stream path keeps one front demux that splits the

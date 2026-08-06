@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use nxvim_core::BufferId;
 use nxvim_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentSyncKind, Url};
 use nxvim_lsp::{
-    LspEvent, LspNotify, LspReply, PositionEncoding, ProgressKind, ProgressUpdate, RefreshKind,
-    ServerKey,
+    CapabilityRegistration, LspEvent, LspNotify, LspReply, PositionEncoding, ProgressKind,
+    ProgressUpdate, RefreshKind, ServerKey,
 };
 use nxvim_lua::{LspClientData, LspOp, LspProgressData};
 
@@ -1220,7 +1220,71 @@ impl EditHost {
                 changes,
             } => self.on_apply_edit(key, id, label, changes),
             LspEvent::Progress { key, token, update } => self.on_lsp_progress(key, token, update),
+            LspEvent::RegisterCapability { key, registrations } => {
+                self.on_register_capability(key, registrations)
+            }
+            LspEvent::UnregisterCapability { key, ids } => self.on_unregister_capability(key, ids),
         }
+    }
+
+    /// A server→client `client/registerCapability`: hand the registrations to
+    /// `nx.lsp._register_capability`, which is where honoring them lives (a
+    /// `workspace/didChangeWatchedFiles` registration arms `nx.fs.watch` per resolved
+    /// base directory and notifies the server on a matching change).
+    ///
+    /// The client's `root` rides along because a registration's glob may be relative
+    /// with no `baseUri` — "relative to the workspace" — and the Lua mirror of a
+    /// client carries no root of its own.
+    fn on_register_capability(
+        &mut self,
+        key: ServerKey,
+        registrations: Vec<CapabilityRegistration>,
+    ) {
+        let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) else {
+            // A registration before the `initialize` reply landed has no client id to
+            // key on. Servers register after `initialized` (which we send after the
+            // reply), so this is a protocol violation rather than a race — say so.
+            self.editor.record_message(
+                format!(
+                    "nx.lsp: {} registered a capability before its handshake finished; ignored",
+                    key.name
+                ),
+                false,
+            );
+            return;
+        };
+        let regs: Vec<serde_json::Value> = registrations
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "method": r.method,
+                    "registerOptions": r.register_options,
+                })
+            })
+            .collect();
+        let root = key.root.to_string_lossy().into_owned();
+        if let Err(e) = self.lua.lsp_register_capability(client_id, &root, &regs) {
+            self.editor.echo(format!(
+                "E5108: Error in nx.lsp capability registration: {e}"
+            ));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// The twin of [`Self::on_register_capability`]: retire the named registrations
+    /// (a watch registration's watches stop). Ids the client never saw are ignored in
+    /// Lua — the protocol lets a server unregister defensively.
+    fn on_unregister_capability(&mut self, key: ServerKey, ids: Vec<String>) {
+        let Some(client_id) = self.lsp_servers.get(&key).map(|r| r.client_id) else {
+            return; // its server is already gone; `_remove_client` dropped the watches
+        };
+        if let Err(e) = self.lua.lsp_unregister_capability(client_id, &ids) {
+            self.editor.echo(format!(
+                "E5108: Error in nx.lsp capability unregistration: {e}"
+            ));
+        }
+        self.apply_lua_effects();
     }
 
     /// Fold one `$/progress` update into the server's live-task store, mirror the

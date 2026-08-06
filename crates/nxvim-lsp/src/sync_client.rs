@@ -42,7 +42,7 @@ use lsp_types::{
 };
 use serde_json::{json, Value};
 
-use crate::client::{configuration_reply, init_params, read_init_result};
+use crate::client::{configuration_reply, init_params, read_init_result, workspace_folders};
 use crate::convert::{
     code_actions_value, completion_reply, document_symbols, folding_ranges, goto_locations,
     hover_reply, inlay_hint, normalize_workspace_edit_value, resolved_completion,
@@ -51,8 +51,8 @@ use crate::convert::{
 };
 use crate::log::LspLog;
 use crate::protocol::{
-    progress_token, progress_update, ApplyEditOutcome, LspEvent, LspNotify, LspReply, LspRequest,
-    RefreshKind, ReqToken, ServerKey, ServerSpawn,
+    progress_token, progress_update, ApplyEditOutcome, CapabilityRegistration, LspEvent, LspNotify,
+    LspReply, LspRequest, RefreshKind, ReqToken, ServerKey, ServerSpawn,
 };
 
 /// One raw operation the wasm host forwards to the daemon's LSP leg. `Spawn`/`Kill`
@@ -632,9 +632,63 @@ impl SyncLspClient {
                     ),
                 }
             }
-            // Everything else a server may request (registerCapability,
-            // workDoneProgress/create, …) is acked with a null result so the server
-            // proceeds — matching async-lsp's lenient default.
+            // The folder-set pull, answered from the key's root through the SAME
+            // helper that builds the `workspaceFolders` we push at `initialize` — the
+            // push and the pull must name one folder, whichever leg a session runs on.
+            "workspace/workspaceFolders" => {
+                let folders = workspace_folders(&key.root);
+                let reply = serde_json::to_value(folders).unwrap_or(Value::Null);
+                self.send_response(key, req_id, reply);
+            }
+            // Dynamic capability registration. Forwarded and acked exactly as the
+            // native router does (`nx.lsp._register_capability` arms the file watches),
+            // so a browser/daemon session is not the degraded one that serves stale
+            // results after an outside-the-editor change.
+            "client/registerCapability" => {
+                let registrations = params
+                    .get("registrations")
+                    .and_then(Value::as_array)
+                    .map(|regs| {
+                        regs.iter()
+                            .filter_map(|r| {
+                                Some(CapabilityRegistration {
+                                    id: r.get("id")?.as_str()?.to_string(),
+                                    method: r.get("method")?.as_str()?.to_string(),
+                                    register_options: r
+                                        .get("registerOptions")
+                                        .cloned()
+                                        .unwrap_or(Value::Null),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.events.push(LspEvent::RegisterCapability {
+                    key: key.clone(),
+                    registrations,
+                });
+                self.send_response(key, req_id, Value::Null);
+            }
+            "client/unregisterCapability" => {
+                // The protocol's field really is spelled `unregisterations`.
+                let ids = params
+                    .get("unregisterations")
+                    .and_then(Value::as_array)
+                    .map(|regs| {
+                        regs.iter()
+                            .filter_map(|r| Some(r.get("id")?.as_str()?.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.events.push(LspEvent::UnregisterCapability {
+                    key: key.clone(),
+                    ids,
+                });
+                self.send_response(key, req_id, Value::Null);
+            }
+            // Everything else a server may request (workDoneProgress/create, …) is
+            // acked with a null result so the server proceeds — matching async-lsp's
+            // lenient default.
             _ => self.send_response(key, req_id, Value::Null),
         }
     }

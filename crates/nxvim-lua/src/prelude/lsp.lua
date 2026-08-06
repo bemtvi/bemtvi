@@ -43,6 +43,11 @@ nx.lsp._attached = nx.lsp._attached or {}
 -- (`nx.lsp._set_progress` replaces the whole list per update; the server clears the
 -- slot when the last task ends and when the server exits). Read by `nx.lsp.progress`.
 nx.lsp._progress = nx.lsp._progress or {}
+-- client id -> { [registration id] = { method =, watches = { Watch, … } } } — the
+-- capabilities a server registered dynamically (`client/registerCapability`) and
+-- whatever honoring each one armed. `nx.lsp._unregister_capability` and
+-- `_remove_client` tear the entry down, which is what stops the watches.
+nx.lsp._registrations = nx.lsp._registrations or {}
 
 -- ----- small helpers ---------------------------------------------------------
 
@@ -1958,12 +1963,263 @@ function nx.lsp._set_client(id, name, capabilities, offset_encoding)
   end
 end
 
+-- ----- dynamic capability registration --------------------------------------
+-- `client/registerCapability` is how a server turns a feature on AFTER the
+-- handshake. nxvim advertises `dynamicRegistration` for exactly two capabilities
+-- (`workspace/didChangeConfiguration` and `workspace/didChangeWatchedFiles`), and
+-- this is where the second one is honored: the registration's globs become
+-- `nx.fs.watch` subscriptions, and a matching change on disk goes back to the
+-- server as `workspace/didChangeWatchedFiles`. Without it a server never learns
+-- about a file that changed outside the editor (a `git checkout`, a code
+-- generator, a `pip install`) and quietly serves stale results — which is what
+-- ruff, gopls and lua_ls warn about at startup when the capability is missing.
+--
+-- Written on `nx.*` (`nx.fs.watch` + `nx.glob` + `client:notify`) rather than in
+-- the engine, so the one implementation serves a local, daemon and browser
+-- session alike — `nx.fs.watch` is what already knows where the files are.
+
+-- The LSP `WatchKind` bit for a `FileChangeType`: created 1 -> 1, changed 2 -> 2,
+-- deleted 3 -> 4. The two vocabularies deliberately don't line up (one is a bitmask,
+-- the other an enum), and conflating them silently drops every deletion.
+local WATCH_KIND_BIT = { [1] = 1, [2] = 2, [3] = 4 }
+
+-- The `file://` URI a watched path reports as. Kept next to the change builder so
+-- the two spellings (what we match globs against, what the server is told) stay one
+-- conversion apart.
+local function watched_uri(path)
+  return nx.utils.uri_from_path(path)
+end
+
+-- Resolve one registered `globPattern` to an ABSOLUTE glob. The protocol allows
+-- either a plain string (relative to the workspace, or already absolute) or a
+-- `RelativePattern` — `{ baseUri = <uri | WorkspaceFolder>, pattern = "…" }` — which
+-- is why `relativePatternSupport` is advertised. Returns nil for a shape we can't
+-- read, so the caller can say which watcher was dropped rather than watch the wrong
+-- tree.
+local function absolute_glob(pattern, root)
+  local base, relative = root, nil
+  if type(pattern) == "string" then
+    relative = pattern
+  elseif type(pattern) == "table" then
+    relative = pattern.pattern
+    local uri = pattern.baseUri
+    if type(uri) == "table" then -- a WorkspaceFolder rather than a bare URI
+      uri = uri.uri
+    end
+    if type(uri) == "string" and uri ~= "" then
+      base = nx.utils.uri_to_path(uri)
+    end
+  end
+  if type(relative) ~= "string" or relative == "" then
+    return nil
+  end
+  if relative:sub(1, 1) == "/" or relative:match("^%a:[/\\]") then
+    return relative -- already absolute; the base is not ours to impose
+  end
+  return (base:gsub("/$", "")) .. "/" .. relative
+end
+
+-- The directory to actually watch for an absolute glob: its longest literal prefix.
+-- `/p/**/*.py` watches `/p`; `/p/src/*.rs` watches `/p/src`; a glob-free
+-- `/p/pyproject.toml` watches `/p` (watching the file itself would arm on a path
+-- that may not exist yet, and would miss its re-creation).
+local function watch_root(glob)
+  local dir, globbed = {}, false
+  for _, part in ipairs(nx.str.split(glob, "/", { plain = true })) do
+    if part:find("[%*%?%[{]") then
+      globbed = true
+      break
+    end
+    dir[#dir + 1] = part
+  end
+  -- No glob character anywhere: the pattern names one file, so watch its directory.
+  -- (Watching the file itself would arm on a path that may not exist yet, and would
+  -- miss its re-creation.)
+  if not globbed and #dir > 1 then
+    table.remove(dir)
+  end
+  -- The leading component of an absolute path is empty, so `{"", "p"}` concatenates
+  -- back to `/p` and a root-level watch (`{""}`) to `/`.
+  local path = table.concat(dir, "/")
+  return path ~= "" and path or "/"
+end
+
+-- Pump one armed watch: for every coalesced change batch, work out which paths the
+-- registration actually asked about and tell the server. Order matters — the glob
+-- test is a compiled regex in Rust, the existence probe is a filesystem op, so
+-- matching FIRST keeps a burst of uninteresting churn (a `.git` rewrite, a build
+-- directory) from costing one `stat` per file.
+--
+-- The change TYPE is the event class confirmed against what is on disk: a structural
+-- class (`create`/`remove`/`rename`) means the file appeared or vanished, so which one
+-- is decided by whether it exists NOW — a rename reports as a creation at the new path
+-- and a deletion at the old, and a `create` whose file is already gone again is
+-- reported as the deletion it ended up being. Trusting the class alone would tell a
+-- server to re-read a file that isn't there.
+local pump_watch = nx.async(function(client_id, watch, specs)
+  local globs = {}
+  for i, spec in ipairs(specs) do
+    globs[i] = spec.glob
+  end
+  local set = nx.glob.set(globs)
+  while true do
+    local ev = nx.await(watch:next())
+    if ev == nil then
+      return -- `:stop()` — the registration was retired, or its client went away
+    end
+    local changes = {}
+    for _, path in ipairs(ev.paths or {}) do
+      local matched = set:matches(path)
+      if #matched > 0 then
+        local exists = nx.await(nx.fs.exists(path))
+        local structural = ev.kind == "create" or ev.kind == "remove" or ev.kind == "rename"
+        local change_type = 2
+        if not exists then
+          change_type = 3
+        elseif structural then
+          change_type = 1
+        end
+        local bit = WATCH_KIND_BIT[change_type]
+        for _, i in ipairs(matched) do
+          if specs[i].kind & bit ~= 0 then
+            changes[#changes + 1] = { uri = watched_uri(path), type = change_type }
+            break
+          end
+        end
+      end
+    end
+    if #changes > 0 then
+      local client = nx.lsp._clients[client_id]
+      if client then
+        client:notify("workspace/didChangeWatchedFiles", { changes = changes })
+      end
+    end
+  end
+end)
+
+-- Arm the watches one `workspace/didChangeWatchedFiles` registration asks for.
+-- Watchers sharing a base directory share ONE `nx.fs.watch` (a server commonly
+-- registers `**/*.py` and `**/*.pyi` over the same root; two recursive watches on
+-- one tree would double every event for nothing).
+local function arm_file_watches(client_id, root, entry, options)
+  local watchers = type(options) == "table" and options.watchers or nil
+  if type(watchers) ~= "table" or #watchers == 0 then
+    nx.notify(
+      "nx.lsp: didChangeWatchedFiles registered with no watchers; nothing is being watched",
+      vim.log.levels.WARN
+    )
+    return
+  end
+  local by_dir = {}
+  for _, w in ipairs(watchers) do
+    local glob = absolute_glob(w.globPattern, root)
+    if glob == nil then
+      nx.notify(
+        "nx.lsp: unreadable file-watch pattern in a didChangeWatchedFiles registration; skipped",
+        vim.log.levels.WARN
+      )
+    else
+      local dir = watch_root(glob)
+      by_dir[dir] = by_dir[dir] or {}
+      -- Absent `kind` means all three (LSP's documented default: create|change|delete).
+      table.insert(by_dir[dir], { glob = glob, kind = w.kind or 7 })
+    end
+  end
+  for dir, specs in pairs(by_dir) do
+    -- A pattern whose literal prefix is the filesystem root would arm a recursive
+    -- watch over every mounted filesystem — minutes of walking and an event storm
+    -- with the editor waiting behind it. No server means that; refuse it loudly.
+    if dir == "/" then
+      nx.notify(
+        "nx.lsp: refusing a file watch rooted at / (pattern '" .. specs[1].glob .. "')",
+        vim.log.levels.WARN
+      )
+    else
+      local watch = nx.fs.watch(dir, { recursive = true })
+      entry.watches[#entry.watches + 1] = watch
+      -- A watch that can't arm (a root that doesn't exist, the inotify limit) rejects
+      -- the pump. Say so: the alternative is a server that looks watched and isn't.
+      pump_watch(client_id, watch, specs):catch(function(err)
+        nx.notify(
+          "nx.lsp: file watch on " .. dir .. " ended: " .. tostring(err),
+          vim.log.levels.WARN
+        )
+      end)
+    end
+  end
+end
+
+-- A server registered capabilities after the handshake (`client/registerCapability`).
+-- `root` is its workspace root, used for a relative glob with no `baseUri`;
+-- `registrations` are the protocol's `{ id, method, registerOptions }` entries.
+--
+-- Only the two methods nxvim advertises `dynamicRegistration` for can legitimately
+-- arrive. Anything else means a server registered a capability we never claimed to
+-- honor, and honoring it is the difference between a feature working and silently
+-- not — so it is reported rather than swallowed.
+function nx.lsp._register_capability(client_id, root, registrations)
+  local regs = nx.lsp._registrations[client_id] or {}
+  nx.lsp._registrations[client_id] = regs
+  for _, reg in ipairs(registrations or {}) do
+    local id, method = reg.id, reg.method
+    if type(id) == "string" and type(method) == "string" then
+      -- Re-registering an id replaces it (the protocol's own rule), so tear the old
+      -- one down first or its watches leak and every change is reported twice.
+      nx.lsp._unregister_capability(client_id, { id })
+      local entry = { method = method, watches = {} }
+      regs[id] = entry
+      if method == "workspace/didChangeWatchedFiles" then
+        arm_file_watches(client_id, root, entry, reg.registerOptions)
+      elseif method ~= "workspace/didChangeConfiguration" then
+        -- `didChangeConfiguration` needs nothing armed: nxvim pushes the config's
+        -- `settings` whenever they change, registered or not. Everything else is
+        -- unhandled, and loudly so.
+        nx.notify(
+          "nx.lsp: server registered '" .. method .. "' dynamically, which nxvim does not honor",
+          vim.log.levels.WARN
+        )
+      end
+    end
+  end
+end
+
+-- `client/unregisterCapability`: retire the named registrations and stop whatever
+-- they armed. An id we never registered is ignored — the protocol lets a server
+-- unregister defensively.
+function nx.lsp._unregister_capability(client_id, ids)
+  local regs = nx.lsp._registrations[client_id]
+  if not regs then
+    return
+  end
+  for _, id in ipairs(ids or {}) do
+    local entry = regs[id]
+    if entry then
+      for _, watch in ipairs(entry.watches) do
+        watch:stop()
+      end
+      regs[id] = nil
+    end
+  end
+end
+
 -- A server exited: forget its handle, drop it from every buffer's attach set, and
 -- drop whatever it was in the middle of. A dead server's half-finished "Indexing
 -- 40%" would otherwise sit on the statusline forever — its `end` is never coming.
 function nx.lsp._remove_client(id)
   nx.lsp._clients[id] = nil
   nx.lsp._progress[id] = nil
+  -- Its dynamic registrations die with it: a file watch outlives the process that
+  -- asked for it otherwise, feeding notifications to a client id that is gone (and
+  -- holding an inotify watch on the whole workspace for the rest of the session).
+  local regs = nx.lsp._registrations[id]
+  if regs then
+    local ids = {}
+    for reg_id in pairs(regs) do
+      ids[#ids + 1] = reg_id
+    end
+    nx.lsp._unregister_capability(id, ids)
+    nx.lsp._registrations[id] = nil
+  end
   for _, set in pairs(nx.lsp._attached) do
     set[id] = nil
   end

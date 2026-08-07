@@ -2983,16 +2983,23 @@ fn plugin_shada_to_tuples(data: Vec<PluginNamespace>) -> Vec<(String, Vec<(Strin
 /// The on-daemon shada sync handle for a `Remote`-config session (Approach A, per-instance
 /// mirror): the daemon fs seam, the remote shada **directory**, and the sibling filenames
 /// downloaded at connect (deleted on the daemon at clean-exit compaction). The session
-/// uploads its *own* instance file into `remote_dir` after each flush. `busy` coalesces
-/// overlapping checkpoint uploads — a debounced checkpoint that fires while a prior upload
-/// is still in flight is skipped (the next checkpoint, or the awaited final upload, carries
-/// the latest bytes), so uploads neither pile up nor land out of order.
+/// uploads its *own* instance file into `remote_dir` after each flush.
+///
+/// `upload` serializes those uploads, and it has to be a lock rather than a flag because the
+/// two writers want *different* things from it. They all target the same remote path, so two
+/// in flight at once can land in either order — and the loser is whichever the daemon happens
+/// to write last, not whichever is newest. A debounced checkpoint that finds the lock taken
+/// **skips** (`try_lock_owned`): it is fire-and-forget so the editor tick never blocks on the
+/// network, and the next checkpoint — or the final upload — carries the newer bytes anyway.
+/// The clean-exit upload instead **waits** (`lock().await`): it carries the session's last
+/// state and must be the last write to land, so it has to outlive any checkpoint still
+/// crossing a slow link rather than race it.
 #[cfg(feature = "native")]
 struct RemoteShadaSync {
     fs: Arc<dyn HostFsAsync>,
     remote_dir: String,
     downloaded: Vec<String>,
-    busy: Arc<std::sync::atomic::AtomicBool>,
+    upload: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[cfg(feature = "native")]
@@ -3002,7 +3009,7 @@ impl RemoteShadaSync {
             fs,
             remote_dir,
             downloaded,
-            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            upload: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -3311,30 +3318,30 @@ impl EditHost {
     /// Upload our instance file to the daemon after a checkpoint flush (Approach A),
     /// **fire-and-forget**: snapshot the bytes now (consistent — the flush just
     /// committed), then write them over the fs seam on a spawned task so the editor tick
-    /// never blocks on the network. Coalesced via [`RemoteShadaSync::busy`] so debounced
-    /// checkpoints can't pile up. A no-op when remote shada is off.
+    /// never blocks on the network. Holds [`RemoteShadaSync::upload`] for the write, and
+    /// skips outright when it can't take it — a debounced checkpoint has nothing worth
+    /// waiting for (the upload already in flight, or the next checkpoint, carries bytes at
+    /// least as new). A no-op when remote shada is off.
     fn upload_shada_checkpoint(&self) {
-        use std::sync::atomic::Ordering;
         let Some(sync) = self.remote_shada.as_ref() else {
             return;
         };
-        // Skip if a prior upload is still in flight — the next checkpoint (or the awaited
+        // Skip if any upload is still in flight — the next checkpoint (or the awaited
         // final upload) carries the latest bytes; this avoids pile-up and out-of-order
-        // writes.
-        if sync.busy.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let Some((target, bytes)) = self.staged_shada_upload() else {
-            sync.busy.store(false, Ordering::Release);
+        // writes. The guard rides the spawned task, so the lock is held for the whole
+        // write and released even if that task is dropped at exit.
+        let Ok(guard) = sync.upload.clone().try_lock_owned() else {
             return;
         };
+        let Some((target, bytes)) = self.staged_shada_upload() else {
+            return; // `guard` drops here — nothing was written, so nothing to serialize.
+        };
         let fs = sync.fs.clone();
-        let busy = sync.busy.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             if let Err(e) = fs.write(target, bytes).await {
                 eprintln!("shada: remote checkpoint upload failed: {e}");
             }
-            busy.store(false, Ordering::Release);
         });
     }
 
@@ -3345,6 +3352,11 @@ impl EditHost {
     /// delete the absorbed siblings on the daemon so the remote dir stays bounded by live
     /// sessions. Best-effort (failures logged; we're leaving). A no-op when remote shada is
     /// off or the store never loaded (nothing absorbed → nothing to remove).
+    ///
+    /// Takes [`RemoteShadaSync::upload`] and **waits**: a debounced checkpoint may still be
+    /// crossing the link with an older snapshot of the same remote path, and two concurrent
+    /// writes land in whichever order the daemon finishes them — so letting this one race
+    /// would let the stale bytes win and silently lose the session's last state.
     pub(crate) async fn shada_upload_final(&self) {
         let Some(sync) = self.remote_shada.as_ref() else {
             return;
@@ -3352,6 +3364,7 @@ impl EditHost {
         if self.shada.is_none() {
             return;
         }
+        let _guard = sync.upload.lock().await;
         if let Some((target, bytes)) = self.staged_shada_upload() {
             if let Err(e) = sync.fs.write(target, bytes).await {
                 eprintln!("shada: final remote upload failed: {e}");

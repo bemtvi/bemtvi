@@ -620,9 +620,11 @@ async fn run_connection(state: &LinkState, conn: DialedConnection) {
 
 /// Publish `conn`'s four per-group `Rpc`s into the swappable cells, so the seams the editor
 /// holds route onto this connection. Split out from [`run_connection`] so it can also fill the
-/// cells *before* the supervisor task runs — the initial connect publishes here before handing
-/// the client back (so the caller's first seam op — the config-resolve round trip — lands on a
-/// live cell rather than racing the not-yet-polled supervisor), and a re-dial publishes before
+/// cells *before* the client is handed back — **both** dialers publish here first, so the
+/// caller's first seam op (the config-resolve round trip it issues the instant the dial
+/// returns) lands on a live cell instead of racing the code that would otherwise fill it: the
+/// not-yet-polled supervisor task on the reconnecting path, the link thread's own next step on
+/// the one-shot [`serve_daemon_link_inner`] path. And a re-dial publishes before
 /// announcing [`DaemonStatus::Connected`] (the editor's reconnect resync fires on that
 /// transition and must re-arm watches / re-open LSP onto live cells, never the just-cleared
 /// ones). Idempotent — `run_connection` re-publishes the same `Rpc`s.
@@ -4332,6 +4334,15 @@ pub(crate) async fn serve_daemon_link_inner(
         state.control_rpc.clone(),
         state.take_git_jobs_rx(),
     ));
+    // Publish the connection's `Rpc`s into the cells *before* handing the client out — the
+    // same ordering the reconnecting dialer needs, and for the same reason. The caller
+    // issues its first seam op (the config-resolve round trip) the instant `connect_daemon`
+    // returns, but the publish runs on *this* thread: send the client first and the two
+    // race, so a caller that gets going before this thread is next scheduled finds an empty
+    // cell and fails loud with "daemon disconnected" — surfacing as an intermittent
+    // `could not resolve the session config from the daemon` at session startup. Idempotent
+    // with `run_connection`'s re-publish.
+    publish_cells(&state, &conn);
     // Hand the seams out before serving; if the caller already dropped, there's nothing
     // to drive.
     if client_tx.send(client).is_err() {

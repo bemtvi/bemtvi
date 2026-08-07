@@ -725,3 +725,214 @@ async fn remote_shada_namespace_isolates_projects() {
         );
     }
 }
+
+/// How long [`HoldShadaWrites`] pins a remote-shada upload "in flight" before letting it
+/// reach the wire. Generous on purpose: it has to outlast everything the test does between
+/// observing the checkpoint upload and the clean-exit upload being issued (two `feed`s, the
+/// quit, the final flush) even on a machine loaded by a full `cargo test --workspace`, or the
+/// overlap the assertion hunts for would close by itself and the test would pass vacuously.
+const UPLOAD_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What [`HoldShadaWrites`] saw, shared with the test.
+#[derive(Default)]
+struct ShadaWriteStats {
+    /// Remote-shada uploads that have entered the seam and not yet returned.
+    inflight: std::sync::atomic::AtomicUsize,
+    /// Uploads that started while another was still in flight — the bug this measures.
+    overlaps: std::sync::atomic::AtomicUsize,
+    /// Every remote-shada upload seen, so the test can wait for the checkpoint's.
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+/// A [`HostFsAsync`] decorator over the daemon seam that makes a *slow link* deterministic:
+/// every remote-shada (`.redb`) upload is held [`UPLOAD_HOLD`] before it reaches the wire,
+/// and overlapping uploads are counted. Everything else is delegated untouched, so the
+/// session is otherwise a normal `Remote`-config daemon session against the real daemon.
+///
+/// Reacting to its input, not a fixture: it discriminates on the actual path being written
+/// (only the shada mirror is held — a buffer `:w` is not), and the counters move only when
+/// the editor really issues an upload.
+struct HoldShadaWrites {
+    inner: nxvim_server::RemoteHostFs,
+    stats: std::sync::Arc<ShadaWriteStats>,
+}
+
+impl nxvim_server::HostFsAsync for HoldShadaWrites {
+    fn read(
+        &self,
+        path: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<nxvim_server::FsRead>> + Send>,
+    > {
+        self.inner.read(path)
+    }
+
+    fn chdir(
+        &self,
+        path: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<String>> + Send>> {
+        self.inner.chdir(path)
+    }
+
+    fn write(
+        &self,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Option<nxvim_core::FileStat>>> + Send>,
+    > {
+        // Only the shada mirror is held — an ordinary remote `:w` goes straight through.
+        if !path.ends_with(".redb") {
+            return self.inner.write(path, bytes);
+        }
+        use std::sync::atomic::Ordering;
+        let stats = self.stats.clone();
+        // Built (not polled) here: the wire op only starts when the returned future is
+        // first polled, i.e. *after* the hold below — a slow link, not a slow ack.
+        let write = self.inner.write(path, bytes);
+        Box::pin(async move {
+            stats.seen.fetch_add(1, Ordering::SeqCst);
+            if stats.inflight.fetch_add(1, Ordering::SeqCst) > 0 {
+                stats.overlaps.fetch_add(1, Ordering::SeqCst);
+            }
+            tokio::time::sleep(UPLOAD_HOLD).await;
+            let result = write.await;
+            stats.inflight.fetch_sub(1, Ordering::SeqCst);
+            result
+        })
+    }
+
+    fn mkdir(
+        &self,
+        path: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+        self.inner.mkdir(path)
+    }
+
+    fn remove(
+        &self,
+        path: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+        self.inner.remove(path)
+    }
+
+    fn watch(&self, path: String, known: Option<nxvim_core::FileStat>) {
+        self.inner.watch(path, known);
+    }
+
+    fn unwatch(&self, path: String) {
+        self.inner.unwatch(path);
+    }
+
+    fn take_watch_events(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<nxvim_server::WatchEvent>> {
+        self.inner.take_watch_events()
+    }
+}
+
+/// Block until the debounced checkpoint's upload is in flight (or fail loud).
+///
+/// Polls the decorator's own counter rather than the editor: **every** client message
+/// re-arms the 150ms checkpoint debounce, so driving this over RPC would keep pushing the
+/// checkpoint out and it would never fire. Nothing here touches the wire.
+async fn await_checkpoint_upload(stats: &ShadaWriteStats) {
+    use std::sync::atomic::Ordering;
+    for _ in 0..250 {
+        if stats.seen.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the debounced shada checkpoint never uploaded — the test proved nothing");
+}
+
+/// Regression: a **checkpoint** upload in flight must never overtake the **clean-exit**
+/// upload and clobber the daemon's copy with older bytes.
+///
+/// Both write the session's *same* instance file on the daemon. The debounced checkpoint
+/// uploads fire-and-forget (the editor tick must not block on the network) while the exit
+/// upload is awaited — so with nothing serializing them, a checkpoint that is still crossing
+/// a slow link when the session quits lands its stale snapshot *after* the exit upload. The
+/// session's last state is then silently lost: exactly what the next session fails to
+/// restore. Ordering them is the fix, and no-overlap is the property that guarantees it —
+/// two concurrent writes to one path can land in either order.
+///
+/// Deterministic by construction: [`HoldShadaWrites`] pins the checkpoint upload in flight
+/// for [`UPLOAD_HOLD`], and the register is yanked *after* that checkpoint snapshotted, so
+/// only the exit upload carries it.
+#[tokio::test]
+async fn a_checkpoint_upload_never_overtakes_the_clean_exit_upload() {
+    let _g = serial_lock().lock().await;
+    let state = temp_dir("remote_shada_order_state");
+    let _xs = EnvGuard::set("XDG_STATE_HOME", Some(&state));
+    let _xc = EnvGuard::set(
+        "XDG_CACHE_HOME",
+        Some(&temp_dir("remote_shada_order_cache")),
+    );
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&temp_dir("remote_shada_order_cfg")));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&temp_dir("remote_shada_order_data")));
+
+    let stats = std::sync::Arc::new(ShadaWriteStats::default());
+    {
+        let client = spawn_daemon_client();
+        let resolved = client
+            .config
+            .resolve(ConfigSource::Remote)
+            .await
+            .expect("resolve remote config");
+        let fs = HoldShadaWrites {
+            inner: client.host_fs,
+            stats: stats.clone(),
+        };
+        let (store, remote_shada) = nxvim_server::resolve_session_shada(
+            &fs,
+            ConfigSource::Remote,
+            resolved.state_dir.as_deref(),
+            None,
+            nxvim_server::default_shada(),
+        )
+        .await;
+        assert!(
+            remote_shada.is_some(),
+            "a Remote-config session must get an on-daemon shada target"
+        );
+        let init = ServerInit {
+            config_dir: resolved.config_dir,
+            runtimepath: resolved.runtimepath,
+            shada: Some(store),
+            remote_shada,
+            host_proc: Some(Box::new(client.host_proc)),
+            host_fs_async: Some(Box::new(fs)),
+            lsp_transport: Some(Box::new(client.lsp_transport)),
+            fs_jobs: Some(client.fs_jobs),
+            ..Default::default()
+        };
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+
+        // Some state for the checkpoint to snapshot — but NOT the register below.
+        feed(&rpc, "ihello world<Esc>");
+        assert_eq!(lines(&rpc).await, vec!["hello world"]);
+        // The debounce elapses (no RPC traffic to re-arm it) and its upload goes in flight.
+        await_checkpoint_upload(&stats).await;
+
+        // Yanked *after* that snapshot, so only the clean-exit upload carries register `a`.
+        feed(&rpc, "0\"ayiw");
+        feed(&rpc, ":qa!<CR>");
+        drain_until_exit(incoming).await;
+    }
+
+    use std::sync::atomic::Ordering;
+    assert!(
+        stats.seen.load(Ordering::SeqCst) >= 2,
+        "both the checkpoint and the clean-exit upload must have run, saw {}",
+        stats.seen.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        stats.overlaps.load(Ordering::SeqCst),
+        0,
+        "the clean-exit upload started while a checkpoint upload was still in flight — \
+         the stale bytes can land last and lose the session's final state"
+    );
+}

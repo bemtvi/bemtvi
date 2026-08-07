@@ -112,6 +112,11 @@ axum = { workspace = true, optional = true }
 form_urlencoded = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The daemon **dial** test exercises the handoff race between the link thread and the
+# caller's first seam op — a window a few instructions wide, which only opens under true
+# parallelism (the product's own runtimes are current-thread, so the workspace tokio dep
+# deliberately omits this feature).
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 # Shared black-box test harness. The single Lua backend (PUC lua54) comes from
 # the shared `mlua` dep, so the harness's nxvim-server dependency resolves to the
 # same backend as the crate under test.

@@ -1125,8 +1125,9 @@ end
 -- as you type instead of on demand.
 --
 -- A call with more than one parameter is laid out **one parameter per line**, with a
--- `▸` marking the parameter the cursor is inside (the `LspSignatureActiveParameter`
--- highlight group):
+-- `▸` marking the parameter the cursor is inside — drawn in the *foreground* of the
+-- `LspSignatureActiveParameter` highlight group, since a theme that spells that group
+-- as a background band would otherwise paint a lone block into the popup:
 --
 -- ```
 -- def connect(

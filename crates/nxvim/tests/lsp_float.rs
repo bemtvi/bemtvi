@@ -114,6 +114,39 @@ fn overlay_markers(win: &[(Value, Value)]) -> Vec<(usize, u64, String)> {
     out
 }
 
+/// The resolved *style* of the first overlay `virt_text` chunk in `win` — the
+/// signature float's active-parameter caret — looked up in the frame's `styles`
+/// palette (the wire carries a palette index per chunk). `None` when there is no
+/// overlay chunk or its group resolved to nothing.
+fn overlay_marker_style(
+    redraw: &[(Value, Value)],
+    win: &[(Value, Value)],
+) -> Option<Vec<(Value, Value)>> {
+    let styles = map_get(redraw, "styles")?.as_array()?;
+    let rows = map_get(win, "virt_text")?.as_array()?;
+    let id = rows
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_array)
+        .filter(|p| p[0].as_u64() == Some(2))
+        .filter_map(|p| p[3].as_array()?.first()?.as_array()?[1].as_u64())
+        .next()?;
+    match styles.get(id as usize)? {
+        Value::Map(m) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+/// A color channel (`fg` / `bg`) of a wire style map as `0xRRGGBB`; `None` when the
+/// style leaves it unset — which for `bg` is exactly "the surface below shows".
+fn hl_color(style: &[(Value, Value)], key: &str) -> Option<u64> {
+    style
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_u64())
+}
+
 /// Paint a captured redraw through the **real client renderer** and return its
 /// rows as strings — the tier-2 check that a wire-level decoration actually lands
 /// on cells a user sees (mirrors `screen.rs`).
@@ -439,6 +472,59 @@ async fn signature_help_marks_the_active_parameter_line() {
     assert!(
         rows.iter().any(|r| r.contains("    b: i32,")),
         "the unmarked parameter keeps the bare indent, aligned with the marked one"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The marker takes its highlight group's **foreground only** — it is a caret drawn
+/// into the popup's indent, not a highlight *of* the parameter's text, so the float's
+/// own background has to run through it. `LspSignatureActiveParameter` is a group a
+/// theme is free to express as a pure background band (catppuccin defines nothing but
+/// `bg` + `bold`, because neovim paints it over the parameter text itself); painted
+/// over a lone `▸` in the indent that band reads as a coloured box adrift in the popup.
+#[tokio::test]
+async fn signature_marker_takes_the_group_foreground_not_its_background() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_marker_hl");
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "fn foo(a: i32, b: i32)",
+               "parameters": [ { "label": "a: i32" }, { "label": "b: i32" } ] } ],
+             "activeSignature": 0, "activeParameter": 0 } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+    // A theme's take on the group: an accent *background* band, plus a foreground so
+    // the assertion can tell "fg kept" from "nothing resolved".
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_hl(0, 'LspSignatureActiveParameter', \
+         { fg = '#89b4fa', bg = '#313244', bold = true })",
+    )
+    .await;
+
+    let (redraw, win) =
+        await_doc_float_redraw(&rpc, &mut incoming, "nx.lsp.signature_help()", "a: i32").await;
+    let style = overlay_marker_style(&redraw, &win).expect("the marker chunk resolved a style");
+    assert_eq!(
+        hl_color(&style, "fg"),
+        Some(0x89b4fa),
+        "the caret keeps the group's accent colour, got {style:?}"
+    );
+    assert_eq!(
+        hl_color(&style, "bg"),
+        None,
+        "the caret drops the group's background so the float's own shows through, \
+         got {style:?}"
+    );
+    assert_eq!(
+        style
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("bold"))
+            .and_then(|(_, v)| v.as_bool()),
+        Some(true),
+        "the group's attributes still apply, got {style:?}"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

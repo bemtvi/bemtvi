@@ -111,6 +111,78 @@ async fn await_float(
     panic!("the hover float window never contained {want:?}; last float lines: {last:?}");
 }
 
+/// [`await_float`] for a test that needs the *styling* as well as the text: retry
+/// `trigger` until a float window carries a line containing `want`, returning the whole
+/// redraw (for its `styles` palette) alongside the window.
+async fn await_float_redraw(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    trigger: &str,
+    want: &str,
+) -> (Vec<(Value, Value)>, Vec<(Value, Value)>) {
+    for _ in 0..200 {
+        exec_lua(rpc, trigger).await;
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| floating_window(m).is_some()) {
+            let win = floating_window(&map).expect("a floating window");
+            if window_lines(&win).iter().any(|l| l.contains(want)) {
+                return (map, win);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the float window never contained {want:?}");
+}
+
+/// One window row's highlight spans as `(start column, group)`, in wire order — the
+/// `highlights` key carries `[start, end, group, style_id]` per span.
+fn row_spans(win: &[(Value, Value)], row: usize) -> Vec<(u64, String)> {
+    let Some(rows) = map_get(win, "highlights").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(spans) = rows.get(row).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    spans
+        .iter()
+        .filter_map(Value::as_array)
+        .filter_map(|s| Some((s[0].as_u64()?, s[2].as_str()?.to_string())))
+        .collect()
+}
+
+/// The resolved style of the `line_fill` overlay chunk on window row `row` — the `─`
+/// run a section header's rule continues out to the float's edge with — looked up in
+/// the frame's `styles` palette.
+fn header_fill_style(
+    redraw: &[(Value, Value)],
+    win: &[(Value, Value)],
+    row: usize,
+) -> Option<Vec<(Value, Value)>> {
+    let styles = map_get(redraw, "styles")?.as_array()?;
+    let rows = map_get(win, "virt_text")?.as_array()?;
+    let id = rows
+        .get(row)?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_array)
+        .filter(|p| p[0].as_u64() == Some(2))
+        .filter_map(|p| p[3].as_array()?.first()?.as_array()?[1].as_u64())
+        .next()?;
+    match styles.get(id as usize)? {
+        Value::Map(m) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+/// A color channel (`fg` / `bg`) of a wire style map as `0xRRGGBB`, or `None` when the
+/// style leaves it unset.
+fn hl_color(style: &[(Value, Value)], key: &str) -> Option<u64> {
+    style
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_u64())
+}
+
 /// Poll `expr` (a Lua expression, `return`-ed) until it equals `want` or the window
 /// elapses; returns whether it matched. Used to wait on async attach side effects.
 async fn await_lua_eq(rpc: &Rpc, expr: &str, want: &str) -> bool {
@@ -1077,6 +1149,79 @@ async fn merged_signatures_with_parameters_take_a_client_heading() {
         ],
         "each split signature is headed by its client, got {shown:?}"
     );
+}
+
+/// The section header is drawn as *float chrome*: its `─` rule — the leading glyph and
+/// the fill that runs on to the float's edge — takes **`FloatBorder`**, the very group
+/// the box around it is painted in, so the header reads as border inset with a title
+/// rather than as a third colour inside the popup. The client's name then has to be an
+/// accent **distinct from that border** (`Special`) or it disappears into the rule it
+/// is inset in — under a theme like catppuccin, whose `FloatBorder` and headings are
+/// both blue, an unchanged heading group would leave `─ alpha ─────` one flat colour.
+#[tokio::test]
+async fn a_section_header_rules_in_the_float_border_colour_and_labels_in_an_accent() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp-sig-header-hl");
+    let sig = |name: &str| {
+        format!(
+            r#"{{ "signature_help": {{ "signatures": [
+                 {{ "label": "{name}(x: int, y: int)",
+                    "parameters": [ {{ "label": "x: int" }}, {{ "label": "y: int" }} ] }} ],
+                 "activeSignature": 0, "activeParameter": 0 }} }}"#
+        )
+    };
+    arm_mock_named(dir.as_path(), "alpha", &sig("alpha_sig"));
+    arm_mock_named(dir.as_path(), "beta", &sig("beta_sig"));
+    let (rpc, mut incoming) = open_rust(dir.as_path()).await;
+    // Two float-chrome colours a theme would define; the accent is a third, so the
+    // assertions can tell the rule, the label, and the popup body apart.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_hl(0, 'FloatBorder', { fg = '#89b4fa', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'NormalFloat', { fg = '#cdd6f4', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'Special',     { fg = '#f5c2e7' })\n\
+         nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
+         nx.lsp.enable({ 'alpha', 'beta' })",
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "#vim.lsp.get_clients({ bufnr = 0 })", "2").await,
+        "both servers attached"
+    );
+
+    let (redraw, win) =
+        await_float_redraw(&rpc, &mut incoming, "nx.lsp.signature_help()", "─ alpha").await;
+    let header = window_lines(&win)
+        .iter()
+        .position(|l| l.starts_with("─ alpha"))
+        .expect("the header row");
+
+    // The rule glyph leading the label, and the label itself.
+    let spans = row_spans(&win, header);
+    assert_eq!(
+        spans.first().map(|(start, group)| (*start, group.as_str())),
+        Some((0, "FloatBorder")),
+        "the header's leading rule takes the float's own border group, got {spans:?}"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|(start, group)| *start > 0 && group == "Special"),
+        "the client's name takes an accent distinct from the rule, got {spans:?}"
+    );
+
+    // ...and the `─` fill running from the label to the float's edge is the same
+    // border colour as the leading glyph — one rule, not two halves.
+    let fill = header_fill_style(&redraw, &win, header).expect("the header's fill chunk style");
+    assert_eq!(
+        hl_color(&fill, "fg"),
+        Some(0x89b4fa),
+        "the fill continues the rule in the border colour, got {fill:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD_ALPHA");
+    std::env::remove_var("NXVIM_LSP_CMD_BETA");
 }
 
 #[tokio::test]

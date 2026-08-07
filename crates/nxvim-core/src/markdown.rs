@@ -57,10 +57,17 @@ const RULE: &str = "@punctuation.special";
 /// a rule — the shape a float's border title has. Public because the signature-help
 /// float, whose content is *code* rather than markdown, heads each contributing
 /// server's block with the same thing and must spell it identically.
+///
+/// The rule takes **`FloatBorder`** — it *is* border drawn inside the float, so it
+/// reads as one piece of chrome with the box around it rather than as a third color
+/// (a thematic break inside a server's own markdown keeps [`RULE`], which is content).
+/// The label then has to be an accent *distinct from the border*, so the server's name
+/// stands out of the rule it is inset in: `Special`, the group nxvim already accents
+/// widget chrome with (the picker prompt, the completion match).
 pub const SECTION_FILL: char = '─';
 pub const SECTION_LEAD: &str = "─ ";
-pub const SECTION_RULE_GROUP: &str = RULE;
-pub const SECTION_LABEL_GROUP: &str = HEADING[0];
+pub const SECTION_RULE_GROUP: &str = "FloatBorder";
+pub const SECTION_LABEL_GROUP: &str = "Special";
 
 /// The line text of a section header: the label inset after [`SECTION_LEAD`], with a
 /// trailing space parting it from the fill that runs on to the right edge.

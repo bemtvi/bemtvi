@@ -186,6 +186,18 @@ pub struct VirtDecor {
     /// Hide the `virt_text` when the line is covered (e.g. by a visual block);
     /// stored for parity, honored by the renderer.
     pub virt_text_hide: bool,
+    /// Paint the `virt_text` with only the **foreground** of its highlight group —
+    /// the background (and `reverse`) are dropped, so the surface underneath shows
+    /// through. For an overlay glyph that is *chrome* rather than a highlight **of**
+    /// text: the signature float's active-parameter caret is drawn in
+    /// `LspSignatureActiveParameter`, a group a theme is free to express as a
+    /// background band (catppuccin defines nothing but `bg` + `bold`) because
+    /// neovim paints it over the parameter's own text. Over a lone `▸` sitting in a
+    /// popup's indent that same band renders as a coloured box in the middle of the
+    /// float, so the caret takes the group's color and leaves the float's own
+    /// background alone. `hl_mode` can't express this: it merges the chunk's *set*
+    /// attributes over the cell beneath, and `bg` is exactly what is set.
+    pub virt_text_fg_only: bool,
     pub hl_mode: HlMode,
     /// Each inner `Vec` is one virtual line's chunk run; the outer order is the
     /// top-to-bottom draw order.

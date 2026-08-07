@@ -30,6 +30,17 @@ const POS_OVERLAY: u64 = 2;
 const POS_RIGHT_ALIGN: u64 = 3;
 const POS_WIN_COL: u64 = 4;
 
+/// Everything but the chunks of one `virt_text` placement: where it draws
+/// (`pos`/`col`), how its highlight merges with what's under it (`hl_mode`), and
+/// whether its chunks take their group's foreground only
+/// ([`virt_text_fg_only`](nxvim_core::VirtDecor::virt_text_fg_only)).
+struct Placement {
+    pos: u64,
+    col: u64,
+    hl_mode: u64,
+    fg_only: bool,
+}
+
 /// One highlight interval over a single line, in **byte offsets within that
 /// line**. `priority`/`order` decide who wins where intervals overlap (higher
 /// `priority`, then higher `order`, paints on top). `capture` selects the style
@@ -292,9 +303,12 @@ impl EditHost {
                             }
                         };
                         Some(self.virt_placement_value(
-                            pos,
-                            col,
-                            hl_mode_code(decor.hl_mode),
+                            Placement {
+                                pos,
+                                col,
+                                hl_mode: hl_mode_code(decor.hl_mode),
+                                fg_only: decor.virt_text_fg_only,
+                            },
                             &decor.virt_text,
                             winhl,
                             styles,
@@ -393,18 +407,16 @@ impl EditHost {
     /// absent or unresolved — the client then paints in normal colors).
     fn virt_placement_value(
         &self,
-        pos: u64,
-        col: u64,
-        hl_mode: u64,
+        at: Placement,
         chunks: &[VirtChunk],
         winhl: &WinHl,
         styles: &mut StyleTable,
     ) -> Value {
         Value::Array(vec![
-            Value::from(pos),
-            Value::from(col),
-            Value::from(hl_mode),
-            self.virt_chunks_value(chunks, winhl, styles),
+            Value::from(at.pos),
+            Value::from(at.col),
+            Value::from(at.hl_mode),
+            self.virt_chunks_value_fg(chunks, at.fg_only, winhl, styles),
         ])
     }
 
@@ -418,12 +430,35 @@ impl EditHost {
         winhl: &WinHl,
         styles: &mut StyleTable,
     ) -> Value {
+        self.virt_chunks_value_fg(chunks, false, winhl, styles)
+    }
+
+    /// [`virt_chunks_value`](Self::virt_chunks_value) with the mark's
+    /// [`virt_text_fg_only`](nxvim_core::VirtDecor::virt_text_fg_only): when set, each
+    /// resolved style keeps its foreground (and its attributes) but drops `bg` /
+    /// `reverse`, so the chunk paints as a glyph on whatever surface is under it
+    /// instead of as a band of the group's own background. Resolved here rather than
+    /// in the client so every front end gets it from one place — the wire still
+    /// carries a plain interned style.
+    fn virt_chunks_value_fg(
+        &self,
+        chunks: &[VirtChunk],
+        fg_only: bool,
+        winhl: &WinHl,
+        styles: &mut StyleTable,
+    ) -> Value {
         let chunks: Vec<Value> = chunks
             .iter()
             .map(|c| {
                 let style_id = match c.hl_group.as_deref() {
                     Some(group) => match self.resolve_winhl(winhl, group) {
-                        Some(style) => Value::from(styles.intern(style) as u64),
+                        Some(mut style) => {
+                            if fg_only {
+                                style.bg = None;
+                                style.reverse = false;
+                            }
+                            Value::from(styles.intern(style) as u64)
+                        }
                         None => Value::Nil,
                     },
                     None => Value::Nil,
@@ -630,8 +665,17 @@ impl EditHost {
                 text: fill.text.repeat(text_width.saturating_sub(from).max(1)),
                 hl_group: fill.hl_group.clone(),
             };
-            let placement =
-                self.virt_placement_value(POS_OVERLAY, from as u64, 0, &[chunk], winhl, styles);
+            let placement = self.virt_placement_value(
+                Placement {
+                    pos: POS_OVERLAY,
+                    col: from as u64,
+                    hl_mode: 0,
+                    fg_only: false,
+                },
+                &[chunk],
+                winhl,
+                styles,
+            );
             if let Some(Value::Array(row)) = rows.get_mut(i) {
                 row.push(placement);
             }

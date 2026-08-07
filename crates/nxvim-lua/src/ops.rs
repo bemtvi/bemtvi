@@ -1312,6 +1312,10 @@ pub struct VirtDecorData {
     /// Fixed 0-based window column (neovim's `virt_text_win_col`); wins over `pos`.
     pub virt_text_win_col: Option<i64>,
     pub virt_text_hide: bool,
+    /// `nx`-native: paint the virtual text in its highlight group's **foreground**
+    /// only, letting the surface's own background through (neovim has no equivalent;
+    /// see [`nxvim_core::VirtDecor::virt_text_fg_only`]).
+    pub virt_text_fg_only: bool,
     /// `"replace"` | `"combine"` | `"blend"`; `None` ⇒ replace default.
     pub hl_mode: Option<String>,
     pub virt_lines: Vec<Vec<VirtChunkData>>,

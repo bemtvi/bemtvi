@@ -365,6 +365,10 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         virt_text_pos,
         virt_text_win_col: t.get::<Option<i64>>("virt_text_win_col")?,
         virt_text_hide: t.get::<Option<bool>>("virt_text_hide")?.unwrap_or(false),
+        // `nx`-native: paint the virtual text in its group's foreground only, leaving
+        // the surface's own background — for an overlay glyph that is chrome rather
+        // than a highlight of text (see `VirtDecor::virt_text_fg_only`).
+        virt_text_fg_only: t.get::<Option<bool>>("virt_text_fg_only")?.unwrap_or(false),
         hl_mode,
         virt_lines,
         virt_lines_above: t.get::<Option<bool>>("virt_lines_above")?.unwrap_or(false),

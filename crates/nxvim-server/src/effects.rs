@@ -157,6 +157,7 @@ fn virt_decor_to_core(d: VirtDecorData) -> nxvim_core::VirtDecor {
         virt_text: chunks(d.virt_text),
         virt_text_pos,
         virt_text_hide: d.virt_text_hide,
+        virt_text_fg_only: d.virt_text_fg_only,
         hl_mode,
         virt_lines: d.virt_lines.into_iter().map(chunks).collect(),
         virt_lines_above: d.virt_lines_above,

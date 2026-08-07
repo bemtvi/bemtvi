@@ -352,6 +352,10 @@ impl Editor {
                         hl_group: Some("LspSignatureActiveParameter".to_string()),
                     }],
                     virt_text_pos: VirtTextPos::Overlay,
+                    // The caret is chrome drawn into the popup's indent, not a
+                    // highlight of the parameter text: take the group's color, leave
+                    // the float's background alone (see `virt_text_fg_only`).
+                    virt_text_fg_only: true,
                     ..VirtDecor::default()
                 })),
             );

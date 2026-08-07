@@ -794,6 +794,11 @@ local EXTMARK_OPT_DECORATION = {
   virt_text_pos = true,
   virt_text_win_col = true,
   virt_text_hide = true,
+  -- `virt_text_fg_only` — nx-native: paint the virtual text in its highlight group's
+  -- FOREGROUND only, so the surface underneath keeps its own background. For an
+  -- overlay glyph that is chrome rather than a highlight of text (the signature
+  -- float's active-parameter caret); RENDERS end to end.
+  virt_text_fg_only = true,
   virt_text_repeat_linebreak = true,
   hl_mode = true,
   hl_eol = true,

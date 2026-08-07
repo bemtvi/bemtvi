@@ -963,6 +963,72 @@ nx.complete.setup { sources = { { 'k' } }, min_chars = 1 }";
     );
 }
 
+/// One outlier candidate must not stretch the popup across the whole window. The box
+/// is sized to its **widest** row, so a single 200-column label — a generated
+/// identifier, a word scanned out of a minified line — used to blow it out to every
+/// column the window had left, and the short rows were then read against a box built
+/// for the one row they aren't. `'pummaxwidth'` caps it; the outlier elides.
+#[tokio::test]
+async fn a_huge_candidate_does_not_stretch_the_popup_across_the_window() {
+    let dir = temp_dir("complete_pummaxwidth");
+    let init = "\
+nx.complete.source {\n\
+  name = 'k', debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then\n\
+    ctx.push { text = 'abshort', kind = 'Snippet' }\n\
+    ctx.push { text = 'ab' .. string.rep('x', 200), kind = 'Function' }\n\
+  end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'k' } }, min_chars = 1 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    let width = mu64(&menu_of(&map), "width");
+    let text_width = {
+        let win = focused_window(&map);
+        win_rect(&win, "width") - mu64(&win, "number_width")
+    };
+    assert!(
+        width <= 50,
+        "the popup is capped at the default 'pummaxwidth' (50), got {width}"
+    );
+
+    // ...and it is the *cap* doing it, not the window edge: with the cap off the box
+    // claims everything the window has left, which is the shape being fixed.
+    exec_lua(&rpc, "nx.o.pummaxwidth = 0").await;
+    let uncapped = mu64(
+        &menu_of(&poll_menu(&rpc, &mut incoming).await.unwrap()),
+        "width",
+    );
+    assert!(
+        uncapped > 50 && uncapped + 2 >= text_width,
+        "uncapped, the same popup spans the window ({uncapped} of {text_width})"
+    );
+}
+
+/// The cap is a *maximum*, not a width: a popup whose rows are all short keeps its
+/// snug box (and its aligned kind column) rather than being padded out to it.
+#[tokio::test]
+async fn short_candidates_are_not_padded_out_to_the_cap() {
+    let dir = temp_dir("complete_pummaxwidth_short");
+    let init = "\
+nx.complete.source {\n\
+  name = 'k', debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then\n\
+    ctx.push { text = 'ab', kind = 'Snippet' }\n\
+    ctx.push { text = 'abcdefgh', kind = 'X' }\n\
+  end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'k' } }, min_chars = 1 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    // Widest label (8) + gap + widest kind (`Snippet` = 7) — unchanged by the cap.
+    assert_eq!(map_get(&menu, "width").and_then(Value::as_u64), Some(16));
+}
+
 /// A `buffer`-source word carries the `Text` kind in the popup's kind column.
 #[tokio::test]
 async fn buffer_words_carry_the_text_kind() {

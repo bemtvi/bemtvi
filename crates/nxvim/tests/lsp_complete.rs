@@ -651,3 +651,105 @@ async fn a_completion_burst_does_not_accumulate_candidates() {
         "the burst must not stall the editor (took {elapsed:?})"
     );
 }
+
+/// A candidate **both** servers offer is one row in the popup — the two would be
+/// indistinguishable and accept to the same text — but what each server has to *say*
+/// about it is its own, and the docs float shows both, each under its labelled rule,
+/// in routing order.
+///
+/// Regression: the duplicate offer was dropped outright, so the docs shown came from
+/// whichever server happened to answer first — one server's explanation vanished, and
+/// which one it was varied run to run. This is the completion twin of the merged hover
+/// (`docs/plans/2026-07-25-multi-server-lsp-attach.md`).
+#[tokio::test]
+async fn a_candidate_two_servers_offer_shows_both_servers_docs_in_sections() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_shared_docs");
+    // Identical offers — same label, same inserted text — so they share a row. Only
+    // the documentation differs, which is exactly what must survive the merge.
+    arm_completion_mock(
+        dir.as_path(),
+        "alpha",
+        r#"{ "completion": [ { "label": "compute", "insertText": "compute",
+             "documentation": "ALPHA-EXPLAINS" } ] }"#,
+    );
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "completion": [ { "label": "compute", "insertText": "compute",
+             "documentation": "BETA-EXPLAINS" } ] }"#,
+    );
+    let (rpc, mut incoming) = start_two_servers(dir.as_path(), "", "icom").await;
+
+    await_items(&rpc, &mut incoming, "compute").await;
+    let docs = await_docs(&rpc, &mut incoming, "BETA-EXPLAINS").await;
+    let rows = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .unwrap_or_default();
+
+    disarm_completion_mocks();
+    assert!(
+        docs.iter().any(|l| l.contains("ALPHA-EXPLAINS"))
+            && docs.iter().any(|l| l.contains("BETA-EXPLAINS")),
+        "both servers' docs reach the float, not just the quickest one's: {docs:?}"
+    );
+    // Each under its own labelled rule — `─ alpha ────`, the merged hover's section
+    // header — so the reader knows which server made which claim...
+    let at = |label: &str| {
+        docs.iter()
+            .position(|l| l.trim() == format!("─ {label}"))
+            .unwrap_or_else(|| panic!("no `{label}` section header in {docs:?}"))
+    };
+    // ...and in routing order (`alpha` sorts first), NOT reply order.
+    assert!(
+        at("alpha") < at("beta"),
+        "sections follow the servers' routing order: {docs:?}"
+    );
+    // The popup still shows the shared candidate ONCE — two identical rows would be
+    // noise, which is why the offers merge rather than doubling up.
+    assert_eq!(
+        rows.iter().filter(|r| *r == "compute").count(),
+        1,
+        "the shared candidate is one row, got {rows:?}"
+    );
+}
+
+/// A shared row's docs are **lazy** per contributor: each server holds its own behind
+/// its own `completionItem/resolve`, and each resolve must go back to the server that
+/// issued that section's item. Both sections fill in, one round-trip at a time.
+///
+/// The one-at-a-time walk is forced by the request layer — `lsp_requests` keeps a
+/// single slot per request kind, so two concurrent resolves would supersede each other
+/// and one section would settle empty forever.
+#[tokio::test]
+async fn each_contributors_docs_resolve_against_its_own_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_shared_resolve");
+    // Neither server sends inline documentation — both withhold it until resolved.
+    arm_completion_mock(
+        dir.as_path(),
+        "alpha",
+        r#"{ "completion": [ { "label": "compute", "insertText": "compute" } ],
+             "completion_resolve": { "label": "compute",
+               "documentation": "ALPHA-RESOLVED" } }"#,
+    );
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "completion": [ { "label": "compute", "insertText": "compute" } ],
+             "completion_resolve": { "label": "compute",
+               "documentation": "BETA-RESOLVED" } }"#,
+    );
+    let (rpc, mut incoming) = start_two_servers(dir.as_path(), "", "icom").await;
+
+    await_items(&rpc, &mut incoming, "compute").await;
+    // The second section only exists once the *first* resolve has landed and the walk
+    // moved on, so waiting for beta's implies alpha's arrived too.
+    let docs = await_docs(&rpc, &mut incoming, "BETA-RESOLVED").await;
+
+    disarm_completion_mocks();
+    assert!(
+        docs.iter().any(|l| l.contains("ALPHA-RESOLVED")),
+        "the first contributor's resolve landed in its own section: {docs:?}"
+    );
+}

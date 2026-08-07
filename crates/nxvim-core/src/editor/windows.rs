@@ -1650,12 +1650,16 @@ impl Editor {
         }
         // `mousetime` is an unbounded non-negative millisecond count — it doesn't
         // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
-        // so handle it before the bounded block.
+        // so handle it before the bounded block. `pummaxwidth` joins them: a column
+        // count with no upper bound to check (`menu_geom` clamps it to the room the
+        // window actually has) and nothing on screen to re-lay out — the popup box is
+        // recomputed from scratch every frame.
         if name == "mousetime"
             || name == "timeoutlen"
             || name == "scrollanimduration"
             || name == "scrollback"
             || name == "history"
+            || name == "pummaxwidth"
         {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));

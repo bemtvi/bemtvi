@@ -1039,12 +1039,14 @@ pub struct EditHost {
     /// item's `textEdit` / `additionalTextEdits`. `None` when no LSP completion is in
     /// view. Phase 4-C.
     lsp_complete: Option<LspComplete>,
-    /// The `lsp_complete.items` index of the completion row a `completionItem/resolve`
-    /// is currently in flight for (the docs sidebar's lazy-docs fetch, Phase 4-D), so a
-    /// reply updates the right item and the trigger doesn't re-issue while it is
-    /// pending. `None` when no resolve is outstanding. Reset whenever a fresh completion
-    /// list lands ([`EditHost::on_completion_reply`]). Phase 4-D.
-    lsp_complete_resolve_key: Option<usize>,
+    /// The completion **row** a `completionItem/resolve` is currently in flight for (the
+    /// docs float's lazy-docs fetch, Phase 4-D), as `(lsp_complete.rows index, offer
+    /// index within that row)` — so a reply updates the right contributor's item and the
+    /// trigger doesn't re-issue while it is pending. A row several servers offered
+    /// resolves one contributor at a time, walking the offers in rank order. `None` when
+    /// no resolve is outstanding. Reset whenever a fresh completion round opens
+    /// ([`EditHost::request_lsp_completion`]). Phase 4-D.
+    lsp_complete_resolve_key: Option<(usize, usize)>,
     /// Resolved lazy docs for **plugin** completion rows (`nx.complete.source`'s
     /// `resolve` callback), keyed by the row's resolve handle. An entry (even `""` ⇒
     /// resolved-but-docless) means the docs are in hand and the sidebar renders them

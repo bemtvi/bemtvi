@@ -12,6 +12,9 @@
 //! `lsp` row's `detail` + `documentation`, lazily fetched via `completionItem/resolve`
 //! (`complete_lsp_maybe_resolve` / `on_completion_resolve_reply`), built into markdown by
 //! `EditHost::lsp_complete_docs_md` and rendered by `Editor::open_completion_docs_float`.
+//! A candidate several servers all offer is **one** row carrying an [`Offer`] each, so
+//! the float can show every server's docs under its own labelled rule
+//! (`EditHost::lsp_complete_docs_sections`) instead of the first-to-answer's alone.
 
 use nxvim_core::{BufferId, Mode};
 use nxvim_lsp::CompletionItemData;
@@ -20,14 +23,15 @@ use super::*;
 use crate::EditHost;
 
 /// Whether two candidates are the **same offer**: same label, same kind, and the same
-/// text an accept would insert. Used to drop the duplicate when two servers on one
-/// buffer both offer a symbol — the rows would be indistinguishable in the popup and
-/// accept identically, so the second is noise rather than a second choice.
+/// text an accept would insert. This is what folds two servers' takes on one symbol
+/// into a single [`CompletionRow`] — the rows would be indistinguishable in the popup
+/// and accept identically, so a second row would be noise rather than a second choice
+/// (their *docs* are kept apart, one section each).
 ///
 /// Compared on the *effective* insert text (the `textEdit`'s replacement, else
 /// `insertText`, else the label) so an item that merely spells its insertion
-/// differently — a different range, a snippet body — is kept: accepting it does
-/// something different.
+/// differently — a different range, a snippet body — gets its own row: accepting it
+/// does something different.
 fn same_offer(a: &CompletionItemData, b: &CompletionItemData) -> bool {
     fn inserted(item: &CompletionItemData) -> &str {
         item.text_edit
@@ -42,26 +46,65 @@ fn same_offer(a: &CompletionItemData, b: &CompletionItemData) -> bool {
         && inserted(a) == inserted(b)
 }
 
+/// `server`'s place in the buffer's routing order — its index in `rank`, or the tail
+/// for a server no longer attached (one that detached mid-round, whose share is still
+/// in flight). The tail rather than the head: an unranked contributor is the one we
+/// know least about, so it must not silently outrank the servers we do.
+fn rank_position(rank: &[ServerKey], server: &ServerKey) -> usize {
+    rank.iter().position(|k| k == server).unwrap_or(rank.len())
+}
+
+/// One server's **offer** of a candidate: the item it sent, and which server sent it.
+///
+/// The server is load-bearing three times over: the accept converts that item's
+/// `textEdit` ranges at **its** server's negotiated encoding, its lazy
+/// `completionItem/resolve` must go back to the same server (the `data` blob it
+/// round-trips is only meaningful there), and the docs float labels the offer's
+/// section with its name.
+pub(crate) struct Offer {
+    pub server: ServerKey,
+    pub item: CompletionItemData,
+}
+
+/// One **row** of the merged popup: every server that made the same offer
+/// ([`same_offer`]), ordered by the buffer's server rank (`priority`, then key —
+/// the order every other multi-server surface merges in).
+///
+/// Two servers on one buffer routinely name the same symbol, and their rows would be
+/// indistinguishable in the popup and accept to the same text — so they share a row
+/// rather than doubling it. What they do *not* share is what they have to say about
+/// it: a type-checker's signature and a linter's note are different claims, and the
+/// docs float shows each under its own labelled rule, the way a merged hover does.
+/// Before this, the duplicate was dropped outright and the surviving row's docs came
+/// from whichever server answered first — i.e. at random.
+pub(crate) struct CompletionRow {
+    pub offers: Vec<Offer>,
+}
+
+impl CompletionRow {
+    /// The **primary** offer — the best-ranked contributor's. Its item is what the
+    /// popup displays and what an accept applies (every offer in the row inserts the
+    /// same text by construction, but they may differ in `textEdit` range or in the
+    /// `additionalTextEdits` they carry, and one server has to be the one that wins).
+    pub fn primary(&self) -> &Offer {
+        &self.offers[0]
+    }
+}
+
 /// One completion **round**'s merged candidates: every capable server is asked at
 /// once and their items accumulate here as the replies land, kept so a delegated
 /// accept can apply the chosen item's edit and so an `isIncomplete = false` list can
 /// be re-served on a prefix edit without another round-trip. Indexed by the
-/// `MenuItem.key` the engine carries (the position in `items`).
+/// `MenuItem.key` the engine carries (the position in `rows`).
 ///
 /// The round is opened — and this cache reset — when the requests go out, so a reply
-/// only ever *appends*. That is what keeps `key` stable while a round is still
-/// filling: a lazy `completionItem/resolve` issued against row 3 of the first
-/// server's share still addresses row 3 after the second server's share arrives.
+/// only ever *appends* rows (a duplicate offer joins an existing one in place). That
+/// is what keeps `key` stable while a round is still filling: a lazy
+/// `completionItem/resolve` issued against row 3 of the first server's share still
+/// addresses row 3 after the second server's share arrives.
 pub(crate) struct LspComplete {
-    /// The servers' items, verbatim; `items[key]` is the row the engine accepted.
-    pub items: Vec<CompletionItemData>,
-    /// The server that produced each entry, parallel to [`items`](Self::items).
-    ///
-    /// Load-bearing twice over: the accept converts that item's `textEdit` ranges at
-    /// **its** server's negotiated encoding, and its lazy `completionItem/resolve`
-    /// must go back to the same server — the `data` blob it round-trips is only
-    /// meaningful there.
-    pub origins: Vec<ServerKey>,
+    /// The merged rows; `rows[key]` is the row the engine displayed and accepted.
+    pub rows: Vec<CompletionRow>,
     /// The buffer + (row, word-start byte col) the round was requested at. Reused
     /// while the cursor stays in this word; invalidated when it moves on.
     pub buffer: BufferId,
@@ -150,8 +193,7 @@ impl EditHost {
         // request was actually computed. A round that resets on ISSUE rather than on
         // first reply is what makes every later reply a plain append.
         self.lsp_complete = Some(LspComplete {
-            items: Vec::new(),
-            origins: Vec::new(),
+            rows: Vec::new(),
             buffer,
             anchor: (row, word_start),
             is_incomplete: false,
@@ -183,10 +225,12 @@ impl EditHost {
     /// request, or the round was already superseded (no cache).
     ///
     /// A candidate another server already offered **identically** (same label, kind and
-    /// inserted text) is skipped: the two rows would be indistinguishable in the popup
-    /// and accept to the same text, so the duplicate is noise. Anything that differs —
-    /// a different `textEdit`, kind, or insert text — is kept, because accepting it
-    /// does something different.
+    /// inserted text) does not get a second row — the two would be indistinguishable in
+    /// the popup and accept to the same text. It **joins** that row instead, as a
+    /// further [`Offer`], so both servers' docs reach the docs float under their own
+    /// labelled section and the row's identity is the best-ranked contributor's rather
+    /// than the quickest one's. Anything that differs — a different `textEdit`, kind, or
+    /// insert text — still gets its own row, because accepting it does something else.
     pub(crate) fn on_completion_reply(
         &mut self,
         buffer: BufferId,
@@ -200,29 +244,92 @@ impl EditHost {
         if buffer != self.editor.current_buffer_id() {
             return;
         }
+        // Where this server sits in the buffer's routing order, and the priority a row
+        // it produced carries — both resolved before the cache is borrowed mutably.
+        let rank = self.lsp_server_rank(buffer);
+        let rank_of = |k: &ServerKey| rank_position(&rank, k);
+        let priority = self.lsp_row_priority(&rank, &server);
+        let gen = self.editor.menu_generation();
         let Some(cache) = self.lsp_complete.as_mut() else {
             return; // the round was superseded before this share landed
         };
         if cache.buffer != buffer {
             return;
         }
-        let start = cache.items.len();
+        let start = cache.rows.len();
+        // Rows whose primary contributor changed to this (better-ranked) server, so
+        // their already-pushed menu priority can be raised once the borrow ends.
+        let mut promoted: Vec<usize> = Vec::new();
         for item in items {
-            if cache.items.iter().any(|had| same_offer(had, &item)) {
-                continue;
+            let offer = Offer {
+                server: server.clone(),
+                item,
+            };
+            match cache
+                .rows
+                .iter_mut()
+                .position(|r| same_offer(&r.primary().item, &offer.item))
+            {
+                Some(key) => {
+                    let offers = &mut cache.rows[key].offers;
+                    // One section per SERVER: a server that lists the same offer twice
+                    // (two `sortText`s over one symbol) contributes once — a second
+                    // section under the same name says nothing the first didn't.
+                    if offers.iter().any(|o| o.server == offer.server) {
+                        continue;
+                    }
+                    // Insert in rank order, so the row's primary — the item an accept
+                    // applies and the first section the float shows — is the best-ranked
+                    // server's however the replies happened to interleave.
+                    let at = offers.partition_point(|o| rank_of(&o.server) <= rank_of(&server));
+                    offers.insert(at, offer);
+                    if at == 0 {
+                        promoted.push(key);
+                    }
+                }
+                None => cache.rows.push(CompletionRow {
+                    offers: vec![offer],
+                }),
             }
-            cache.items.push(item);
-            cache.origins.push(server.clone());
         }
         cache.is_incomplete |= is_incomplete;
         // Push into the live menu generation — the engine bumped it on the keystroke
         // that fired the request, and a `Complete` menu is open (core seeded it, or
         // will re-seed on the next key). A `0` generation means no menu is open.
-        let gen = self.editor.menu_generation();
         if gen != 0 {
+            // A row this reply took over as primary already sits in the menu at the
+            // previous primary's (worse) rank — raise it to where its new best
+            // contributor belongs, so the order states the routing priority rather than
+            // recording which server was quicker.
+            for key in promoted {
+                self.editor.menu_reprioritize(gen, key, priority);
+            }
             self.complete_lsp_push_from(gen, start);
         }
         self.lsp_dirty = true;
+    }
+
+    /// The buffer's servers in **routing order** (`priority`, then key) — the rank
+    /// every multi-server surface merges by, and the order a merged row's offers and
+    /// docs sections are held in. Empty when the buffer has no attached servers.
+    fn lsp_server_rank(&self, buffer: BufferId) -> Vec<ServerKey> {
+        self.lsp_states
+            .get(&buffer)
+            .map(|s| s.servers().map(|(k, _)| k.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The menu priority a row whose primary contributor is `server` carries: the `lsp`
+    /// source's merge bias stepped down one point per place in `rank`, so **equally-good**
+    /// matches from two servers order by the stated routing priority instead of by which
+    /// reply landed first (the engine's blended sort is stable, so streamed order would
+    /// otherwise decide ties). One point per server keeps every LSP row far above the
+    /// buffer-word tier — the `lsp` bias is 8 against 0.
+    ///
+    /// Shared by the initial push and the promotion a merged row takes when a
+    /// better-ranked server joins it, so the two can't disagree about where a row goes.
+    fn lsp_row_priority(&self, rank: &[ServerKey], server: &ServerKey) -> i32 {
+        self.complete_lsp_priority - rank_position(rank, server) as i32
     }
 
     /// Build `MenuItem`s from the whole merged cache and append them to the open
@@ -242,33 +349,21 @@ impl EditHost {
     /// and merges them with the buffer rows by priority; a stale `gen` is dropped by
     /// [`Editor::menu_push`].
     ///
-    /// The priority is stepped down by the producing server's position in key order,
-    /// so **equally-good** matches from two servers rank in a stable order instead of
-    /// in whichever order the replies happened to arrive (the engine's blended sort is
-    /// stable, so streamed order decides ties). One point per server keeps every LSP
-    /// row far above the buffer-word tier — the `lsp` bias is 8 against 0.
+    /// Each row ranks by its **primary** contributor
+    /// ([`lsp_row_priority`](Self::lsp_row_priority)).
     fn complete_lsp_push_from(&mut self, gen: u64, start: usize) {
         let Some(cache) = self.lsp_complete.as_ref() else {
             return;
         };
-        let base_priority = self.complete_lsp_priority;
-        let rank: Vec<ServerKey> = self
-            .lsp_states
-            .get(&cache.buffer)
-            .map(|s| s.servers().map(|(k, _)| k.clone()).collect())
-            .unwrap_or_default();
+        let rank = self.lsp_server_rank(cache.buffer);
         let items: Vec<nxvim_core::MenuItem> = cache
-            .items
+            .rows
             .iter()
             .enumerate()
             .skip(start)
-            .map(|(key, item)| {
-                let step = cache
-                    .origins
-                    .get(key)
-                    .and_then(|o| rank.iter().position(|k| k == o))
-                    .unwrap_or(0) as i32;
-                let priority = base_priority - step;
+            .map(|(key, row)| {
+                let item = &row.primary().item;
+                let priority = self.lsp_row_priority(&rank, &row.primary().server);
                 // Display the label; insert the label as a no-op fallback (the real
                 // edit is applied server-side on accept via `source_accept`).
                 let label = item.label.clone();
@@ -300,11 +395,15 @@ impl EditHost {
         // the replaced range to; taken up front so an early return can't leak it into
         // the next accept. `None` ⇒ an `Insert` accept, or the caret was at the word end.
         let extend_to = self.editor.complete_accept_extend_to.take();
-        let Some(item) = self
+        // The row's **primary** offer — the best-ranked server that made it. Several
+        // servers may have offered the same completion; they insert the same text by
+        // construction, but the range they replace and the imports they bring along are
+        // their own, so one has to win, and it is the one the routing order names.
+        let Some((item, origin)) = self
             .lsp_complete
             .as_ref()
-            .and_then(|c| c.items.get(key))
-            .cloned()
+            .and_then(|c| c.rows.get(key))
+            .map(|r| (r.primary().item.clone(), r.primary().server.clone()))
         else {
             return;
         };
@@ -312,12 +411,7 @@ impl EditHost {
         // authored in its own server's coordinates, and a two-server buffer can hold
         // a utf-8 and a utf-16 one at once — reading one as the other shifts every
         // column after the line's first multi-byte glyph.
-        let origin = self
-            .lsp_complete
-            .as_ref()
-            .and_then(|c| c.origins.get(key))
-            .cloned();
-        let encoding = self.reply_encoding(origin.as_ref());
+        let encoding = self.reply_encoding(Some(&origin));
         // Anchor the word fallback at the current word start (the engine kept the
         // cursor in the word; recompute rather than thread core's anchor through).
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
@@ -420,13 +514,22 @@ impl EditHost {
         self.lsp_dirty = true;
     }
 
-    /// The docs sidebar's lazy-docs fetch (Phase 4-D): when the **highlighted** row is
-    /// an `lsp` row whose cached item carries no inline `documentation` yet but has
+    /// The docs float's lazy-docs fetch (Phase 4-D): when the **highlighted** row is an
+    /// `lsp` row one of whose contributors carries no inline `documentation` yet but has
     /// `resolve_data`, issue a `completionItem/resolve` to pull its docs. Called once
     /// per key from [`EditHost::run_pending`] (the selection is final by then). A no-op
-    /// for a native `buffer` row, an already-resolved item, a row the server gave no
-    /// `data` to resolve against, or while a resolve is already in flight for this row.
-    /// The reply ([`EditHost::on_completion_resolve_reply`]) fills the item and repaints.
+    /// for a native `buffer` row, a fully-resolved row, contributors the server gave no
+    /// `data` to resolve against, or while a resolve for this row is already in flight.
+    /// The reply ([`EditHost::on_completion_resolve_reply`]) fills that contributor's
+    /// item and repaints.
+    ///
+    /// **One at a time, in rank order.** A merged row has a contributor per server and
+    /// each holds its docs behind its own resolve, but `lsp_requests` keeps a single
+    /// slot per request kind — a second concurrent resolve would supersede the first and
+    /// settle it empty. So the earliest unresolved contributor goes out now and the
+    /// reply re-settles, which brings us straight back here for the next one: the float
+    /// fills section by section rather than all at once, and never loses a section to a
+    /// race.
     pub(crate) fn complete_lsp_maybe_resolve(&mut self) {
         if !self.complete_lsp_active {
             return;
@@ -436,35 +539,32 @@ impl EditHost {
         let Some((key, true)) = self.editor.complete_selected() else {
             return;
         };
-        // A resolve for this exact row is already pending — let it land.
-        if self.lsp_complete_resolve_key == Some(key) {
+        // A resolve for this row is already pending — let it land (it will bring us
+        // back for the next unresolved contributor). A pending resolve for a *different*
+        // row is stale: the selection moved on, so supersede it.
+        if matches!(self.lsp_complete_resolve_key, Some((k, _)) if k == key) {
             return;
         }
-        let Some(item) = self.lsp_complete.as_ref().and_then(|c| c.items.get(key)) else {
-            return;
-        };
-        // Inline docs already present, or a prior resolve filled them (it stamps
-        // `Some("")` even when docless) — nothing to fetch.
-        if item.documentation.is_some() {
-            return;
-        }
-        let Some(resolve_data) = item.resolve_data.clone() else {
-            return; // the server gave no `data` to resolve against — stays docless
-        };
-        // Back to the server that OFFERED this row, not the buffer's first: the
-        // `data` blob being round-tripped is that server's own handle on the item.
-        // Resolving ruff's candidate against pyright is a wrong request, not a
-        // degraded one — and with a merged popup the two are routinely different.
-        let Some(server_key) = self
-            .lsp_complete
-            .as_ref()
-            .and_then(|c| c.origins.get(key))
-            .cloned()
-        else {
+        // The first contributor still missing its docs. `documentation` is stamped
+        // `Some("")` by a docless reply, so a resolved-but-empty section is never
+        // re-requested and the walk always terminates.
+        let Some((idx, resolve_data, server_key)) = self.lsp_complete.as_ref().and_then(|c| {
+            let row = c.rows.get(key)?;
+            row.offers.iter().enumerate().find_map(|(idx, o)| {
+                if o.item.documentation.is_some() {
+                    return None;
+                }
+                // Back to the server that OFFERED this section, not the buffer's
+                // first: the `data` blob being round-tripped is that server's own
+                // handle on the item. Resolving ruff's candidate against pyright is
+                // a wrong request, not a degraded one.
+                Some((idx, o.item.resolve_data.clone()?, o.server.clone()))
+            })
+        }) else {
             return;
         };
         let token = self.register_lsp_request_to(LspReqKind::CompletionResolve, 0, &server_key);
-        self.lsp_complete_resolve_key = Some(key);
+        self.lsp_complete_resolve_key = Some((key, idx));
         self.fx.lsp_request(
             server_key,
             token,
@@ -540,28 +640,31 @@ impl EditHost {
     }
 
     /// Apply a `completionItem/resolve` reply (Phase 4-D): fill the resolved
-    /// `documentation` / `detail` into the cached item the docs sidebar reads, keyed by
-    /// the row the resolve was issued for ([`EditHost::lsp_complete_resolve_key`]).
-    /// `documentation` is stamped `Some` even when the server returned nothing (an
-    /// empty string ⇒ resolved-but-docless), so the row is never re-requested. A reply
-    /// whose list was replaced meanwhile finds a `None` key and is ignored. `lsp_dirty`
-    /// repaints the sidebar with the freshly resolved docs.
+    /// `documentation` / `detail` into the cached item the docs float reads, keyed by
+    /// the **(row, contributor)** the resolve was issued for
+    /// ([`EditHost::lsp_complete_resolve_key`]) — a merged row resolves one section per
+    /// server, so the reply has to land in the section that asked for it rather than in
+    /// the row's first. `documentation` is stamped `Some` even when the server returned
+    /// nothing (an empty string ⇒ resolved-but-docless), so it is never re-requested. A
+    /// reply whose list was replaced meanwhile finds a `None` key and is ignored.
+    /// `lsp_dirty` repaints the float with the freshly resolved docs.
     pub(crate) fn on_completion_resolve_reply(
         &mut self,
         documentation: Option<String>,
         detail: Option<String>,
     ) {
-        let Some(key) = self.lsp_complete_resolve_key.take() else {
+        let Some((key, idx)) = self.lsp_complete_resolve_key.take() else {
             return;
         };
-        if let Some(item) = self
+        if let Some(offer) = self
             .lsp_complete
             .as_mut()
-            .and_then(|c| c.items.get_mut(key))
+            .and_then(|c| c.rows.get_mut(key))
+            .and_then(|r| r.offers.get_mut(idx))
         {
-            item.documentation = Some(documentation.unwrap_or_default());
+            offer.item.documentation = Some(documentation.unwrap_or_default());
             if detail.is_some() {
-                item.detail = detail;
+                offer.item.detail = detail;
             }
         }
         self.lsp_dirty = true;
@@ -569,6 +672,42 @@ impl EditHost {
 }
 
 impl EditHost {
+    /// The **labelled sections** the completion docs float renders for the `lsp` row
+    /// `key`: one per server that offered it, in routing order, each holding that
+    /// server's own `detail` + `documentation`
+    /// ([`lsp_complete_docs_md`](Self::lsp_complete_docs_md)).
+    ///
+    /// This is the completion twin of the merged hover: with two servers on a buffer,
+    /// the same symbol is routinely offered by both, and what they say about it differs
+    /// — a type-checker's signature and a linter's note are different claims, so the
+    /// reader has to see which one made which. A **lone** contributor (the one-server
+    /// buffer, and any row only one server offered) takes an empty label and renders
+    /// bare, so the ordinary float is unchanged; the label is dropped, too, when only
+    /// one of several contributors actually has docs — a rule naming the only section
+    /// present separates nothing.
+    ///
+    /// Empty when no contributor has docs yet, which closes the float rather than
+    /// showing an empty box.
+    pub(crate) fn lsp_complete_docs_sections(&self, key: usize) -> Vec<(String, String)> {
+        let Some(row) = self.lsp_complete.as_ref().and_then(|c| c.rows.get(key)) else {
+            return Vec::new();
+        };
+        let mut sections: Vec<(String, String)> = row
+            .offers
+            .iter()
+            .filter_map(|o| {
+                self.lsp_complete_docs_md(&o.item)
+                    .map(|md| (o.server.name.clone(), md))
+            })
+            .collect();
+        if sections.len() < 2 {
+            for s in &mut sections {
+                s.0 = String::new();
+            }
+        }
+        sections
+    }
+
     /// Build the **markdown** the completion docs float renders for an `lsp` row
     /// (Phase 4-D, now the doc-float-window model): the item's `detail` — a one-line
     /// code signature — as a fenced code block in the *current buffer's* language, then

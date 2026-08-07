@@ -2334,6 +2334,7 @@ impl EditHost {
             incsearch: go.incsearch,
             showtabline: go.showtabline,
             laststatus: go.laststatus,
+            pummaxwidth: go.pummaxwidth as u64,
             statusline: go.statusline.clone(),
             tabline: go.tabline.clone(),
             guifont: go.guifont.clone(),
@@ -3579,40 +3580,50 @@ impl EditHost {
             self.editor.close_completion_docs_float();
             return;
         }
-        let Some(md) = self.selected_complete_docs_md() else {
+        let sections = self.selected_complete_docs_sections();
+        if sections.is_empty() {
             self.editor.close_completion_docs_float();
             return;
-        };
+        }
         let wrap = self.editor.complete_docs_wrap();
-        self.editor.open_completion_docs_float(&md, wrap);
+        self.editor.open_completion_docs_float(&sections, wrap);
     }
 
-    /// The markdown the [`sync_complete_docs_float`](Self::sync_complete_docs_float)
+    /// The labelled markdown sections [`sync_complete_docs_float`](Self::sync_complete_docs_float)
     /// renders for the actively-selected completion row, from whichever of the three
     /// docs sources fits it: a plugin async row's **inline** `doc`; else a plugin row's
     /// **resolve** handle whose docs the server fetched lazily into
-    /// `complete_resolve_docs`; else an `lsp` row whose `detail` + `documentation` live
-    /// in the server's LSP item cache. `None` for a noselect popup, a `buffer` row, or a
-    /// row whose lazy docs haven't landed yet.
-    fn selected_complete_docs_md(&self) -> Option<String> {
+    /// `complete_resolve_docs`; else an `lsp` row whose contributors' `detail` +
+    /// `documentation` live in the server's LSP item cache. Empty for a noselect popup,
+    /// a `buffer` row, or a row whose lazy docs haven't landed yet.
+    ///
+    /// Only the `lsp` source has more than one thing to say about a row (a symbol two
+    /// servers both offer); the plugin sources produce a single, unlabelled section,
+    /// which renders exactly as it did before sections existed.
+    fn selected_complete_docs_sections(&self) -> Vec<(String, String)> {
+        let bare = |doc: String| vec![(String::new(), doc)];
         // Inline docs (a plugin source's `push { doc = … }`).
         if let Some(doc) = self.editor.complete_selected_doc() {
-            return Some(doc);
+            return bare(doc);
         }
         // A plugin `resolve` handle → the server-fetched docs cache. On the wasm edit-host
         // the plugin resolve path (`complete_plugin_maybe_resolve`) never runs, so the
-        // cache is always empty there and this simply yields `None`.
+        // cache is always empty there and this simply yields nothing.
         if let Some(id) = self.editor.complete_selected_resolve() {
-            return self.complete_resolve_docs.get(&id).cloned();
+            return self
+                .complete_resolve_docs
+                .get(&id)
+                .cloned()
+                .map(bare)
+                .unwrap_or_default();
         }
-        // An `lsp` row → the server's LSP item cache (`detail` + `documentation`). LSP
-        // completion runs on both builds (native locally, wasm over the daemon), so this
-        // is not native-gated — the web python demo shows completion docs too.
+        // An `lsp` row → the server's LSP item cache, one section per server that
+        // offered it. LSP completion runs on both builds (native locally, wasm over the
+        // daemon), so this is not native-gated — the web python demo shows docs too.
         if let Some((key, true)) = self.editor.complete_selected() {
-            let item = self.lsp_complete.as_ref()?.items.get(key)?;
-            return self.lsp_complete_docs_md(item);
+            return self.lsp_complete_docs_sections(key);
         }
-        None
+        Vec::new()
     }
 
     /// Refresh the **cmdline wildmenu docs** float beside the wildmenu box — the

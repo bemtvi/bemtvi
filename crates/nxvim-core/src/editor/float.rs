@@ -76,14 +76,16 @@ pub(crate) fn plain_float_lines(lines: Vec<String>) -> Vec<Vec<VirtChunk>> {
         .collect()
 }
 
-/// The identity of an open completion docs float — its markdown, the popup box it was
-/// placed beside (`WindowId` + the box's `menu_geom` col/row/width), and `wrap`. When
-/// these are all unchanged [`Editor::open_completion_docs_float`] leaves the float
-/// (and its scroll offset) alone rather than closing + re-opening it; a keystroke that
-/// moves the popup or changes the selected row shifts the signature and re-places it.
+/// The identity of an open completion docs float — its markdown sections, the popup
+/// box it was placed beside (`WindowId` + the box's `menu_geom` col/row/width), and
+/// `wrap`. When these are all unchanged [`Editor::open_completion_docs_float`] leaves
+/// the float (and its scroll offset) alone rather than closing + re-opening it; a
+/// keystroke that moves the popup or changes the selected row shifts the signature and
+/// re-places it — as does a lazily-resolved section landing, which is a *content*
+/// change the float must take up.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CompletionDocsSig {
-    markdown: String,
+    sections: Vec<(String, String)>,
     win: WindowId,
     box_col: usize,
     box_row: usize,
@@ -401,21 +403,16 @@ impl Editor {
         self.place_doc_float(name, buf, &lines);
     }
 
-    /// Render `markdown` (via [`crate::markdown`]) into the doc-float scratch buffer
-    /// `buf`: load the stripped display lines, leave the buffer untyped, and repaint
-    /// its [`DOC_MD_NS`] styling from scratch — inline `@markup.*` spans, thematic-break
-    /// [`line_fill`](VirtDecor::line_fill)s, and fenced code blocks syntax-highlighted
-    /// in their own language (fail-soft when the grammar is absent). Returns the
-    /// stripped lines (for sizing); empty when the markup renders to nothing. Shared by
-    /// the hover ([`open_markdown_float`](Self::open_markdown_float)) and completion-docs
-    /// ([`open_completion_docs_float`](Self::open_completion_docs_float)) surfaces.
-    fn render_markdown_into(&mut self, buf: BufferId, name: &str, markdown: &str) -> Vec<String> {
-        self.render_rendered_into(buf, name, crate::markdown::render(markdown))
-    }
-
-    /// [`render_markdown_into`](Self::render_markdown_into) over an already-rendered
-    /// document, so a caller that composed one out of several sections
-    /// ([`crate::markdown::render_sections`]) shares the same load + repaint.
+    /// Render an already-[`Rendered`](crate::markdown::Rendered) markdown document into
+    /// the doc-float scratch buffer `buf`: load the stripped display lines, leave the
+    /// buffer untyped, and repaint its [`DOC_MD_NS`] styling from scratch — inline
+    /// `@markup.*` spans, thematic-break [`line_fill`](VirtDecor::line_fill)s, and fenced
+    /// code blocks syntax-highlighted in their own language (fail-soft when the grammar
+    /// is absent). Returns the stripped lines (for sizing); empty when the markup renders
+    /// to nothing. Shared by the hover ([`open_markdown_float`](Self::open_markdown_float))
+    /// and completion-docs ([`open_completion_docs_float`](Self::open_completion_docs_float))
+    /// surfaces, both of which compose their document out of labelled sections
+    /// ([`crate::markdown::render_sections`]) when more than one server contributed.
     fn render_rendered_into(
         &mut self,
         buf: BufferId,
@@ -596,18 +593,24 @@ impl Editor {
         self.doc_float_wins.push((name.to_string(), win));
     }
 
-    /// Render `markdown` into the **completion docs** float and place it beside the open
+    /// Render `sections` into the **completion docs** float and place it beside the open
     /// completion popup — a passive, non-focusable float window (the doc-float model)
     /// that persists across keystrokes while the menu is open
     /// (see [`close_transient_doc_floats`](Self::close_transient_doc_floats)). The
-    /// server sources the `markdown` (the selected row's LSP / resolved / inline docs)
-    /// and passes `wrap` (the configured `docs_wrap`); **core** owns the placement,
-    /// computing it beside the popup box via [`complete_docs_geom`](Self::complete_docs_geom)
+    /// server sources them (the selected row's LSP / resolved / inline docs) and passes
+    /// `wrap` (the configured `docs_wrap`); **core** owns the placement, computing it
+    /// beside the popup box via [`complete_docs_geom`](Self::complete_docs_geom)
     /// — the windows-area twin of the old `redraw.rs::project_complete_docs` geometry,
     /// so the float lands exactly where the server-projected menu overlay does. Empty
     /// markup — or no completion popup / no room beside it — closes the float instead of
     /// showing an empty box. Re-opening replaces the previous float in place.
-    pub fn open_completion_docs_float(&mut self, markdown: &str, wrap: bool) {
+    ///
+    /// Each `(label, markdown)` section is headed by a labelled rule, exactly as the
+    /// merged hover's are ([`open_markdown_sections`](Self::open_markdown_sections)):
+    /// a row several language servers all offer is one row in the popup, but each
+    /// server's docs stay its own. An **empty** label renders bare, which is the
+    /// ordinary single-contributor float.
+    pub fn open_completion_docs_float(&mut self, sections: &[(String, String)], wrap: bool) {
         // The popup box geometry this float is placed against (region cells) — also the
         // stable part of the signature that decides whether a redundant reopen (which
         // would reset the float's scroll) can be skipped. `None` ⇒ no completion popup.
@@ -616,7 +619,7 @@ impl Editor {
             return;
         };
         let sig = CompletionDocsSig {
-            markdown: markdown.to_string(),
+            sections: sections.to_vec(),
             win,
             box_col,
             box_row,
@@ -638,7 +641,10 @@ impl Editor {
         // reflects the stripped display lines), then place — or close if it renders to
         // nothing / there's no room beside the popup.
         let buf = self.doc_float_buffer(COMPLETION_DOC_FLOAT);
-        let lines = self.render_markdown_into(buf, COMPLETION_DOC_FLOAT, markdown);
+        let rendered = crate::markdown::render_sections(
+            sections.iter().map(|(l, s)| (l.as_str(), s.as_str())),
+        );
+        let lines = self.render_rendered_into(buf, COMPLETION_DOC_FLOAT, rendered);
         if lines.is_empty() {
             self.close_completion_docs_float();
             return;

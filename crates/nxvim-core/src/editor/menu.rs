@@ -1228,6 +1228,42 @@ impl Editor {
         }
     }
 
+    /// Raise an already-pushed completion row's `priority` and re-order the view — for
+    /// a row whose source learns, *after* pushing it, that a better-ranked contributor
+    /// also offers it.
+    ///
+    /// The LSP source is the caller: every capable server is asked at once and their
+    /// replies stream in, so a row is pushed at the rank of whichever server happened
+    /// to answer first. When a higher-ranked server later makes the same offer, the row
+    /// is merged into (one row, both servers' docs) and must rank where the *best* of
+    /// its contributors would put it — otherwise the popup's order depends on which
+    /// server was quicker, which is exactly what a stated priority is meant to remove.
+    ///
+    /// Raise-only, so this can never demote a row under a late straggler; a no-op on a
+    /// closed menu, a stale generation, a non-completion menu, or a key no row carries.
+    /// `key` is matched against **delegated-accept** rows only, the ones a source owns.
+    pub fn menu_reprioritize(&mut self, gen: u64, key: usize, priority: i32) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if menu.kind != MenuKind::Complete || menu.items_gen != gen {
+            return;
+        }
+        let Some(item) = menu
+            .all_items
+            .iter_mut()
+            .find(|i| i.key == key && i.source_accept)
+        else {
+            return;
+        };
+        if item.priority >= priority {
+            return;
+        }
+        item.priority = priority;
+        menu.sort_complete_view();
+        menu.clamp_cursor();
+    }
+
     /// Mark generation `gen`'s search **complete** (the source called `done()`). If
     /// no result of `gen` ever arrived (`gen > items_gen`), the new query matched
     /// nothing: clear the now-confirmed-empty list. If results did arrive
@@ -2281,10 +2317,24 @@ impl Editor {
                     .map(|k| k.chars().count())
                     .max()
                     .unwrap_or(0);
-                let content_w = if max_kind > 0 {
+                let rows_w = if max_kind > 0 {
                     max_label + 1 + max_kind
                 } else {
                     max_label
+                };
+                // ...then cap the rows at `'pummaxwidth'` (`0` = no maximum). The box is
+                // sized to its WIDEST row, so uncapped a single outlier — a generated
+                // identifier, a word scanned out of a minified line — stretches the popup
+                // across the whole window and every other row is read against a box built
+                // for the one it isn't. Capped, that row elides with a trailing `…` (the
+                // client's `elide_keep_tail`) and the kind column slides in beside it.
+                //
+                // The **prompt** is exempt: `query_w` is applied after the cap, since a
+                // `nx.ui.select` title is one line the user is meant to read whole, not a
+                // row the popup is being sized *by*.
+                let content_w = match self.options.pummaxwidth {
+                    0 => rows_w,
+                    cap => rows_w.min(cap),
                 }
                 .max(query_w)
                 .max(1);

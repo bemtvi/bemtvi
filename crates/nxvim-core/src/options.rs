@@ -36,6 +36,18 @@ pub struct Options {
     /// `0/1/2` toggle the per-window status row; `3` additionally docks one global
     /// row in [`crate::Editor`]'s relayout, like the tabline at the top.
     pub laststatus: u8,
+    /// Maximum width in columns of the cursor-anchored popup menu — the completion
+    /// popup and `nx.ui.select` — or `0` for no maximum. The box is otherwise sized
+    /// to its **widest** row, so a single outlier candidate (a generated identifier,
+    /// a word scanned out of a minified line) stretches it across the whole window
+    /// and every other row is read against a box built for the one it isn't. Capped,
+    /// the outlier elides with a trailing `…` and the menu stays a menu.
+    ///
+    /// The cap covers the whole box — label, the gap, and the aligned kind column —
+    /// as neovim's `'pummaxwidth'` does; it is a *maximum*, so a popup whose rows are
+    /// all short is unaffected. Unlike neovim it defaults non-zero: unbounded is the
+    /// behavior that reads as broken the first time a server offers a 200-column label.
+    pub pummaxwidth: usize,
     /// The `'statusline'` format string (neovim's `%`-format mini-language).
     /// Empty means the built-in default look; a non-empty value is parsed and
     /// rendered by the statusline engine. Global-only for now (no per-window
@@ -284,6 +296,7 @@ impl Options {
             ("workspacepersistunnamed", Bool(b)) => self.workspace_persist_unnamed = *b,
             ("showtabline", Num(n)) => self.showtabline = *n as u8,
             ("laststatus", Num(n)) => self.laststatus = *n as u8,
+            ("pummaxwidth", Num(n)) => self.pummaxwidth = *n as usize,
             ("mousetime", Num(n)) => self.mousetime = *n as usize,
             ("timeoutlen", Num(n)) => self.timeoutlen = *n as usize,
             ("scrollanimduration", Num(n)) => self.scrollanimduration = *n as usize,
@@ -337,6 +350,7 @@ impl Options {
             "workspacepersistunnamed" => Bool(self.workspace_persist_unnamed),
             "showtabline" => Num(self.showtabline as i64),
             "laststatus" => Num(self.laststatus as i64),
+            "pummaxwidth" => Num(self.pummaxwidth as i64),
             "mousetime" => Num(self.mousetime as i64),
             "timeoutlen" => Num(self.timeoutlen as i64),
             "scrollanimduration" => Num(self.scrollanimduration as i64),
@@ -476,6 +490,9 @@ impl Default for Options {
             showtabline: 1,
             // Every window carries its own status line (vim's default).
             laststatus: 2,
+            // Wide enough for any ordinary identifier plus its kind, narrow enough
+            // that one outlier candidate can't stretch the popup across the window.
+            pummaxwidth: 50,
             // No custom statusline by default — the built-in look is used.
             statusline: String::new(),
             // No custom tabline by default — the built-in tab cells are used.
@@ -1958,6 +1975,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Global,
             doc: "When to show the status line: 0 never, 1 when >1, 2 always, 3 global.",
+        },
+        OptionInfo {
+            name: "pummaxwidth",
+            abbrev: Some("pmw"),
+            kind: Num,
+            scope: Global,
+            doc: "Maximum width of the popup menu in columns; 0 is no maximum.",
         },
         OptionInfo {
             name: "statusline",

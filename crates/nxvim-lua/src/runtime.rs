@@ -525,6 +525,9 @@ pub struct GoMirror {
     pub incsearch: bool,
     pub showtabline: u8,
     pub laststatus: u8,
+    /// `'pummaxwidth'` — the popup menu's width cap in columns (`0` = no maximum).
+    /// Backs `vim.o.pummaxwidth` / `nx.o.pummaxwidth`.
+    pub pummaxwidth: u64,
     pub statusline: String,
     pub tabline: String,
     pub guifont: String,

@@ -326,6 +326,12 @@ and run `nxvim --test-plugin .`. See the full guides:
 [**Writing nxvim plugins**](docs/plugin-authoring.md) and
 [**Testing nxvim plugins**](docs/specs/2026-06-19-lua-plugin-testing.md).
 
+Writing one with a coding agent? Install
+[**nxvim-plugin-skills**](https://github.com/nxvim/nxvim-plugin-skills)
+(`npx skills add https://github.com/nxvim/nxvim-plugin-skills`) — agent skills
+covering the `nx.*` model and one surface each, so the agent doesn't reach for
+neovim APIs that don't exist here.
+
 ---
 
 ## How it's built

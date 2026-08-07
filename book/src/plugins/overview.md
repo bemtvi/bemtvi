@@ -19,3 +19,7 @@ nx.plugins({
   loading, the `nx.*` surfaces you'll use, a worked example, and testing.
 - **[nx.* API Reference](../api/index.md)** — every public function in the
   `nx.*` namespace, generated from the prelude source.
+- **[nxvim-plugin-skills](https://github.com/nxvim/nxvim-plugin-skills)** — agent
+  skills that teach a coding agent the `nx.*` model, one skill per surface. The
+  model is not in any agent's training data, so without them an agent writes
+  neovim plugins that do not run here.

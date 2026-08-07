@@ -11,6 +11,31 @@ module exposing `setup(opts)` — but the API you call is `nx.*`, not `vim.*`. (
 closed whitelist of `vim.*` muscle-memory aliases exists for config ergonomics; new
 plugin code should target `nx.*` directly.)
 
+## Writing plugins with a coding agent
+
+The `nx.*` model is not in any agent's training data — left to itself, an agent
+writes neovim plugins that fail on nxvim (`vim.uv`, blocking `vim.wait`, a
+`nvim_buf_set_lines` that does not exist). **[nxvim-plugin-skills](https://github.com/nxvim/nxvim-plugin-skills)**
+is a set of agent skills that teach it the real model, the surfaces below, and the
+traps; it also bundles a generated snapshot of the `nx.*` API reference and every
+public `nx.*`/`vim.*` name in a live editor.
+
+```sh
+npx skills add https://github.com/nxvim/nxvim-plugin-skills   # any agent
+```
+
+Claude Code can install it as a plugin instead:
+
+```
+/plugin marketplace add nxvim/nxvim-plugin-skills
+/plugin install nxvim-plugin-skills
+```
+
+One skill per surface — scaffolding, async, keymaps/commands/events,
+buffers/windows, UI and components, views and docks, decorations, picker,
+completion, statusline, LSP and diagnostics, fs/process/net, testing, vimdoc, and
+porting from neovim — with the `nxvim` skill routing to the right one.
+
 ## Anatomy of a plugin
 
 A plugin is a directory laid out the way neovim plugins are, so it resolves on the
@@ -172,6 +197,8 @@ exits `0`/`1` for CI. See the full guide: **[Testing plugins](plugin-testing.md)
 
 ## See also
 
+- [nxvim-plugin-skills](https://github.com/nxvim/nxvim-plugin-skills) —
+  agent skills for authoring plugins, one per `nx.*` surface.
 - [Native plugin API design](specs/2026-06-11-native-plugin-api.md) — the model and
   six worked API examples.
 - [ADR 0002 — native plugin system](decisions/0002-native-plugin-system.md) — why

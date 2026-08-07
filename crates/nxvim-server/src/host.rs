@@ -28,6 +28,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
@@ -433,11 +434,16 @@ pub async fn run_duplex_process(
         });
     }
 
-    // Stream stderr as raw chunks from a detached task (so a chatty stderr can't
-    // deadlock the stdout reader against a full pipe).
+    // Stream stderr as raw chunks from its own task (so a chatty stderr can't deadlock
+    // the stdout reader against a full pipe). Its handle is kept, not detached: the exit
+    // below waits for this pump to reach EOF, or the last chunks would race the
+    // `ProcExit` — and losing that race drops them outright, since `nx._proc_exit`
+    // forgets the handler and `nx._proc_recv` ignores an unknown id. A child that fails
+    // would then report no reason at all.
+    let mut stderr_pump = None;
     if let Some(mut err) = child.stderr.take() {
         let tx = event_tx.clone();
-        tokio::spawn(async move {
+        stderr_pump = Some(tokio::spawn(async move {
             let mut buf = [0u8; 8192];
             loop {
                 match err.read(&mut buf).await {
@@ -456,7 +462,7 @@ pub async fn run_duplex_process(
                     }
                 }
             }
-        });
+        }));
     }
 
     // Read stdout raw, racing each read against the kill signal.
@@ -487,9 +493,40 @@ pub async fn run_duplex_process(
     } else {
         tokio::select! {
             status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
-            _ = &mut kill_rx => -1,
+            _ = &mut kill_rx => { killed = true; -1 }
         }
     };
+    // Drain the stderr pump before announcing the exit, so `on_exit` really is the last
+    // event and no trailing chunk is dropped for a handler that has already been
+    // forgotten (`nx._proc_exit` removes the entry; `nx._proc_recv` ignores an unknown
+    // id). The LSP leg joins its pumps for the same reason.
+    //
+    // Not on a kill: the child is only terminated by `kill_on_drop` when this function
+    // returns, so one that ignores stdin EOF still holds the pipe open and there is
+    // nothing to wait for — a killed child is owed a prompt exit, not its trailing
+    // output. Bounded even on a natural exit, because EOF needs *every* holder of the
+    // write end to close it and a forked grandchild inherits one; a reaped child's pipe
+    // is already closed, so the ordinary case returns at once.
+    match stderr_pump {
+        Some(pump) if !killed => {
+            if tokio::time::timeout(Duration::from_secs(2), pump)
+                .await
+                .is_err()
+            {
+                // Loud rather than a silent truncation: something still holds the pipe,
+                // and whatever it writes from here on cannot be delivered.
+                let _ = event_tx.send(LoopEvent::ProcOut {
+                    id,
+                    data: b"nx.process: stderr still open 2s after exit (a background \
+                            child inherited it); later output is not delivered\n"
+                        .to_vec(),
+                    stderr: true,
+                });
+            }
+        }
+        Some(pump) => pump.abort(),
+        None => {}
+    }
     let _ = event_tx.send(LoopEvent::ProcExit { id, code });
 }
 

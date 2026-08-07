@@ -74,19 +74,29 @@ fn term_data_for(buf: u64, method: &str, params: &[Value]) -> Option<Vec<u8>> {
 /// stream collapsed the whole 200 × 50ms budget into the first 50ms, so the test failed
 /// (instantly, having never waited) whenever a loaded `cargo test --workspace` made the
 /// daemon slower than one poll. Only a *closed* channel ends the wait.
+///
+/// **`term_exit` is not the end of the stream either.** The daemon deliberately splits the
+/// two: `term_data` rides the *backpressured* stream channel (so a slow consumer throttles
+/// the child instead of growing an unbounded backlog) while `term_exit` rides the control
+/// channel, "so it is delivered promptly even behind a backed-up data stream"
+/// (`daemon.rs`, `serve_term_daemon_on`). A short-lived child under load therefore
+/// reports its exit *before* its trailing output — by design. Giving up there failed
+/// ~20% of loaded runs with an empty `text`, having discarded a `hello` that was still on
+/// the wire. Record the code and keep draining; the needle still decides.
 async fn await_text(
     incoming: &mut UnboundedReceiver<Incoming>,
     buf: u64,
     needle: &str,
 ) -> (String, Option<Option<i32>>) {
     let mut text = String::new();
+    let mut exited: Option<Option<i32>> = None;
     for _ in 0..200 {
         match tokio::time::timeout(Duration::from_millis(50), incoming.recv()).await {
             Ok(Some(Incoming::Notification { method, params })) => {
                 if let Some(bytes) = term_data_for(buf, &method, &params) {
                     text.push_str(&String::from_utf8_lossy(&bytes));
                     if text.contains(needle) {
-                        return (text, Some(None));
+                        return (text, Some(exited.flatten()));
                     }
                 } else if method == "term_exit"
                     && params.first().and_then(Value::as_u64) == Some(buf)
@@ -95,7 +105,9 @@ async fn await_text(
                     if text.contains(needle) {
                         return (text, Some(code));
                     }
-                    return (text, None); // exited without ever producing the needle
+                    // Trailing output may still be in flight behind it — hold the code
+                    // and keep draining rather than reporting "exited without output".
+                    exited = Some(code);
                 }
             }
             Ok(Some(_)) => {}

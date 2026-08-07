@@ -139,7 +139,7 @@ impl EditHost {
         match result {
             Ok(stat) => {
                 self.editor
-                    .finalize_save(save.buffer, save.path.clone(), stat);
+                    .finalize_save(save.buffer, save.path.clone(), stat, save.changedtick);
                 self.editor.echo(format!(
                     "\"{}\"{} {}L, {}B written",
                     save.path.display(),

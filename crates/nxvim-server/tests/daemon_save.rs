@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_test_harness::{
-    await_lines, config_init, exec_lua, feed, message_of, spawn_with_daemon_fs,
+    await_lines, buf_lines, config_init, exec_lua, feed, message_of, spawn_with_daemon_fs,
     spawn_with_daemon_fs_init, temp_dir, DaemonFs,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -269,6 +269,52 @@ async fn write_pushes_edited_bytes_over_the_wire_and_clears_modified_on_ack() {
     assert!(
         !modified(&rpc).await,
         "the modified flag clears only after the daemon acks the write"
+    );
+}
+
+/// An edit made **while the write is in flight** survives the ack: the buffer stays
+/// `modified`, because what reached the daemon is the *snapshot*, not what the buffer now
+/// holds.
+///
+/// The snapshot is taken at command time (`PendingSave::bytes`, deliberately, "so edits
+/// made while the write is in flight can never tear into what gets persisted") and the ack
+/// lands one wire round-trip later — a window the user can type into, and over a real
+/// daemon link a long one. Clearing `modified` there reports a buffer as saved whose newest
+/// text exists nowhere but memory: `:q` then closes it with no `E37` and the edit is gone.
+/// The write itself is fine — the file holds the snapshot — so only the *flag* is wrong.
+///
+/// Deterministic rather than timing-dependent: [`DaemonFs::hold_writes`] parks the write on
+/// the daemon so the edit provably lands inside the window (hence the multi-thread runtime
+/// — the parked daemon task must not stall the editor).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_while_the_write_is_in_flight_keeps_the_buffer_modified() {
+    let fake = DaemonFs::with("/virtual/note.txt", "one\n");
+    let (rpc, mut incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/note.txt").await;
+    await_lines(&rpc, &["one"]).await;
+
+    // Edit, then save: the write snapshots "two\n" and parks on the daemon.
+    feed(&rpc, "ggcctwo<Esc>");
+    assert_eq!(await_lines(&rpc, &["two"]).await, vec!["two"]);
+    let hold = fake.hold_writes();
+    feed(&rpc, ":w<CR>");
+    hold.await_parked().await;
+
+    // The user types on, inside the in-flight window.
+    feed(&rpc, "ggccthree<Esc>");
+    assert_eq!(await_lines(&rpc, &["three"]).await, vec!["three"]);
+
+    // Let the write finish and its ack land.
+    hold.release();
+    await_message_containing(&mut incoming, "written").await;
+
+    // The daemon holds the snapshot — the write did exactly what it promised...
+    await_daemon_content(&fake, "/virtual/note.txt", "two\n").await;
+    // ...but "three" never went anywhere, so the buffer is still dirty.
+    assert_eq!(buf_lines(&rpc, 0).await, vec!["three"]);
+    assert!(
+        modified(&rpc).await,
+        "an edit made while the write was in flight is unsaved — the ack for the earlier \
+         snapshot must not report the buffer clean"
     );
 }
 

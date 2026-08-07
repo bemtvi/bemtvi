@@ -992,6 +992,47 @@ struct DaemonFsTree {
     files: std::collections::HashMap<PathBuf, Vec<u8>>,
     dirs: std::collections::HashMap<PathBuf, Vec<(bool, String)>>,
     fail_writes: bool,
+    hold: Option<Arc<WriteGate>>,
+}
+
+/// The shared state behind [`DaemonFs::hold_writes`]: `released` gates the daemon's
+/// `write_atomic`, `parked` counts the writers currently waiting on it.
+#[derive(Default)]
+struct WriteGate {
+    state: Mutex<(bool, usize)>,
+    cv: std::sync::Condvar,
+}
+
+/// A parked-writes latch from [`DaemonFs::hold_writes`] — every daemon-side write
+/// blocks until it is [`release`](WriteHold::release)d.
+///
+/// This is what makes "the buffer was edited *while the write was in flight*"
+/// deterministic instead of a race: park the write, edit, then let the ack land. The
+/// wait is a real blocking wait on the daemon's task, so a test using this **must** run
+/// on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`)
+/// or the parked daemon stalls the editor too.
+pub struct WriteHold(Arc<WriteGate>);
+
+impl WriteHold {
+    /// Poll until at least one daemon write is parked on this latch, so the test knows
+    /// the snapshot has been taken and the bytes are on the wire. Panics if none parks
+    /// within the budget — a silent "nothing was in flight" would make the test that
+    /// edits mid-write prove nothing.
+    pub async fn await_parked(&self) {
+        for _ in 0..200 {
+            if self.0.state.lock().unwrap().1 > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no daemon write parked on the hold within 2s");
+    }
+
+    /// Let every parked (and future) write through.
+    pub fn release(self) {
+        self.0.state.lock().unwrap().0 = true;
+        self.0.cv.notify_all();
+    }
 }
 
 impl DaemonFs {
@@ -1045,6 +1086,16 @@ impl DaemonFs {
         self
     }
 
+    /// Park every subsequent [`write_atomic`](nxvim_core::HostFs::write_atomic) until
+    /// the returned [`WriteHold`] is released — the seam for asserting on a buffer that
+    /// is edited *while its write is in flight*. See [`WriteHold`] for the
+    /// multi-thread-runtime requirement.
+    pub fn hold_writes(&self) -> WriteHold {
+        let gate = Arc::new(WriteGate::default());
+        self.inner.lock().unwrap().hold = Some(gate.clone());
+        WriteHold(gate)
+    }
+
     /// Make every subsequent [`write_atomic`](nxvim_core::HostFs::write_atomic)
     /// fail loud (`PermissionDenied`) — the edit-host must surface it, never
     /// report a silent success. Chainable.
@@ -1094,6 +1145,18 @@ impl nxvim_core::HostFs for DaemonFs {
     }
 
     fn write_atomic(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+        // Park here if a `hold_writes` latch is armed — taken *without* the tree lock
+        // held, so the test can still read the fake while a write waits.
+        let hold = self.inner.lock().unwrap().hold.clone();
+        if let Some(gate) = hold {
+            let mut state = gate.state.lock().unwrap();
+            state.1 += 1;
+            gate.cv.notify_all();
+            while !state.0 {
+                state = gate.cv.wait(state).unwrap();
+            }
+            state.1 -= 1;
+        }
         let mut t = self.inner.lock().unwrap();
         if t.fail_writes {
             // A loud failure the edit-host must surface — never a silent success.

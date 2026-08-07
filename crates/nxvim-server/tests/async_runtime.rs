@@ -574,6 +574,103 @@ async fn nx_process_streams_stderr_and_natural_exit_code() {
     assert_eq!(lua_u64(&rpc, "return _G.code").await, Some(3));
 }
 
+/// A child's stderr is delivered **before** its `on_exit` — the exit is the last event,
+/// not a cutoff that strands whatever the stderr pump had not drained yet.
+///
+/// `nx._proc_exit` forgets the handler entry and `nx._proc_recv` returns silently for an
+/// unknown id, so a chunk that arrives after the exit is dropped on the floor: the client
+/// sees a child that failed with no diagnostic at all. That is the failure mode this
+/// guards — a debug adapter (nxvim-dap runs on `nx.process`) dying with its reason
+/// swallowed.
+///
+/// The ordering is a scheduler race for an ordinary `printf`-and-exit child (it lost
+/// stderr in ~15% of *loaded* runs and none of the idle ones), which is no basis for a
+/// regression guard. So the window is made structural instead: the child forks a
+/// grandchild that inherits the stderr pipe (but *not* stdout — held open, that pipe
+/// would delay the exit on its own and hide the bug), exits immediately, and only then
+/// does the grandchild write. The exit status is available at once while the bytes do not
+/// exist yet — so nothing but waiting for the stream itself can deliver them, on any
+/// machine at any load.
+#[tokio::test]
+async fn nx_process_delivers_stderr_written_after_the_child_exits() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.err = ''\n\
+         _G.code = nil\n\
+         _G.after_exit = 0\n\
+         nx.process.open({\n\
+           cmd = 'sh',\n\
+           args = { '-c', '(sleep 0.3; printf oops 1>&2) >/dev/null & exit 3' },\n\
+           on_stderr = function(chunk)\n\
+             _G.err = _G.err .. chunk\n\
+             if _G.code ~= nil then _G.after_exit = _G.after_exit + #chunk end\n\
+           end,\n\
+           on_exit = function(c) _G.code = c end,\n\
+         })",
+    )
+    .await;
+    poll_true(&rpc, "return _G.code ~= nil").await;
+    // A straggler would land here, so "arrived late" reads differently from "lost".
+    settle_ms(&rpc, 400).await;
+
+    assert_eq!(
+        lua_u64(&rpc, "return _G.code").await,
+        Some(3),
+        "the child's real exit code still reaches on_exit"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err").await.as_str(),
+        Some("oops"),
+        "stderr written while the child was already gone still reaches on_stderr"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return _G.after_exit").await,
+        Some(0),
+        "and it arrives BEFORE on_exit — the exit stays the last event"
+    );
+}
+
+/// `:kill()` on a child that never closes its own pipes still fires `on_exit` promptly —
+/// the exit is not held behind the stderr drain.
+///
+/// The natural-exit path waits for that stream (above), but a killed child is only
+/// terminated by `kill_on_drop` once its task returns, so one that ignores stdin EOF is
+/// still holding the pipe open at that moment: waiting would trade a lost chunk for a
+/// hang, and a kill is owed a prompt exit rather than trailing output. `sleep` is the
+/// child precisely because it ignores stdin (`cat`, which the duplex test kills, exits on
+/// EOF by itself and so would pass either way).
+#[tokio::test]
+async fn nx_process_kill_of_a_child_that_ignores_stdin_exits_promptly() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.code = nil\n\
+         _G.proc = nx.process.open({\n\
+           cmd = 'sleep',\n\
+           args = { '30' },\n\
+           on_exit = function(c) _G.code = c end,\n\
+         })",
+    )
+    .await;
+    exec_lua(&rpc, "_G.proc:kill()").await;
+
+    // Well under the 2s stderr-drain bound, so a regression that waits on it fails here
+    // rather than passing slowly.
+    let started = std::time::Instant::now();
+    poll_true(&rpc, "return _G.code ~= nil").await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.code ~= nil").await,
+        Some(true),
+        "on_exit fired after the kill"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the kill's on_exit must not wait on the stderr drain (took {:?})",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn nx_process_spawn_failure_is_loud_not_silent() {
     let (rpc, _incoming) = start().await;

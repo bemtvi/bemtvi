@@ -42,6 +42,12 @@ pub struct PendingSave {
     /// the message describes the bytes that went over the wire, and the buffer may
     /// have been edited (or had `'fixendofline'` toggled) before the ack lands.
     pub noeol: bool,
+    /// The buffer's [`changedtick`](crate::Buffer::changedtick) when `bytes` were
+    /// taken. The ack compares it against the buffer's current one
+    /// ([`Editor::finalize_save`]): an edit made while the write was in flight moves it,
+    /// and the buffer must stay `modified` because what landed on the remote is this
+    /// snapshot, not what the buffer now holds.
+    pub changedtick: u64,
     /// A quit to replay once this write acks: `Some(bang)` for `:wq` / `:x` (run
     /// `:q` / `:q!`), `None` for a plain `:w`. The editor defers the quit until the
     /// bytes are safely on the remote — an unflushed write is never silently
@@ -883,7 +889,7 @@ impl Editor {
     ) -> Option<u64> {
         // Encode at snapshot time so an unrepresentable character fails loud *here*,
         // before anything is enqueued — never a silently-mangled write off the tick.
-        let (bytes, lines, noeol) = {
+        let (bytes, lines, noeol, changedtick) = {
             let buf = &self.buffers.get(buffer).buffer;
             // The snapshot's own `[noeol]`: `'fixendofline'` decides it, and these are
             // exactly the bytes it decided for.
@@ -891,6 +897,7 @@ impl Editor {
                 buf.to_save_bytes(),
                 buf.line_count(),
                 buf.save_is_unterminated(),
+                buf.changedtick,
             )
         };
         let bytes = match bytes {
@@ -907,6 +914,7 @@ impl Editor {
             bytes,
             lines,
             noeol,
+            changedtick,
             then_quit,
         });
         Some(seq)
@@ -925,15 +933,39 @@ impl Editor {
     /// only once the bytes are confirmed on the remote. A no-op if the buffer was
     /// closed while the write was in flight (nothing to finalize). The server emits
     /// the `written` echo and replays any deferred quit; this only touches core state.
-    pub fn finalize_save(&mut self, buffer: BufferId, path: PathBuf, stat: Option<FileStat>) {
+    ///
+    /// `snapshot_tick` is the [`changedtick`](crate::Buffer::changedtick) the write's
+    /// bytes were taken at ([`PendingSave::changedtick`]). Only the *clean* half is
+    /// conditional on it still matching: what reached the remote is the snapshot, so a
+    /// buffer edited during the round-trip holds text that exists nowhere else, and
+    /// reporting it saved would let `:q` close it with no `E37`. The disk baseline is
+    /// stamped either way — the file really does hold those bytes — but `modified` stays
+    /// set and `saved_seq` keeps pointing at the last genuinely-written state, so undoing
+    /// back to it still reads clean. A window a local `:w` doesn't have (it writes
+    /// synchronously) but every daemon / browser session does.
+    pub fn finalize_save(
+        &mut self,
+        buffer: BufferId,
+        path: PathBuf,
+        stat: Option<FileStat>,
+        snapshot_tick: u64,
+    ) {
         if !self.buffers.map.contains_key(&buffer) {
             return;
         }
+        let moved_on = self.buffers.get(buffer).buffer.changedtick != snapshot_tick;
         self.buffers
             .get_mut(buffer)
             .buffer
             .mark_written(path.clone(), stat);
-        self.mark_undo_saved(buffer);
+        if moved_on {
+            // `mark_written` cleared it for the snapshot; the buffer has since moved past
+            // what was written, so it is dirty again — and its current state is *not* the
+            // saved undo node.
+            self.buffers.get_mut(buffer).buffer.modified = true;
+        } else {
+            self.mark_undo_saved(buffer);
+        }
         // Record the (now-acked) write so the server fires `BufWritePost`. `BufWritePre`
         // already fired before the enqueue (in the pre-write drain's `begin_write_scope`).
         self.record_write(buffer, path);

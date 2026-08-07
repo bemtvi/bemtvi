@@ -46,6 +46,14 @@ const INJECTION_DEADLINE: Duration = Duration::from_millis(50);
 /// regions are dropped.
 const MAX_INJECTION_DEPTH: usize = 4;
 
+/// How many lines a doc block may hold and still be tried as a **list of items**
+/// (see [`Engine::highlight_fragment`]). Every line of a list costs its own ladder,
+/// so the bound is what keeps a long block — which, being long, is far likelier to
+/// be real source that simply failed to parse than a list of overloads — from
+/// turning a doc float's repaint into a parse storm. Typeshed's most-overloaded
+/// signatures run to a couple of dozen lines.
+const MAX_SPLIT_ITEMS: usize = 64;
+
 /// Per-buffer parse state.
 struct BufferState {
     shadow: Rope,
@@ -932,7 +940,8 @@ impl Engine {
     /// `constructor`; the `lua_ls` hover loses its `function` keyword and paints the
     /// *types* as parameters). Plausible-but-wrong colour reads worse than none.
     ///
-    /// So fragment mode works in two steps.
+    /// So fragment mode works in steps, each of which either makes the snippet a
+    /// **whole parse** or hands on to the next.
     ///
     /// **The framing ladder.** A snippet that doesn't parse on its own is tried
     /// inside each of its language's [fragment contexts](Self::set_fragment_context)
@@ -944,15 +953,33 @@ impl Engine {
     /// Structure recovered this way is real — the wrapped text genuinely is a
     /// program, so `Vec` comes back as `@type`, not `@constructor`.
     ///
-    /// **The repaint**, when no framing fits (an annotation dialect is not a fragment
-    /// of anything). Then fragment mode trusts structure only where the parse is
-    /// sound: every `ERROR` region of the host tree has its structural captures
-    /// dropped — the token-classifying ones survive, the lexer having worked where
-    /// the parser didn't — and is repainted from the leaves' own token kinds (see
-    /// [`fragment_repaint`]).
+    /// **The annotation peel.** A leading `(kind) ` is the server's own display
+    /// label, not code — `pyright` writes `(method) def join(self, x: str) -> str`,
+    /// `tsserver` `(property) Foo.bar: number` — and it is what stops an otherwise
+    /// framable signature from framing. So when the ladder comes up empty, the label
+    /// is [taken off](annotation_prefix) and the ladder runs again on what's left;
+    /// its spans shift back by the label's width and the label itself is painted
+    /// `comment`, the non-code text it is. All or nothing: if the remainder doesn't
+    /// frame either, the snippet goes on to the next step whole, with no label span
+    /// invented over text nothing explained.
+    ///
+    /// **The item split.** A doc block is often a *list* rather than one fragment —
+    /// `ty` sends every overload of a function as its own signature line. Together
+    /// they are a fragment of nothing and no framing takes them, so each line is
+    /// resolved in its own right instead (its own ladder, its own peel, possibly a
+    /// different rung). All or nothing again: one line that isn't a whole item means
+    /// this isn't a list, and forcing the rest would paint them out of a context the
+    /// parse says isn't there.
+    ///
+    /// **The repaint**, when nothing above made it whole (an annotation dialect is
+    /// not a fragment of anything). Then fragment mode trusts structure only where
+    /// the parse is sound: every `ERROR` region of the host tree has its structural
+    /// captures dropped — the token-classifying ones survive, the lexer having worked
+    /// where the parser didn't — and is repainted from the leaves' own token kinds
+    /// (see [`fragment_repaint`]).
     ///
     /// A snippet that parses cleanly on its own — most rust-analyzer hovers, every
-    /// `:help` example — takes neither step and is byte-identical to
+    /// `:help` example — takes none of the steps and is byte-identical to
     /// [`highlight_text`](Self::highlight_text).
     pub fn highlight_fragment(
         &mut self,
@@ -961,13 +988,36 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> Vec<Span> {
-        // A snippet that stands on its own needs neither step. `parses_cleanly` is a
+        if let Some(spans) = self.resolve_fragment(lang, text, first_line, last_line) {
+            return spans;
+        }
+        if let Some(spans) = self.split_fragment(lang, text, first_line, last_line) {
+            return spans;
+        }
+        self.highlight_snippet(lang, text, first_line, last_line, true)
+            .0
+    }
+
+    /// The whole snippet resolved as **one** item — a clean parse, a framing, or a
+    /// framing of what's left once its display annotation is peeled off. `None` when
+    /// none of those makes it whole, which is what sends
+    /// [`highlight_fragment`](Self::highlight_fragment) on to the item split and then
+    /// the repaint.
+    fn resolve_fragment(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Option<Vec<Span>> {
+        // A snippet that stands on its own needs no step at all. `parses_cleanly` is a
         // throwaway parse, but a doc block is a handful of lines and this only runs
         // for a surface that just changed (a hover reply, a completion row).
         if self.parses_cleanly(lang, text) {
-            return self
-                .highlight_snippet(lang, text, first_line, last_line, false)
-                .0;
+            return Some(
+                self.highlight_snippet(lang, text, first_line, last_line, false)
+                    .0,
+            );
         }
         for context in self
             .fragment_contexts
@@ -991,10 +1041,81 @@ impl Engine {
                     false,
                 )
                 .0;
-            return unwrap_spans(spans, &context, &lines);
+            return Some(unwrap_spans(spans, &context, &lines));
         }
-        self.highlight_snippet(lang, text, first_line, last_line, true)
-            .0
+        self.peel_annotation(lang, text, first_line, last_line)
+    }
+
+    /// Take the server's display annotation (`(method) `, `(type alias) `) off the
+    /// snippet's first line and resolve what's left, bringing its first-line columns
+    /// back over the label and painting the label `comment`. `None` when there is no
+    /// label, or when the remainder doesn't resolve either — a peel that explains
+    /// nothing must leave no trace.
+    ///
+    /// A label the recursion strips is one the shorter text no longer carries, so a
+    /// doubly-labelled snippet terminates, and each label lands at its true column.
+    fn peel_annotation(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Option<Vec<Span>> {
+        let (label, skip) = annotation_prefix(text)?;
+        let mut spans = self.resolve_fragment(lang, &text[skip..], first_line, last_line)?;
+        for span in &mut spans {
+            if span.line == 0 {
+                span.start_byte += skip;
+                span.end_byte += skip;
+            }
+        }
+        if first_line == 0 {
+            spans.push(Span {
+                line: 0,
+                start_byte: 0,
+                end_byte: label,
+                group: "comment".to_string(),
+            });
+        }
+        spans.sort_by_key(|s| (s.line, s.start_byte));
+        Some(spans)
+    }
+
+    /// The snippet resolved as a **list of items**, one line each: every non-blank
+    /// line must [resolve](Self::resolve_fragment) on its own, or this isn't a list
+    /// and the caller falls back to the whole-block repaint. Spans come back on the
+    /// line they were found on; lines outside `first_line..last_line` are still
+    /// resolved (they're what makes it a list) but paint nothing.
+    fn split_fragment(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Option<Vec<Span>> {
+        let lines: Vec<&str> = text.lines().collect();
+        // One line is not a list, and a block long enough to be a parse storm is
+        // source that should have parsed whole — the repaint is the cheap answer for
+        // both. The cap keeps the worst case at `MAX_SPLIT_ITEMS` × the ladder.
+        if lines.len() < 2 || lines.len() > MAX_SPLIT_ITEMS {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim().is_empty() {
+                continue; // a blank line separates items; it has nothing to resolve
+            }
+            let item = format!("{line}\n");
+            let spans = self.resolve_fragment(lang, &item, 0, 1)?;
+            if index < first_line || index >= last_line {
+                continue;
+            }
+            out.extend(spans.into_iter().map(|span| Span {
+                line: index,
+                ..span
+            }));
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     /// Whether `text` parses in `lang` with no `ERROR` and no `MISSING` node — the
@@ -1787,6 +1908,45 @@ fn tree_has_defect(tree: &Tree) -> bool {
 /// [`unwrap_spans`] clips against.
 fn line_lengths(text: &str) -> Vec<usize> {
     text.lines().map(str::len).collect()
+}
+
+/// The longest `(…)` [annotation](annotation_prefix) label taken as one — long
+/// enough for `(type parameter)`, short enough that a parenthesised line of real
+/// code cannot pass for a label.
+const MAX_ANNOTATION_LABEL: usize = 24;
+
+/// The **display annotation** a language server puts in front of a hover, as
+/// `(label width, bytes to skip)` — `Some((8, 9))` for `"(method) join(…)"`, `None`
+/// when the snippet doesn't open with one.
+///
+/// The shape is an LSP display convention rather than any one server's: `pyright`
+/// writes `(class) Foo` / `(type alias) Bar`, `tsserver` `(local var) x: number`.
+/// So the rule is deliberately narrow — a parenthesised run of words on the first
+/// line, followed by a space and then some code — and it is only ever consulted
+/// after a snippet has already failed to parse every way it could. Code that
+/// genuinely opens with a parenthesised expression (a lisp form, a cast, a tuple)
+/// parses, and so never reaches here.
+fn annotation_prefix(text: &str) -> Option<(usize, usize)> {
+    let line = text.lines().next()?;
+    let close = line.strip_prefix('(')?.find(')')? + 1;
+    let label = &line[1..close];
+    // Words and spaces only: `type alias` yes, `a + b` or `Foo::bar` no.
+    if label.is_empty()
+        || label.len() > MAX_ANNOTATION_LABEL
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '-')
+        || !label.starts_with(|c: char| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let rest = line[close + 1..].trim_start_matches(' ');
+    // Nothing after the label (or nothing *between* it and the rest) means this is
+    // the snippet itself, not an annotation on one.
+    if rest.is_empty() || rest.len() == line.len() - close - 1 {
+        return None;
+    }
+    Some((close + 1, line.len() - rest.len()))
 }
 
 /// Bring `spans` back from a [framed](FragmentContext) parse into the fragment's own

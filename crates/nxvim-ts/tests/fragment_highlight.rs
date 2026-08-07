@@ -405,6 +405,170 @@ fn an_indenting_framing_indents_and_maps_back_every_line() {
     );
 }
 
+// ---- the display annotation ------------------------------------------------
+
+/// A hover's leading `(kind) ` is the server's own display annotation, not code:
+/// `pyright` writes `(method) join(self, x: str) -> str`, `tsserver`
+/// `(property) Foo.bar: number`. It makes the *rest* — a fragment that would have
+/// framed cleanly — unparseable, so the whole line drops to the repaint and the
+/// signature loses its structure. Peeling the annotation before the ladder gets it
+/// back, at the fragment's own columns.
+#[test]
+fn a_display_annotation_is_peeled_off_before_the_ladder() {
+    let mut engine = engine();
+    engine.set_fragment_context("rust", vec!["struct __nx {\n%s\n}".to_string()]);
+    let text = "(field) count: Vec<String>\n";
+
+    let frag = painted(&mut engine, text, true);
+    assert_eq!(
+        group_of(&frag, "count"),
+        Some("property"),
+        "the framed parse of the peeled fragment names the field; got {frag:?}"
+    );
+    assert_eq!(
+        group_of(&frag, "Vec"),
+        Some("type"),
+        "…and its real type; got {frag:?}"
+    );
+    assert_eq!(
+        group_of(&frag, "(field)"),
+        Some("comment"),
+        "the annotation itself is painted as the non-code text it is; got {frag:?}"
+    );
+
+    // The peel is a coordinate shift, not a rewrite: `count` sits at bytes 8..13 of
+    // the line the *caller* handed in, annotation included.
+    let spans = engine.highlight_fragment("rust", text, 0, 1);
+    let name = spans
+        .iter()
+        .find(|s| s.group == "property")
+        .expect("the field name");
+    assert_eq!(
+        (name.line, name.start_byte, name.end_byte),
+        (0, 8, 13),
+        "the annotation's width must go back onto the columns: {spans:?}"
+    );
+}
+
+/// The peel is all-or-nothing. When what's left still fits no framing — an
+/// annotation dialect whose body isn't a fragment of the language either — the
+/// snippet falls to the repaint whole, and no annotation span is invented over text
+/// the peel didn't actually explain.
+#[test]
+fn an_annotation_whose_body_still_fails_leaves_no_trace() {
+    let mut engine = engine();
+    engine.set_fragment_context("rust", vec!["fn __nx() {\n%s\n}".to_string()]);
+    let frag = painted(&mut engine, "(method) Foo::bar(x: u32) -> bool\n", true);
+
+    assert!(
+        !frag.iter().any(|(_, g)| g == "comment"),
+        "an unexplained annotation must not be painted; got {frag:?}"
+    );
+    assert!(
+        frag.iter().all(|(t, _)| t != "Foo"),
+        "and the repaint still refuses to name a construct; got {frag:?}"
+    );
+}
+
+// ---- a block of items ------------------------------------------------------
+
+/// A doc block is often a *list* of items rather than one: `ty` sends every
+/// overload of a function as its own signature line. Together they are not a
+/// fragment of anything — no framing takes both — so the whole block used to drop
+/// to the repaint and lose the structure each line has on its own. Each line is
+/// framed in its own right instead, and may take a different rung of the ladder.
+#[test]
+fn a_block_of_items_is_framed_item_by_item() {
+    let mut engine = engine();
+    engine.set_fragment_context(
+        "rust",
+        vec![
+            "struct __nx {\n%s\n}".to_string(),
+            "fn __nx() {\n%s\n}".to_string(),
+        ],
+    );
+    // A statement and a field: clean in *different* framings, in neither together.
+    let text = "let x = 1;\nfield: Vec<String>,\n";
+
+    let frag = painted(&mut engine, text, true);
+    assert_eq!(
+        group_of(&frag, "let"),
+        Some("keyword"),
+        "line 0 is framed as a statement; got {frag:?}"
+    );
+    assert_eq!(
+        group_of(&frag, "field"),
+        Some("property"),
+        "line 1 takes a different rung and is framed as a field; got {frag:?}"
+    );
+    assert_eq!(
+        group_of(&frag, "Vec"),
+        Some("type"),
+        "…which is structure the whole-block repaint cannot recover; got {frag:?}"
+    );
+
+    // Every span lands on its own line, at that line's own columns.
+    let spans = engine.highlight_fragment("rust", text, 0, 2);
+    let lens = [10, 19];
+    assert!(
+        spans.iter().all(|s| s.end_byte <= lens[s.line]),
+        "no span may run past its own line: {spans:?}"
+    );
+}
+
+/// A blank line between items is skipped rather than failing the split, and an item
+/// carrying its own display annotation is peeled inside it — the two shapes a
+/// python hover arrives in (`ty` blank-separates its overloads, `pyright` annotates
+/// each one).
+#[test]
+fn blank_lines_and_per_item_annotations_ride_the_split() {
+    let mut engine = engine();
+    engine.set_fragment_context(
+        "rust",
+        vec![
+            "struct __nx {\n%s\n}".to_string(),
+            "fn __nx() {\n%s\n}".to_string(),
+        ],
+    );
+    let text = "let x = 1;\n\n(field) count: Vec<String>\n";
+    let frag = painted(&mut engine, text, true);
+
+    assert_eq!(group_of(&frag, "let"), Some("keyword"), "got {frag:?}");
+    assert_eq!(group_of(&frag, "count"), Some("property"), "got {frag:?}");
+    assert_eq!(group_of(&frag, "(field)"), Some("comment"), "got {frag:?}");
+
+    let spans = engine.highlight_fragment("rust", text, 0, 3);
+    assert!(
+        spans.iter().any(|s| s.line == 2),
+        "the item after the blank line keeps its own line index: {spans:?}"
+    );
+    assert!(
+        !spans.iter().any(|s| s.line == 1),
+        "nothing is painted on the blank line: {spans:?}"
+    );
+}
+
+/// The split is all-or-nothing too: one line that isn't a whole item of its own
+/// means the block isn't a list, and forcing it would highlight the lines that
+/// happen to parse out of a context the parse says isn't there. It falls back to the
+/// whole-block repaint — which still refuses to name a construct.
+#[test]
+fn one_unresolvable_line_drops_the_whole_split() {
+    let mut engine = engine();
+    engine.set_fragment_context("rust", vec!["struct __nx {\n%s\n}".to_string()]);
+    let frag = painted(&mut engine, "field: Vec<String>,\n@@@\n", true);
+
+    assert_eq!(
+        group_of(&frag, "Vec"),
+        None,
+        "the split is dropped, so line 0 is not framed either; got {frag:?}"
+    );
+    assert!(
+        !frag.is_empty(),
+        "the repaint still paints what it can vouch for; got {frag:?}"
+    );
+}
+
 /// A same-line opener is *not* indentation, so it stays a first-line-only shift: a
 /// second line must not have the opener's width taken off it.
 #[test]

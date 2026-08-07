@@ -16,8 +16,8 @@
 -- the server invented for display. This config fakes those replies with a
 -- completion source so you can see all three outcomes without a language server.
 --
--- Type `fie`, `let`, `sig`, `dia`, `pyd` or `pyc` in insert mode; `<C-n>` selects a
--- row and the documentation float opens beside the popup.
+-- Type `fie`, `let`, `sig`, `dia`, `pyd`, `pyc`, `pym` or `pyo` in insert mode;
+-- `<C-n>` selects a row and the documentation float opens beside the popup.
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
@@ -49,6 +49,13 @@ nx.complete.source({
       { text = "pyd", doc = "```python\ndef frobnicate(name: str, count: int) -> bool\n```" },
       -- 6. a python class header, likewise
       { text = "pyc", doc = "```python\nclass Registry(Mapping)\n```" },
+      -- 7. pyright's shape: a display label in front of a bare signature
+      { text = "pym", doc = "```python\n(method) join(self, sep: str) -> str\n```" },
+      -- 8. ty's shape: one block holding every overload as its own line
+      {
+        text = "pyo",
+        doc = "```python\ndef join(self, x: str) -> str\ndef join(self, x: bytes) -> bytes\n```",
+      },
     }
     for _, item in ipairs(items) do
       if item.text:find(ctx.prefix, 1, true) == 1 then
@@ -89,6 +96,27 @@ nx.complete.setup({ sources = { { "hoverdemo" } } })
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
+-- 2c. A DISPLAY LABEL, and a block that is a LIST.
+--
+-- Two shapes the ladder is run for you on, because as written no framing can take
+-- either. `pyright` puts its own label in front of the code — `(method) `,
+-- `(class) `, `(type alias) ` — which is what stops the signature behind it from
+-- framing; it is peeled off, the ladder runs on the rest, and the label is painted
+-- like a comment. And `ty` answers a hover on an overloaded function with EVERY
+-- signature, one per line: together they are a fragment of nothing, so each line is
+-- resolved in its own right.
+--
+-- Both are all-or-nothing. The dialect in section 2 is peeled too — and what is
+-- left still fits no framing, so the peel leaves no trace and the block falls to
+-- the repaint whole, exactly as before.
+--
+-- Type-this:  <Esc> d d i p y m <C-n>       (then again with `pyo`)
+-- See-that:   `pym` — `(method)` is dimmed like a comment while `join` is a
+--             function and `sep` / `str` a parameter and a type.
+--             `pyo` — BOTH overload rows are fully coloured, not just the first.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
 -- 3. Teach it a framing of your own.
 --
 -- `fragment_context` replaces a language's list of framings. Each template holds
@@ -113,6 +141,7 @@ nx.treesitter.fragment_context("python", {
   "class __nx:\n%s", -- a member block that already carries its indentation
   "class __nx:\n    %s", -- a flush member block: indented line by line
   "def __nx():\n    %s", -- a flush statement block, likewise
+  "def %s:\n    pass\n", -- a BARE signature: the `def` a hover dropped
 })
 
 --------------------------------------------------------------------------------

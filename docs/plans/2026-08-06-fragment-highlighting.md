@@ -268,3 +268,53 @@ sees it. With the chain merged by hand the framings paint correctly (`get` keywo
 `name` method, `async` coroutine keyword). Worth knowing when reading engine-level
 output: **`Engine` alone under-highlights every inherits-based grammar**, and any
 future engine test for those languages has to merge the chain itself.
+
+---
+
+## Phase 3 — the two shapes the ladder can't take as written (2026-08-07)
+
+Testing against real python servers turned up two hover shapes that fell all the
+way to the repaint, each for a reason the ladder cannot fix by adding rungs: what
+needs framing isn't the text as sent.
+
+**A display label in front of the code.** `pyright` writes `(class) Asdfd`,
+`(method) def join(self, x: str) -> str`, `(variable) count: int` — and `tsserver`
+`(property) Foo.bar: number`. The label is the server's own annotation, not source;
+its presence is what makes an otherwise framable signature unparseable, so every
+one of these lost its structure. `annotation_prefix` takes it off — a parenthesised
+run of words at the start of line 1, followed by a space and then code — the ladder
+runs again on the remainder, the spans shift back over the label's width, and the
+label itself paints `comment`, the non-code text it is.
+
+**A block that is a list, not a fragment.** `ty` answers a hover on an overloaded
+function with *every* signature, one per line (blank-separated or not). Each line
+frames cleanly on its own; together they are a fragment of nothing, and the whole
+block dropped to the repaint — so a two-overload hover was *less* highlighted than
+a one-overload hover. `split_fragment` resolves line by line instead, each through
+its own ladder and its own peel, possibly landing on different rungs (the test pins
+a statement and a struct field in one block).
+
+Both are all-or-nothing, which is the same rule Phase 2 already lives by: a peel
+whose remainder doesn't frame leaves no trace (no label span over text nothing
+explained), and one line that isn't a whole item drops the whole split. Otherwise a
+"list" would be whatever lines happened to parse out of a context the parse says
+isn't there. `MAX_SPLIT_ITEMS` (64) bounds the split: past it a block is far likelier
+to be real source that failed to parse than a list of overloads, and the repaint is
+the cheap answer.
+
+One rung was added on the way: python's `def %s:\n    pass\n`, for a **bare**
+signature (`join(self, x: str) -> str`) — which is what a `(method)` hover is once
+its label comes off, in servers that don't repeat the `def`.
+
+Measured on the real python grammar, all six shapes now come back fully framed
+(`def` keyword, `join` function, `self` builtin, `x` parameter, `str` type); before,
+four of them painted nothing but brackets and operators. tsserver's dotted
+`(property) Foo.bar: number` still doesn't frame after the peel — `Foo.bar` is not a
+member name in any TS framing — and correctly leaves no label span.
+
+**Tests** — `crates/nxvim-ts/tests/fragment_highlight.rs`: the peel (structure +
+columns), a peel whose body still fails leaving no trace, an item split across two
+different rungs, blank lines and per-item labels riding it, and one unresolvable
+line dropping the whole split. `crates/nxvim/tests/syntax.rs`: both shapes in one
+doc float through the shipped framings (mutation-checked by disabling the peel and
+the split).

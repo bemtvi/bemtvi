@@ -392,13 +392,16 @@ local FRAGMENT_CONTEXTS = {
   },
   -- A python hover is very often a header with no body (`def f(a: int) -> bool`,
   -- `class Foo(Base)`, `if x > 1`): giving it a colon and a `pass` is what makes it
-  -- a statement. The last two rungs indent a flush block into a class/function.
+  -- a statement. The middle rungs indent a flush block into a class/function; the
+  -- last supplies the `def` a *bare* signature drops (`join(self, x: str) -> str`,
+  -- what a pyright method hover is once its `(method)` label is peeled off).
   python = {
     "%s:\n    pass\n",
     "class __nx:\n%s",
     "def __nx():\n%s",
     "class __nx:\n    %s",
     "def __nx():\n    %s",
+    "def %s:\n    pass\n",
   },
   -- Go's `source_file` wants a package clause, so every framing carries one.
   go = {
@@ -495,6 +498,17 @@ local FRAGMENT_CONTEXTS = {
 -- A same-line framing works too (`"fn __nx() { return %s }"`) — there the prefix's
 -- width comes off the first line only. The wrapped text always ends in a newline,
 -- because some grammars (go) treat a missing final terminator as a parse defect.
+--
+-- **Two shapes the ladder is run for you on.** A hover often carries the server's
+-- own display label in front of the code — `pyright` sends
+-- `(method) def join(self, x: str) -> str`, `tsserver` `(property) Foo.bar: number`
+-- — and that label is what stops an otherwise framable signature from framing. It
+-- is peeled off, the ladder runs on the rest, and the label itself is painted as a
+-- `comment`. And a block that is a *list* rather than one fragment — `ty` sends
+-- every overload of a function as its own signature line — is resolved line by
+-- line, each through its own ladder. Both are all-or-nothing: a peel or a split
+-- that doesn't end in a clean parse leaves no trace, and the block falls to the
+-- repaint whole.
 --
 -- Calling this replaces the language's list; passing `{}` turns the ladder off for
 -- it. nxvim ships defaults for rust, python, go, lua, javascript, typescript, tsx,

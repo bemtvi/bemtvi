@@ -1565,6 +1565,86 @@ nx.complete.setup { sources = { { 'hover' } } }",
     );
 }
 
+/// The two shapes a real hover arrives in that no framing can take *as written*,
+/// end to end on the shipped framings: a code block whose first line carries the
+/// server's own display label (`pyright` sends `(method) def join(self) -> str`,
+/// `tsserver` `(property) Foo.bar: number`) and which holds a *list* of items rather
+/// than one fragment (`ty` sends every overload as its own signature line).
+///
+/// Both used to drop the whole block to the conservative repaint — the label made
+/// line 1 unparseable, and no framing takes two unrelated items — so a hover lost
+/// exactly the structure fragment mode exists to recover. The label is peeled and
+/// each item resolved in its own right instead, so both rows come back framed.
+#[tokio::test]
+async fn a_labelled_multi_item_doc_float_block_is_framed_row_by_row() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let config_dir = temp_dir("frag-items-config");
+    std::fs::write(
+        config_dir.join("init.lua"),
+        "\
+nx.complete.source {\n\
+  name = 'hover', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('field'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'field',\n\
+        doc = '```rust\\n(field) count: Vec<String>\\nlet x = 1;\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'hover' } } }",
+    )
+    .expect("write init.lua");
+    let file = write_temp("frag-items", "rs", "\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(config_dir)).await;
+
+    feed(&rpc, "ifie");
+    feed(&rpc, "<C-n>");
+
+    // The labelled row and the second item's row, each as its own group list.
+    let (mut labelled, mut item) = (Vec::new(), Vec::new());
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[CompletionDocs]") {
+                let lines = win_text(&win);
+                let groups = |needle: &str| -> Vec<String> {
+                    lines
+                        .iter()
+                        .position(|l| l.contains(needle))
+                        .and_then(|row| win_hl(&win).get(row).cloned())
+                        .map(|spans| spans.iter().map(|(_, _, g)| g.clone()).collect())
+                        .unwrap_or_default()
+                };
+                labelled = groups("(field) count");
+                item = groups("let x = 1;");
+                if labelled.iter().any(|g| g == "type") && item.iter().any(|g| g == "keyword") {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        labelled.iter().any(|g| g == "type"),
+        "the peeled row is framed as a struct field, so `Vec` is a real type: {labelled:?}"
+    );
+    assert!(
+        labelled.iter().any(|g| g == "property"),
+        "…and `count` the field it names: {labelled:?}"
+    );
+    assert!(
+        labelled.iter().any(|g| g == "comment"),
+        "the display label itself paints as the non-code text it is: {labelled:?}"
+    );
+    assert!(
+        item.iter().any(|g| g == "keyword"),
+        "the second item takes a different rung and is framed as a statement: {item:?}"
+    );
+}
+
 /// End-to-end proof for the `; inherits:` fix, on the surface that was actually
 /// broken: **folds**.
 ///

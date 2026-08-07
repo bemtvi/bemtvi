@@ -64,5 +64,8 @@ pub use options::{
     WindowOptions,
 };
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};
-pub use syntax::{FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
+pub use syntax::{
+    parse_query_inherits, query_extends, FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine,
+    ENGINE_QUERY_NAMES,
+};
 pub use view::{ContentFloatView, MenuView, TabView, View, ViewRect, WindowView};

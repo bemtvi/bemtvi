@@ -110,12 +110,20 @@ impl Grammar {
 
         let hl_src = match overrides.get(&(lang.to_string(), "highlights".to_string())) {
             Some(text) => text.clone(),
-            None => {
-                let hl_path = query_path(data_dir, lang, "highlights.scm");
-                std::fs::read_to_string(&hl_path)
-                    .with_context(|| format!("reading {}", hl_path.display()))
-                    .map_err(LoadError::Failed)?
-            }
+            None => resolve_query(data_dir, lang, "highlights")
+                .with_context(|| {
+                    format!(
+                        "reading {}",
+                        query_path(data_dir, lang, "highlights.scm").display()
+                    )
+                })
+                .map_err(LoadError::Failed)?
+                .ok_or_else(|| {
+                    LoadError::Failed(anyhow!(
+                        "reading {}: no such file",
+                        query_path(data_dir, lang, "highlights.scm").display()
+                    ))
+                })?,
         };
         let query = compile_query(&language, &hl_src)
             .with_context(|| format!("compiling {lang} highlights"))
@@ -157,18 +165,12 @@ fn load_optional_query(
 ) -> Result<Option<Query>, LoadError> {
     let src = match overrides.get(&(lang.to_string(), name.to_string())) {
         Some(text) => Some(text.clone()),
-        None => {
-            let path = query_path(data_dir, lang, &format!("{name}.scm"));
-            match std::fs::read_to_string(&path) {
-                Ok(src) => Some(src),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(LoadError::Failed(
-                        anyhow::Error::new(e).context(format!("reading {}", path.display())),
-                    ))
-                }
-            }
-        }
+        None => resolve_query(data_dir, lang, name).map_err(|e| {
+            LoadError::Failed(anyhow::Error::new(e).context(format!(
+                "reading {}",
+                query_path(data_dir, lang, &format!("{name}.scm")).display()
+            )))
+        })?,
     };
     match src {
         Some(s) => Ok(Some(
@@ -276,6 +278,114 @@ pub(crate) fn native_lib_ext() -> &'static str {
 
 pub(crate) fn query_path(data_dir: &Path, lang: &str, file: &str) -> PathBuf {
     data_dir.join("queries").join(lang).join(file)
+}
+
+/// Read exactly one `<name>.scm` for `lang` under `root` — no `; inherits:`
+/// resolution. `Ok(None)` when the file is absent (an optional query a language
+/// simply doesn't ship).
+pub(crate) fn read_one_query(
+    root: &Path,
+    lang: &str,
+    name: &str,
+) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(query_path(root, lang, &format!("{name}.scm"))) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The languages `(lang, name)` inherits, transitively, in merge order — deepest
+/// ancestor first, `lang` itself excluded. Cycle-guarded, so a chain that loops
+/// back terminates instead of recursing forever.
+///
+/// nvim-treesitter shares one query set between related grammars this way:
+/// `javascript/folds.scm` is *only* `; inherits: ecma,jsx`, with every pattern in
+/// `ecma/folds.scm`. The whole chain resolves within `root`, the same root the
+/// parser loaded from, so a grammar borrowed from a read-only fallback root reads
+/// *its* ancestors rather than a half-matched pair.
+pub(crate) fn query_inherits(root: &Path, lang: &str, name: &str) -> Vec<String> {
+    fn walk(
+        root: &Path,
+        lang: &str,
+        name: &str,
+        chain: &mut Vec<String>,
+        seen: &mut HashMap<String, ()>,
+    ) {
+        let Ok(Some(text)) = read_one_query(root, lang, name) else {
+            return;
+        };
+        for parent in nxvim_core::parse_query_inherits(&text) {
+            if seen.insert(parent.clone(), ()).is_some() {
+                continue; // already pulled in via another edge, or a cycle
+            }
+            walk(root, &parent, name, chain, seen); // post-order: ancestors first
+            chain.push(parent);
+        }
+    }
+    let mut chain = Vec::new();
+    let mut seen = HashMap::from([(lang.to_string(), ())]);
+    walk(root, lang, name, &mut chain, &mut seen);
+    chain
+}
+
+/// The query source for `(lang, name)` as the engine compiles it: the file's own
+/// text with every `; inherits:` ancestor folded in. `Ok(None)` when the language
+/// has no such file.
+///
+/// Merge order is ancestors first, this language last, so its own patterns are the
+/// later write and win a tie against what it inherits. The file's leading comment
+/// block is re-emitted *first*, ahead of the ancestors, so the `; inherits:`
+/// modeline stays where a reader finds it — the server parses the chain off this
+/// very text to pull runtimepath overlays for the inherited languages, which the
+/// engine cannot see. Comments are inert in a query, so the duplicate costs nothing.
+///
+/// This is the **one** query reader: `Grammar::load` compiles what it returns and
+/// [`Engine::base_query`](crate::Engine::base_query) reports it, so the compiled
+/// query and the text the server diffs against can never drift.
+pub(crate) fn resolve_query(
+    root: &Path,
+    lang: &str,
+    name: &str,
+) -> std::io::Result<Option<String>> {
+    let Some(own) = read_one_query(root, lang, name)? else {
+        return Ok(None);
+    };
+    let inherited = query_inherits(root, lang, name);
+    if inherited.is_empty() {
+        return Ok(Some(own));
+    }
+    let (head, body) = split_leading_comments(&own);
+    let mut merged = String::with_capacity(own.len() * 2);
+    merged.push_str(head);
+    for ancestor in &inherited {
+        if let Some(text) = read_one_query(root, ancestor, name)? {
+            // Drop the ancestor's own modeline block: its chain is already flattened
+            // into `inherited`, and a stray modeline mid-file would only mislead a
+            // later reader.
+            merged.push_str(split_leading_comments(&text).1);
+            merged.push('\n');
+        }
+    }
+    merged.push_str(body);
+    Ok(Some(merged))
+}
+
+/// Split a query file at the end of its **leading comment block**: `(head, body)`,
+/// where `head` is the run of `;`-comment and blank lines the file opens with (the
+/// `; inherits:` modeline lives there) and `body` is everything from the first
+/// pattern on.
+fn split_leading_comments(text: &str) -> (&str, &str) {
+    let mut cut = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            cut += line.len();
+        } else {
+            break;
+        }
+    }
+    text.split_at(cut)
 }
 
 /// Compile a query, first making its source palatable to our tree-sitter binding.

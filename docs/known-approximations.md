@@ -53,17 +53,26 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
   wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
   Rust indent stays.
-- **Treesitter query resolution — additive, host-only.** The query bridge
+- **Treesitter query resolution.** The query bridge
   ([design](specs/2026-06-08-treesitter-query-bridge-design.md)) merges a language's
   bundled base with runtimepath `queries/` + `after/queries/` and the `; inherits:`
   chain — and `:TSInstall` fetches the inherited query sets too (`javascript` →
-  `ecma`,`jsx`), so base js/ts highlighting carries the `ecma` patterns. Two edges
-  remain: (1) the merge is **additive concatenation**, not neovim's full
-  replace-vs-extend precedence; (2) it resolves only the **buffer's own** language —
-  an **injected child** grammar still loads its query off disk raw, so an
-  `; inherits:`-based child (e.g. `javascript` injected into markdown) paints only
-  its own non-inherited captures until that child language is itself opened as a
-  buffer (which installs its resolved overlay).
+  `ecma`,`jsx`), so base js/ts highlighting carries the `ecma` patterns. `;; extends`
+  carries its upstream meaning: a runtimepath file with it is *added*, one without it
+  *replaces* that language's bundled query (first in runtimepath order wins). Two
+  deliberate deviations remain:
+  (1) **extension ordering** — every extension lands after every base, including the
+  bases of inherited languages, so an `after/queries` customization wins a tie
+  against what it customizes; upstream interleaves per language, which lets a
+  *bundled* pattern of the outer language beat a user's extension of an inherited
+  one. (2) **`; inherits: (lang)`** — upstream's parenthesized form means "inherit
+  only when this query is loaded for an *injected* language"; nxvim doesn't model the
+  condition, and such a name simply doesn't resolve, so the language is not
+  inherited. No shipped nvim-treesitter query uses it.
+  *(Two former edges are closed: the bundled `; inherits:` chain is now resolved by
+  the engine's own query reader, so every grammar it loads gets it — **injected
+  children** included, where `javascript` inside a markdown fence used to paint only
+  its non-inherited captures; and resolution is no longer additive-only.)*
 - **No `vim.uv` / `vim.loop`.** neovim exposes libuv as a public Lua API; nxvim
   does not — the `vim.uv` / `vim.loop` table does not exist, so a plugin reaching
   for it hits a loud nil index. Both the libuv **handle** surface (`new_timer` /

@@ -1562,6 +1562,17 @@ pub enum TsOp {
         text: String,
         cb_id: u64,
     },
+    /// `nx.treesitter.fragment_context(lang, templates)`: install the framings the
+    /// **fragment** highlighter (LSP hover / completion-docs code blocks) tries, in
+    /// order, when a snippet doesn't parse on its own — each a template with one
+    /// `%s` where the snippet goes (`"struct __nx {\n%s\n}"`). Replaces the
+    /// language's list; an empty list turns the ladder off for it. Plain editor-side
+    /// engine config, applied in every build: the wasm JS-side highlighter does no
+    /// off-buffer highlighting at all, so it simply has no ladder to configure.
+    SetFragmentContext {
+        lang: String,
+        templates: Vec<String>,
+    },
 }
 
 /// Where a [`WindowOp::Jump`] opens its target — the picker's confirm gesture.

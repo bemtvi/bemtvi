@@ -1,0 +1,9 @@
+Fragment highlighting demo — type in INSERT mode, then <C-n>.
+
+  fie   a struct-field hover      -> framed, real types
+  let   a statement hover         -> framed, real parse
+  sig   a body-less signature     -> parses on its own
+  dia   an annotation dialect     -> nothing guessed
+
+Scratch space (open insert here):
+

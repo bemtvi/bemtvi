@@ -4181,6 +4181,20 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._ts_fragment_context(lang, templates)`: the native setter behind
+    // `nx.treesitter.fragment_context`. Queues a [`TsOp::SetFragmentContext`] the
+    // server hands to the engine's fragment highlighter (the LSP doc-block path).
+    let sh = shared.clone();
+    nx.set(
+        "_ts_fragment_context",
+        lua.create_function(move |_, (lang, templates): (String, Vec<String>)| {
+            sh.borrow_mut()
+                .ts_ops
+                .push(TsOp::SetFragmentContext { lang, templates });
+            Ok(())
+        })?,
+    )?;
+
     // `nx._textobject_map(lhs, capture|nil)`: the native setter behind
     // `nx.textobject.map`. Queues a [`TextObjectOp`] the server applies to the
     // editor's text-object registry — bind `lhs` (`"il"`, `"af"`) to the exact

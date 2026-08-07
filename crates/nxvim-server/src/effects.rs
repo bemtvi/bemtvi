@@ -770,6 +770,15 @@ impl EditHost {
                         "E: nx.treesitter.set_query is not available in the browser build yet",
                     );
                 }
+                // Unlike `SetQuery`, this needs no cfg split and never fails loud: it
+                // is config for the *fragment* highlighter, and the wasm JS-side
+                // engine does no off-buffer highlighting at all, so it has no ladder
+                // to configure. The prelude ships defaults for several languages, so a
+                // loud arm here would greet every browser session with a wall of
+                // errors about a surface that isn't there.
+                TsOp::SetFragmentContext { lang, templates } => {
+                    self.editor.set_ts_fragment_context(&lang, templates);
+                }
             }
         }
         // User tree-sitter text-object bindings from `nx.textobject.map`: applied to

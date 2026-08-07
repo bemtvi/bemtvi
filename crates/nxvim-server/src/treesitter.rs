@@ -21,34 +21,6 @@ use nxvim_core::{unicode, view::WindowView, BufferId, WinHl};
 use rmpv::Value;
 use std::collections::HashMap;
 
-/// Language names from a query file's `; inherits: a,b,c` modeline(s) — the
-/// languages whose same-named query this one builds on. Only the leading comment
-/// block is scanned (the modeline is conventionally the first line); scanning stops
-/// at the first non-comment line, so a stray `inherits:` deeper in the file is
-/// ignored. Returns them in declared order; empty when there is no modeline.
-fn parse_inherits(text: &str) -> Vec<String> {
-    let mut langs = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if !line.starts_with(';') {
-            break; // past the leading comment block — modelines live only there
-        }
-        let body = line.trim_start_matches(';').trim();
-        if let Some(rest) = body.strip_prefix("inherits:") {
-            langs.extend(
-                rest.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
-            );
-        }
-    }
-    langs
-}
-
 /// A cached highlight span in buffer coordinates: a byte range within a line.
 #[derive(Clone)]
 pub(crate) struct ByteSpan {
@@ -227,9 +199,8 @@ impl EditHost {
         }
         let rtp = self.lua.runtimepath().to_vec();
         let mut applied = false;
-        for name in ["highlights", "indents", "injections", "textobjects"] {
-            let mut visited = std::collections::HashSet::new();
-            let parts = self.collect_query_parts(lang, name, &rtp, &mut visited);
+        for name in nxvim_core::ENGINE_QUERY_NAMES {
+            let parts = self.collect_query_parts(lang, name, &rtp);
             if parts.is_empty() {
                 continue;
             }
@@ -250,42 +221,89 @@ impl EditHost {
         }
     }
 
-    /// Gather the query texts for `(lang, name)` in merge order — the engine's
-    /// bundled base, then this language's runtimepath `queries/` and
-    /// `after/queries/` files — and, for every `; inherits: a,b` modeline found in
-    /// any of them, the same gathered for each inherited language **first** (so a
-    /// language's own patterns override what it inherits). `visited` guards the
-    /// inherit graph against cycles. Empty when nothing exists for the language.
+    /// Gather the query texts for `(lang, name)` in merge order — the language's
+    /// bundled base plus every runtimepath `queries/` / `after/queries/` file, for
+    /// this language *and* each language it inherits.
+    ///
+    /// A runtimepath file's relationship to the bundled one is decided by its
+    /// modeline, upstream's rule: a file carrying `;; extends` is **added**, and a
+    /// file without one **replaces** its language's bundled query outright (the
+    /// first such file in runtimepath order wins; a later one is dropped, exactly as
+    /// neovim drops it). Without that, a drop-in `queries/rust/highlights.scm` could
+    /// only ever add to the shipped query — a config could never remove a pattern or
+    /// redefine the set as a whole.
+    ///
+    /// Replacing one link means rebuilding the chain from its links, so that path
+    /// composes from the *raw* per-language bases
+    /// ([`ts_base_query_raw`](nxvim_core::Editor::ts_base_query_raw)) rather than the
+    /// engine's already-merged one. With nothing on the runtimepath at all, the
+    /// engine's own base is returned byte-for-byte, so `set_query_overlay` recognizes
+    /// it and an uncustomized language stays on the plain disk-read path.
+    ///
+    /// Extensions land after every base — including the bases of inherited languages
+    /// — so an `after/queries` customization is the later write and wins a tie
+    /// against what it customizes. (Upstream interleaves them per language, which
+    /// lets a *bundled* pattern of the outer language beat a user's extension of an
+    /// inherited one; that is not what someone writing an `after/` file means.)
     fn collect_query_parts(
         &self,
         lang: &str,
         name: &str,
         rtp: &[std::path::PathBuf],
-        visited: &mut std::collections::HashSet<String>,
     ) -> Vec<String> {
-        if !visited.insert(lang.to_string()) {
-            return Vec::new(); // already pulled in via another inherit edge
-        }
-        // This language's own texts: bundled base, then runtimepath `queries/` and
-        // `after/queries/` (each in runtimepath order).
-        let mut own: Vec<String> = Vec::new();
-        if let Some(base) = self.editor.ts_base_query(lang, name) {
-            own.push(base);
-        }
-        for sub in ["queries", "after/queries"] {
-            for dir in rtp {
-                let path = dir.join(sub).join(lang).join(format!("{name}.scm"));
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    own.push(text);
+        // The languages to sweep: bundled ancestors first, this language last.
+        // `pending` grows if a runtimepath file declares an inherit of its own.
+        let mut pending = self.editor.ts_query_inherits(lang, name);
+        pending.push(lang.to_string());
+        let mut seen: std::collections::HashSet<String> = pending.iter().cloned().collect();
+
+        // Per language, in chain order: the file that replaces its bundled query (if
+        // any) and the files that extend it.
+        let mut replacements: Vec<(String, Option<String>)> = Vec::new();
+        let mut extensions: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < pending.len() {
+            let l = pending[i].clone();
+            i += 1;
+            let mut replacement: Option<String> = None;
+            for sub in ["queries", "after/queries"] {
+                for dir in rtp {
+                    let path = dir.join(sub).join(&l).join(format!("{name}.scm"));
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for extra in nxvim_core::parse_query_inherits(&text) {
+                        if seen.insert(extra.clone()) {
+                            pending.push(extra);
+                        }
+                    }
+                    if nxvim_core::query_extends(&text) {
+                        extensions.push(text);
+                    } else if replacement.is_none() {
+                        replacement = Some(text); // the first one is the base
+                    }
                 }
             }
+            replacements.push((l, replacement));
         }
-        // Inherited languages (from any `; inherits:` modeline) contribute first.
+
+        // Nothing on the runtimepath for this language or anything it inherits: hand
+        // back the engine's own base unchanged, so the overlay is recognized as a
+        // no-op and the buffer stays on the disk-read path.
+        if extensions.is_empty() && replacements.iter().all(|(_, r)| r.is_none()) {
+            return self.editor.ts_base_query(lang, name).into_iter().collect();
+        }
+
         let mut parts: Vec<String> = Vec::new();
-        for inherited in own.iter().flat_map(|t| parse_inherits(t)) {
-            parts.extend(self.collect_query_parts(&inherited, name, rtp, visited));
+        for (l, replacement) in replacements {
+            match replacement {
+                Some(text) => parts.push(text),
+                // Not replaced: this language contributes its own bundled query —
+                // the raw single file, since the chain is being rebuilt link by link.
+                None => parts.extend(self.editor.ts_base_query_raw(&l, name)),
+            }
         }
-        parts.extend(own);
+        parts.extend(extensions);
         parts
     }
 

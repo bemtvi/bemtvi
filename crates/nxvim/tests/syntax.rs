@@ -1352,3 +1352,458 @@ async fn rendered_markdown_float_injects_rust_into_code_blocks() {
         "the example float injects rust: `fn` in the code block paints as a keyword"
     );
 }
+
+/// The window whose scratch buffer is `name` in a redraw, or `None`.
+fn named_win(params: &[Value], name: &str) -> Option<Vec<(Value, Value)>> {
+    let Value::Map(map) = params.first()? else {
+        return None;
+    };
+    let windows = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("windows"))?
+        .1
+        .as_array()?;
+    windows
+        .iter()
+        .filter_map(Value::as_map)
+        .find(|w| {
+            w.iter()
+                .any(|(k, v)| k.as_str() == Some("file_name") && v.as_str() == Some(name))
+        })
+        .map(|w| w.to_vec())
+}
+
+/// End-to-end proof that an LSP doc float highlights its code blocks as
+/// **fragments**, not whole files. A completion source pushes a fenced block holding
+/// a field-hover fragment (`field: Vec<String>` — the shape rust-analyzer and
+/// `lua_ls` send); parsed as a whole file it is 94% `ERROR` bytes and the recovered
+/// parse paints `Vec` as `@constructor`, a construct that isn't in the text. The
+/// float must not show that lie — while still painting the tokens it can vouch for.
+///
+/// The config turns the **framing ladder** off for rust (`fragment_context` with an
+/// empty list), so this isolates the conservative repaint; the shipped framings, and
+/// the structure they recover instead, are
+/// [the next test](a_shipped_fragment_context_recovers_structure_in_a_doc_float).
+#[tokio::test]
+async fn a_doc_float_code_block_is_highlighted_as_a_fragment() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let config_dir = temp_dir("frag-docs-config");
+    std::fs::write(
+        config_dir.join("init.lua"),
+        "\
+nx.treesitter.fragment_context('rust', {})\n\
+nx.complete.source {\n\
+  name = 'hover', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('field'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'field', doc = '```rust\\nfield: Vec<String>\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'hover' } } }",
+    )
+    .expect("write init.lua");
+    let file = write_temp("frag-docs", "rs", "\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(config_dir)).await;
+
+    feed(&rpc, "ifie");
+    feed(&rpc, "<C-n>"); // select the row: the docs float renders the item's `doc`
+
+    // Poll for the docs float showing the fragment, then read that row's spans.
+    let mut spans: Option<Vec<(u64, u64, String)>> = None;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[CompletionDocs]") {
+                let lines = win_text(&win);
+                if let Some(row) = lines.iter().position(|l| l.contains("field: Vec<String>")) {
+                    if let Some(row_spans) = win_hl(&win).get(row) {
+                        spans = Some(row_spans.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let spans = spans.expect("the docs float renders the fenced fragment");
+
+    assert!(
+        !spans
+            .iter()
+            .any(|(_, _, g)| g.split('.').next() == Some("constructor")),
+        "a construct recovered from an ERROR must not reach the float: {spans:?}"
+    );
+    assert!(
+        !spans.iter().any(|(_, _, g)| g == "type"),
+        "with the ladder off there is no framed parse to name a type: {spans:?}"
+    );
+    // …and the fragment is not simply left plain: the tokens the parse *can* vouch
+    // for (here the `:` delimiter and the `<` / `>` operators) are still painted.
+    assert!(
+        spans.iter().any(|(_, _, g)| {
+            matches!(g.split('.').next(), Some("punctuation") | Some("operator"))
+        }),
+        "the fragment repaint still paints the tokens it can vouch for: {spans:?}"
+    );
+}
+
+/// A **one-line** fenced block in a doc float is highlighted at all. The block text
+/// is handed to the off-buffer highlighter, which treats a rope's last line as the
+/// phantom one — so without a trailing newline a single-line block resolves to zero
+/// visible lines and every span is dropped. A bare signature on one line is the
+/// commonest hover there is, so this was most of "hover isn't highlighted".
+#[tokio::test]
+async fn a_one_line_doc_float_code_block_is_highlighted() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let config_dir = temp_dir("oneline-docs-config");
+    std::fs::write(
+        config_dir.join("init.lua"),
+        "\
+nx.complete.source {\n\
+  name = 'hover', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('field'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'field', doc = '```rust\\nfn zzz() {}\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'hover' } } }",
+    )
+    .expect("write init.lua");
+    let file = write_temp("oneline-docs", "rs", "\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(config_dir)).await;
+
+    feed(&rpc, "ifie");
+    feed(&rpc, "<C-n>");
+
+    let mut painted = false;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[CompletionDocs]") {
+                if let Some(row) = win_text(&win).iter().position(|l| l.contains("fn zzz")) {
+                    if let Some(spans) = win_hl(&win).get(row) {
+                        painted = spans
+                            .iter()
+                            .any(|(_, _, g)| g.split('.').next() == Some("keyword"));
+                        if painted {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        painted,
+        "the one-line block's `fn` paints as a rust keyword in the docs float"
+    );
+}
+
+/// The Phase 2 chain, end to end, on the **shipped** framings — no config at all.
+/// `nx.treesitter.fragment_context` runs from the prelude, so a field hover that
+/// cannot stand on its own is framed as a struct body and gets its real structure
+/// back: `Vec` paints as `@type`, where the ladder-off run above leaves it plain and
+/// the whole-file path called it `@constructor`.
+#[tokio::test]
+async fn a_shipped_fragment_context_recovers_structure_in_a_doc_float() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let config_dir = temp_dir("frag-ctx-config");
+    std::fs::write(
+        config_dir.join("init.lua"),
+        "\
+nx.complete.source {\n\
+  name = 'hover', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('field'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'field', doc = '```rust\\nfield: Vec<String>\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'hover' } } }",
+    )
+    .expect("write init.lua");
+    let file = write_temp("frag-ctx", "rs", "\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(config_dir)).await;
+
+    feed(&rpc, "ifie");
+    feed(&rpc, "<C-n>");
+
+    let mut groups: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[CompletionDocs]") {
+                let lines = win_text(&win);
+                if let Some(row) = lines.iter().position(|l| l.contains("field: Vec<String>")) {
+                    if let Some(spans) = win_hl(&win).get(row) {
+                        groups = spans.iter().map(|(_, _, g)| g.clone()).collect();
+                        if groups.iter().any(|g| g == "type") {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        groups.iter().any(|g| g == "type"),
+        "the shipped framing must recover `Vec` / `String` as real types: {groups:?}"
+    );
+    assert!(
+        !groups.iter().any(|g| g == "constructor"),
+        "and never resurrect the whole-file path's invented construct: {groups:?}"
+    );
+}
+
+/// End-to-end proof for the `; inherits:` fix, on the surface that was actually
+/// broken: **folds**.
+///
+/// nvim-treesitter's `javascript/folds.scm` is *only* the line `; inherits: ecma,jsx`
+/// — every pattern lives in `ecma/folds.scm`. The engine read one file per language
+/// and compiled that modeline into an empty query, so a `.js` buffer had no fold
+/// query at all; and unlike highlights/indents/injections/textobjects, folds were
+/// never merged by the server's runtimepath bridge either, so nothing covered for
+/// it. This reproduces the shape with the fixture grammar: rust's `folds.scm` is a
+/// bare modeline, and the real pattern lives in an inherited language.
+#[tokio::test]
+async fn a_fold_query_that_only_inherits_folds_through_the_server() {
+    let _guard = test_lock().lock().await;
+    let shared = fixture_data_dir().to_path_buf();
+
+    // A data dir of its own: the same compiled parser (copied, not recompiled) with
+    // a folds query that carries nothing but an inherit.
+    let data = temp_dir("ts-inherit-folds");
+    std::fs::create_dir_all(data.join("parser")).unwrap();
+    std::fs::copy(shared.join("parser/rust.so"), data.join("parser/rust.so")).unwrap();
+    for (lang, name, text) in [
+        ("rust", "highlights", "\"fn\" @keyword\n"),
+        ("rust", "folds", "; inherits: rustfolds\n"),
+        ("rustfolds", "folds", "(function_item) @fold\n"),
+    ] {
+        let dir = data.join("queries").join(lang);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.scm")), text).unwrap();
+    }
+    std::env::set_var("NXVIM_DATA_DIR", &data);
+
+    let file = write_temp(
+        "inherit-folds",
+        "rs",
+        "fn zzz() {\n    let x = 1;\n    let y = 2;\n}\nfn after() {}\n",
+    );
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), None).await;
+    feed(&rpc, ":set foldexpr=v:lua.vim.treesitter.foldexpr()<CR>");
+    feed(&rpc, ":set foldmethod=expr<CR>");
+
+    // The fold closes at the default foldlevel, so `fn zzz` collapses to a single
+    // placeholder row and the body lines stop rendering.
+    let mut rendered: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = window0(&params) {
+                rendered = win_text(win);
+                if rendered.iter().any(|l| l.contains("lines")) {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Restore the shared fixture *before* asserting: `fixture_data_dir` sets the env
+    // var only once, so a panic here would strand every later test on this dir.
+    std::env::set_var("NXVIM_DATA_DIR", &shared);
+
+    assert!(
+        rendered.iter().any(|l| l.contains("lines")),
+        "the inherited `(function_item) @fold` must fold `fn zzz`; rendered {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|l| l.contains("let y")),
+        "the folded body must not render; got {rendered:?}"
+    );
+}
+
+/// A data dir of its own carrying the fixture parser and `queries` written by the
+/// caller, plus the shared dir to restore afterwards. `fixture_data_dir` sets
+/// `NXVIM_DATA_DIR` only once, so a test that points it elsewhere must put it back.
+fn private_data_dir(tag: &str, queries: &[(&str, &str, &str)]) -> (PathBuf, PathBuf) {
+    let shared = fixture_data_dir().to_path_buf();
+    let data = temp_dir(tag);
+    std::fs::create_dir_all(data.join("parser")).unwrap();
+    std::fs::copy(shared.join("parser/rust.so"), data.join("parser/rust.so")).unwrap();
+    for (lang, name, text) in queries {
+        let dir = data.join("queries").join(lang);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.scm")), text).unwrap();
+    }
+    std::env::set_var("NXVIM_DATA_DIR", &data);
+    (data, shared)
+}
+
+/// A runtimepath dir holding one `queries/<lang>/<name>.scm`.
+fn rtp_with_query(tag: &str, lang: &str, name: &str, text: &str) -> PathBuf {
+    let rtp = temp_dir(tag);
+    let dir = rtp.join("queries").join(lang);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.scm")), text).unwrap();
+    rtp
+}
+
+/// Every highlight group painted on the first window, once the file has coloured.
+async fn painted_groups(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Vec<String> {
+    let mut groups: Vec<String> = Vec::new();
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if let Some(win) = window0(&params) {
+                groups = win_hl(win)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, _, g)| g)
+                    .collect();
+                if groups.iter().any(|g| g == want) {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    groups
+}
+
+/// A runtimepath query **without** `;; extends` **replaces** the language's bundled
+/// query — upstream's rule, and the only way a config can *remove* a pattern rather
+/// than pile onto the shipped set. Here the bundled query paints both `fn` and the
+/// integer; the replacement names only `fn`, so the integer must go unpainted.
+#[tokio::test]
+async fn a_runtimepath_query_without_extends_replaces_the_bundled_one() {
+    let _guard = test_lock().lock().await;
+    let (_data, shared) = private_data_dir(
+        "ts-replace-data",
+        &[(
+            "rust",
+            "highlights",
+            "\"fn\" @keyword\n(integer_literal) @number\n",
+        )],
+    );
+    let rtp = rtp_with_query(
+        "ts-replace-rtp",
+        "rust",
+        "highlights",
+        "\"fn\" @my.replaced\n",
+    );
+    let file = write_temp("ts-replace", "rs", "fn zzz() {\n    let x = 1;\n}\n");
+    let (rpc, mut incoming) = start_full(Some(file), vec![rtp], None).await;
+
+    let groups = painted_groups(&rpc, &mut incoming, "my.replaced").await;
+    std::env::set_var("NXVIM_DATA_DIR", &shared);
+
+    assert!(
+        groups.iter().any(|g| g == "my.replaced"),
+        "the replacing query must paint: {groups:?}"
+    );
+    assert!(
+        !groups.iter().any(|g| g == "number"),
+        "the bundled query it replaced must be gone entirely: {groups:?}"
+    );
+}
+
+/// The other half: with `;; extends` the same file **adds** to the bundled query,
+/// so the pattern it doesn't mention keeps painting.
+#[tokio::test]
+async fn a_runtimepath_query_with_extends_adds_to_the_bundled_one() {
+    let _guard = test_lock().lock().await;
+    let (_data, shared) = private_data_dir(
+        "ts-extend-data",
+        &[(
+            "rust",
+            "highlights",
+            "\"fn\" @keyword\n(integer_literal) @number\n",
+        )],
+    );
+    let rtp = rtp_with_query(
+        "ts-extend-rtp",
+        "rust",
+        "highlights",
+        ";; extends\n\"fn\" @my.added\n",
+    );
+    let file = write_temp("ts-extend", "rs", "fn zzz() {\n    let x = 1;\n}\n");
+    let (rpc, mut incoming) = start_full(Some(file), vec![rtp], None).await;
+
+    let groups = painted_groups(&rpc, &mut incoming, "my.added").await;
+    std::env::set_var("NXVIM_DATA_DIR", &shared);
+
+    assert!(
+        groups.iter().any(|g| g == "my.added"),
+        "the extending query must paint, and win its tie against the base: {groups:?}"
+    );
+    assert!(
+        groups.iter().any(|g| g == "number"),
+        "…while everything it didn't mention keeps its bundled colour: {groups:?}"
+    );
+}
+
+/// Replacement is per language, and a chain is rebuilt link by link: replacing the
+/// *inherited* language's query drops only its patterns, leaving the inheriting
+/// language's own bundled query intact.
+#[tokio::test]
+async fn replacing_an_inherited_language_leaves_the_inheritor_alone() {
+    let _guard = test_lock().lock().await;
+    let (_data, shared) = private_data_dir(
+        "ts-replace-inherited-data",
+        &[
+            (
+                "rust",
+                "highlights",
+                "; inherits: rustbase\n\"fn\" @keyword\n",
+            ),
+            ("rustbase", "highlights", "(integer_literal) @number\n"),
+        ],
+    );
+    // Replaces `rustbase`'s query (dropping @number), says nothing about rust's own.
+    let rtp = rtp_with_query(
+        "ts-replace-inherited-rtp",
+        "rustbase",
+        "highlights",
+        "(line_comment) @my.comment\n",
+    );
+    let file = write_temp(
+        "ts-replace-inherited",
+        "rs",
+        "// note\nfn zzz() {\n    let x = 1;\n}\n",
+    );
+    let (rpc, mut incoming) = start_full(Some(file), vec![rtp], None).await;
+
+    let groups = painted_groups(&rpc, &mut incoming, "my.comment").await;
+    std::env::set_var("NXVIM_DATA_DIR", &shared);
+
+    assert!(
+        groups.iter().any(|g| g == "my.comment"),
+        "the replacement for the inherited language must paint: {groups:?}"
+    );
+    assert!(
+        !groups.iter().any(|g| g == "number"),
+        "the inherited language's own patterns are replaced, not merged: {groups:?}"
+    );
+    assert!(
+        groups.iter().any(|g| g == "keyword"),
+        "but the inheriting language's bundled query is untouched: {groups:?}"
+    );
+}

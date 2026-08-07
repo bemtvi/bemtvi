@@ -171,6 +171,82 @@ pub struct Engine {
     /// Query-text overrides from the resolution bridge, consulted by
     /// [`Grammar::load`] and applied in place by [`Engine::set_query`].
     query_overrides: QueryOverrides,
+    /// Per-language **fragment contexts**: the framings
+    /// [`Engine::highlight_fragment`] wraps a snippet in when it doesn't parse on
+    /// its own, in order of preference. Set from Lua
+    /// (`nx.treesitter.fragment_context`), which also ships the defaults.
+    fragment_contexts: HashMap<String, Vec<FragmentContext>>,
+}
+
+/// One framing a fragment can be parsed inside — a template split at its `%s`.
+/// `"struct __nx {\n%s\n}"` becomes `prefix = "struct __nx {\n"`, `suffix =
+/// "\n}"`, and the line/column offsets the fragment's spans must be shifted back
+/// by.
+#[derive(Clone, Debug)]
+struct FragmentContext {
+    prefix: String,
+    suffix: String,
+    /// Newlines in `prefix` — the fragment's first line in wrapped coordinates.
+    line_offset: usize,
+    /// Bytes of `prefix` after its last newline — the column the fragment starts at.
+    /// Zero for the usual newline-terminated prefix.
+    col_offset: usize,
+    /// Set when what follows the prefix's last newline is **pure indentation**
+    /// (`"class __nx:\n    %s"`). Then the opener isn't something the first line
+    /// merely continues — it's the block level the *whole* fragment sits at, so it
+    /// is repeated on every line and every line's columns shift back by it. Without
+    /// it a multi-line fragment in an indentation-sensitive language (python) would
+    /// be framed as `class __nx:` + one indented line + a dedent, which is a syntax
+    /// error rather than a block. `None` for a same-line opener (`"return %s"`),
+    /// which applies to the first line only.
+    indent: Option<String>,
+}
+
+impl FragmentContext {
+    /// Split `template` at its first `%s`. `None` when the template has no `%s` —
+    /// it would wrap nothing, so it is not a framing.
+    fn parse(template: &str) -> Option<Self> {
+        let (prefix, suffix) = template.split_once("%s")?;
+        let opener = &prefix[prefix.rfind('\n').map_or(0, |i| i + 1)..];
+        Some(FragmentContext {
+            line_offset: prefix.matches('\n').count(),
+            col_offset: opener.len(),
+            indent: (!opener.is_empty() && opener.bytes().all(|b| b == b' ' || b == b'\t'))
+                .then(|| opener.to_string()),
+            prefix: prefix.to_string(),
+            suffix: suffix.to_string(),
+        })
+    }
+
+    /// Put `text` inside this framing. In [indent](Self::indent) mode every line
+    /// after the first is indented to match (the prefix already indents the first);
+    /// a blank line is left alone rather than given trailing whitespace.
+    ///
+    /// The result always ends in a newline. A template's suffix usually closes a
+    /// block (`"\n}"`), and some grammars want a terminator after the last
+    /// declaration — tree-sitter-go reports a `MISSING` one, which is a defect, so
+    /// without this a Go struct-field framing could never win despite producing a
+    /// perfect tree.
+    fn wrap(&self, text: &str) -> String {
+        let mut out = String::with_capacity(self.prefix.len() + text.len() + self.suffix.len() + 1);
+        out.push_str(&self.prefix);
+        match self.indent.as_deref() {
+            None => out.push_str(text),
+            Some(indent) => {
+                for (i, line) in text.split_inclusive('\n').enumerate() {
+                    if i > 0 && !line.trim().is_empty() {
+                        out.push_str(indent);
+                    }
+                    out.push_str(line);
+                }
+            }
+        }
+        out.push_str(&self.suffix);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
 }
 
 impl Engine {
@@ -184,6 +260,7 @@ impl Engine {
             grammars: HashMap::new(),
             retired_grammars: Vec::new(),
             query_overrides: QueryOverrides::new(),
+            fragment_contexts: HashMap::new(),
         }
     }
 
@@ -298,12 +375,35 @@ impl Engine {
     /// queries) actually load from — so a grammar resolved from a read-only
     /// fallback root reports *its* base, not a missing `data_dir` file.
     fn read_disk_query(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
-        let path = query_path(self.root_for(lang), lang, &format!("{name}.scm"));
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("reading {}: {e}", path.display())),
-        }
+        crate::loader::resolve_query(self.root_for(lang), lang, name).map_err(|e| {
+            format!(
+                "reading {}: {e}",
+                query_path(self.root_for(lang), lang, &format!("{name}.scm")).display()
+            )
+        })
+    }
+
+    /// The **single-file** base for `(lang, name)`: this language's own query with
+    /// no `; inherits:` resolution — the raw link the server needs when a
+    /// runtimepath file replaces one language of a chain.
+    pub fn base_query_raw(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
+        crate::loader::read_one_query(self.root_for(lang), lang, name).map_err(|e| {
+            format!(
+                "reading {}: {e}",
+                query_path(self.root_for(lang), lang, &format!("{name}.scm")).display()
+            )
+        })
+    }
+
+    /// The languages `(lang, name)`'s on-disk query inherits, transitively, in merge
+    /// order (deepest ancestor first, `lang` excluded) — the chain
+    /// [`read_disk_query`](Self::read_disk_query) already folded into the base.
+    ///
+    /// The server reads this to pull the **runtimepath** overlays of the same
+    /// languages: a config's `queries/ecma/injections.scm` has to reach a javascript
+    /// buffer, and only the server can see the runtimepath.
+    pub fn query_inherits(&self, lang: &str, name: &str) -> Vec<String> {
+        crate::loader::query_inherits(self.root_for(lang), lang, name)
     }
 
     /// Recompile the affected query in place against the already-loaded `Language`,
@@ -774,7 +874,7 @@ impl Engine {
                     });
                 }
             }
-            extract_spans(&layers, &state.shadow, first_line, last_line)
+            extract_spans(&layers, &state.shadow, first_line, last_line, None)
         };
         // Stash the line-background lines for the server to read (via
         // `line_background_lines`) immediately after this call — the source of the
@@ -815,6 +915,142 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> (Vec<Span>, Vec<usize>) {
+        self.highlight_snippet(lang, text, first_line, last_line, false)
+    }
+
+    /// [`highlight_text`](Self::highlight_text) for a snippet that is **not a whole
+    /// program** — a fenced code block inside LSP documentation (hover, completion
+    /// docs). Those blocks are either a *fragment* of the language (a struct field, a
+    /// bare statement, a signature with no body) or an annotation dialect the server
+    /// invented for display: `lua_ls` puts `function f(t: table)` in a ` ```lua `
+    /// fence, `tsserver` prefixes `(method) `. Neither is source the grammar can
+    /// parse.
+    ///
+    /// Handed to the whole-file path, the second kind does not merely degrade — it
+    /// comes out **confidently wrong**, because a structural query matched a
+    /// construct that isn't there (`Vec` in `field: Vec<String>` paints as
+    /// `constructor`; the `lua_ls` hover loses its `function` keyword and paints the
+    /// *types* as parameters). Plausible-but-wrong colour reads worse than none.
+    ///
+    /// So fragment mode works in two steps.
+    ///
+    /// **The framing ladder.** A snippet that doesn't parse on its own is tried
+    /// inside each of its language's [fragment contexts](Self::set_fragment_context)
+    /// in turn — `field: Vec<String>` inside `struct __nx { … }`, a bare statement
+    /// inside `fn __nx() { … }`. The *first framing that parses cleanly* wins, and
+    /// its spans are mapped back into the snippet's own coordinates. Only a clean
+    /// parse is accepted: the point is to turn a broken parse into a whole one, and a
+    /// framing that merely fails *differently* would just relocate the guesswork.
+    /// Structure recovered this way is real — the wrapped text genuinely is a
+    /// program, so `Vec` comes back as `@type`, not `@constructor`.
+    ///
+    /// **The repaint**, when no framing fits (an annotation dialect is not a fragment
+    /// of anything). Then fragment mode trusts structure only where the parse is
+    /// sound: every `ERROR` region of the host tree has its structural captures
+    /// dropped — the token-classifying ones survive, the lexer having worked where
+    /// the parser didn't — and is repainted from the leaves' own token kinds (see
+    /// [`fragment_repaint`]).
+    ///
+    /// A snippet that parses cleanly on its own — most rust-analyzer hovers, every
+    /// `:help` example — takes neither step and is byte-identical to
+    /// [`highlight_text`](Self::highlight_text).
+    pub fn highlight_fragment(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Vec<Span> {
+        // A snippet that stands on its own needs neither step. `parses_cleanly` is a
+        // throwaway parse, but a doc block is a handful of lines and this only runs
+        // for a surface that just changed (a hover reply, a completion row).
+        if self.parses_cleanly(lang, text) {
+            return self
+                .highlight_snippet(lang, text, first_line, last_line, false)
+                .0;
+        }
+        for context in self
+            .fragment_contexts
+            .get(nxvim_core::resolve_language(lang))
+            .cloned()
+            .unwrap_or_default()
+        {
+            let wrapped = context.wrap(text);
+            if !self.parses_cleanly(lang, &wrapped) {
+                continue;
+            }
+            // The wrapped text is a whole program, so it highlights through the
+            // ordinary path; only the coordinates need bringing home.
+            let lines = line_lengths(text);
+            let spans = self
+                .highlight_snippet(
+                    lang,
+                    &wrapped,
+                    first_line + context.line_offset,
+                    last_line + context.line_offset,
+                    false,
+                )
+                .0;
+            return unwrap_spans(spans, &context, &lines);
+        }
+        self.highlight_snippet(lang, text, first_line, last_line, true)
+            .0
+    }
+
+    /// Whether `text` parses in `lang` with no `ERROR` and no `MISSING` node — the
+    /// bar a [fragment context](Self::set_fragment_context) must clear. A language
+    /// with no installed grammar reports `true`: there is nothing to be wrong about,
+    /// and the caller paints nothing either way.
+    fn parses_cleanly(&mut self, lang: &str, text: &str) -> bool {
+        let lang = nxvim_core::resolve_language(lang);
+        let language = match self.grammar(lang) {
+            Slot::Loaded(g) => g.language.clone(),
+            _ => return true,
+        };
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_err() {
+            return true;
+        }
+        let shadow = Rope::from_str(text);
+        let started = Instant::now();
+        let mut budget = deadline_budget(started, PARSE_DEADLINE);
+        let options = ParseOptions::new().progress_callback(&mut budget);
+        let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(&shadow, byte) };
+        match parser.parse_with_options(&mut callback, None, Some(options)) {
+            // A cancelled parse is not evidence of a clean one — don't let a framing
+            // win on a timeout.
+            None => false,
+            Some(tree) => !tree_has_defect(&tree),
+        }
+    }
+
+    /// Install the **fragment contexts** for `lang` — the framings
+    /// [`highlight_fragment`](Self::highlight_fragment) tries, in order, when a
+    /// snippet doesn't parse on its own. Each is a template with one `%s` where the
+    /// snippet goes (`"struct __nx {\n%s\n}"`); a template without `%s` is dropped
+    /// (it would wrap nothing). Replaces any previous list for the language; an empty
+    /// list turns the ladder off for it.
+    pub fn set_fragment_context(&mut self, lang: &str, templates: Vec<String>) {
+        let contexts: Vec<FragmentContext> = templates
+            .iter()
+            .filter_map(|t| FragmentContext::parse(t))
+            .collect();
+        self.fragment_contexts
+            .insert(nxvim_core::resolve_language(lang).to_string(), contexts);
+    }
+
+    /// The shared body of [`highlight_text_bg`](Self::highlight_text_bg) and
+    /// [`highlight_fragment`](Self::highlight_fragment): one stateless parse of
+    /// `text`, its injected child layers, and the span extraction. `fragment` turns
+    /// on the low-confidence repaint described on `highlight_fragment`.
+    fn highlight_snippet(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+        fragment: bool,
+    ) -> (Vec<Span>, Vec<usize>) {
         // The host language is an alias-resolvable name too: this is fed a fence's
         // info string (a markdown doc float's code block) as often as a filetype.
         let lang = nxvim_core::resolve_language(lang);
@@ -836,6 +1072,10 @@ impl Engine {
         let Some(tree) = parser.parse_with_options(&mut callback, None, Some(options)) else {
             return (Vec::new(), Vec::new());
         };
+        // Fragment mode: the byte ranges this parse could not make sense of, plus the
+        // token-level paint to put there in place of the host layer's guessed
+        // structure. Computed here, before the tree moves into the layer list.
+        let repaint = fragment.then(|| fragment_repaint(&tree, text));
 
         // Build the layer trees, host first, then injected children — a **stateless**
         // mirror of the buffer path's `build_injection_layers` (no `BufferId`, no
@@ -951,7 +1191,7 @@ impl Engine {
         // so the preview can paint them under the text as its own `line_bg` layer —
         // otherwise the token spans (a `>lua` block's injected lua) overwrite the
         // block background on every non-blank cell.
-        extract_spans(&layers, &shadow, first_line, last_line)
+        extract_spans(&layers, &shadow, first_line, last_line, repaint.as_ref())
     }
 
     /// Target indent **width in columns** for the 0-indexed `line`, by running the
@@ -1366,6 +1606,20 @@ impl SyntaxEngine for Engine {
         Engine::highlight_text_bg(self, lang, text, first, last)
     }
 
+    fn highlight_fragment(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        Engine::highlight_fragment(self, lang, text, first, last)
+    }
+
+    fn set_fragment_context(&mut self, lang: &str, templates: Vec<String>) {
+        Engine::set_fragment_context(self, lang, templates)
+    }
+
     fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {
         Engine::indent(self, buffer, line, p)
     }
@@ -1427,9 +1681,18 @@ impl SyntaxEngine for Engine {
     }
 
     fn base_query(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
-        // The base the engine would compile with no override: the on-disk file,
-        // the same source `set_query_overlay` compares a resolved overlay against.
+        // The base the engine would compile with no override: the on-disk file with
+        // its `; inherits:` chain folded in — the same source `set_query_overlay`
+        // compares a resolved overlay against.
         self.read_disk_query(lang, name)
+    }
+
+    fn base_query_raw(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
+        Engine::base_query_raw(self, lang, name)
+    }
+
+    fn query_inherits(&self, lang: &str, name: &str) -> Vec<String> {
+        Engine::query_inherits(self, lang, name)
     }
 }
 
@@ -1511,6 +1774,199 @@ fn match_satisfies_lua_predicates(query: &Query, m: &QueryMatch, shadow: &Rope) 
 /// resolving the `line_bg` group against the colorscheme).
 const LINE_BACKGROUND_GROUPS: &[&str] = &["markup.raw.block"];
 
+/// Whether `tree` holds an `ERROR` or a `MISSING` node — i.e. the parser had to
+/// invent its way through the text. Both count: an `ERROR` means it gave up on a
+/// region, a `MISSING` means it inserted a token that isn't there, and a framing
+/// that leaves either behind hasn't actually made the snippet whole.
+fn tree_has_defect(tree: &Tree) -> bool {
+    // `has_error` covers both on the root, so the common (clean) case is O(1).
+    tree.root_node().has_error()
+}
+
+/// The byte length of each line of `text`, excluding its terminator — the geometry
+/// [`unwrap_spans`] clips against.
+fn line_lengths(text: &str) -> Vec<usize> {
+    text.lines().map(str::len).collect()
+}
+
+/// Bring `spans` back from a [framed](FragmentContext) parse into the fragment's own
+/// coordinates: shift the line index by the prefix's newline count, shift the *first*
+/// line's columns by the prefix's trailing column (a same-line template like
+/// `"return %s"`), and drop or clip anything that falls outside the fragment — the
+/// framing's own tokens, and any suffix that shares the fragment's last line.
+fn unwrap_spans(spans: Vec<Span>, context: &FragmentContext, line_lens: &[usize]) -> Vec<Span> {
+    spans
+        .into_iter()
+        .filter_map(|span| {
+            let line = span.line.checked_sub(context.line_offset)?;
+            let len = *line_lens.get(line)?;
+            let (mut start, mut end) = (span.start_byte, span.end_byte);
+            // The opener shares the fragment's first line — and in indent mode it is
+            // repeated on all of them — so what it covers belongs to the framing and
+            // what survives shifts left by its width.
+            if line == 0 || context.indent.is_some() {
+                start = start.saturating_sub(context.col_offset);
+                end = end.checked_sub(context.col_offset)?;
+            }
+            end = end.min(len); // a suffix sharing the fragment's last line
+            (start < end).then_some(Span {
+                line,
+                start_byte: start,
+                end_byte: end,
+                group: span.group,
+            })
+        })
+        .collect()
+}
+
+/// The regions of a fragment's parse the grammar could not make sense of, plus the
+/// token-level paint to put there — see
+/// [`Engine::highlight_fragment`](Engine::highlight_fragment).
+struct FragmentPaint {
+    /// Byte ranges covered by an `ERROR` node. The host layer's captures touching one
+    /// are dropped: inside an `ERROR` the tree is a recovery guess, and a structural
+    /// query that matches there names a construct that isn't in the text.
+    errors: Vec<Range<usize>>,
+    /// `(start, end, group)` recovered from the leaves inside those ranges.
+    tokens: Vec<(usize, usize, &'static str)>,
+}
+
+impl FragmentPaint {
+    /// Whether `[s, e)` touches a region the parse failed on.
+    fn overlaps_error(&self, s: usize, e: usize) -> bool {
+        self.errors.iter().any(|r| s < r.end && r.start < e)
+    }
+}
+
+/// Whether the capture `name` classifies a **token** rather than naming a
+/// construct — the captures that stay trustworthy inside an `ERROR` region, where
+/// the lexer still worked but the parser did not.
+///
+/// A string, a number, a comment, a keyword, an operator, a bracket: the grammar
+/// knows these from the text alone, and a query that captured one under an `ERROR`
+/// captured a token that really is there. Everything else (`@type`, `@function`,
+/// `@variable.parameter`, `@constructor`, `@property`, …) names the *role* a node
+/// plays in a construct, which is precisely what error recovery guessed at.
+/// Matched on the major segment, so refinements (`constant.builtin`,
+/// `punctuation.delimiter`, `keyword.function`) travel with their family.
+fn is_lexical_group(name: &str) -> bool {
+    matches!(
+        name.split('.').next().unwrap_or(name),
+        "comment"
+            | "string"
+            | "character"
+            | "number"
+            | "float"
+            | "boolean"
+            | "constant"
+            | "escape"
+            | "keyword"
+            | "operator"
+            | "punctuation"
+    )
+}
+
+/// The highlight group for a **literal** node kind, or `None` when the kind isn't
+/// one. Matched on a substring of the kind *name* so it holds for any grammar
+/// without a per-language table — `string_literal` / `interpreted_string_literal`
+/// / `raw_string`, `line_comment` / `block_comment`, `integer_literal` / `number`
+/// / `float`. A literal is painted whole and never descended into, so a string's
+/// own quote delimiters (anonymous tokens) can't leak out as operators.
+fn literal_group(kind: &str) -> Option<&'static str> {
+    if kind.contains("comment") {
+        Some("comment")
+    } else if kind.contains("string") || kind.contains("char") {
+        Some("string")
+    } else if kind.contains("number") || kind.contains("integer") || kind.contains("float") {
+        Some("number")
+    } else {
+        None
+    }
+}
+
+/// The highlight group for a leaf inside an `ERROR` region, or `None` to leave it
+/// plain.
+///
+/// Anonymous tokens *are* the grammar's own keyword / punctuation / operator set —
+/// tree-sitter still lexes them under error recovery — so they classify from their
+/// spelling alone, in any language. Named leaves that aren't literals are
+/// identifiers, and an identifier inside an `ERROR` could be a variable, a type, a
+/// parameter, or a display-only annotation: guessing between those is exactly what
+/// fragment mode exists to stop, so they stay plain.
+fn leaf_group(kind: &str, named: bool, text: &str) -> Option<&'static str> {
+    if kind.contains("keyword") {
+        return Some("keyword"); // some grammars name their keyword nodes
+    }
+    if named || text.is_empty() {
+        return None;
+    }
+    if text.chars().all(|c| c.is_alphabetic() || c == '_') {
+        Some("keyword")
+    } else if text.chars().all(|c| "()[]{}".contains(c)) {
+        Some("punctuation.bracket")
+    } else if text.chars().all(|c| ",;:.".contains(c)) {
+        Some("punctuation.delimiter")
+    } else {
+        Some("operator")
+    }
+}
+
+/// Collect the `ERROR` regions of `tree` and repaint them from their own leaves.
+/// `text` is the source the tree was parsed from, so node byte ranges index it
+/// directly.
+fn fragment_repaint(tree: &Tree, text: &str) -> FragmentPaint {
+    let mut paint = FragmentPaint {
+        errors: Vec::new(),
+        tokens: Vec::new(),
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.is_error() {
+            // Outermost `ERROR` only — a nested one is already inside this range, and
+            // `repaint_tokens` walks the whole subtree.
+            paint.errors.push(node.byte_range());
+            repaint_tokens(node, text, &mut paint.tokens);
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    paint.errors.sort_by_key(|r| r.start);
+    paint
+}
+
+/// Walk `node`'s subtree, emitting a span for every literal (whole, not descended
+/// into) and every other leaf [`leaf_group`] can classify.
+fn repaint_tokens(node: Node, text: &str, out: &mut Vec<(usize, usize, &'static str)>) {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        let range = n.byte_range();
+        if range.is_empty() {
+            continue; // a MISSING node the recovery inserted: no text to paint
+        }
+        if let Some(group) = literal_group(n.kind()) {
+            out.push((range.start, range.end, group));
+            continue;
+        }
+        let mut cursor = n.walk();
+        let mut children = n.children(&mut cursor).peekable();
+        if children.peek().is_some() {
+            for child in children {
+                stack.push(child);
+            }
+            continue;
+        }
+        let Some(slice) = text.get(range.clone()) else {
+            continue;
+        };
+        if let Some(group) = leaf_group(n.kind(), n.is_named(), slice) {
+            out.push((range.start, range.end, group));
+        }
+    }
+}
+
 /// resolve the captures into per-line byte spans. Within a layer the most-specific
 /// (narrowest) capture wins; across layers a deeper (injected) layer overwrites a
 /// shallower one inside its region — so injected highlighting paints over the host.
@@ -1520,11 +1976,16 @@ const LINE_BACKGROUND_GROUPS: &[&str] = &["markup.raw.block"];
 /// list is recorded when a background capture is bucketed onto a line — *before* the
 /// per-cell overwrite — so a line stays listed even where an injected token covers
 /// every cell (e.g. a `}` at column 0 with no surrounding space).
+///
+/// `repaint` is the fragment-mode low-confidence pass (`None` for a buffer or a
+/// whole-file snippet): inside its `ERROR` ranges the host layer's captures are
+/// dropped and its recovered tokens painted instead.
 fn extract_spans(
     layers: &[Layer],
     shadow: &Rope,
     first_line: usize,
     last_line: usize,
+    repaint: Option<&FragmentPaint>,
 ) -> (Vec<Span>, Vec<usize>) {
     let line_count = shadow.len_lines(LINE_TYPE).saturating_sub(1);
     let last_line = last_line.min(line_count);
@@ -1572,17 +2033,44 @@ fn extract_spans(
             if e <= s {
                 continue;
             }
+            // Fragment mode: inside an `ERROR` region the host layer's *structure* is
+            // a recovery guess, so a capture that names a construct there (a type, a
+            // function, a parameter) is naming something that isn't in the text — drop
+            // it. Its *lexing* is still sound, so a capture that only classifies a
+            // token (a keyword, a string, a number) is kept. Child layers keep
+            // everything: an injected region is its own parse, with its own tree.
+            if rank == 0
+                && !is_lexical_group(name)
+                && repaint.is_some_and(|f| f.overlaps_error(s, e))
+            {
+                continue;
+            }
             if layer.ranges.is_empty() {
-                raw.push((s, e, name, rank)); // host: no clipping
+                // `rank + 1`: fill precedence 0 is reserved for the fragment-mode
+                // token repaint below, so a real capture always wins over a recovered
+                // one. Relative order between layers is unchanged.
+                raw.push((s, e, name, rank + 1)); // host: no clipping
             } else {
                 // Child: clip to the injected ranges so a node spanning the gap
                 // between a combined layer's ranges paints only within them.
                 for r in layer.ranges {
                     let (cs, ce) = (s.max(r.start), e.min(r.end));
                     if cs < ce {
-                        raw.push((cs, ce, name, rank));
+                        raw.push((cs, ce, name, rank + 1));
                     }
                 }
+            }
+        }
+    }
+
+    // Fragment mode: the token-level paint for the regions cleared above, at fill
+    // precedence 0 — below every real capture, so the lexical captures that survived
+    // the drop (and any genuinely injected layer) paint over it, and the repaint only
+    // shows through where the parse left nothing.
+    if let Some(f) = repaint {
+        for &(s, e, group) in &f.tokens {
+            if s < hi && lo < e {
+                raw.push((s, e, group, 0));
             }
         }
     }
@@ -1957,8 +2445,5 @@ fn point((row, col): (usize, usize)) -> Point {
 /// text objects (`vif`, `daf`, …). Every other resolved name stays Lua-side and is
 /// a no-op here.
 fn is_engine_query(name: &str) -> bool {
-    matches!(
-        name,
-        "highlights" | "indents" | "injections" | "folds" | "textobjects"
-    )
+    nxvim_core::ENGINE_QUERY_NAMES.contains(&name)
 }

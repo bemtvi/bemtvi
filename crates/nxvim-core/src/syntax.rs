@@ -149,6 +149,37 @@ pub trait SyntaxEngine {
         (self.highlight_text(language, text, first, last), Vec::new())
     }
 
+    /// [`highlight_text`](Self::highlight_text) for a snippet that is **not a whole
+    /// program** — a fenced code block inside LSP documentation (hover, completion
+    /// docs), which is either a fragment of the language (a struct field, a bare
+    /// statement, a body-less signature) or an annotation dialect the server invented
+    /// for display (`lua_ls` puts `function f(t: table)` in a ` ```lua ` fence).
+    ///
+    /// Handed to the whole-file path, the second kind doesn't degrade — it comes out
+    /// *confidently wrong*, because a structural query matched a construct that isn't
+    /// there. An engine implementing this must trust structure only where the parse
+    /// is sound. The default is [`highlight_text`](Self::highlight_text): an engine
+    /// with no notion of a failed parse (the wasm JS-side highlighter) just keeps
+    /// doing what it did.
+    fn highlight_fragment(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        self.highlight_text(language, text, first, last)
+    }
+
+    /// Install the **fragment contexts** for `language` — the framings
+    /// [`highlight_fragment`](Self::highlight_fragment) tries, in order, when a
+    /// snippet doesn't parse on its own (`"struct __nx {\n%s\n}"`, the `%s` marking
+    /// where the snippet goes). Replaces any previous list; an empty list turns the
+    /// ladder off for that language. The default ignores them, which is right for an
+    /// engine that does no off-buffer highlighting to begin with (the wasm JS-side
+    /// one): there is no ladder to configure.
+    fn set_fragment_context(&mut self, _language: &str, _templates: Vec<String>) {}
+
     /// Target indent **width in columns** for `line`, or `None` when there is no
     /// grammar / no `indents.scm` / the query is inconclusive — in which case the
     /// caller falls back (copy-previous-line autoindent, then column 0).
@@ -230,7 +261,8 @@ pub trait SyntaxEngine {
     ) -> Result<(), String>;
 
     /// The engine's **base** `(lang, name)` query — the on-disk text it would
-    /// compile with no override. The server reads this to compose an
+    /// compile with no override, with any [`; inherits:`](parse_query_inherits)
+    /// chain already folded in. The server reads this to compose an
     /// `after/queries` / runtimepath overlay (base ⧺ extensions) before handing the
     /// merged string back via [`set_query_overlay`](Self::set_query_overlay).
     /// `Ok(None)` when there is no base file (an engine that has none, or a
@@ -240,4 +272,87 @@ pub trait SyntaxEngine {
     fn base_query(&self, _lang: &str, _name: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
+
+    /// The **single-file** base for `(lang, name)` — this language's own on-disk
+    /// query with *no* `; inherits:` resolution, the raw part
+    /// [`base_query`](Self::base_query) composes from.
+    ///
+    /// The server needs the parts, not just the whole: neovim's rule is that a
+    /// runtimepath query file with no `;; extends` **replaces** its language's
+    /// bundled query, and replacing one link of an inherit chain means rebuilding
+    /// the chain from its links. Defaults to [`base_query`](Self::base_query) — for
+    /// an engine with no inherit concept the two are the same file.
+    fn base_query_raw(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
+        self.base_query(lang, name)
+    }
+
+    /// The languages `(lang, name)`'s on-disk query **inherits**, transitively, in
+    /// merge order (deepest ancestor first, `lang` itself excluded) — the chain the
+    /// engine already folded into [`base_query`](Self::base_query).
+    ///
+    /// The engine resolves the *bundled* files; the server still has to pull
+    /// `queries/<inherited>/<name>.scm` overlays out of the **runtimepath**, which
+    /// the engine cannot see, so it needs to know which languages are in the chain.
+    /// Empty by default, and for a language that inherits nothing.
+    fn query_inherits(&self, _lang: &str, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// The query kinds the **engine** compiles, and therefore the kinds the query
+/// bridge must resolve. One list so the two can never drift: a kind added here and
+/// wired in the engine is automatically resolved by the server too. (`folds` used to
+/// be missing from the server's list, which left every `; inherits:`-only fold query
+/// — javascript's is *only* a modeline — with no patterns at all.)
+pub const ENGINE_QUERY_NAMES: &[&str] = &[
+    "highlights",
+    "indents",
+    "injections",
+    "folds",
+    "textobjects",
+];
+
+/// The **modeline** bodies a query file opens with: the `;`-comment lines before
+/// its first pattern, stripped of their leading `;`s and surrounding whitespace.
+/// Scanning stops at the first non-comment line, so a `;`-comment deeper in the
+/// file is never read as a modeline.
+fn query_modelines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with(';'))
+        .filter(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches(';').trim())
+}
+
+/// Language names from a query file's `; inherits: a,b,c` modeline(s) — the
+/// languages whose same-named query this one builds on, in declared order.
+///
+/// nvim-treesitter uses this to share one query set between related grammars:
+/// `javascript/folds.scm` is *only* `; inherits: ecma,jsx`, with every pattern in
+/// `ecma/folds.scm`. Empty when there is no such modeline.
+///
+/// Lives here because both sides of the query bridge read it: the engine folds the
+/// chain into its on-disk base, and the server walks the same chain for runtimepath
+/// overlays.
+pub fn parse_query_inherits(text: &str) -> Vec<String> {
+    query_modelines(text)
+        .filter_map(|body| body.strip_prefix("inherits:"))
+        .flat_map(|rest| rest.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Whether a query file carries the `;; extends` modeline — nvim-treesitter's
+/// marker for "**add** these patterns to the language's query" as opposed to
+/// "**be** the language's query".
+///
+/// This is the one bit that decides a runtimepath file's relationship to the
+/// bundled one: an extending file is appended, a non-extending file *replaces* the
+/// base. Without it every drop-in `queries/<lang>/<name>.scm` would silently layer
+/// on top of the shipped query, so a config could add patterns but never remove or
+/// redefine the set as a whole.
+pub fn query_extends(text: &str) -> bool {
+    query_modelines(text).any(|body| body == "extends")
 }

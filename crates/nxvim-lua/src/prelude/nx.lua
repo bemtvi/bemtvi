@@ -370,6 +370,144 @@ function nx.treesitter.highlight(lang, text)
   end)
 end
 
+-- The shipped framings, applied at the bottom of this section. Ordered per language
+-- by how a doc block usually arrives, most likely first — the first framing that
+-- parses cleanly wins, so ordering is the whole tuning knob. A framing that never
+-- fits is inert (it simply never parses cleanly), so the cost of a speculative entry
+-- is one throwaway parse, never a wrong colour.
+--
+-- A `%s` that follows only indentation on its line puts the fragment in an INDENTED
+-- block: every line of it is indented to match, which is what an
+-- indentation-sensitive language needs to be framed at all.
+--
+-- The rust, python, go, javascript, json and lua entries were each checked against
+-- the real grammar on the hover shapes their servers actually send; the rest follow
+-- the same shapes and cost nothing when they don't fit.
+local FRAGMENT_CONTEXTS = {
+  rust = {
+    "struct __nx {\n%s\n}",
+    "fn __nx() {\n%s\n}",
+    "trait __nx {\n%s\n}",
+    "impl __nx {\n%s\n}",
+  },
+  -- A python hover is very often a header with no body (`def f(a: int) -> bool`,
+  -- `class Foo(Base)`, `if x > 1`): giving it a colon and a `pass` is what makes it
+  -- a statement. The last two rungs indent a flush block into a class/function.
+  python = {
+    "%s:\n    pass\n",
+    "class __nx:\n%s",
+    "def __nx():\n%s",
+    "class __nx:\n    %s",
+    "def __nx():\n    %s",
+  },
+  -- Go's `source_file` wants a package clause, so every framing carries one.
+  go = {
+    "package __nx\ntype __nx struct {\n%s\n}",
+    "package __nx\ntype __nx interface {\n%s\n}",
+    "package __nx\nfunc __nx() {\n%s\n}",
+    "package __nx\n%s",
+  },
+  lua = { "local __nx = {\n%s\n}", "function __nx()\n%s\nend" },
+  -- `%s {}` gives a body to the bodyless method signature a hover shows.
+  javascript = {
+    "class __nx {\n%s {}\n}",
+    "class __nx {\n%s\n}",
+    "const __nx = {%s}",
+    "function __nx() {\n%s\n}",
+  },
+  typescript = {
+    "interface __nx {\n%s\n}",
+    "class __nx {\n%s {}\n}",
+    "class __nx {\n%s\n}",
+    "declare %s",
+    "type __nx = %s",
+    "function __nx() {\n%s\n}",
+  },
+  tsx = {
+    "interface __nx {\n%s\n}",
+    "class __nx {\n%s {}\n}",
+    "class __nx {\n%s\n}",
+    "declare %s",
+    "type __nx = %s",
+    "function __nx() {\n%s\n}",
+  },
+  c = { "struct __nx {\n%s\n};", "void __nx() {\n%s\n}" },
+  cpp = { "class __nx {\n%s\n};", "struct __nx {\n%s\n};", "void __nx() {\n%s\n}" },
+  java = { "class __nx {\n%s\n}", "class __nx {\nvoid __m() {\n%s\n}\n}" },
+  c_sharp = { "class __nx {\n%s\n}", "class __nx {\nvoid __m() {\n%s\n}\n}" },
+  kotlin = { "class __nx {\n%s\n}", "fun __nx() {\n%s\n}" },
+  swift = { "struct __nx {\n%s\n}", "func __nx() {\n%s\n}" },
+  scala = { "object __nx {\n%s\n}", "def __nx = {\n%s\n}" },
+  dart = { "class __nx {\n%s\n}", "void __nx() {\n%s\n}" },
+  zig = { "const __nx = struct {\n%s\n};", "fn __nx() void {\n%s\n}" },
+  ruby = { "class __Nx\n%s\nend", "def __nx\n%s\nend" },
+  php = { "<?php\nclass __nx {\n%s\n}", "<?php\nfunction __nx() {\n%s\n}", "<?php\n%s" },
+  elixir = { "defmodule __Nx do\n%s\nend", "def __nx do\n%s\nend" },
+  -- A declaration (`color: red`) is not a stylesheet; a JSON member is not a document.
+  css = { "__nx {\n%s\n}" },
+  scss = { "__nx {\n%s\n}" },
+  json = { "{%s}", "[%s]" },
+}
+
+-- `nx.treesitter.fragment_context(lang, templates)` — teach the **fragment**
+-- highlighter how to make sense of a code block that is not a whole program.
+--
+-- The code blocks inside LSP documentation (hover, completion docs) are usually
+-- *fragments*: a struct field, a bare statement, a body-less signature. Parsed as a
+-- whole file they land in tree-sitter's error recovery, which doesn't merely
+-- under-highlight them — it names constructs that aren't in the text (`Vec` in
+-- `field: Vec<String>` comes out `@constructor`). nxvim's fragment highlighter drops
+-- those guesses; a *framing* is how it gets the real structure back instead.
+--
+-- `templates` is an ordered list of framings, each a string with one `%s` marking
+-- where the snippet goes. A snippet that doesn't parse on its own is tried inside
+-- each in turn, and the **first framing that parses cleanly** wins — its highlight
+-- spans are mapped back onto the snippet's own lines and columns:
+--
+-- ```lua
+-- nx.treesitter.fragment_context("rust", {
+--   "struct __nx {\n%s\n}",   -- a field hover: `field: Vec<String>`
+--   "fn __nx() {\n%s\n}",     -- a statement or expression
+-- })
+-- ```
+--
+-- Only a clean parse is accepted, so a framing that doesn't fit costs one throwaway
+-- parse and nothing else — the snippet falls through to the conservative repaint
+-- (keywords, strings, numbers, comments, punctuation; no guessed constructs), which
+-- is also where an annotation dialect ends up: `lua_ls` writes
+-- `function f(t: table)` into a ` ```lua ` fence, and that is not a fragment of any
+-- Lua program.
+--
+-- **Indentation-sensitive languages.** When a template's `%s` follows only
+-- whitespace on its line, that whitespace is the block level the fragment sits at,
+-- not just an opener the first line continues — so *every* line of the fragment is
+-- indented to match:
+--
+-- ```lua
+-- nx.treesitter.fragment_context("python", { "class __nx:\n    %s" })
+-- ```
+--
+-- Without that a multi-line python fragment would be framed as a header, one
+-- indented line, and then a dedent — a syntax error rather than a block. The spans
+-- come back with the indent taken off every line, so the caller still sees the
+-- fragment's own columns.
+--
+-- A same-line framing works too (`"fn __nx() { return %s }"`) — there the prefix's
+-- width comes off the first line only. The wrapped text always ends in a newline,
+-- because some grammars (go) treat a missing final terminator as a parse defect.
+--
+-- Calling this replaces the language's list; passing `{}` turns the ladder off for
+-- it. nxvim ships defaults for rust, python, go, lua, javascript, typescript, tsx,
+-- c, cpp, java, c_sharp, kotlin, swift, scala, dart, zig, ruby, php, elixir, css,
+-- scss and json.
+function nx.treesitter.fragment_context(lang, templates)
+  nx._ts_fragment_context(lang or "", templates or {})
+end
+
+for lang, templates in pairs(FRAGMENT_CONTEXTS) do
+  nx.treesitter.fragment_context(lang, templates)
+end
+
 -- vim.* muscle-memory alias (ADR 0002 §4 whitelist): neovim's canonical spelling
 -- `v:lua.vim.treesitter.foldexpr()`. Same native marker — nxvim recognizes both
 -- the `vim.` and `nx.` references.

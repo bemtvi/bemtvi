@@ -506,14 +506,25 @@ impl Editor {
         // `line_bg` layer, so they compose rather than fight the winner-takes-cell
         // merge). Fail-soft — a block with no `lang` or no installed grammar simply
         // stays plain, still reading as code via that background.
+        //
+        // Through the **fragment** highlighter, not the whole-file one: an LSP doc
+        // block is a fragment or an outright display dialect (`lua_ls`'s
+        // `function f(t: table)`), and a whole-file parse paints those confidently
+        // wrong rather than merely plain.
         for block in &rendered.code {
             let Some(lang) = block.lang.as_deref() else {
                 continue;
             };
+            // Trailing newline: the highlighter treats the rope's last line as the
+            // phantom one (`len_lines - 1`), so without it a **one-line** block parses
+            // to zero visible lines and every span is dropped — and a one-line block is
+            // the common hover (a bare signature). Same normalization the preview
+            // projection does.
             let text = rendered.lines
                 [block.first_line..(block.first_line + block.len).min(rendered.lines.len())]
-                .join("\n");
-            let spans = self.preview_highlights(lang, &text, 0, block.len);
+                .join("\n")
+                + "\n";
+            let spans = self.preview_highlights_fragment(lang, &text, 0, block.len);
             let b = &mut self.buffers.get_mut(buf).buffer;
             for span in spans {
                 let line = block.first_line + span.line;

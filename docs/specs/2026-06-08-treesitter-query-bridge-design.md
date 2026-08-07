@@ -15,26 +15,42 @@ the as-built shape is:
 > - `EditHost::resolve_runtimepath_queries(lang)`
 >   ([`treesitter.rs`](../../crates/nxvim-server/src/treesitter.rs)) runs once per
 >   language at its buffer's first highlight (guarded by `resolved_ts_langs`). For
->   each engine query (`highlights` / `indents` / `injections`) it gathers, via
->   `collect_query_parts`, the engine base + every runtimepath
->   `queries/<lang>/<name>.scm` and `after/queries/<lang>/<name>.scm`, and —
->   following `; inherits: a,b` modelines (`parse_inherits`) — the same for each
->   inherited language first, then installs the concatenation through
+>   each engine query (`nxvim_core::ENGINE_QUERY_NAMES` — `highlights` / `indents` /
+>   `injections` / `folds` / `textobjects`) it gathers, via `collect_query_parts`,
+>   the engine base + every runtimepath `queries/<lang>/<name>.scm` and
+>   `after/queries/<lang>/<name>.scm`, for this language *and* each language it
+>   inherits, then installs the concatenation through
 >   `Editor::set_resolved_ts_query` → `Engine::set_query_overlay` (a no-op when the
 >   result equals the base).
-> - Resolution is **additive concatenation**, not a faithful reimplementation of
->   `query.lua`'s precedence. `;; extends` / `; inherits:` are valid query comments,
->   so they concatenate harmlessly; this covers the overlay and inherits cases real
->   configs ship (e.g. a config `queries/ecma/injections.scm` reaching `javascript`,
->   whose bundled `injections.scm` is just `; inherits: ecma,jsx`). The
+> - **The two halves of the merge have different owners.** The `; inherits:` chain of
+>   the **bundled** files is resolved by the *engine*, in the one function that reads
+>   a query off disk (`loader::resolve_query`), so `Grammar::load` compiles it and
+>   `Engine::base_query` reports it — they cannot drift, and every grammar the engine
+>   loads gets it, injected children included. The **runtimepath** layer stays on the
+>   server, which is the only side that can see it: it walks the same chain (reported
+>   by `Engine::query_inherits`) to pull a config's `queries/ecma/injections.scm` in
+>   for a javascript buffer. Merge order is every bundled pattern first, then every
+>   overlay (inherited languages before the buffer's own), so an `after/queries`
+>   customization is the later write and wins a tie against what it customizes.
+> - **`;; extends` decides replace vs. add**, upstream's rule: a runtimepath query
+>   file carrying the modeline is appended to its language's bundled query, and one
+>   without it **replaces** that query outright — the first such file in runtimepath
+>   order wins (config before plugins), later ones are dropped. Replacing one link of
+>   an inherit chain rebuilds the chain from the raw per-language files
+>   (`Engine::base_query_raw`), so replacing `ecma` drops only ecma's patterns and
+>   leaves `javascript`'s own alone. With nothing on the runtimepath the engine's
+>   merged base is handed back byte-for-byte, so an uncustomized language stays on
+>   the plain disk-read path. This is what lets a config *remove* or redefine a
+>   pattern rather than only pile onto the shipped set. The
 >   `vim.treesitter.query.set` in-memory path is **not** wired (no `nx`-public query
 >   setter; the native `nx._nx_set_ts_query` raw-replace exists but is unused).
 > `:TSInstall` follows the same `; inherits:` modelines and fetches the inherited
 > query sets to disk (`javascript` → `ecma`,`jsx`), so the resolver has them to merge
 > and base js/ts highlighting carries the `ecma` patterns. See
 > [known-approximations.md](../known-approximations.md) for the remaining edge —
-> injected *child* grammars load their queries raw (no inherits) until that child
-> language is opened as a buffer.
+> the merge is additive concatenation, not neovim's full replace-vs-extend
+> precedence. (The former injected-*child* edge is closed: children load through the
+> same inherit-resolving reader as any other grammar.)
 
 > **Historical implementation note — getting the resolved *string* (obsolete).**
 > The plan below assumed `query.get(lang, name)` (vendored Lua) and a

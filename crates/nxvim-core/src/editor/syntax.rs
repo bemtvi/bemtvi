@@ -271,6 +271,27 @@ impl Editor {
             .and_then(|engine| engine.base_query(lang, name).ok().flatten())
     }
 
+    /// The **single-file** base for `(lang, name)` — no `; inherits:` resolution.
+    /// The server composes from these raw links when a runtimepath file replaces one
+    /// language of a chain. `None` with no engine or no such file.
+    pub fn ts_base_query_raw(&self, lang: &str, name: &str) -> Option<String> {
+        self.syntax
+            .as_ref()
+            .and_then(|engine| engine.base_query_raw(lang, name).ok().flatten())
+    }
+
+    /// The languages `(lang, name)`'s **bundled** query inherits, transitively, in
+    /// merge order — the chain the engine already folded into
+    /// [`ts_base_query`](Self::ts_base_query). The server walks it to pull the
+    /// *runtimepath* overlays of the same languages, which the engine cannot see.
+    /// Empty with no engine.
+    pub fn ts_query_inherits(&self, lang: &str, name: &str) -> Vec<String> {
+        self.syntax
+            .as_ref()
+            .map(|engine| engine.query_inherits(lang, name))
+            .unwrap_or_default()
+    }
+
     /// Highlight spans for the line range `[first, last)` of buffer `buf`,
     /// synced to the buffer's current content. Empty when there is no engine or
     /// no grammar for the buffer.
@@ -308,6 +329,35 @@ impl Editor {
         match self.syntax.as_mut() {
             Some(engine) => engine.highlight_text(language, text, first, last),
             None => Vec::new(),
+        }
+    }
+
+    /// [`preview_highlights`](Self::preview_highlights) for a snippet that is **not a
+    /// whole program**: a fenced code block inside LSP documentation. A hover block is
+    /// a fragment (a struct field, a body-less signature) or an annotation dialect the
+    /// server invented for display (`lua_ls` writes `function f(t: table)` into a
+    /// ` ```lua ` fence), and a whole-file parse doesn't merely under-highlight those
+    /// — it paints them *confidently wrong*. Empty with no engine / grammar.
+    pub fn preview_highlights_fragment(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        match self.syntax.as_mut() {
+            Some(engine) => engine.highlight_fragment(language, text, first, last),
+            None => Vec::new(),
+        }
+    }
+
+    /// Install the **fragment contexts** for `language` — the framings the fragment
+    /// highlighter tries, in order, when an LSP doc block doesn't parse on its own
+    /// (`"struct __nx {\n%s\n}"`). Behind `nx.treesitter.fragment_context`, which
+    /// also ships the per-language defaults. No-op with no engine.
+    pub fn set_ts_fragment_context(&mut self, language: &str, templates: Vec<String>) {
+        if let Some(engine) = self.syntax.as_mut() {
+            engine.set_fragment_context(language, templates);
         }
     }
 

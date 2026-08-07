@@ -2494,3 +2494,72 @@ vim.cmd('colorscheme nxvim')"
         "every wrapped code row carries a resolved line_bg, got {line_bg:?}"
     );
 }
+
+/// A late batch that re-orders the popup must not **retarget the selection**: the row
+/// the user navigated to stays the row a confirm accepts, wherever the re-sort moves it.
+///
+/// Regression: the selection was a plain index into the *view*, and the merged
+/// completion view is re-sorted on every streamed batch (each source's candidates land
+/// as they arrive). A batch that sorted above the highlighted row therefore slid a
+/// different candidate under the cursor — silently, between the keystroke that chose a
+/// row and the one that accepted it. This is the sharp end of the streamed merge: the
+/// user reads the popup once and types `<C-y>`.
+#[tokio::test]
+async fn a_late_batch_reorders_the_popup_without_moving_the_selection() {
+    let dir = temp_dir("complete_selection_survives_resort");
+    // `slow` outranks `fast`, so once its candidate lands it sorts to the top and pushes
+    // the already-selected `fast` row down. Its `complete` parks the push behind a
+    // promise the test resolves by hand, so the reorder happens at an exact, known point
+    // — after the navigation, before the accept — with no sleeps.
+    let init = "\
+nx.complete.source {\n\
+  name = 'fast', debounce = 0, priority = 1,\n\
+  complete = function(ctx) ctx.push('cand_fast') end,\n\
+}\n\
+nx.complete.source {\n\
+  name = 'slow', debounce = 0, priority = 50,\n\
+  complete = function(ctx)\n\
+    return nx.promise.new(function(resolve)\n\
+      _G.release_slow = function() ctx.push('cand_slow'); resolve() end\n\
+    end)\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'fast' }, { 'slow' } }, min_chars = 2 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "icand");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["cand_fast"],
+        "only the fast source has answered yet"
+    );
+
+    // Navigate onto the one row there is — an *active* selection, the state a confirm
+    // key acts on.
+    feed(&rpc, "<C-n>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("row selected"));
+    assert_eq!(menu_selected(&menu), 0);
+
+    // The slow source answers: its candidate outranks and sorts above the selected row.
+    exec_lua(&rpc, "release_slow()").await;
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("popup re-sorts"),
+    );
+    assert_eq!(
+        menu_items(&menu),
+        vec!["cand_slow", "cand_fast"],
+        "the higher-priority late candidate leads"
+    );
+    assert_eq!(
+        menu_selected(&menu),
+        1,
+        "the selection followed its row down rather than staying on index 0"
+    );
+
+    // ...and the confirm accepts the row the user actually chose.
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["cand_fast"]);
+}

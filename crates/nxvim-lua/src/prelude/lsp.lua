@@ -347,10 +347,11 @@ end
 --
 -- It decides the order the merging verbs present in — the hover float's sections, the
 -- signature lines, the code-action chooser's rows, the reference, symbol and goto
--- lists — and which server the verbs that ACT (`format`, `rename`) pick, since two
--- servers' edits cannot both be applied. It does not decide *whether* a server is
--- asked: that is capability, and a server that doesn't advertise the feature is
--- skipped whatever its rank. `nx.lsp.hover{ name = … }` / `:LspHover <server>`
+-- lists, and the completion popup's rows (plus the docs float's sections for a
+-- candidate several servers offer) — and which server the verbs that ACT (`format`,
+-- `rename`) pick, since two servers' edits cannot both be applied. It does not decide
+-- *whether* a server is asked: that is capability, and a server that doesn't advertise
+-- the feature is skipped whatever its rank. `nx.lsp.hover{ name = … }` / `:LspHover <server>`
 -- override the rank outright for one call. A change takes effect on the next start,
 -- so `nx.lsp.restart(name)` applies it to a server already running.
 function nx.lsp.config(name, opts)

@@ -309,14 +309,24 @@ impl EditHost {
         self.lsp_dirty = true;
     }
 
-    /// The buffer's servers in **routing order** (`priority`, then key) — the rank
-    /// every multi-server surface merges by, and the order a merged row's offers and
+    /// The buffer's servers in **routing order** (`priority` descending, then key) — the
+    /// rank every multi-server surface merges by, and the order a merged row's offers and
     /// docs sections are held in. Empty when the buffer has no attached servers.
+    ///
+    /// Sorted through the shared [`lsp_routing_order`](Self::lsp_routing_order)
+    /// comparator, not taken from the state map's own iteration: that map is keyed by
+    /// [`ServerKey`], so walking it yields **key** order — config name, then root — and a
+    /// stated `nx.lsp.config{ priority = … }` had no effect on the popup at all. The
+    /// comparator is the one every other ordered view of a buffer's servers uses, so the
+    /// completion merge can't disagree with the routing it is meant to state.
     fn lsp_server_rank(&self, buffer: BufferId) -> Vec<ServerKey> {
-        self.lsp_states
+        let mut rank: Vec<ServerKey> = self
+            .lsp_states
             .get(&buffer)
             .map(|s| s.servers().map(|(k, _)| k.clone()).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        rank.sort_by(|a, b| self.lsp_routing_order(a, b));
+        rank
     }
 
     /// The menu priority a row whose primary contributor is `server` carries: the `lsp`
@@ -373,6 +383,12 @@ impl EditHost {
                     // `None` when the server sent no kind (code `0`).
                     kind: item.kind_label().map(str::to_string),
                     priority,
+                    // The server's own order for equally-good matches — how it says
+                    // "these parameters belong above those globals" for the call the
+                    // cursor is in. Falls back to the label, as the spec defines a
+                    // missing `sortText` to, so a server that sends it for some items
+                    // only still orders the rest against them coherently.
+                    sort_key: Some(item.sort_text.clone().unwrap_or_else(|| label.clone())),
                     // The docs sidebar reads an `lsp` row's docs from the server's
                     // item cache (`source_accept`), not an inline `doc` / `resolve`.
                     source_accept: true,

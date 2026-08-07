@@ -452,6 +452,19 @@ async fn start_two_servers(
     body: &str,
     keys: &str,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_two_servers_ranked(dir, body, keys, "", "").await
+}
+
+/// [`start_two_servers`] with each server's extra `nx.lsp.config` fields spelled out
+/// (`alpha_extra` / `beta_extra`, e.g. `priority = 10,`), so a test can state a routing
+/// order that disagrees with the alphabetical key order.
+async fn start_two_servers_ranked(
+    dir: &Path,
+    body: &str,
+    keys: &str,
+    alpha_extra: &str,
+    beta_extra: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
     let file_path = dir.join("a.rs");
     std::fs::write(&file_path, body).expect("write test file");
     let init = ServerInit {
@@ -462,9 +475,13 @@ async fn start_two_servers(
     attach(&rpc, 80, 24).await;
     exec_lua(
         &rpc,
-        "nx.lsp.config('alpha', { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
-         nx.lsp.config('beta',  { cmd = { 'unused' }, filetypes = { 'rust' } })\n\
-         nx.lsp.enable({ 'alpha', 'beta' })",
+        &format!(
+            "nx.lsp.config('alpha', {{ {alpha_extra} cmd = {{ 'unused' }}, \
+             filetypes = {{ 'rust' }} }})\n\
+             nx.lsp.config('beta',  {{ {beta_extra} cmd = {{ 'unused' }}, \
+             filetypes = {{ 'rust' }} }})\n\
+             nx.lsp.enable({{ 'alpha', 'beta' }})"
+        ),
     )
     .await;
     assert!(
@@ -751,5 +768,111 @@ async fn each_contributors_docs_resolve_against_its_own_server() {
     assert!(
         docs.iter().any(|l| l.contains("ALPHA-RESOLVED")),
         "the first contributor's resolve landed in its own section: {docs:?}"
+    );
+}
+
+/// The position of `label` among the popup rows, or a panic naming what was there.
+fn row_at(rows: &[String], label: &str) -> usize {
+    rows.iter()
+        .position(|r| r == label)
+        .unwrap_or_else(|| panic!("no `{label}` row in {rows:?}"))
+}
+
+/// Poll the completion popup until every label in `want` is present, then return the
+/// rows in display order. Panics after the window with the last rows seen.
+async fn await_all_rows(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &[&str],
+) -> Vec<String> {
+    let mut last = Vec::new();
+    for _ in 0..200 {
+        exec_lua(rpc, "nx.complete.trigger()").await;
+        if let Some(items) = poll_menu_items(rpc, incoming).await {
+            if want.iter().all(|w| items.iter().any(|i| i == w)) {
+                return items;
+            }
+            if !items.is_empty() {
+                last = items;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("lsp completion never produced all of {want:?}; last menu rows: {last:?}");
+}
+
+/// Equally-good candidates from two servers order by the buffer's **routing order** —
+/// the configured `nx.lsp.config{ priority }` — not by which server answered first and
+/// not by how the two configs happen to be spelled.
+///
+/// Regression: the completion merge resolved each row's rank from the buffer's server
+/// map in plain **key** order (config name, then root) while claiming to use routing
+/// order, so a stated `priority` had no effect on the popup at all. `beta` here is both
+/// alphabetically second *and* the slower responder, and must still lead.
+#[tokio::test]
+async fn completion_rows_order_by_server_priority_not_key_order() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_priority_order");
+    // Same shape, same match positions against `pr` — so the two tie on fuzzy score and
+    // the merge's source rank is what decides which leads.
+    arm_completion_mock(
+        dir.as_path(),
+        "alpha",
+        r#"{ "completion": [ { "label": "pr_one", "insertText": "pr_one" } ] }"#,
+    );
+    arm_completion_mock(
+        dir.as_path(),
+        "beta",
+        r#"{ "reply_delay_ms": 120,
+             "completion": [ { "label": "pr_two", "insertText": "pr_two" } ] }"#,
+    );
+    let (rpc, mut incoming) =
+        start_two_servers_ranked(dir.as_path(), "", "ipr", "", "priority = 10,").await;
+
+    let rows = await_all_rows(&rpc, &mut incoming, &["pr_one", "pr_two"]).await;
+
+    disarm_completion_mocks();
+    assert!(
+        row_at(&rows, "pr_two") < row_at(&rows, "pr_one"),
+        "the higher-`priority` server's candidate leads even though it sorts second by \
+         key and answers later, got {rows:?}"
+    );
+}
+
+/// Among equally-good matches from one server, the popup follows the server's own
+/// `sortText` — the field the protocol reserves for exactly this ("relevance here", not
+/// "quality of the match"), which is how a server puts a call's parameters above the
+/// globals that match the same prefix.
+///
+/// Regression: `sortText` was parsed and then dropped, so equal-scoring rows fell back
+/// to the order the items arrived in — the server's array order, or across servers the
+/// reply order, i.e. random from the reader's side.
+#[tokio::test]
+async fn completion_rows_break_ties_on_the_servers_sort_text() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_sort_text");
+    // SAFETY: serialized on `serial_lock`, so no other test races this env mutation.
+    std::env::set_var(
+        "NXVIM_LSP_CMD",
+        format!("{NXVIM_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+    // Sent worst-first: the array order and the `sortText` order disagree, so only a
+    // client that reads `sortText` shows `arg_one` on top.
+    let (rpc, mut incoming) = start_typed(
+        dir.as_path(),
+        r#"[ { "label": "arg_two", "insertText": "arg_two", "sortText": "20" },
+             { "label": "arg_six", "insertText": "arg_six", "sortText": "30" },
+             { "label": "arg_one", "insertText": "arg_one", "sortText": "10" } ]"#,
+        "ar",
+    )
+    .await;
+
+    let rows = await_all_rows(&rpc, &mut incoming, &["arg_one", "arg_two", "arg_six"]).await;
+
+    assert!(
+        row_at(&rows, "arg_one") < row_at(&rows, "arg_two")
+            && row_at(&rows, "arg_two") < row_at(&rows, "arg_six"),
+        "equal-scoring rows follow the server's `sortText`, not the order its items \
+         arrived in, got {rows:?}"
     );
 }

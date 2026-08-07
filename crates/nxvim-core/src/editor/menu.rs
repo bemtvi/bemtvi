@@ -235,6 +235,24 @@ pub struct MenuItem {
     /// the matched line). `None` for every plain single-column row, which truncates
     /// path-tail-first as before.
     pub layout: Option<RowLayout>,
+    /// The **source's own stated order** for this row (`Complete` menus only): the
+    /// opaque string the merged view compares two *equally-good* matches by, before
+    /// falling back to the order they streamed in. The `lsp` source fills it from the
+    /// item's `sortText` (the protocol's field for exactly this — "how relevant here",
+    /// as opposed to the matcher's "how good a match"), falling back to the label the
+    /// way the spec says a missing `sortText` does.
+    ///
+    /// Load-bearing because equal fuzzy scores are the *common* case, not a corner: a
+    /// two-character prefix matches a dozen candidates at the same positions, so with
+    /// nothing under the score the popup falls back to the order the items happened to
+    /// arrive in — a server's internal array order, or across servers whichever replied
+    /// first. That is what buries a call's parameters under unrelated globals.
+    ///
+    /// `None` for a `buffer` word and for every `select` / picker / cmdline row (no
+    /// source order to state); a `None` row leads a tied `Some` one, which is the right
+    /// way round — the tiers differ by their `priority` bias, so a tie across them means
+    /// the un-stated row out-matched the stated one by exactly that bias.
+    pub sort_key: Option<String>,
 }
 
 impl MenuItem {
@@ -255,6 +273,7 @@ impl MenuItem {
             resolve: None,
             replace: None,
             layout: None,
+            sort_key: None,
         }
     }
 }
@@ -841,6 +860,15 @@ impl Menu {
     /// (`lsp` bias 8 > snippets 5 > buffer 0). This replaces the old strict priority
     /// tiers, which pinned every buffer word below every snippet regardless of quality.
     ///
+    /// Rows that tie on the blended key then order by their source's own stated order
+    /// ([`MenuItem::sort_key`] — the `lsp` source's `sortText`), and only then by the
+    /// order they streamed in. Ties are the *common* case, not a corner: a short prefix
+    /// matches many candidates at the same positions, so without the second key the
+    /// popup's order is the order the items happened to arrive in — a server's internal
+    /// array order, and across servers whichever replied first. The matcher still decides
+    /// *whether* two rows tie; the source only breaks the tie, so a stated order can
+    /// never pull a poor match above a good one.
+    ///
     /// Re-scores via [`crate::fuzzy::rank_scored`] over the (small) filtered label set —
     /// the streamed spans are kept; only the order changes. A stable sort over the
     /// parallel `filtered` / `match_spans`. Called by [`Editor::menu_push`] for
@@ -849,6 +877,14 @@ impl Menu {
         if self.filtered.is_none() {
             return;
         }
+        // The row the user is standing on, as an `all_items` index — the identity the
+        // selection has to keep across the reorder. `self.cursor` is a position in the
+        // *view*, so leaving it alone slides whatever the sort moves into that slot
+        // under the caret: the popup would accept a candidate the user never chose.
+        // `None` for a noselect popup (nothing highlighted yet), which has no identity
+        // to preserve and must stay parked at the top.
+        let selected = (self.selected_active && self.cursor < self.view_len())
+            .then(|| self.item_at(self.cursor));
         let filtered = self.filtered.take().unwrap();
         let spans = std::mem::take(&mut self.match_spans);
         // The blend needs each row's fuzzy score against the live prefix; re-rank the
@@ -862,19 +898,33 @@ impl Menu {
         for (pos, sc, _) in crate::fuzzy::rank_scored(&query, &labels) {
             score_of[pos] = sc as i32;
         }
-        let mut rows: Vec<(usize, Vec<Range<usize>>, i32)> = filtered
-            .into_iter()
-            .zip(spans)
-            .enumerate()
-            .map(|(pos, (idx, sp))| {
-                let key = score_of[pos] + self.all_items[idx].priority;
-                (idx, sp, key)
-            })
+        // Sort a permutation of the view rather than the rows themselves, so the
+        // comparator can read `all_items` in place (no cloned keys) and the parallel
+        // `filtered` / `match_spans` are rebuilt from one order.
+        let mut order: Vec<usize> = (0..filtered.len()).collect();
+        // Descending blended key, then the source's stated order; stable, so rows that
+        // tie on both keep their streamed order.
+        order.sort_by(|&a, &b| {
+            let (ia, ib) = (&self.all_items[filtered[a]], &self.all_items[filtered[b]]);
+            (score_of[b] + ib.priority)
+                .cmp(&(score_of[a] + ia.priority))
+                .then_with(|| ia.sort_key.cmp(&ib.sort_key))
+        });
+        let mut spans: Vec<Option<Vec<Range<usize>>>> = spans.into_iter().map(Some).collect();
+        self.match_spans = order
+            .iter()
+            .map(|&pos| spans[pos].take().unwrap_or_default())
             .collect();
-        // Descending blended key; stable, so equal keys keep their streamed order.
-        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
-        self.filtered = Some(rows.iter().map(|r| r.0).collect());
-        self.match_spans = rows.into_iter().map(|r| r.1).collect();
+        let reordered: Vec<usize> = order.into_iter().map(|pos| filtered[pos]).collect();
+        // Follow the selected row to wherever it landed. A row that vanished mid-sort
+        // is not reachable here (the reorder is a permutation, never a filter), but
+        // fall back to the cursor as it was rather than assuming it.
+        if let Some(item) = selected {
+            if let Some(at) = reordered.iter().position(|&i| i == item) {
+                self.cursor = at;
+            }
+        }
+        self.filtered = Some(reordered);
     }
 
     /// The [`PreviewTarget`] for the highlighted row, when this picker carries a

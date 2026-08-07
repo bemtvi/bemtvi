@@ -22,7 +22,7 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    await_lines, buf_lines, buf_name, exec_lua, feed, spawn_with_daemon_fs,
+    await_lines, buf_lines, buf_name, exec_lua, feed, poll_true, spawn_with_daemon_fs,
     spawn_with_daemon_fs_init, DaemonFs,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -319,12 +319,11 @@ async fn edit_existing_remote_file_fires_bufreadpost_not_bufnewfile() {
     // The control: a genuinely-new remote path still fires BufNewFile.
     exec_lua(&rpc, "_G.events = {}").await;
     feed(&rpc, ":edit /virtual/fresh-lint.txt<CR>");
-    for _ in 0..100 {
-        if buf_name(&rpc).await == "/virtual/fresh-lint.txt" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Wait for the *event*, not for the buffer name: an off-tick `:edit` names its
+    // buffer the moment it is created and only learns the path doesn't exist when the
+    // fetch lands, so the name is true long before `BufNewFile` fires. Polling the name
+    // reads `_G.events` while it is still empty — the flake this used to show under load.
+    poll_true(&rpc, "return #_G.events > 0").await;
     let events = exec_lua(&rpc, "return table.concat(_G.events, ',')")
         .await
         .as_str()
@@ -425,6 +424,22 @@ async fn reload_over_the_wire_fires_bufwinenter() {
          return 1",
     )
     .await;
+
+    // Take the daemon's file watch out of the count *before* touching the file. The
+    // fixture write below is a real external change, so the watch pushes an `fs_changed`
+    // and 'autoread' turns it into a second, off-tick re-read of the same file — which
+    // owes its own `BufWinEnter` just as legitimately as the `:e!` does. Whether that
+    // watch reload lands before or after the assertion is pure timing, so the count was
+    // 1 or 2 depending on load. Left on, this test measures `:e!` *plus* an autoreload;
+    // off, it measures the `:e!` it is about. Round-tripped (`vim.o.autoread` read back)
+    // so the option is set server-side before the write races it — the convention every
+    // disk-change test here follows.
+    feed(&rpc, ":set noautoread<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.autoread").await.as_bool(),
+        Some(false),
+        "'noautoread' must land before the fixture write, or the watch reloads too"
+    );
 
     fake.set("/virtual/note.txt", "changed on the daemon\n");
     feed(&rpc, ":e!<CR>");

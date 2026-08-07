@@ -20,6 +20,32 @@ async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
 }
 
+/// Block until one of `sentinels` (Lua expressions, typically a `_G.x` a promise arm
+/// assigns) goes non-nil — i.e. the op under test settled — polling between server ticks
+/// up to a 30s ceiling.
+///
+/// Every git verb is a promise, so a fixed `tokio::time::sleep` is a bet that a clone /
+/// fetch / status finishes inside a hardcoded budget. Under a loaded
+/// `cargo test --workspace` that bet loses and the assertions then read a half-finished
+/// worktree — the flake this suite showed. Nil-checked rather than truthiness-checked so
+/// a sentinel that legitimately settles to `false` (`_G.pulled = r.updated`) counts as
+/// settled. `tests/daemon_git.rs` already polls; this is the same shape.
+async fn settle(rpc: &Rpc, sentinels: &[&str]) {
+    let cond = sentinels
+        .iter()
+        .map(|s| format!("({s}) ~= nil"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let code = format!("return {cond}");
+    for _ in 0..1200 {
+        if exec_lua(rpc, &code).await.as_bool() == Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out after 30s waiting for one of {sentinels:?} to settle");
+}
+
 /// Whether `git` is available; skip-if-missing is the convention for an external
 /// fixture dependency (the editor itself never shells out to git).
 fn have_git() -> bool {
@@ -77,7 +103,7 @@ async fn head_reports_branch_and_sha() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.h", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.h and _G.h.branch").await.as_str(),
         Some("main")
@@ -116,7 +142,7 @@ async fn diff_file_counts_a_modified_line() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.d"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.d and _G.d.changed")
             .await
@@ -155,7 +181,7 @@ async fn show_returns_head_blob_not_worktree() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.s", "_G.serr"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.s").await.as_str(),
         Some("a\nb\nc\n")
@@ -180,7 +206,7 @@ async fn status_reports_a_modified_file() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.st and _G.st.dirty")
             .await
@@ -230,7 +256,7 @@ async fn show_uncommitted_file_rejects_enoent_not_enorepo() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.code"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.code").await.as_str(),
         Some("ENOENT")
@@ -329,7 +355,7 @@ async fn clone_creates_worktree() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.dir", "_G.err"]).await;
     // Resolved the dir, no error, and the committed file is really on disk.
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
@@ -378,7 +404,7 @@ async fn checkout_detach_resets_worktree() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -401,7 +427,7 @@ async fn checkout_detach_resets_worktree() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.h"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.h and _G.h.detached")
             .await
@@ -432,7 +458,7 @@ async fn pull_fast_forwards_then_reports_noop() {
         &format!("nx.git_local.clone({src:?}, {dest:?}):next(function() _G.cloned = true end, function(e) _G.err = e end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.cloned", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.cloned").await.as_bool(),
         Some(true),
@@ -446,7 +472,7 @@ async fn pull_fast_forwards_then_reports_noop() {
         &format!("_G.p = nil\nnx.git_local.pull({dest:?}):next(function(r) _G.p = r end, function(e) _G.perr = e end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.p", "_G.perr"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.perr and _G.perr.message")
             .await
@@ -476,7 +502,7 @@ async fn pull_fast_forwards_then_reports_noop() {
         &format!("_G.p2 = nil\nnx.git_local.pull({dest:?}):next(function(r) _G.p2 = r end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    settle(&rpc, &["_G.p2"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.p2 and _G.p2.updated")
             .await
@@ -502,7 +528,7 @@ async fn pull_rejects_non_fast_forward() {
         &format!("nx.git_local.clone({src:?}, {dest:?}):next(function() _G.cloned = true end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.cloned"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.cloned").await.as_bool(),
         Some(true),
@@ -525,7 +551,7 @@ async fn pull_rejects_non_fast_forward() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.code"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.code").await.as_str(),
         Some("ENOTFF")
@@ -577,7 +603,7 @@ async fn submodule_update_inits_and_checks_out() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -633,7 +659,7 @@ async fn checkout_matches_git_oracle() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -666,7 +692,7 @@ async fn pull_matches_git_oracle() {
         &format!("nx.git_local.clone({src:?}, {mine:?}):next(function() _G.cloned = true end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.cloned"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.cloned").await.as_bool(),
         Some(true)
@@ -682,7 +708,7 @@ async fn pull_matches_git_oracle() {
         &format!("nx.git_local.pull({mine:?}):next(function() _G.pulled = true end, function(e) _G.err = e end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.pulled", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -754,7 +780,7 @@ async fn submodule_update_matches_git_oracle() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -857,7 +883,7 @@ async fn submodule_relative_url_matches_git_oracle() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -891,7 +917,7 @@ async fn discover_rejects_outside_a_repo() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.code"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.code").await.as_str(),
         Some("ENOREPO")
@@ -925,7 +951,7 @@ async fn status_folds_a_staged_and_modified_file_into_one_entry() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
 
     assert_eq!(
         exec_lua(&rpc, "return _G.st and #_G.st.entries").await,
@@ -969,7 +995,7 @@ async fn status_spells_untracked_as_both_columns() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
 
     assert_eq!(
         exec_lua(&rpc, "return _G.st and _G.st.entries[1].path")
@@ -1013,7 +1039,7 @@ async fn status_reports_an_unstaged_rename() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
 
     // One entry: the destination, marked `R` on the worktree column, carrying the path
     // it came from. (git's own porcelain does not detect unstaged renames — it prints
@@ -1065,7 +1091,7 @@ async fn status_leaves_orig_path_empty_for_a_plain_change() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.st and _G.st.entries[1].orig_path")
             .await
@@ -1098,7 +1124,7 @@ async fn status_keeps_the_rename_source_when_folding_a_later_edit() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
 
     assert_eq!(
         exec_lua(&rpc, "return _G.st and #_G.st.entries").await,
@@ -1167,7 +1193,7 @@ async fn checkout_attaches_head_to_a_branch() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -1182,7 +1208,7 @@ async fn checkout_attaches_head_to_a_branch() {
         &format!("_G.h = nil\nnx.git.head({dest:?}):next(function(r) _G.h = r end)"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.h"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.h and _G.h.detached")
             .await
@@ -1238,7 +1264,7 @@ async fn checkout_attaches_to_a_remote_only_branch() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.err and _G.err.message")
             .await
@@ -1267,15 +1293,16 @@ async fn checkout_attach_rejects_an_unknown_branch() {
     exec_lua(
         &rpc,
         &format!(
-            "_G.err = nil\n\
+            "_G.done, _G.err = nil, nil\n\
              nx.async(function()\n\
                nx.await(nx.git_local.clone({src:?}, {dest:?}))\n\
                nx.await(nx.git_local.checkout({dest:?}, \"no-such-branch\"))\n\
+               _G.done = true\n\
              end)():catch(function(e) _G.err = e end)",
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     let msg = exec_lua(&rpc, "return _G.err and _G.err.message").await;
     let msg = msg.as_str().unwrap_or("");
     assert!(
@@ -1317,7 +1344,7 @@ async fn fetch_unshallow_makes_older_history_reachable() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    settle(&rpc, &["_G.ok2", "_G.err2"]).await;
     assert!(
         exec_lua(&rpc, "return _G.err1").await.as_str().is_some(),
         "a depth-1 clone should not be able to reach the parent commit"
@@ -1354,10 +1381,16 @@ async fn fetch_updates_tracking_refs_without_touching_the_worktree() {
     let dest_s = dest.to_string_lossy().to_string();
     exec_lua(
         &rpc,
-        &format!("nx.async(function() nx.await(nx.git_local.clone({src:?}, {dest:?})) end)()"),
+        &format!(
+            "_G.cloned, _G.cerr = nil, nil\n\
+             nx.async(function()\n\
+               nx.await(nx.git_local.clone({src:?}, {dest:?}))\n\
+               _G.cloned = true\n\
+             end)():catch(function(e) _G.cerr = tostring(e and e.message or e) end)",
+        ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    settle(&rpc, &["_G.cloned", "_G.cerr"]).await;
     let before = git_out(Path::new(&dest_s), &["rev-parse", "HEAD"]);
 
     // The remote moves on; a fetch brings the tracking ref forward but leaves HEAD and
@@ -1373,7 +1406,7 @@ async fn fetch_updates_tracking_refs_without_touching_the_worktree() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    settle(&rpc, &["_G.done", "_G.err"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.done").await.as_bool(),
         Some(true),
@@ -1431,7 +1464,7 @@ async fn attaching_to_a_remote_only_branch_tracks_its_upstream_so_pull_works() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    settle(&rpc, &["_G.attached", "_G.aerr"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.attached").await.as_bool(),
         Some(true),
@@ -1456,7 +1489,7 @@ async fn attaching_to_a_remote_only_branch_tracks_its_upstream_so_pull_works() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    settle(&rpc, &["_G.pulled", "_G.perr"]).await;
     assert_eq!(
         exec_lua(&rpc, "return _G.pulled").await.as_bool(),
         Some(true),
@@ -1511,7 +1544,7 @@ async fn status_reports_ignored_paths_only_when_asked() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
     assert_eq!(
         exec_lua(&rpc, collect).await.as_str(),
         Some(""),
@@ -1529,7 +1562,7 @@ async fn status_reports_ignored_paths_only_when_asked() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
     assert_eq!(
         exec_lua(&rpc, collect).await.as_str(),
         Some("ignored.log=!!"),
@@ -1571,7 +1604,7 @@ async fn status_collapses_an_ignored_directory_into_one_entry() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
     // Exactly one entry, naming the directory — not the 9 files under it.
     assert_eq!(
         exec_lua(&rpc, "return _G.st and #_G.st.entries")
@@ -1632,7 +1665,7 @@ async fn status_with_ignored_keeps_modified_and_untracked_intact() {
         ),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    settle(&rpc, &["_G.st", "_G.sterr"]).await;
     assert_eq!(
         exec_lua(
             &rpc,

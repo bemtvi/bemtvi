@@ -306,6 +306,9 @@ fn build_float_config(
         focusable,
         border,
         title: normalize_title(title),
+        // The cursor-line-avoiding placement is core-owned (the LSP doc popups);
+        // a Lua-mounted float takes the plain `anchor`/`row`/`col` geometry.
+        flip: false,
     })
 }
 

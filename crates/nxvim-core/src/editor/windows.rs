@@ -303,6 +303,14 @@ pub struct FloatConfig {
     /// for an untitled float. Only meaningful with a `border`; the TUI renders it
     /// on the border's top row.
     pub title: Option<String>,
+    /// Keep the box clear of the `relative` origin's own row — the cursor-anchored
+    /// doc-popup rule (see [`place_float`]). A hover / signature float drops *below*
+    /// the cursor line, but near the bottom of the screen there is no room there and
+    /// the plain on-screen clamp would slide it back up **over** the line it
+    /// describes. With this set the box flips *above* the origin row instead, and
+    /// when neither side fits it shrinks to whichever side has more room (the only
+    /// case where a float's height is reduced) rather than covering the cursor.
+    pub flip: bool,
 }
 
 impl Default for FloatConfig {
@@ -320,6 +328,7 @@ impl Default for FloatConfig {
             focusable: true,
             border: BorderStyle::None,
             title: None,
+            flip: false,
         }
     }
 }
@@ -805,6 +814,13 @@ impl WindowTree {
 /// shift so the `anchor` corner lands there (an `E` anchor subtracts the width, an
 /// `S` anchor the height), then clamp on-screen.
 ///
+/// [`flip`](FloatConfig::flip) adds one rule on top of the low-level form, for a
+/// cursor-anchored doc popup: the box must never cover the origin's own row (the
+/// line it describes). When it does not fit below, it flips to sit *above* the
+/// origin row; when neither side fits it shrinks into the roomier one — the one
+/// case where a float's height is reduced — instead of being clamped back over the
+/// cursor.
+///
 /// `nvim_win_get_config` reports the resolved inner cells off the laid-out rect
 /// (see `float_mirror` / `win_config_value`), not the raw `Extent`. A float larger
 /// than `bounds` pins to the top-left rather than shrinking.
@@ -815,7 +831,7 @@ fn place_float(origin: Rect, bounds: Rect, cfg: &FloatConfig) -> Rect {
         0
     };
     let w = cfg.width.resolve(bounds.width).max(1) + border;
-    let h = cfg.height.resolve(bounds.height).max(1) + border;
+    let mut h = cfg.height.resolve(bounds.height).max(1) + border;
     let (x, y) = if let Some(align) = cfg.align {
         place_aligned(
             (bounds.x, bounds.y, bounds.width, bounds.height),
@@ -836,6 +852,28 @@ fn place_float(origin: Rect, bounds: Rect, cfg: &FloatConfig) -> Rect {
         }
         if matches!(cfg.anchor, FloatAnchor::SW | FloatAnchor::SE) {
             y = y.saturating_sub(h as isize);
+        }
+        if cfg.flip {
+            // The row the box must not cover is the origin's own (the cursor's line).
+            // Space below is what is left under the requested top; space above is
+            // everything strictly above the origin row.
+            let space_below = ((bounds.y + bounds.height) as isize)
+                .saturating_sub(y)
+                .max(0) as usize;
+            let space_above = origin.y.saturating_sub(bounds.y);
+            if h > space_below {
+                if h <= space_above {
+                    // Flips whole: sit with the box's bottom edge on the row above.
+                    y = origin.y.saturating_sub(h) as isize;
+                } else if space_above > space_below {
+                    // Neither side fits — take the roomier one and shrink into it (the
+                    // popup scrolls) rather than clamping back over the cursor line.
+                    h = space_above.max(border + 1);
+                    y = origin.y.saturating_sub(h) as isize;
+                } else {
+                    h = space_below.max(border + 1);
+                }
+            }
         }
         let lo_x = bounds.x as isize;
         let lo_y = bounds.y as isize;

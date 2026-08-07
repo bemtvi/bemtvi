@@ -656,6 +656,10 @@ impl EditHost {
             focusable: flag(get("focusable"), true),
             border,
             title: parse_title(get("title")),
+            // No `nvim_open_win` key for it: the cursor-line-avoiding placement is
+            // core-owned (the LSP doc popups), so a wire float is positioned by the
+            // plain `anchor`/`row`/`col` geometry it asked for.
+            flip: false,
         })
     }
 

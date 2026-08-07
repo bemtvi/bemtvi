@@ -550,8 +550,9 @@ impl Editor {
 
     /// Size the doc float to `lines` (widest line × line count, each clamped so a
     /// long popup scrolls rather than filling the screen), open it as a
-    /// non-focusable rounded float below the cursor with `wrap` on, and register it
-    /// under `name`. Shared by the plain ([`open_doc_float`](Self::open_doc_float)) and
+    /// non-focusable rounded float below the cursor — above it when the bottom of
+    /// the screen leaves no room ([`FloatConfig::flip`]) — with `wrap` on, and
+    /// register it under `name`. Shared by the plain ([`open_doc_float`](Self::open_doc_float)) and
     /// rendered ([`open_markdown_float`](Self::open_markdown_float)) doc surfaces (the
     /// LSP hover / signature-help popups).
     fn place_doc_float(&mut self, name: &str, buf: BufferId, lines: &[String]) {
@@ -572,10 +573,13 @@ impl Editor {
         let cfg = FloatConfig {
             relative: FloatRelative::Cursor,
             anchor: FloatAnchor::NW,
-            // Drop below the cursor's own line. `place_float` clamps the box fully
-            // on-screen, so a hover near the bottom is pulled up and stays visible.
+            // Drop below the cursor's own line — but never *over* it: with `flip`,
+            // a popup with no room below (writing a call near the bottom of the
+            // screen) opens above the cursor instead of being clamped back on top of
+            // the line being typed.
             row: 1,
             col: 0,
+            flip: true,
             width: Extent::Cells(width),
             height: Extent::Cells(height),
             focusable: false,

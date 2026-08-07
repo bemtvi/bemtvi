@@ -38,17 +38,23 @@ fn arm_mock(dir: &Path, script: &str) {
 /// Open a `.rs` buffer with `foo` under the cursor, attach, and bind the mock
 /// server. Returns the rpc + redraw stream; the caller drives hover / signature.
 async fn start(dir: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
+    // Put the cursor on `foo` (column 4) so a hover request has a symbol; it stays
+    // there (no motion) so the reply's cursor-staleness gate passes.
+    start_with(dir, "let foo = bar()\n", "0fw").await
+}
+
+/// [`start`] over arbitrary buffer `text`, with `keys` placing the cursor — so a
+/// test can drive a hover from a chosen screen row (e.g. the last one).
+async fn start_with(dir: &Path, text: &str, keys: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
     let file_path = dir.join("a.rs");
-    std::fs::write(&file_path, "let foo = bar()\n").expect("write test file");
+    std::fs::write(&file_path, text).expect("write test file");
     let init = ServerInit {
         file: Some(file_path.to_string_lossy().into_owned()),
         ..Default::default()
     };
     let (rpc, incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
-    // Put the cursor on `foo` (column 4) so a hover request has a symbol; it stays
-    // there (no motion) so the reply's cursor-staleness gate passes.
-    feed(&rpc, "0fw");
+    feed(&rpc, keys);
     exec_lua(
         &rpc,
         "nx._lsp_start('mock', { 'placeholder' }, vim.fn.getcwd(), 'rust', \
@@ -180,6 +186,26 @@ fn window_rect(win: &[(Value, Value)]) -> (usize, usize, usize, usize) {
     (n("x"), n("y"), n("width"), n("height"))
 }
 
+/// The focused *text* window's cursor cell as an absolute screen row — its rect's
+/// top plus the in-window `cursor_row`. The float has to stay clear of this row.
+fn cursor_screen_row(map: &[(Value, Value)]) -> usize {
+    let windows = map_get(map, "windows")
+        .and_then(Value::as_array)
+        .expect("windows in the redraw");
+    let win = windows
+        .iter()
+        .filter_map(Value::as_map)
+        .find(|w| {
+            map_get(w, "floating").and_then(Value::as_bool) != Some(true)
+                && map_get(w, "focused").and_then(Value::as_bool) == Some(true)
+        })
+        .expect("the focused text window");
+    let (_, y, _, _) = window_rect(win);
+    y + map_get(win, "cursor_row")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
 /// Retry the `trigger` Lua until a floating doc-float *window* (hover / signature)
 /// appears with some line containing `want` (the async reply takes a moment to
 /// land); returns its rows.
@@ -212,6 +238,113 @@ async fn await_doc_float_redraw(
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     panic!("the doc-float window never contained {want:?}");
+}
+
+/// A doc float drops *below* the cursor's line — but near the bottom of the screen
+/// there is no room below, and merely clamping the box on-screen slides it back up
+/// **over** the cursor, hiding the very line being described (you cannot see what
+/// you are typing while the signature popup covers the call). It must flip above the
+/// cursor line instead, the way the content-float projection already does.
+#[tokio::test]
+async fn a_hover_at_the_bottom_of_the_screen_opens_above_the_cursor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_hover_bottom");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown",
+             "value": "`foo`: a scripted hover symbol" } } }"#,
+    );
+    // More lines than the 24-row screen, so `G` scrolls the view and leaves the
+    // cursor on the LAST text row — no room at all for a float below it.
+    let mut text: String = (0..60).map(|_| "let x = 1\n").collect();
+    text.push_str("let foo = bar()\n");
+    let (rpc, mut incoming) = start_with(&dir, &text, "G0fw").await;
+
+    let (redraw, win) =
+        await_doc_float_redraw(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
+    let cursor_row = cursor_screen_row(&redraw);
+    let (_, y, _, h) = window_rect(&win);
+    assert!(
+        y + h <= cursor_row,
+        "the hover float must sit entirely above the cursor row {cursor_row}, \
+         got rows {y}..{}",
+        y + h
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// A popup taller than *either* side of the cursor: it takes the roomier side and
+/// shrinks into it (the content scrolls) rather than spilling over the cursor line.
+#[tokio::test]
+async fn a_tall_hover_shrinks_into_the_roomier_side_of_the_cursor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_hover_tall");
+    // 30 lines of hover — 20 after the popup's height cap, 22 with its border, more
+    // than fits above *or* below a cursor sitting low in a 24-row screen.
+    let body = format!(
+        "```\\n{}\\n```",
+        (0..30)
+            .map(|i| format!("hover line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\\n")
+    );
+    arm_mock(
+        &dir,
+        &format!(r#"{{ "hover": {{ "contents": {{ "kind": "markdown", "value": "{body}" }} }} }}"#),
+    );
+    // Every line hovers, so `G10k` lands the cursor ~10 rows off the bottom: more
+    // room above than below, but not enough for the whole popup on either side.
+    let text: String = (0..60).map(|_| "let foo = bar()\n").collect();
+    let (rpc, mut incoming) = start_with(&dir, &text, "G10k0fw").await;
+
+    let (redraw, win) =
+        await_doc_float_redraw(&rpc, &mut incoming, "nx.lsp.hover()", "hover line 00").await;
+    let cursor_row = cursor_screen_row(&redraw);
+    let (_, y, _, h) = window_rect(&win);
+    assert!(
+        y + h <= cursor_row,
+        "a too-tall hover shrinks to stay clear of the cursor row {cursor_row}, \
+         got rows {y}..{}",
+        y + h
+    );
+    assert!(
+        h > 2,
+        "the shrunk float still shows content, got height {h}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+/// The signature popup is the surface this hurts most — you are mid-call in insert
+/// mode, and a popup over the cursor hides what you are typing. Same placement rule.
+#[tokio::test]
+async fn a_signature_float_at_the_bottom_of_the_screen_opens_above_the_cursor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_sig_bottom");
+    arm_mock(
+        &dir,
+        r#"{ "signature_help": { "signatures": [
+             { "label": "fn foo(a: i32, b: i32)",
+               "parameters": [ { "label": "a: i32" }, { "label": "b: i32" } ] } ],
+             "activeSignature": 0, "activeParameter": 0 } }"#,
+    );
+    let mut text: String = (0..60).map(|_| "let x = 1\n").collect();
+    text.push_str("let foo = bar()\n");
+    let (rpc, mut incoming) = start_with(&dir, &text, "G0fw").await;
+
+    let (redraw, win) =
+        await_doc_float_redraw(&rpc, &mut incoming, "nx.lsp.signature_help()", "fn foo(").await;
+    let cursor_row = cursor_screen_row(&redraw);
+    let (_, y, _, h) = window_rect(&win);
+    assert!(
+        y + h <= cursor_row,
+        "the signature float must sit entirely above the cursor row {cursor_row}, \
+         got rows {y}..{}",
+        y + h
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
 }
 
 #[tokio::test]

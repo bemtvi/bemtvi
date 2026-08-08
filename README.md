@@ -60,6 +60,18 @@ Downloads ship with checksums and SLSA build provenance — see
 > kitty protocol, not xterm's older `modifyOtherKeys`.) Force the decision either way
 > with `NXVIM_KITTY_KEYBOARD=1` / `=0`.
 
+> **The clipboard works over ssh.** `"+y` / `"*y` use a real host clipboard tool
+> when one can actually reach you (`pbcopy`, `wl-copy`, `xclip`/`xsel` with a
+> display, `tmux`). On a remote machine none can — so nxvim asks your *terminal*
+> to set its own clipboard with an [OSC
+> 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Operating-System-Commands)
+> escape, which travels back down the ssh connection. It is used only when the
+> terminal advertises support (queried at startup), so a yank never silently
+> copies into a void; force the decision either way with `NXVIM_OSC52=1` / `=0`.
+> Pasting *into* nxvim from another app on your machine is your terminal's own
+> paste (`Ctrl+Shift+V`, middle-click) — reading the clipboard back over OSC 52 is
+> a round trip most terminals refuse, so `"+p` pastes what this session copied.
+
 The terminal editor is the whole thing in one binary: it embeds the server on
 its own thread and runs the client on the main thread, joined over the same
 msgpack-RPC the UI clients speak.

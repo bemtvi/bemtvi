@@ -50,6 +50,29 @@ pub async fn start_with_clipboard() -> (Rpc, UnboundedReceiver<Incoming>, FakeCl
     (rpc, incoming, fake)
 }
 
+/// Start a server whose `"+` / `"*` registers fall back to the client terminal's
+/// **OSC 52** clipboard — the ssh case: no host clipboard tool on this machine, so
+/// the copy rides an escape sequence out to the terminal emulator instead. The UI
+/// attaches declaring `osc52` support, the way the real TUI does when it has
+/// probed the terminal.
+pub async fn start_with_osc52() -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_osc52_with_caps(vec![(Value::from("osc52"), Value::Boolean(true))]).await
+}
+
+/// [`start_with_osc52`] with an explicit capabilities map, so a test can attach a
+/// client that does *not* declare `osc52` (a terminal whose probe came back
+/// negative) and assert the registers stay loudly unavailable.
+pub async fn start_osc52_with_caps(
+    caps: Vec<(Value, Value)>,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let (rpc, incoming) = spawn(ServerInit {
+        clipboard: nxvim_server::ClipboardProvider::Osc52,
+        ..Default::default()
+    });
+    attach_with_caps(&rpc, 80, 25, caps).await;
+    (rpc, incoming)
+}
+
 // ===== redraw / view accessors ===============================================
 
 /// Feed `keys` and return the `redraw` carrying the one-shot `scroll` gesture —

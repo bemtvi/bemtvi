@@ -30,6 +30,11 @@ struct Session {
     /// The throwaway empty config dir injected for hermeticity (removed on drop);
     /// `None` when the test supplied its own `NXVIM_CONFIG`.
     _cfg_dir: Option<PathBuf>,
+    /// Every byte the child wrote, kept alongside the parsed screen. `vt100`
+    /// renders the *display*, so escapes that aren't display state (an OSC 52
+    /// clipboard write) are invisible there — the raw log is the only place a test
+    /// can see one.
+    raw: Arc<Mutex<Vec<u8>>>,
 }
 
 /// Create a fresh, empty config directory under the temp dir, unique per call, so a
@@ -85,6 +90,8 @@ impl Session {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
         let sink = parser.clone();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let raw_sink = raw.clone();
         // Continuously drain the PTY so the deadline logic in `wait_until` never
         // blocks on a read. The thread ends when the child closes the PTY.
         std::thread::spawn(move || {
@@ -92,7 +99,10 @@ impl Session {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => sink.lock().unwrap().process(&buf[..n]),
+                    Ok(n) => {
+                        raw_sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                        sink.lock().unwrap().process(&buf[..n]);
+                    }
                 }
             }
         });
@@ -103,6 +113,7 @@ impl Session {
             _child: child,
             _master: pair.master,
             _cfg_dir: cfg_dir,
+            raw,
         }
     }
 
@@ -124,6 +135,27 @@ impl Session {
             if Instant::now() >= deadline {
                 let guard = self.parser.lock().unwrap();
                 return pred(guard.screen());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Poll the *raw* output stream until it contains `needle`, or `timeout`
+    /// elapses. For escapes that leave no mark on the screen (see [`Session::raw`]).
+    fn wait_for_raw(&self, timeout: Duration, needle: &[u8]) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .raw
+                .lock()
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -175,6 +207,58 @@ fn startup_shows_the_file_contents() {
         t.contains("alpha") && t.contains("beta")
     });
     assert!(ok, "screen never showed the file:\n{}", s.screen_text());
+
+    s.send(b":q!\r");
+    std::fs::remove_file(&path).ok();
+}
+
+/// The whole `"+y`-over-ssh chain, end to end through the real binary: the server
+/// finds no clipboard tool it could usefully run, the client says it can carry
+/// OSC 52, and the yank leaves the process as the escape that puts the text on the
+/// clipboard of the machine the terminal is running on.
+///
+/// The probe can't run here (a `portable-pty` terminal answers no capability
+/// query), so `NXVIM_OSC52=1` forces the capability on — the same escape hatch a
+/// user needs on a terminal that supports the write but advertises nothing. The
+/// display variables are cleared so the server takes the no-host-tool path on a
+/// developer's desktop, which is what an ssh session looks like.
+#[test]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn a_clipboard_yank_leaves_as_an_osc52_escape() {
+    let path =
+        nxvim_test_harness::temp_root().join(format!("nxvim_e2e_osc52_{}.txt", std::process::id()));
+    std::fs::write(
+        &path, "clip me
+",
+    )
+    .unwrap();
+
+    let mut s = Session::spawn_with_env(
+        &[path.to_str().unwrap()],
+        &[
+            ("NXVIM_OSC52", "1"),
+            ("DISPLAY", ""),
+            ("WAYLAND_DISPLAY", ""),
+            ("TMUX", ""),
+        ],
+        80,
+        24,
+    );
+    assert!(
+        s.wait_until(Duration::from_secs(5), |scr| scr
+            .contents()
+            .contains("clip me")),
+        "file never showed:\n{}",
+        s.screen_text()
+    );
+
+    s.send(b"\"+yy");
+    // `ESC ] 52 ; c ;` then base64("clip me\n").
+    assert!(
+        s.wait_for_raw(Duration::from_secs(5), b"\x1b]52;c;Y2xpcCBtZQo=\x1b\\"),
+        "no OSC 52 clipboard write reached the terminal; screen:\n{}",
+        s.screen_text()
+    );
 
     s.send(b":q!\r");
     std::fs::remove_file(&path).ok();

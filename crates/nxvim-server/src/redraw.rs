@@ -360,6 +360,12 @@ impl EditHost {
             ));
         }
 
+        // Terminal writes the tick queued (an OSC 52 clipboard write from a `"+`
+        // yank) leave just ahead of the frame that tick produced. The editor is
+        // synchronous and holds no transport, so this is where an escape bound for
+        // the client's terminal — rather than for its renderer — is handed over.
+        #[cfg(feature = "native")]
+        self.flush_ui_sends();
         self.fx.notify("redraw", vec![Value::Map(map)]);
     }
 

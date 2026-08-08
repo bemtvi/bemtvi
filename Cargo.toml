@@ -117,6 +117,9 @@ image = "=0.25.10"
 # reply *without consuming stdin*, which `std::io` can't express. Already in the
 # tree transitively; pinned to the resolved version.
 libc = "=0.2.186"
+# OSC 52 clipboard payloads (`crates/nxvim-server/src/clipboard.rs`) — the escape
+# carries its text base64-encoded.
+base64 = "=0.22.1"
 # Native GUI client stack (`nxvim-gui`). winit owns the window + input event loop,
 # wgpu the GPU surface, and glyphon the text rendering (it re-exports cosmic-text,
 # so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through `glyphon::`). glyphon

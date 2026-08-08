@@ -134,6 +134,19 @@ impl EditHost {
                 if cap("truecolor") && self.lua.get_global_var("colors_name").is_none() {
                     self.set_colorscheme("nxvim");
                 }
+                // `osc52 = true` says the client's terminal accepts OSC 52 clipboard
+                // writes (it probed for them). That makes the terminal itself a usable
+                // `"+` / `"*` provider — the only one that can reach the user's own
+                // machine from an ssh session — so install it now that we know. Armed
+                // in `run` only when nothing better was found, so this never displaces
+                // a real host clipboard; a client that stays quiet gets no provider and
+                // the registers keep erroring loudly rather than copying into a void.
+                if cap("osc52") {
+                    if let Some(state) = self.osc52.clone() {
+                        self.editor
+                            .set_clipboard(Box::new(crate::clipboard::Osc52Clipboard::new(state)));
+                    }
+                }
                 // The resize assigns the window its first rect, so a `nx.decor`
                 // provider's viewport is only now known. Drive `run_pending` to
                 // dispatch it (and any other off-tick work the size change queued)

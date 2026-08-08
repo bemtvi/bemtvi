@@ -463,10 +463,19 @@ pub struct ServerInit {
 #[cfg(feature = "native")]
 #[derive(Default)]
 pub enum ClipboardProvider {
-    /// Best-effort real host clipboard (the binary's choice). If no clipboard
-    /// tool is found on this platform, the registers stay unavailable and error
-    /// loudly on use rather than silently falling back to the unnamed register.
+    /// Best-effort real host clipboard (the binary's choice): a host tool if one
+    /// is usable here, else the client terminal's OSC 52 clipboard
+    /// ([`Osc52`](Self::Osc52)) when it declares support. If neither is available
+    /// the registers stay unavailable and error loudly on use rather than
+    /// silently falling back to the unnamed register.
     System,
+    /// The client terminal's **OSC 52** clipboard, armed at attach if the client
+    /// declares the `osc52` capability (and left unarmed — loudly unavailable —
+    /// if it doesn't). What [`System`](Self::System) resolves to on a machine with
+    /// no usable clipboard tool: an ssh session's copy has to reach the terminal
+    /// emulator, not the remote host. Selected directly by tests, which must not
+    /// depend on what the developer's box has installed.
+    Osc52,
     /// No provider — `"+` / `"*` error loudly. The default, so bare-server tests
     /// never touch the host clipboard unless they opt in.
     #[default]
@@ -912,6 +921,14 @@ pub struct EditHost {
     /// [`ServerInit::remote_shada`] + a clone of the daemon `host_fs_async`.
     #[cfg(feature = "native")]
     remote_shada: Option<RemoteShadaSync>,
+    /// The OSC 52 clipboard's shared state, when this session's `"+` / `"*` are to
+    /// ride the client terminal (no usable host tool — see
+    /// [`ClipboardProvider::Osc52`]). Armed in [`run`], *installed* on the editor
+    /// only once a client attaches declaring `osc52`, since the escape is the
+    /// client's to emit. `None` when a real host clipboard was found, or when the
+    /// registers are meant to stay unavailable.
+    #[cfg(feature = "native")]
+    osc52: Option<crate::clipboard::Osc52Handle>,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
     /// Whether the attached client has the kitty keyboard protocol active (reported
@@ -1656,6 +1673,8 @@ impl EditHost {
             pending_session: None,
             #[cfg(feature = "native")]
             remote_shada: None,
+            #[cfg(feature = "native")]
+            osc52: None,
             ui: None,
             keyboard_protocol: false,
             #[cfg(feature = "native")]
@@ -3559,15 +3578,23 @@ where
     // simply isn't highlighted.
     editor.set_syntax_engine(Box::new(nxvim_ts::Engine::new(nxvim_ts::data_dir())));
     // The `"+` / `"*` registers route through an injected clipboard provider.
-    // `System` resolves a real host clipboard tool (best effort); `Custom` is a
-    // caller-supplied fake (tests); `Disabled` installs nothing and lets `"+`
-    // error loudly.
+    // `System` resolves a real host clipboard tool (best effort), falling back to
+    // the client terminal's OSC 52 clipboard when this machine has none that could
+    // reach the user; `Custom` is a caller-supplied fake (tests); `Disabled`
+    // installs nothing and lets `"+` error loudly. The OSC 52 provider is *armed*
+    // rather than installed — it needs a client that can emit the escape, which is
+    // only known once one attaches (`nx_ui_attach`).
+    let mut osc52: Option<clipboard::Osc52Handle> = None;
     match init.clipboard {
-        ClipboardProvider::System => {
-            if let Some(cb) = clipboard::SystemClipboard::detect() {
-                editor.set_clipboard(Box::new(cb));
-            }
-        }
+        ClipboardProvider::System => match clipboard::SystemClipboard::detect() {
+            Some(cb) => editor.set_clipboard(Box::new(cb)),
+            // Nothing on this host can reach a clipboard the user would see — a
+            // bare server, or (the common case) an ssh session, where a tool would
+            // only ever set the *remote* machine's clipboard. Fall back to asking
+            // the terminal itself.
+            None => osc52 = Some(clipboard::Osc52Handle::default()),
+        },
+        ClipboardProvider::Osc52 => osc52 = Some(clipboard::Osc52Handle::default()),
         ClipboardProvider::Custom(cb) => editor.set_clipboard(cb),
         ClipboardProvider::Disabled => {}
     }
@@ -3814,6 +3841,9 @@ where
             host_term,
         )),
     );
+    // The terminal-backed clipboard, if this session resolved to one: held until a
+    // client attaches and says it can emit the escape (`nx_ui_attach`).
+    host.osc52 = osc52;
     // The two capabilities `new` defaults but the native session injects: the
     // persistence store (loaded before the first frame) and the optional fake mouse
     // clock (multi-click timing in tests).

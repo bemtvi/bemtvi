@@ -42,6 +42,7 @@ native = [
     "dep:ureq",
     "dep:axum",
     "dep:form_urlencoded",
+    "dep:base64",
 ]
 
 [dependencies]
@@ -110,6 +111,10 @@ axum = { workspace = true, optional = true }
 # same canonical `rust-url` serializer `nx.http`'s outbound `query`/`form` encoding
 # uses, read in reverse. No bespoke query parser.
 form_urlencoded = { workspace = true, optional = true }
+# The OSC 52 clipboard payload is base64 (`clipboard.rs`) — the escape sequence
+# carries the copied text encoded. Optional + `native`-gated with the rest of the
+# clipboard module (the browser build has its own clipboard seam).
+base64 = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The daemon **dial** test exercises the handoff race between the link thread and the

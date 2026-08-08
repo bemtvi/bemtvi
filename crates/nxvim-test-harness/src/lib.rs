@@ -474,6 +474,48 @@ pub fn drain_to_latest_redraw(
     }
 }
 
+/// Wait for the next notification named `method` and return its params, up to a
+/// generous timeout — for the one-shot server→client notifications that are not
+/// `redraw` frames (`nx_ui_send`, …).
+///
+/// Take-*first*, deliberately: unlike a repaint, each of these carries a distinct
+/// event, so "the latest" would silently drop earlier ones. Panics if none
+/// arrives before the timeout.
+pub async fn wait_notification(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    method: &str,
+) -> Vec<Value> {
+    if let Some(params) = drain_notification(incoming, method) {
+        return params;
+    }
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(params) = drain_notification(incoming, method) {
+            return params;
+        }
+    }
+    panic!("no {method:?} notification arrived");
+}
+
+/// The first queued notification named `method`, or `None` when none is buffered
+/// — the non-blocking half of [`wait_notification`], for asserting that a
+/// notification was *not* emitted (drain after a barrier that guarantees the
+/// server has finished the tick).
+pub fn drain_notification(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    method: &str,
+) -> Option<Vec<Value>> {
+    loop {
+        match incoming.try_recv() {
+            Ok(Incoming::Notification { method: m, params }) if m == method => {
+                return Some(params);
+            }
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Wait for a `redraw` whose map satisfies `keep`, up to a generous timeout:
 /// the most recent match already queued, else the first match to arrive.
 /// *Map convention.* Because the await path returns the *first* arrival that

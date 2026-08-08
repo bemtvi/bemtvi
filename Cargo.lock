@@ -4119,6 +4119,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "form_urlencoded",
  "getrandom 0.4.3",
  "notify",

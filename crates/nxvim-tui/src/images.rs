@@ -193,7 +193,7 @@ fn terminal_answers_status_query() -> bool {
         return false;
     }
     // Generous first wait: a slow hop (ssh) can sit on the reply for a while.
-    if !stdin_readable_within(std::time::Duration::from_millis(1000)) {
+    if !crate::termquery::stdin_readable_within(std::time::Duration::from_millis(1000)) {
         return false;
     }
     // Drain until a quiet gap so the capability query starts from clean input.
@@ -205,34 +205,8 @@ fn terminal_answers_status_query() -> bool {
             Ok(0) | Err(_) => return false,
             Ok(_) => {}
         }
-        if !stdin_readable_within(std::time::Duration::from_millis(50)) {
+        if !crate::termquery::stdin_readable_within(std::time::Duration::from_millis(50)) {
             return true;
-        }
-    }
-}
-
-/// `poll(2)` stdin for readability within `timeout` — waits without consuming a
-/// byte, and holds no resources once it returns (unlike a parked reader thread).
-#[cfg(unix)]
-fn stdin_readable_within(timeout: std::time::Duration) -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let mut pfd = libc::pollfd {
-        fd: std::io::stdin().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let remain = deadline.saturating_duration_since(std::time::Instant::now());
-        let ms = i32::try_from(remain.as_millis()).unwrap_or(i32::MAX);
-        match unsafe { libc::poll(&mut pfd, 1, ms) } {
-            // Interrupted by a signal: retry with the remaining budget (a zero
-            // budget makes `poll` return 0 immediately, ending the loop).
-            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
-                continue;
-            }
-            n => return n > 0 && (pfd.revents & libc::POLLIN) != 0,
         }
     }
 }

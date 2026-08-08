@@ -25,6 +25,7 @@ mod images;
 mod keys;
 mod render;
 mod signals;
+mod termquery;
 
 pub use keys::encode_key;
 pub use render::{cursor_style, paint, paint_with_cursor, ScrollHarness};
@@ -247,6 +248,145 @@ fn truecolor_enabled() -> bool {
     }
 }
 
+/// Whether the terminal can be handed a clipboard write — an **OSC 52** escape,
+/// which asks the terminal emulator to put text on *its own* machine's clipboard.
+///
+/// This is what makes `"+y` work over ssh. Nothing running on the remote host can
+/// reach the clipboard the user actually pastes from; the terminal in front of
+/// them can, and the escape rides back down the same pipe the screen does. The
+/// server falls back to it (as the `osc52` attach capability) only when it found
+/// no usable clipboard tool of its own.
+///
+/// Gating on real support is load-bearing, not politeness — same reasoning as
+/// [`kitty_keyboard_enabled`]. Reporting it unconditionally would make every `"+y`
+/// on a terminal that ignores the escape *look* like it copied while the text went
+/// nowhere; a copy that silently vanishes is worse than a loud "no clipboard
+/// provider". So we ask, the way neovim does: DA1 (`ESC[c`), whose reply lists
+/// capability `52` on terminals that implement the clipboard extension, then
+/// XTGETTCAP for the `Ms` capability as a fallback for terminals that answer that
+/// instead. Detection must run with raw mode on but before the input
+/// `EventStream` exists, so both probes read their own reply.
+///
+/// `NXVIM_OSC52` overrides detection in either direction, matching
+/// [`truecolor_enabled`]: a falsey value (`0`/`false`/`off`/`no`, or empty) forces
+/// it **off**; any other value forces it **on** — the escape hatch for a terminal
+/// that supports the write but advertises nothing (a multiplexer that passes it
+/// through, a terminal with no XTGETTCAP), and the only way to enable it where
+/// there is no tty to probe.
+fn osc52_enabled() -> bool {
+    match std::env::var("NXVIM_OSC52").ok().as_deref() {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+        None => terminal_advertises_osc52(),
+    }
+}
+
+/// Ask the terminal whether it implements OSC 52 (see [`osc52_enabled`]).
+#[cfg(unix)]
+fn terminal_advertises_osc52() -> bool {
+    use std::time::Duration;
+
+    // Primary Device Attributes. Every terminal answers this one, so a silent
+    // reply means "no capability information at all" — don't probe further.
+    let Some(reply) = termquery::ask(b"\x1b[c", Duration::from_millis(1000)) else {
+        return false;
+    };
+    if da1_advertises_osc52(&reply) {
+        return true;
+    }
+    // Terminal.app echoes sequences it doesn't understand straight back, which
+    // would land in the input stream as garbage — never XTGETTCAP it (neovim
+    // carves out the same exception).
+    if std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal") {
+        return false;
+    }
+    // XTGETTCAP for `Ms` — the terminfo capability naming the sequence that sets
+    // the clipboard. `4D73` is "Ms" hex-encoded, as the query requires.
+    let Some(reply) = termquery::ask(b"\x1bP+q4D73\x1b\\", Duration::from_millis(500)) else {
+        return false;
+    };
+    xtgettcap_advertises_osc52(&reply)
+}
+
+/// Non-unix: no `poll(2)` to probe with, so leave OSC 52 to the explicit
+/// `NXVIM_OSC52` opt-in rather than emit an escape the terminal may not know.
+#[cfg(not(unix))]
+fn terminal_advertises_osc52() -> bool {
+    false
+}
+
+/// Whether a Primary Device Attributes reply lists capability **52** — "can set
+/// the clipboard via OSC 52".
+///
+/// The reply is `ESC [ ? <param> ; <param> ; … c`; a terminal may send other
+/// output around it, so this scans for the introducer rather than anchoring at the
+/// start. Public for the client-side test (`tests/osc52.rs`) — parsing a reply
+/// needs no terminal.
+pub fn da1_advertises_osc52(reply: &[u8]) -> bool {
+    let mut rest = reply;
+    while let Some(at) = find(rest, b"\x1b[?") {
+        let params = &rest[at + 3..];
+        // The parameters run up to the sequence's final byte. Stopping at the first
+        // byte that can't be one keeps this from reading the digits of some *other*
+        // `CSI ?` report (a mode report, say) as device attributes — those carry
+        // numbers too, and a stray `52` in one must not read as clipboard support.
+        let end = params
+            .iter()
+            .position(|&b| !b.is_ascii_digit() && b != b';')
+            .unwrap_or(params.len());
+        if params.get(end) == Some(&b'c') && params[..end].split(|&b| b == b';').any(|p| p == b"52")
+        {
+            return true;
+        }
+        // Not a DA1 reply (or truncated: no final byte at all) — keep looking. The
+        // slice always shrinks, since it starts past the introducer just examined.
+        rest = &params[end..];
+    }
+    false
+}
+
+/// Whether an XTGETTCAP reply says the `Ms` capability *is* an OSC 52 sequence.
+///
+/// A successful reply is `ESC P 1 + r <name-hex> = <value-hex> ESC \`; a terminal
+/// that doesn't know the capability answers `ESC P 0 + r … ESC \`. The value is
+/// only useful if it really is OSC 52 — a terminal reporting some other clipboard
+/// mechanism must not be sent one (nxvim, like neovim, emits OSC 52 and nothing
+/// else). Public for the client-side test, as with [`da1_advertises_osc52`].
+pub fn xtgettcap_advertises_osc52(reply: &[u8]) -> bool {
+    let Some(at) = find(reply, b"\x1bP1+r") else {
+        return false;
+    };
+    let body = &reply[at + 5..];
+    let end = body.iter().position(|&b| b == 0x1b).unwrap_or(body.len());
+    let Some(eq) = body[..end].iter().position(|&b| b == b'=') else {
+        return false;
+    };
+    let Some(value) = unhex(&body[eq + 1..end]) else {
+        return false;
+    };
+    value.starts_with(b"\x1b]52")
+}
+
+/// Decode an even-length ASCII-hex string, or `None` if it isn't one.
+fn unhex(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    hex.chunks(2)
+        .map(|pair| {
+            let s = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(s, 16).ok()
+        })
+        .collect()
+}
+
+/// The index of the first occurrence of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Builds a replacement backend for a `nx.session.reconnect` swap (§B). The swap loop
 /// hands it the raw `nx_session_reconnect` params and gets back the client-side transport
 /// of a fresh session (same stream type). The binary provides it — it owns session +
@@ -313,6 +453,12 @@ where
     // capability report — no terminal state to set up or tear down — so unlike the
     // guards above it's just a bool carried into each `event_loop`/attach.
     let truecolor = truecolor_enabled();
+    // Whether this terminal accepts an OSC 52 clipboard write, reported to the
+    // server so it can back `"+` / `"*` with the terminal when the host it runs on
+    // has no clipboard of its own — the ssh case (see `osc52_enabled`). Probed
+    // here for the same reason as the keyboard protocol: raw mode is on, and the
+    // `EventStream` that would race for the reply isn't up until `event_loop`.
+    let osc52 = osc52_enabled();
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
     // Restore the user's cursor shape on the way out — the loop switches it to a
@@ -330,6 +476,7 @@ where
             build.clone(),
             keyboard.is_some(),
             truecolor,
+            osc52,
             &mut shutdown,
         )
         .await
@@ -354,6 +501,7 @@ async fn event_loop<S>(
     build: SessionBuilder<S>,
     keyboard_protocol: bool,
     truecolor: bool,
+    osc52: bool,
     shutdown: &mut ShutdownSignal,
 ) -> Result<Outcome<S>>
 where
@@ -386,6 +534,10 @@ where
                 // 24-bit color support: lets the server default in the bundled
                 // `nxvim` colorscheme on a rich terminal (see `truecolor_enabled`).
                 (Value::from("truecolor"), Value::from(truecolor)),
+                // OSC 52 clipboard writes: lets the server back `"+` / `"*` with
+                // this terminal when its own host has no clipboard tool that could
+                // reach the user — the ssh case (see `osc52_enabled`).
+                (Value::from("osc52"), Value::from(osc52)),
             ]),
         ],
     )
@@ -549,6 +701,20 @@ where
                         if cursor_shape != Some(want) {
                             let _ = crossterm::execute!(std::io::stdout(), want);
                             cursor_shape = Some(want);
+                        }
+                    }
+                    // Raw bytes for the *terminal* rather than the renderer: today an
+                    // OSC 52 clipboard write behind a `"+` yank. The client is a dumb
+                    // pipe here — the server owns which escape to send (and only sends
+                    // ones this client declared it can take at attach); we write it
+                    // verbatim and flush, since an escape sitting in the buffer until
+                    // the next paint would land the copy late.
+                    "nx_ui_send" => {
+                        if let Some(seq) = params.first().and_then(|v| v.as_str()) {
+                            use std::io::Write as _;
+                            let mut out = std::io::stdout();
+                            let _ = out.write_all(seq.as_bytes());
+                            let _ = out.flush();
                         }
                     }
                     "nxvim_exit" => return Ok(Outcome::Exit),

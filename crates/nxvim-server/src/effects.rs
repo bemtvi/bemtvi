@@ -1368,6 +1368,24 @@ impl EditHost {
         }
     }
 
+    /// Push any escape sequences the tick queued for the client's *terminal*
+    /// (today: the OSC 52 clipboard write behind a `"+` / `"*` yank) as
+    /// `nx_ui_send` notifications — the client writes each verbatim to its tty.
+    /// Called from [`redraw`](crate::EditHost::redraw), so a write always travels
+    /// with the frame of the tick that produced it. A no-op unless this session's
+    /// clipboard is the terminal (see
+    /// [`ClipboardProvider::Osc52`](crate::ClipboardProvider::Osc52)).
+    #[cfg(feature = "native")]
+    pub(crate) fn flush_ui_sends(&mut self) {
+        let Some(state) = self.osc52.as_ref() else {
+            return;
+        };
+        let pending = std::mem::take(&mut state.lock().unwrap().pending);
+        for seq in pending {
+            self.fx.notify("nx_ui_send", vec![Value::from(seq)]);
+        }
+    }
+
     /// Drain the status-line clicks the core recorded for the last mouse gesture
     /// (`%@handler@…%X` regions) and fire each one's Lua handler. For every click,
     /// recompute the window's click regions and resolve the clicked column to a

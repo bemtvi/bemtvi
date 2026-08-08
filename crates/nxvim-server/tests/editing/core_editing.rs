@@ -1139,3 +1139,42 @@ async fn big_word_motions_span_punctuation() {
         "B jumps back to start of foo.bar"
     );
 }
+
+// ===== insert-mode <Home> / <End> ============================================
+
+/// `<Home>` / `<End>` move to the first / last column *without leaving Insert*,
+/// the way every other editor (and vim's `i_<Home>` / `i_<End>`) behaves. They
+/// used to fall through Insert's key match unhandled, so the cursor never moved.
+#[tokio::test]
+async fn insert_home_and_end_move_within_the_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello world");
+    // Mid-line: `<Home>` lands on column 0 and typed text prepends.
+    feed(&rpc, "<Home>X");
+    assert_eq!(lines(&rpc).await, vec!["Xhello world"]);
+    assert_eq!(cursor(&rpc).await, (1, 1));
+
+    // `<End>` goes *past* the last character (the insert-mode append column), so
+    // typing there lands at the end of the line rather than before its last char.
+    feed(&rpc, "<End>Y");
+    assert_eq!(lines(&rpc).await, vec!["Xhello worldY"]);
+
+    // Still in Insert the whole time — no `<Esc>` was implied.
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "<Esc>");
+}
+
+/// `<Home>` / `<End>` act on the cursor's own line, not the buffer, and survive
+/// a vertical move — the plain per-line semantics.
+#[tokio::test]
+async fn insert_home_and_end_act_on_the_current_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>");
+    feed(&rpc, "ggji"); // Insert on line 2 ("two")
+    feed(&rpc, "<End>!");
+    assert_eq!(lines(&rpc).await, vec!["one", "two!", "three"]);
+    feed(&rpc, "<Home>?");
+    assert_eq!(lines(&rpc).await, vec!["one", "?two!", "three"]);
+    assert_eq!(cursor(&rpc).await, (2, 1));
+    feed(&rpc, "<Esc>");
+}

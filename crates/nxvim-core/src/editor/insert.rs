@@ -215,10 +215,6 @@ impl Editor {
             }
             return;
         }
-        // The soft-tab marker is valid only for the keystroke immediately after a
-        // `<Tab>` (or a chained soft-tab `<BS>`). Take it here so every key clears
-        // it; only the Tab/Backspace arms thread it through and may re-arm it.
-        let soft_tab = self.soft_tab.take();
         // The did_ai arm (an untouched auto-indent) is consumed by *this* key: any
         // key clears it, only `<Esc>` acts on it. `<CR>` clears it here and then
         // re-arms it for the line it opens (`insert_newline`).
@@ -274,8 +270,8 @@ impl Editor {
                 self.for_each_cursor(|ed| ed.insert_newline());
                 self.insert_text.push('\n'); // `".` last-insert register
             }
-            KeyCode::Backspace => self.for_each_cursor(|ed| ed.insert_backspace(soft_tab)),
-            KeyCode::Tab => self.insert_tab(soft_tab),
+            KeyCode::Backspace => self.for_each_cursor(|ed| ed.insert_backspace()),
+            KeyCode::Tab => self.insert_tab(),
             KeyCode::Left => {
                 let s = self.buffer().line(self.cursor.line);
                 self.cursor.col = unicode::prev_grapheme(&s, self.cursor.col);
@@ -286,6 +282,12 @@ impl Editor {
             }
             KeyCode::Up => self.move_vertical(-1, true),
             KeyCode::Down => self.move_vertical(1, true),
+            // `i_<Home>` / `i_<End>`: jump to the first / last column of the
+            // cursor's own line without leaving Insert. `<Home>` is column zero
+            // (vim's `0`, not `^` — it does not stop at the first non-blank), and
+            // `<End>` is the past-the-last-character append column Insert allows.
+            KeyCode::Home => self.cursor.col = 0,
+            KeyCode::End => self.cursor.col = self.line_len(),
             KeyCode::Delete => {
                 let len = self.line_len();
                 if self.cursor.col < len {
@@ -348,6 +350,8 @@ impl Editor {
                     | KeyCode::Delete
                     | KeyCode::Left
                     | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
             )
         {
             if manual_session {
@@ -606,16 +610,17 @@ impl Editor {
     /// cells. With `expandtab` the fill is spaces; otherwise it's real tabs (each
     /// jumping a `tabstop` boundary) plus any trailing spaces.
     ///
-    /// `prev` is the soft-tab marker carried from the previous keystroke; a fill
-    /// of pure spaces re-arms the marker (chaining onto a contiguous prior run) so
-    /// the next `<BS>` can undo this tab as a unit.
-    fn insert_tab(&mut self, prev: Option<(usize, usize)>) {
+    /// `<BS>` undoes such a fill as a unit — see [`softtab_backspace`], which
+    /// works off the whitespace actually in the line rather than off any marker
+    /// left here, so indentation nobody typed with `<Tab>` collapses the same way.
+    ///
+    /// [`softtab_backspace`]: Editor::softtab_backspace
+    fn insert_tab(&mut self) {
         let opts = self.buffer().options;
         let unit = opts.effective_softtabstop();
         let start = self.cursor_virtcol();
         let target = start - (start % unit) + unit; // next multiple of the unit
         let ws = fill_indent(start, target, opts.effective_tabstop(), opts.expandtab);
-        let begin = self.cursor.col;
         let at = self.cursor_char();
         // `ws` is ASCII (tabs/spaces), so its byte length is its column advance.
         let n = ws.len();
@@ -624,35 +629,14 @@ impl Editor {
         self.buffer_mut().modified = true;
         // The expanded tab is part of the `".` last-insert register.
         self.insert_text.push_str(&ws);
-        // Only a pure-spaces fill is unit-deletable (a literal `\t` is one
-        // grapheme the normal backspace already removes wholesale). Anchor at the
-        // start of a contiguous prior soft-tab run, else where this tab began.
-        self.soft_tab = if n > 0 && ws.bytes().all(|b| b == b' ') {
-            let line = self.cursor.line;
-            let anchor = match prev {
-                Some((l, a)) if l == line && a <= begin && self.is_spaces(line, a, begin) => a,
-                _ => begin,
-            };
-            Some((line, anchor))
-        } else {
-            None
-        };
     }
 
-    /// Whether `line[start..end]` (byte columns) is entirely ASCII spaces.
-    fn is_spaces(&self, line: usize, start: usize, end: usize) -> bool {
-        let s = self.buffer().line(line);
-        s.as_bytes()
-            .get(start..end)
-            .is_some_and(|run| run.iter().all(|&b| b == b' '))
-    }
-
-    fn insert_backspace(&mut self, soft_tab: Option<(usize, usize)>) {
+    fn insert_backspace(&mut self) {
         if self.cursor.col > 0 {
             if self.buffer().options.autopairs && self.autopair_backspace() {
                 return;
             }
-            if self.softtab_backspace(soft_tab) {
+            if self.softtab_backspace() {
                 return;
             }
             let at = self.cursor_char();
@@ -687,58 +671,71 @@ impl Editor {
         }
     }
 
-    /// `<BS>` over a soft tab: delete a whole [`softtabstop`] unit of spaces back
-    /// to the previous tab boundary, rather than one space at a time — but *only*
-    /// for whitespace a `<Tab>` inserted, tracked by `soft_tab` (the marker from
-    /// the immediately preceding keystroke). Hand-typed spaces carry no marker, so
-    /// they fall through to the normal one-character delete. The delete never
-    /// crosses the run's anchor, and re-arms the marker while soft-tab spaces
-    /// remain so a second `<BS>` peels off the next unit. Returns `true` when it
-    /// handled the delete.
+    /// `<BS>` over blanks: delete back to the previous [`softtabstop`] boundary rather
+    /// than one column at a time — the mirror of the fill [`insert_tab`] lays
+    /// down. Vim's `ins_bs` rule, and deliberately *not* keyed on who wrote the
+    /// whitespace: auto-indent, the file on disk and a typed run of spaces all
+    /// collapse a unit at a time, which is what makes `<BS>` on an `o`-opened
+    /// indented line dedent one level.
     ///
+    /// It applies only when the character *before* the cursor is a blank (a word
+    /// character rubs out singly, as always), the walk back stops at the first
+    /// non-blank so it never eats real text, and deleting a `\t` that straddles
+    /// the boundary pads the remainder back out with spaces. Returns `true` when
+    /// it handled the delete.
+    ///
+    /// [`insert_tab`]: Editor::insert_tab
     /// [`softtabstop`]: crate::options::BufferOptions::effective_softtabstop
-    fn softtab_backspace(&mut self, soft_tab: Option<(usize, usize)>) -> bool {
-        let Some((line, anchor)) = soft_tab else {
-            return false;
-        };
-        if line != self.cursor.line || anchor >= self.cursor.col {
-            return false;
-        }
+    fn softtab_backspace(&mut self) -> bool {
         let opts = self.buffer().options;
         let unit = opts.effective_softtabstop();
         if unit <= 1 {
             return false;
         }
+        let ts = opts.effective_tabstop();
         let s = self.buffer().line(self.cursor.line);
-        // The marked run must still be spaces from the anchor up to the cursor.
-        if !self.is_spaces(line, anchor, self.cursor.col) {
+        let prev_col = unicode::prev_grapheme(&s, self.cursor.col);
+        if !is_blank(&s[prev_col..self.cursor.col]) {
             return false;
         }
-        // Delete back one unit by virtual column, but never past the anchor.
-        let ts = opts.effective_tabstop();
+        // The column to land on: the boundary at or below the last cell the
+        // character before the cursor occupies (`vcol - 1`).
         let vcol = unicode::virtcol(&s, self.cursor.col, ts);
-        let anchor_vcol = unicode::virtcol(&s, anchor, ts);
-        let target_vcol = (((vcol - 1) / unit) * unit).max(anchor_vcol);
-        let mut col = self.cursor.col;
-        let mut vc = vcol;
-        while vc > target_vcol && col > anchor {
-            col -= 1;
-            vc -= 1;
+        let target = ((vcol - 1) / unit) * unit;
+        // Walk back over blanks only, never below the target column.
+        let (mut col, mut at_vcol) = (self.cursor.col, vcol);
+        while at_vcol > target && col > 0 {
+            let prev = unicode::prev_grapheme(&s, col);
+            if !is_blank(&s[prev..col]) {
+                break;
+            }
+            col = prev;
+            at_vcol = unicode::virtcol(&s, col, ts);
         }
         if col == self.cursor.col {
             return false;
         }
+        // A tab can straddle the boundary — deleting it lands below `target`, so
+        // pad the difference back out with spaces (vim does the same).
+        let pad = " ".repeat(target.saturating_sub(at_vcol));
         let line_start = self.buffer().line_start(self.cursor.line);
+        let removed = s[col..self.cursor.col].chars().count();
         let range = line_start + col..line_start + self.cursor.col;
-        let removed = self.cursor.col - col; // pure ASCII spaces: bytes == chars
         self.buffer_mut().remove(range);
-        self.cursor.col = col;
-        self.buffer_mut().modified = true;
-        self.trim_insert_text(removed); // `".` last-insert register
-                                        // Keep peeling on the next <BS> while soft-tab spaces remain before us.
-        if col > anchor {
-            self.soft_tab = Some((line, anchor));
+        if !pad.is_empty() {
+            self.buffer_mut().insert(line_start + col, &pad);
         }
+        self.cursor.col = col + pad.len();
+        self.buffer_mut().modified = true;
+        // `".` last-insert register: the blanks go, any padding takes their place.
+        self.trim_insert_text(removed);
+        self.insert_text.push_str(&pad);
         true
     }
+}
+
+/// Whether `s` is entirely blanks (spaces and tabs) — the run `<BS>` collapses
+/// by a soft-tab unit and `<Tab>` fills with.
+fn is_blank(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b == b' ' || b == b'\t')
 }

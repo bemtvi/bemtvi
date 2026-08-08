@@ -111,7 +111,10 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   nxvim breaks with vim's defaults on indentation: `tabstop` defaults to **4**,
   with `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow
   shiftwidth") so the one `tabstop` knob drives the whole indent width.
-  `tabstop`, `softtabstop`, and `expandtab` drive rendering and `<Tab>`;
+  `tabstop`, `softtabstop`, and `expandtab` drive rendering, `<Tab>` and the
+  `<BS>`-over-blanks unit delete (nxvim always has an effective soft-tab unit,
+  so it has no `smarttab` and applies that unit wherever vim's `softtabstop`
+  would);
   `shiftwidth` drives the `>>`/`<<` shift operators and the LSP indent width.
   `commentstring` backs the `gc`/`gcc` comment operator and defaults from the
   filetype (the ~20 most common languages) when unset. Still, the **bulk** of

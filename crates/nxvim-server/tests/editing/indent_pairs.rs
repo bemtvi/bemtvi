@@ -413,3 +413,88 @@ async fn open_line_then_escape_keeps_indent_when_indentemptylines_set() {
     feed(&rpc, "o<Esc>");
     assert_eq!(lines(&rpc).await, vec!["if x {", "    "]);
 }
+
+// ===== soft tabs: `<BS>` deletes indentation by the unit ====================
+//
+// Ground truth is neovim (`ts=4 sw=4 sts=-1 expandtab`, checked against a real
+// `nvim`): with a soft-tab unit in effect, `<BS>` on whitespace deletes back to
+// the previous unit boundary — *whoever* put the whitespace there (auto-indent,
+// the file on disk, a typed run of spaces), stopping at the first non-blank.
+
+#[tokio::test]
+async fn backspace_deletes_auto_indent_one_unit_at_a_time() {
+    // The reported bug: `o` on a deeply indented line opens an auto-indented
+    // line, and `<BS>` used to peel the indent off one *space* at a time because
+    // no `<Tab>` had typed it.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4 autoindent<CR>");
+    feed(&rpc, "i        deep<Esc>"); // 8 spaces of indent
+    feed(&rpc, "o"); // auto-indent copies the 8 spaces
+    feed(&rpc, "<BS>x<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["        deep", "    x"]);
+}
+
+#[tokio::test]
+async fn backspace_snaps_existing_indent_to_the_unit_boundary() {
+    // Whitespace that was already in the buffer (never typed this session) also
+    // deletes a unit at a time, and a partial unit snaps to the boundary rather
+    // than jumping a whole one.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "i     five<Esc>"); // 5 spaces
+    feed(&rpc, "^i<BS><Esc>"); // cursor before `f`, at virtual column 5
+    assert_eq!(lines(&rpc).await, vec!["    five"], "5 spaces snap to 4");
+    feed(&rpc, "^i<BS><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["five"], "the last unit clears");
+}
+
+#[tokio::test]
+async fn backspace_over_a_typed_space_run_deletes_the_whole_unit() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "i    <BS>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["X"]);
+}
+
+#[tokio::test]
+async fn backspace_over_blanks_stops_at_the_first_non_blank() {
+    // "a" + 3 spaces: the unit boundary is column 0, but the delete stops at the
+    // `a` — it never eats a non-blank character.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "ia   <BS>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["aX"]);
+}
+
+#[tokio::test]
+async fn backspace_after_a_non_blank_still_deletes_one_character() {
+    // The unit delete is whitespace-only: `<BS>` after a word rubs out exactly
+    // one character, and a word's own characters never snap to a boundary.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "iword<BS><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["wor"]);
+}
+
+#[tokio::test]
+async fn backspace_over_blanks_mid_line_snaps_to_the_boundary() {
+    // Not just the indent: a run of spaces between words snaps to the unit
+    // boundary too (neovim with `softtabstop` in effect does the same).
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(&rpc, "iab    cd<Esc>");
+    feed(&rpc, "0fci<BS><Esc>"); // cursor before `c`, virtual column 6
+    assert_eq!(lines(&rpc).await, vec!["ab  cd"]);
+}
+
+#[tokio::test]
+async fn backspace_pads_back_a_tab_that_straddles_the_boundary() {
+    // `noexpandtab tabstop=8 softtabstop=4`: the real tab in the file spans two
+    // soft-tab units, so deleting it overshoots the boundary — the remainder is
+    // padded back out with spaces, exactly as vim's `ins_bs` does.
+    let path = write_temp("softtab_bs", "txt", "\tindented\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "^i<BS>X<Esc>"); // cursor before `i`, at virtual column 8
+    assert_eq!(lines(&rpc).await, vec!["    Xindented"]);
+}

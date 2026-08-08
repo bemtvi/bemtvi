@@ -1305,13 +1305,6 @@ pub struct Editor {
     /// (same source as the mouse multi-click clock). Finer-grained than [`now_mono`]
     /// for sub-second timing — the terminal triple-`<Esc>` chord window reads it.
     now_ms: u64,
-    /// Provenance for soft-tab `<BS>`: `(line, anchor_col)` of the whitespace run
-    /// the *immediately preceding* `<Tab>` keypress inserted as spaces (its
-    /// `anchor_col` is where the whole run began, preserved across consecutive
-    /// tabs). [`handle_insert`](Self::handle_insert) clears it before every other
-    /// key, so only Tab-inserted spaces collapse a whole unit on backspace —
-    /// hand-typed spaces always delete one at a time. `None` outside that window.
-    soft_tab: Option<(usize, usize)>,
     /// Set by `<C-r>` in Insert / Command mode: the *next* keystroke names the
     /// register whose text is inserted at the cursor (vim's "insert a register"),
     /// then the flag clears. A non-register key (e.g. `<Esc>`) cancels, inserting
@@ -2059,7 +2052,6 @@ impl Editor {
             ai_open_line: None,
             now_mono: 0,
             now_ms: 0,
-            soft_tab: None,
             awaiting_register: false,
             visual_anchor: Cursor::default(),
             select_escape_insert: false,

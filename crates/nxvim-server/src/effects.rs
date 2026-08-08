@@ -15,8 +15,8 @@ use nxvim_lua::FsJob;
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorInvalidate, DecorPublish, DockOp,
     ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp,
-    LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, StatuslineKind, StatuslineTarget,
-    TabMirror, TabOp, TsOp, ViewOp, VirtDecorData, WindowMirror, WindowOp,
+    LinesDelta, LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, StatuslineKind,
+    StatuslineTarget, TabMirror, TabOp, TsOp, ViewOp, VirtDecorData, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -201,6 +201,168 @@ fn byte_rowcol(buf: &nxvim_core::Buffer, byte: usize) -> (u64, u64) {
     let row = buf.byte_to_line(byte);
     let col = byte - buf.line_start(row);
     (row as u64, col as u64)
+}
+
+/// Whether namespace `ns` is internal editor state (multi-cursor heads and their
+/// visual anchors, snippet tabstops, the `:s` preview, diagnostics) rather than a
+/// user-visible extmark — those are kept out of the `nvim_buf_get_extmarks` mirror.
+fn is_reserved_ns(ns: u32) -> bool {
+    ns == nxvim_core::extmark::CURSOR_NS
+        || ns == nxvim_core::extmark::ANCHOR_NS
+        || ns == nxvim_core::extmark::SNIPPET_NS
+        || ns == nxvim_core::extmark::SUBST_PREVIEW_NS
+        || ns == nxvim_core::extmark::DIAGNOSTIC_NS
+}
+
+/// Which marks an edit can have moved *in `(row, col)` terms*.
+///
+/// The distinction that makes the refresh cheap: shifting a mark's byte anchor is not
+/// the same as changing its row/column. Typing a character on one line slides the
+/// anchors of every later mark, but their `(row, col)` is **identical** — only marks
+/// on the edited line move. So a same-line edit needs to refresh a handful of marks,
+/// not all of them, and each refresh that *is* needed costs two rope lookups
+/// (`byte_rowcol`) which is what made the naive per-keystroke rebuild expensive.
+#[derive(Clone, Copy)]
+enum PosScope {
+    /// Refresh every mark — a structural change, a resync, or a batch we can't bound.
+    All,
+    /// Refresh only marks touching the byte range `[lo, hi)` (`hi = None` ⇒ unbounded,
+    /// which is the case when the edit changed the line count and every later mark's
+    /// row therefore shifts).
+    Window { lo: usize, hi: Option<usize> },
+}
+
+impl PosScope {
+    /// Whether `m` falls in this scope. A range mark counts if *either* edge does — a
+    /// mark starting on an earlier line but ending inside the edited one has its
+    /// `end_row`/`end_col` changed even though its start is untouched.
+    fn touches(self, m: &nxvim_core::extmark::Extmark) -> bool {
+        let (lo, hi) = match self {
+            PosScope::All => return true,
+            PosScope::Window { lo, hi } => (lo, hi),
+        };
+        let in_range = |p: usize| p >= lo && hi.is_none_or(|h| p < h);
+        in_range(m.start) || m.end.is_some_and(in_range)
+    }
+}
+
+/// The byte window an edit batch can have moved marks within, for [`PosScope`].
+///
+/// Only a **single-edit** batch is bounded, and that restriction is load-bearing
+/// rather than conservatism. Each edit's byte offsets are expressed in the buffer as
+/// it stood before *that* edit, so across a batch they live in different coordinate
+/// spaces: an earlier edit's `new_end_byte` can point past the final rope (resolving
+/// it panics), and — the quieter bug — a batch whose row changes *cancel out* to zero
+/// still moved every mark between the two edits, so bounding on the net delta would
+/// silently stale them. Folding that soundly needs the same forward/non-overlapping
+/// mapping [`fold_mirror_edits`] does; until something shows multi-edit batches are
+/// hot, refreshing all of a buffer's marks is the correct answer for them.
+///
+/// For the single edit that the typing path actually produces: `lo` is the start of
+/// its line (a mark anywhere on that line can have its column changed), and `hi`
+/// closes at the next line's start when the edit did not change the line count —
+/// every mark beyond keeps both row and column. An edit that adds or removes lines
+/// shifts every later row, so the window stays open.
+///
+/// `None` ⇒ refresh everything.
+fn extmark_dirty_window(
+    buf: &nxvim_core::Buffer,
+    batch: &nxvim_core::EditBatch,
+) -> Option<PosScope> {
+    if batch.resync {
+        return None;
+    }
+    let [edit] = &batch.edits[..] else {
+        return None;
+    };
+    // Nothing ahead of an edit's start moves, so this offset means the same thing
+    // before and after it — but clamp anyway rather than trust it against the rope.
+    let lo_byte = edit.start_byte.min(buf.len_bytes());
+    let lo = buf.line_start(buf.byte_to_line(lo_byte));
+    let hi = if edit.new_end_point.0 == edit.old_end_point.0 {
+        let last = edit.new_end_byte.min(buf.len_bytes());
+        let row = buf.byte_to_line(last);
+        // Start of the following line, or unbounded if the edit touched the last one.
+        (row + 1 < buf.line_count()).then(|| buf.line_start(row + 1))
+    } else {
+        None
+    };
+    Some(PosScope::Window { lo, hi })
+}
+
+/// Every mirrored mark's *positions* in `buf`, flat:
+/// `[ns, id, row, col, end_row, end_col]` per mark, with `-1, -1` for a mark with no
+/// end. This is the whole payload an edit needs — `ExtmarkStore::shift` moves byte
+/// anchors and nothing else, so a mark's decorations (`hl_group`, priority, the sign
+/// / line-fill / line-hl payloads, gravity) are re-pushed only when the store's
+/// structural generation moves. One flat integer array per buffer costs no per-mark
+/// table or string allocation, which is what made the old per-keystroke rebuild
+/// O(marks) with a punishing constant. See
+/// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+fn extmark_positions(buf: &nxvim_core::Buffer, scope: PosScope) -> Vec<i64> {
+    let mut flat = Vec::new();
+    for (ns, m) in buf.extmarks.iter_with_ns() {
+        if is_reserved_ns(ns) {
+            continue;
+        }
+        if !scope.touches(m) {
+            continue;
+        }
+        let (row, col) = byte_rowcol(buf, m.start);
+        let (end_row, end_col) = match m.end {
+            Some(e) => {
+                let (r, c) = byte_rowcol(buf, e);
+                (r as i64, c as i64)
+            }
+            None => (-1, -1),
+        };
+        flat.extend_from_slice(&[
+            ns as i64,
+            m.id as i64,
+            row as i64,
+            col as i64,
+            end_row,
+            end_col,
+        ]);
+    }
+    flat
+}
+
+/// Fold a mirror edit batch into one replaced **row** span
+/// `(start, old_end_row, new_end_row)`. `start` and `old_end_row` are rows in the
+/// buffer as it stood *before* the batch; `new_end_row` is a row in the buffer as it
+/// stands now. All three are edit *positions*, so the rows they touch are inclusive
+/// at both ends — the caller converts to an end-exclusive line span.
+///
+/// Each edit's points are expressed in the buffer as it stood before *that* edit, so
+/// folding them requires mapping each one back through the row shift of every
+/// preceding edit. That mapping is only sound while the batch moves strictly forward
+/// without overlapping — which is the shape of every common batch (a multi-key
+/// insert, a `:s` walking down the buffer, the trailing-newline `normalize`). For
+/// anything else (out-of-order or overlapping edits) this returns `None` and the
+/// caller pushes the buffer in full rather than guessing at a span.
+fn fold_mirror_edits(edits: &[nxvim_core::BufferEdit]) -> Option<(usize, usize, usize)> {
+    let first = edits.first()?;
+    let start = first.start_point.0;
+    let mut old_end = first.old_end_point.0;
+    let mut new_end = first.new_end_point.0;
+    // Rows added (negative: removed) by the edits folded so far — what maps a later
+    // edit's coordinates back onto the pre-batch buffer. The fold keeps the invariant
+    // `new_end - shift == old_end`.
+    let mut shift = new_end as isize - old_end as isize;
+    for e in &edits[1..] {
+        // Strictly forward and non-overlapping: the edit must begin at or after the
+        // span folded so far, in the *current* buffer's coordinates.
+        if e.start_point.0 < new_end {
+            return None;
+        }
+        // Non-negative by that guard (`old_end_point >= start_point >= new_end`, and
+        // `new_end - shift == old_end >= 0`), but resolved fallibly rather than cast.
+        old_end = usize::try_from(e.old_end_point.0 as isize - shift).ok()?;
+        new_end = e.new_end_point.0;
+        shift = new_end as isize - old_end as isize;
+    }
+    Some((start, old_end, new_end))
 }
 
 /// Project a core [`BufferEdit`] (absolute byte offsets + `(row, byte-col)`
@@ -1922,6 +2084,50 @@ impl EditHost {
         let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
     }
 
+    /// Fold buffer `id`'s drained mirror edit batch into one [`LinesDelta`] — the
+    /// rows to splice into the mirror array Lua already holds, instead of
+    /// re-serializing the whole buffer. `prev_count` is the line count the mirror
+    /// was last pushed at, which bounds the replaced span.
+    ///
+    /// `None` means "push the buffer in full": either the batch can't be folded
+    /// soundly (see [`fold_mirror_edits`]) or the folded span doesn't fit the mirror
+    /// Lua holds — a safety valve, since applying a span that overruns the array
+    /// would silently corrupt it.
+    fn mirror_delta(
+        &self,
+        id: BufferId,
+        prev_count: usize,
+        batch: &nxvim_core::EditBatch,
+    ) -> Option<LinesDelta> {
+        // A whole-rope replacement (undo/redo, `:e`, reload) invalidates every row
+        // anchor, so there is nothing to splice onto.
+        if batch.resync {
+            return None;
+        }
+        let (start, old_end_row, new_end_row) = fold_mirror_edits(&batch.edits)?;
+        // The journal's points are *positions*; the rows they touch are inclusive at
+        // both ends, so the end-exclusive line span runs one past `old_end_row` /
+        // `new_end_row` (the same conversion `on_lines` makes for its
+        // `lastline`/`new_lastline`).
+        let new_end = new_end_row + 1;
+        // An edit ending at the very end of the buffer has its `old_end_point` on the
+        // rope's phantom trailing line, which is never mirrored — so the span can run
+        // exactly one row past the mirrored count, and clamping it there is the
+        // conversion, not a fudge. Anything further past the end is an inconsistency
+        // between the fold and the mirror, so bail to a full push rather than splice a
+        // span that would overrun the array.
+        let old_end = (old_end_row + 1).min(prev_count);
+        if old_end_row > prev_count || start > prev_count {
+            return None;
+        }
+        let lines = self.editor.lines_range_of(id, start, new_end)?;
+        Some(LinesDelta {
+            start: start as u64,
+            old_end: old_end as u64,
+            lines,
+        })
+    }
+
     /// Refresh the Rust→Lua buffer mirror (`nx._bufs` + `nx._cur_cursor` +
     /// current window) the buffer-read API resolves against (Phase 6). Pushed
     /// before any Lua entry that can read buffer/cursor state. The per-buffer line
@@ -1946,7 +2152,11 @@ impl EditHost {
         let mut bo: Vec<BoMirror> = Vec::new();
         // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
         // marks contribute, so a session with no decoration plugin pays nothing.
-        let mut extmarks: Vec<(u64, Vec<ExtmarkMirror>)> = Vec::new();
+        // `None` for a buffer whose mark set did not change structurally — Lua keeps
+        // the decorations it already holds and only its positions are refreshed
+        // (below), which is the whole point: an edit moves anchors, never payloads.
+        let mut extmarks: Vec<(u64, Option<Vec<ExtmarkMirror>>)> = Vec::new();
+        let mut extmark_positions_by_buf: Vec<(u64, Vec<i64>)> = Vec::new();
         // Buffers whose text changed since the last mirror, for the `nvim_buf_attach`
         // `on_lines` callbacks: `(bufnr, changedtick, old_line_count, new_line_count)`.
         // Only buffers already known last push contribute (a buffer's first
@@ -1968,18 +2178,42 @@ impl EditHost {
                 .unwrap_or(0);
             let known = self.buf_mirror_ticks.contains_key(&id);
             let fresh = self.buf_mirror_ticks.get(&id) != Some(&tick);
-            let lines = if fresh {
+            // A changed buffer ships either the rows that changed (a `LinesDelta`,
+            // spliced into the array Lua already holds) or the whole array. The delta
+            // is what keeps an edit O(changed rows) instead of O(buffer); the full
+            // push is the fallback for a buffer Lua has never seen, a whole-rope
+            // replacement, and an unfoldable batch. See
+            // `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+            let (mut lines, mut delta) = (None, None);
+            // Which of this buffer's marks the batch can have moved in row/col terms.
+            // `All` until a batch bounds it (and for a buffer that didn't change, it
+            // is never consulted — no positions are pushed at all).
+            let mut pos_scope = PosScope::All;
+            if fresh {
                 self.buf_mirror_ticks.insert(id, tick);
                 fresh_ids.push((id, known, tick));
-                Some(self.editor.lines_of(id).unwrap_or_default())
-            } else {
-                None
-            };
-            if let Some(l) = &lines {
-                let new_count = l.len();
+                // Drained unconditionally on a changed buffer, so the journal can't
+                // accumulate behind a full push.
+                let batch = self.editor.take_mirror_edits_of(id).unwrap_or_default();
+                if let Some(b) = self.editor.buffer_of(id) {
+                    if let Some(scope) = extmark_dirty_window(b, &batch) {
+                        pos_scope = scope;
+                    }
+                }
+                let prev_count = self.buf_mirror_lines.get(&id).copied();
+                delta = match (known, prev_count) {
+                    (true, Some(prev)) => self.mirror_delta(id, prev, &batch),
+                    _ => None,
+                };
+                if delta.is_none() {
+                    lines = Some(self.editor.lines_of(id).unwrap_or_default());
+                }
+                // The line counts the `on_lines` callbacks report. Taken from the
+                // core rather than the pushed array, which a delta no longer carries
+                // whole.
+                let new_count = self.editor.line_count_of(id).unwrap_or(0);
                 if known {
-                    let old_count = self.buf_mirror_lines.get(&id).copied().unwrap_or(new_count);
-                    changed.push((id.0, tick, old_count, new_count));
+                    changed.push((id.0, tick, prev_count.unwrap_or(new_count), new_count));
                 }
                 self.buf_mirror_lines.insert(id, new_count);
             }
@@ -2020,7 +2254,26 @@ impl EditHost {
                     foldnestmax: o.foldnestmax,
                     foldminlines: o.foldminlines,
                 });
-                if !b.extmarks.is_empty() {
+                // A buffer contributes a full re-serialize only when its store's
+                // structural generation moved (a mark set / deleted / cleared). An
+                // untouched buffer contributes nothing at all, and an edited one
+                // contributes positions only.
+                let ext_gen = b.extmarks.generation();
+                let structural = self.extmark_gens.get(&id) != Some(&ext_gen);
+                if structural {
+                    self.extmark_gens.insert(id, ext_gen);
+                }
+                if b.extmarks.is_empty() {
+                    // No marks: the buffer contributes nothing and Lua drops it.
+                } else if !structural {
+                    extmarks.push((id.0, None));
+                    if fresh {
+                        let flat = extmark_positions(b, pos_scope);
+                        if !flat.is_empty() {
+                            extmark_positions_by_buf.push((id.0, flat));
+                        }
+                    }
+                } else {
                     let marks = b
                         .extmarks
                         .iter_with_ns()
@@ -2028,13 +2281,7 @@ impl EditHost {
                         // their visual anchors) are internal editor state, not
                         // user-visible extmarks — keep them out of the
                         // `nvim_buf_get_extmarks` mirror.
-                        .filter(|(ns, _)| {
-                            *ns != nxvim_core::extmark::CURSOR_NS
-                                && *ns != nxvim_core::extmark::ANCHOR_NS
-                                && *ns != nxvim_core::extmark::SNIPPET_NS
-                                && *ns != nxvim_core::extmark::SUBST_PREVIEW_NS
-                                && *ns != nxvim_core::extmark::DIAGNOSTIC_NS
-                        })
+                        .filter(|(ns, _)| !is_reserved_ns(*ns))
                         .map(|(ns, m)| {
                             let (row, col) = byte_rowcol(b, m.start);
                             let (end_row, end_col) = match m.end {
@@ -2074,12 +2321,13 @@ impl EditHost {
                             }
                         })
                         .collect();
-                    extmarks.push((id.0, marks));
+                    extmarks.push((id.0, Some(marks)));
                 }
             }
             bufs.push(BufMirror {
                 bufnr: id.0,
                 lines,
+                delta,
                 name,
                 changedtick: tick,
                 focused: focused_bufs.contains(&id),
@@ -2090,6 +2338,7 @@ impl EditHost {
         let live: HashSet<BufferId> = self.editor.buffer_ids().into_iter().collect();
         self.buf_mirror_ticks.retain(|id, _| live.contains(id));
         self.buf_mirror_lines.retain(|id, _| live.contains(id));
+        self.extmark_gens.retain(|id, _| live.contains(id));
 
         // Drain each changed buffer's byte-delta journal and project it into neovim's
         // `on_bytes` tuple for the `nvim_buf_attach` `on_bytes` callbacks (fired below,
@@ -2282,7 +2531,9 @@ impl EditHost {
             padding: w.padding.to_string(),
             winhighlight: w.winhighlight.clone(),
         });
-        let _ = self.lua.set_extmark_mirror(&extmarks);
+        let _ = self
+            .lua
+            .set_extmark_mirror(&extmarks, &extmark_positions_by_buf);
         // The highlight registry, mirrored so `nvim_get_hl` reads live group
         // definitions from Lua. Gated on the registry's generation — a colorscheme
         // populates hundreds of groups once and rarely changes them, so re-pushing

@@ -1678,44 +1678,69 @@ nx._extmark_next = nx._extmark_next or {}
 -- marks the server pushed from core (positions already shifted for any edits).
 -- Rebuilds `nx._extmarks` from the authoritative state; the persistent
 -- allocator (`nx._extmark_next`) is deliberately untouched.
-function nx._set_extmark_mirror(entries)
+function nx._set_extmark_mirror(entries, positions)
   local marks = {}
   for bufnr, list in pairs(entries or {}) do
-    local by_ns = {}
-    for _, m in ipairs(list) do
-      by_ns[m.ns] = by_ns[m.ns] or {}
-      -- Reconstruct the `decoration` sub-table from the round-tripped sign fields so
-      -- a get_extmarks(details=true) AFTER this server refresh still returns the
-      -- gutter sign (the same shape the same-chunk write-through stored).
-      local decoration
-      if m.sign_text ~= nil or m.sign_hl_group ~= nil then
-        decoration = { sign_text = m.sign_text, sign_hl_group = m.sign_hl_group }
+    -- `true` ⇒ the buffer's mark SET did not change, only (possibly) where the marks
+    -- sit. Keep the decorations we already hold and let the position pass below move
+    -- them; rebuilding them would re-allocate every hl_group / sign / gravity field
+    -- on every keystroke, which is exactly what this avoids.
+    if list == true then
+      marks[bufnr] = nx._extmarks[bufnr] or {}
+    else
+      local by_ns = {}
+      for _, m in ipairs(list) do
+        by_ns[m.ns] = by_ns[m.ns] or {}
+        -- Reconstruct the `decoration` sub-table from the round-tripped sign fields so
+        -- a get_extmarks(details=true) AFTER this server refresh still returns the
+        -- gutter sign (the same shape the same-chunk write-through stored).
+        local decoration
+        if m.sign_text ~= nil or m.sign_hl_group ~= nil then
+          decoration = { sign_text = m.sign_text, sign_hl_group = m.sign_hl_group }
+        end
+        if m.line_fill_text ~= nil then
+          decoration = decoration or {}
+          decoration.line_fill = { text = m.line_fill_text, hl_group = m.line_fill_hl }
+        end
+        if m.line_hl_group ~= nil then
+          decoration = decoration or {}
+          decoration.line_hl_group = m.line_hl_group
+        end
+        by_ns[m.ns][m.id] = {
+          row = m.row,
+          col = m.col,
+          end_row = m.end_row,
+          end_col = m.end_col,
+          hl_group = m.hl_group,
+          priority = m.priority,
+          decoration = decoration,
+          -- Only the non-default gravity rides the wire; fill the default when absent
+          -- (start defaults right-gravity `true`, end defaults left-gravity → `false`).
+          right_gravity = m.right_gravity ~= false,
+          end_right_gravity = m.end_right_gravity == true,
+        }
       end
-      if m.line_fill_text ~= nil then
-        decoration = decoration or {}
-        decoration.line_fill = { text = m.line_fill_text, hl_group = m.line_fill_hl }
-      end
-      if m.line_hl_group ~= nil then
-        decoration = decoration or {}
-        decoration.line_hl_group = m.line_hl_group
-      end
-      by_ns[m.ns][m.id] = {
-        row = m.row,
-        col = m.col,
-        end_row = m.end_row,
-        end_col = m.end_col,
-        hl_group = m.hl_group,
-        priority = m.priority,
-        decoration = decoration,
-        -- Only the non-default gravity rides the wire; fill the default when absent
-        -- (start defaults right-gravity `true`, end defaults left-gravity → `false`).
-        right_gravity = m.right_gravity ~= false,
-        end_right_gravity = m.end_right_gravity == true,
-      }
+      marks[bufnr] = by_ns
     end
-    marks[bufnr] = by_ns
   end
   nx._extmarks = marks
+  -- Positions only: `[ns, id, row, col, end_row, end_col]` per mark, flat, with
+  -- `-1` for a mark with no end. One table per buffer, no per-mark allocation.
+  for bufnr, flat in pairs(positions or {}) do
+    local by_ns = marks[bufnr]
+    if by_ns then
+      for i = 1, #flat, 6 do
+        local ns_marks = by_ns[flat[i]]
+        local m = ns_marks and ns_marks[flat[i + 1]]
+        if m then
+          m.row, m.col = flat[i + 2], flat[i + 3]
+          if flat[i + 4] >= 0 then
+            m.end_row, m.end_col = flat[i + 4], flat[i + 5]
+          end
+        end
+      end
+    end
+  end
 end
 
 -- `nx._call_ctx_lock`: set while inside an `nvim_buf_call` / `nvim_win_call` whose
@@ -1827,14 +1852,44 @@ end
 function nx._set_buf_mirror(entries, row, col, win, wins, cur_wins, next_win, mode, cmdtype)
   nx._cur_mode = mode or "n"
   nx._cur_cmdtype = cmdtype or ""
-  -- The server omits `lines` for a buffer whose changedtick is unchanged (the
-  -- cheap cursor-moved-no-edit path); keep the prior `lines` in that case.
+  -- A buffer arrives in one of three shapes. `lines` present is a full push (a
+  -- buffer Lua has not seen, a whole-rope replacement, an unfoldable edit batch).
+  -- `delta` present is the incremental push: splice its rows into the array we
+  -- already hold, so an edit costs the rows that changed rather than the whole
+  -- buffer. Neither present means the text did not change (the cheap
+  -- cursor-moved-no-edit path) and the prior array carries over untouched.
   for bufnr, entry in pairs(entries) do
     if entry.lines == nil then
       local prev = nx._bufs[bufnr]
-      if prev then
-        entry.lines = prev.lines
+      local lines = prev and prev.lines
+      local delta = entry.delta
+      if delta then
+        if not lines then
+          error(
+            ("nx._set_buf_mirror: buffer %s got a line delta with no mirror to splice it into"):format(
+              tostring(bufnr)
+            )
+          )
+        end
+        -- `start`/`old_end` are 0-based and end-exclusive; the array is 1-based.
+        local n = #lines
+        local start, old_end = delta.start, delta.old_end
+        local added, removed = #delta.lines, old_end - start
+        if added ~= removed then
+          -- Shift the untouched tail into place first (`table.move` handles the
+          -- overlap in both directions), then clear what a shrink left stranded
+          -- past the new end.
+          table.move(lines, old_end + 1, n, start + added + 1)
+          for i = n + added - removed + 1, n do
+            lines[i] = nil
+          end
+        end
+        for i = 1, added do
+          lines[start + i] = delta.lines[i]
+        end
+        entry.delta = nil
       end
+      entry.lines = lines
     end
     entry.loaded = true
   end

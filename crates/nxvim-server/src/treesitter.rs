@@ -345,6 +345,9 @@ impl EditHost {
         // `SyntaxState`, each slicing its own rows.
         let spans_by_line = self.syntax_states.get(&buffer).map(|state| &state.spans);
         let buf = self.editor.buffer_of(buffer);
+        // The extmark lookup structure for this frame, built once rather than
+        // re-scanning every mark on each of the rows below (see `HlMarkIndex`).
+        let mark_index = buf.map(crate::extmarks::HlMarkIndex::build);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -376,14 +379,16 @@ impl EditHost {
                 // Fast path: no extmarks *and* no semantic tokens on this line ⇒
                 // emit the (already non-overlapping) treesitter spans verbatim,
                 // byte-identical to the pre-extmark projection.
-                let ext = self.extmark_intervals(
-                    buffer,
-                    line_idx,
-                    b.line_start(line_idx),
-                    text.len(),
-                    // treesitter spans take orders [0, n); semantic + extmarks above.
-                    ts_len + sem.len() as u32,
-                );
+                let ext = match &mark_index {
+                    Some(index) => self.extmark_intervals(
+                        index,
+                        b.line_start(line_idx),
+                        text.len(),
+                        // treesitter spans take orders [0, n); semantic + extmarks above.
+                        ts_len + sem.len() as u32,
+                    ),
+                    None => Vec::new(),
+                };
                 if ext.is_empty() && sem.is_empty() && control.is_empty() {
                     let Some(spans) = ts_spans else {
                         return Value::Array(Vec::new());

@@ -172,6 +172,19 @@ pub struct Buffer {
     /// separate from the other journals for the usual reason — independent drain
     /// timing must not let one consumer starve another.
     jump_edits: Vec<BufferEdit>,
+    /// A **fifth** independent edit journal, drained by
+    /// [`Buffer::take_mirror_edits`], feeding the Rust→Lua buffer mirror
+    /// (`nx._bufs`): the server folds the batch into one replaced line span so the
+    /// mirror ships only the rows that changed instead of re-serializing the whole
+    /// buffer on every edit. Separate for the usual reason — the `on_bytes` stream
+    /// already drains `lua_ts_edits` in the same pass (see the server's
+    /// `push_buf_mirror`), and one destructive journal would let whichever drains
+    /// first starve the other. See
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    mirror_edits: Vec<BufferEdit>,
+    /// `resync` for the mirror journal (whole-rope replacement → the mirror must be
+    /// pushed in full, since deltas against the old rope are meaningless).
+    mirror_resync: bool,
     /// Buffer-anchored extmarks (highlight-layering marks set via
     /// `nvim_buf_set_extmark`), partitioned by namespace. Their byte anchors are
     /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
@@ -268,6 +281,8 @@ impl Buffer {
             lua_ts_edits: Vec::new(),
             lua_ts_resync: false,
             jump_edits: Vec::new(),
+            mirror_edits: Vec::new(),
+            mirror_resync: false,
             changelist: Vec::new(),
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
@@ -477,6 +492,12 @@ impl Buffer {
         &self,
     ) -> std::collections::BTreeMap<usize, crate::extmark::VirtLineRows> {
         use crate::extmark::Extmark;
+        // O(1) gate: the walks below run several times per frame (view, cursor and
+        // mouse), and virtual lines are rare, so a buffer carrying none must not pay
+        // a filter over every mark on each call.
+        if !self.extmarks.has_virt_lines() {
+            return std::collections::BTreeMap::new();
+        }
         let mut marks: Vec<&Extmark> = self
             .extmarks
             .iter_all()
@@ -568,12 +589,13 @@ impl Buffer {
 
     /// Mark that the whole rope was replaced (undo/redo, file reload), so any
     /// pending deltas are moot and the consumer must re-sync from full text. All
-    /// three edit journals (syntax, LSP, and Lua-treesitter) are reset, so none
-    /// send stale deltas.
+    /// four delta journals (syntax, LSP, Lua-treesitter, and the Lua buffer mirror)
+    /// are reset, so none send stale deltas.
     pub fn mark_resync(&mut self) {
         self.edits.clear();
         self.lsp_edits.clear();
         self.lua_ts_edits.clear();
+        self.mirror_edits.clear();
         // The jumplist journal is moot too: positions against the old rope can't be
         // shifted into the new one. The editor clears jumplist entries for a
         // resync'd buffer on its own (mirroring marks), so just drop the deltas.
@@ -581,6 +603,7 @@ impl Buffer {
         self.resync = true;
         self.lsp_resync = true;
         self.lua_ts_resync = true;
+        self.mirror_resync = true;
         // Byte anchors are meaningless against the wholesale-new rope, and an
         // extmark has no source of truth to rebuild from (unlike the treesitter
         // / LSP journals, which re-derive from the full text), so drop them all —
@@ -632,6 +655,17 @@ impl Buffer {
         }
     }
 
+    /// Drain the **mirror** edit journal — the line-delta stream the server folds
+    /// into the Rust→Lua buffer mirror's replaced line span (parallel to the
+    /// others). A `resync` batch means the whole rope was replaced, so the mirror
+    /// must be pushed in full rather than spliced.
+    pub fn take_mirror_edits(&mut self) -> EditBatch {
+        EditBatch {
+            edits: std::mem::take(&mut self.mirror_edits),
+            resync: std::mem::replace(&mut self.mirror_resync, false),
+        }
+    }
+
     /// Drain the **jumplist** edit journal — the line-adjustment stream the editor
     /// applies to per-window `<C-o>` targets (parallel to the others). `resync` is
     /// irrelevant here (a resync'd buffer's entries are cleared outright), so this
@@ -670,6 +704,7 @@ impl Buffer {
         self.edits.push(edit.clone());
         self.lsp_edits.push(edit.clone());
         self.jump_edits.push(edit.clone());
+        self.mirror_edits.push(edit.clone());
         self.lua_ts_edits.push(edit);
         self.changedtick += 1;
         self.modified = true;

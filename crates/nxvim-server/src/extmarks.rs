@@ -55,25 +55,132 @@ pub(crate) struct HlInterval<'a> {
     pub capture: bool,
 }
 
+/// The byte range `[lo, hi)` that the visible rows span, or `None` when no row maps
+/// to a buffer line.
+///
+/// Every per-frame bucketing pass below keys marks by their **anchor line**, so a
+/// mark anchored outside the visible rows cannot contribute to the frame. Pruning on
+/// the byte range costs an integer compare, whereas deriving a mark's line costs a
+/// rope lookup (`byte_to_line`) — so with a few thousand marks and ~50 visible rows
+/// this is the difference between thousands of rope lookups per frame and a handful.
+/// It is what made a buffer full of git signs / inlay hints / line highlights cost
+/// ~6x one full of plain highlight marks. See
+/// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+fn viewport_byte_range(
+    buf: &nxvim_core::Buffer,
+    segs: &[crate::redraw::RowSeg],
+) -> Option<(usize, usize)> {
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    for seg in segs {
+        if let Some(n) = seg.line {
+            let idx = n - 1;
+            first = first.min(idx);
+            last = last.max(idx);
+        }
+    }
+    if first == usize::MAX {
+        return None;
+    }
+    let lo = buf.line_start(first);
+    // Exclusive at the start of the row after the last visible one, so an anchor on
+    // the last visible line (including its trailing newline) is still inside.
+    let hi = if last + 1 < buf.line_count() {
+        buf.line_start(last + 1)
+    } else {
+        buf.len_bytes()
+    };
+    Some((lo, hi))
+}
+
+/// The buffer's highlight-bearing extmarks, prepared **once per frame** so the
+/// per-row projection can find the marks touching its line without re-scanning the
+/// whole store.
+///
+/// [`EditHost::extmark_intervals`] is called once per visible row, and used to scan
+/// every mark in the buffer on each call — so one window cost O(rows x marks), about
+/// 250 000 mark visits per frame with a few thousand marks. That was 77% of the
+/// extmark cost of a keystroke; see
+/// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+///
+/// Only marks that can actually paint are kept — a `hl_group` *and* a range `end`,
+/// which is exactly what the old per-mark clip required — each paired with its
+/// `iter_all` enumerate index so the deterministic source-layering order the scan
+/// produced is preserved byte-for-byte.
+pub(crate) struct HlMarkIndex<'a> {
+    /// `(enumerate order, start, end, mark)`, sorted by `start`.
+    marks: Vec<(u32, usize, usize, &'a nxvim_core::Extmark)>,
+    /// `max_end[i]` is the largest `end` among `marks[..=i]`, so a query can walk
+    /// back from the last mark starting before the line and stop as soon as no
+    /// earlier mark can still reach it. That is immediate for the usual
+    /// non-overlapping mark set and stays correct for arbitrarily nested ranges,
+    /// which a fixed look-back window would get wrong.
+    max_end: Vec<usize>,
+}
+
+impl<'a> HlMarkIndex<'a> {
+    pub(crate) fn build(buf: &'a nxvim_core::Buffer) -> Self {
+        let mut marks: Vec<(u32, usize, usize, &'a nxvim_core::Extmark)> = buf
+            .extmarks
+            .iter_all()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                // Mirrors the clip's own guards: no group or no range ⇒ paints nothing.
+                let end = m.end?;
+                m.hl_group.as_deref()?;
+                Some((i as u32, m.start, end, m))
+            })
+            .collect();
+        marks.sort_by_key(|(order, start, _, _)| (*start, *order));
+        let mut max_end = Vec::with_capacity(marks.len());
+        let mut running = 0usize;
+        for (_, _, end, _) in &marks {
+            running = running.max(*end);
+            max_end.push(running);
+        }
+        Self { marks, max_end }
+    }
+
+    /// Marks overlapping the byte range `[lo, hi)`, in the store's original order.
+    fn overlapping(&self, lo: usize, hi: usize) -> Vec<(u32, &'a nxvim_core::Extmark)> {
+        // Everything starting at or after `hi` is out; the rest is a prefix.
+        let mut i = self.marks.partition_point(|(_, start, _, _)| *start < hi);
+        let mut out = Vec::new();
+        while i > 0 {
+            i -= 1;
+            if self.max_end[i] <= lo {
+                break;
+            }
+            let (order, _, end, m) = self.marks[i];
+            if end > lo {
+                out.push((order, m));
+            }
+        }
+        // Walking backwards found them newest-first; the clip below assigns orders
+        // from the stored enumerate index, but callers merge on `order`, so restore
+        // ascending order to keep the emitted interval list stable.
+        out.reverse();
+        out
+    }
+}
+
 impl EditHost {
-    /// Every hl_group extmark of `buffer` clipped to line `line_idx` (whose
-    /// content occupies byte range `[line_start, line_start + line_len)` in the
-    /// rope), as line-relative intervals. Point marks (no `end`) and marks
-    /// without an `hl_group` contribute nothing visible in v1 and are skipped.
-    /// `base_order` offsets the per-mark `order` so extmarks sort above the
-    /// treesitter spans they are merged with.
+    /// Every hl_group extmark touching the line occupying byte range
+    /// `[line_start, line_start + line_len)` in the rope, as line-relative
+    /// intervals. Point marks (no `end`) and marks without an `hl_group` contribute
+    /// nothing visible and are skipped. `base_order` offsets the per-mark `order` so
+    /// extmarks sort above the treesitter spans they are merged with.
+    ///
+    /// `index` is the caller's per-frame [`HlMarkIndex`] — built once before the row
+    /// loop rather than rebuilt here, since this runs once per visible row and used
+    /// to re-scan the whole store each time.
     pub(crate) fn extmark_intervals<'a>(
         &'a self,
-        buffer: BufferId,
-        line_idx: usize,
+        index: &HlMarkIndex<'a>,
         line_start: usize,
         line_len: usize,
         base_order: u32,
     ) -> Vec<HlInterval<'a>> {
-        let _ = line_idx;
-        let Some(buf) = self.editor.buffer_of(buffer) else {
-            return Vec::new();
-        };
         let line_end = line_start + line_len;
         // Clip one mark's byte range to this line's content; a multi-line mark
         // contributes its overlap with each line it crosses. Point marks and marks
@@ -94,13 +201,11 @@ impl EditHost {
                 capture: false,
             })
         };
-        let out: Vec<HlInterval<'a>> = buf
-            .extmarks
-            .iter_all()
-            .enumerate()
-            .filter_map(|(i, m)| clip(m, base_order + i as u32))
-            .collect();
-        out
+        index
+            .overlapping(line_start, line_end)
+            .into_iter()
+            .filter_map(|(order, m)| clip(m, base_order + order))
+            .collect()
     }
 
     /// The browser (`not(feature = "native")`) twin of
@@ -134,6 +239,8 @@ impl EditHost {
         let Some(b) = self.editor.buffer_of(buffer) else {
             return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         };
+        // Built once for the whole frame; see `HlMarkIndex`.
+        let mark_index = HlMarkIndex::build(b);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -150,8 +257,7 @@ impl EditHost {
                 let sem = self.semantic_intervals(buffer, line_idx, 0);
                 let mut intervals = sem;
                 intervals.extend(self.extmark_intervals(
-                    buffer,
-                    line_idx,
+                    &mark_index,
                     b.line_start(line_idx),
                     text.len(),
                     intervals.len() as u32,
@@ -221,11 +327,17 @@ impl EditHost {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return nil_rows();
         };
-        // Bucket virt_text marks by their anchor buffer line (0-based). Cheap: the
-        // mark set is small and scanned once per frame.
+        // Bucket virt_text marks by their anchor buffer line (0-based), considering
+        // only marks anchored in the visible range — see `viewport_byte_range`.
+        let Some((lo, hi)) = viewport_byte_range(buf, segs) else {
+            return nil_rows();
+        };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, Vec<&nxvim_core::Extmark>> = HashMap::new();
         for m in buf.extmarks.iter_all() {
+            if m.start < lo || m.start >= hi {
+                continue;
+            }
             let Some(decor) = m.decor.as_deref() else {
                 continue;
             };
@@ -346,11 +458,17 @@ impl EditHost {
             return empty();
         };
         // Bucket line_hl_group marks by their anchor buffer line (0-based), keeping
-        // the highest-priority group per line. Cheap: the mark set is small, scanned
-        // once per frame (like `virt_text_for`).
+        // the highest-priority group per line, and considering only marks anchored in
+        // the visible range — see `viewport_byte_range`.
+        let Some((lo, hi)) = viewport_byte_range(buf, segs) else {
+            return empty();
+        };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, (&str, u32)> = HashMap::new();
         for m in buf.extmarks.iter_all() {
+            if m.start < lo || m.start >= hi {
+                continue;
+            }
             let Some(group) = m.decor.as_deref().and_then(|d| d.line_hl_group.as_deref()) else {
                 continue;
             };
@@ -511,10 +629,18 @@ impl EditHost {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return none_rows();
         };
-        // Bucket sign marks by their anchor buffer line (0-based); cheap (small set).
+        // Bucket sign marks by their anchor buffer line (0-based), considering only
+        // marks anchored in the visible range so the rope lookup is paid per visible
+        // mark rather than per mark in the buffer.
+        let Some((lo, hi)) = viewport_byte_range(buf, segs) else {
+            return none_rows();
+        };
         use std::collections::HashMap;
         let mut by_line: HashMap<usize, Vec<&nxvim_core::Extmark>> = HashMap::new();
         for m in buf.extmarks.iter_all() {
+            if m.start < lo || m.start >= hi {
+                continue;
+            }
             if m.decor.as_deref().is_some_and(|d| d.sign_text.is_some()) {
                 by_line
                     .entry(buf.byte_to_line(m.start))

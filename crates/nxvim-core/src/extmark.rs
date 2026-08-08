@@ -278,6 +278,29 @@ struct NsMarks {
 #[derive(Debug, Default, Clone)]
 pub struct ExtmarkStore {
     by_ns: HashMap<u32, NsMarks>,
+    /// Bumped by every **structural** change — a mark set, deleted, or cleared, and a
+    /// namespace moved in or out — but deliberately NOT by [`shift`](Self::shift),
+    /// which moves byte anchors and touches nothing else.
+    ///
+    /// That asymmetry is what lets the Rust→Lua mirror stop re-serializing every
+    /// mark's decorations on every keystroke: `hl_group`, `priority`, the sign /
+    /// line-fill / line-hl payloads and the gravity flags are fixed for a mark's
+    /// lifetime, so they only need re-pushing when this counter moves. An edit
+    /// refreshes positions alone. See
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    generation: u64,
+    /// How many marks carry `virt_lines`. Maintained on every structural mutation so
+    /// [`Buffer::virt_lines_by_line`](crate::Buffer::virt_lines_by_line) — called from
+    /// the view, cursor and mouse walks, several times per frame — can answer "none"
+    /// in O(1) instead of filtering every mark. [`shift`](Self::shift) never changes
+    /// it: it moves anchors, not payloads.
+    virt_lines_marks: usize,
+}
+
+/// Whether `m` carries `virt_lines` rows, the one payload
+/// [`ExtmarkStore::virt_lines_marks`] counts.
+fn has_virt_lines(m: &Extmark) -> bool {
+    m.decor.as_deref().is_some_and(|d| !d.virt_lines.is_empty())
 }
 
 impl ExtmarkStore {
@@ -318,6 +341,7 @@ impl ExtmarkStore {
         right_gravity: bool,
         end_right_gravity: bool,
     ) -> u64 {
+        self.generation += 1;
         let slot = self.by_ns.entry(ns).or_default();
         let id = match id {
             Some(id) => {
@@ -330,19 +354,22 @@ impl ExtmarkStore {
                 id
             }
         };
-        slot.marks.insert(
+        let mark = Extmark {
             id,
-            Extmark {
-                id,
-                start,
-                end,
-                hl_group,
-                priority,
-                decor,
-                right_gravity,
-                end_right_gravity,
-            },
-        );
+            start,
+            end,
+            hl_group,
+            priority,
+            decor,
+            right_gravity,
+            end_right_gravity,
+        };
+        let gained = has_virt_lines(&mark);
+        let replaced = slot.marks.insert(id, mark);
+        // `insert` hands back whatever occupied this id, which is the only way to
+        // know whether the count should also drop for a mark just overwritten.
+        let lost = replaced.as_ref().is_some_and(has_virt_lines);
+        self.virt_lines_marks = self.virt_lines_marks + usize::from(gained) - usize::from(lost);
         id
     }
 
@@ -353,22 +380,44 @@ impl ExtmarkStore {
 
     /// Delete one mark; returns whether it existed.
     pub fn del(&mut self, ns: u32, id: u64) -> bool {
-        match self.by_ns.get_mut(&ns) {
-            Some(slot) => slot.marks.remove(&id).is_some(),
-            None => false,
+        self.generation += 1;
+        let removed = match self.by_ns.get_mut(&ns) {
+            Some(slot) => slot.marks.remove(&id),
+            None => None,
+        };
+        if removed.as_ref().is_some_and(has_virt_lines) {
+            self.virt_lines_marks -= 1;
         }
+        removed.is_some()
     }
 
     /// Remove every mark of namespace `ns` whose `start` falls in the byte range
     /// `range` (`None` ⇒ the whole buffer). Mirrors
     /// `nvim_buf_clear_namespace`, whose line range the caller converts to bytes.
     pub fn clear(&mut self, ns: u32, range: Option<std::ops::Range<usize>>) {
+        self.generation += 1;
         let Some(slot) = self.by_ns.get_mut(&ns) else {
             return;
         };
         match range {
-            None => slot.marks.clear(),
-            Some(r) => slot.marks.retain(|_, m| !r.contains(&m.start)),
+            None => {
+                let dropped = slot.marks.values().filter(|m| has_virt_lines(m)).count();
+                slot.marks.clear();
+                self.virt_lines_marks -= dropped;
+            }
+            Some(r) => {
+                // Counted inside the retain rather than by scanning twice around it:
+                // `retain` already visits every mark, so the bookkeeping is free.
+                let mut dropped = 0usize;
+                slot.marks.retain(|_, m| {
+                    let keep = !r.contains(&m.start);
+                    if !keep && has_virt_lines(m) {
+                        dropped += 1;
+                    }
+                    keep
+                });
+                self.virt_lines_marks -= dropped;
+            }
         }
     }
 
@@ -376,7 +425,9 @@ impl ExtmarkStore {
     /// (undo/redo, file reload), where byte anchors are meaningless against the
     /// new text and there is nothing to rebuild them from.
     pub fn clear_all(&mut self) {
+        self.generation += 1;
         self.by_ns.clear();
+        self.virt_lines_marks = 0;
     }
 
     /// Move namespace `ns`'s marks out of `self` and into `dst`, replacing whatever
@@ -386,8 +437,19 @@ impl ExtmarkStore {
     /// store about to be installed, so undo never wipes them. See
     /// [`crate::editor::Editor::restore_snapshot`].
     pub fn move_namespace_into(&mut self, ns: u32, dst: &mut ExtmarkStore) {
+        self.generation += 1;
+        dst.generation += 1;
+        // Whatever `dst` held for `ns` is discarded either way, so its count sheds
+        // that slot before taking on ours.
+        let displaced = dst.by_ns.get(&ns).map_or(0, |s| {
+            s.marks.values().filter(|m| has_virt_lines(m)).count()
+        });
+        dst.virt_lines_marks -= displaced;
         match self.by_ns.remove(&ns) {
             Some(slot) => {
+                let moved = slot.marks.values().filter(|m| has_virt_lines(m)).count();
+                self.virt_lines_marks -= moved;
+                dst.virt_lines_marks += moved;
                 dst.by_ns.insert(ns, slot);
             }
             None => {
@@ -412,6 +474,18 @@ impl ExtmarkStore {
 
     /// Whether any namespace holds a mark (empty namespace slots left by `del` /
     /// `clear` don't count). Lets the redraw / mirror skip buffers with none.
+    /// Whether any mark carries `virt_lines` — the O(1) gate on the virtual-line
+    /// walks. See [`virt_lines_marks`](Self::virt_lines_marks).
+    pub fn has_virt_lines(&self) -> bool {
+        self.virt_lines_marks > 0
+    }
+
+    /// The structural [`generation`](Self::generation) — see that field for why a
+    /// consumer gates a full re-serialize on it rather than on any change.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_ns.values().all(|s| s.marks.is_empty())
     }

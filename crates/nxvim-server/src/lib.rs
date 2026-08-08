@@ -1289,6 +1289,15 @@ pub struct EditHost {
     /// (`nvim_buf_attach`). Tracked only to fire faithful buffer-change callbacks —
     /// a fuzzy-finder plugin drives its prompt filtering off `on_lines`.
     buf_mirror_lines: HashMap<BufferId, usize>,
+    /// Per-buffer extmark-store *structural* generation last serialized into the
+    /// `nx._extmarks` Lua mirror ([`EditHost::push_buf_mirror`]). A mark's
+    /// decorations (`hl_group`, priority, the sign / line-fill / line-hl payloads,
+    /// gravity) are fixed for its lifetime — an edit moves byte anchors and nothing
+    /// else — so the full re-serialize is gated on this counter and an edit refreshes
+    /// positions alone. Without it, a buffer carrying a few thousand marks (any
+    /// diagnostics / git-sign / rainbow plugin) re-serialized every mark on every
+    /// keystroke. See `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    extmark_gens: HashMap<BufferId, u64>,
     /// Per-buffer undo fingerprint last serialized into the `nx._undotree` Lua
     /// mirror ([`EditHost::push_undotree_mirror`]), so an unchanged tree isn't
     /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
@@ -1746,6 +1755,7 @@ impl EditHost {
             scheduled: VecDeque::new(),
             buf_mirror_ticks: HashMap::new(),
             buf_mirror_lines: HashMap::new(),
+            extmark_gens: HashMap::new(),
             undo_mirror_versions: HashMap::new(),
             start: std::time::Instant::now(),
             mouse_clock: None,

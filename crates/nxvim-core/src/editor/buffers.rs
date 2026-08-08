@@ -393,6 +393,18 @@ impl Editor {
             .map(|ob| ob.buffer.take_lua_ts_edits())
     }
 
+    /// Drain buffer `id`'s **mirror** edit journal — the line-delta stream the
+    /// server folds into one replaced line span for the Rust→Lua buffer mirror
+    /// (`nx._bufs`). `None` for an unknown buffer. Sibling of
+    /// [`take_lua_ts_edits_of`](Self::take_lua_ts_edits_of), with its own drain
+    /// cursor: `push_buf_mirror` drains both in the same pass.
+    pub fn take_mirror_edits_of(&mut self, id: BufferId) -> Option<EditBatch> {
+        self.buffers
+            .map
+            .get_mut(&id)
+            .map(|ob| ob.buffer.take_mirror_edits())
+    }
+
     /// All open buffer ids, ascending (the `nvim_list_bufs` order). Global across
     /// every layer — the neovim API lists *all* buffers regardless of which dock or
     /// the main area they live in.
@@ -507,6 +519,18 @@ impl Editor {
     /// open. Cheap (no text copy), unlike [`Editor::lines_of`].
     pub fn line_count_of(&self, id: BufferId) -> Option<usize> {
         self.buffers.map.get(&id).map(|ob| ob.buffer.line_count())
+    }
+
+    /// Editable lines `[start, end)` of buffer `id`, clamped to the buffer (so the
+    /// phantom trailing line is never returned), or `None` if no such buffer is open.
+    /// The range form of [`Editor::lines_of`], for a caller that needs only the rows
+    /// that changed — the Rust→Lua mirror's line delta, which must not pay
+    /// `lines_of`'s whole-buffer copy on every edit.
+    pub fn lines_range_of(&self, id: BufferId, start: usize, end: usize) -> Option<Vec<String>> {
+        self.buffers.map.get(&id).map(|ob| {
+            let end = end.min(ob.buffer.line_count());
+            (start.min(end)..end).map(|i| ob.buffer.line(i)).collect()
+        })
     }
 
     /// Replace lines `[start, end)` of buffer `id` with `replacement` — the

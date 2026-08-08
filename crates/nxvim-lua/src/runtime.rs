@@ -325,6 +325,18 @@ pub struct HlDefMirror {
     pub link: Option<String>,
 }
 
+/// One buffer's **line-range delta** for the Rust→Lua mirror: replace mirror rows
+/// `[start, old_end)` with `lines`. Rows are 0-based and the range is end-exclusive
+/// (the `nvim_buf_set_lines` convention the whole buffer surface uses); `lines` is
+/// read from the rope *after* the batch landed, so it is the final content of the
+/// span. A pure insertion has `start == old_end`; a pure deletion has empty `lines`.
+#[derive(Clone, Debug, Serialize)]
+pub struct LinesDelta {
+    pub start: u64,
+    pub old_end: u64,
+    pub lines: Vec<String>,
+}
+
 /// One buffer's row in the Rust→Lua buffer mirror (`nx._buffers[bufnr]`). `lines`
 /// rides only on the ticks where the buffer changed (the server passes `None` to
 /// reuse the table already in Lua, the bulk the per-chunk push otherwise skips);
@@ -334,6 +346,15 @@ pub struct BufMirror {
     pub bufnr: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<Vec<String>>,
+    /// The **incremental** alternative to `lines`: the rows that changed since the
+    /// last push, as one replaced line span. Present only when `lines` is absent and
+    /// the buffer's text moved — the Lua side splices it into the array it already
+    /// holds, so an edit costs O(changed rows) instead of re-serializing the whole
+    /// buffer. Both absent ⇒ the buffer's text did not change and the prior array
+    /// carries over unchanged. See
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<LinesDelta>,
     pub name: String,
     /// The buffer's `changedtick` — the monotonic counter the core bumps on every
     /// text change. Backs `nx.buf.changedtick` (neovim's `nvim_buf_get_changedtick`),
@@ -3622,8 +3643,11 @@ impl LuaRuntime {
     /// neovim convention) and the current-window handle. The server pushes this
     /// before running any Lua that can read buffer/cursor state, so synchronous
     /// getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read live data
-    /// without reaching the `Server`. `set_lines` write-through mutates this same
-    /// mirror in Lua so a read-after-write within one chunk stays consistent.
+    /// without reaching the `Server`. A buffer whose text changed carries either a
+    /// full `lines` array or a [`LinesDelta`] the Lua side splices into the array it
+    /// already holds; `nx.buf.set_lines` does *not* write through to the mirror (it
+    /// queues a `BufOp` that lands through the core and is journaled like any other
+    /// edit), so a delta can never be applied on top of an already-applied write.
     ///
     /// `bufs` is `(bufnr, lines, name)` per open buffer. `wins` is one
     /// [`WindowMirror`] per open window **across every tab** (so a window in
@@ -3678,14 +3702,34 @@ impl LuaRuntime {
     /// each entry's marks come from the authoritative core
     /// [`ExtmarkStore`](nxvim_core::ExtmarkStore) with positions already shifted
     /// for any edits, so a read this chunk reflects the live buffer.
-    pub fn set_extmark_mirror(&self, bufs: &[(u64, Vec<ExtmarkMirror>)]) -> mlua::Result<()> {
+    ///
+    /// A buffer's entry is its full mark list only when the store's **structural**
+    /// generation moved (a mark set / deleted / cleared); otherwise it is `true`,
+    /// meaning "keep the decorations you already hold". `positions` then carries that
+    /// buffer's flat `[ns, id, row, col, end_row, end_col]` refresh — the only thing
+    /// an edit can change about a mark. This is what stops a buffer carrying a few
+    /// thousand marks from re-serializing all of them on every keystroke; see
+    /// `docs/plans/2026-08-07-incremental-buffer-mirror.md`.
+    pub fn set_extmark_mirror(
+        &self,
+        bufs: &[(u64, Option<Vec<ExtmarkMirror>>)],
+        positions: &[(u64, Vec<i64>)],
+    ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let entries = self.lua.create_table()?;
         for (bufnr, marks) in bufs {
-            entries.set(*bufnr, self.to_lua(marks)?)?;
+            match marks {
+                Some(marks) => entries.set(*bufnr, self.to_lua(marks)?)?,
+                // `true` ⇒ structurally unchanged: Lua keeps the decorations it holds.
+                None => entries.set(*bufnr, true)?,
+            }
+        }
+        let pos = self.lua.create_table()?;
+        for (bufnr, flat) in positions {
+            pos.set(*bufnr, self.to_lua(flat)?)?;
         }
         let set: mlua::Function = nx.get("_set_extmark_mirror")?;
-        set.call(entries)
+        set.call((entries, pos))
     }
 
     /// Refresh the Rust→Lua highlight mirror (`nx._hl_defs[name]`) that

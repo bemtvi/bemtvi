@@ -34,6 +34,19 @@ pub struct DecorViewport {
     pub generation: u64,
 }
 
+/// Which windows an [`Editor::invalidate_decor`] applies to — everything, every
+/// window showing one buffer, or a single window. The `nx.decor.invalidate` scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecorScope {
+    /// Every visible window (an unscoped `nx.decor.invalidate()`).
+    All,
+    /// Every window currently displaying this buffer — the usual scope, since a
+    /// provider's data is per-buffer and the same buffer can be in several splits.
+    Buffer(BufferId),
+    /// One window (a provider that knows exactly which viewport went stale).
+    Window(WindowId),
+}
+
 impl Editor {
     /// Detect every visible (tiled) window whose `(buffer, top, bot)` changed since
     /// the last call, bump that window's viewport generation, and queue a
@@ -63,8 +76,27 @@ impl Editor {
             // `changedtick` is in the key so an on-screen edit that leaves top/bot
             // unchanged (typing within the viewport) still re-dispatches the provider.
             let key = (buf, top, bot, tick);
-            if self.decor_viewports.get(&win) == Some(&key) {
+            let moved = self.decor_viewports.get(&win) != Some(&key);
+            // An outstanding `nx.decor.invalidate` re-dispatches this window even
+            // though the viewport itself is unchanged — but at most ONCE per pass.
+            // The ask is never refused: it is paced, the same way `decor_dirty` is
+            // latest-wins and a superseded publish is dropped. What that buys is a
+            // loop that cannot run away — a provider whose `on_range` asks to be run
+            // again (directly, or from a continuation that lands before the fixpoint
+            // settles) is answered once, and the ask its *second* run raises waits for
+            // the next pass instead of spinning the convergence. Nothing is lost: the
+            // ask stays outstanding until it is served.
+            let serve = self.decor_invalidated_wins.contains(&win)
+                && !self.decor_served_wins.contains(&win);
+            if !moved && !serve {
                 continue;
+            }
+            // Either way the window is about to be re-dispatched with fresh state, so
+            // any outstanding ask for it is satisfied. A real viewport change answers
+            // an invalidation for free, and never spends the pass's slot.
+            self.decor_invalidated_wins.remove(&win);
+            if !moved {
+                self.decor_served_wins.insert(win);
             }
             self.decor_viewports.insert(win, key);
             let counter = self.decor_gen.entry(win).or_insert(0);
@@ -84,11 +116,79 @@ impl Editor {
         self.decor_viewports.retain(|w, _| seen.contains(w));
         self.decor_gen.retain(|w, _| seen.contains(w));
         self.decor_dirty.retain(|d| seen.contains(&d.win));
+        // …including an invalidation naming a window that has since closed (or never
+        // existed): it can never be served, so it must not accumulate.
+        self.decor_invalidated_wins.retain(|w| seen.contains(w));
+        self.decor_served_wins.retain(|w| seen.contains(w));
+    }
+
+    /// Invalidate the cached viewport of the windows `scope` selects, so the next
+    /// [`Editor::recompute_decor_dirty`] re-queues them with a **fresh generation**
+    /// and their providers run again — the "there is new content to draw" signal a
+    /// plugin raises through `nx.decor.invalidate` when nothing the viewport detector
+    /// watches has moved.
+    ///
+    /// The viewport signal only wakes a provider when `(buffer, top, bot,
+    /// changedtick)` changes, which covers scroll / resize / edit but *not* a change
+    /// in the data the provider draws *from*: git blame that just came back off a
+    /// promise, an LSP result, a toggled setting. Rather than let a plugin fake a
+    /// viewport move (or re-derive the marks and push them behind the engine's back),
+    /// this marks the windows at the layer that owns the signal — so the re-dispatch
+    /// is the ordinary one, gen-stamped like any other, and a publish still in flight
+    /// from the superseded run is dropped by the same staleness check.
+    ///
+    /// The scope is resolved to window ids *here*, while the layout is in hand, and
+    /// the generation bump is left to `recompute_decor_dirty` so one place stamps
+    /// generations. Marking the windows (rather than dropping their cached key) is
+    /// what lets the recompute tell an invalidation-driven re-dispatch apart from a
+    /// real viewport move — the distinction its once-per-pass pacing rests on. The ask
+    /// stays outstanding until it is served, so an invalidation is never dropped, and
+    /// repeated asks for the same window coalesce into one re-dispatch.
+    pub fn invalidate_decor(&mut self, scope: DecorScope) {
+        match scope {
+            DecorScope::All => {
+                let wins = self.window_ids();
+                self.decor_invalidated_wins.extend(wins);
+            }
+            DecorScope::Window(win) => {
+                self.decor_invalidated_wins.insert(win);
+            }
+            DecorScope::Buffer(buf) => {
+                let wins: Vec<WindowId> = self
+                    .window_ids()
+                    .into_iter()
+                    .filter(|w| self.window_buffer(*w) == Some(buf))
+                    .collect();
+                self.decor_invalidated_wins.extend(wins);
+            }
+        }
+        self.decor_invalidated = true;
+    }
+
+    /// Close the current pass: the per-pass invalidation slots are spent per window,
+    /// so clear them once the server's `run_pending` fixpoint has settled. Pacing is
+    /// per convergence and nothing else — a plugin that invalidates from a timer (a
+    /// clock or blame line refreshing every few seconds) lands in its own pass and is
+    /// served every time; only re-asking *within* one pass waits for the next.
+    pub fn settle_decor_pass(&mut self) {
+        self.decor_served_wins.clear();
+    }
+
+    /// Whether an invalidation has been raised but not yet drained — the server's
+    /// cue that its fixpoint owes another round (an invalidate from inside a provider,
+    /// or from a promise continuation, lands after the dispatch step has already run
+    /// for this round).
+    pub fn decor_invalidation_pending(&self) -> bool {
+        self.decor_invalidated
     }
 
     /// Drain the windows whose viewport changed since the last drain (the server
-    /// dispatches each to matching providers off-tick).
+    /// dispatches each to matching providers off-tick). Also consumes the
+    /// invalidation flag: this is the single drain point (with or without a
+    /// registered provider), so clearing it here is what keeps an invalidate from
+    /// spinning the server's fixpoint.
     pub fn take_decor_dirty(&mut self) -> Vec<DecorViewport> {
+        self.decor_invalidated = false;
         std::mem::take(&mut self.decor_dirty)
     }
 

@@ -73,6 +73,88 @@ function nx.decor.provider(spec)
   nx._decor_register()
 end
 
+-- The option keys `nx.decor.invalidate` accepts. An unknown key fails loud rather
+-- than silently widening the scope to "everything" — notably `name`, which reads like
+-- a per-provider filter but is not one (an invalidation re-runs every provider matching
+-- the window, the same way a scroll does).
+local INVALIDATE_KEYS = { buf = true, win = true }
+
+-- `nx.decor.invalidate([opts])`: tell the engine a provider has new content to draw,
+-- and re-dispatch it. A provider is normally woken by the viewport signal — scroll,
+-- resize, or an edit to the visible slice — so a change in the data it draws *from*
+-- (git blame that came back off a promise, an LSP response, a palette or setting the
+-- user just changed) would otherwise not repaint until the user happened to move: a
+-- rainbow-bracket provider whose colours were swapped keeps painting the old ones
+-- until you scroll past them. This is that missing edge — it marks the windows in
+-- scope, and the next engine pass re-runs `on_range` there with a fresh snapshot and
+-- a fresh generation token.
+--
+-- The scope (omitted ⇒ every visible window):
+-- ```lua
+-- nx.decor.invalidate()                  -- every visible window
+-- nx.decor.invalidate({ buf = bufnr })   -- every window showing that buffer (0 = current)
+-- nx.decor.invalidate({ win = winid })   -- exactly that window (0 = current)
+-- ```
+-- Pass `buf` for the usual case: a provider's data is per-buffer, and the same buffer
+-- can be open in several splits, each of which needs its own viewport re-run. Passing
+-- both `buf` and `win` is an error (they are alternative scopes, not a conjunction).
+--
+-- Scoped to the *window*, not to the provider: every provider matching the window runs
+-- again, exactly as it would on a scroll. A publish still in flight from the run this
+-- supersedes is dropped by the generation check, so nothing is lost.
+--
+-- It is a HINT, not a repaint: like everything else a plugin hands the decoration
+-- engine, the ask is optimistic and the engine decides when it is served. Repeated
+-- asks for the same window coalesce, and each window is served at most ONCE per pass —
+-- so a provider that asks to be re-run in response to its own run cannot spin the
+-- editor, it just paces to the next pass. Nothing is dropped; an ask stays outstanding
+-- until it is served. (Asking from inside your own `on_range` is still pointless work
+-- rather than an error: you already hold the `ctx`, so publish what you want drawn
+-- from the run you are in.)
+--
+-- The re-dispatch happens on the current pass, off the frame like every other
+-- dispatch — no redraw is forced and no Lua runs at frame time.
+function nx.decor.invalidate(opts)
+  if opts == nil then
+    return nx._decor_invalidate(nil, nil)
+  end
+  if type(opts) ~= "table" then
+    error("nx.decor.invalidate: expects an optional { buf = <n> } or { win = <n> } table", 2)
+  end
+  for k in pairs(opts) do
+    if not INVALIDATE_KEYS[k] then
+      error("nx.decor.invalidate: unknown option '" .. tostring(k) .. "' (accepts buf, win)", 2)
+    end
+  end
+  if opts.buf ~= nil and opts.win ~= nil then
+    error("nx.decor.invalidate: pass buf OR win, not both (they are alternative scopes)", 2)
+  end
+  if opts.win ~= nil then
+    if type(opts.win) ~= "number" then
+      error("nx.decor.invalidate: win must be a window id (0 = the current window)", 2)
+    end
+    -- `0` is "the current window" throughout the nx API; resolve it here so the scope
+    -- the engine gets is always a concrete id.
+    local win = opts.win
+    if win == 0 then
+      win = nx.win.current()
+    end
+    return nx._decor_invalidate(win, nil)
+  end
+  if opts.buf ~= nil then
+    if type(opts.buf) ~= "number" then
+      error("nx.decor.invalidate: buf must be a buffer number (0 = the current buffer)", 2)
+    end
+    local buf = opts.buf
+    if buf == 0 then
+      buf = nx.buf.current()
+    end
+    return nx._decor_invalidate(nil, buf)
+  end
+  -- An empty table is the same unscoped ask as no argument at all.
+  return nx._decor_invalidate(nil, nil)
+end
+
 -- Whether provider `p` runs for the window described by `ctx` — its `bufs` filter.
 -- No `bufs` ⇒ every buffer. Otherwise every present constraint must hold (AND):
 --   `bufs.filetype = { "lua", … }`        — the buffer's filetype must be in the list;

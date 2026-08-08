@@ -1,0 +1,13 @@
+A sample buffer for the nx.decor.invalidate example. Nothing here is special:
+the decoration depends on a LIMIT the provider holds, not on this text.
+
+This line is comfortably short.
+This one is a good deal longer than the others and runs past the forty-eight column mark by some way.
+Short again.
+Another long one: the provider flags everything past the limit column, so the tail of this line lights up.
+
+Try :Limit 20 and watch how much more of each line is flagged the moment the command runs.
+Then :Limit 70 and watch almost all of it go plain again.
+
+tiny
+The point is that the buffer never changes and the viewport never moves — only the data behind the provider does.

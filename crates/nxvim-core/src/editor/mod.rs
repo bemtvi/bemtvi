@@ -79,7 +79,7 @@ pub(crate) use self::command::{
     PendingCommand, Stage,
 };
 pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKeys};
-pub use self::decor::DecorViewport;
+pub use self::decor::{DecorScope, DecorViewport};
 pub use self::float::{SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT};
 pub use self::menu::{
     CmdlineCandidate, Extent, FilterSeed, MenuGeom, MenuItem, MenuMetrics, MenuPlacement,
@@ -1451,6 +1451,28 @@ pub struct Editor {
     /// Windows whose viewport changed since the last drain (latest-wins per window),
     /// drained by the server in `run_pending`.
     decor_dirty: Vec<decor::DecorViewport>,
+    /// Windows a plugin invalidated (`nx.decor.invalidate`) that the next
+    /// `recompute_decor_dirty` must re-queue even though their `(buffer, top, bot,
+    /// changedtick)` key is unchanged. Marking them — rather than dropping the cached
+    /// key — is what lets the recompute tell "the plugin asked for this" apart from
+    /// "the viewport actually moved", the distinction its once-per-pass pacing
+    /// (`decor_served_wins`) rests on. An ask stays here until it is served, so
+    /// repeated asks for one window coalesce into a single re-dispatch.
+    decor_invalidated_wins: HashSet<WindowId>,
+    /// Windows already served an invalidation-driven re-dispatch in the current pass.
+    /// An invalidation is served at most once per window per convergence, so a provider
+    /// that asks to be re-run in response to its own run is paced to the next pass
+    /// rather than spinning this one. Cleared by the server when `run_pending` settles
+    /// ([`Editor::settle_decor_pass`]).
+    decor_served_wins: HashSet<WindowId>,
+    /// A plugin asked for a re-dispatch it can't get from the viewport signal
+    /// ([`Editor::invalidate_decor`], behind `nx.decor.invalidate`) since the last
+    /// drain. The ask itself is recorded in `decor_invalidated_wins`; this flag is
+    /// purely the server's "another round is owed" signal, so an
+    /// invalidate raised *during* a dispatch still re-dispatches within the same
+    /// convergence instead of waiting for the next keystroke. Consumed by
+    /// [`Editor::take_decor_dirty`].
+    decor_invalidated: bool,
     /// Extmark namespaces that hold **ephemeral, derived** marks — viewport
     /// decoration-provider publishes (`nx.decor`), republished off-tick on every
     /// viewport/edit change. They are *not* document history, so undo/redo must not
@@ -2064,6 +2086,9 @@ impl Editor {
             decor_viewports: HashMap::new(),
             decor_gen: HashMap::new(),
             decor_dirty: Vec::new(),
+            decor_invalidated_wins: HashSet::new(),
+            decor_served_wins: HashSet::new(),
+            decor_invalidated: false,
             ephemeral_extmark_ns: HashSet::new(),
             placement_undo: Vec::new(),
             placement_redo: Vec::new(),

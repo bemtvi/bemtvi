@@ -8,15 +8,15 @@ use crate::{EditHost, WindowStatusline};
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
     command_pending_after, parse_color, parse_keys, BorderStyle, BufferId, CommandContinuation,
-    DecorViewport, DeferredCmd, Editor, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
-    QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    DecorScope, DecorViewport, DeferredCmd, Editor, FloatAnchor, FloatConfig, FloatRelative,
+    QfAction, QfEntry, QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::FsJob;
 use nxvim_lua::{
-    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
-    ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp, LoopOp, NamedListOp,
-    OptionValue, PanelOp, QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp,
-    TsOp, ViewOp, VirtDecorData, WindowMirror, WindowOp,
+    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorInvalidate, DecorPublish, DockOp,
+    ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp,
+    LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, StatuslineKind, StatuslineTarget,
+    TabMirror, TabOp, TsOp, ViewOp, VirtDecorData, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -67,6 +67,17 @@ fn merge_builtin_continuations(
 
 /// Convert a Lua-side [`QfItem`] (from `setqflist`) into a core [`QfEntry`]. The
 /// type char is the first byte of the (possibly empty) `type` string.
+/// The core scope one queued [`DecorInvalidate`] selects. A `win` is the narrowest
+/// ask and wins over a `buf` (the Lua wrapper rejects passing both, so this only
+/// settles the wire form); neither ⇒ every visible window.
+fn decor_scope(req: DecorInvalidate) -> DecorScope {
+    match (req.win, req.buf) {
+        (Some(win), _) => DecorScope::Window(WindowId(win)),
+        (None, Some(buf)) => DecorScope::Buffer(BufferId(buf)),
+        (None, None) => DecorScope::All,
+    }
+}
+
 fn qf_entry_from_item(it: QfItem) -> QfEntry {
     QfEntry {
         filename: it.filename,
@@ -677,6 +688,15 @@ impl EditHost {
         // publishes from a later off-tick round still lands).
         for publish in self.lua.take_decor_publishes() {
             self.apply_decor_publish(publish);
+        }
+        // nx.decor.invalidate: "the data my provider draws from changed" — a
+        // re-dispatch the viewport signal can't produce on its own, because nothing it
+        // watches (buffer, top, bot, changedtick) moved. Lowered onto the core, which
+        // drops the affected windows' cached viewport keys so `run_pending`'s
+        // recompute re-queues them with a fresh generation; the run this supersedes has
+        // any in-flight publish dropped by the ordinary staleness check.
+        for req in self.lua.take_decor_invalidations() {
+            self.editor.invalidate_decor(decor_scope(req));
         }
         // Window mutations from the `vim.api.nvim_win_*` family (Phase 5): applied
         // to the live editor after the chunk. Their `WinNew`/`WinEnter`/… autocmds
@@ -4129,6 +4149,13 @@ impl EditHost {
                 // gated sequence; a *parked* sequence (waiting on an async handler) has already
                 // consumed it, so the loop breaks and resumes on the settle.
                 && !self.editor.has_exit_requested()
+                // A `nx.decor.invalidate` raised *after* this round's decor dispatch —
+                // from inside a provider, or from a promise continuation that resolved
+                // mid-round — owes another round, or the re-dispatch would sit until the
+                // next keystroke (the buffer would stay drawn with the stale data). The
+                // dispatch step's `take_decor_dirty` consumes the flag, so this can only
+                // hold the loop for one extra round per invalidation.
+                && !self.editor.decor_invalidation_pending()
             {
                 break;
             }
@@ -4161,6 +4188,11 @@ impl EditHost {
                 break;
             }
         }
+        // The fixpoint settled: close the decor pass, so each window's once-per-pass
+        // `nx.decor.invalidate` slot is fresh for the next convergence. An ask that
+        // was paced (raised in response to this pass's own re-dispatch) is still
+        // outstanding and is served first thing next pass.
+        self.editor.settle_decor_pass();
         // The drained work may have changed the buffer/window topology (a queued
         // `:lua` window op, a `vim.cmd('split')`, a buffer switch). Diff once more
         // so the resulting `WinNew`/`WinEnter`/`BufEnter`/… autocmds fire — the

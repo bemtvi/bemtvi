@@ -2480,6 +2480,20 @@ pub struct DecorPublish {
     pub marks: Vec<DecorMark>,
 }
 
+/// A `nx.decor.invalidate` request: "the data a provider draws from changed —
+/// re-run it", for windows the scope selects. `buf`/`win` are the raw ids Lua sees
+/// (the same space as `ctx.buf` / `ctx.win`); both `None` ⇒ every visible window,
+/// `buf` set ⇒ every window showing that buffer, `win` set ⇒ that one window (a
+/// `win` wins over a `buf`, matching the Lua wrapper's validation). The server lowers
+/// it onto [`nxvim_core::Editor::invalidate_decor`], which drops the cached viewport
+/// key so the next recompute re-queues the window with a fresh generation. Queued in
+/// [`crate::runtime::Shared::decor_invalidations`].
+#[derive(Clone, Copy, Debug)]
+pub struct DecorInvalidate {
+    pub win: Option<u64>,
+    pub buf: Option<u64>,
+}
+
 /// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a
 /// single-key button dialog showing `label` (the message plus the rendered
 /// buttons, already formatted by the Lua wrapper) and fire callback `cb_id` (a

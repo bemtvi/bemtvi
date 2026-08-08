@@ -17,13 +17,13 @@ use crate::host::seed_package_path;
 use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
-    BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish,
-    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue, GitValue, GlobalOptionOp, HlSet,
-    HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspProgressData,
-    NamedListOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
-    TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    WindowOp, WorkspaceOptionOp,
+    BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq,
+    DecorInvalidate, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue,
+    GitValue, GlobalOptionOp, HlSet, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp,
+    LspClientData, LspOp, LspProgressData, NamedListOp, PanelOp, PickerOpenReq, PickerPush,
+    QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq,
+    StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TextObjectOp, TsOp,
+    UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -1049,6 +1049,11 @@ pub(crate) struct Shared {
     /// provider's namespace in the extmark layer. Empty for a no-provider config.
     /// Phase 3 of `nx.decor`.
     pub(crate) decor_publishes: Vec<DecorPublish>,
+    /// Re-dispatch requests a plugin raised through `nx.decor.invalidate`
+    /// (`nx._decor_invalidate`) — "the data I draw from changed, wake my provider"
+    /// — drained by the server onto `Editor::invalidate_decor`. Scoped to a window,
+    /// a buffer, or unscoped; see [`DecorInvalidate`].
+    pub(crate) decor_invalidations: Vec<DecorInvalidate>,
     /// Whether any `nx.decor` provider has been registered (`nx._decor_register`).
     /// The gate the server checks before dispatching a viewport-change signal: while
     /// no provider is set it skips the whole off-tick decor path (never slices the
@@ -1166,6 +1171,7 @@ impl Shared {
             cmdline_actions,
             helix_actions,
             decor_publishes,
+            decor_invalidations,
             confirms,
             feedkeys,
             // `nx.schedule` / `nx.timer` / `nx.run` requests survive the discard:
@@ -1235,6 +1241,7 @@ impl Shared {
         *cmdline_actions = Default::default();
         *helix_actions = Default::default();
         *decor_publishes = Default::default();
+        *decor_invalidations = Default::default();
         *confirms = Default::default();
         *feedkeys = Default::default();
     }
@@ -2044,6 +2051,13 @@ impl LuaRuntime {
         /// Take the marks `nx.decor` providers published since the last drain, for
         /// the server to apply (generation-gated) into each provider's namespace.
         take_decor_publishes -> Vec<DecorPublish> = decor_publishes
+    }
+
+    take_queue! {
+        /// Take the `nx.decor.invalidate` requests raised since the last drain, for
+        /// the server to lower onto `Editor::invalidate_decor` (which re-queues the
+        /// selected windows so their providers run again).
+        take_decor_invalidations -> Vec<DecorInvalidate> = decor_invalidations
     }
 
     take_queue! {

@@ -20,12 +20,12 @@ use crate::convert::{
 };
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
-    BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish,
-    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GitJob, GlobalOptionOp, HlSet,
-    HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq,
-    PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
-    StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp,
-    TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
+    BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorInvalidate, DecorMark,
+    DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GitJob, GlobalOptionOp,
+    HlSet, HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp,
+    PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq,
+    SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget,
+    TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
     VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
@@ -3931,6 +3931,25 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._decor_invalidate(win, buf)`: `nx.decor.invalidate` — "the data my provider
+    // draws from changed, wake it" for a scope the viewport detector can't see move
+    // (blame that came back off a promise, a toggled setting). Both `nil` ⇒ every
+    // visible window; `win` ⇒ that window; `buf` ⇒ every window showing that buffer.
+    // The server lowers it onto `Editor::invalidate_decor`, which drops the cached
+    // viewport key so the next recompute re-queues the window with a fresh generation
+    // (and the ordinary stale-drop discards any publish still in flight from the run
+    // it supersedes).
+    let sh = shared.clone();
+    nx.set(
+        "_decor_invalidate",
+        lua.create_function(move |_, (win, buf): (Option<u64>, Option<u64>)| {
+            sh.borrow_mut()
+                .decor_invalidations
+                .push(DecorInvalidate { win, buf });
+            Ok(())
+        })?,
     )?;
 
     // `nx._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`

@@ -851,3 +851,407 @@ async fn line_hl_group_survives_the_mirror_refresh_in_get_extmarks() {
         "line_hl_group must round-trip through the server mirror refresh; got {got:?}"
     );
 }
+
+/// A provider whose marks come from *plugin* state (`_G.blame`) rather than from the
+/// buffer text — the async-data shape: the answer arrives long after the viewport
+/// settled, so nothing the viewport detector watches (buffer, top, bot, changedtick)
+/// ever moves again. It counts its runs so a test can prove it was (or was not)
+/// re-dispatched, on top of what it paints.
+const INVALIDATE_INIT: &str = r##"
+_G.blame = false
+_G.runs = 0
+nx.hl.define(0, "BlameMark", { fg = "#ff00ff" })
+nx.decor.provider {
+  name = "blame",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs = _G.runs + 1
+    if not _G.blame then
+      return publish({})
+    end
+    publish({ { ctx.top, 0, end_col = 1, hl = "BlameMark" } })
+  end,
+}
+"##;
+
+#[tokio::test]
+async fn invalidate_redispatches_a_provider_whose_data_changed() {
+    // `nx.decor.invalidate`: the "I have new content to draw" edge. The viewport signal
+    // only wakes a provider when the visible range or the changedtick moves, so data
+    // that arrives on its own schedule (git blame off a promise, an LSP response) would
+    // never repaint. Arriving data is simulated by flipping `_G.blame` from a separate
+    // Lua chunk — no key is pressed, no buffer edited, the viewport is untouched.
+    let dir = temp_dir("decor_invalidate");
+    let (rpc, mut incoming) = start(&dir, INVALIDATE_INIT).await;
+    let path = dir.join("b.lua");
+    std::fs::write(&path, "return x\n").expect("write b.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let opened = wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    assert!(
+        !row_has_group(&opened, 0, "BlameMark"),
+        "nothing painted before the data arrives: {:?}",
+        row_spans(&opened, 0)
+    );
+
+    // The data lands. On its own that changes nothing on screen — the guard that makes
+    // this test fail if `invalidate` were a no-op that merely rode some ambient
+    // re-dispatch.
+    let before = lua_u64(&rpc, "_G.blame = true\nreturn _G.runs").await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.runs").await,
+        before,
+        "an unchanged viewport re-dispatches nothing by itself"
+    );
+
+    // Signal it, and the provider runs again and paints — with no key pressed.
+    exec_lua(&rpc, "nx.decor.invalidate({ buf = 0 })").await;
+    let painted = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "BlameMark")).await;
+    assert_eq!(
+        group_at(&painted, 0, 0).as_deref(),
+        Some("BlameMark"),
+        "invalidate re-runs the provider and its marks render: {:?}",
+        row_spans(&painted, 0)
+    );
+    let after = lua_u64(&rpc, "return _G.runs").await;
+    assert!(
+        after > before,
+        "the provider was dispatched again ({before:?} -> {after:?})"
+    );
+}
+
+#[tokio::test]
+async fn invalidate_from_a_promise_continuation_paints_without_input() {
+    // The real shape end-to-end: the provider itself kicks off async work and calls
+    // `invalidate` when the answer lands, off a later tick and outside any input
+    // handling. The re-dispatch has to come from the server's own drain — no keystroke
+    // follows — and the second run must not re-arm the fetch, or it would spin.
+    let dir = temp_dir("decor_invalidate_async");
+    let init = r##"
+nx.hl.define(0, "LateMark", { fg = "#00ffff" })
+_G.data = nil
+nx.decor.provider {
+  name = "late",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    if _G.data then
+      return publish({ { ctx.top, 0, end_col = 1, hl = "LateMark" } })
+    end
+    publish({})
+    if not _G.fetching then
+      _G.fetching = true
+      nx.promise.delay(5):next(function()
+        _G.data = "blame"
+        nx.decor.invalidate({ buf = ctx.buf })
+      end)
+    end
+  end,
+}
+"##;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = dir.join("l.lua");
+    std::fs::write(&path, "return x\n").expect("write l.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let painted = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "LateMark")).await;
+    assert_eq!(
+        group_at(&painted, 0, 0).as_deref(),
+        Some("LateMark"),
+        "the provider's own late invalidate repaints with no further input: {:?}",
+        row_spans(&painted, 0)
+    );
+}
+
+#[tokio::test]
+async fn invalidate_scopes_to_a_buffer_and_to_a_window() {
+    // The scope selects *windows*: `buf` wakes every window showing that buffer (a
+    // buffer can be in several splits, each with its own viewport), `win` wakes exactly
+    // one. Two splits on two different files give both cases something to miss.
+    let dir = temp_dir("decor_invalidate_scope");
+    let init = r#"
+_G.runs = {}
+nx.decor.provider {
+  name = "counter",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs[ctx.win] = (_G.runs[ctx.win] or 0) + 1
+    publish({})
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let top = dir.join("t.lua");
+    let bottom = dir.join("o.lua");
+    std::fs::write(&top, "return t\n").expect("write t.lua");
+    std::fs::write(&bottom, "return o\n").expect("write o.lua");
+    feed(&rpc, &format!(":e {}<CR>", top.display()));
+    let top_win = lua_u64(&rpc, "return nx.win.current()").await.unwrap();
+    let top_buf = lua_u64(&rpc, "return nx.buf.current()").await.unwrap();
+    feed(&rpc, &format!(":split {}<CR>", bottom.display()));
+    let other_win = lua_u64(&rpc, "return nx.win.current()").await.unwrap();
+    assert_ne!(other_win, top_win, "the split is a second window");
+
+    let runs = |win: u64| format!("return _G.runs[{win}] or 0");
+    let top_before = lua_u64(&rpc, &runs(top_win)).await.unwrap();
+    let other_before = lua_u64(&rpc, &runs(other_win)).await.unwrap();
+
+    // Buffer scope: only the window showing that buffer re-runs.
+    exec_lua(&rpc, &format!("nx.decor.invalidate({{ buf = {top_buf} }})")).await;
+    assert_eq!(
+        lua_u64(&rpc, &runs(top_win)).await,
+        Some(top_before + 1),
+        "the window showing the invalidated buffer re-runs"
+    );
+    assert_eq!(
+        lua_u64(&rpc, &runs(other_win)).await,
+        Some(other_before),
+        "a window showing another buffer is untouched"
+    );
+
+    // Window scope: only that window, even though both show a matching filetype.
+    exec_lua(
+        &rpc,
+        &format!("nx.decor.invalidate({{ win = {other_win} }})"),
+    )
+    .await;
+    assert_eq!(
+        lua_u64(&rpc, &runs(other_win)).await,
+        Some(other_before + 1),
+        "the named window re-runs"
+    );
+    assert_eq!(
+        lua_u64(&rpc, &runs(top_win)).await,
+        Some(top_before + 1),
+        "the other window is untouched by a window-scoped invalidate"
+    );
+
+    // Unscoped: every visible window.
+    exec_lua(&rpc, "nx.decor.invalidate()").await;
+    assert_eq!(
+        lua_u64(&rpc, &runs(top_win)).await,
+        Some(top_before + 2),
+        "an unscoped invalidate wakes every visible window (top)"
+    );
+    assert_eq!(
+        lua_u64(&rpc, &runs(other_win)).await,
+        Some(other_before + 2),
+        "an unscoped invalidate wakes every visible window (split)"
+    );
+}
+
+#[tokio::test]
+async fn invalidate_rejects_a_scope_it_does_not_implement() {
+    // No silent stubs: the scope is a window scope, not a per-provider one. A `name`
+    // key reads like a provider filter, so accepting-and-ignoring it would quietly
+    // re-run every provider; it fails loud instead. Same for the two scopes together,
+    // which are alternatives rather than a conjunction.
+    let dir = temp_dir("decor_invalidate_bad");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(nx.decor.invalidate, { name = 'blame' })\nreturn tostring(e)",
+    )
+    .await;
+    assert!(
+        err.as_str().unwrap_or_default().contains("unknown option"),
+        "an unknown scope key fails loud: {err:?}"
+    );
+    let both = exec_lua(
+        &rpc,
+        "local ok, e = pcall(nx.decor.invalidate, { buf = 1, win = 1 })\nreturn tostring(e)",
+    )
+    .await;
+    assert!(
+        both.as_str().unwrap_or_default().contains("not both"),
+        "buf and win together fail loud: {both:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_self_invalidating_provider_is_paced_not_looped() {
+    // A provider that unconditionally asks to be re-run from its own `on_range` — the
+    // shape that would loop forever if the ask were served on demand. It is not an
+    // error (the ask is a hint, like every other thing a plugin hands the decoration
+    // engine): the engine simply serves each window at most once per pass, so the run
+    // count settles instead of spinning, and the editor keeps answering throughout.
+    let dir = temp_dir("decor_selfloop");
+    let init = r#"
+_G.runs = 0
+_G.err = nil
+nx.decor.provider {
+  name = "loopy",
+  bufs = { filetype = { "lua" } },
+  on_range = function(_ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({})
+    local ok, e = pcall(nx.decor.invalidate)
+    _G.err = ok and "ok" or tostring(e)
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = dir.join("s.lua");
+    std::fs::write(&path, "return x\n").expect("write s.lua");
+    let t = std::time::Instant::now();
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err").await.as_str(),
+        Some("ok"),
+        "the ask is optimistic — a provider is never told 'no' about drawing"
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "the editor kept answering while the provider re-asked ({:?})",
+        t.elapsed()
+    );
+    // Bounded: the opening dispatch plus the one invalidation the pass serves.
+    let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        (1..=4).contains(&settled),
+        "the pass serves the ask once, it does not loop: {settled}"
+    );
+    // …and it is not free-running: sitting idle for a while adds nothing beyond the
+    // pass each measurement RPC itself drives. (A loop served on demand would add
+    // thousands of runs over this window; the pacing makes the cost O(1) per pass,
+    // which is what a provider dispatched per keystroke already costs.)
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let idle = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        idle - settled <= 2,
+        "idling adds at most the measurement's own pass, not a spin: {settled} -> {idle}"
+    );
+
+    // Still a working provider: a real viewport change dispatches it as usual, and the
+    // ask that was paced is served alongside — bounded again.
+    feed(&rpc, "ay<Esc>");
+    let after = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        after > idle && after <= idle + 4,
+        "a later pass dispatches normally, still bounded ({idle} -> {after})"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_may_invalidate_a_different_window() {
+    // The guard is aimed at the self-loop, not at cross-window work: a provider that
+    // invalidates *another* window (a side panel it feeds, a preview) is legitimate and
+    // must still be served.
+    let dir = temp_dir("decor_crosswin");
+    let init = r#"
+_G.asked = false
+_G.err = nil
+nx.decor.provider {
+  name = "lua-side",
+  bufs = { filetype = { "lua" } },
+  on_range = function(_ctx, publish)
+    publish({})
+    -- Wake the other window once (guarded, so this test is not itself a runaway).
+    if _G.target and not _G.asked then
+      _G.asked = true
+      local ok, e = pcall(nx.decor.invalidate, { win = _G.target })
+      _G.err = ok and "ok" or tostring(e)
+    end
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let side = dir.join("side.txt");
+    let lua = dir.join("main.lua");
+    std::fs::write(&side, "side\n").expect("write side.txt");
+    std::fs::write(&lua, "return x\n").expect("write main.lua");
+    feed(&rpc, &format!(":e {}<CR>", side.display()));
+    let side_win = lua_u64(&rpc, "return nx.win.current()").await.unwrap();
+    let side_buf = lua_u64(&rpc, "return nx.buf.current()").await.unwrap();
+    // Scope the side provider by buffer id — deterministic, unlike guessing the
+    // filetype nxvim gives a `.txt` file.
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"
+_G.other_runs = 0
+nx.decor.provider {{
+  name = "side",
+  bufs = {{ buf = {side_buf} }},
+  on_range = function(_ctx, publish)
+    _G.other_runs = _G.other_runs + 1
+    publish({{}})
+  end,
+}}
+"#
+        ),
+    )
+    .await;
+    feed(&rpc, &format!(":split {}<CR>", lua.display()));
+    let before = lua_u64(&rpc, "return _G.other_runs").await.unwrap();
+
+    // Arm the cross-window invalidate, then drive one dispatch of the lua provider.
+    exec_lua(&rpc, &format!("_G.target = {side_win}")).await;
+    feed(&rpc, "ax<Esc>");
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err").await.as_str(),
+        Some("ok"),
+        "invalidating another window from on_range is allowed"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return _G.other_runs").await,
+        Some(before + 1),
+        "and the other window really was re-dispatched"
+    );
+}
+
+#[tokio::test]
+async fn a_re_armed_invalidate_loop_is_paced_and_recovers() {
+    // The loop the call site cannot see: the ask is re-armed from a scheduled callback,
+    // so it is raised outside `on_range` — but still lands inside the same convergence,
+    // which is exactly what would spin the fixpoint. The once-per-pass pacing bounds it
+    // without the plugin ever being refused, and a real viewport change still
+    // dispatches normally afterwards.
+    let dir = temp_dir("decor_runaway");
+    let init = r#"
+_G.runs = 0
+nx.decor.provider {
+  name = "rearm",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({})
+    nx.schedule(function()
+      nx.decor.invalidate({ buf = ctx.buf })
+    end)
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = dir.join("r.lua");
+    std::fs::write(&path, "return x\n").expect("write r.lua");
+    let t = std::time::Instant::now();
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let after_open = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "the editor kept answering while the provider re-armed ({:?})",
+        t.elapsed()
+    );
+    assert!(
+        (1..=4).contains(&after_open),
+        "the pass serves the re-armed ask once, not without end: {after_open}"
+    );
+    // Not free-running: idling adds nothing beyond the pass the measurement itself
+    // drives, where an on-demand loop would add thousands of runs over this window.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let idle = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        idle - after_open <= 2,
+        "idling adds at most the measurement's own pass, not a spin: {after_open} -> {idle}"
+    );
+
+    // Recovery: a real viewport change is never paced, so decoration still works after
+    // a provider has been re-asking.
+    feed(&rpc, "ay<Esc>");
+    let after_edit = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        after_edit > idle,
+        "a real viewport change still dispatches ({idle} -> {after_edit})"
+    );
+}

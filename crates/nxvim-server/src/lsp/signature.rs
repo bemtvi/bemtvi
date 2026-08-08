@@ -13,8 +13,8 @@
 //! so `f(items: dict[str, int], key: tuple[A, B])` breaks into two parameters and
 //! not four. When a server gives parameters that cannot be located in its own
 //! label (or gives none at all), there is nothing to split on and the signature
-//! renders as the single line it always did — with the active parameter named in
-//! brackets, as before.
+//! renders as a single line — with the active parameter named in brackets, since
+//! nothing else says which of them you are on.
 //!
 //! The marker is *not* in the text: core paints it as an overlay extmark over the
 //! indent (see [`Editor::open_signature_float`](nxvim_core::Editor::open_signature_float)),
@@ -100,14 +100,23 @@ pub(crate) fn layout_signature(info: &SignatureInfo) -> SignatureLayout {
     }
 }
 
-/// The single-line rendering: the label as the server spelled it, with the active
-/// parameter appended in brackets when one is known. Used for a one-parameter (or
-/// parameterless) signature — where a vertical split would cost three rows to say
-/// what one already says — and as the fallback for a server whose parameters
-/// cannot be located in its own label.
+/// The single-line rendering: the label as the server spelled it. Used for a
+/// one-parameter (or parameterless) signature — where a vertical split would cost
+/// three rows to say what one already says — and as the fallback for a server whose
+/// parameters cannot be located in its own label.
+///
+/// The active parameter is appended in brackets only when naming it *says* something.
+/// With a **single** parameter it does not: `fn only(a: i32)    [a: i32]` echoes the
+/// only thing the line already shows, and pushes the popup wider than the signature
+/// it exists to show — there is one candidate, so showing the signature is showing
+/// the active parameter. The bracket stays for the unlocatable fallback, where a
+/// server's several parameters are all still on one line and naming one is the only
+/// way to point at it.
 fn single_line(info: &SignatureInfo) -> SignatureLayout {
     let line = match &info.active_text {
-        Some(param) if !param.is_empty() => format!("{}    [{param}]", info.label),
+        Some(param) if !param.is_empty() && !info.has_sole_parameter() => {
+            format!("{}    [{param}]", info.label)
+        }
         _ => info.label.clone(),
     };
     SignatureLayout {

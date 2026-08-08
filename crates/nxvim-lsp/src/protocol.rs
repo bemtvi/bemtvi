@@ -408,12 +408,13 @@ pub struct SignatureInfo {
 }
 
 impl SignatureInfo {
-    /// The byte spans, when they can carry a per-parameter layout: at least two
-    /// parameters, each span in bounds, on a char boundary, and strictly after
-    /// the last. A server that reports overlapping or out-of-order spans gets the
-    /// single-line rendering rather than a scrambled one.
-    pub fn layout_spans(&self) -> Option<&[(usize, usize)]> {
-        if self.parameters.len() < 2 {
+    /// The byte spans, when every one of them actually addresses the label: in
+    /// bounds, on a char boundary, non-empty, and strictly after the last. A
+    /// server that reports overlapping or out-of-order spans gets `None` — the
+    /// editor then falls back to rendering the label as the server spelled it,
+    /// rather than slicing it into a scrambled layout.
+    pub fn valid_spans(&self) -> Option<&[(usize, usize)]> {
+        if self.parameters.is_empty() {
             return None;
         }
         let mut prev_end = 0;
@@ -426,6 +427,24 @@ impl SignatureInfo {
             prev_end = end;
         }
         Some(&self.parameters)
+    }
+
+    /// The spans, when they can carry a **per-parameter layout**: [valid](Self::valid_spans)
+    /// *and* at least two of them. One parameter has nothing to lay out vertically
+    /// — it renders as a single line, which
+    /// [`has_sole_parameter`](Self::has_sole_parameter) is what distinguishes from
+    /// the unlocatable fallback.
+    pub fn layout_spans(&self) -> Option<&[(usize, usize)]> {
+        self.valid_spans().filter(|spans| spans.len() >= 2)
+    }
+
+    /// Whether the signature takes exactly **one** parameter, located in the label
+    /// — in which case showing the label is already showing the active parameter,
+    /// and the single-line rendering has no reason to name it after the signature.
+    /// `false` for a server whose spans do not address its label: there the count
+    /// is unknown, so the active parameter still has to be named.
+    pub fn has_sole_parameter(&self) -> bool {
+        self.valid_spans().is_some_and(|spans| spans.len() == 1)
     }
 }
 

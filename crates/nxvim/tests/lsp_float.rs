@@ -732,11 +732,13 @@ async fn signature_help_splits_on_label_offsets_not_commas() {
     std::env::remove_var("NXVIM_LSP_CMD");
 }
 
-/// A single-parameter call has nothing to lay out vertically — three rows would
-/// say what one already says — so it keeps the compact one-line form, with the
-/// active parameter named in brackets as before.
+/// A single-parameter call has nothing to lay out vertically — three rows would say
+/// what one already says — so it keeps the compact one-line form. And with one
+/// parameter the line is the whole answer: naming it after the signature
+/// (`fn only(a: i32)    [a: i32]`) echoes the only thing the line shows and pushes
+/// the popup wider than the signature it exists to show, so the label stands alone.
 #[tokio::test]
-async fn single_parameter_signature_stays_on_one_line() {
+async fn a_single_parameter_is_not_echoed_after_the_signature() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_float_sig_one");
     arm_mock(
@@ -747,16 +749,29 @@ async fn single_parameter_signature_stays_on_one_line() {
     );
     let (rpc, mut incoming) = start(&dir).await;
 
-    let win =
-        await_doc_float_window(&rpc, &mut incoming, "nx.lsp.signature_help()", "fn only").await;
+    let (redraw, win) =
+        await_doc_float_redraw(&rpc, &mut incoming, "nx.lsp.signature_help()", "fn only").await;
     assert_eq!(
         window_lines(&win),
-        vec!["fn only(a: i32)    [a: i32]"],
-        "a one-parameter signature stays on one line"
+        vec!["fn only(a: i32)"],
+        "a one-parameter signature is the label alone — no bracketed echo of it"
     );
     assert!(
         overlay_markers(&win).is_empty(),
-        "with nothing split there is no parameter row to point at"
+        "with nothing split there is no parameter row to point a caret at"
+    );
+    // Tier 2: it reaches painted cells as the bare signature.
+    let rows = painted_rows(&redraw);
+    assert!(
+        rows.iter().any(|r| r.contains("fn only(a: i32)")),
+        "the signature paints as itself, got {:?}",
+        rows.iter()
+            .filter(|r| r.contains("only"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("[a: i32]")),
+        "no bracketed copy of the sole parameter reaches the screen"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

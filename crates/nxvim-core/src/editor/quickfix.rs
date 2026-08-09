@@ -272,7 +272,13 @@ impl Editor {
     }
 
     /// The current list of `which`, mutably, if the stack exists and is non-empty.
+    ///
+    /// Handing out the reference bumps [`qf_generation`](Editor::qf_generation),
+    /// whether or not the caller writes through it. That direction is the safe one:
+    /// a caller that changes nothing costs one redundant mirror push, while a write
+    /// site that forgot to bump would leave the mirror silently stale.
     fn qf_cur_mut(&mut self, which: QfWhich) -> Option<&mut QfList> {
+        self.qf_generation += 1;
         match which {
             QfWhich::Quickfix => self.qf.current_mut(),
             QfWhich::Location(w) => self
@@ -290,6 +296,7 @@ impl Editor {
     /// window when needed (so `setloclist` / `:lvimgrep` on a fresh window has
     /// somewhere to write). `None` only for a stale location-window id.
     fn qf_stack_ensure(&mut self, which: QfWhich) -> Option<&mut QfStack> {
+        self.qf_generation += 1;
         match which {
             QfWhich::Quickfix => Some(&mut self.qf),
             QfWhich::Location(w) => self
@@ -299,6 +306,20 @@ impl Editor {
             // so it is present here (absent only for a bogus, never-interned id).
             QfWhich::Named(id) => self.named_lists.get_mut(&id).map(|nl| &mut nl.stack),
         }
+    }
+
+    /// The quickfix / location-list write counter: unchanged between two reads
+    /// means no list stack was handed out mutably in between, so neither the
+    /// quickfix list nor any window's location list can have changed. The mirror
+    /// push gates on it — rebuilding a `:vimgrep`-sized list on every keystroke
+    /// cost 18x a list-free buffer
+    /// (`docs/plans/2026-08-08-per-keystroke-costs-round-2.md`).
+    ///
+    /// It does **not** cover a window with a location list being *closed*: the list
+    /// is gone with its window without anything here being touched. The server
+    /// pairs this with the set of windows that currently hold one.
+    pub fn qf_generation(&self) -> u64 {
+        self.qf_generation
     }
 
     /// The current quickfix list (read-only) — the projection source for the

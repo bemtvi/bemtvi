@@ -1542,9 +1542,10 @@ impl LuaRuntime {
         lua_to_rmpv(&value)
     }
 
-    /// Evaluate a generic `'foldexpr'` for buffer lines `1..=line_count` — vim's
-    /// per-line fold-expr model, with `v:lnum` (the 1-based line) bound before each
-    /// call — and return one fold value string per line (`"0"`, `"1"`, `">1"`,
+    /// Evaluate a generic `'foldexpr'` for the `count` buffer lines starting at the
+    /// 0-based row `first` — vim's per-line fold-expr model, with `v:lnum` (the
+    /// 1-based line) bound before each call — and return one fold value string per
+    /// evaluated line (`"0"`, `"1"`, `">1"`,
     /// `"<1"`, `"="`, …) for the core fold engine to resolve. nxvim-core can't run
     /// Lua, so the server drives this off the [`Editor`]'s `'foldexpr'` and pushes
     /// the result back via `set_foldexpr_values`.
@@ -1556,13 +1557,18 @@ impl LuaRuntime {
     /// result passes through; anything else reads as `"0"` (the line isn't folded).
     /// A compile/eval error propagates so the server can surface it (no silent
     /// no-op).
-    pub fn eval_foldexpr_lines(&self, expr: &str, line_count: usize) -> mlua::Result<Vec<String>> {
+    pub fn eval_foldexpr_lines(
+        &self,
+        expr: &str,
+        first: usize,
+        count: usize,
+    ) -> mlua::Result<Vec<String>> {
         let trimmed = expr.trim();
         let chunk = trimmed.strip_prefix("v:lua.").unwrap_or(trimmed);
         let func: mlua::Function = self.lua.load(format!("return {chunk}")).into_function()?;
         let vmirror: Table = self.nx()?.get("_v_mirror")?;
-        let mut out = Vec::with_capacity(line_count);
-        for lnum in 1..=line_count {
+        let mut out = Vec::with_capacity(count);
+        for lnum in (first + 1)..=(first + count) {
             vmirror.set("lnum", lua_int(lnum as i64))?;
             let value: mlua::Value = func.call(())?;
             out.push(foldexpr_value_string(&value));
@@ -3865,6 +3871,25 @@ impl LuaRuntime {
             entries.set(name.to_string(), entry)?;
         }
         let set: mlua::Function = nx.get("_set_reg_mirror")?;
+        set.call(entries)
+    }
+
+    /// Refresh only the read-only special registers (`%` `/` `:` `.`) on the
+    /// existing `nx._registers` table. The companion to
+    /// [`set_reg_mirror`](Self::set_reg_mirror) for the common tick where the stored
+    /// register file did not change but a special did (`.` moves on every keystroke
+    /// of an insert) — a full push would re-copy every stored register's text to
+    /// carry four short strings.
+    pub fn set_reg_specials(&self, regs: &[(char, String, bool)]) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let entries = self.lua.create_table()?;
+        for (name, text, linewise) in regs {
+            let entry = self.lua.create_table()?;
+            entry.set("text", text.as_str())?;
+            entry.set("type", if *linewise { "V" } else { "v" })?;
+            entries.set(name.to_string(), entry)?;
+        }
+        let set: mlua::Function = nx.get("_set_reg_specials")?;
         set.call(entries)
     }
 

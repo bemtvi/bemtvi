@@ -405,6 +405,17 @@ impl Editor {
             .map(|ob| ob.buffer.take_mirror_edits())
     }
 
+    /// Drain buffer `id`'s **fold** edit journal — the row-span stream the computed
+    /// fold sources splice their cached per-line inputs from. `None` for an unknown
+    /// buffer. Sibling of [`take_mirror_edits_of`](Self::take_mirror_edits_of), with
+    /// its own drain cursor.
+    pub(crate) fn take_fold_edits_of(&mut self, id: BufferId) -> Option<EditBatch> {
+        self.buffers
+            .map
+            .get_mut(&id)
+            .map(|ob| ob.buffer.take_fold_edits())
+    }
+
     /// All open buffer ids, ascending (the `nvim_list_bufs` order). Global across
     /// every layer — the neovim API lists *all* buffers regardless of which dock or
     /// the main area they live in.

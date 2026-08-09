@@ -464,6 +464,30 @@ impl ExtmarkStore {
         self.by_ns.values().flat_map(|s| s.marks.values())
     }
 
+    /// How many marks namespace `ns` holds, in O(1). Lets a caller that addresses
+    /// its marks by id check the set is actually *there* before trusting the
+    /// addressing — an undo snapshot can restore a store from before the marks were
+    /// placed, leaving a bookkeeping count that no longer describes it.
+    pub fn ns_len(&self, ns: u32) -> usize {
+        self.by_ns.get(&ns).map_or(0, |s| s.marks.len())
+    }
+
+    /// Every mark of namespace `ns`, **in ascending id order** (the store keys each
+    /// namespace by id in a `BTreeMap`, so this is the map's natural order and costs
+    /// no sort). Empty for a namespace holding nothing.
+    ///
+    /// The ordering is load-bearing for callers that give their marks meaningful ids:
+    /// the diagnostic anchors are addressed by their position in the merged
+    /// diagnostic list, so walking them here yields them in merged order, which is
+    /// what lets the render surfaces select the visible ones without touching the
+    /// diagnostics that are off screen.
+    pub fn iter_ns(&self, ns: u32) -> impl Iterator<Item = &Extmark> + '_ {
+        self.by_ns
+            .get(&ns)
+            .into_iter()
+            .flat_map(|s| s.marks.values())
+    }
+
     /// Every mark paired with its namespace id — for the Rust→Lua mirror that
     /// `nvim_buf_get_extmarks` reads.
     pub fn iter_with_ns(&self) -> impl Iterator<Item = (u32, &Extmark)> {

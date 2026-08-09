@@ -72,6 +72,11 @@ struct BufferState {
     /// ships no injection query or no region matches. See
     /// [`Engine::rebuild_injection_layers`].
     injections: Vec<InjectionLayer>,
+    /// The `(language, ranges)` region-sets [`injections`](Self::injections) was
+    /// built from — kept so an edit can update them **incrementally** instead of
+    /// re-running the host's injection query over the whole tree. See
+    /// [`Engine::update_injection_layers`].
+    injection_regions: Vec<InjectionRegion>,
     /// Lines a full-line-background capture ([`LINE_BACKGROUND_GROUPS`]) touched in
     /// the most recent [`Engine::highlights`] call — read back by the server via
     /// [`line_background_lines`](nxvim_core::syntax::SyntaxEngine::line_background_lines)
@@ -493,7 +498,12 @@ impl Engine {
     /// Each surviving child tree is `edit`ed with this frame's deltas and reused as
     /// the parse hint for the region of its language, so unchanged subtrees are not
     /// reparsed (and it doubles as the last-good fallback under the parse budget).
-    fn update_injection_layers(&mut self, buffer: BufferId, edits: &[InputEdit]) {
+    fn update_injection_layers(
+        &mut self,
+        buffer: BufferId,
+        edits: &[InputEdit],
+        before: Option<&Tree>,
+    ) {
         // Lift the old layers out, shifting each tree by this frame's deltas so it
         // can serve as an incremental reparse hint for its language's new region(s).
         let old_by_lang = {
@@ -509,8 +519,103 @@ impl Engine {
             }
             map
         };
-        let regions = self.top_level_injection_regions(buffer);
+        let regions = self
+            .incremental_injection_regions(buffer, edits, before)
+            .unwrap_or_else(|| self.top_level_injection_regions(buffer));
         self.build_injection_layers(buffer, regions, old_by_lang);
+    }
+
+    /// Update the cached top-level injection regions for `buffer` from what the edit
+    /// changed, or `None` when that cannot be done soundly and the caller must fall
+    /// back to the full walk.
+    ///
+    /// **Why this exists.** The full walk runs the host grammar's injection query over
+    /// the entire tree, and it ran on *every edit*. On a 2000-line rust file, an
+    /// injection query matching nothing in it still cost 15x the same edits with no
+    /// query at all — and the cost grows with the file
+    /// (`docs/plans/2026-08-08-per-keystroke-costs-round-2.md`).
+    ///
+    /// **Why not clip the query to the viewport**, the way `extract_spans` does? Two
+    /// reasons the highlight path does not have. A region's identity would churn on
+    /// every scroll, and [`build_injection_layers`] hands a region's previous tree to
+    /// tree-sitter as the incremental parse hint — a hint from an unrelated region
+    /// yields a *wrong* parse, not a slow one. And a combined region-set spans the
+    /// whole document by construction, so a viewport would cut it in half.
+    ///
+    /// **The shape used instead.** A region outside every dirty range is, by
+    /// construction, unaffected by the edit: its nodes did not change and the text its
+    /// predicates read did not change. So shift the cached regions through the edits,
+    /// drop the ones the dirty set touches, re-run the query restricted to the dirty
+    /// ranges, and union the results back. Regions keep their identity, which is what
+    /// keeps the parse hints valid.
+    ///
+    /// Returns `None` — deferring to the full walk — when the query contains any
+    /// `injection.combined` pattern, because such a set is accumulated *across*
+    /// matches spread over the document and a partial re-derivation would produce a
+    /// partial set. Of the languages that ship queries here only markdown has one, so
+    /// this costs almost nothing in practice, and it fails to today's behavior rather
+    /// than to a wrong one.
+    fn incremental_injection_regions(
+        &self,
+        buffer: BufferId,
+        edits: &[InputEdit],
+        before: Option<&Tree>,
+    ) -> Option<Vec<InjectionRegion>> {
+        let state = self.buffers.get(&buffer)?;
+        let tree = state.tree.as_ref()?;
+        let Some(Slot::Loaded(host)) = self.grammars.get(&state.language) else {
+            return None;
+        };
+        let query = host.injections.as_ref()?;
+        if query_has_combined(query) {
+            return None;
+        }
+        // Computed only now, past every early-out: `changed_ranges` walks both trees,
+        // so a language that ships no injection query (or a combined one, which takes
+        // the full walk anyway) must not pay for it.
+        let dirty = Self::dirty_ranges(before, Some(tree), edits);
+        let dirty = &dirty[..];
+        // Survivors: cached regions shifted onto the new text, minus anything the
+        // dirty set reaches.
+        let touches_dirty =
+            |r: &Range<usize>| dirty.iter().any(|d| r.start < d.end && d.start < r.end);
+        let mut regions: Vec<InjectionRegion> = state
+            .injection_regions
+            .iter()
+            .map(|r| InjectionRegion {
+                language: r.language.clone(),
+                ranges: r.ranges.iter().map(|x| shift_range(x, edits)).collect(),
+                extent: shift_range(&r.extent, edits),
+            })
+            // Dropped on the **extent**, not on the injected ranges: the match may
+            // have read text outside what it injects (markdown's fence language is
+            // the shipping example), and that text changing changes the match.
+            .filter(|r| !touches_dirty(&r.extent))
+            .collect();
+        // Re-derive within each dirty range. A match is returned when it *intersects*
+        // the range, and its captured nodes are reported whole, so a region straddling
+        // the edge comes back complete rather than clipped.
+        for d in dirty {
+            for found in collect_injection_regions_in(
+                query,
+                tree,
+                &state.shadow,
+                Some(&state.language),
+                None,
+                Some(d.clone()),
+            ) {
+                // A match can be found from more than one dirty range, and one whose
+                // content sits outside the dirty set may survive above as well.
+                if !regions.contains(&found) {
+                    regions.push(found);
+                }
+            }
+        }
+        // Document order, so the layer vector (and therefore the painter's precedence
+        // between same-depth layers) does not depend on which regions happened to be
+        // re-derived this edit.
+        regions.sort_by_key(|r| r.ranges.first().map_or(usize::MAX, |x| x.start));
+        Some(regions)
     }
 
     /// Run the host grammar's injection query over the root tree and resolve the
@@ -518,7 +623,7 @@ impl Engine {
     /// tree. The host is the query's `injection.self`; it has no parent. `&self` (no
     /// grammar load), so it can borrow the buffer + grammar caches together and
     /// return owned data the caller then builds with `&mut self`.
-    fn top_level_injection_regions(&self, buffer: BufferId) -> Vec<(String, Vec<Range<usize>>)> {
+    fn top_level_injection_regions(&self, buffer: BufferId) -> Vec<InjectionRegion> {
         let Some(state) = self.buffers.get(&buffer) else {
             return Vec::new();
         };
@@ -527,11 +632,12 @@ impl Engine {
         };
         match self.grammars.get(&state.language) {
             Some(Slot::Loaded(host)) => match host.injections.as_ref() {
-                Some(query) => collect_injection_regions(
+                Some(query) => collect_injection_regions_in(
                     query,
                     tree,
                     &state.shadow,
                     Some(&state.language),
+                    None,
                     None,
                 ),
                 None => Vec::new(), // no injection query → no layers
@@ -587,7 +693,7 @@ impl Engine {
     fn build_injection_layers(
         &mut self,
         buffer: BufferId,
-        regions: Vec<(String, Vec<Range<usize>>)>,
+        regions: Vec<InjectionRegion>,
         mut old_by_lang: HashMap<String, Vec<Tree>>,
     ) {
         // The host language injected the top-level regions; it is their parent for
@@ -595,13 +701,16 @@ impl Engine {
         let Some(host_lang) = self.buffers.get(&buffer).map(|s| s.language.clone()) else {
             return;
         };
+        if let Some(state) = self.buffers.get_mut(&buffer) {
+            state.injection_regions = regions.clone();
+        }
         let started = Instant::now();
         let mut layers = Vec::with_capacity(regions.len());
         // (language, ranges, depth, injector) — `injector` is the language that
         // injected this region, used as `injection.parent` when recursing into it.
         let mut queue: VecDeque<(String, Vec<Range<usize>>, usize, String)> = regions
             .into_iter()
-            .map(|(lang, ranges)| (lang, ranges, 1, host_lang.clone()))
+            .map(|r| (r.language, r.ranges, 1, host_lang.clone()))
             .collect();
 
         while let Some((language, mut ranges, depth, injector)) = queue.pop_front() {
@@ -730,6 +839,7 @@ impl Engine {
             language: lang.to_string(),
             incomplete: false,
             injections: Vec::new(),
+            injection_regions: Vec::new(),
             line_bg_lines: Vec::new(),
         };
         state.reparse();
@@ -793,11 +903,53 @@ impl Engine {
         if state.incomplete {
             state.parser.reset();
         }
+        // The edited-but-not-yet-reparsed tree, kept to ask tree-sitter which byte
+        // ranges the reparse actually *changed* — the input to the incremental
+        // injection update below. Cloning a `Tree` is a refcount bump, not a copy.
+        let before = state.tree.clone();
         state.reparse();
         // The injected regions move with every edit, so re-derive the child layers
         // from the fresh root tree — incrementally, replaying `applied` onto the
         // surviving child trees. `state`'s borrow ends at the line above.
-        self.update_injection_layers(buffer, &applied);
+        self.update_injection_layers(buffer, &applied, before.as_ref());
+    }
+
+    /// The byte ranges an edit could have changed the *injection structure* of:
+    /// tree-sitter's `changed_ranges` between the pre- and post-reparse trees, plus
+    /// the ranges the edits themselves wrote.
+    ///
+    /// The union is not belt-and-braces. `changed_ranges` reports where the **syntax**
+    /// differs, so a same-shape token substitution (`"a"` → `"b"` inside a string) can
+    /// leave it empty while changing the very text an injection query's `#eq?` /
+    /// `#match?` / `#lua-match?` predicate reads. Adding the written ranges covers
+    /// that; leaving them out would let an injection silently fail to appear.
+    fn dirty_ranges(
+        before: Option<&Tree>,
+        after: Option<&Tree>,
+        edits: &[InputEdit],
+    ) -> Vec<Range<usize>> {
+        let mut out: Vec<Range<usize>> = edits
+            .iter()
+            .map(|e| e.start_byte..e.new_end_byte.max(e.start_byte))
+            .collect();
+        if let (Some(before), Some(after)) = (before, after) {
+            out.extend(
+                before
+                    .changed_ranges(after)
+                    .map(|r| r.start_byte..r.end_byte.max(r.start_byte)),
+            );
+        }
+        // Merge into a minimal ascending set, so the query below runs once per
+        // genuinely separate region rather than once per overlapping report.
+        out.sort_by_key(|r| r.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+        for r in out {
+            match merged.last_mut() {
+                Some(prev) if r.start <= prev.end => prev.end = prev.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        merged
     }
 
     /// Forget a buffer's shadow text and parse tree (the editor deleted it).
@@ -2367,9 +2519,84 @@ fn collect_injection_regions(
     self_lang: Option<&str>,
     parent_lang: Option<&str>,
 ) -> Vec<(String, Vec<Range<usize>>)> {
+    collect_injection_regions_in(query, tree, rope, self_lang, parent_lang, None)
+        .into_iter()
+        .map(|r| (r.language, r.ranges))
+        .collect()
+}
+
+/// One top-level injection region-set, as derived from the host's injection query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InjectionRegion {
+    /// The injected language.
+    language: String,
+    /// The buffer byte ranges the child grammar parses.
+    ranges: Vec<Range<usize>>,
+    /// The byte span of **everything the match matched on** — every captured node,
+    /// not only the injected content.
+    ///
+    /// This is what an edit must be checked against to decide whether the region is
+    /// still valid, and it is wider than `ranges` for the query markdown actually
+    /// ships: `(info_string (language) @injection.language)` reads the fence's
+    /// language from *outside* the content it injects, so rewriting ```` ```rust ````
+    /// as ```` ```ruby ```` changes the match while touching none of its content.
+    extent: Range<usize>,
+}
+
+/// Whether `query` has any pattern carrying `injection.combined` — the property that
+/// makes a region-set accumulate across matches from anywhere in the document, and so
+/// the one thing that cannot be re-derived from a byte range. Cheap: a handful of
+/// patterns, each with a handful of properties, against a walk of the whole tree.
+fn query_has_combined(query: &Query) -> bool {
+    (0..query.pattern_count()).any(|i| {
+        query
+            .property_settings(i)
+            .iter()
+            .any(|p| &*p.key == "injection.combined")
+    })
+}
+
+/// Map a byte range through a sequence of edits, in the order they were applied. A
+/// position at or before an edit's start is unmoved; one after the replaced span
+/// slides by the edit's length delta; one *inside* it collapses to the span's new
+/// end. That last case only arises for a region the caller is about to discard
+/// anyway — a region containing an edit's interior necessarily intersects the dirty
+/// set — so it is defined for totality rather than for its result.
+fn shift_range(r: &Range<usize>, edits: &[InputEdit]) -> Range<usize> {
+    let shift = |mut b: usize| {
+        for e in edits {
+            b = if b <= e.start_byte {
+                b
+            } else if b <= e.old_end_byte {
+                e.new_end_byte
+            } else {
+                (b + e.new_end_byte).saturating_sub(e.old_end_byte)
+            };
+        }
+        b
+    };
+    let start = shift(r.start);
+    start..shift(r.end).max(start)
+}
+
+/// [`collect_injection_regions`] restricted to a byte range: only matches
+/// intersecting `within` are returned, and the cursor prunes subtrees outside it
+/// rather than walking them. Captured nodes are still reported in full, so a region
+/// straddling the boundary comes back whole.
+fn collect_injection_regions_in(
+    query: &Query,
+    tree: &Tree,
+    rope: &Rope,
+    self_lang: Option<&str>,
+    parent_lang: Option<&str>,
+    within: Option<Range<usize>>,
+) -> Vec<InjectionRegion> {
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut out: Vec<(String, Vec<Range<usize>>)> = Vec::new();
+    if let Some(w) = within {
+        cursor.set_byte_range(w);
+    }
+    let mut out: Vec<InjectionRegion> = Vec::new();
     // Combined region-sets are keyed by (language, pattern) to an index into `out`,
     // so every match of a combined pattern appends to the same set.
     let mut combined_set: HashMap<(String, usize), usize> = HashMap::new();
@@ -2395,7 +2622,15 @@ fn collect_injection_regions(
         // the content ranges in one pass over the captures.
         let mut dynamic_lang: Option<String> = None;
         let mut ranges: Vec<Range<usize>> = Vec::new();
+        // Every captured node, content or not — the text this match's result depends
+        // on, and therefore the span an edit invalidates it through.
+        let mut extent: Option<Range<usize>> = None;
         for cap in m.captures {
+            let (cs, ce) = (cap.node.start_byte(), cap.node.end_byte());
+            extent = Some(match extent {
+                Some(e) => e.start.min(cs)..e.end.max(ce),
+                None => cs..ce,
+            });
             match names[cap.index as usize] {
                 "injection.language" => {
                     let (s, e) = (cap.node.start_byte(), cap.node.end_byte());
@@ -2419,16 +2654,33 @@ fn collect_injection_regions(
         if ranges.is_empty() {
             continue; // an empty set would be read as "the whole buffer"
         }
+        let extent = extent.unwrap_or_else(|| {
+            let lo = ranges.iter().map(|r| r.start).min().unwrap_or(0);
+            let hi = ranges.iter().map(|r| r.end).max().unwrap_or(0);
+            lo..hi
+        });
         if combined {
             match combined_set.get(&(language.clone(), m.pattern_index)) {
-                Some(&idx) => out[idx].1.extend(ranges),
+                Some(&idx) => {
+                    out[idx].ranges.extend(ranges);
+                    out[idx].extent.start = out[idx].extent.start.min(extent.start);
+                    out[idx].extent.end = out[idx].extent.end.max(extent.end);
+                }
                 None => {
                     combined_set.insert((language.clone(), m.pattern_index), out.len());
-                    out.push((language, ranges));
+                    out.push(InjectionRegion {
+                        language,
+                        ranges,
+                        extent,
+                    });
                 }
             }
         } else {
-            out.push((language, ranges));
+            out.push(InjectionRegion {
+                language,
+                ranges,
+                extent,
+            });
         }
     }
     out

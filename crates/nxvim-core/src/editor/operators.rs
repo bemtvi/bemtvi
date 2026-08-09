@@ -1146,6 +1146,9 @@ impl Editor {
     /// every stored cell plus the read-only specials, as `(name, text,
     /// linewise)`. Names are the stored keys (lowercase / digit / symbol); the
     /// server pushes this before any Lua that can read registers.
+    ///
+    /// O(stored bytes), so the server gates it — see [`Editor::register_generation`]
+    /// and [`Editor::register_specials`].
     pub fn register_mirror(&self) -> Vec<(char, String, bool)> {
         let mut out: Vec<(char, String, bool)> = self
             .registers
@@ -1153,6 +1156,20 @@ impl Editor {
             .into_iter()
             .map(|(name, text, kind)| (name, text.to_string(), kind == RegKind::Line))
             .collect();
+        out.extend(self.register_specials());
+        out
+    }
+
+    /// The **read-only special** registers (`%` `/` `:` `.`) as the mirror carries
+    /// them. Split out of [`Editor::register_mirror`] because they are the half of
+    /// it the write counter cannot see: they are resolved from live editor state
+    /// (buffer name, last search, last command line, last insert) rather than
+    /// stored in the register file, so a mirror gated on
+    /// [`register_generation`](Self::register_generation) alone would freeze them.
+    /// They are short and few, so the server compares them literally each tick and
+    /// only pays for the (unbounded) stored cells when something actually moved.
+    pub fn register_specials(&self) -> Vec<(char, String, bool)> {
+        let mut out = Vec::new();
         for name in ['%', '/', ':', '.'] {
             if let Some((text, kind)) = self.register_text(Some(name)) {
                 if !text.is_empty() {
@@ -1161,6 +1178,14 @@ impl Editor {
             }
         }
         out
+    }
+
+    /// The register file's write counter: unchanged between two reads means no
+    /// *stored* register was written in between (the read-only specials move
+    /// independently — see [`register_specials`](Self::register_specials)). The
+    /// mirror push gates on it so typing never re-copies a yanked file.
+    pub fn register_generation(&self) -> u64 {
+        self.registers.generation()
     }
 
     /// Apply a `vim.fn.setreg` write to the register file. The Lua bridge has

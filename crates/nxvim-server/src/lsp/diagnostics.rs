@@ -222,15 +222,19 @@ impl EditHost {
     /// The pairing is the point: two servers on one buffer may have negotiated
     /// different encodings, so their `character` columns are not comparable and can
     /// only be converted per source. Callers must not flatten this into one encoding.
+    ///
+    /// Lends rather than collects: this is walked several times per frame (once per
+    /// render surface, plus the cursor and statusline surfaces), so materializing a
+    /// vector of every diagnostic each time was itself an O(diagnostics) per-frame
+    /// cost — see `docs/plans/2026-08-08-per-keystroke-costs-round-2.md`.
     fn lsp_diagnostics_of(
         &self,
         buffer: nxvim_core::BufferId,
-    ) -> Vec<(&Diagnostic, Option<&ServerKey>, PositionEncoding)> {
-        let Some(state) = self.lsp_states.get(&buffer) else {
-            return Vec::new();
-        };
-        state
-            .servers()
+    ) -> impl Iterator<Item = (&Diagnostic, Option<&ServerKey>, PositionEncoding)> + '_ {
+        self.lsp_states
+            .get(&buffer)
+            .into_iter()
+            .flat_map(|state| state.servers())
             .filter_map(|(key, doc)| {
                 let encoding = self.lsp_servers.get(key)?.encoding;
                 Some(
@@ -240,7 +244,6 @@ impl EditHost {
                 )
             })
             .flatten()
-            .collect()
     }
 
     /// Every diagnostic to project for `buffer`, **in the canonical merged order**:
@@ -254,14 +257,30 @@ impl EditHost {
     fn merged_sources(
         &self,
         buffer: nxvim_core::BufferId,
-    ) -> Vec<(&Diagnostic, Option<&ServerKey>, PositionEncoding)> {
-        let mut out = self.lsp_diagnostics_of(buffer);
-        if let Some(diags) = self.client_diagnostics.get(&buffer) {
-            // Client-set diagnostics have no server, so their columns are already
-            // nxvim's native bytes — `Utf8` makes the shared conversion the identity.
-            out.extend(diags.iter().map(|d| (d, None, PositionEncoding::Utf8)));
-        }
-        out
+    ) -> impl Iterator<Item = (&Diagnostic, Option<&ServerKey>, PositionEncoding)> + '_ {
+        // Client-set diagnostics have no server, so their columns are already
+        // nxvim's native bytes — `Utf8` makes the shared conversion the identity.
+        let client = self
+            .client_diagnostics
+            .get(&buffer)
+            .into_iter()
+            .flat_map(|diags| diags.iter().map(|d| (d, None, PositionEncoding::Utf8)));
+        self.lsp_diagnostics_of(buffer).chain(client)
+    }
+
+    /// How many entries [`merged_sources`](Self::merged_sources) yields, counted
+    /// without walking (let alone materializing) them. Only the anchor-trust check
+    /// needs the length, and it needs it *before* the walk starts.
+    fn merged_len(&self, buffer: nxvim_core::BufferId) -> usize {
+        let lsp: usize = self
+            .lsp_states
+            .get(&buffer)
+            .into_iter()
+            .flat_map(|state| state.servers())
+            .filter(|(key, _)| self.lsp_servers.contains_key(*key))
+            .map(|(_, doc)| doc.diagnostics.len())
+            .sum();
+        lsp + self.client_diagnostics.get(&buffer).map_or(0, |d| d.len())
     }
 
     /// Every diagnostic to project for `buffer`, each resolved to the byte span it
@@ -280,17 +299,102 @@ impl EditHost {
         &self,
         buffer: nxvim_core::BufferId,
     ) -> Vec<TrackedDiagnostic<'_>> {
-        let sources = self.merged_sources(buffer);
+        self.diagnostics_resolved(buffer, None)
+    }
+
+    /// [`diagnostics_merged`](Self::diagnostics_merged) pruned to the diagnostics
+    /// that can touch the byte range `[lo, hi)` — the form every **render** surface
+    /// wants, since only the rows on screen can paint anything.
+    ///
+    /// This is where the render path stops scaling with the buffer's diagnostic
+    /// count. The full list costs an allocation per entry and, downstream, a
+    /// `byte_to_line` rope lookup per entry in each surface's line index; with a few
+    /// thousand diagnostics that ran three times a frame and made typing 36x slower
+    /// than on a clean buffer (`docs/plans/2026-08-08-per-keystroke-costs-round-2.md`
+    /// — the same fix the extmark decoration projections took in the round before).
+    /// The prune itself is two integer compares against an already-resolved anchor,
+    /// so the entries that miss cost nothing but the compare.
+    ///
+    /// **Intersection, not anchor containment.** A diagnostic that starts above the
+    /// viewport and reaches into it still underlines the rows it covers, so the test
+    /// is overlap. The surfaces that key on the anchor line alone (the gutter sign,
+    /// the inline message) simply find its start line outside their rows and skip it,
+    /// exactly as they did against the full list.
+    pub(crate) fn diagnostics_in_byte_range(
+        &self,
+        buffer: nxvim_core::BufferId,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<TrackedDiagnostic<'_>> {
+        self.diagnostics_resolved(buffer, Some((lo, hi)))
+    }
+
+    /// The shared body of [`diagnostics_merged`](Self::diagnostics_merged) and
+    /// [`diagnostics_in_byte_range`](Self::diagnostics_in_byte_range): resolve every
+    /// merged diagnostic to its current byte span, keeping only those overlapping
+    /// `window` when one is given.
+    ///
+    /// **Walked from the anchors, not from the diagnostics**, whenever a window is
+    /// asked for and the anchors are trustworthy. The anchors live in a `BTreeMap`
+    /// keyed by the diagnostic's position in the merged list, so iterating them
+    /// yields merged order for free and costs one integer compare per diagnostic —
+    /// where resolving from the diagnostic side costs a hash probe *and* a step
+    /// through the merged iterator each. Measured over 300 frames with 5000
+    /// diagnostics, that difference was the entire remaining render cost: 2038 ms of
+    /// resolution against 28 ms of index building and 83 ms of row emission
+    /// (`docs/plans/2026-08-08-per-keystroke-costs-round-2.md`). Only the handful of
+    /// diagnostics that survive the compare are ever looked up.
+    ///
+    /// The unwindowed and unanchored cases keep the straight walk: the first is not a
+    /// per-frame path (jumps, the location list, the float), and the second is the
+    /// deliberate fallback for a mark set that does not match the list it was placed
+    /// from, where published ranges are all there is.
+    fn diagnostics_resolved(
+        &self,
+        buffer: nxvim_core::BufferId,
+        window: Option<(usize, usize)>,
+    ) -> Vec<TrackedDiagnostic<'_>> {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return Vec::new();
         };
         // The anchors are addressed by position in the merged list, so they are only
         // trustworthy while the list is the one they were placed from.
-        let anchored = self.diag_mark_counts.get(&buffer) == Some(&sources.len());
-        sources
-            .into_iter()
+        let merged_len = self.merged_len(buffer);
+        let anchored = self.diag_mark_counts.get(&buffer) == Some(&merged_len);
+        // Walking *from* the anchors additionally requires that they all still exist:
+        // the slow path falls back to a diagnostic's published range whenever its own
+        // anchor is missing, but a walk that starts at the anchors would simply not
+        // see it. An undo can restore a buffer's extmark store from before the set was
+        // placed, which leaves the bookkeeping count matching a store that no longer
+        // holds the marks — so the count alone is not enough to start from them.
+        let all_anchored = anchored && buf.extmarks.ns_len(DIAGNOSTIC_NS) == merged_len;
+        if let (Some((lo, hi)), true) = (window, all_anchored) {
+            return buf
+                .extmarks
+                .iter_ns(DIAGNOSTIC_NS)
+                .filter_map(|m| {
+                    let start = m.start;
+                    let end = m.end.unwrap_or(start).max(start);
+                    // `end >= lo` rather than `end > lo` so a zero-width diagnostic
+                    // sitting exactly on `lo` survives; it admits a range ending
+                    // exactly at `lo` too, which is one harmless extra entry the row
+                    // clip drops.
+                    if start >= hi || end < lo {
+                        return None;
+                    }
+                    let (d, server, _) = self.merged_at(buffer, m.id as usize)?;
+                    Some(TrackedDiagnostic {
+                        d,
+                        server,
+                        start,
+                        end,
+                    })
+                })
+                .collect();
+        }
+        self.merged_sources(buffer)
             .enumerate()
-            .map(|(i, (d, server, encoding))| {
+            .filter_map(|(i, (d, server, encoding))| {
                 let span = anchored
                     .then(|| buf.extmarks.get(DIAGNOSTIC_NS, i as u64))
                     .flatten()
@@ -299,14 +403,69 @@ impl EditHost {
                         let r = lsp_range_to_bytes_in(buf, &d.range, encoding);
                         (r.start, r.end)
                     });
-                TrackedDiagnostic {
+                let (start, end) = (span.0, span.1.max(span.0));
+                if window.is_some_and(|(lo, hi)| start >= hi || end < lo) {
+                    return None;
+                }
+                Some(TrackedDiagnostic {
                     d,
                     server,
-                    start: span.0,
-                    end: span.1.max(span.0),
-                }
+                    start,
+                    end,
+                })
             })
             .collect()
+    }
+
+    /// The `i`th entry of [`merged_sources`](Self::merged_sources), by index rather
+    /// than by walking. The merged order is "each attached server's set, in
+    /// [`ServerKey`] order, then the client-set one", so the index is resolved by
+    /// stepping the *servers* (of which there are a handful) and indexing into the
+    /// one whose range contains it — never by stepping the diagnostics.
+    fn merged_at(
+        &self,
+        buffer: nxvim_core::BufferId,
+        i: usize,
+    ) -> Option<(&Diagnostic, Option<&ServerKey>, PositionEncoding)> {
+        let mut rest = i;
+        if let Some(state) = self.lsp_states.get(&buffer) {
+            for (key, doc) in state.servers() {
+                let Some(server) = self.lsp_servers.get(key) else {
+                    continue;
+                };
+                if let Some(d) = doc.diagnostics.get(rest) {
+                    return Some((d, Some(key), server.encoding));
+                }
+                rest -= doc.diagnostics.len();
+            }
+        }
+        let d = self.client_diagnostics.get(&buffer)?.get(rest)?;
+        Some((d, None, PositionEncoding::Utf8))
+    }
+
+    /// The byte range the rendered rows `segs` cover, for
+    /// [`diagnostics_in_byte_range`](Self::diagnostics_in_byte_range). `None` when
+    /// the frame shows no buffer line at all (an empty window, all `~` filler), which
+    /// is the one case where "no range" and "the whole buffer" must not be confused.
+    fn seg_byte_range(buf: &Buffer, segs: &[crate::redraw::RowSeg]) -> Option<(usize, usize)> {
+        let mut lines = segs.iter().filter_map(|s| s.line);
+        let first = lines.next()?;
+        // Rows are emitted in order, but `min`/`max` rather than first/last so a
+        // future reordering (or an interleaved virtual row) cannot silently narrow
+        // the window — under-covering here hides a diagnostic.
+        let (mut lo_line, mut hi_line) = (first, first);
+        for n in lines {
+            lo_line = lo_line.min(n);
+            hi_line = hi_line.max(n);
+        }
+        let line_count = buf.line_count();
+        let lo = buf.line_start((lo_line - 1).min(line_count.saturating_sub(1)));
+        let hi = if hi_line < line_count {
+            buf.line_start(hi_line)
+        } else {
+            buf.len_bytes()
+        };
+        Some((lo, hi.max(lo)))
     }
 
     /// [`EditHost::diagnostics_merged`] for the current buffer — the merged set the
@@ -333,9 +492,8 @@ impl EditHost {
                 return;
             };
             self.merged_sources(buffer)
-                .iter()
                 .map(|(d, _, encoding)| {
-                    let r = lsp_range_to_bytes_in(buf, &d.range, *encoding);
+                    let r = lsp_range_to_bytes_in(buf, &d.range, encoding);
                     (r.start, r.end.max(r.start))
                 })
                 .collect()
@@ -379,10 +537,17 @@ impl EditHost {
     /// Diagnostic counts for `buffer` by severity `[error, warn, info, hint]`,
     /// for the `diagnostics` statusline segment. Zero across the board when the
     /// buffer has no language server / no diagnostics.
+    ///
+    /// Counts the whole buffer, so unlike the render surfaces it is **not** pruned to
+    /// the viewport — an off-screen error still belongs in the tally. It reads
+    /// straight off [`merged_sources`](Self::merged_sources) rather than through
+    /// [`diagnostics_merged`](Self::diagnostics_merged) because severity does not
+    /// depend on position: resolving every anchor to a byte span just to throw the
+    /// span away was a per-frame cost buying nothing.
     pub(crate) fn diag_counts_for(&self, buffer: nxvim_core::BufferId) -> [usize; 4] {
         let mut counts = [0usize; 4];
-        for t in self.diagnostics_merged(buffer) {
-            let sev = t.severity(); // 1=error … 4=hint
+        for (d, _, _) in self.merged_sources(buffer) {
+            let sev = severity_code(d.severity); // 1=error … 4=hint
             if (1..=4).contains(&sev) {
                 counts[(sev - 1) as usize] += 1;
             }
@@ -408,8 +573,13 @@ impl EditHost {
             return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         };
         // The LSP-pushed and client-set sets merged, each already resolved to where
-        // it sits in the buffer *now* (its anchor's span, not its published range).
-        let diags = self.diagnostics_merged(buffer);
+        // it sits in the buffer *now* (its anchor's span, not its published range) —
+        // and pruned to the rows this frame draws, so the index below is built over
+        // the handful on screen rather than over every diagnostic in the buffer.
+        let Some((lo, hi)) = Self::seg_byte_range(buf, segs) else {
+            return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
+        };
+        let diags = self.diagnostics_in_byte_range(buffer, lo, hi);
         // Per-frame index built once instead of scanning the whole merged list per
         // row: each diagnostic intersects every buffer row its span crosses (exactly
         // when `row_span` returns `Some`). Single-line diagnostics — the overwhelming
@@ -491,7 +661,10 @@ impl EditHost {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return Value::Array(segs.iter().map(|_| Value::Nil).collect());
         };
-        let diags = self.diagnostics_merged(buffer);
+        let Some((lo, hi)) = Self::seg_byte_range(buf, segs) else {
+            return Value::Array(segs.iter().map(|_| Value::Nil).collect());
+        };
+        let diags = self.diagnostics_in_byte_range(buffer, lo, hi);
         // Per-frame index of the diagnostics *starting* on each line, in merged
         // order, so `min_by_key` (which returns the first element reaching the
         // minimum) picks the same winner as a per-row `filter`/`min_by_key` would.
@@ -563,7 +736,10 @@ impl EditHost {
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return Value::Array(segs.iter().map(|_| Value::Nil).collect());
         };
-        let diags = self.diagnostics_merged(buffer);
+        let Some((lo, hi)) = Self::seg_byte_range(buf, segs) else {
+            return Value::Array(segs.iter().map(|_| Value::Nil).collect());
+        };
+        let diags = self.diagnostics_in_byte_range(buffer, lo, hi);
         // Same per-frame start-line index as the virtual-text surface: same
         // "starts on line" filter and same `min_by_key` tie-break.
         let by_start = DiagStartIndex::build(&diags, buf);
@@ -617,7 +793,11 @@ impl EditHost {
             .editor
             .buffer()
             .byte_at(self.editor.cursor.line, self.editor.cursor.col);
-        self.current_diagnostics_merged()
+        // Pruned to the cursor's own byte: this runs on every frame, and walking the
+        // whole merged set to find the one diagnostic under a single position was the
+        // fourth O(diagnostics) pass per frame. `covers` widens a zero-width span to
+        // one cell, so the window must too.
+        self.diagnostics_in_byte_range(self.editor.current_buffer_id(), at, at + 1)
             .into_iter()
             .filter(|t| t.covers(at))
             .min_by_key(|t| t.severity())

@@ -232,6 +232,22 @@ function nx._set_reg_mirror(t)
   nx._registers = t or {}
 end
 
+-- The read-only special registers (`%` `/` `:` `.`), refreshed **in place** on the
+-- table `nx._set_reg_mirror` installed. They are resolved from live editor state
+-- (buffer name, last search, last command line, the insert in progress) rather than
+-- from the stored register file, so they move on ticks where no register was
+-- written -- `.` on literally every keystroke of an insert. Re-pushing the whole
+-- mirror for them would re-copy every stored register's text along with them, which
+-- is exactly the O(stored bytes) per keystroke this split exists to avoid. A special
+-- that no longer resolves is cleared (nil), not left stale.
+local REG_SPECIALS = { "%", "/", ":", "." }
+function nx._set_reg_specials(t)
+  t = t or {}
+  for _, name in ipairs(REG_SPECIALS) do
+    nx._registers[name] = t[name]
+  end
+end
+
 -- Rust→Lua mirror of the set marks (the current buffer's locals, the globals, and
 -- the numbered marks), refreshed by the server (`nx._set_marks_mirror`) before any
 -- Lua that can read it — so `nx.mark.list` sees positions that shift with edits and

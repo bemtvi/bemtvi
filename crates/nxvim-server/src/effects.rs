@@ -342,27 +342,7 @@ fn extmark_positions(buf: &nxvim_core::Buffer, scope: PosScope) -> Vec<i64> {
 /// anything else (out-of-order or overlapping edits) this returns `None` and the
 /// caller pushes the buffer in full rather than guessing at a span.
 fn fold_mirror_edits(edits: &[nxvim_core::BufferEdit]) -> Option<(usize, usize, usize)> {
-    let first = edits.first()?;
-    let start = first.start_point.0;
-    let mut old_end = first.old_end_point.0;
-    let mut new_end = first.new_end_point.0;
-    // Rows added (negative: removed) by the edits folded so far — what maps a later
-    // edit's coordinates back onto the pre-batch buffer. The fold keeps the invariant
-    // `new_end - shift == old_end`.
-    let mut shift = new_end as isize - old_end as isize;
-    for e in &edits[1..] {
-        // Strictly forward and non-overlapping: the edit must begin at or after the
-        // span folded so far, in the *current* buffer's coordinates.
-        if e.start_point.0 < new_end {
-            return None;
-        }
-        // Non-negative by that guard (`old_end_point >= start_point >= new_end`, and
-        // `new_end - shift == old_end >= 0`), but resolved fallibly rather than cast.
-        old_end = usize::try_from(e.old_end_point.0 as isize - shift).ok()?;
-        new_end = e.new_end_point.0;
-        shift = new_end as isize - old_end as isize;
-    }
-    Some((start, old_end, new_end))
+    nxvim_core::buffer::fold_edit_rows(edits)
 }
 
 /// Project a core [`BufferEdit`] (absolute byte offsets + `(row, byte-col)`
@@ -2675,10 +2655,30 @@ impl EditHost {
             .collect();
         let _ = self.lua.set_wso_mirror(&wso);
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
-        // core's current registers (stored cells + the read-only specials). Small
-        // (a handful of short strings), so it isn't gated on a dirty flag.
-        let regs = self.editor.register_mirror();
-        let _ = self.lua.set_reg_mirror(&regs);
+        // core's current registers (stored cells + the read-only specials).
+        //
+        // Gated: this is O(stored bytes), and the stored bytes are whatever the user
+        // last yanked — a `ggyG` over a real file makes an ungated push copy the
+        // whole thing twice (once into Rust `String`s, once into Lua) on every
+        // keystroke. The core's write counter covers the stored cells; the four
+        // read-only specials (`%` `/` `:` `.`) resolve from live editor state and
+        // move without it, so they are compared literally — they are short, and
+        // comparing them is what keeps the unbounded half from being rebuilt.
+        let reg_gen = self.editor.register_generation();
+        let reg_specials = self.editor.register_specials();
+        if self.reg_mirror_gen != Some(reg_gen) {
+            // A register was written: re-push everything (which carries the specials).
+            let regs = self.editor.register_mirror();
+            let _ = self.lua.set_reg_mirror(&regs);
+            self.reg_mirror_gen = Some(reg_gen);
+            self.reg_mirror_specials = reg_specials;
+        } else if self.reg_mirror_specials != reg_specials {
+            // Only a special moved — `.` does so on every keystroke of an insert — so
+            // refresh those four in place rather than re-copying the stored cells
+            // along with them.
+            let _ = self.lua.set_reg_specials(&reg_specials);
+            self.reg_mirror_specials = reg_specials;
+        }
         // The set marks (current buffer's locals + globals + numbered), mirrored so
         // `nx.mark.list` / the `marks` picker read the core's live positions — which
         // shift with edits and restore on undo. Small (a few dozen short rows).
@@ -2743,10 +2743,32 @@ impl EditHost {
 
     /// Refresh the `nx._qflist` mirror (`vim.fn.getqflist()`) from the editor's
     /// current quickfix list, plus the per-window `nx._loclist` mirror
-    /// (`vim.fn.getloclist(win)`) from every window that has a location list. Cheap
-    /// (a handful of short strings each), so it isn't gated on a dirty flag —
-    /// pushed alongside the other per-tick mirrors.
+    /// (`vim.fn.getloclist(win)`) from every window that has a location list.
+    ///
+    /// **Gated on a version**, because this runs on the per-keystroke mirror push
+    /// and a list is not small: every entry costs a fresh Lua table plus 13 field
+    /// sets, and a `:vimgrep` across a repo routinely produces thousands, which made
+    /// typing 18x slower than with no list at all
+    /// (`docs/plans/2026-08-08-per-keystroke-costs-round-2.md`). The version is the
+    /// core's list-write counter paired with **which** windows currently hold a
+    /// location list: the counter alone cannot see a loclist-owning window *close*
+    /// (the list vanishes with the window without any stack being touched), and
+    /// carrying the ids rather than a count means a close racing an open cannot
+    /// alias. Computing it is O(windows) integer work.
     pub(crate) fn push_qflist_mirror(&mut self) {
+        let version = (
+            self.editor.qf_generation(),
+            self.editor
+                .window_ids()
+                .into_iter()
+                .filter(|w| self.editor.loclist(*w).is_some())
+                .map(|w| w.0)
+                .collect::<Vec<u64>>(),
+        );
+        if self.qf_mirror_version.as_ref() == Some(&version) {
+            return;
+        }
+        self.qf_mirror_version = Some(version);
         let list = self.editor.qf_list();
         let items = qf_mirror_items(list);
         let title = list.title.clone();

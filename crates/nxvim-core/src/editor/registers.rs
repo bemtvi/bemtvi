@@ -33,9 +33,21 @@ pub(crate) struct RegisterCell {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Registers {
     cells: HashMap<char, RegisterCell>,
+    /// Bumped on every write, so the Rust→Lua mirror can skip re-serializing a
+    /// register file nothing has touched. Copying every register's text on every
+    /// tick is O(stored bytes) per keystroke, which a yanked file makes expensive
+    /// — see `docs/plans/2026-08-08-per-keystroke-costs-round-2.md`. Every writer
+    /// funnels through [`Registers::set`], which is the only place this moves.
+    generation: u64,
 }
 
 impl Registers {
+    /// The write counter the mirror gates on. Two reads returning the same value
+    /// mean no register changed in between.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Record a yank. An explicit `"x` register is written directly (uppercase
     /// appends) and mirrored into the unnamed register. With no explicit
     /// register, the yank fills the unnamed register **and** the yank register
@@ -148,6 +160,7 @@ impl Registers {
     }
 
     fn set(&mut self, name: char, text: String, kind: RegKind) {
+        self.generation += 1;
         self.cells.insert(name, RegisterCell { text, kind });
     }
 
@@ -158,7 +171,7 @@ impl Registers {
             let from = char::from_digit(n, 10).unwrap();
             let to = char::from_digit(n + 1, 10).unwrap();
             if let Some(cell) = self.cells.get(&from).cloned() {
-                self.cells.insert(to, cell);
+                self.set(to, cell.text, cell.kind);
             }
         }
         self.set('1', text, kind);

@@ -1302,6 +1302,18 @@ pub struct EditHost {
     /// mirror ([`EditHost::push_undotree_mirror`]), so an unchanged tree isn't
     /// re-projected on every Lua entry — only edits/undo/redo rebuild it.
     undo_mirror_versions: HashMap<BufferId, (u64, usize, u64, bool)>,
+    /// Version of the quickfix / location-list state last serialized into the
+    /// `nx._qflist` + `nx._loclist` Lua mirrors: the core's list-write counter paired
+    /// with the ids of the windows that then held a location list. See
+    /// [`EditHost::push_qflist_mirror`] for why it takes both halves.
+    qf_mirror_version: Option<(u64, Vec<u64>)>,
+    /// The register file's write counter as of the last `nx._registers` push, with the
+    /// read-only specials (`%` `/` `:` `.`) that push carried. The counter covers the
+    /// stored cells — whose size is unbounded, and is the reason the push is gated at
+    /// all — while the specials resolve from live editor state and so must be compared
+    /// by value. See [`EditHost::push_buf_mirror`].
+    reg_mirror_gen: Option<u64>,
+    reg_mirror_specials: Vec<(char, String, bool)>,
     /// Monotonic base for the editor's time: `start.elapsed()` seconds are stamped
     /// onto undo nodes and handed to `vim.fn.localtime()`. Monotonic so elapsed
     /// labels survive wall-clock jumps; see [`Editor::set_now_mono`].
@@ -1757,6 +1769,9 @@ impl EditHost {
             buf_mirror_lines: HashMap::new(),
             extmark_gens: HashMap::new(),
             undo_mirror_versions: HashMap::new(),
+            qf_mirror_version: None,
+            reg_mirror_gen: None,
+            reg_mirror_specials: Vec::new(),
             start: std::time::Instant::now(),
             mouse_clock: None,
             hl_mirror_gen: None,

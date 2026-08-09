@@ -1192,6 +1192,15 @@ pub struct Editor {
     /// are interned to ids through [`Editor::named_list_id`] so [`QfWhich`] stays
     /// `Copy`. Not persisted. See [`quickfix`](crate::editor::quickfix).
     named_lists: std::collections::HashMap<NamedListId, NamedList>,
+    /// Bumped whenever a quickfix / location / named list stack is handed out
+    /// mutably, so the Rust→Lua list mirror can skip a tick on which nothing
+    /// changed. See [`Editor::qf_generation`].
+    qf_generation: u64,
+    /// Per-buffer cached per-line inputs for the *computed* fold sources, spliced
+    /// from the fold edit journal so a keystroke costs the rows it changed rather
+    /// than a pass over the whole buffer. See
+    /// [`Editor::sync_fold_inputs`](crate::editor::Editor).
+    fold_inputs: std::collections::HashMap<BufferId, fold::FoldInputs>,
     /// Name → id index for the named-list registry, plus the id allocator
     /// ([`Editor::next_named_id`]). Interning a new name allocates the next id and
     /// inserts an empty [`NamedList`] into [`Editor::named_lists`].
@@ -2022,6 +2031,8 @@ impl Editor {
             qf: QfStack::default(),
             qf_bufnr: None,
             named_lists: std::collections::HashMap::new(),
+            qf_generation: 0,
+            fold_inputs: std::collections::HashMap::new(),
             named_by_name: std::collections::HashMap::new(),
             next_named_id: 1,
             panel_buffers: Vec::new(),

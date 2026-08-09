@@ -80,11 +80,15 @@ pub(crate) struct ExternalFolds {
 /// The raw payload of [`ExternalFolds`], one variant per externally-computed
 /// source. Core turns it into `(start, end, level)` ranges itself (applying
 /// `'foldnestmax'`/`'foldminlines'`) so all the fold semantics stay in one place.
+///
+/// The generic `'foldexpr'` used to live here too, as one value string per line
+/// replaced wholesale on every edit. It now rides the per-line fold input cache
+/// instead, which splices the rows an edit touched and leaves only those needing
+/// re-evaluation — the difference between one Lua call per buffer line per keystroke
+/// and one per *changed* line. LSP folds stay here: `foldingRange` answers for the
+/// whole document at once, so there is no per-line input to splice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExternalFoldData {
-    /// One vim `'foldexpr'` value string per buffer line (`0`, `"1"`, `">1"`,
-    /// `"<1"`, `"="`, `"a1"`, `"s1"`, `"-1"`, …) — the server-evaluated result.
-    Expr(Vec<String>),
     /// LSP `foldingRange` line spans, each an inclusive 0-based `[start, end]`.
     Lsp(Vec<(usize, usize)>),
 }
@@ -102,6 +106,11 @@ pub(crate) struct FoldKey {
     source: FoldSource,
     /// The effective `'shiftwidth'` (the indent fold's level divisor).
     shiftwidth: usize,
+    /// The effective `'tabstop'` — the other half of an indent level, since it
+    /// decides what a leading tab is *worth* in display columns. Without it here,
+    /// `:set tabstop=` re-folded nothing on a tab-indented buffer: the structure
+    /// cache matched (no text had changed) and the recompute was skipped.
+    tabstop: usize,
     /// `'foldnestmax'` (the depth cap).
     foldnestmax: usize,
     /// `'foldminlines'` (the minimum span a fold must have to exist).
@@ -747,6 +756,7 @@ impl Editor {
             changedtick: self.buffer().changedtick,
             source,
             shiftwidth: bo.effective_shiftwidth(),
+            tabstop: bo.effective_tabstop(),
             foldnestmax: bo.foldnestmax,
             foldminlines: bo.foldminlines,
         }
@@ -786,25 +796,36 @@ impl Editor {
     /// pushes the values back via [`Editor::set_foldexpr_values`]; once a current
     /// result is stored this returns `None`, so the foldexpr isn't re-evaluated
     /// every frame (only after an edit or a foldexpr change).
-    pub fn pending_foldexpr(&self) -> Option<(BufferId, u64, String, usize)> {
+    pub fn pending_foldexpr(&self) -> Option<(BufferId, u64, String, usize, usize)> {
         if self.fold_source() != FoldSource::GenericExpr {
             return None;
         }
         let buf = self.current_buffer_id();
         let tick = self.buffer().changedtick;
-        let fresh = self
-            .external_folds
-            .get(&buf)
-            .is_some_and(|e| e.changedtick == tick && matches!(e.data, ExternalFoldData::Expr(_)));
-        if fresh {
-            return None;
+        let expr = self.foldexpr().to_string();
+        let line_count = self.buffer().line_count();
+        // The cache is spliced by `refresh_folds`, which runs on the input hook
+        // *before* the redraw this is driven from, so the unevaluated rows here are
+        // exactly the ones the last edit touched. An absent (or differently-derived)
+        // cache means the whole buffer needs evaluating.
+        let Some(FoldInputs {
+            tick: cached_tick,
+            params: FoldInputParams::Expr { expr: cached_expr },
+            lines: FoldLines::Expr(values),
+        }) = self.fold_inputs.get(&buf)
+        else {
+            return Some((buf, tick, expr, 0, line_count));
+        };
+        if *cached_tick != tick || *cached_expr != expr || values.len() != line_count {
+            return Some((buf, tick, expr, 0, line_count));
         }
-        Some((
-            buf,
-            tick,
-            self.foldexpr().to_string(),
-            self.buffer().line_count(),
-        ))
+        let first = values.iter().position(Option::is_none)?;
+        // The contiguous span covering every hole. An edit produces one run, so this
+        // is normally exactly the inserted rows; a batch that produced several runs
+        // re-evaluates the rows between them too, which is correct (if not minimal)
+        // and keeps the server's side a single range.
+        let last = values.iter().rposition(Option::is_none)?;
+        Some((buf, tick, expr, first, last - first + 1))
     }
 
     /// Whether buffer `buf` resolves its folds from LSP `foldingRange` —
@@ -973,14 +994,52 @@ impl Editor {
     /// run). Busts the structure cache so the push is honored even when the
     /// `changedtick` is unchanged (e.g. the first evaluation after an edit already
     /// cached an empty set while the server caught up).
-    pub fn set_foldexpr_values(&mut self, buf: BufferId, changedtick: u64, values: Vec<String>) {
-        self.external_folds.insert(
-            buf,
-            ExternalFolds {
-                changedtick,
-                data: ExternalFoldData::Expr(values),
-            },
-        );
+    /// `first` is the 0-based row `values[0]` belongs to — the range
+    /// [`pending_foldexpr`](Self::pending_foldexpr) asked for. A push whose
+    /// `changedtick` no longer matches the buffer (the text moved on while the
+    /// server was evaluating) is dropped: the next frame asks again against the
+    /// current text rather than splicing values derived from stale lines.
+    pub fn set_foldexpr_values(
+        &mut self,
+        buf: BufferId,
+        changedtick: u64,
+        first: usize,
+        values: Vec<String>,
+    ) {
+        let current = self
+            .buffer_of(buf)
+            .map(|b| (b.changedtick, b.line_count()))
+            .unwrap_or((0, 0));
+        if current.0 != changedtick {
+            return;
+        }
+        let params = FoldInputParams::Expr {
+            expr: self.effective_foldexpr(buf).to_string(),
+        };
+        // A push covering the whole buffer can seed the cache outright; a partial one
+        // only makes sense against a cache that is already the right shape.
+        let entry = self.fold_inputs.entry(buf).or_insert_with(|| FoldInputs {
+            tick: changedtick,
+            params: params.clone(),
+            lines: FoldLines::Expr(vec![None; current.1]),
+        });
+        if entry.params != params || entry.tick != changedtick {
+            if first != 0 || values.len() != current.1 {
+                return;
+            }
+            *entry = FoldInputs {
+                tick: changedtick,
+                params,
+                lines: FoldLines::Expr(vec![None; current.1]),
+            };
+        }
+        if let FoldLines::Expr(slots) = &mut entry.lines {
+            for (i, v) in values.into_iter().enumerate() {
+                if let Some(slot) = slots.get_mut(first + i) {
+                    *slot = Some(v);
+                }
+            }
+        }
         self.rebuild_pushed_folds(buf);
     }
 
@@ -1032,16 +1091,26 @@ impl Editor {
     /// per-line values (vim's `fold-expr` value grammar), applying `'foldnestmax'`
     /// and `'foldminlines'`. `None` when no fresh values have been pushed yet (or
     /// the pushed data is for the LSP source) — leave folds alone and retry.
-    fn compute_generic_expr_folds(&self) -> Option<Vec<(usize, usize, usize)>> {
-        let ExternalFoldData::Expr(values) = self.fresh_external_folds()? else {
-            return None;
+    fn compute_generic_expr_folds(&mut self) -> Option<Vec<(usize, usize, usize)>> {
+        let params = FoldInputParams::Expr {
+            expr: self.foldexpr().to_string(),
         };
         let bo = &self.buffer().options;
+        let (nestmax, foldminlines, line_count) =
+            (bo.foldnestmax, bo.foldminlines, self.buffer().line_count());
+        let Some(FoldLines::Expr(values)) = self.sync_fold_inputs(&params) else {
+            return None;
+        };
+        // Any row still unevaluated: leave the folds alone and retry once the server
+        // has filled it in (it reads the same cache through `pending_foldexpr`).
+        if values.iter().any(Option::is_none) {
+            return None;
+        }
         Some(ranges_from_foldexpr_values(
             values,
-            self.buffer().line_count(),
-            bo.foldnestmax,
-            bo.foldminlines,
+            line_count,
+            nestmax,
+            foldminlines,
         ))
     }
 
@@ -1049,9 +1118,7 @@ impl Editor {
     /// spans — containment depth → per-line levels (the same shape as tree-sitter),
     /// then nested ranges. `None` when no fresh ranges have been pushed yet.
     fn compute_lsp_folds(&self) -> Option<Vec<(usize, usize, usize)>> {
-        let ExternalFoldData::Lsp(spans) = self.fresh_external_folds()? else {
-            return None;
-        };
+        let ExternalFoldData::Lsp(spans) = self.fresh_external_folds()?;
         let bo = &self.buffer().options;
         Some(ranges_from_containment(
             spans,
@@ -1067,41 +1134,95 @@ impl Editor {
     /// non-blank lines around it — so trailing blanks fall out of a fold while
     /// blanks *between* same-level lines stay in (vim's `fold-indent` rule). The
     /// per-line level array is folded into nested ranges by [`ranges_from_levels`].
-    fn compute_indent_folds(&self) -> Vec<(usize, usize, usize)> {
-        let buf = self.buffer();
-        let n = buf.line_count();
-        let bo = &buf.options;
-        let sw = bo.effective_shiftwidth().max(1);
-        let tabstop = bo.effective_tabstop();
-        let nestmax = bo.foldnestmax;
-        let foldminlines = bo.foldminlines;
-
+    fn compute_indent_folds(&mut self) -> Vec<(usize, usize, usize)> {
+        let bo = &self.buffer().options;
+        let (sw, nestmax, foldminlines) = (
+            bo.effective_shiftwidth().max(1),
+            bo.foldnestmax,
+            bo.foldminlines,
+        );
+        let params = FoldInputParams::Indent {
+            tabstop: bo.effective_tabstop(),
+        };
+        let Some(FoldLines::Indent(cols)) = self.sync_fold_inputs(&params) else {
+            return Vec::new();
+        };
         // Per-line indent level; blank lines are marked and resolved afterward so a
         // blank line never starts or ends a fold on its own.
-        let mut levels = vec![0usize; n];
-        let mut blank = vec![false; n];
-        for (i, slot) in levels.iter_mut().enumerate() {
-            let line = buf.line_cow(i);
-            if line.trim().is_empty() {
-                blank[i] = true;
-                continue;
-            }
-            // Leading-whitespace display columns: a tab advances to the next tabstop.
-            let mut cols = 0usize;
-            for ch in line.chars() {
-                match ch {
-                    ' ' => cols += 1,
-                    '\t' => cols += tabstop - (cols % tabstop),
-                    _ => break,
-                }
-            }
-            *slot = (cols / sw).min(nestmax);
+        let mut levels = Vec::with_capacity(cols.len());
+        let mut blank = Vec::with_capacity(cols.len());
+        for c in cols {
+            levels.push(c.map_or(0, |c| (c / sw).min(nestmax)));
+            blank.push(c.is_none());
         }
         // Resolve blank lines to `min(prev_nonblank, next_nonblank)` — the level
         // that keeps an interior blank inside its block but drops a trailing blank
         // out of the fold above it.
         resolve_masked_levels(&mut levels, &blank);
         ranges_from_levels(&levels, foldminlines)
+    }
+
+    /// Bring the focused buffer's cached per-line fold inputs up to date under
+    /// `params` and hand them back.
+    ///
+    /// The cache is what stops a computed fold source from costing a pass over the
+    /// whole buffer on every keystroke: each source derives one value per line from
+    /// that line's **text alone**, so an edit invalidates exactly the rows it
+    /// touched. The fold edit journal names those rows and the rest are spliced
+    /// through untouched. What remains per keystroke is deriving levels from the
+    /// cached values, which is integer work with no rope reads and no allocation.
+    ///
+    /// Rebuilt from text rather than spliced when there is no cache yet, when the
+    /// derivation parameters changed (`:set tabstop=`, `:set foldmarker=`), when the
+    /// batch is a `resync` (undo/redo, reload — the rows are meaningless), when the
+    /// batch cannot be folded into one forward-moving span, or when the spliced
+    /// length does not match the buffer's. That last check is the safety net: any
+    /// mistake in the span arithmetic shows up as a length mismatch and falls back to
+    /// the correct-by-construction path instead of producing wrong folds.
+    fn sync_fold_inputs(&mut self, params: &FoldInputParams) -> Option<&FoldLines> {
+        let id = self.current_buffer_id();
+        // Drained unconditionally, so the journal cannot accumulate behind a rebuild.
+        let batch = self.take_fold_edits_of(id).unwrap_or_default();
+        let tick = self.buffer().changedtick;
+        let cached = self.fold_inputs.get(&id);
+        let mut lines = match cached {
+            Some(c) if c.params == *params && !batch.resync => {
+                if c.tick == tick && batch.edits.is_empty() {
+                    return self.fold_inputs.get(&id).map(|c| &c.lines);
+                }
+                Some(c.lines.clone())
+            }
+            _ => None,
+        };
+        if let Some(l) = lines.as_mut() {
+            let buf = self.buffer();
+            // The journal's points are *positions*, so the rows they touch are
+            // inclusive at both ends; the end-exclusive spans run one past. An edit
+            // ending at the very end of the buffer has its `old_end_point` on the
+            // rope's phantom trailing line, which is not cached, so the old span can
+            // run exactly one row past the cached length — clamping there is the
+            // conversion, not a fudge.
+            let spliced = crate::buffer::fold_edit_rows(&batch.edits).is_some_and(|(s, oe, ne)| {
+                if s > l.len() || oe > l.len() {
+                    return false;
+                }
+                l.splice(buf, params, s, (oe + 1).min(l.len()), ne + 1);
+                true
+            });
+            if !spliced || l.len() != buf.line_count() {
+                lines = None;
+            }
+        }
+        let lines = lines.unwrap_or_else(|| FoldLines::build(self.buffer(), params));
+        self.fold_inputs.insert(
+            id,
+            FoldInputs {
+                tick,
+                params: params.clone(),
+                lines,
+            },
+        );
+        self.fold_inputs.get(&id).map(|c| &c.lines)
     }
 
     /// Compute `'foldmethod=marker'` folds for the focused buffer: the literal
@@ -1111,23 +1232,31 @@ impl Editor {
     /// marker lowers it only *after* its line (so the end-marker line stays in the
     /// fold), and a number after a marker sets an absolute level — then the per-line
     /// levels fold into nested ranges via [`ranges_from_levels`].
-    fn compute_marker_folds(&self) -> Vec<(usize, usize, usize)> {
+    fn compute_marker_folds(&mut self) -> Vec<(usize, usize, usize)> {
         let (open, close) = self.effective_foldmarker();
-        let buf = self.buffer();
-        let n = buf.line_count();
-        let nestmax = buf.options.foldnestmax;
-        let foldminlines = buf.options.foldminlines;
-        let mut levels = vec![0usize; n];
+        let nestmax = self.buffer().options.foldnestmax;
+        let foldminlines = self.buffer().options.foldminlines;
+        let params = FoldInputParams::Marker { open, close };
+        let Some(FoldLines::Marker(per_line)) = self.sync_fold_inputs(&params) else {
+            return Vec::new();
+        };
         // `run` is vim's `lvl_next`: the fold level carried into the next line. It is
         // kept uncapped so deeply-nested markers still *pair* correctly; only the
         // recorded per-line level is clamped to `'foldnestmax'` (as vim does).
         let mut run = 0usize;
-        for (i, slot) in levels.iter_mut().enumerate() {
-            let line = buf.line_cow(i);
-            let (lvl, next) = marker_line_levels(&line, &open, &close, run);
-            *slot = lvl.min(nestmax);
-            run = next;
-        }
+        let levels: Vec<usize> = per_line
+            .iter()
+            .map(|toks| {
+                // A line with no markers is the identity transition, which is almost
+                // every line — the reason the cache stores `None` for it.
+                let Some(toks) = toks else {
+                    return run.min(nestmax);
+                };
+                let (lvl, next) = marker_levels_from(toks, run);
+                run = next;
+                lvl.min(nestmax)
+            })
+            .collect();
         ranges_from_levels(&levels, foldminlines)
     }
 
@@ -1197,53 +1326,6 @@ impl Editor {
 /// Vim's default `'foldmarker'` pair (`{{{` / `}}}`).
 fn default_foldmarker() -> (String, String) {
     ("{{{".to_string(), "}}}".to_string())
-}
-
-/// Apply vim's `foldlevelMarker` to one line: given `start_lvl` (the fold level
-/// carried in from the previous line), scan the line's fold markers left to right
-/// and return `(this_line_level, next_line_level)`. Mirrors vim/neovim's
-/// `fold.c::foldlevelMarker` — a plain start marker raises both levels by one, a
-/// plain end marker lowers only the *next* level (the marker line itself stays in
-/// the fold), and a numbered marker sets an absolute level: `{{{N` sets both to
-/// `N`, `}}}N` ends down to level `N` (the next line is `N-1`, the marker line is
-/// clamped to at most the incoming level so an end marker never *opens* a fold).
-/// Levels are returned uncapped; the caller clamps the recorded level to
-/// `'foldnestmax'`.
-fn marker_line_levels(line: &str, open: &str, close: &str, start_lvl: usize) -> (usize, usize) {
-    // Collect every marker occurrence (non-overlapping per pattern) and process them
-    // in document order, so nesting and absolute-level resets apply left to right.
-    let mut markers: Vec<(usize, bool)> = line
-        .match_indices(open)
-        .map(|(p, _)| (p, true))
-        .chain(line.match_indices(close).map(|(p, _)| (p, false)))
-        .collect();
-    markers.sort_by_key(|&(p, _)| p);
-    let mut lvl = start_lvl;
-    let mut next = start_lvl;
-    for (pos, is_open) in markers {
-        let after = pos + if is_open { open.len() } else { close.len() };
-        let num = leading_number(&line[after..]);
-        match (is_open, num) {
-            // `{{{N` — absolute open to level N.
-            (true, Some(n)) if n > 0 => {
-                lvl = n;
-                next = n;
-            }
-            // `{{{` — nest one deeper.
-            (true, _) => {
-                lvl += 1;
-                next += 1;
-            }
-            // `}}}N` — close down to level N (next line N-1); never opens a fold.
-            (false, Some(n)) if n > 0 => {
-                lvl = n.min(start_lvl);
-                next = n.saturating_sub(1);
-            }
-            // `}}}` — close one level (the marker line stays in the fold).
-            (false, _) => next = next.saturating_sub(1),
-        }
-    }
-    (lvl, next)
 }
 
 /// Resolve every `mask`ed line's fold level to `min(prev_unmasked,
@@ -1378,7 +1460,7 @@ fn parse_foldexpr_value(raw: &str) -> FoldExprValue {
 /// level is capped at `'foldnestmax'`, and [`ranges_from_levels`] recovers the
 /// tree honoring `'foldminlines'`.
 fn ranges_from_foldexpr_values(
-    values: &[String],
+    values: &[Option<String>],
     line_count: usize,
     foldnestmax: usize,
     foldminlines: usize,
@@ -1390,7 +1472,7 @@ fn ranges_from_foldexpr_values(
     // are relative to, and where a `<N` end drops back to).
     let mut run = 0usize;
     for i in 0..n {
-        let raw = values.get(i).map(String::as_str).unwrap_or("0");
+        let raw = values.get(i).and_then(Option::as_deref).unwrap_or("0");
         let value = parse_foldexpr_value(raw);
         let lvl = match value {
             FoldExprValue::Level(k) => k,
@@ -1459,4 +1541,184 @@ fn ranges_from_levels(levels: &[usize], foldminlines: usize) -> Vec<(usize, usiz
     out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     out.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     out
+}
+
+/// The parameters a set of cached per-line fold inputs was derived under. A
+/// mismatch means the cache describes a different derivation and must be rebuilt —
+/// this is what makes `:set tabstop=` / `:set foldmarker=` take effect on text that
+/// did not change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FoldInputParams {
+    /// `'tabstop'` only: `'shiftwidth'` divides the cached columns at derive time,
+    /// so changing it does not invalidate the scan.
+    Indent {
+        tabstop: usize,
+    },
+    Marker {
+        open: String,
+        close: String,
+    },
+    /// The generic Lua `'foldexpr'` itself: a different expression is a different
+    /// derivation, so changing it discards the values rather than reusing them.
+    Expr {
+        expr: String,
+    },
+}
+
+/// One marker occurrence: whether it opens (`{{{`) or closes (`}}}`), and the
+/// absolute level a trailing number gave it.
+pub(crate) type MarkerTok = (bool, Option<usize>);
+
+/// The cached per-line inputs themselves, one entry per editable line.
+#[derive(Debug, Clone)]
+pub(crate) enum FoldLines {
+    /// Leading-whitespace **display columns**, or `None` for a blank line (which
+    /// takes its level from its neighbours rather than owning one).
+    Indent(Vec<Option<usize>>),
+    /// The marker tokens each line carries, in document order — `None` for a line
+    /// with none, which is almost every line and is the identity transition.
+    Marker(Vec<Option<Box<[MarkerTok]>>>),
+    /// The generic `'foldexpr'` value for each line, or `None` for a line whose
+    /// value has not been evaluated yet. Unlike the other two this cannot be derived
+    /// from text here — nxvim-core cannot run Lua — so a fresh or spliced row is
+    /// left `None` and the server fills it in
+    /// ([`Editor::pending_foldexpr`] / [`Editor::set_foldexpr_values`]).
+    Expr(Vec<Option<String>>),
+}
+
+impl FoldLines {
+    fn len(&self) -> usize {
+        match self {
+            FoldLines::Indent(v) => v.len(),
+            FoldLines::Marker(v) => v.len(),
+            FoldLines::Expr(v) => v.len(),
+        }
+    }
+
+    /// Replace rows `[start, old_end)` with the same rows re-derived from `buf`'s
+    /// current text over `[start, new_end)`.
+    fn splice(
+        &mut self,
+        buf: &Buffer,
+        params: &FoldInputParams,
+        start: usize,
+        old_end: usize,
+        new_end: usize,
+    ) {
+        match (self, params) {
+            (FoldLines::Indent(v), FoldInputParams::Indent { tabstop }) => {
+                let fresh = (start..new_end).map(|i| indent_cols_of(&buf.line_cow(i), *tabstop));
+                v.splice(start..old_end, fresh.collect::<Vec<_>>());
+            }
+            (FoldLines::Marker(v), FoldInputParams::Marker { open, close }) => {
+                let fresh = (start..new_end).map(|i| marker_toks_of(&buf.line_cow(i), open, close));
+                v.splice(start..old_end, fresh.collect::<Vec<_>>());
+            }
+            (FoldLines::Expr(v), FoldInputParams::Expr { .. }) => {
+                // No text derivation: the replaced rows simply need re-evaluating.
+                v.splice(start..old_end, (start..new_end).map(|_| None));
+            }
+            // Kind and params disagree — the caller rebuilds rather than splicing.
+            _ => {}
+        }
+    }
+
+    /// Derive the whole set from `buf`'s text, in one sequential pass.
+    fn build(buf: &Buffer, params: &FoldInputParams) -> Self {
+        match params {
+            FoldInputParams::Indent { tabstop } => FoldLines::Indent(
+                buf.iter_lines()
+                    .map(|l| indent_cols_of(&l, *tabstop))
+                    .collect(),
+            ),
+            FoldInputParams::Marker { open, close } => FoldLines::Marker(
+                buf.iter_lines()
+                    .map(|l| marker_toks_of(&l, open, close))
+                    .collect(),
+            ),
+            FoldInputParams::Expr { .. } => FoldLines::Expr(vec![None; buf.line_count()]),
+        }
+    }
+}
+
+/// A buffer's cached per-line fold inputs, with what they describe.
+#[derive(Debug, Clone)]
+pub(crate) struct FoldInputs {
+    /// The `changedtick` the inputs describe.
+    tick: u64,
+    params: FoldInputParams,
+    lines: FoldLines,
+}
+
+/// The display columns of `line`'s leading whitespace, or `None` when the line is
+/// blank. A tab advances to the next `tabstop`. Pure function of the line's text —
+/// which is exactly why the result can be cached per line and spliced.
+fn indent_cols_of(line: &str, tabstop: usize) -> Option<usize> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    let mut cols = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => cols += 1,
+            '\t' => cols += tabstop - (cols % tabstop),
+            _ => break,
+        }
+    }
+    Some(cols)
+}
+
+/// The fold markers `line` carries, in document order, or `None` when it carries
+/// none. Also a pure function of the line's text.
+fn marker_toks_of(line: &str, open: &str, close: &str) -> Option<Box<[MarkerTok]>> {
+    let mut markers: Vec<(usize, bool)> = line
+        .match_indices(open)
+        .map(|(p, _)| (p, true))
+        .chain(line.match_indices(close).map(|(p, _)| (p, false)))
+        .collect();
+    if markers.is_empty() {
+        return None;
+    }
+    markers.sort_by_key(|&(p, _)| p);
+    Some(
+        markers
+            .into_iter()
+            .map(|(pos, is_open)| {
+                let after = pos + if is_open { open.len() } else { close.len() };
+                (is_open, leading_number(&line[after..]))
+            })
+            .collect(),
+    )
+}
+
+/// Apply one line's marker tokens to the running fold level, returning
+/// `(this line's level, the level carried into the next)` — vim's `foldlevelMarker`.
+/// A start marker raises the level at its own line, an end marker lowers it only
+/// *after* its line (so the marker line stays in the fold), and a number after
+/// either sets an absolute level.
+fn marker_levels_from(toks: &[MarkerTok], start_lvl: usize) -> (usize, usize) {
+    let mut lvl = start_lvl;
+    let mut next = start_lvl;
+    for &(is_open, num) in toks {
+        match (is_open, num) {
+            // `{{{N` — absolute open to level N.
+            (true, Some(n)) if n > 0 => {
+                lvl = n;
+                next = n;
+            }
+            // `{{{` — nest one deeper.
+            (true, _) => {
+                lvl += 1;
+                next += 1;
+            }
+            // `}}}N` — close down to level N (next line N-1); never opens a fold.
+            (false, Some(n)) if n > 0 => {
+                lvl = n.min(start_lvl);
+                next = n.saturating_sub(1);
+            }
+            // `}}}` — close one level (the marker line stays in the fold).
+            (false, _) => next = next.saturating_sub(1),
+        }
+    }
+    (lvl, next)
 }

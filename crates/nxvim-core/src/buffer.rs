@@ -185,6 +185,20 @@ pub struct Buffer {
     /// `resync` for the mirror journal (whole-rope replacement → the mirror must be
     /// pushed in full, since deltas against the old rope are meaningless).
     mirror_resync: bool,
+    /// A **sixth** independent edit journal, drained by
+    /// [`Buffer::take_fold_edits`], feeding the *computed* fold sources
+    /// (`foldmethod=indent`/`marker`, and a generic Lua `'foldexpr'`). Each of those
+    /// derives one value per line from that line's text alone, so an edit
+    /// invalidates only the rows it touched; the editor splices its cached per-line
+    /// inputs from this journal instead of re-reading (or re-evaluating) the whole
+    /// buffer on every keystroke. Separate for the usual reason — the other five
+    /// consumers drain at their own moments, and one destructive journal would let
+    /// whichever drains first starve the rest. See
+    /// `docs/plans/2026-08-08-per-keystroke-costs-round-2.md`.
+    fold_edits: Vec<BufferEdit>,
+    /// `resync` for the fold journal (whole-rope replacement → the cached per-line
+    /// fold inputs are meaningless and must be rebuilt).
+    fold_resync: bool,
     /// Buffer-anchored extmarks (highlight-layering marks set via
     /// `nvim_buf_set_extmark`), partitioned by namespace. Their byte anchors are
     /// shifted on every edit through [`Buffer::record`] and dropped wholesale on
@@ -283,6 +297,8 @@ impl Buffer {
             jump_edits: Vec::new(),
             mirror_edits: Vec::new(),
             mirror_resync: false,
+            fold_edits: Vec::new(),
+            fold_resync: false,
             changelist: Vec::new(),
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
@@ -537,6 +553,28 @@ impl Buffer {
         (0..self.line_count()).map(|i| self.line(i)).collect()
     }
 
+    /// The editable lines in order, each borrowed like [`line_cow`](Self::line_cow).
+    ///
+    /// Prefer this to `(0..line_count()).map(|i| line_cow(i))` for any pass that
+    /// reads the whole buffer: indexed access resolves a line number to a byte
+    /// offset through the rope's index every time, so the indexed form is
+    /// O(lines · log lines) where walking the leaves in order is O(lines). On a
+    /// per-keystroke pass (the computed fold sources) that difference was the
+    /// difference between 24x a fold-free buffer and parity — see
+    /// `docs/plans/2026-08-08-per-keystroke-costs-round-2.md`.
+    ///
+    /// The trailing phantom line the rope always carries is excluded, matching
+    /// [`line_count`](Self::line_count) and every other line accessor.
+    pub fn iter_lines(&self) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+        self.text
+            .lines(LINE_TYPE)
+            .take(self.line_count())
+            .map(|sl| match sl.as_str() {
+                Some(s) => Cow::Borrowed(strip_eol(s)),
+                None => Cow::Owned(strip_eol(&sl.to_string()).to_owned()),
+            })
+    }
+
     // ----- tracked mutations ------------------------------------------------
 
     /// Insert `s` at byte offset `byte`, journaling the edit and bumping
@@ -588,14 +626,15 @@ impl Buffer {
     }
 
     /// Mark that the whole rope was replaced (undo/redo, file reload), so any
-    /// pending deltas are moot and the consumer must re-sync from full text. All
-    /// four delta journals (syntax, LSP, Lua-treesitter, and the Lua buffer mirror)
-    /// are reset, so none send stale deltas.
+    /// pending deltas are moot and the consumer must re-sync from full text. Every
+    /// delta journal (syntax, LSP, Lua-treesitter, the Lua buffer mirror, and the
+    /// computed folds) is reset, so none send stale deltas.
     pub fn mark_resync(&mut self) {
         self.edits.clear();
         self.lsp_edits.clear();
         self.lua_ts_edits.clear();
         self.mirror_edits.clear();
+        self.fold_edits.clear();
         // The jumplist journal is moot too: positions against the old rope can't be
         // shifted into the new one. The editor clears jumplist entries for a
         // resync'd buffer on its own (mirroring marks), so just drop the deltas.
@@ -604,6 +643,7 @@ impl Buffer {
         self.lsp_resync = true;
         self.lua_ts_resync = true;
         self.mirror_resync = true;
+        self.fold_resync = true;
         // Byte anchors are meaningless against the wholesale-new rope, and an
         // extmark has no source of truth to rebuild from (unlike the treesitter
         // / LSP journals, which re-derive from the full text), so drop them all —
@@ -666,6 +706,17 @@ impl Buffer {
         }
     }
 
+    /// Drain the **fold** edit journal — the row-span stream the editor splices its
+    /// cached per-line fold inputs from (parallel to the others). A `resync` batch
+    /// means the whole rope was replaced, so the inputs must be rebuilt rather than
+    /// spliced.
+    pub fn take_fold_edits(&mut self) -> EditBatch {
+        EditBatch {
+            edits: std::mem::take(&mut self.fold_edits),
+            resync: std::mem::replace(&mut self.fold_resync, false),
+        }
+    }
+
     /// Drain the **jumplist** edit journal — the line-adjustment stream the editor
     /// applies to per-window `<C-o>` targets (parallel to the others). `resync` is
     /// irrelevant here (a resync'd buffer's entries are cleared outright), so this
@@ -705,6 +756,7 @@ impl Buffer {
         self.lsp_edits.push(edit.clone());
         self.jump_edits.push(edit.clone());
         self.mirror_edits.push(edit.clone());
+        self.fold_edits.push(edit.clone());
         self.lua_ts_edits.push(edit);
         self.changedtick += 1;
         self.modified = true;
@@ -1166,4 +1218,46 @@ pub fn dir_listing(entries: Vec<crate::host::DirEntry>) -> String {
         text.push('\n');
     }
     text
+}
+
+/// Fold an edit batch into one replaced **row** span `(start, old_end_row,
+/// new_end_row)`. `start` and `old_end_row` are rows in the buffer as it stood
+/// *before* the batch; `new_end_row` is a row in the buffer as it stands now. All
+/// three are edit *positions*, so the rows they touch are inclusive at both ends —
+/// the caller converts to whatever end-exclusive span it needs.
+///
+/// Each edit's points are expressed in the buffer as it stood before *that* edit, so
+/// folding them requires mapping each one back through the row shift of every
+/// preceding edit. That mapping is only sound while the batch moves strictly forward
+/// without overlapping — which is the shape of every common batch (a multi-key
+/// insert, a `:s` walking down the buffer, the trailing-newline `normalize`). For
+/// anything else (out-of-order or overlapping edits) this returns `None` and the
+/// caller falls back to rebuilding whole rather than guessing at a span.
+///
+/// Shared by the Rust→Lua buffer mirror (which splices its line array from it) and
+/// the computed fold sources (which splice their per-line inputs) — one
+/// implementation, because a divergence between them would be a silent
+/// wrong-rows bug in whichever copy drifted.
+pub fn fold_edit_rows(edits: &[BufferEdit]) -> Option<(usize, usize, usize)> {
+    let first = edits.first()?;
+    let start = first.start_point.0;
+    let mut old_end = first.old_end_point.0;
+    let mut new_end = first.new_end_point.0;
+    // Rows added (negative: removed) by the edits folded so far — what maps a later
+    // edit's coordinates back onto the pre-batch buffer. The fold keeps the invariant
+    // `new_end - shift == old_end`.
+    let mut shift = new_end as isize - old_end as isize;
+    for e in &edits[1..] {
+        // Strictly forward and non-overlapping: the edit must begin at or after the
+        // span folded so far, in the *current* buffer's coordinates.
+        if e.start_point.0 < new_end {
+            return None;
+        }
+        // Non-negative by that guard (`old_end_point >= start_point >= new_end`, and
+        // `new_end - shift == old_end >= 0`), but resolved fallibly rather than cast.
+        old_end = usize::try_from(e.old_end_point.0 as isize - shift).ok()?;
+        new_end = e.new_end_point.0;
+        shift = new_end as isize - old_end as isize;
+    }
+    Some((start, old_end, new_end))
 }

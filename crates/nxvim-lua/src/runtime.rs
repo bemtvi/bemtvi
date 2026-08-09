@@ -1859,6 +1859,22 @@ impl LuaRuntime {
         take_highlights -> Vec<HlSet> = highlights
     }
 
+    /// The **global-namespace** group names queued by `nvim_set_hl` and not yet
+    /// drained, without consuming the queue. The server reads this right after
+    /// sourcing a colorscheme to learn which groups that scheme owns, so loading
+    /// the next one can drop exactly those (and nothing a plugin defined) instead
+    /// of letting the two palettes stack. Non-zero namespaces are excluded: they
+    /// never reach the table the renderer resolves against.
+    pub fn peek_global_highlight_names(&self) -> Vec<String> {
+        self.shared
+            .borrow()
+            .highlights
+            .iter()
+            .filter(|hl| hl.ns == 0)
+            .map(|hl| hl.name.clone())
+            .collect()
+    }
+
     take_queue! {
         /// Take the dock requests queued by `nx.dock.*` since the last drain, for the
         /// server to apply to the core (which owns the dock state).

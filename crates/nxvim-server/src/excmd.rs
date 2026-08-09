@@ -711,10 +711,27 @@ impl EditHost {
                 }
             },
         };
+        // Drop the groups the *previous* scheme owned before sourcing this one, so
+        // the two palettes replace rather than stack. Without this every group the
+        // incoming scheme leaves undefined keeps the outgoing scheme's value — most
+        // visibly when a truecolor attach defaults in the bundled `nxvim` (One Dark)
+        // and the user's config picks its own theme a moment later: the theme paints
+        // what it models and One Dark shows through everywhere else, so the result is
+        // a blend of two palettes that shifts with startup timing. Only the scheme's
+        // own groups go; a plugin's stay (and a plugin restyling on `ColorScheme`
+        // re-registers below anyway). Blank definitions are how the registry removes.
+        for group in std::mem::take(&mut self.scheme_groups) {
+            self.editor
+                .highlights
+                .set_ns(0, &group, nxvim_core::highlight::HlDef::default());
+        }
         if let Err(e) = self.lua.exec(&src) {
             self.editor
                 .echo(format!("E5108: Error loading colorscheme {name}: {e}"));
         }
+        // Read the queued definitions before `apply_lua_effects` drains them: these
+        // are the groups this scheme owns, and the next load drops exactly them.
+        self.scheme_groups = self.lua.peek_global_highlight_names().into_iter().collect();
         self.apply_lua_effects();
         let _ = self.lua.set_global_var("colors_name", name);
         let r = self.lua.fire_autocmd("ColorScheme", name);

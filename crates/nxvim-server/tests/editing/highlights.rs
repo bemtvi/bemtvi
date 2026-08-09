@@ -852,3 +852,57 @@ async fn colorscheme_compiles_to_bytecode_then_reuses_the_cache() {
         "second load should reuse the cached bytecode, not recompile"
     );
 }
+
+#[tokio::test]
+async fn a_new_colorscheme_drops_the_previous_scheme_groups() {
+    // Loading a colorscheme must leave the *selected* scheme's palette on screen,
+    // not a blend with whatever was loaded before. Without this, the schemes stack:
+    // the bundled `nxvim` One Dark that a truecolor attach defaults in survives
+    // *underneath* the scheme the user's config picks, and every group the new
+    // scheme leaves undefined keeps One Dark's warmer value — muted browns bleeding
+    // through the theme that was actually chosen. (The reported symptom: catppuccin
+    // "looks browner" whenever the attach wins the race against the config's
+    // `:colorscheme`, which startup timing — inside tmux vs not — decides.)
+    let dir = temp_dir("colorscheme_replaces");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    // A deliberately partial scheme: it styles `Normal` and says nothing about
+    // `Comment`, exactly as a real theme says nothing about the groups it doesn't
+    // model.
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "Comment").await, "fg"),
+        Some(hex("5c6370")),
+        "precondition: the built-in scheme defines Comment"
+    );
+    // A group a *plugin* owns, defined outside any colorscheme.
+    exec_lua(
+        &rpc,
+        "nx.hl.define(0, 'MyPluginGroup', { fg = '#ff00ff' }) return 1",
+    )
+    .await;
+
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme cat<CR>").await;
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "Normal").await, "bg"),
+        Some(hex("1e1e2e")),
+        "the new scheme's own groups are in force"
+    );
+    assert!(
+        get_hl(&rpc, "Comment").await.is_empty(),
+        "a group the previous scheme defined and the new one doesn't must be dropped, \
+         not left showing the old palette"
+    );
+    // Only the *previous scheme's* groups go: a plugin's own group is not collateral.
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "MyPluginGroup").await, "fg"),
+        Some(hex("ff00ff")),
+        "a plugin-defined group survives a colorscheme switch"
+    );
+}

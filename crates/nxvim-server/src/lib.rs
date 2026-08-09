@@ -1327,6 +1327,15 @@ pub struct EditHost {
     /// changes — a colorscheme load, a `:hi`/`nvim_set_hl` — so the common chunk
     /// pays nothing for `nvim_get_hl` support. `None` until the first push.
     hl_mirror_gen: Option<u64>,
+    /// The global-namespace highlight groups the **currently loaded colorscheme**
+    /// defined ([`EditHost::set_colorscheme`]). Loading the next scheme drops
+    /// exactly these before sourcing it, so the two palettes replace rather than
+    /// stack: a group the old scheme styled and the new one says nothing about
+    /// goes back to unstyled instead of showing the old theme's colour through the
+    /// new one. Scheme-owned only — a group a plugin defined is never collateral,
+    /// and a plugin restyling on `ColorScheme` re-registers after the load anyway.
+    /// Empty until a scheme loads.
+    scheme_groups: std::collections::HashSet<String>,
     /// The `nx._cb_fns` id of the `vim.ui.input` callback awaiting the open
     /// command-line prompt's result, or `None` when no scripted prompt is open
     /// (Phase 8). Set when a prompt opens; taken when the user submits/cancels.
@@ -1775,6 +1784,7 @@ impl EditHost {
             start: std::time::Instant::now(),
             mouse_clock: None,
             hl_mirror_gen: None,
+            scheme_groups: std::collections::HashSet::new(),
             pending_ui_input: None,
             pending_ui_select: None,
             #[cfg(feature = "native")]

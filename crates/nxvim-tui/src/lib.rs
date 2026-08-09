@@ -30,6 +30,7 @@ mod termquery;
 pub use keys::encode_key;
 pub use render::{cursor_style, paint, paint_with_cursor, ScrollHarness};
 pub use signals::{exit_as_signal_if_killed, install as install_signal_restore, ShutdownSignal};
+pub use termquery::{has_status_report, parse_term_caps, term_names_a_multiplexer, TermCaps};
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
@@ -201,22 +202,33 @@ impl<W: Write> Drop for KeyboardEnhancement<W> {
     }
 }
 
-/// Whether to enable the kitty keyboard protocol at startup. By default this
-/// **detects** terminal support with [`crossterm::terminal::supports_keyboard_enhancement`]
-/// — so it must be called with raw mode already on but *before* the input
-/// [`EventStream`] exists (both true where [`run`] calls it), since the probe reads
-/// the terminal's reply off the same tty the stream would drain.
+/// Whether to enable the kitty keyboard protocol at startup. By default this reads
+/// the answer out of the one capability round [`termquery::probe`] ran — the
+/// terminal replied to the progressive-enhancement flags query, so it speaks the
+/// protocol.
+///
+/// Detection deliberately does *not* go through
+/// [`crossterm::terminal::supports_keyboard_enhancement`]: that asks its own
+/// question on its own timeout, through crossterm's internal reader, which both
+/// adds a serial probe in front of the first frame and competes with our `poll(2)`
+/// for the same bytes. On non-unix, where [`termquery::probe`] asks nothing, it is
+/// still the only probe available.
 ///
 /// `NXVIM_KITTY_KEYBOARD` overrides detection in either direction: a falsey value
 /// (`0`/`false`/`off`/`no`, case-insensitive, or empty) forces it **off** for a
 /// terminal that mishandles the flags; any other value forces it **on**, the escape
 /// hatch for a supporting terminal whose probe reply raced and read as unsupported.
-fn kitty_keyboard_enabled() -> bool {
+fn kitty_keyboard_enabled(caps: &TermCaps) -> bool {
+    #[cfg(not(unix))]
+    let _ = caps;
     match std::env::var("NXVIM_KITTY_KEYBOARD").ok().as_deref() {
         Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"
         ),
+        #[cfg(unix)]
+        None => caps.kitty_keyboard,
+        #[cfg(not(unix))]
         None => crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false),
     }
 }
@@ -262,59 +274,39 @@ fn truecolor_enabled() -> bool {
 /// on a terminal that ignores the escape *look* like it copied while the text went
 /// nowhere; a copy that silently vanishes is worse than a loud "no clipboard
 /// provider". So we ask, the way neovim does: DA1 (`ESC[c`), whose reply lists
-/// capability `52` on terminals that implement the clipboard extension, then
+/// capability `52` on terminals that implement the clipboard extension, with
 /// XTGETTCAP for the `Ms` capability as a fallback for terminals that answer that
-/// instead. Detection must run with raw mode on but before the input
-/// `EventStream` exists, so both probes read their own reply.
+/// instead. Both questions ride the one capability round [`termquery::probe`] runs,
+/// so neither costs a wait of its own.
+///
+/// **Behind a multiplexer, an unanswered question is not a "no".** tmux and screen
+/// answer our queries *themselves*: tmux's device attributes never list `52` (they
+/// describe tmux, not the emulator on the far end) and it ignores XTGETTCAP
+/// entirely, so the probe learns nothing about the terminal the user is actually
+/// looking at — and there is no way to ask it, since a passthrough-wrapped query
+/// needs `allow-passthrough`, which is off by default and can't be turned on from
+/// the far side of an ssh hop. Taking that silence as "no" is what made `"+y`
+/// unavailable in every tmux session, which is the *worst* answer available:
+/// the multiplexer is exactly the case OSC 52 exists for (a remote host with no
+/// clipboard of its own), and both tmux (`set-clipboard`, default `external`) and
+/// screen forward the escape outward by default. So a multiplexer counts as
+/// support: a very likely yank beats a certain failure. A user who turned
+/// forwarding off wants `NXVIM_OSC52=0`.
 ///
 /// `NXVIM_OSC52` overrides detection in either direction, matching
 /// [`truecolor_enabled`]: a falsey value (`0`/`false`/`off`/`no`, or empty) forces
-/// it **off**; any other value forces it **on** — the escape hatch for a terminal
-/// that supports the write but advertises nothing (a multiplexer that passes it
-/// through, a terminal with no XTGETTCAP), and the only way to enable it where
-/// there is no tty to probe.
-fn osc52_enabled() -> bool {
+/// it **off** — for a `set-clipboard off` multiplexer, or a terminal that ignores
+/// the escape; any other value forces it **on**, for a terminal that supports the
+/// write but advertises nothing, and the only way to enable it where there is no
+/// tty to probe.
+fn osc52_enabled(caps: &TermCaps) -> bool {
     match std::env::var("NXVIM_OSC52").ok().as_deref() {
         Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"
         ),
-        None => terminal_advertises_osc52(),
+        None => caps.osc52 || caps.multiplexer,
     }
-}
-
-/// Ask the terminal whether it implements OSC 52 (see [`osc52_enabled`]).
-#[cfg(unix)]
-fn terminal_advertises_osc52() -> bool {
-    use std::time::Duration;
-
-    // Primary Device Attributes. Every terminal answers this one, so a silent
-    // reply means "no capability information at all" — don't probe further.
-    let Some(reply) = termquery::ask(b"\x1b[c", Duration::from_millis(1000)) else {
-        return false;
-    };
-    if da1_advertises_osc52(&reply) {
-        return true;
-    }
-    // Terminal.app echoes sequences it doesn't understand straight back, which
-    // would land in the input stream as garbage — never XTGETTCAP it (neovim
-    // carves out the same exception).
-    if std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal") {
-        return false;
-    }
-    // XTGETTCAP for `Ms` — the terminfo capability naming the sequence that sets
-    // the clipboard. `4D73` is "Ms" hex-encoded, as the query requires.
-    let Some(reply) = termquery::ask(b"\x1bP+q4D73\x1b\\", Duration::from_millis(500)) else {
-        return false;
-    };
-    xtgettcap_advertises_osc52(&reply)
-}
-
-/// Non-unix: no `poll(2)` to probe with, so leave OSC 52 to the explicit
-/// `NXVIM_OSC52` opt-in rather than emit an escape the terminal may not know.
-#[cfg(not(unix))]
-fn terminal_advertises_osc52() -> bool {
-    false
 }
 
 /// Whether a Primary Device Attributes reply lists capability **52** — "can set
@@ -325,26 +317,24 @@ fn terminal_advertises_osc52() -> bool {
 /// start. Public for the client-side test (`tests/osc52.rs`) — parsing a reply
 /// needs no terminal.
 pub fn da1_advertises_osc52(reply: &[u8]) -> bool {
-    let mut rest = reply;
-    while let Some(at) = find(rest, b"\x1b[?") {
-        let params = &rest[at + 3..];
-        // The parameters run up to the sequence's final byte. Stopping at the first
-        // byte that can't be one keeps this from reading the digits of some *other*
-        // `CSI ?` report (a mode report, say) as device attributes — those carry
-        // numbers too, and a stray `52` in one must not read as clipboard support.
-        let end = params
-            .iter()
-            .position(|&b| !b.is_ascii_digit() && b != b';')
-            .unwrap_or(params.len());
-        if params.get(end) == Some(&b'c') && params[..end].split(|&b| b == b';').any(|p| p == b"52")
-        {
-            return true;
-        }
-        // Not a DA1 reply (or truncated: no final byte at all) — keep looking. The
-        // slice always shrinks, since it starts past the introducer just examined.
-        rest = &params[end..];
-    }
-    false
+    da1_lists(reply, b"52")
+}
+
+/// Whether a Primary Device Attributes reply lists capability **4** — sixel
+/// graphics. Read from the same reply as [`da1_advertises_osc52`] (one DA1 answers
+/// both questions), and public for the client-side test for the same reason.
+pub fn da1_advertises_sixel(reply: &[u8]) -> bool {
+    da1_lists(reply, b"4")
+}
+
+/// Whether the device attributes report in `reply` lists `param`.
+///
+/// Matching is per-parameter, never substring: a stray `52` inside `152`/`520`
+/// would otherwise read as clipboard support, and a truncated report (no final
+/// `c`) would read as a complete one. [`termquery::csi_question_params`] enforces
+/// both by only returning the parameters of a *terminated* `CSI ? … c`.
+fn da1_lists(reply: &[u8], param: &[u8]) -> bool {
+    termquery::csi_question_params(reply, b'c').is_some_and(|params| params.contains(&param))
 }
 
 /// Whether an XTGETTCAP reply says the `Ms` capability *is* an OSC 52 sequence.
@@ -355,7 +345,7 @@ pub fn da1_advertises_osc52(reply: &[u8]) -> bool {
 /// mechanism must not be sent one (nxvim, like neovim, emits OSC 52 and nothing
 /// else). Public for the client-side test, as with [`da1_advertises_osc52`].
 pub fn xtgettcap_advertises_osc52(reply: &[u8]) -> bool {
-    let Some(at) = find(reply, b"\x1bP1+r") else {
+    let Some(at) = termquery::find(reply, b"\x1bP1+r") else {
         return false;
     };
     let body = &reply[at + 5..];
@@ -382,11 +372,6 @@ fn unhex(hex: &[u8]) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The index of the first occurrence of `needle` in `haystack`.
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 /// Builds a replacement backend for a `nx.session.reconnect` swap (§B). The swap loop
 /// hands it the raw `nx_session_reconnect` params and gets back the client-side transport
 /// of a fresh session (same stream type). The binary provides it — it owns session +
@@ -394,6 +379,25 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// forwarding the params verbatim. Runs on the blocking pool (the handshake can take
 /// seconds), so the current session keeps rendering while it builds.
 pub type SessionBuilder<S> = std::sync::Arc<dyn Fn(Vec<Value>) -> Result<S> + Send + Sync>;
+
+/// What this client tells the server about the terminal behind it, plus the raw
+/// probe answers the parts of the client that render need.
+///
+/// Detected once in [`run`] and carried across every `nx.session.reconnect` swap:
+/// the terminal doesn't change when the backend does, and re-probing mid-session
+/// would read the user's keystrokes instead of a reply.
+#[derive(Clone, Copy, Debug)]
+struct AttachCaps {
+    /// The kitty keyboard protocol is *on* — the flags were pushed, so the server
+    /// can parse a distinct `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>`.
+    keyboard_protocol: bool,
+    /// 24-bit color (see [`truecolor_enabled`]).
+    truecolor: bool,
+    /// OSC 52 clipboard writes (see [`osc52_enabled`]).
+    osc52: bool,
+    /// The terminal's own answers, for the renderer (image protocol, cell size).
+    term: TermCaps,
+}
 
 /// What [`event_loop`] reports back to the swap loop in [`run`].
 enum Outcome<S> {
@@ -435,6 +439,15 @@ where
     // cells the first frame leaves blank are never painted, so stale content shows
     // through as "render leftover". The explicit clear makes the baseline real.
     let _ = terminal.clear();
+    // Ask the terminal everything we need to know about it — ONCE, in a single round
+    // trip (see [`termquery`]). Every capability below is read out of this one answer:
+    // asking them one at a time put each unanswered question's timeout in front of the
+    // first frame, which is what made a multiplexer or a two-hop ssh feel like a hang.
+    // It must run here — raw mode is on (`ratatui::init`) but the `EventStream` that
+    // would race for the replies isn't up until `event_loop`.
+    let __t = std::time::Instant::now();
+    let caps = termquery::probe();
+    eprintln!("PROBE all: {:?} -> {caps:?}", __t.elapsed());
     // Enable the kitty keyboard protocol WHEN THE TERMINAL SUPPORTS IT, so modified
     // keys the legacy encoding can't express (`<S-CR>`, `<C-CR>`, `<C-S-…>`, an
     // unambiguous lone `<Esc>`) reach the server as distinct keys. Gating on real
@@ -447,7 +460,8 @@ where
     // comes, so the map dies. Detection must run here — raw mode is on (`ratatui::init`)
     // but the `EventStream` that would race for the query reply isn't up until
     // `event_loop`. `None` ⇒ legacy encoding, and nothing to pop on exit.
-    let keyboard = kitty_keyboard_enabled().then(|| KeyboardEnhancement::push(std::io::stdout()));
+    let keyboard =
+        kitty_keyboard_enabled(&caps).then(|| KeyboardEnhancement::push(std::io::stdout()));
     // Whether this terminal can show 24-bit color, reported to the server so it can
     // default in the bundled `nxvim` colorscheme (see `truecolor_enabled`). A pure
     // capability report — no terminal state to set up or tear down — so unlike the
@@ -455,10 +469,8 @@ where
     let truecolor = truecolor_enabled();
     // Whether this terminal accepts an OSC 52 clipboard write, reported to the
     // server so it can back `"+` / `"*` with the terminal when the host it runs on
-    // has no clipboard of its own — the ssh case (see `osc52_enabled`). Probed
-    // here for the same reason as the keyboard protocol: raw mode is on, and the
-    // `EventStream` that would race for the reply isn't up until `event_loop`.
-    let osc52 = osc52_enabled();
+    // has no clipboard of its own — the ssh case (see `osc52_enabled`).
+    let osc52 = osc52_enabled(&caps);
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
     // Restore the user's cursor shape on the way out — the loop switches it to a
@@ -474,9 +486,12 @@ where
             stream,
             &mut terminal,
             build.clone(),
-            keyboard.is_some(),
-            truecolor,
-            osc52,
+            AttachCaps {
+                keyboard_protocol: keyboard.is_some(),
+                truecolor,
+                osc52,
+                term: caps,
+            },
             &mut shutdown,
         )
         .await
@@ -499,9 +514,7 @@ async fn event_loop<S>(
     stream: S,
     terminal: &mut DefaultTerminal,
     build: SessionBuilder<S>,
-    keyboard_protocol: bool,
-    truecolor: bool,
-    osc52: bool,
+    caps: AttachCaps,
     shutdown: &mut ShutdownSignal,
 ) -> Result<Outcome<S>>
 where
@@ -529,15 +542,15 @@ where
             Value::Map(vec![
                 (
                     Value::from("keyboard_protocol"),
-                    Value::from(keyboard_protocol),
+                    Value::from(caps.keyboard_protocol),
                 ),
                 // 24-bit color support: lets the server default in the bundled
                 // `nxvim` colorscheme on a rich terminal (see `truecolor_enabled`).
-                (Value::from("truecolor"), Value::from(truecolor)),
+                (Value::from("truecolor"), Value::from(caps.truecolor)),
                 // OSC 52 clipboard writes: lets the server back `"+` / `"*` with
                 // this terminal when its own host has no clipboard tool that could
                 // reach the user — the ssh case (see `osc52_enabled`).
-                (Value::from("osc52"), Value::from(osc52)),
+                (Value::from("osc52"), Value::from(caps.osc52)),
             ]),
         ],
     )
@@ -553,10 +566,10 @@ where
     let (img_bytes_tx, mut img_bytes_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, (u64, u64), Result<Vec<u8>, String>)>();
 
-    // The image renderer for `'imagepreview'`: detect the terminal's graphics
-    // protocol now (it queries over stdio), *before* the `EventStream` below starts
-    // reading input, so the two don't race for the terminal's replies.
-    let mut image_store = images::ImageStore::new(img_fetch_tx);
+    // The image renderer for `'imagepreview'`: the terminal's graphics protocol and
+    // cell size come out of the capability round `run` already ran, so nothing here
+    // touches stdio — no second query to race the `EventStream` below.
+    let mut image_store = images::ImageStore::new(img_fetch_tx, caps.term);
 
     let mut view = View::default();
     let mut anim: Option<ScrollAnim> = None;

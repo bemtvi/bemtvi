@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::termquery::TermCaps;
 use image::DynamicImage;
 pub(crate) use nxvim_view::images::ImageFetch;
 use nxvim_view::images::{decode_bytes, decode_file, RemoteImages, MAX_EDGE};
@@ -13,9 +14,9 @@ use nxvim_view::ImageData;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
+use ratatui_image::{FontSize, StatefulImage};
 use tokio::sync::mpsc::UnboundedSender;
 
 // The fetch request / remote byte cache / bounded decode helpers are the
@@ -55,14 +56,13 @@ struct Decoded {
 }
 
 impl ImageStore {
-    /// Detect the terminal's graphics protocol and cell pixel size by querying it
-    /// over stdio. Must run after entering the alternate screen and before the
-    /// input reader starts. Detection failure (e.g. no tty / a terminal that
-    /// answers nothing) falls back to unicode halfblocks, so previews still render
-    /// — just coarser.
-    pub(crate) fn new(fetch_tx: UnboundedSender<ImageFetch>) -> Self {
+    /// Build the renderer from the capabilities the client already asked the
+    /// terminal for ([`crate::termquery::probe`]) — no I/O of its own. A terminal
+    /// that answered nothing about graphics falls back to unicode halfblocks, so
+    /// previews still render — just coarser.
+    pub(crate) fn new(fetch_tx: UnboundedSender<ImageFetch>, caps: TermCaps) -> Self {
         ImageStore {
-            picker: detect_picker(),
+            picker: detect_picker(caps),
             cache: HashMap::new(),
             remote: RemoteImages::new(),
             fetch_tx,
@@ -147,75 +147,52 @@ impl ImageStore {
     }
 }
 
-/// Detect the graphics protocol — but only *query* a terminal that provably answers
-/// queries; anything else gets the halfblocks fallback outright.
+/// Build the [`Picker`] from one capability round's answers.
 ///
-/// `Picker::from_query_stdio` (ratatui-image 11.0.4) spawns a helper thread that
-/// blocks in `stdin.read()` until it sees the reply to its `ESC[5n` device-status
-/// query — its termination sentinel. On a terminal that answers nothing (a dumb
-/// PTY, `TERM=dumb`, some ssh hops / multiplexers) that reply never comes: the
-/// caller times out and falls back to halfblocks, but the helper thread stays
-/// parked on the blocking read. It then *swallows the first keystrokes the user
-/// types* (they land in its `read`), and on its way out — its result channel is
-/// closed by then, so the loop errors — it runs its `disable_raw_mode()` cleanup,
-/// dropping the terminal back to cooked mode. Every later keystroke is then
-/// line-buffered by the PTY and never reaches the input reader: all input is dead.
-/// (Caught by the PTY e2e tests, `crates/nxvim/tests/e2e.rs`.)
+/// The protocol is decided the way `ratatui-image`'s own `from_query_stdio` decides
+/// it — what the terminal *answered* wins, then the env hints for what is running
+/// outside a multiplexer (`Picker::from_fontsize` supplies those) — but off the
+/// already-collected [`TermCaps`] instead of a second stdio query.
 ///
-/// The probe sends the same `ESC[5n` and waits on `poll(2)`, which can wait
-/// *without consuming stdin* and leaves nothing behind on timeout — so a mute
-/// terminal costs one bounded wait and keeps a fully working keyboard.
-fn detect_picker() -> Picker {
-    if terminal_answers_status_query() {
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
-    } else {
-        Picker::halfblocks()
-    }
-}
-
-/// Probe whether the terminal answers an `ESC[5n` device-status report (the query
-/// every terminal is expected to implement, and the one `from_query_stdio` relies
-/// on to terminate). Waits via [`stdin_readable_within`] — never a blocking read —
-/// then drains the pending reply so the *stale* `ESC[0n` can't terminate the real
-/// capability query prematurely (its parser treats any status report as "done").
-/// Raw mode is already on here (`ratatui::init` ran), so the reply isn't held back
-/// by the line discipline.
+/// Not querying again is the point, and it is a correctness fix as much as a speed
+/// one. `Picker::from_query_stdio` spawns a helper thread that blocks in
+/// `stdin.read()` until it sees the reply to its own `ESC[5n`, and wraps its
+/// questions in tmux passthrough — which tmux drops unless `allow-passthrough` is
+/// on (it is off by default, and the `tmux set` that ratatui-image runs to turn it
+/// on can't reach a tmux server living on the *other* side of an ssh hop). The
+/// reply then never comes: the caller times out after two seconds — two seconds in
+/// front of the first frame — and the helper thread stays parked on the blocking
+/// read, where it **swallows the first keystroke the user types**. Reading the
+/// answers we already have costs nothing and parks nothing.
+///
+/// Without a cell size there is nothing to convert an image's pixels into cells
+/// with, so that is the halfblocks fallback (matching `from_query_stdio`'s own
+/// `NoFontSize` arm).
 #[cfg(unix)]
-fn terminal_answers_status_query() -> bool {
-    use std::io::{Read, Write};
-
-    let mut out = std::io::stdout();
-    if out
-        .write_all(b"\x1b[5n")
-        .and_then(|()| out.flush())
-        .is_err()
-    {
-        return false;
+fn detect_picker(caps: TermCaps) -> Picker {
+    let Some((width, height)) = caps.cell_size else {
+        return Picker::halfblocks();
+    };
+    let trust_answers = !crate::termquery::graphics_query_suppressed();
+    // Deprecated in favour of `from_query_stdio`, which is exactly the query we are
+    // replacing; this is the only constructor that takes a font size we measured
+    // ourselves, and it still applies the outer-terminal env hints we want.
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(FontSize::new(width, height));
+    if trust_answers && caps.kitty_graphics {
+        picker.set_protocol_type(ProtocolType::Kitty);
+    } else if trust_answers && caps.sixel {
+        picker.set_protocol_type(ProtocolType::Sixel);
     }
-    // Generous first wait: a slow hop (ssh) can sit on the reply for a while.
-    if !crate::termquery::stdin_readable_within(std::time::Duration::from_millis(1000)) {
-        return false;
-    }
-    // Drain until a quiet gap so the capability query starts from clean input.
-    let mut stdin = std::io::stdin();
-    let mut buf = [0u8; 64];
-    loop {
-        match stdin.read(&mut buf) {
-            // EOF / error: stdin will never carry a reply — don't query.
-            Ok(0) | Err(_) => return false,
-            Ok(_) => {}
-        }
-        if !crate::termquery::stdin_readable_within(std::time::Duration::from_millis(50)) {
-            return true;
-        }
-    }
+    picker
 }
 
-/// Non-unix fallback: no `poll(2)` to probe with, so keep the direct query (the
-/// pre-probe behavior; crossterm's Windows console path answers via the API).
+/// Non-unix: [`crate::termquery::probe`] asks nothing there (no `poll(2)` to wait
+/// on stdin without consuming it), so keep ratatui-image's own query — on Windows
+/// it answers through the console API rather than a parked stdin read.
 #[cfg(not(unix))]
-fn terminal_answers_status_query() -> bool {
-    true
+fn detect_picker(_caps: TermCaps) -> Picker {
+    Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
 }
 
 /// The largest aspect-preserving sub-rect of `area` the image fits in — never

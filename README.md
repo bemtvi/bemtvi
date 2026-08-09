@@ -67,7 +67,10 @@ Downloads ship with checksums and SLSA build provenance — see
 > 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Operating-System-Commands)
 > escape, which travels back down the ssh connection. It is used only when the
 > terminal advertises support (queried at startup), so a yank never silently
-> copies into a void; force the decision either way with `NXVIM_OSC52=1` / `=0`.
+> copies into a void — with one exception: inside **tmux or screen** the
+> multiplexer answers the query itself and can only speak for itself, so its
+> silence is taken as "yes" (both forward the escape outward by default). Force
+> the decision either way with `NXVIM_OSC52=1` / `=0`.
 > Pasting *into* nxvim from another app on your machine is your terminal's own
 > paste (`Ctrl+Shift+V`, middle-click) — reading the clipboard back over OSC 52 is
 > a round trip most terminals refuse, so `"+p` pastes what this session copied.

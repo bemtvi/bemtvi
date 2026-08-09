@@ -1138,7 +1138,13 @@ impl Editor {
                 Ok(ms) => self.pending_sleep = Some(ms),
                 Err(e) => self.echo(e),
             },
-            "mes" | "messages" | "message" => self.ex_messages(),
+            // `:messages` opens the history panel; `:messages clear` empties it
+            // (neovim's only argument — anything else is rejected loud).
+            "mes" | "messages" | "message" => match args.trim() {
+                "" => self.ex_messages(),
+                "clear" => self.ex_messages_clear(),
+                other => self.echo(format!("E474: Invalid argument: {other}")),
+            },
             // `:ec[ho]` evaluates its argument as a Vim expression and shows the
             // result on the message line *without* recording it in `:messages`;
             // `:echom[sg]` records it (the history-keeping form); `:echoe[rr]`

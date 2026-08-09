@@ -2598,13 +2598,17 @@ impl Editor {
         self.open_named_panel("[Panels]", lines, 0, "nxpanels", LISTING_HEIGHT);
     }
 
-    /// `:messages` — show the message history in a read-only scratch listing,
-    /// opened scrolled to the end with the newest line selected.
+    /// `:messages` — show the message history in a read-only listing, opened
+    /// scrolled to the end with the newest line selected. Tagged
+    /// `filetype=nxmessages` (rather than the generic `nxlisting`) so the
+    /// `FileType nxmessages` autocmd's buffer-local `C` map — clear the log —
+    /// lives only on this panel; `q`/`<Esc>` still dismiss it like every other
+    /// listing.
     pub fn ex_messages(&mut self) {
         let lines: Vec<String> = self.messages.iter().map(|m| m.text.clone()).collect();
         let errors: Vec<bool> = self.messages.iter().map(|m| m.error).collect();
         let last = lines.len().saturating_sub(1);
-        self.open_scratch_listing("[Messages]", lines, last);
+        self.open_named_panel("[Messages]", lines, last, "nxmessages", LISTING_HEIGHT);
         // Messages are free-form (notifications, multi-line errors, stack traces),
         // so soft-wrap the panel — the global `nowrap` default would clip a long
         // message off the right edge. Window-local, set after the panel window is
@@ -2616,6 +2620,20 @@ impl Editor {
         // is current and freshly loaded, so the marks survive until the next
         // re-open clears them).
         self.highlight_listing_lines(&errors, "ErrorMsg");
+    }
+
+    /// `:messages clear` — drop the whole recorded history. When run from inside
+    /// the `[Messages]` panel (its `C` map) the now-empty listing is re-rendered
+    /// in place, so the panel doesn't keep showing the log that was just cleared.
+    pub fn ex_messages_clear(&mut self) {
+        self.messages.clear();
+        let showing = self
+            .panel_buffers
+            .iter()
+            .any(|(name, buf)| name == "[Messages]" && *buf == self.cur_buffer());
+        if showing {
+            self.ex_messages();
+        }
     }
 
     /// `:registers` / `:reg` / `:display` — list the non-empty registers in a

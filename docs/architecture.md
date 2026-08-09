@@ -767,20 +767,24 @@ nxvim-native, closest in spirit to neovim's quickfix window.
   because the panel *is* a real window onto a real buffer, not because the input
   loop special-cases it. The activation and dismiss keys are **buffer-local
   keymaps installed by a `FileType` autocmd**, never hard-coded: the prelude's
-  `FileType nxlisting/nxbuffers/nxpanels/nxpanel` maps bind `q`/`<Esc>` to
+  `FileType nxlisting/nxbuffers/nxpanels/nxmessages/nxpanel` maps bind `q`/`<Esc>` to
   `nx.panel.close`, and a per-listing `<CR>` action (e.g. `nx.buffers.actions.open`
   reads the bufnr off the cursor row and switches) is an ordinary `default` map
   that a user map overrides — rebindable the standard way.
-- **Built-in listings mount here.** `:messages`, `:registers`, `:marks`,
-  `:jumps`, `:changes` go through `Editor::open_scratch_listing(name, lines,
-  cursor)` (filetype `nxlisting`); `:ls`/`:buffers` through
-  `Editor::open_buffer_listing` (filetype `nxbuffers`, whose `<CR>` switches
-  buffer); the named-panel list through `nxpanels`. Each opens scrolled to a
-  chosen cursor line — `:messages` to the newest line, `:ls` to the current
-  buffer.
+- **Built-in listings mount here.** `:registers`, `:marks`, `:jumps`, `:changes`
+  go through `Editor::open_scratch_listing(name, lines, cursor)` (filetype
+  `nxlisting`); `:ls`/`:buffers` through `Editor::open_buffer_listing` (filetype
+  `nxbuffers`, whose `<CR>` switches buffer); the named-panel list through
+  `nxpanels`; `:messages` through `nxmessages`, whose `C` map
+  (`nx.messages.actions.clear` → `:messages clear`) empties the log and
+  re-renders the panel in place. Each opens scrolled to a chosen cursor line —
+  `:messages` to the newest line, `:ls` to the current buffer.
 - **A message history feeds it.** `Editor::echo` is the one place a user-facing
   message is set; it records each line in a `messages` history (the backing store
-  for `:messages`) as well as showing it on the message line. The server routes
+  for `:messages`) as well as showing it on the message line. A message spanning
+  several lines is fenced above and below with a `MESSAGE_SEPARATOR` row, so a
+  block (a `:=` table dump, a traceback) stays visibly one entry in the flat
+  history; adjacent blocks share their divider. The server routes
   its own messages (errors, captured `print`/`nvim_echo`) through the same call.
 - **It's scriptable.** A plugin mounts its own panel with
   `nx.panel.open{ name?, lines, filetype?, height?, margin? }` and dismisses it

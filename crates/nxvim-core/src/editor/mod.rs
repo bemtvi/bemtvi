@@ -123,6 +123,11 @@ pub(crate) use self::syntax::fill_indent;
 /// caps `:messages`).
 const MAX_MESSAGES: usize = 1000;
 
+/// The divider row `:messages` fences a *multi-line* message with, so the
+/// boundaries of a block (a pretty-printed table, a traceback) are visible in
+/// the otherwise flat, one-line-per-entry history.
+pub const MESSAGE_SEPARATOR: &str = "────────────────────────────────";
+
 /// Lexically normalize a path — collapse `.`, `..`, and redundant separators —
 /// **without touching the filesystem** (no symlink resolution, no existence
 /// check), so the pure core stays free of blocking I/O. Enough to treat `./a`
@@ -2589,14 +2594,49 @@ impl Editor {
     /// the many command errors that flow through [`Editor::echo`] light up red
     /// without threading a flag through 100-plus call sites.
     pub fn record_message(&mut self, text: impl AsRef<str>, force_error: bool) {
-        for line in text.as_ref().split('\n').filter(|l| !l.is_empty()) {
+        let lines: Vec<&str> = text
+            .as_ref()
+            .split('\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        // A message that spans several lines (a `:=` table dump, a Lua traceback,
+        // a multi-line diagnostic) is otherwise indistinguishable from several
+        // one-line messages once it lands in the flat history, so fence the block
+        // with a separator row above and below.
+        let fenced = lines.len() > 1;
+        if fenced {
+            self.record_separator();
+        }
+        for line in lines {
             self.messages.push(LoggedMessage {
                 text: line.to_string(),
                 error: force_error || is_error_line(line),
             });
         }
+        if fenced {
+            self.record_separator();
+        }
         // Bound the history so a long-running session can't grow it forever.
         cap_ring(&mut self.messages, MAX_MESSAGES);
+    }
+
+    /// Push one [`MESSAGE_SEPARATOR`] row onto the history — the boundary marker
+    /// [`Editor::record_message`] fences a multi-line message with. Skipped when
+    /// the log is empty (nothing above to separate from) or already ends in a
+    /// separator, so back-to-back multi-line messages get one divider between
+    /// them rather than two.
+    fn record_separator(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_none_or(|m| m.text == MESSAGE_SEPARATOR)
+        {
+            return;
+        }
+        self.messages.push(LoggedMessage {
+            text: MESSAGE_SEPARATOR.to_string(),
+            error: false,
+        });
     }
 
     /// The editor's total screen size in `(columns, rows)` — the text-viewport

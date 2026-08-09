@@ -528,14 +528,40 @@ nx.autocmd.create("FileType", {
   end,
 })
 
+-- `:messages` opens a `nxmessages` panel holding the recorded history. `C` clears the
+-- log — `:messages clear`, which re-renders the (now empty) panel in place, so the key
+-- reads as "wipe this". Buffer-local and `default`, like every other panel action, so a
+-- user `C` map wins and the key never bleeds onto ordinary buffers.
+nx.messages = nx.messages or {}
+nx.messages.actions = nx.messages.actions or {}
+-- `nx.messages.actions.clear`(): the default `C` action inside the `:messages` panel
+-- (filetype `nxmessages`). Clears the recorded message history and re-renders the panel
+-- in place. Rebindable like the other panel actions (`nx.qf.actions.jump`,
+-- `nx.buffers.actions.open`).
+nx.messages.actions.clear = function()
+  vim.cmd("messages clear")
+end
+
+nx.autocmd.create("FileType", {
+  pattern = "nxmessages",
+  callback = function(args)
+    nx.keymap.set(
+      "n",
+      "C",
+      nx.messages.actions.clear,
+      { buffer = args.buf, default = true, desc = "Clear the message log" }
+    )
+  end,
+})
+
 -- Every panel listing (the built-in text listings `nxlisting`, the buffer list
--- `nxbuffers`, the panel list `nxpanels`, and scripted `nx.panel.open` panels defaulting to
--- `nxpanel`) dismisses on `q` / `<Esc>` — the focus-locked overlay's "you're done here, go
+-- `nxbuffers`, the panel list `nxpanels`, the message log `nxmessages`, and scripted
+-- `nx.panel.open` panels defaulting to `nxpanel`) dismisses on `q` / `<Esc>` — the focus-locked overlay's "you're done here, go
 -- back" key. An ordinary buffer-local default map, so motions / `<CR>` / a plugin's own
 -- keys coexist and a user map wins. A scripted panel with its *own* filetype opts out and
 -- wires its own dismiss.
 nx.autocmd.create("FileType", {
-  pattern = { "nxlisting", "nxbuffers", "nxpanels", "nxpanel" },
+  pattern = { "nxlisting", "nxbuffers", "nxpanels", "nxmessages", "nxpanel" },
   callback = function(args)
     for _, key in ipairs({ "q", "<Esc>" }) do
       nx.keymap.set(

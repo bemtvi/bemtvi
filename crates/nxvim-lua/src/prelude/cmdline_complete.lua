@@ -99,7 +99,7 @@ local BUILTIN = {
   { "lnewer", ":lnewer", "Go to a newer location list." },
   { "lua", ":lua {chunk}", "Execute {chunk} as Lua in the nx.* runtime." },
   { "sleep", ":sleep [n]", "Pause for [n] seconds (or milliseconds with `m`)." },
-  { "messages", ":messages", "Show recorded messages." },
+  { "messages", ":messages [clear]", "Show recorded messages (`clear` empties the log)." },
   { "echo", ":echo {expr}", "Evaluate and display {expr}." },
   { "echomsg", ":echomsg {expr}", "Display {expr} and record it in :messages." },
   { "echoerr", ":echoerr {expr}", "Display {expr} as an error and record it." },

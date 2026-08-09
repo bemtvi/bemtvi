@@ -234,6 +234,123 @@ async fn notify_at_error_level_flags_the_cmdline_line_red() {
     );
 }
 
+/// The divider row `:messages` fences a multi-line entry with (mirrors the core's
+/// `MESSAGE_SEPARATOR`).
+const SEP: &str = "────────────────────────────────";
+
+// A message that spans several lines lands in the flat history as several rows, so
+// without a marker there is no way to tell one multi-line message from several
+// one-line ones. `:messages` fences each multi-line block with a separator row.
+#[tokio::test]
+async fn a_multiline_message_is_fenced_by_separators_in_the_history() {
+    let (rpc, _incoming) = start(None).await;
+
+    feed(&rpc, ":lua print('one-liner')<CR>");
+    feed(&rpc, ":lua print('top\\nmiddle\\nbottom')<CR>");
+    feed(&rpc, ":lua print('after')<CR>");
+    feed(&rpc, ":messages<CR>");
+
+    let shown = lines(&rpc).await;
+    let at = |needle: &str| {
+        shown
+            .iter()
+            .position(|l| l == needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {shown:?}"))
+    };
+    // The block sits between two separators; the single-line messages around it
+    // are outside them.
+    assert!(
+        at("one-liner") < at(SEP) && at(SEP) < at("top"),
+        "a separator opens the block; history was: {shown:?}"
+    );
+    assert!(
+        at("bottom") < shown.iter().rposition(|l| l == SEP).unwrap(),
+        "a separator closes the block; history was: {shown:?}"
+    );
+    assert!(
+        shown.iter().rposition(|l| l == SEP).unwrap() < at("after"),
+        "the next message lands after the closing separator; history was: {shown:?}"
+    );
+    assert_eq!(
+        shown.iter().filter(|l| *l == SEP).count(),
+        2,
+        "exactly one separator each side; history was: {shown:?}"
+    );
+}
+
+// Back-to-back multi-line messages share the divider between them — a closing and an
+// opening separator collapse into one — and a single-line message is never fenced.
+#[tokio::test]
+async fn separators_do_not_double_up_and_single_lines_are_not_fenced() {
+    let (rpc, _incoming) = start(None).await;
+
+    feed(&rpc, ":lua print('a1\\na2')<CR>");
+    feed(&rpc, ":lua print('b1\\nb2')<CR>");
+    feed(&rpc, ":messages<CR>");
+    let shown = lines(&rpc).await;
+    assert_eq!(
+        shown,
+        vec!["a1", "a2", SEP, "b1", "b2", SEP],
+        "adjacent blocks share one divider, and an empty log grows no leading one"
+    );
+
+    feed(&rpc, "q");
+    feed(&rpc, ":messages clear<CR>");
+    feed(&rpc, ":lua print('solo')<CR>");
+    feed(&rpc, ":messages<CR>");
+    let shown = lines(&rpc).await;
+    assert!(
+        !shown.iter().any(|l| l == SEP),
+        "a one-line message is not fenced; history was: {shown:?}"
+    );
+}
+
+// `:messages clear` empties the log; `C` inside the panel is the bound form of it and
+// re-renders the (now empty) panel in place.
+#[tokio::test]
+async fn messages_clear_empties_the_log_and_c_is_its_keymap() {
+    let (rpc, _incoming) = start(None).await;
+
+    feed(&rpc, ":lua print('gone')<CR>");
+    feed(&rpc, ":messages clear<CR>");
+    feed(&rpc, ":messages<CR>");
+    assert!(
+        !lines(&rpc).await.iter().any(|l| l == "gone"),
+        "`:messages clear` drops the history"
+    );
+    feed(&rpc, "q");
+
+    // `C` in the panel clears and re-renders it in place — still a panel, now empty.
+    feed(&rpc, ":lua print('here')<CR>");
+    feed(&rpc, ":messages<CR>");
+    assert!(
+        lines(&rpc).await.iter().any(|l| l == "here"),
+        "the history is showing before the clear"
+    );
+    feed(&rpc, "C");
+    assert!(
+        panel_is_open(&rpc).await,
+        "`C` re-renders the panel in place"
+    );
+    assert!(
+        !lines(&rpc).await.iter().any(|l| l == "here"),
+        "`C` cleared the log the panel is showing"
+    );
+}
+
+// An unknown argument fails loud rather than silently clearing or no-opping.
+#[tokio::test]
+async fn messages_rejects_an_unknown_argument() {
+    let (rpc, mut incoming) = start(None).await;
+
+    let map = redraw_after(&rpc, &mut incoming, ":messages nonsense<CR>").await;
+    assert_eq!(message(&map), "E474: Invalid argument: nonsense");
+    assert!(
+        !panel_is_open(&rpc).await,
+        "a rejected argument opens no panel"
+    );
+}
+
 #[tokio::test]
 async fn a_panel_is_navigable_with_plain_motions() {
     let (rpc, _incoming) = start(None).await;

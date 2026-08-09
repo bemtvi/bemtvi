@@ -53,6 +53,42 @@ async fn nowrap_scrolls_horizontally_to_keep_cursor_visible() {
     assert_eq!(view_u64(&back, "leftcol"), 0);
 }
 
+/// Widening the window pulls a horizontally-scrolled view back: `leftcol` only ever
+/// grows to keep the cursor visible, so a scroll computed for a narrow text area used to
+/// survive the window getting wide enough for the whole line — painting the buffer panned
+/// into empty space that the wheel then refused to scroll back (its clamp says a window
+/// whose lines all fit cannot scroll).
+#[tokio::test]
+async fn widening_the_window_unscrolls_a_line_that_now_fits() {
+    let (rpc, mut incoming) = start(None).await;
+    // 150 columns: wider than the 80-column window, narrower than the 200 it grows to.
+    feed(&rpc, "i");
+    feed(&rpc, &"abcdefghij".repeat(15));
+
+    // At the line end the 80-column window is scrolled right.
+    let narrow = redraw_after(&rpc, &mut incoming, "<Esc>$").await;
+    assert!(
+        view_u64(&narrow, "leftcol") > 0,
+        "precondition: the 150-column line does not fit 80 columns"
+    );
+
+    rpc.request(
+        "nx_ui_try_resize",
+        vec![Value::from(200u64), Value::from(24u64)],
+    )
+    .await
+    .expect("resize");
+
+    let wide = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        view_u64(&wide, "leftcol"),
+        0,
+        "the whole line fits 200 columns, so the view scrolls back to the left edge"
+    );
+    // The cursor is still on the line's last column, now visible without any panning.
+    assert_eq!(view_u64(&wide, "cursor_screen_col"), 149);
+}
+
 /// `sidescrolloff` keeps a margin of columns between the cursor and the window
 /// edge while horizontally scrolling, mirroring vim's option.
 #[tokio::test]

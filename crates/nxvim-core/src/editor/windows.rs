@@ -2874,9 +2874,20 @@ impl Editor {
     /// us only how tall the text area is (status/command lines are the client's
     /// own regions), so the whole height here is editable rows.
     pub fn resize(&mut self, width: usize, height: usize) {
-        self.width = width.max(1);
+        let width = width.max(1);
+        // Every frame re-enters here with the *same* size (`Editor::view` resizes before
+        // projecting), so anything that overrides deliberate state must key off a real
+        // change — hence the gate below rather than an unconditional clamp.
+        let width_changed = width != self.width;
+        self.width = width;
         self.height = height.max(1);
         self.relayout();
+        // A window that got WIDER may be left panned into empty space: the horizontal
+        // scroll was computed for the old, narrower text area and the cursor-visibility
+        // pass below only ever nudges `leftcol` when the cursor falls outside the band.
+        if width_changed {
+            self.clamp_leftcol_to_content();
+        }
         self.ensure_visible();
         // A resize changes every window's visible height (and may clamp `top`), so
         // re-detect viewports for the `nx.decor` signal (`editor/decor.rs`).

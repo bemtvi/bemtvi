@@ -2238,7 +2238,7 @@ impl Editor {
     /// its current viewport minus the text width, floored at 0. At this offset the
     /// widest visible line's last column sits at the right edge, so a window whose
     /// lines all fit (`widest <= text width`) has a max of 0 — no horizontal scroll.
-    fn window_max_leftcol(&self, win: WindowId) -> usize {
+    pub(crate) fn window_max_leftcol(&self, win: WindowId) -> usize {
         let (Some((top, _)), Some((content_w, text_h)), Some(buf_id), Some(opts)) = (
             self.window_scroll(win),
             self.window_text_area(win),
@@ -2266,6 +2266,46 @@ impl Editor {
             .max()
             .unwrap_or(0);
         widest.saturating_sub(text_w)
+    }
+
+    /// Pull every laid-out window's `leftcol` back to what its content justifies
+    /// ([`window_max_leftcol`](Self::window_max_leftcol)), so the view is never panned
+    /// into empty space to the right of the widest visible line.
+    ///
+    /// The horizontal scroll is only ever *grown* by the cursor-visibility pass
+    /// ([`ensure_visible_horizontal`](Editor::ensure_visible_horizontal)), which nudges
+    /// `leftcol` when the cursor leaves the band and otherwise leaves it alone — so a
+    /// `leftcol` computed for a **narrower** viewport survives the window getting wider,
+    /// with the cursor still comfortably inside the band and nothing pulling the view
+    /// back. That is exactly what a restored session hits: the layout is rebuilt during
+    /// startup, against the boot placeholder width, and the client's real terminal size
+    /// only arrives with its `ui_attach`. The result was a buffer painted scrolled
+    /// sideways for no reason, which the wheel then refused to scroll back (its own
+    /// clamp already says a window whose lines all fit has a max of 0).
+    ///
+    /// Clamping keeps the cursor visible by construction: the max is measured from the
+    /// widest line **in the viewport**, which includes the cursor's own line. Windows
+    /// that are not laid out (an inactive tab) are skipped rather than clamped to zero —
+    /// their view is re-derived when their tab is shown.
+    ///
+    /// Called only when the screen width actually changes ([`Editor::resize`]), never
+    /// per-frame: a plugin's deliberate [`set_window_leftcol`](Editor::set_window_leftcol)
+    /// (the side-by-side-diff primitive) may legitimately park a short-lined window past
+    /// this max, and a clamp on every projection would undo it on the next redraw.
+    pub(crate) fn clamp_leftcol_to_content(&mut self) {
+        let current = self.current_window_id();
+        for id in self.all_window_ids() {
+            if self.window_text_area(id).is_none() {
+                continue;
+            }
+            let max = self.window_max_leftcol(id);
+            if id == current {
+                self.leftcol = self.leftcol.min(max);
+            } else if let Some(tree) = self.tree_of_window_mut(id) {
+                let w = tree.get_mut(id);
+                w.saved_leftcol = w.saved_leftcol.min(max);
+            }
+        }
     }
 
     /// Pull the focused window's cursor into the visible horizontal band

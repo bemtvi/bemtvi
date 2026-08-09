@@ -1743,3 +1743,41 @@ async fn session_restore_keeps_config_window_options() {
         );
     }
 }
+
+/// A restored session must not come back **horizontally scrolled** into empty space.
+/// The layout is rebuilt during startup, before the client's `nx_ui_attach` hands over
+/// the real terminal size — so the restore's `ensure_visible` computes `leftcol` against
+/// the boot placeholder width (80). Reattaching at a width where the whole line fits left
+/// that stale `leftcol` in place: the buffer painted scrolled sideways with the cursor at
+/// the right buffer column, and nothing to scroll back to (the wheel's own clamp already
+/// says a window whose lines all fit has `max_leftcol == 0`).
+#[tokio::test]
+async fn session_restores_unscrolled_when_the_line_fits_the_real_width() {
+    let dir = temp_dir("session_leftcol_store");
+    // One line far wider than the 80-column boot default, but well inside the 200-column
+    // terminal the client attaches with.
+    let long = "x".repeat(150);
+    let file = write_temp("session_leftcol", "txt", &format!("{long}\nshort\n"));
+
+    // Session 1: park the cursor at the end of the long line, then quit.
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file.clone()), true), 200, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, "$");
+        assert_eq!(cursor(&rpc).await, (1, 149), "cursor at the line end");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: same 200-column terminal — the line fits, so the view is unscrolled.
+    {
+        let (rpc, mut incoming) = start_attached(init(&dir, None, true), 200, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 149), "cursor column restored");
+        let map = nxvim_test_harness::redraw_after(&rpc, &mut incoming, "").await;
+        assert_eq!(
+            nxvim_test_harness::window0_field(&map, "leftcol").and_then(rmpv::Value::as_u64),
+            Some(0),
+            "a 150-column line inside a 200-column window is never scrolled sideways"
+        );
+    }
+}

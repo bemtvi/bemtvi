@@ -445,9 +445,7 @@ where
     // first frame, which is what made a multiplexer or a two-hop ssh feel like a hang.
     // It must run here — raw mode is on (`ratatui::init`) but the `EventStream` that
     // would race for the replies isn't up until `event_loop`.
-    let __t = std::time::Instant::now();
     let caps = termquery::probe();
-    eprintln!("PROBE all: {:?} -> {caps:?}", __t.elapsed());
     // Enable the kitty keyboard protocol WHEN THE TERMINAL SUPPORTS IT, so modified
     // keys the legacy encoding can't express (`<S-CR>`, `<C-CR>`, `<C-S-…>`, an
     // unambiguous lone `<Esc>`) reach the server as distinct keys. Gating on real

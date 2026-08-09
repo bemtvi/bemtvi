@@ -754,3 +754,39 @@ fn daemon_stderr_log_is_private_and_per_pid() {
     s.send(b":q!\r");
     std::fs::remove_file(&log).ok();
 }
+
+/// Startup must not write anything of its own to the terminal. The terminal
+/// capability probe runs after the alternate screen is cleared but before the first
+/// frame, so anything it prints races the frame the client is painting: on a real
+/// terminal (tmux, notably) the two interleave into a garbled line that survives
+/// until something forces a full repaint — changing the colorscheme, say. A stray
+/// `eprintln!` left in the probe path is invisible to every other tier, and even
+/// here the *screen* may or may not show it depending on who wins the race; the
+/// raw output stream is where it is always visible.
+#[test]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn startup_writes_no_diagnostics_to_the_terminal() {
+    let path =
+        nxvim_test_harness::temp_root().join(format!("nxvim_e2e_quiet_{}.txt", std::process::id()));
+    std::fs::write(&path, "alpha\nbeta\n").unwrap();
+
+    let mut s = Session::spawn(&[path.to_str().unwrap()], 80, 24);
+    let ok = s.wait_until(Duration::from_secs(5), |scr| {
+        let t = scr.contents();
+        t.contains("alpha") && t.contains("beta")
+    });
+    assert!(ok, "screen never showed the file:\n{}", s.screen_text());
+
+    // Names of startup internals that have leaked to the terminal before: the probe's
+    // own type and its debug label. None of them belong in the byte stream at all.
+    let raw = String::from_utf8_lossy(&s.raw.lock().unwrap().clone()).into_owned();
+    for needle in ["TermCaps", "PROBE", "kitty_keyboard"] {
+        assert!(
+            !raw.contains(needle),
+            "startup wrote {needle:?} to the terminal"
+        );
+    }
+
+    s.send(b":q!\r");
+    std::fs::remove_file(&path).ok();
+}

@@ -2284,9 +2284,12 @@ impl Editor {
     /// clamp already says a window whose lines all fit has a max of 0).
     ///
     /// Clamping keeps the cursor visible by construction: the max is measured from the
-    /// widest line **in the viewport**, which includes the cursor's own line. Windows
-    /// that are not laid out (an inactive tab) are skipped rather than clamped to zero —
-    /// their view is re-derived when their tab is shown.
+    /// widest line **in the viewport**, which includes the cursor's own line. A window
+    /// that is not laid out (a parked tab's) has no rect to measure against and cannot be
+    /// clamped here — clamping it to zero would be a guess, and leaving it alone paints
+    /// the tab panned sideways the moment it is switched to. It is instead flagged
+    /// [`leftcol_needs_clamp`](crate::editor::windows::Window::leftcol_needs_clamp), which
+    /// [`clamp_pending_leftcol`](Self::clamp_pending_leftcol) settles once the tab is live.
     ///
     /// Called only when the screen width actually changes ([`Editor::resize`]), never
     /// per-frame: a plugin's deliberate [`set_window_leftcol`](Editor::set_window_leftcol)
@@ -2295,7 +2298,20 @@ impl Editor {
     pub(crate) fn clamp_leftcol_to_content(&mut self) {
         let current = self.current_window_id();
         for id in self.all_window_ids() {
-            if self.window_text_area(id).is_none() {
+            // `tree_of_window` sees exactly the trees `relayout` lays out (each open
+            // layer's *active* tab). A window outside them sits in a parked tab: it
+            // still carries a `rect`, but a stale one from whenever that tab was last
+            // shown, so measuring against it would clamp to the old width. Flag it for
+            // `clamp_pending_leftcol` instead, and leave the scroll alone until then.
+            if self.tree_of_window(id).is_none() || self.window_text_area(id).is_none() {
+                if let Some((layer, idx)) = self.tab_of_window(id) {
+                    if let Some(w) = self
+                        .layer_tab_tree_mut(layer, idx)
+                        .and_then(|t| t.try_get_mut(id))
+                    {
+                        w.leftcol_needs_clamp = true;
+                    }
+                }
                 continue;
             }
             let max = self.window_max_leftcol(id);
@@ -2305,6 +2321,50 @@ impl Editor {
                 let w = tree.get_mut(id);
                 w.saved_leftcol = w.saved_leftcol.min(max);
             }
+        }
+    }
+
+    /// Settle the horizontal scroll of every window in the **live** tree that was
+    /// parked across a screen-width change ([`clamp_leftcol_to_content`](Self::clamp_leftcol_to_content)
+    /// flagged it), now that it has a rect to be measured against.
+    ///
+    /// A parked window's `saved_leftcol` was derived for the width its tab was last
+    /// shown at; a restored session derives it against the boot placeholder width (80),
+    /// since the layout is rebuilt before the client's `ui_attach` hands over the real
+    /// terminal size. Switching to that tab restores the stash verbatim, so it painted
+    /// panned into empty space with nothing to scroll back to — the resize-time clamp
+    /// could not reach it, because a parked tab's tree has no layout.
+    ///
+    /// Runs at the end of [`enter_window`](Editor::enter_window) — the point where the
+    /// incoming tree is both laid out *and* settled (its focused window's live
+    /// `leftcol`/`top` are restored), which is what makes the measurement meaningful.
+    /// Only flagged windows are touched, so a plugin's deliberate
+    /// [`set_window_leftcol`](Editor::set_window_leftcol) still survives an ordinary
+    /// focus or tab switch.
+    pub(crate) fn clamp_pending_leftcol(&mut self) {
+        let pending: Vec<WindowId> = self
+            .windows
+            .leaves()
+            .into_iter()
+            .chain(self.windows.floats.iter().copied())
+            .filter(|&id| {
+                self.windows
+                    .try_get(id)
+                    .is_some_and(|w| w.leftcol_needs_clamp)
+            })
+            .collect();
+        let current = self.windows.current;
+        for id in pending {
+            if self.window_text_area(id).is_none() {
+                continue; // still unmeasurable (a float mid-placement): keep the flag.
+            }
+            let max = self.window_max_leftcol(id);
+            if id == current {
+                self.leftcol = self.leftcol.min(max);
+            }
+            let w = self.windows.get_mut(id);
+            w.saved_leftcol = w.saved_leftcol.min(max);
+            w.leftcol_needs_clamp = false;
         }
     }
 

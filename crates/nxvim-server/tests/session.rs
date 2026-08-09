@@ -1781,3 +1781,51 @@ async fn session_restores_unscrolled_when_the_line_fits_the_real_width() {
         );
     }
 }
+
+/// The same stale-`leftcol` restore bug as above, but for a tab that is **not** the
+/// active one. The clamp that fixes the focused window runs on `resize`, which can only
+/// measure windows that are laid out — an inactive tab's tree is parked off `self.windows`
+/// and has no rect, so it was skipped. Switching to that tab then restores its stashed
+/// `leftcol` verbatim: the tab paints scrolled sideways into empty space with nothing to
+/// scroll back to.
+#[tokio::test]
+async fn session_restores_an_inactive_tab_unscrolled_too() {
+    let dir = temp_dir("session_leftcol_tab_store");
+    // Both lines are far wider than the 80-column boot default, but fit the 200-column
+    // terminal the client attaches with.
+    let long = "x".repeat(150);
+    let file_a = write_temp("session_leftcol_tab_a", "txt", &format!("{long}\nshort\n"));
+    let file_b = write_temp("session_leftcol_tab_b", "txt", &format!("{long}\nshort\n"));
+
+    // Session 1: two tabs, each parked at the end of its long line.
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 200, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, "$");
+        feed(&rpc, &format!(":tabnew {file_b}<CR>"));
+        feed(&rpc, "$");
+        assert_eq!(tab_count(&rpc).await, 2, "two tabs before quit");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the restored active tab is unscrolled (the resize clamp) — and so is
+    // the other tab once it is switched to.
+    {
+        let (rpc, mut incoming) = start_attached(init(&dir, None, true), 200, 25).await;
+        assert_eq!(tab_count(&rpc).await, 2, "both tab pages came back");
+        let map = nxvim_test_harness::redraw_after(&rpc, &mut incoming, "").await;
+        assert_eq!(
+            nxvim_test_harness::window0_field(&map, "leftcol").and_then(rmpv::Value::as_u64),
+            Some(0),
+            "the active tab is not scrolled sideways"
+        );
+        let map = nxvim_test_harness::redraw_after(&rpc, &mut incoming, "gT").await;
+        assert_eq!(
+            nxvim_test_harness::window0_field(&map, "leftcol").and_then(rmpv::Value::as_u64),
+            Some(0),
+            "a 150-column line inside a 200-column window is never scrolled sideways, \
+             whichever tab it is in"
+        );
+    }
+}

@@ -379,6 +379,13 @@ pub(crate) struct Window {
     pub(crate) saved_cursor: Cursor,
     pub(crate) saved_top: usize,
     pub(crate) saved_leftcol: usize,
+    /// Set when the screen width changed while this window was **parked** (an
+    /// inactive tab, or a non-focused layer's tab): its `saved_leftcol` was derived
+    /// against a viewport width that no longer applies, and no rect exists to measure
+    /// the new one against. [`Editor::clamp_leftcol_to_content`] raises it, and
+    /// [`Editor::clamp_pending_leftcol`] consumes it the moment the window is laid out
+    /// again — see the pair for why the clamp cannot simply happen at resize time.
+    pub(crate) leftcol_needs_clamp: bool,
     /// While this window is not focused, the byte offsets of its secondary
     /// (multi-)cursors — the per-window analogue of `saved_cursor`. The live set
     /// is the focused window's `CURSOR_NS` marks; on focus-out they are stashed
@@ -588,6 +595,7 @@ impl WindowTree {
             saved_cursor,
             saved_top,
             saved_leftcol,
+            leftcol_needs_clamp: false,
             saved_cursors: Vec::new(),
             rect: Rect::default(),
             options: WindowOptions::default(),
@@ -2841,6 +2849,11 @@ impl Editor {
         self.restore_secondary_cursors(saved_cursors);
         self.clamp_cursor();
         self.ensure_visible();
+        // This tree may have been parked across a screen-width change (a restored
+        // session's inactive tab is laid out at the boot placeholder width): now that it
+        // is live and settled, pull any window flagged then back to what its content
+        // justifies, so the tab is never shown panned into empty space.
+        self.clamp_pending_leftcol();
     }
 
     /// Re-enter a [`ResumeState`] mode parked on a window by the dock chord — the

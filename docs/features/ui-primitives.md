@@ -179,7 +179,13 @@ end)
 The owning namespace is derived from your plugin's location, exactly like
 `nx.shada.plugin()` — so two plugins can both use `persist = "main"` without colliding, and
 a persisted view whose plugin is no longer installed has its slot quietly collapsed on
-restore. From a context that attributes to no plugin (a bare `:lua`, an RPC, a test), pass
+restore. **A lazy plugin does not have to be awake for this.** A reserved slot names its
+owner, so a restore that finds one belonging to a `cmd`/`keys`/`event`/`ft`-lazy plugin
+loads that plugin — the slot is itself a trigger, on equal footing with the ones you
+declared. You do not arm anything for it: keep `nxvim-tree` behind `cmd = "NxTree"` and the
+sidebar you quit with still comes back, its `config` running (and its `on_restore`
+registering) before the slot is given up on. A plugin that is `enabled = false` stays
+unloaded and its slot collapses, exactly as if it had been removed. From a context that attributes to no plugin (a bare `:lua`, an RPC, a test), pass
 an explicit `namespace = "…"` to both `create` and `on_restore`, the same escape hatch
 `nx.shada.plugin(namespace)` takes. **GC:** the editor never deletes your stored state —
 delete it yourself when the view is closed for good (the `on_close` line above). A view

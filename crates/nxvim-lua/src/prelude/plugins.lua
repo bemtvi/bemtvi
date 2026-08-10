@@ -795,6 +795,41 @@ local function activate_eager()
   end
 end
 
+-- `nx.plugins._wake_for_view_restore(namespaces)` — load the LAZY plugins a session
+-- restore is waiting on, returning how many loads it started. A persisted `nx.view`
+-- slot records its owning plugin (the namespace IS the manager's name for it), and a
+-- restore reserves that slot before any plugin code runs. A lazy plugin's triggers are
+-- all things the *user* does — `:Cmd`, a keypress, opening a filetype — and a restore
+-- does none of them, so without this the plugin never loads, never registers its
+-- `nx.view.on_restore`, and its reserved sidebar collapses as an orphan: the dock you
+-- quit with silently does not come back. The reserved slot IS the trigger.
+--
+-- Each woken load is counted in flight for the persisted-view restore coordinator
+-- exactly as `activate_eager` counts an eager one, so the slot survives until this
+-- load's `config` has had its turn to claim it (and the collapse fires once it has).
+-- Called by `nx._run_view_restores` (prelude/view.lua) with the namespaces of the
+-- reserved slots that have no handler yet.
+function M._wake_for_view_restore(namespaces)
+  local started = 0
+  for _, ns in ipairs(namespaces or {}) do
+    local spec = M._specs[ns]
+    -- Only lazy ones: an eager plugin is already loading (and already counted), and a
+    -- plugin the user disabled stays disabled — a restored slot is not a reason to
+    -- override that (its slot collapses, as it would have with the plugin removed).
+    if spec and spec.lazy and enabled(spec) and not M._loaded[ns] and not M._loading[ns] then
+      started = started + 1
+      nx._view_restore_pending_loads = (nx._view_restore_pending_loads or 0) + 1
+      load_reporting(ns):finally(function()
+        nx._view_restore_pending_loads = math.max(0, (nx._view_restore_pending_loads or 1) - 1)
+        if nx._maybe_collapse_view_restores then
+          nx._maybe_collapse_view_restores()
+        end
+      end)
+    end
+  end
+  return started
+end
+
 -- ----- declaration ------------------------------------------------------------
 
 -- Register one or more plugin specs. Accepts a single spec (string or table) or a

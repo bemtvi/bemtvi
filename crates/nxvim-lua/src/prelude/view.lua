@@ -195,6 +195,23 @@ end
 -- (a synchronous `init.lua` / `pack/start` plugin — an async `nx.plugins` handler registers
 -- later and self-claims via `on_restore`'s drain-now). Then decides orphan collapse.
 function nx._run_view_restores()
+  -- FIRST, wake the lazy plugins the reserved slots belong to. A slot whose namespace names
+  -- a `cmd`/`keys`/`event`-lazy plugin has no handler here and never will — a restore
+  -- presses none of those triggers — so without this its dock collapses as an orphan and the
+  -- sidebar you quit with does not come back. The manager counts each wake-up load in flight
+  -- (`nx._view_restore_pending_loads`), so the collapse decision below waits for the load's
+  -- `config` to register its handler and claim the slot.
+  if nx.plugins and nx.plugins._wake_for_view_restore then
+    local want = {}
+    for _, e in ipairs(nx._view_pending or {}) do
+      -- Skip a namespace already registered: its handler is dispatched below (and its
+      -- plugin, if managed, is loaded by definition).
+      if not nx._view_restorers[e.namespace] then
+        want[#want + 1] = e.namespace
+      end
+    end
+    nx.plugins._wake_for_view_restore(want)
+  end
   for _, e in ipairs(nx._view_pending or {}) do
     local fn = nx._view_restorers[e.namespace]
     if fn then

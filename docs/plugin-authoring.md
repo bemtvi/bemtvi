@@ -117,7 +117,10 @@ plugin the lockfile pins; advancing past it is `:PluginUpdate`'s job, and
 `:PluginRestore` goes back. See
 [Configuration → the lockfile](../book/src/guide/configuration.md) for the full rules. A spec with `cmd`/`event`/`ft`/`keys` (or
 `lazy = true`) loads on first use; `config` runs after the plugin is on the
-runtimepath, `init` runs at startup regardless.
+runtimepath, `init` runs at startup regardless. Restoring a workspace session counts as
+first use too: a persisted [`nx.view`](features/ui-primitives.md#persisting-a-view-across-sessions)
+slot names its owner, so a lazy plugin whose sidebar was open when you quit is loaded by
+the restore itself — no trigger to press, nothing extra to declare.
 
 Git submodules are initialised by default — the manager clones with
 `--recurse-submodules` and runs `git submodule update --init --recursive` on update,

@@ -574,6 +574,100 @@ async fn session_restores_a_persisted_view_when_the_owning_plugin_loads_async() 
     }
 }
 
+#[tokio::test]
+async fn session_restores_a_persisted_view_when_the_owning_plugin_is_lazy() {
+    // A LAZY plugin owns the restored sidebar. Its declared triggers (`cmd`/`keys`/`event`)
+    // are things the *user* does, and a session restore does none of them — so nothing ever
+    // loads the plugin, its `on_restore` is never registered, and the slot the restore
+    // reserved for its sidebar collapses: the sidebar you quit with silently doesn't come
+    // back. A reserved slot naming the plugin IS the missing trigger, so the restore wakes it.
+    let dir = temp_dir("session_view_lazy_plugin_store");
+    let mroot = temp_dir("session_view_lazy_plugin_root");
+    let root = mroot.join("install");
+    let plugdir = write_restore_plugin(&temp_dir("session_view_lazy_plugin_dir"), "lazytree");
+
+    // The same lazy declaration on both runs: it loads only on `:LazyTree`, which no test
+    // (and no restore) ever types.
+    let decl = format!(
+        "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+         nx.plugins {{ {{ name = \"lazytree\", dir = \"{plug}\", cmd = \"LazyTree\",\n\
+           config = function() require(\"lazytree\").setup() end }} }}",
+        root = q(&root),
+        cfg = q(&mroot.join("config")),
+        plug = q(&plugdir),
+    );
+
+    // Session 1: the plugin's persisted view is mounted in a left dock (via the RPC escape
+    // hatch, ns "lazytree" — the plugin itself stays unloaded), its content stashed in the
+    // plugin's own shada. Quit.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl.clone());
+        let (rpc, incoming) = start_attached(si, 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local lines = { "root", "  a.txt", "  b.txt" }
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "lazytree",
+            }
+            v:set_lines(lines)
+            v:mount{ dock = "left", size = 30 }
+            nx.shada.plugin("lazytree"):set("view:main", lines)
+            "#,
+        )
+        .await;
+        exec_lua(&rpc, "nx.layer.main()").await; // quit from main
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: nothing presses the `cmd` trigger — the reserved slot must wake the plugin.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl);
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+
+        assert!(
+            poll_true(
+                &rpc,
+                "return _G.async_setup_ran == true and #nx.view.pending_restores() == 0",
+            )
+            .await,
+            "the reserved slot woke the lazy plugin, whose on_restore claimed it"
+        );
+        assert!(
+            exec_lua(&rpc, r#"return nx.plugins.list()"#)
+                .await
+                .as_array()
+                .map(|l| l.iter().any(|p| {
+                    let m = p.as_map().unwrap();
+                    let f = |k: &str| {
+                        m.iter()
+                            .find(|(a, _)| a.as_str() == Some(k))
+                            .map(|(_, b)| b.clone())
+                    };
+                    f("name").and_then(|v| v.as_str().map(str::to_string))
+                        == Some("lazytree".into())
+                        && f("loaded").and_then(|v| v.as_bool()) == Some(true)
+                }))
+                .unwrap_or(false),
+            "the manager reports the lazy plugin as loaded"
+        );
+        assert_eq!(
+            restored_view_content(&rpc).await,
+            "root|  a.txt|  b.txt",
+            "the woken plugin rebuilt the view's content from its own shada"
+        );
+        let w = main_win_width(&rpc).await;
+        assert!(
+            w < 70,
+            "the restored view's left dock shrinks the main (got {w})"
+        );
+    }
+}
+
 /// Write a plugin dir whose `setup` mounts a persistent `nx.view.component` in a left dock —
 /// the framework path (no hand-written `on_restore`). Loaded via `nx.plugins`, its namespace
 /// is the manager `name`, so `ctx.store` and the reserved slot line up across sessions.
@@ -660,6 +754,135 @@ async fn session_restores_a_persisted_component_when_the_owning_plugin_loads_asy
             window_count(&rpc).await,
             2,
             "main + the restored component dock"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_restores_a_persisted_component_when_the_owning_plugin_is_lazy() {
+    // The framework path (`nx.view.component` + `mount{ persist= }`) under a LAZY owner: the
+    // reserved slot wakes the plugin, its `setup` mounts the component, and the component's
+    // restore router adopts the slot instead of opening a second, fresh sidebar.
+    let dir = temp_dir("session_component_lazy_store");
+    let mroot = temp_dir("session_component_lazy_root");
+    let root = mroot.join("install");
+    let plugdir = write_component_plugin(&temp_dir("session_component_lazy_dir"), "notes");
+
+    let decl = format!(
+        "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+         nx.plugins {{ {{ name = \"notes\", dir = \"{plug}\", cmd = \"Notes\",\n\
+           config = function() require(\"notes\").setup() end }} }}",
+        root = q(&root),
+        cfg = q(&mroot.join("config")),
+        plug = q(&plugdir),
+    );
+
+    // Session 1: press the `cmd` trigger once so the component mounts and the layout
+    // captures its slot; seed the store, quit.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl.clone());
+        let (rpc, incoming) = start_attached(si, 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, ":Notes<CR>");
+        assert!(
+            poll_true(&rpc, "return _G.cplug_setup_ran == true").await,
+            "the cmd trigger loaded the lazy plugin and mounted its component"
+        );
+        exec_lua(
+            &rpc,
+            r#"nx.shada.plugin("notes"):set("view:notes", { "r1", "r2" })"#,
+        )
+        .await;
+        exec_lua(&rpc, "nx.layer.main()").await; // quit from main
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: nothing types `:Notes` — the reserved slot alone must wake the plugin.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl);
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        assert!(
+            poll_true(
+                &rpc,
+                r#"local b = _G.cplug_buf
+                   if not b then return false end
+                   return table.concat(nx.buf.lines(b, 0, -1, false), "|") == "r1|r2"
+                     and #nx.view.pending_restores() == 0"#,
+            )
+            .await,
+            "the woken lazy plugin's component adopted the slot and rebuilt from ctx.store"
+        );
+        assert_eq!(
+            window_count(&rpc).await,
+            2,
+            "main + the restored component dock — the slot was adopted, not doubled"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_collapses_the_slot_when_the_woken_lazy_plugin_claims_nothing() {
+    // The wake-up must not be able to wedge a restore: a lazy plugin woken by a reserved
+    // slot that then registers no `on_restore` (the feature was dropped, or it only mounts
+    // on demand) leaves the slot unclaimed — and the orphan collapse, which now waits for
+    // that wake-up load, must still fire once the load settles rather than leaving an empty
+    // placeholder window behind forever.
+    let dir = temp_dir("session_view_lazy_noclaim_store");
+    let mroot = temp_dir("session_view_lazy_noclaim_root");
+    let root = mroot.join("install");
+    let plugdir = temp_dir("session_view_lazy_noclaim_dir");
+
+    let decl = format!(
+        "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+         nx.plugins {{ {{ name = \"quiet\", dir = \"{plug}\", cmd = \"Quiet\",\n\
+           config = function() _G.quiet_loaded = true end }} }}",
+        root = q(&root),
+        cfg = q(&mroot.join("config")),
+        plug = q(&plugdir),
+    );
+
+    // Session 1: a persisted view owned by `quiet` is mounted in a left dock; quit.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl.clone());
+        let (rpc, incoming) = start_attached(si, 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local v = nx.view.create{
+              name = "Quiet", filetype = "nxview", persist = "main", namespace = "quiet",
+            }
+            v:set_lines({ "x" })
+            v:mount{ dock = "left", size = 30 }
+            "#,
+        )
+        .await;
+        exec_lua(&rpc, "nx.layer.main()").await;
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the slot wakes the plugin, which claims nothing — the slot must collapse.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl);
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        assert!(
+            poll_true(
+                &rpc,
+                "return _G.quiet_loaded == true and #nx.view.pending_restores() == 0",
+            )
+            .await,
+            "the slot woke the plugin and then drained"
+        );
+        assert_eq!(
+            window_count(&rpc).await,
+            1,
+            "the unclaimed slot collapsed after the wake-up load settled"
         );
     }
 }

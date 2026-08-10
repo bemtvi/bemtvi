@@ -2563,3 +2563,74 @@ nx.complete.setup { sources = { { 'fast' }, { 'slow' } }, min_chars = 2 }";
     feed(&rpc, "<C-y>");
     assert_eq!(lines(&rpc).await, vec!["cand_fast"]);
 }
+
+/// A **preselection** is the top row, not a row the user picked: a late batch that
+/// sorts above it must leave the highlight on top, not carry it down.
+///
+/// Regression (the manual-trigger twin of
+/// [`a_late_batch_reorders_the_popup_without_moving_the_selection`]): a manual trigger
+/// (`<C-Space>` → `nx.complete.trigger()`) opens the popup with row 0 preselected so a
+/// confirm accepts without navigating. Only the synchronous `buffer` words are there
+/// at that instant; the snippet/LSP rows stream in a tick later and — outranking the
+/// buffer words — sort above them. The re-sort followed the highlighted row's
+/// *identity*, so the preselection rode the buffer word down and the popup opened with
+/// its caret parked two rows below the top, on a candidate nobody chose. Identity is
+/// the right thing to follow for a row the user navigated to; a preselection has no
+/// identity to keep.
+#[tokio::test]
+async fn a_late_batch_leaves_a_preselection_on_the_top_row() {
+    let dir = temp_dir("complete_preselect_stays_on_top");
+    // `snip` outranks the `buffer` source, so once its rows land they sort above the
+    // buffer words. Its push is parked behind a promise the test releases by hand, so
+    // the reorder happens at an exact, known point — after the manual open, with no
+    // navigation in between and no sleeps.
+    let init = "\
+nx.complete.source {\n\
+  name = 'snip', priority = 5, debounce = 0,\n\
+  complete = function(ctx)\n\
+    return nx.promise.new(function(resolve)\n\
+      _G.release_snip = function()\n\
+        ctx.push { text = 'ifelse' }\n\
+        ctx.push { text = 'ifthen' }\n\
+        resolve()\n\
+      end\n\
+    end)\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'snip' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Two buffer words to complete from, then the prefix and an explicit trigger.
+    feed(&rpc, "iifcount ifvalue<CR>if");
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["ifcount", "ifvalue"],
+        "only the synchronous buffer source has answered yet"
+    );
+    assert!(menu_active(&menu), "a manual trigger preselects a row");
+    assert_eq!(menu_selected(&menu), 0, "…the top one");
+
+    // The snippet source answers: both rows outrank the buffer words and sort above.
+    exec_lua(&rpc, "release_snip()").await;
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("popup re-sorts"),
+    );
+    assert_eq!(
+        menu_items(&menu),
+        vec!["ifelse", "ifthen", "ifcount", "ifvalue"],
+        "the higher-priority late rows lead"
+    );
+    assert_eq!(
+        menu_selected(&menu),
+        0,
+        "the preselection stays on the top row rather than riding the buffer word down"
+    );
+
+    // ...and the confirm accepts the row the caret is actually on.
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["ifcount ifvalue", "ifelse"]);
+}

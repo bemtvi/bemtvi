@@ -635,6 +635,15 @@ pub(crate) struct Menu {
     /// completion popup it starts `false` (noselect — nothing highlighted, `<CR>`
     /// makes a newline) and flips `true` on the first navigation.
     selected_active: bool,
+    /// Whether the highlighted row is one the user **chose** (navigated to), as
+    /// opposed to a *preselection* — the top row a manual completion trigger
+    /// highlights up front so a confirm needs no navigation step. Both look the same
+    /// on screen (`selected_active`), but they mean different things to a re-sort:
+    /// a chosen row is an identity to follow, a preselection is just "the top row"
+    /// and must stay there. Only [`sort_complete_view`](Menu::sort_complete_view)
+    /// reads it; every other menu kind sets it alongside `selected_active` and never
+    /// re-sorts under the caret.
+    selection_chosen: bool,
     placement: MenuPlacement,
     /// The input-grab query field — `Some` for a picker, `None` for `select`.
     prompt: Option<PromptSet>,
@@ -725,6 +734,7 @@ impl Menu {
             match_spans: Vec::new(),
             cursor: 0,
             selected_active: false,
+            selection_chosen: false,
             placement,
             prompt: None,
             complete_prefix: String::new(),
@@ -881,10 +891,15 @@ impl Menu {
         // selection has to keep across the reorder. `self.cursor` is a position in the
         // *view*, so leaving it alone slides whatever the sort moves into that slot
         // under the caret: the popup would accept a candidate the user never chose.
-        // `None` for a noselect popup (nothing highlighted yet), which has no identity
-        // to preserve and must stay parked at the top.
-        let selected = (self.selected_active && self.cursor < self.view_len())
-            .then(|| self.item_at(self.cursor));
+        // `None` when there is no identity to preserve and the caret belongs at the
+        // top: a noselect popup (nothing highlighted yet), and equally a *preselection*
+        // — the top row a manual trigger highlights before the async sources have
+        // answered. A preselection means "the top row", so following it down as the
+        // snippet/LSP rows sort above would open the popup with its caret parked
+        // mid-list, on a candidate nobody chose.
+        let selected =
+            (self.selected_active && self.selection_chosen && self.cursor < self.view_len())
+                .then(|| self.item_at(self.cursor));
         let filtered = self.filtered.take().unwrap();
         let spans = std::mem::take(&mut self.match_spans);
         // The blend needs each row's fuzzy score against the live prefix; re-rank the
@@ -916,13 +931,17 @@ impl Menu {
             .map(|&pos| spans[pos].take().unwrap_or_default())
             .collect();
         let reordered: Vec<usize> = order.into_iter().map(|pos| filtered[pos]).collect();
-        // Follow the selected row to wherever it landed. A row that vanished mid-sort
+        // Follow the chosen row to wherever it landed. A row that vanished mid-sort
         // is not reachable here (the reorder is a permutation, never a filter), but
         // fall back to the cursor as it was rather than assuming it.
-        if let Some(item) = selected {
-            if let Some(at) = reordered.iter().position(|&i| i == item) {
-                self.cursor = at;
+        match selected {
+            Some(item) => {
+                if let Some(at) = reordered.iter().position(|&i| i == item) {
+                    self.cursor = at;
+                }
             }
+            // A preselection / noselect caret re-parks on the new top row.
+            None => self.cursor = 0,
         }
         self.filtered = Some(reordered);
     }
@@ -958,8 +977,10 @@ impl Menu {
         if len == 0 {
         } else if !self.selected_active {
             self.selected_active = true;
+            self.selection_chosen = true;
             self.cursor = 0;
         } else {
+            self.selection_chosen = true;
             self.cursor = (self.cursor + 1) % len;
         }
     }
@@ -972,8 +993,10 @@ impl Menu {
         if len == 0 {
         } else if !self.selected_active {
             self.selected_active = true;
+            self.selection_chosen = true;
             self.cursor = len - 1;
         } else {
+            self.selection_chosen = true;
             self.cursor = (self.cursor + len - 1) % len;
         }
     }
@@ -1555,6 +1578,7 @@ impl Editor {
             let len = m.view_len();
             if len > 0 {
                 m.selected_active = true;
+                m.selection_chosen = true;
                 m.cursor = idx.min(len - 1);
             }
         }

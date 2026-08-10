@@ -109,6 +109,20 @@ function nx._au_event_set()
   return out
 end
 
+-- Reject a user-command name the ex-command dispatcher can never reach. `:Name`
+-- resolves by an exact match on the command word, so a name carrying whitespace or
+-- punctuation is registered-but-undispatchable: `:Name` reports `E492` for a command
+-- sitting right there in the registry, and every diagnostic shows it as present. A
+-- trailing space in a config is invisible on the page, so this has to fail at
+-- REGISTRATION — the call site that would notice never runs. Lowercase names stay
+-- legal: nxvim dispatches plugin-provided `:help` / `:h`, so this checks the
+-- characters, not vim's uppercase-initial convention.
+local function check_command_name(name)
+  if type(name) ~= "string" or name == "" or name:find("[^%w_]") then
+    error("E182: Invalid command name: " .. tostring(name), 0)
+  end
+end
+
 -- `nx.user_command.create(name, command, opts)` [alias `nvim_create_user_command`]:
 -- register a global `:Name`. `command` is a function or an ex-command string.
 -- `opts.desc` (a one-line summary) is stored alongside the body — `get()` surfaces it
@@ -128,6 +142,7 @@ end
 --     the wildmenu and is re-run as you type; an ASYNC one (returns a promise, e.g. an
 --     `nx.async` function) lists in the picker. A throw / rejection yields no candidates.
 function nx.user_command.create(name, command, opts)
+  check_command_name(name)
   nx._user_commands[name] = command
   nx._user_command_desc[name] = type(opts) == "table" and opts.desc or nil
   nx._user_command_complete[name] = type(opts) == "table" and opts.complete or nil
@@ -141,6 +156,7 @@ end
 -- per-bufnr table so the global registry stays clean; `nx._resolve_user_command`
 -- consults both at dispatch.
 function nx.user_command.buf_create(buffer, name, command, opts)
+  check_command_name(name)
   if buffer == nil or buffer == 0 then
     buffer = nx._cur_buf and nx._cur_buf.bufnr or 0
   end

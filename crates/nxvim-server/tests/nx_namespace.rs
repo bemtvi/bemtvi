@@ -1370,3 +1370,64 @@ async fn runtime_file_globs_with_the_full_dialect() {
     assert_eq!(names("colors/alpha.lua").await, "alpha.lua");
     assert_eq!(names("colors/nonesuch.lua").await, "");
 }
+
+// ----- a command name that can never be typed must fail loud ------------------
+
+// A user command whose name carries whitespace (or any character the ex-command
+// parser cannot read back) is a dead registration: `:Name` never resolves to it, so
+// it reports `E492` for a command that demonstrably exists in the registry. Accepting
+// it silently is the worst outcome — a trailing space in a config is invisible, and
+// the only symptom is a command that "does nothing". Registration fails loud instead.
+#[tokio::test]
+async fn a_user_command_name_that_cannot_be_dispatched_is_rejected() {
+    let (rpc, _i) = start().await;
+
+    for bad in ["MarkdownPreview ", " Leading", "Two Words", "Has-Dash", ""] {
+        let err = exec_lua(
+            &rpc,
+            &format!(
+                "local ok, err = pcall(nx.user_command.create, \"{bad}\", function() end, {{}})\n\
+                 return tostring(ok) .. \"|\" .. tostring(err)"
+            ),
+        )
+        .await;
+        let err = format!("{err:?}");
+        assert!(
+            err.contains("false"),
+            "registering the name {bad:?} should fail loud, got {err}"
+        );
+        assert!(
+            err.contains("E182"),
+            "the rejection should name the invalid command, got {err}"
+        );
+    }
+
+    // The registry is left untouched by a rejected name.
+    let leaked = exec_lua(
+        &rpc,
+        "local n = 0 for k in pairs(nx.user_command.get()) do if k:find(\" \") then n = n + 1 end end return tostring(n)",
+    )
+    .await;
+    assert!(
+        format!("{leaked:?}").contains('0'),
+        "a rejected name must not land in the registry, got {leaked:?}"
+    );
+}
+
+// Lowercase names stay legal: nxvim dispatches plugin-provided `:help` / `:h`
+// (nxvim-help registers exactly those), so the check rejects undispatchable
+// characters only — never vim's uppercase-initial convention.
+#[tokio::test]
+async fn a_lowercase_command_name_is_still_accepted() {
+    let (rpc, _i) = start().await;
+    let ok = exec_lua(
+        &rpc,
+        "local ok = pcall(nx.user_command.create, \"help\", function() end, {})\n\
+         return tostring(ok) .. \"|\" .. tostring(nx.user_command.get()[\"help\"] ~= nil)",
+    )
+    .await;
+    assert!(
+        format!("{ok:?}").contains("true|true"),
+        "a lowercase command name must still register, got {ok:?}"
+    );
+}

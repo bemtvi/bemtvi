@@ -194,6 +194,73 @@ local function as_fn(v, what)
   return v
 end
 
+-- Every key `normalize` reads, plus the positional source at `[1]`. Anything else in
+-- a spec is dead weight: nothing reads it, so it changes nothing the author intended.
+-- That matters most for a misspelled TRIGGER key — `cmds` instead of `cmd` leaves the
+-- trigger set empty, which silently reclassifies the spec from lazy to EAGER, so no
+-- stub command is registered and `:TheCommand` reports `E492` for a plugin the author
+-- can see in their config.
+local SPEC_KEYS = {
+  [1] = true,
+  branch = true,
+  cmd = true,
+  commit = true,
+  config = true,
+  dependencies = true,
+  deps = true,
+  desc = true,
+  dir = true,
+  enabled = true,
+  event = true,
+  ft = true,
+  init = true,
+  keys = true,
+  lazy = true,
+  name = true,
+  src = true,
+  submodules = true,
+  tag = true,
+  url = true,
+  version = true,
+}
+
+-- The key `k` was most likely meant to be: a real key wearing a plural `s` (`cmds` ->
+-- `cmd`, `events` -> `event`) or missing one (`dep` -> `deps`). Returns nil when
+-- nothing is close, so the report falls back to "it is ignored".
+local function meant_key(k)
+  if type(k) ~= "string" then
+    return nil
+  end
+  if k:sub(-1) == "s" and SPEC_KEYS[k:sub(1, -2)] then
+    return k:sub(1, -2)
+  end
+  if SPEC_KEYS[k .. "s"] then
+    return k .. "s"
+  end
+  return nil
+end
+
+-- Report every key of `spec` the manager does not read, naming the plugin and the key.
+-- Reported, NOT raised: `M.add` normalizes a whole list in one loop, so throwing here
+-- would abort it and silently drop every spec AFTER this one — trading a small silent
+-- bug for a much larger one.
+local function report_unknown_keys(spec, name)
+  for k in pairs(spec) do
+    if not SPEC_KEYS[k] then
+      local hint = meant_key(k)
+      nx.notify(
+        "nx.plugins["
+          .. name
+          .. "]: unrecognized spec key '"
+          .. tostring(k)
+          .. "'"
+          .. (hint and (" — did you mean '" .. hint .. "'?") or " — it is ignored"),
+        3
+      )
+    end
+  end
+end
+
 -- Normalize one declared spec (a string shorthand or a table) into the internal
 -- record every later step reads. Fails loud on a spec naming neither a source nor
 -- a local `dir` — a silent skip would make a typo look like a working install.
@@ -215,6 +282,8 @@ local function normalize(spec)
 
   local name = spec.name or (src and basename(src)) or basename(dir)
   local url = src and (is_full_url(src) and src or M._opts.github:format(src)) or nil
+
+  report_unknown_keys(spec, name)
 
   -- `commit`/`tag`/`version` all pin; `commit` wins. A pin is never auto-updated.
   local commit = spec.commit
@@ -531,7 +600,12 @@ local function arm_lazy(spec)
   end
 
   for _, c in ipairs(spec._triggers.cmd) do
-    nx.command(c, function(o)
+    -- The trigger name comes straight from the author's spec, so it can be one the
+    -- ex-command dispatcher will never reach (`"MarkdownPreview "` — a trailing space
+    -- is invisible in a config). `nx.command` rejects it; report which plugin and which
+    -- trigger, and keep arming the rest. Raising here would abort `M.add`'s loop and
+    -- silently drop every spec AFTER this one.
+    local armed, arm_err = pcall(nx.command, c, function(o)
       M.load(name)
         :next(function()
           -- Re-dispatch the original invocation against the real command the
@@ -542,6 +616,17 @@ local function arm_lazy(spec)
           nx.notify(tostring(err and err.message or err), 4)
         end)
     end, { nargs = "*", desc = "Lazy-load " .. name .. ", then run :" .. c })
+    if not armed then
+      nx.notify(
+        "nx.plugins["
+          .. name
+          .. "]: cannot arm the `cmd` trigger '"
+          .. tostring(c)
+          .. "': "
+          .. tostring(arm_err and arm_err.message or arm_err),
+        3
+      )
+    end
   end
 
   for _, ev in ipairs(spec._triggers.event) do
@@ -632,6 +717,47 @@ local function maybe_fire_plugins_loaded()
 end
 nx._maybe_fire_plugins_loaded = maybe_fire_plugins_loaded
 
+-- Eager plugins found NOT on disk, batched for ONE report. A fresh config declares its
+-- whole set before the first `:PluginSync`, and one message per plugin would bury the
+-- message line under a dozen repaints — so the names accumulate and flush together.
+-- `reported` remembers what has been named, so re-declaring (a dependency re-added, a
+-- second `nx.plugins{}` call) does not repeat the warning; a name is forgotten again
+-- once the plugin is present, so a plugin removed from disk warns afresh.
+local missing_batch, missing_reported = nil, {}
+
+-- Report that eager `name` is declared but not installed. Silence here was the whole
+-- bug: `activate_eager` simply skipped an absent plugin, so a plugin the user can see
+-- in their config never loaded, its commands never existed, and nothing said why —
+-- leaving only `E492: Not an editor command` from a command they believe they have.
+-- The lazy trigger path already reports this, and declaring an eager one is no less
+-- of a dead end.
+local function report_missing(name)
+  if missing_reported[name] then
+    return
+  end
+  missing_reported[name] = true
+  if missing_batch then
+    missing_batch[#missing_batch + 1] = name
+    return
+  end
+  missing_batch = { name }
+  -- Flush on the NEXT tick, not this one: every plugin's presence check is its own
+  -- off-tick `nx.fs` call, so the rest of the set is still landing when the first one
+  -- reports. (`nx.schedule` runs within this convergence and would report alone.)
+  nx.on_next_tick(function()
+    local names = missing_batch
+    missing_batch = nil
+    table.sort(names)
+    nx.notify(
+      "nx.plugins: "
+        .. table.concat(names, ", ")
+        .. (#names == 1 and " is" or " are")
+        .. " declared but not installed — run :PluginSync",
+      3
+    )
+  end)
+end
+
 -- Load every enabled, eager (non-lazy), already-installed plugin that is not yet
 -- loaded — at startup and again after a sync brings new ones onto disk.
 local function activate_eager()
@@ -648,7 +774,10 @@ local function activate_eager()
       M._eager_pending = M._eager_pending + 1
       nx.async(function()
         if spec.dir ~= nil or nx.await(lfs.exists(spec._dir)) then
+          missing_reported[name] = nil
           nx.await(M.load(name))
+        else
+          report_missing(name)
         end
       end)()
         :catch(function(err)

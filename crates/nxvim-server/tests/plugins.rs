@@ -20,7 +20,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, map_get,
-    message_after, poll_true, q, spawn, start_attached, temp_dir,
+    message, message_after, poll_true, q, redraw_after_matching, spawn, start_attached, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -4392,6 +4392,17 @@ async fn scoped_clean_refuses_a_name_that_escapes_the_install_root() {
 }
 
 // A scoped verb that passes over the plugin it was NAMED must say so. Unscoped, skipping
+/// The freshest redraw whose message line contains `needle` — for a verb summary that
+/// an unrelated async notify (the manager's "declared but not installed" report) can
+/// repaint over before the test reads it.
+async fn summary_frame(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    needle: &'static str,
+) -> Vec<(Value, Value)> {
+    redraw_after_matching(rpc, incoming, "", move |m| message(m).contains(needle)).await
+}
+
 // a disabled or uninstalled plugin is routine; scoped, a silent "0 plugin(s)" is
 // indistinguishable from "already up to date".
 #[tokio::test]
@@ -4412,7 +4423,11 @@ async fn a_scoped_verb_says_why_it_skipped_the_plugin_you_named() {
     run_verb(&rpc, "nx.plugins.install({ plugins = 'alpha' })").await;
     assert!(poll_true(&rpc, "return _G.done == 0").await);
     assert!(!root.join("alpha").exists());
-    let msg = message_after(&rpc, &mut incoming, "").await;
+    // Target the verb's own summary rather than draining to the latest frame:
+    // declaring an uninstalled eager plugin now also reports "declared but not
+    // installed — run :PluginSync" on a later tick, and that repaint can land between
+    // the summary and this read.
+    let msg = message(&summary_frame(&rpc, &mut incoming, "installed 0 plugin(s)").await);
     assert!(
         msg.contains("installed 0 plugin(s)")
             && msg.contains("skipped 'alpha'")
@@ -4433,7 +4448,7 @@ async fn a_scoped_verb_says_why_it_skipped_the_plugin_you_named() {
     .await;
     run_verb(&rpc, "nx.plugins.update({ plugins = 'beta' })").await;
     assert!(poll_true(&rpc, "return _G.done == 0").await);
-    let msg = message_after(&rpc, &mut incoming, "").await;
+    let msg = message(&summary_frame(&rpc, &mut incoming, "updated 0 plugin(s)").await);
     assert!(
         msg.contains("updated 0 plugin(s)")
             && msg.contains("skipped 'beta'")
@@ -4491,5 +4506,215 @@ async fn the_dashboard_binds_both_verb_scopes_including_the_moved_refresh() {
     assert!(
         !msg.contains("newest change"),
         "<C-r> should reach the refresh mapping, not fall through to redo; got {msg:?}"
+    );
+}
+
+// ----- a declared plugin that never loads must say why ------------------------
+
+/// Capture every `nx.notify` into `_G.notes`, so a test asserts on the exact text a
+/// plugin-manager path reported rather than racing the message line (a later repaint
+/// overwrites it). `nx.notify` is looked up dynamically at each call site in the
+/// prelude, so replacing it here is enough.
+async fn capture_notifies(rpc: &Rpc) {
+    exec_lua(
+        rpc,
+        "_G.notes = {}\n\
+         nx.notify = function(m) _G.notes[#_G.notes + 1] = tostring(m) end",
+    )
+    .await;
+}
+
+/// `return true` once some captured notify contains every one of `needles`.
+fn any_note_with(needles: &[&str]) -> String {
+    let tests = needles
+        .iter()
+        .map(|n| format!("n:find(\"{n}\", 1, true)"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "for _, n in ipairs(_G.notes or {{}}) do if {tests} then return true end end\nreturn false"
+    )
+}
+
+// An EAGER plugin (no lazy trigger) that is not on disk was skipped in silence:
+// `activate_eager` only loaded it `if present`, with no else. The plugin never
+// loaded, its commands never existed, and nothing anywhere said so — the user sees
+// only `E492: Not an editor command` from a command they believe they installed.
+// The lazy path already reports this ("not installed — run :PluginSync"); declaring
+// an eager one must be just as loud.
+#[tokio::test]
+async fn an_eager_plugin_that_is_not_installed_reports_it() {
+    let (rpc, _i) = start().await;
+    let root = setup_root(&rpc, "plug_eager_missing").await;
+    capture_notifies(&rpc).await;
+
+    exec_lua(&rpc, "nx.plugins { { \"owner/gamma\", name = \"gamma\" } }").await;
+
+    assert!(
+        poll_true(
+            &rpc,
+            &any_note_with(&["gamma", "not installed", "PluginSync"])
+        )
+        .await,
+        "an eager plugin that is not on disk must report it, not skip silently"
+    );
+    assert!(!root.join("gamma").exists());
+}
+
+// The report names every missing plugin ONCE, in a single line: a fresh config
+// declares its whole set before the first `:PluginSync`, and one error per plugin
+// would bury the message line under a dozen repaints.
+#[tokio::test]
+async fn missing_eager_plugins_are_reported_together_once() {
+    let (rpc, _i) = start().await;
+    setup_root(&rpc, "plug_eager_missing_many").await;
+    capture_notifies(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "nx.plugins { { \"owner/one\", name = \"one\" }, { \"owner/two\", name = \"two\" } }",
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, &any_note_with(&["one", "two", "PluginSync"])).await,
+        "both missing plugins should be named in one report"
+    );
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "local n = 0\n\
+             for _, m in ipairs(_G.notes or {}) do if m:find(\"PluginSync\", 1, true) then n = n + 1 end end\n\
+             return n == 1"
+        )
+        .await,
+        Some(true),
+        "the missing set should be reported once, not once per plugin"
+    );
+}
+
+// ----- an unrecognized spec key must not silently change the spec -------------
+
+// `cmds = "X"` (the plural typo for `cmd`) was read by nobody: the spec normalized
+// with an EMPTY trigger set, which silently reclassified it from lazy to eager. No
+// stub command was registered, so `:X` was `E492`, and — being eager and not yet
+// installed — it never loaded either. Both halves of that were silent. An
+// unrecognized key is reported, naming the plugin and the key.
+#[tokio::test]
+async fn an_unknown_spec_key_is_reported() {
+    let (rpc, _i) = start().await;
+    setup_root(&rpc, "plug_unknown_key").await;
+    capture_notifies(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "nx.plugins { { \"owner/delta\", name = \"delta\", cmds = \"DeltaGo\" } }",
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, &any_note_with(&["delta", "cmds"])).await,
+        "an unrecognized spec key must be reported, naming the plugin and the key"
+    );
+    // The plural typo of a real trigger key is the whole reason this bites, so the
+    // report points at the key that was meant.
+    assert!(
+        poll_true(&rpc, &any_note_with(&["cmds", "cmd"])).await,
+        "the report should suggest the key that was meant"
+    );
+}
+
+// Reporting an unknown key must NOT throw: `M.add` normalizes the list in one loop,
+// so a raised error would abort it and silently drop every spec AFTER the offending
+// one — trading a small silent bug for a much larger one. The rest of the list is
+// declared as usual.
+#[tokio::test]
+async fn an_unknown_spec_key_does_not_drop_the_rest_of_the_list() {
+    let (rpc, _i) = start().await;
+    setup_root(&rpc, "plug_unknown_key_rest").await;
+    capture_notifies(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "nx.plugins { { \"owner/first\", name = \"first\" },\n\
+                      { \"owner/bad\", name = \"bad\", cmds = \"BadGo\" },\n\
+                      { \"owner/last\", name = \"last\" } }",
+    )
+    .await;
+
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "return nx.plugins._specs[\"last\"] ~= nil and nx.plugins._specs[\"bad\"] ~= nil"
+        )
+        .await,
+        Some(true),
+        "a spec with an unknown key, and every spec after it, must still be declared"
+    );
+}
+
+// The keys the manager DOES read must not be reported — the guard is worthless if it
+// cries wolf on a fully-specified spec.
+#[tokio::test]
+async fn a_fully_specified_spec_reports_no_unknown_key() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_allkeys_src");
+    let repo = make_repo(&src, "omega");
+    setup_root(&rpc, "plug_allkeys").await;
+    capture_notifies(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{a}\", name = \"omega\", desc = \"d\", branch = \"main\",\n\
+               submodules = false, enabled = true, lazy = true,\n\
+               cmd = \"OmegaGo\", event = \"BufWritePost\", ft = \"lua\", keys = \"<leader>zz\",\n\
+               init = function() end, config = function() end, dependencies = {{}} }} }}",
+            a = q(&repo)
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            "for _, m in ipairs(_G.notes or {}) do if m:find(\"unrecognized\", 1, true) then return false end end\n\
+             return true"
+        )
+        .await,
+        Some(true),
+        "every key the manager reads must be accepted without a warning"
+    );
+}
+
+// ----- a trigger command name that can never be typed -------------------------
+
+// `cmd = "MarkdownPreview "` — a trailing space in a config — registered the lazy
+// stub under a name `:MarkdownPreview` can never resolve to. The spec looked correct
+// in every diagnostic (`lazy=true`, `cmd` non-empty), yet the command reported E492
+// and the plugin never loaded. The registration is rejected, and the report names the
+// plugin and the offending trigger.
+#[tokio::test]
+async fn a_trigger_command_name_that_cannot_be_typed_is_reported() {
+    let (rpc, _i) = start().await;
+    setup_root(&rpc, "plug_bad_trigger").await;
+    capture_notifies(&rpc).await;
+
+    exec_lua(
+        &rpc,
+        "nx.plugins { { \"owner/mdp\", name = \"mdp\", cmd = \"MarkdownPreview \" },\n\
+                      { \"owner/after\", name = \"after\" } }",
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, &any_note_with(&["mdp", "MarkdownPreview"])).await,
+        "a trigger name that cannot be dispatched must be reported, naming the plugin"
+    );
+    // Reported, not raised: the spec after it is still declared.
+    assert_eq!(
+        lua_bool(&rpc, "return nx.plugins._specs[\"after\"] ~= nil").await,
+        Some(true),
+        "a bad trigger name must not drop the rest of the spec list"
     );
 }

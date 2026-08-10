@@ -217,6 +217,18 @@ function nx.keymap.set(mode, lhs, rhs, opts)
   })
 end
 
+-- `nx.keymap.expand_leader`(lhs): the `lhs` with `<leader>` / `<localleader>` replaced
+-- by the CURRENT `vim.g.mapleader` / `vim.g.maplocalleader` (each `"\"` when unset),
+-- matching the set-time expansion `nx.keymap.set` performs on every LHS it registers.
+--
+-- Call this when you need the concrete key sequence a map is registered under — most
+-- often to feed it back through `nx._feedkeys`, which parses raw vim key-notation and
+-- does NOT know `<leader>`. Expand once, at the moment you set the map, and reuse that
+-- string: the leader in force then is the one baked into the registration.
+function nx.keymap.expand_leader(lhs)
+  return keymap_expand_leader(lhs)
+end
+
 -- `nx.keymap.del`(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
 -- `opts.buffer` (0 = current) targets a buffer-local map; absent targets globals.
 function nx.keymap.del(mode, lhs, opts)

@@ -3805,6 +3805,155 @@ fn float_rect(map: &[(Value, Value)]) -> Option<(String, u64, u64)> {
     })
 }
 
+// ----- keys-lazy plugin: the FIRST press must run the mapping ----------------
+
+// A `keys`-lazy plugin arms a stub mapping on its trigger `lhs`; pressing it loads
+// the plugin and then feeds `lhs` back so the plugin's OWN mapping runs. The feed
+// goes through `nx._feedkeys`, which parses raw vim key-notation — it knows nothing
+// about `<leader>`, which `nx.keymap.set` expands at set time. So an unexpanded
+// `"<leader>e"` was fed as the literal characters `< l e a d e r > e`: in normal mode
+// that runs `<l` (shift), `e`, then `a` — entering INSERT — and the rest of the
+// notation was typed into the buffer. The second press worked, because by then the
+// plugin's real mapping had replaced the stub and nothing was fed at all.
+#[tokio::test]
+async fn keys_lazy_plugin_runs_its_mapping_on_the_first_press() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_keys_leader");
+    let repo = make_repo(&src, "kappa");
+    setup_root(&rpc, "plug_keys_leader").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "vim.g.mapleader = \" \"\n\
+             _G.kappa_fired = 0\n\
+             nx.plugins {{ {{ name = \"kappa\", dir = \"{dir}\", keys = \"<leader>e\",\n\
+               config = function()\n\
+                 nx.keymap.set(\"n\", \"<leader>e\", function()\n\
+                   _G.kappa_fired = _G.kappa_fired + 1\n\
+                 end)\n\
+               end }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+
+    // A buffer with known contents: the fed keys must not land in it.
+    exec_lua(&rpc, "nx.cmd('enew')").await;
+    exec_lua(
+        &rpc,
+        "return nx.buf.set_lines(0, 0, -1, false, { 'hello world' })",
+    )
+    .await;
+
+    // FIRST press of the trigger.
+    feed(&rpc, "<Space>e");
+
+    assert!(
+        poll_true(&rpc, "return _G.kappa_fired == 1").await,
+        "the first <leader>e press must load the plugin and run ITS mapping once"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello world".to_string()],
+        "the replayed trigger must not be typed into the buffer"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.mode().mode").await,
+        Value::from("n"),
+        "and must not have left normal mode"
+    );
+
+    // SECOND press: the plugin's own mapping, unchanged behavior.
+    feed(&rpc, "<Space>e");
+    assert!(
+        poll_true(&rpc, "return _G.kappa_fired == 2").await,
+        "the plugin's mapping keeps working on later presses"
+    );
+}
+
+// The stub trigger is dropped before the load, so a plugin whose `config` maps
+// something OTHER than the trigger key can't bounce the replayed key back into the
+// stub — which would re-enter it on every fed key until the typeahead recursion
+// limit tripped. The key simply falls through to its normal meaning afterwards.
+#[tokio::test]
+async fn keys_lazy_trigger_does_not_re_enter_itself_after_the_load() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_keys_noloop");
+    let repo = make_repo(&src, "iota");
+    setup_root(&rpc, "plug_keys_noloop").await;
+
+    // `x` is the trigger, and the plugin maps nothing at all.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"iota\", dir = \"{dir}\", keys = \"x\",\n\
+               config = function() _G.iota_cfg = true end }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+
+    exec_lua(&rpc, "nx.cmd('enew')").await;
+    exec_lua(
+        &rpc,
+        "return nx.buf.set_lines(0, 0, -1, false, { 'abcdef' })",
+    )
+    .await;
+
+    feed(&rpc, "x");
+
+    assert!(
+        poll_true(&rpc, "return _G.iota_cfg == true").await,
+        "the key trigger loaded the plugin"
+    );
+    assert!(
+        poll_true(
+            &rpc,
+            "return #(nx.buf.lines(0, 0, -1, false)[1] or '') == 5"
+        )
+        .await,
+        "the replayed `x` fell through to its built-in meaning exactly once — \
+         not zero times, and not until the recursion limit"
+    );
+}
+
+// A load that FAILS (the plugin isn't installed yet) must leave the trigger armed:
+// `nx.plugins.load` is retryable by design, so the same key has to wake the plugin
+// once a `:PluginSync` puts it on disk, instead of being dead until restart.
+#[tokio::test]
+async fn a_failed_keys_lazy_load_re_arms_its_trigger() {
+    let (rpc, _i) = start().await;
+    setup_root(&rpc, "plug_keys_rearm").await;
+
+    // Declared by URL and never installed, so `load` rejects with "not installed".
+    exec_lua(
+        &rpc,
+        "vim.g.mapleader = \" \"\n\
+         nx.plugins { { \"nxvim/nope\", keys = \"<leader>q\" } }",
+    )
+    .await;
+
+    let armed = "return (function()\n\
+      for _, m in ipairs(nx.keymap.get('n')) do\n\
+        if m.lhs == ' q' then return true end\n\
+      end\n\
+      return false\n\
+    end)()";
+    assert_eq!(
+        lua_bool(&rpc, armed).await,
+        Some(true),
+        "the trigger is armed under the EXPANDED lhs"
+    );
+
+    feed(&rpc, "<Space>q");
+
+    assert!(
+        poll_true(&rpc, armed).await,
+        "and is still armed after the load failed, so a later :PluginSync makes it work"
+    );
+}
+
 // ----- ft-lazy plugin with an ASYNC config -----------------------------------
 
 #[tokio::test]

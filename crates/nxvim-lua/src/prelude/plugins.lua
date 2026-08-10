@@ -508,8 +508,9 @@ end
 --
 --   * `cmd` re-dispatches the original invocation, with its args, against the real
 --     command the plugin just defined (it replaced this stub);
---   * `keys` feeds the key back through the typeahead so the plugin's own mapping
---     handles it;
+--   * `keys` drops its own stub map and feeds the key back through the typeahead so
+--     the plugin's own mapping handles it (the lhs is `<leader>`-expanded when armed,
+--     because the typeahead parses raw key-notation and has no notion of a leader);
 --   * `event` / `ft` **return the load promise**, so the autocmd dispatcher's settle
 --     protocol waits for the load — including an *async* `config` — and then replays
 --     the event to the handlers that config registered. A hot-path `event` is the one
@@ -572,15 +573,37 @@ local function arm_lazy(spec)
       lhs = k.lhs or k[1]
       mode = k.mode or k[2] or "n"
     end
-    nx.keymap.set(mode, lhs, function()
-      M.load(name)
-        :next(function()
-          nx._feedkeys(lhs, true, false) -- remap=true so the plugin's mapping fires
-        end)
-        :catch(function(err)
-          nx.notify(tostring(err and err.message or err), 4)
-        end)
-    end, { desc = "Lazy-load " .. name })
+    -- Expand <leader> HERE, once, and register the stub under the expanded form: the
+    -- replay below goes through `nx._feedkeys`, which parses raw vim key-notation and
+    -- knows nothing about <leader>. Feeding the unexpanded "<leader>e" typed it as the
+    -- literal characters `< l e a d e r > e` — `<l` shifted, `e` moved, `a` entered
+    -- INSERT and the rest landed in the buffer. Expanding at arm time (not at press
+    -- time) also keeps the vim set-time rule: the leader in force when the map is
+    -- declared is the one baked in.
+    lhs = nx.keymap.expand_leader(lhs)
+    local arm
+    arm = function()
+      nx.keymap.set(mode, lhs, function()
+        -- Drop the stub BEFORE loading, so the replayed key can only reach the plugin's
+        -- own mapping. Deleting it after the load would delete whatever the plugin's
+        -- `config` just registered on the same lhs, and leaving it in place would make a
+        -- plugin that maps something else re-enter this stub on every fed key until the
+        -- typeahead recursion limit trips.
+        nx.keymap.del(mode, lhs)
+        M.load(name)
+          :next(function()
+            nx._feedkeys(lhs, true, false) -- remap=true so the plugin's mapping fires
+          end)
+          :catch(function(err)
+            -- The load failed (not installed yet, a missing dependency) — and `M.load`
+            -- is deliberately retryable, so put the trigger back rather than leaving the
+            -- key dead until restart: after a `:PluginSync` the same press must work.
+            arm()
+            nx.notify(tostring(err and err.message or err), 4)
+          end)
+      end, { desc = "Lazy-load " .. name })
+    end
+    arm()
   end
 end
 

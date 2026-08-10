@@ -48,6 +48,11 @@
   .incsearch { background: #ffd866; color: #1e2127; }
   .statusline { background: var(--status-bg); color: var(--status-fg); }
   .statusline.focused { color: #e6e6e6; }
+  /* An unfocused window's bar takes StatusLineNC (vim's active-split cue), falling
+     back to the StatusLine vars when the theme leaves that group undefined — so a
+     theme modelling only StatusLine keeps both bars themed, as in the TUI/GUI. Only
+     window bars get `.nc`; the tabline and the global bar stay on `.statusline`. */
+  .statusline.nc { background: var(--status-nc-bg, var(--status-bg)); color: var(--status-nc-fg, var(--status-fg)); }
   /* A status / tabline bar paints in two stacked layers — all segment backgrounds
      first, then all glyph text on top — so an over-wide glyph (a powerline separator,
      a Nerd icon) overhangs into its neighbour like it should, instead of being
@@ -1970,6 +1975,8 @@
       setVar("--win-sep", "win_separator", "fg");
       setVar("--status-bg", "status_line", "bg");
       setVar("--status-fg", "status_line", "fg");
+      setVar("--status-nc-bg", "status_line_nc", "bg");
+      setVar("--status-nc-fg", "status_line_nc", "fg");
       setVar("--sel", "visual", "bg");
       setVar("--search", "search", "bg");
       setVar("--cursorline", "cursorline", "bg");
@@ -2203,7 +2210,7 @@
       return el;
     }
     function renderStatusSegments(box, segments, atRow, width, focused) {
-      const el = renderSegmentBar(segments, width, "row statusline" + (focused ? " focused" : ""));
+      const el = renderSegmentBar(segments, width, "row statusline" + (focused ? " focused" : " nc"));
       el.style.top = atRow * ch + "px";
       box.appendChild(el);
     }
@@ -2677,7 +2684,7 @@
       const pad = Math.max(1, width - left.length - right.length - 1);
       const text = (" " + left + " ".repeat(pad) + right + " ").slice(0, width).padEnd(width);
       const el = document.createElement("div");
-      el.className = "row statusline" + (w.focused ? " focused" : "");
+      el.className = "row statusline" + (w.focused ? " focused" : " nc");
       el.style.top = atRow * ch + "px";
       el.style.width = width * cw + "px";
       el.textContent = text;

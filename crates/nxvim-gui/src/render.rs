@@ -1031,7 +1031,8 @@ impl Renderer {
         // The global status line (`laststatus=3`), docked just below the main band.
         if global_status_rows > 0 {
             let row = mid_y + mid_h;
-            self.build_status_row(&view.global_status, (0, row), cols, view, quads, items);
+            let base = status_bar_colors(view, true);
+            self.build_status_row(&view.global_status, (0, row), cols, base, quads, items);
         }
 
         // The insert-mode completion popup, anchored over the focused window (in its
@@ -1146,7 +1147,8 @@ impl Renderer {
             }
             if win.status_visible && (oy + wrows) as usize > 0 {
                 let srow = oy + wrows.saturating_sub(1);
-                self.build_status_row(&win.status, (ox, srow), wcols, view, quads, items);
+                let base = status_bar_colors(view, win.focused);
+                self.build_status_row(&win.status, (ox, srow), wcols, base, quads, items);
             }
             return;
         }
@@ -1833,7 +1835,8 @@ impl Renderer {
         // does not slide), painted with its `%`-format segments' own styles.
         if win.status_visible && (oy + wrows) as usize > 0 {
             let srow = oy + wrows.saturating_sub(1);
-            self.build_status_row(&win.status, (ox, srow), wcols, view, quads, items);
+            let base = status_bar_colors(view, win.focused);
+            self.build_status_row(&win.status, (ox, srow), wcols, base, quads, items);
         }
 
         // The cursor lives only in the focused window — but a focused panel, the
@@ -2223,13 +2226,12 @@ impl Renderer {
         segments: &[StatusSegment],
         at: (u16, u16),
         width: u16,
-        view: &View,
+        base: (u32, u32),
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
         let (ox, row) = at;
-        let base_bg = style_bg(&view.status_line).unwrap_or(0x2a_2a_2a);
-        let base_fg = style_fg(&view.status_line).unwrap_or(DEFAULT_FG);
+        let (base_bg, base_fg) = base;
         // The base bar fills the whole row; segments paint over it.
         self.fill_cells(quads, ox, row, width, base_bg);
         self.paint_segments(segments, ox, row, base_fg, quads, items);
@@ -4629,6 +4631,27 @@ struct TablineColors {
     active_fg: u32,
     /// Active tab background (always a filled cell).
     active_bg: u32,
+}
+
+/// A status bar's base `(bg, fg)`. The focused window's bar takes `StatusLine`;
+/// every other one takes `StatusLineNC` — vim's cue for which split holds focus —
+/// falling back to `StatusLine` when the theme leaves that group undefined, so a
+/// theme modelling only `StatusLine` keeps both bars themed rather than dropping the
+/// unfocused one to the built-in grey. Mirrors the TUI's `status_line_nc_style`, so
+/// both clients paint the same bar.
+fn status_bar_colors(view: &View, focused: bool) -> (u32, u32) {
+    let bar = if focused {
+        &view.status_line
+    } else {
+        &view.status_line_nc
+    };
+    let bg = style_bg(bar)
+        .or_else(|| style_bg(&view.status_line))
+        .unwrap_or(0x2a_2a_2a);
+    let fg = style_fg(bar)
+        .or_else(|| style_fg(&view.status_line))
+        .unwrap_or(DEFAULT_FG);
+    (bg, fg)
 }
 
 impl TablineColors {

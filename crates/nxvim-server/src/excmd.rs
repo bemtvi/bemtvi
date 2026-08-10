@@ -720,11 +720,20 @@ impl EditHost {
         // a blend of two palettes that shifts with startup timing. Only the scheme's
         // own groups go; a plugin's stay (and a plugin restyling on `ColorScheme`
         // re-registers below anyway). Blank definitions are how the registry removes.
-        for group in std::mem::take(&mut self.scheme_groups) {
+        let dropped: Vec<String> = std::mem::take(&mut self.scheme_groups)
+            .into_iter()
+            .collect();
+        for group in &dropped {
             self.editor
                 .highlights
-                .set_ns(0, &group, nxvim_core::highlight::HlDef::default());
+                .set_ns(0, group, nxvim_core::highlight::HlDef::default());
         }
+        // Erase the same rows from the Lua mirror right now. The full mirror push is
+        // gated on the registry generation and only lands between turns, so the
+        // `ColorScheme` handler fired below would otherwise still read these groups as
+        // defined, with the OUTGOING theme's colours — and a plugin re-deriving its
+        // defaults there would skip them as "already styled".
+        let _ = self.lua.clear_hl_mirror_rows(&dropped);
         if let Err(e) = self.lua.exec(&src) {
             self.editor
                 .echo(format!("E5108: Error loading colorscheme {name}: {e}"));

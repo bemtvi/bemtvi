@@ -315,6 +315,7 @@ pub struct WinChrome {
     pub color_column: Option<Style>,
     pub end_of_buffer: Option<Style>,
     pub status_line: Option<Style>,
+    pub status_line_nc: Option<Style>,
     pub normal_float: Option<Style>,
 }
 
@@ -347,6 +348,13 @@ impl WindowView {
     }
     pub fn status_line(&self, view: &View) -> Option<Style> {
         self.chrome.status_line.or(view.status_line)
+    }
+    /// The UNFOCUSED status bar's look (`StatusLineNC`). `None` when neither this
+    /// window's `winhighlight` nor the colorscheme defines it — the client then
+    /// falls back to [`status_line`](Self::status_line), so a theme that models only
+    /// `StatusLine` still paints both bars.
+    pub fn status_line_nc(&self, view: &View) -> Option<Style> {
+        self.chrome.status_line_nc.or(view.status_line_nc)
     }
     pub fn normal_float(&self, view: &View) -> Option<Style> {
         self.chrome.normal_float.or(view.normal_float)
@@ -523,6 +531,11 @@ pub struct View {
     pub search_style: Option<Style>,
     pub incsearch_style: Option<Style>,
     pub status_line: Option<Style>,
+    /// The `StatusLineNC` look — the status bar of every window that does NOT hold
+    /// focus, which is vim's cue for which split is active. `None` when the
+    /// colorscheme leaves it undefined, so the client falls back to `status_line`
+    /// (a theme that models only `StatusLine` keeps both bars themed). Global.
+    pub status_line_nc: Option<Style>,
     /// The `WinSeparator` look — the split / dock border glyphs (`│` / `─`). `None`
     /// when the colorscheme leaves it undefined, so the client falls back to the
     /// status-line tint (vim's out-of-the-box separator look). Global.
@@ -899,6 +912,7 @@ impl View {
         self.search_style = chrome("search");
         self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
+        self.status_line_nc = chrome("status_line_nc");
         self.win_separator = chrome("win_separator");
         self.tabline_style = chrome("tabline");
         self.tabline_sel = chrome("tabline_sel");
@@ -1239,6 +1253,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
                 color_column: chrome_style(c, "colorcolumn", styles),
                 end_of_buffer: chrome_style(c, "end_of_buffer", styles),
                 status_line: chrome_style(c, "status_line", styles),
+                status_line_nc: chrome_style(c, "status_line_nc", styles),
                 normal_float: chrome_style(c, "normal_float", styles),
             }
         },

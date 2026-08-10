@@ -50,6 +50,11 @@ hl(0, "Search",       { fg = p.fg, bg = p.search })
 hl(0, "IncSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "CurSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "StatusLine",   { fg = p.fg, bg = p.bg_dark })
+-- The UNFOCUSED window's status line: the same darker strip, with a dimmed
+-- foreground so the focused bar reads as the active one (vim fades the inactive
+-- text). Statusline plugins derive their inactive palette from this group, so
+-- leaving it undefined stranded them on a generic grey.
+hl(0, "StatusLineNC", { fg = p.comment, bg = p.bg_dark })
 -- Tabline: the bar sits on the same darker chrome background as the status line
 -- (`TabLineFill`), inactive tabs are dimmed onto it (`TabLine`), and the active
 -- tab takes the *editor* background so it reads as the front tab joined to the
@@ -101,6 +106,11 @@ hl(0, "Float",       { fg = p.orange })
 hl(0, "Constant",    { fg = p.orange })
 hl(0, "Function",    { fg = p.blue })
 hl(0, "Identifier",  { fg = p.fg })
+-- `Statement` is the parent of the keyword family in vim's group hierarchy
+-- (Conditional / Repeat / Label / Exception / Keyword all default to it), so a
+-- plugin reading it as "the keyword hue" resolves even though we colour each
+-- child explicitly below.
+hl(0, "Statement",   { fg = p.purple })
 hl(0, "Keyword",     { fg = p.purple })
 hl(0, "Conditional", { fg = p.purple })
 hl(0, "Repeat",      { fg = p.purple })

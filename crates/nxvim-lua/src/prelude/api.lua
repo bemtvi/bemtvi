@@ -1436,6 +1436,184 @@ function vim.fn.hlexists(name)
   return nx.hl.exists(name) and 1 or 0
 end
 
+-- The slot -> source-group chain `nx.hl.palette` resolves, and the One Dark literal
+-- each chain ends in. The literals ARE the built-in `nxvim` colorscheme's palette, so
+-- a session with no colorscheme loaded still reads as the editor's own theme rather
+-- than as some foreign plugin default. Kept above the docstring so the generated book
+-- page stays attached to the function (the generator takes the comment block
+-- immediately above a definition).
+--
+-- A chain lists the canonical groups that carry that hue in vim's own group
+-- vocabulary, most specific first. `Error` is deliberately absent from `red`: vim's
+-- `Error` is white-ON-red, so its `fg` is a *background* colour and would invert any
+-- accent derived from it.
+local PALETTE_SLOTS = {
+  -- surfaces
+  { "bg", { { "Normal", "bg" } }, "#282c34" },
+  { "bg_alt", { { "NormalFloat", "bg" }, { "StatusLine", "bg" } }, "#21252b" },
+  { "bg_cursorline", { { "CursorLine", "bg" } }, "#2c313a" },
+  { "bg_sel", { { "Visual", "bg" } }, "#3e4451" },
+  -- text
+  { "fg", { { "Normal", "fg" } }, "#abb2bf" },
+  { "muted", { { "Comment", "fg" }, { "LineNr", "fg" }, { "NonText", "fg" } }, "#5c6370" },
+  -- accents
+  {
+    "red",
+    { { "DiagnosticError", "fg" }, { "ErrorMsg", "fg" }, { "Exception", "fg" } },
+    "#e06c75",
+  },
+  { "green", { { "String", "fg" }, { "DiagnosticOk", "fg" } }, "#98c379" },
+  { "yellow", { { "Type", "fg" }, { "DiagnosticWarn", "fg" }, { "WarningMsg", "fg" } }, "#e5c07b" },
+  { "blue", { { "Function", "fg" }, { "Directory", "fg" }, { "Title", "fg" } }, "#61afef" },
+  { "purple", { { "Keyword", "fg" }, { "Statement", "fg" }, { "PreProc", "fg" } }, "#c678dd" },
+  { "cyan", { { "Operator", "fg" }, { "Special", "fg" }, { "DiagnosticInfo", "fg" } }, "#56b6c2" },
+  { "orange", { { "Constant", "fg" }, { "Number", "fg" }, { "Boolean", "fg" } }, "#d19a66" },
+}
+
+-- `nx.hl.palette()` -> the ACTIVE colorscheme's semantic palette, as a table of
+-- `"#rrggbb"` strings. This is the canonical way a plugin picks default colors: read
+-- the hues the running theme actually uses instead of hardcoding one theme's hex
+-- values, which go wrong the moment any other colorscheme (or a light flavour of the
+-- same one) is loaded.
+--
+-- Each slot resolves through a chain of the canonical vim/treesitter groups that carry
+-- that hue, most specific first, falling back to the built-in `nxvim` (One Dark)
+-- value when the active theme defines none of them — so a bare session with no
+-- colorscheme still lands on the editor's own colors:
+--
+-- ```
+-- SURFACES
+--   bg             Normal.bg
+--   bg_alt         NormalFloat.bg -> StatusLine.bg    (a float / sidebar / status strip)
+--   bg_cursorline  CursorLine.bg
+--   bg_sel         Visual.bg
+-- TEXT
+--   fg             Normal.fg
+--   muted          Comment.fg -> LineNr.fg -> NonText.fg   (guides, dimmed entries)
+-- ACCENTS
+--   red            DiagnosticError.fg -> ErrorMsg.fg -> Exception.fg
+--   green          String.fg -> DiagnosticOk.fg
+--   yellow         Type.fg -> DiagnosticWarn.fg -> WarningMsg.fg
+--   blue           Function.fg -> Directory.fg -> Title.fg
+--   purple         Keyword.fg -> Statement.fg -> PreProc.fg
+--   cyan           Operator.fg -> Special.fg -> DiagnosticInfo.fg
+--   orange         Constant.fg -> Number.fg -> Boolean.fg
+-- ```
+--
+-- Links are followed to the concrete definition, so a theme that writes
+-- `Function = { link = "Blue" }` still resolves. A fresh table is returned each call
+-- and nothing is cached: re-call it from a `ColorScheme` handler to restyle live.
+--
+-- ```lua
+-- local function paint()
+--   local p = nx.hl.palette()
+--   nx.hl.define(0, "MyPluginKey", { fg = p.cyan })
+--   nx.hl.define(0, "MyPluginDim", { fg = p.muted, italic = true })
+-- end
+-- paint()
+-- nx.on("ColorScheme", {}, paint)
+-- ```
+function nx.hl.palette()
+  local out = {}
+  for _, slot in ipairs(PALETTE_SLOTS) do
+    local name, chain, fallback = slot[1], slot[2], slot[3]
+    local value = nil
+    for _, source in ipairs(chain) do
+      local def = nx.hl.get(0, { name = source[1], link = false })
+      local v = def and def[source[2]]
+      if type(v) == "number" then
+        value = string.format("#%06x", v)
+        break
+      end
+    end
+    out[name] = value or fallback
+  end
+  return out
+end
+
+-- The groups `nx.hl.fallback` has installed, `name -> the spec it wrote`. This is the
+-- ownership ledger that lets a re-apply tell "still holding OUR default" apart from
+-- "a theme or the user has since claimed it". Kept above the docstring so the
+-- generated book page stays attached to the function.
+local hl_fallback_owned = {}
+
+-- A `"#rrggbb"` string or a 0xRRGGBB int -> the int, for comparing a spec (which
+-- writes strings) against a live definition (which reads ints).
+local function hl_color_num(v)
+  if type(v) == "string" then
+    return tonumber((v:gsub("^#", "")), 16)
+  end
+  return v
+end
+
+-- Is the live definition `live` exactly the spec `spec` (over the union of their
+-- keys, colours compared numerically)? `link` and the boolean attrs compare directly.
+local function hl_def_equal(live, spec)
+  local keys = {}
+  for k in pairs(live) do
+    keys[k] = true
+  end
+  for k in pairs(spec) do
+    keys[k] = true
+  end
+  for k in pairs(keys) do
+    local a, b = live[k], spec[k]
+    if k == "fg" or k == "bg" or k == "sp" then
+      a, b = hl_color_num(a), hl_color_num(b)
+    end
+    if a ~= b then
+      return false
+    end
+  end
+  return true
+end
+
+-- `nx.hl.fallback(name, spec)` -> `true` when it installed: define highlight group
+-- `name` as a DEFAULT that yields to the active colorscheme and to the user. It writes
+-- `spec` only when the group is undefined, or when the group still holds exactly what
+-- this API last wrote for it — so a theme (or an explicit `nx.hl.define`) that claims
+-- the group is never clobbered, and a stale default from a *previous* theme is.
+--
+-- That second half is what a plain `if not nx.hl.exists(name)` guard gets wrong.
+-- `:colorscheme` drops only the outgoing scheme's OWN groups; a plugin's stay. So a
+-- group the new theme doesn't model still holds the default derived from the old one,
+-- `exists` reports true, and the guard skips the re-apply — leaving, say, a
+-- dark-flavour hex on a light theme. Pair this with `nx.hl.palette` and a
+-- `ColorScheme` handler and the defaults track whatever is loaded:
+--
+-- ```lua
+-- local function paint()
+--   local p = nx.hl.palette()
+--   nx.hl.fallback("MyPluginKey", { fg = p.cyan })
+--   nx.hl.fallback("MyPluginDim", { fg = p.muted, italic = true })
+-- end
+-- paint()
+-- nx.on("ColorScheme", {}, paint)
+-- ```
+function nx.hl.fallback(name, spec)
+  if type(name) ~= "string" or name == "" then
+    error("nx.hl.fallback: `name` must be a non-empty highlight group name", 2)
+  end
+  if type(spec) ~= "table" then
+    error("nx.hl.fallback: `spec` must be a highlight definition table", 2)
+  end
+  local live = nx.hl.get(0, { name = name })
+  local claimed = next(live) ~= nil
+  local owned = hl_fallback_owned[name]
+  if claimed and not (owned and hl_def_equal(live, owned)) then
+    -- Somebody else owns this group: the colorscheme styled it, or the user did.
+    hl_fallback_owned[name] = nil
+    return false
+  end
+  nx.hl.define(0, name, spec)
+  local copy = {}
+  for k, v in pairs(spec) do
+    copy[k] = v
+  end
+  hl_fallback_owned[name] = copy
+  return true
+end
+
 -- ===== nvim_* deprecated aliases & small gaps ================================
 
 -- `nx.buf.set_option(buf, name, value)` [alias `nvim_buf_set_option`]: set buffer-local

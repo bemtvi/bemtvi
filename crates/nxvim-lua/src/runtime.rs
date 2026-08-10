@@ -3769,6 +3769,30 @@ impl LuaRuntime {
         set.call(entries)
     }
 
+    /// Drop `names` from the global `nx._hl_defs` mirror **now** — the erase side of
+    /// the same-turn write-through `nx.hl.define` already does. It exists for the one
+    /// place the server clears groups behind Lua's back: `:colorscheme` dropping the
+    /// outgoing scheme's own groups before sourcing the new one. The full mirror push
+    /// is gated on the registry generation and only lands between turns, so without
+    /// this a `ColorScheme` handler — where every plugin restyles — reads a mirror
+    /// that still reports those groups defined, carrying the *previous* theme's
+    /// colours. A plugin re-deriving its defaults then sees "already styled" and skips
+    /// the group, leaving the old theme's colour on screen.
+    pub fn clear_hl_mirror_rows(&self, names: &[String]) -> mlua::Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let nx = self.nx()?;
+        let defs: mlua::Table = match nx.get::<Option<mlua::Table>>("_hl_defs")? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        for name in names {
+            defs.set(name.as_str(), mlua::Value::Nil)?;
+        }
+        Ok(())
+    }
+
     /// Refresh the per-namespace highlight mirror (`nx._hl_defs_ns[ns][name]`)
     /// that `nvim_get_hl(ns, …)` reads for a non-zero namespace. Rebuilds the
     /// whole `_hl_defs_ns` map from the core registry's non-zero namespaces (the

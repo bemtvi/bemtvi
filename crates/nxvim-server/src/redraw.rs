@@ -1222,6 +1222,11 @@ const CHROME: &[(&str, &str)] = &[
     ("search", "Search"),
     ("incsearch", "IncSearch"),
     ("status_line", "StatusLine"),
+    // The UNFOCUSED window's status bar. vim paints only the focused window's bar
+    // with `StatusLine`; every other one takes `StatusLineNC`, which is the cue
+    // telling you which split has focus. A client falls back to `status_line` when
+    // the colorscheme leaves it undefined.
+    ("status_line_nc", "StatusLineNC"),
     ("win_separator", "WinSeparator"),
     ("tabline", "TabLine"),
     ("tabline_sel", "TabLineSel"),

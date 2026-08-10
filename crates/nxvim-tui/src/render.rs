@@ -112,6 +112,18 @@ fn status_line_style(view: &View) -> Style {
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED))
 }
 
+/// The base style for an UNFOCUSED window's status bar — the theme's
+/// `StatusLineNC`, vim's own group for it and the cue telling you which split has
+/// focus. Falls back to [`status_line_style`] when the colorscheme leaves it
+/// undefined: a theme that models only `StatusLine` must still paint both bars
+/// themed, since dropping the unfocused one to reverse-video would read as broken
+/// rather than as subtle.
+fn status_line_nc_style(view: &View) -> Style {
+    view.status_line_nc
+        .map(rt)
+        .unwrap_or_else(|| status_line_style(view))
+}
+
 /// The style for the split separators and permanent-dock border glyphs: the
 /// theme's `WinSeparator` group when the colorscheme defines it, else the
 /// status-line tint (vim's out-of-the-box separator look — a colorscheme with no
@@ -365,7 +377,7 @@ pub(crate) fn render(
 
     // The single global status line (`laststatus=3`), docked below all windows.
     if global_status_rows > 0 {
-        render_status(frame, global_status_area, &view.global_status, view);
+        render_status(frame, global_status_area, &view.global_status, view, true);
     }
 
     render_command(frame, cmd_area, view);
@@ -837,7 +849,7 @@ fn render_window(
             store.render(frame, text_area, image);
         }
         if let Some(status_area) = status_area {
-            render_status(frame, status_area, &win.status, view);
+            render_status(frame, status_area, &win.status, view, win.focused);
         }
         return (text_area, 0, 0);
     }
@@ -1241,7 +1253,7 @@ fn render_window(
         }
     }
     if let Some(status_area) = status_area {
-        render_status(frame, status_area, &win.status, view);
+        render_status(frame, status_area, &win.status, view, win.focused);
     }
     // How far the inline inlay hints on the cursor's row push the cursor right —
     // computed from `frame_inlay`, so it's the band's hints mid-slide and the
@@ -2337,14 +2349,27 @@ fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
 
 /// Paint a status line from the `segments` the server's `%`-format engine
 /// projected (text + resolved style). The base look is the theme's `StatusLine`
-/// when loaded, else reverse-video; each segment's own style patches onto that
-/// base (so a `%#Group#` that sets only a foreground keeps the status background).
-/// Segments span the painted width — the engine's `%=`/`%<` pass already padded
-/// or truncated them to fit — and the base style fills any remainder. An empty
-/// `segments` (an older server) leaves the bare base look across the row. Shared
-/// by the per-window status row and the global status line (`laststatus=3`).
-fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view: &View) {
-    let base = status_line_style(view);
+/// when this bar's window holds focus and `StatusLineNC` when it doesn't (vim's
+/// active/inactive split cue), else reverse-video; each segment's own style patches
+/// onto that base (so a `%#Group#` that sets only a foreground keeps the status
+/// background). Segments span the painted width — the engine's `%=`/`%<` pass
+/// already padded or truncated them to fit — and the base style fills any
+/// remainder. An empty `segments` (an older server) leaves the bare base look
+/// across the row. Shared by the per-window status row and the global status line
+/// (`laststatus=3`), which is always the ACTIVE bar — there is only one, and it
+/// describes the focused window.
+fn render_status(
+    frame: &mut Frame,
+    area: Rect,
+    segments: &[StatusSegment],
+    view: &View,
+    focused: bool,
+) {
+    let base = if focused {
+        status_line_style(view)
+    } else {
+        status_line_nc_style(view)
+    };
 
     let spans: Vec<Span> = segments
         .iter()

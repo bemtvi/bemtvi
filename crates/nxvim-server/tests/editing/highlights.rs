@@ -906,3 +906,259 @@ async fn a_new_colorscheme_drops_the_previous_scheme_groups() {
         "a plugin-defined group survives a colorscheme switch"
     );
 }
+
+/// `nx.hl.palette()` -> the named slot, as the `"#rrggbb"` string the API returns.
+async fn palette_slot(rpc: &Rpc, slot: &str) -> String {
+    let code = format!("return nx.hl.palette()[{slot:?}]");
+    exec_lua(rpc, &code)
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn hl_palette_derives_the_builtin_scheme_hues() {
+    // `nx.hl.palette()` is how a plugin picks default colors without hardcoding one
+    // theme's hex values. Under `:colorscheme nxvim` every accent slot must resolve
+    // to the built-in One Dark palette, read off the canonical groups the scheme
+    // defines (String -> green, Type -> yellow, Function -> blue, …).
+    let dir = temp_dir("hl_palette_builtin");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+    for (slot, want) in [
+        ("bg", "#282c34"),
+        ("bg_alt", "#21252b"),
+        ("bg_cursorline", "#2c313a"),
+        ("bg_sel", "#3e4451"),
+        ("fg", "#abb2bf"),
+        ("muted", "#5c6370"),
+        ("red", "#e06c75"),
+        ("green", "#98c379"),
+        ("yellow", "#e5c07b"),
+        ("blue", "#61afef"),
+        ("purple", "#c678dd"),
+        ("cyan", "#56b6c2"),
+        ("orange", "#d19a66"),
+    ] {
+        assert_eq!(
+            palette_slot(&rpc, slot).await,
+            want,
+            "palette slot `{slot}` under :colorscheme nxvim"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hl_palette_follows_the_active_scheme_and_its_links() {
+    // The point of the palette is that it tracks whatever theme is loaded — including
+    // a group defined as a LINK, which must resolve to the concrete definition. A slot
+    // whose whole chain the theme leaves undefined falls back to the built-in nxvim
+    // value, so a partial theme never strands a plugin on a missing colour.
+    let dir = temp_dir("hl_palette_active");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("mytheme.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal',   { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'MyGreen',  { fg = '#a6e3a1' })\n\
+         vim.api.nvim_set_hl(0, 'String',   { link = 'MyGreen' })\n\
+         vim.api.nvim_set_hl(0, 'Function', { fg = '#89b4fa' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme mytheme<CR>").await;
+
+    assert_eq!(palette_slot(&rpc, "bg").await, "#1e1e2e");
+    assert_eq!(palette_slot(&rpc, "fg").await, "#cdd6f4");
+    assert_eq!(palette_slot(&rpc, "blue").await, "#89b4fa");
+    assert_eq!(
+        palette_slot(&rpc, "green").await,
+        "#a6e3a1",
+        "a linked String resolves through to its concrete definition"
+    );
+    // `NormalFloat`/`StatusLine` are unstyled by this theme, so `bg_alt` falls back.
+    assert_eq!(
+        palette_slot(&rpc, "bg_alt").await,
+        "#21252b",
+        "an unmodelled slot falls back to the built-in nxvim value"
+    );
+
+    // Switching schemes re-derives: the same call now reports One Dark.
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+    assert_eq!(palette_slot(&rpc, "bg").await, "#282c34");
+    assert_eq!(palette_slot(&rpc, "green").await, "#98c379");
+}
+
+#[tokio::test]
+async fn hl_fallback_yields_to_a_theme_but_replaces_its_own_stale_default() {
+    // `nx.hl.fallback` is how a plugin ships default groups. The half a plain
+    // `if not nx.hl.exists(name)` guard gets wrong is the RE-apply: `:colorscheme`
+    // drops only the outgoing scheme's own groups, so a group the incoming theme
+    // doesn't model still holds the default derived from the previous one — `exists`
+    // says true and the guard skips it, stranding (say) a dark hex on a light theme.
+    let dir = temp_dir("hl_fallback");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    // `dark` styles the plugin's group; `light` says nothing about it (as a real
+    // theme says nothing about the groups it doesn't model).
+    std::fs::write(
+        dir.join("colors").join("dark.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal',  { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'Comment', { fg = '#6c7086' })\n\
+         vim.api.nvim_set_hl(0, 'PlugDim', { fg = '#45475a' })\n",
+    )
+    .expect("write dark");
+    std::fs::write(
+        dir.join("colors").join("light.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal',  { fg = '#4c4f69', bg = '#eff1f5' })\n\
+         vim.api.nvim_set_hl(0, 'Comment', { fg = '#9ca0b0' })\n",
+    )
+    .expect("write light");
+    // The plugin: paint the group from the active palette, re-painting on ColorScheme.
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local function paint()\n\
+           nx.hl.fallback('PlugDim', { fg = nx.hl.palette().muted })\n\
+         end\n\
+         paint()\n\
+         nx.on('ColorScheme', {}, paint)\n",
+    )
+    .await;
+
+    // With no theme, the default derives from the built-in nxvim palette.
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "PlugDim").await, "fg"),
+        Some(hex("5c6370")),
+        "the plugin default derives from the built-in palette"
+    );
+
+    // `dark` styles PlugDim itself — the theme wins over the plugin's default.
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme dark<CR>").await;
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "PlugDim").await, "fg"),
+        Some(hex("45475a")),
+        "a theme that styles the group beats the plugin's fallback"
+    );
+
+    // `light` doesn't model PlugDim. The plugin must re-derive it from the LIGHT
+    // palette — not leave the dark theme's `Comment` grey standing.
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme light<CR>").await;
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "PlugDim").await, "fg"),
+        Some(hex("9ca0b0")),
+        "a group the new theme doesn't model is re-derived, not left stale"
+    );
+}
+
+#[tokio::test]
+async fn hl_fallback_never_clobbers_an_explicit_definition() {
+    // A user override is not a stale default: once someone else claims the group,
+    // every later fallback for that name is a no-op and reports it.
+    let dir = temp_dir("hl_fallback_user");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hl.fallback('PlugKey', { fg = '#111111' })").await,
+        Value::Boolean(true),
+        "the first fallback installs"
+    );
+    exec_lua(
+        &rpc,
+        "nx.hl.define(0, 'PlugKey', { fg = '#ff00ff' }) return 1",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hl.fallback('PlugKey', { fg = '#222222' })").await,
+        Value::Boolean(false),
+        "an explicitly defined group is left alone"
+    );
+    assert_eq!(
+        hl_color(&get_hl(&rpc, "PlugKey").await, "fg"),
+        Some(hex("ff00ff"))
+    );
+}
+
+#[tokio::test]
+async fn a_colorscheme_handler_sees_the_dropped_groups_as_gone() {
+    // `ColorScheme` is where every plugin restyles, so what it reads from the Lua
+    // highlight mirror has to match the registry. Loading a scheme drops the outgoing
+    // scheme's own groups straight into the core registry, while the full mirror push
+    // is gated on the registry generation and only lands between turns — so without an
+    // explicit erase the handler still sees those groups defined, carrying the OLD
+    // theme's colours, and a plugin re-deriving its defaults skips them as "styled".
+    let dir = temp_dir("colorscheme_handler_mirror");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("dark.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'OnlyDark', { fg = '#45475a' })\n",
+    )
+    .expect("write dark");
+    std::fs::write(
+        dir.join("colors").join("light.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#4c4f69', bg = '#eff1f5' })\n",
+    )
+    .expect("write light");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.seen = {}\n\
+         nx.on('ColorScheme', {}, function(o)\n\
+           local d = nx.hl.get(0, { name = 'OnlyDark', link = false })\n\
+           _G.seen[o.match] = { exists = nx.hl.exists('OnlyDark'), fg = d.fg }\n\
+         end)\n",
+    )
+    .await;
+
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme dark<CR>").await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.seen.dark.exists").await,
+        Value::Boolean(true),
+        "precondition: the handler sees the group the loading scheme just defined"
+    );
+
+    // `light` doesn't define OnlyDark, so by the time its handler runs the group is
+    // gone from the registry — and must read as gone from Lua too.
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme light<CR>").await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.seen.light.exists").await,
+        Value::Boolean(false),
+        "a ColorScheme handler must not see the outgoing scheme's dropped group"
+    );
+    // The handler must also see the INCOMING scheme's own definitions (the
+    // write-through side), so the two halves stay consistent.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local d = nx.hl.get(0, { name = 'Normal', link = false }) return d.bg"
+        )
+        .await
+        .as_u64(),
+        Some(0x00ef_f1f5),
+    );
+}
+
+#[tokio::test]
+async fn status_line_nc_chrome_group_resolves_into_the_frame_chrome() {
+    // The UNFOCUSED window's status bar rides `StatusLineNC`, vim's own group for
+    // it. Without bridging it the client painted every bar with `StatusLine`, so a
+    // split gave no visual cue which window had focus.
+    let dir = temp_dir("statuslinenc_chrome");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'StatusLine',   { fg = '#cdd6f4', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'StatusLineNC', { fg = '#45475a', bg = '#11111b' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('cat')\n").await;
+
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        chrome_fg(&map, "status_line_nc"),
+        Some(hex("45475a")),
+        "StatusLineNC bridges to the client as chrome.status_line_nc"
+    );
+    assert_eq!(
+        chrome_fg(&map, "status_line"),
+        Some(hex("cdd6f4")),
+        "the focused bar still carries StatusLine"
+    );
+}

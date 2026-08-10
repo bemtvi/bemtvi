@@ -1973,3 +1973,94 @@ fn a_collapsed_filter_box_shows_its_badge_on_the_prompt_row() {
         "collapsed, the rows themselves stay hidden"
     );
 }
+
+#[test]
+fn the_unfocused_window_status_bar_takes_status_line_nc() {
+    // vim paints the focused window's status bar with `StatusLine` and every other
+    // one with `StatusLineNC`, which is the only cue telling you which split has
+    // focus. Both bars used to take `StatusLine`, so a split looked uniform.
+    let windows = Value::Array(vec![
+        window(rect(0, 0, 20, 4), false, "top.txt", &["top text"]),
+        window(rect(0, 5, 20, 4), true, "bot.txt", &["bottom text"]),
+    ]);
+    let buf = paint(
+        &view(vec![
+            ("windows", windows),
+            (
+                "styles",
+                Value::Array(vec![
+                    style(vec![
+                        ("fg", rgb(0xcd, 0xd6, 0xf4)),
+                        ("bg", rgb(0x18, 0x18, 0x25)),
+                    ]),
+                    style(vec![
+                        ("fg", rgb(0x45, 0x47, 0x5a)),
+                        ("bg", rgb(0x11, 0x11, 0x1b)),
+                    ]),
+                ]),
+            ),
+            (
+                "chrome",
+                chrome(vec![("status_line", 0), ("status_line_nc", 1)]),
+            ),
+        ]),
+        20,
+        10,
+    );
+
+    // Row 3 is the unfocused (top) window's bar, row 8 the focused (bottom) one's.
+    assert_eq!(
+        (fg(&buf, 0, 3), bg(&buf, 0, 3)),
+        (
+            Some(Color::Rgb(0x45, 0x47, 0x5a)),
+            Some(Color::Rgb(0x11, 0x11, 0x1b))
+        ),
+        "the unfocused bar takes StatusLineNC: {:?}",
+        row_text(&buf, 3)
+    );
+    assert_eq!(
+        (fg(&buf, 0, 8), bg(&buf, 0, 8)),
+        (
+            Some(Color::Rgb(0xcd, 0xd6, 0xf4)),
+            Some(Color::Rgb(0x18, 0x18, 0x25))
+        ),
+        "the focused bar keeps StatusLine: {:?}",
+        row_text(&buf, 8)
+    );
+}
+
+#[test]
+fn an_undefined_status_line_nc_falls_back_to_status_line() {
+    // A colorscheme that themes only `StatusLine` must keep both bars themed —
+    // dropping the unfocused one to reverse-video would look broken, not subtle.
+    let windows = Value::Array(vec![
+        window(rect(0, 0, 20, 4), false, "top.txt", &["top text"]),
+        window(rect(0, 5, 20, 4), true, "bot.txt", &["bottom text"]),
+    ]);
+    let buf = paint(
+        &view(vec![
+            ("windows", windows),
+            (
+                "styles",
+                Value::Array(vec![style(vec![
+                    ("fg", rgb(0xcd, 0xd6, 0xf4)),
+                    ("bg", rgb(0x18, 0x18, 0x25)),
+                ])]),
+            ),
+            ("chrome", chrome(vec![("status_line", 0)])),
+        ]),
+        20,
+        10,
+    );
+
+    for y in [3u16, 8] {
+        assert_eq!(
+            (fg(&buf, 0, y), bg(&buf, 0, y)),
+            (
+                Some(Color::Rgb(0xcd, 0xd6, 0xf4)),
+                Some(Color::Rgb(0x18, 0x18, 0x25))
+            ),
+            "row {y} falls back to StatusLine when StatusLineNC is undefined"
+        );
+    }
+}

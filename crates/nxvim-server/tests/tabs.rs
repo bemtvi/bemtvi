@@ -1137,3 +1137,73 @@ async fn set_current_win_crosses_tabs() {
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
 }
+
+/// `:%bd` with one buffer per tab and a **modified** buffer that refuses to be
+/// deleted (the `:%bd|e#` "close every other buffer" idiom): every tab whose only
+/// buffer was deleted closes, so one tab is left showing the survivor. It used to
+/// rebind each of those tabs onto the surviving buffer instead, leaving as many
+/// tabs as before, all showing the same buffer.
+#[tokio::test]
+async fn percent_bdelete_closes_tabs_whose_only_buffer_was_deleted() {
+    let a = write_temp("pbdm_a", "txt", "aaa\n");
+    let b = write_temp("pbdm_b", "txt", "bbb\n");
+    let c = write_temp("pbdm_c", "txt", "ccc\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B
+    feed_sync(&rpc, &format!(":tabedit {c}<CR>")).await; // tab 3 shows C, focused
+    feed_sync(&rpc, "ix<Esc>").await; // C is modified, so `:bd` refuses it
+    assert_eq!(tab_order(&rpc).await.len(), 3, "three tabs open");
+
+    feed_sync(&rpc, ":%bdelete<CR>").await;
+
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec!["xccc"],
+        "the modified buffer survived the sweep"
+    );
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        1,
+        "the tabs of the deleted buffers closed, rather than all showing the survivor"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    let _ = std::fs::remove_file(&c);
+}
+
+/// The same sweep when the buffer that refuses to go is in a **background** tab:
+/// the focused tab closes through the current-buffer path, the other deleted
+/// buffer's tab closes through the parked-tab sweep, and focus lands on the tab
+/// still showing the modified buffer.
+#[tokio::test]
+async fn percent_bdelete_keeps_the_tab_of_the_buffer_that_refused() {
+    let a = write_temp("pbdk_a", "txt", "aaa\n");
+    let b = write_temp("pbdk_b", "txt", "bbb\n");
+    let c = write_temp("pbdk_c", "txt", "ccc\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B
+    feed_sync(&rpc, "ix<Esc>").await; // B is modified, so `:bd` refuses it
+    feed_sync(&rpc, &format!(":tabedit {c}<CR>")).await; // tab 3 shows C, focused
+
+    feed_sync(&rpc, ":%bdelete<CR>").await;
+
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        1,
+        "only the modified buffer's tab is left"
+    );
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec!["xbbb"],
+        "focus lands on the tab that still shows the modified buffer"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    let _ = std::fs::remove_file(&c);
+}

@@ -472,6 +472,27 @@ impl Editor {
         }
     }
 
+    /// Close the **parked** tab `idx` of `layer` — any tab whose tree lives in its
+    /// own [`TabSlot`], i.e. every tab except the focused layer's active one (that
+    /// tree is live on [`Editor::windows`] and needs [`Editor::close_tab_at`]'s
+    /// promotion dance). Dropping the slot drops its layout; the layer's active
+    /// index shifts to keep naming the same tab. A no-op on the layer's last tab
+    /// (a layer always keeps one) or an out-of-range index. Buffers stay loaded.
+    /// The caller relayouts once it is done closing.
+    pub(crate) fn close_parked_tab(&mut self, layer: Layer, idx: usize) {
+        let Some(stack) = self.stack_mut(layer) else {
+            return;
+        };
+        if stack.tabs.len() <= 1 || idx >= stack.tabs.len() {
+            return;
+        }
+        stack.tabs.remove(idx);
+        if idx < stack.current {
+            stack.current -= 1;
+        }
+        stack.current = stack.current.min(stack.tabs.len() - 1);
+    }
+
     /// Close the tab page at index `target` of the focused layer (assumed valid,
     /// with `tabs.len() > 1`). Closing the **active** tab promotes a neighbor's
     /// stashed tree to live (the tab to the right, or the last tab); closing an

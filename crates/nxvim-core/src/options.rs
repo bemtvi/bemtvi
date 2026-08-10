@@ -214,8 +214,11 @@ pub struct Options {
     /// Whether `:bdelete` of a tab's *last* buffer closes the tab page (`'bdclosetab'`;
     /// nxvim-native, default `true`). When set, deleting the only buffer a tab shows —
     /// with other tabs open — closes that tab rather than loading a sibling buffer into
-    /// its window (vim's behavior). A tab whose windows still show *other* buffers is
-    /// never closed. With it unset, `:bd` behaves the classic way. Honored by
+    /// its window (vim's behavior). This holds for every tab the deleted buffer was
+    /// the only one of, not just the focused one — which is what lets `:%bd` collapse
+    /// a tab-per-buffer session down to the tabs whose buffers survived. A tab whose
+    /// windows still show *other* buffers is never closed, and a layer always keeps
+    /// its last tab. With it unset, `:bd` behaves the classic way. Honored by
     /// [`crate::editor::buffers`].
     pub bdclosetab: bool,
     /// Whether a saved session stores split sizes as proportional PERCENTAGES rather

@@ -2952,6 +2952,13 @@ impl Editor {
             self.alternate_name = deleted_name;
         }
 
+        // Same `'bdclosetab'` rule for every *other* tab page: a tab that showed
+        // nothing but `target` closes instead of being rebound onto a surviving
+        // buffer by the sweep below. Runs before the decision for the focused tab so
+        // that one is taken against the tab count that is actually left (a layer
+        // never closes its last tab).
+        self.close_tabs_emptied_by(target);
+
         // `'bdclosetab'` (nxvim default): if `target` was the *only* buffer the
         // focused tab showed and other tabs are open, close the tab page rather than
         // loading a sibling buffer into it. "Only buffer" means every tiled window of
@@ -2997,6 +3004,64 @@ impl Editor {
         // would panic the next time it is read. Rebind every such window.
         self.rebind_windows_off_buffer(target);
         true
+    }
+
+    /// `'bdclosetab'` for the tabs the focused window isn't on: once `target` has
+    /// been removed from the store, close every **parked** tab page — of any layer —
+    /// whose every tiled window showed it, rather than leaving
+    /// [`Editor::rebind_windows_off_buffer`] to load some surviving buffer into it.
+    /// This is what makes the `:%bd|e#` idiom ("close every other buffer") collapse
+    /// a tab-per-buffer session down to one tab: without it, a buffer that refuses
+    /// to be deleted (a modified one, no `!`) ends up shown in every tab.
+    ///
+    /// A tab with a split onto another buffer stays, and a layer never closes its
+    /// last tab — so a stack whose every tab was on `target` keeps one, which the
+    /// rebind then moves onto a real buffer.
+    fn close_tabs_emptied_by(&mut self, target: BufferId) {
+        if !self.options.bdclosetab {
+            return;
+        }
+        let mut layers = vec![Layer::Main];
+        for side in DockSide::ALL {
+            if self.dock_exists(side) {
+                layers.push(Layer::Dock(side));
+            }
+        }
+        let mut closed = false;
+        for layer in layers {
+            // One close per pass: removing a slot renumbers the ones after it.
+            while let Some(idx) = self.parked_tab_showing_only(layer, target) {
+                self.close_parked_tab(layer, idx);
+                closed = true;
+            }
+        }
+        if closed {
+            // The tabline row can vanish (a layer down to one tab), so the remaining
+            // windows may have grown.
+            self.relayout();
+            self.ensure_visible();
+        }
+    }
+
+    /// The first **parked** tab of `layer` whose every tiled window shows `buf` —
+    /// the next tab [`Editor::close_tabs_emptied_by`] should close. `None` for a
+    /// layer that has no such tab, is closed, or is down to its last tab (a layer
+    /// always keeps one). The focused layer's active tab is never a candidate: its
+    /// tree is the live one, and [`Editor::delete_buffer`] decides it alongside
+    /// where the cursor lands.
+    fn parked_tab_showing_only(&self, layer: Layer, buf: BufferId) -> Option<usize> {
+        let stack = self.stack(layer)?;
+        if stack.tabs.len() <= 1 {
+            return None;
+        }
+        let live_tab = stack.current;
+        (0..stack.tabs.len()).find(|&idx| {
+            if layer == self.focused_layer && idx == live_tab {
+                return false;
+            }
+            self.layer_tab_tree(layer, idx)
+                .is_some_and(|tree| tree.leaves().iter().all(|&w| tree.get(w).buffer == buf))
+        })
     }
 
     /// Open a fresh, empty buffer in the focused window and land on it in a clean

@@ -12,7 +12,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_test_harness::{
-    config_init, cursor, exec_lua, feed, lines, lua_bool, lua_u64, mode, redraw_after,
+    barrier, config_init, cursor, exec_lua, feed, lines, lua_bool, lua_u64, mode, redraw_after,
     start_with_config, temp_dir,
 };
 use rmpv::Value;
@@ -1729,5 +1729,64 @@ async fn a_further_modified_ctrl_chord_does_not_fold() {
         lua_u64(&rpc, "return _G.fired").await,
         Some(1),
         "<C-A-i> is still its own key"
+    );
+}
+
+/// Typeahead must be parsed the way the client's own keys are. Under the protocol a
+/// mapping's LHS `<C-h>` compiles to a distinct key, so folding a *fed* `<C-h>` onto
+/// `<BS>` would make `nx._feedkeys` unable to reach a map the same session installed —
+/// which is exactly how a plugin replays a key (a lazy `keys` trigger, a test's
+/// `t:feed`).
+#[tokio::test]
+async fn fed_keys_are_parsed_like_typed_keys_under_the_protocol() {
+    let dir = temp_dir("keymap_feed_protocol");
+    let (rpc, _incoming) = start_with_config_kbd(
+        &dir,
+        "_G.ch = 0\n_G.bs = 0\n\
+         vim.keymap.set('n', '<C-h>', function() _G.ch = _G.ch + 1 end)\n\
+         vim.keymap.set('n', '<BS>', function() _G.bs = _G.bs + 1 end)\n",
+    )
+    .await;
+
+    exec_lua(&rpc, "nx._feedkeys('<C-h>', true, false)").await;
+    barrier(&rpc).await;
+    assert_eq!(
+        (
+            lua_u64(&rpc, "return _G.ch").await,
+            lua_u64(&rpc, "return _G.bs").await
+        ),
+        (Some(1), Some(0)),
+        "a fed <C-h> reaches the <C-h> map, not the <BS> one"
+    );
+
+    exec_lua(&rpc, "nx._feedkeys('<BS>', true, false)").await;
+    barrier(&rpc).await;
+    assert_eq!(
+        (
+            lua_u64(&rpc, "return _G.ch").await,
+            lua_u64(&rpc, "return _G.bs").await
+        ),
+        (Some(1), Some(1)),
+        "and a fed <BS> reaches its own map"
+    );
+}
+
+/// The legacy half: with no protocol declared, the fold applies on both sides, so a
+/// fed `<C-h>` and a fed `<BS>` are the same key and hit the one map.
+#[tokio::test]
+async fn fed_ctrl_h_folds_onto_bs_without_the_protocol() {
+    let dir = temp_dir("keymap_feed_legacy");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.bs = 0\nvim.keymap.set('n', '<BS>', function() _G.bs = _G.bs + 1 end)\n",
+    )
+    .await;
+
+    exec_lua(&rpc, "nx._feedkeys('<C-h>', true, false)").await;
+    barrier(&rpc).await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.bs").await,
+        Some(1),
+        "a legacy terminal cannot tell them apart, so the fed <C-h> IS <BS>"
     );
 }

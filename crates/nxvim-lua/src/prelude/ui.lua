@@ -481,3 +481,52 @@ end
 function vim.ui.open(path)
   return nx.ui.open(path)
 end
+
+-- ----- nx.ui.caps ------------------------------------------------------------
+-- What the ATTACHED CLIENT reported about its terminal, mirrored from the
+-- capabilities map it sent at attach. All false until a UI attaches (a headless
+-- server has no client to ask), so read it from a `UIEnter` handler — the event
+-- fires right after this mirror is refreshed.
+nx._ui_caps = nx._ui_caps or { keyboard_protocol = false, truecolor = false, osc52 = false }
+
+-- Server-called: refresh the mirror from the attaching client's capabilities map.
+function nx._set_ui_caps(keyboard_protocol, truecolor, osc52)
+  nx._ui_caps.keyboard_protocol = keyboard_protocol and true or false
+  nx._ui_caps.truecolor = truecolor and true or false
+  nx._ui_caps.osc52 = osc52 and true or false
+end
+
+-- `nx.ui.caps()` -> a fresh table of the attached client's terminal capabilities:
+--
+-- ```lua
+-- {
+--   keyboard_protocol = false, -- the kitty keyboard protocol is on
+--   truecolor         = false, -- the terminal can show 24-bit color
+--   osc52             = false, -- the terminal accepts OSC 52 clipboard writes
+-- }
+-- ```
+--
+-- `keyboard_protocol` is the one a keymap cares about. Without it the terminal
+-- cannot tell `<C-i>` / `<C-m>` / `<C-[>` / `<C-h>` apart from `<Tab>` / `<CR>` /
+-- `<Esc>` / `<BS>`, and nxvim folds each onto the named key — on BOTH sides, so
+-- mapping `<C-h>` there really maps `<BS>`. A plugin that wants one of those four
+-- chords should install it only when this is true:
+--
+-- ```lua
+-- nx.on("UIEnter", {}, function()
+--   if nx.ui.caps().keyboard_protocol then
+--     nx.keymap.set("i", "<C-h>", my_action)
+--   end
+-- end)
+-- ```
+--
+-- Every field is false before a client attaches, so check it from `UIEnter` rather
+-- than at config time: the config is sourced (and `VimEnter` fires) before the
+-- first client attaches.
+function nx.ui.caps()
+  return {
+    keyboard_protocol = nx._ui_caps.keyboard_protocol,
+    truecolor = nx._ui_caps.truecolor,
+    osc52 = nx._ui_caps.osc52,
+  }
+end

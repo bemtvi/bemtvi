@@ -1868,6 +1868,13 @@ impl EditHost {
         // `<Tab>`/`<CR>`/`<Esc>`/`<BS>` (mirrors the TUI/GUI reporting it at attach).
         self.keyboard_protocol = true;
         self.keymaps.set_keyboard_protocol(true);
+        // Mirror the same capabilities into `nx.ui.caps()` the native `nx_ui_attach`
+        // does: a browser canvas paints 24-bit color, and the clipboard goes through the
+        // browser API rather than an OSC 52 escape. `UIEnter` is NOT fired here — this
+        // attach runs at `eh_new`, before the Worker sources `init.lua`, so a config
+        // subscribing to it wouldn't exist yet; `boot_finish` fires it once startup is
+        // done, which is the native order (config, `VimEnter`, then the UI is known).
+        let _ = self.lua.set_ui_caps(true, true, false);
         self.redraw();
     }
 
@@ -1912,6 +1919,13 @@ impl EditHost {
         self.run_pending();
         let _ = self.lua.set_vim_did_enter(true);
         self.fire_vim_enter();
+        // Then `UIEnter`, in the native order (startup first, the client second). The
+        // browser's UI is already attached — `eh_new` did it before the config was
+        // sourced — so firing it here is what gives a config or plugin the same chance
+        // to subscribe that it has natively.
+        if self.ui.is_some() {
+            self.fire_ui_enter();
+        }
     }
 
     /// Source the user's single-file `init.lua` (read from OPFS by the Worker) through

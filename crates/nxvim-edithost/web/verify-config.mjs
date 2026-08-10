@@ -64,6 +64,10 @@ try {
     // A BufEnter autocmd: it fires for the STARTUP buffer (emitted by boot_finish), so
     // it only runs if the config sourced BEFORE boot finished — the ordering proof.
     "vim.api.nvim_create_autocmd('BufEnter', { callback = function() vim.g.__bufenter = 'fired' end })",
+    // A UIEnter autocmd: fired when the UI attaches, with nx.ui.caps() already
+    // refreshed. A browser delivers every chord distinctly, so keyboard_protocol is
+    // true here — the fact a plugin gates a <C-h>-class mapping on.
+    "nx.on('UIEnter', {}, function() vim.g.__uienter = tostring(nx.ui.caps().keyboard_protocol) end)",
   ].join("\n");
   await writeOpfs(page, "init.lua", INIT_LUA);
 
@@ -89,13 +93,20 @@ try {
   check("config: a startup-buffer BufEnter autocmd in init.lua fired (config-before-boot-finish)",
     /fired/.test(String(bufenter)), `bufenter=${JSON.stringify(bufenter)}`);
 
-  // 4. A keymap defined in the config works end to end: press Q → it inserts text.
+  // 4. The UIEnter autocmd fired at attach, and read the browser client's caps. This is
+  //    the web half of the tier-1 rule: a plugin that installs capability-dependent
+  //    keymaps on UIEnter behaves here exactly as it does natively.
+  const uienter = await luaResult("return vim.g.__uienter or 'nil'");
+  check("config: a UIEnter autocmd fired with nx.ui.caps() populated",
+    /true/.test(String(uienter)), `uienter=${JSON.stringify(uienter)}`);
+
+  // 5. A keymap defined in the config works end to end: press Q → it inserts text.
   await page.evaluate(() => window.__nxvim.feed("ggdGQ"));
   const afterMap = await page.evaluate(() => window.__nxvim.lines());
   check("config: a keymap from init.lua fires on keypress",
     afterMap === "hi-from-config", `lines=${JSON.stringify(afterMap)}`);
 
-  // 5. A broken config is surfaced, non-fatal: the editor still boots and edits.
+  // 6. A broken config is surfaced, non-fatal: the editor still boots and edits.
   await writeOpfs(page, "init.lua", "this is not valid lua <<<");
   await page.reload();
   await page.waitForFunction(() => window.__nxvim !== undefined, null, { timeout: 15000 });
@@ -116,6 +127,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — single-file init.lua sourced from OPFS (options, keymaps, startup BufEnter), broken config non-fatal"
+  ? "\nALL PASS — single-file init.lua sourced from OPFS (options, keymaps, startup BufEnter, UIEnter caps), broken config non-fatal"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

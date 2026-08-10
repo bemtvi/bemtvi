@@ -586,6 +586,7 @@ local AUTOCMD_EVENTS = {
   -- Startup & plugins
   "PluginLoaded",
   "PluginsLoaded",
+  "UIEnter",
   "VimEnter",
   -- Accepted aliases (each canonicalizes to a real emitted event)
   "BufCreate",

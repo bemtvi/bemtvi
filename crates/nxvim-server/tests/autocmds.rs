@@ -3671,3 +3671,107 @@ async fn autocmd_create_names_a_non_table_opts_instead_of_dying_on_index() {
         "the error names the argument and the spelling that takes a bare handler, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn ui_enter_fires_at_attach_with_the_client_capabilities_readable() {
+    // A config runs (and `VimEnter` fires) before any client attaches, so the
+    // capabilities of the terminal are unknowable at config time. `UIEnter` is the
+    // seam: it fires on attach, after `nx.ui.caps()` is refreshed from what the
+    // client declared — the fact a plugin needs to decide whether a `<C-h>`-class
+    // chord is even distinguishable from `<BS>`.
+    let dir = temp_dir("au_uienter_caps");
+    let (rpc, _incoming) = nxvim_test_harness::spawn(nxvim_test_harness::config_init(
+        &dir,
+        "_G.caps_at_config = nx.ui.caps().keyboard_protocol\n\
+         nx.on('UIEnter', {}, function()\n\
+           _G.caps_at_uienter = nx.ui.caps().keyboard_protocol\n\
+         end)\n",
+    ));
+    // Nothing has attached yet, so the config saw every capability false.
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(_G.caps_at_config)")
+            .await
+            .as_str(),
+        Some("false"),
+        "at config time no client has attached, so the capabilities read false"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(_G.caps_at_uienter)")
+            .await
+            .as_str(),
+        Some("nil"),
+        "and UIEnter has not fired yet"
+    );
+
+    nxvim_test_harness::attach_keyboard_protocol(&rpc, 80, 24).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(_G.caps_at_uienter)")
+            .await
+            .as_str(),
+        Some("true"),
+        "UIEnter fires at attach, and the handler reads the attaching client's caps"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(nx.ui.caps().keyboard_protocol)")
+            .await
+            .as_str(),
+        Some("true"),
+        "and the mirror stays readable afterwards"
+    );
+}
+
+#[tokio::test]
+async fn ui_enter_caps_report_a_legacy_terminal_as_incapable() {
+    // The other half: a client that declares nothing is a legacy terminal, and the
+    // caps must say so — otherwise a plugin gating on `keyboard_protocol` would map
+    // `<C-h>` here, where it really means `<BS>`.
+    let dir = temp_dir("au_uienter_legacy");
+    let (rpc, _incoming) = nxvim_test_harness::spawn(nxvim_test_harness::config_init(
+        &dir,
+        "nx.on('UIEnter', {}, function()\n\
+           _G.seen = nx.ui.caps()\n\
+         end)\n",
+    ));
+    nxvim_test_harness::attach(&rpc, 80, 24).await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return tostring(_G.seen ~= nil) .. '|' .. tostring(_G.seen.keyboard_protocol)\n\
+               .. '|' .. tostring(_G.seen.truecolor) .. '|' .. tostring(_G.seen.osc52)"
+        )
+        .await
+        .as_str(),
+        Some("true|false|false|false"),
+        "UIEnter still fires, reporting a bare terminal's capabilities as false"
+    );
+}
+
+#[tokio::test]
+async fn ui_enter_reports_truecolor_and_osc52_from_the_attach_map() {
+    // Every capability the attach map carries is mirrored, not just the keyboard one.
+    let dir = temp_dir("au_uienter_rich");
+    let (rpc, _incoming) = nxvim_test_harness::spawn(nxvim_test_harness::config_init(&dir, ""));
+    nxvim_test_harness::attach_with_caps(
+        &rpc,
+        80,
+        24,
+        vec![
+            (Value::from("truecolor"), Value::Boolean(true)),
+            (Value::from("osc52"), Value::Boolean(true)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local c = nx.ui.caps()\n\
+             return tostring(c.keyboard_protocol) .. '|' .. tostring(c.truecolor)\n\
+               .. '|' .. tostring(c.osc52)"
+        )
+        .await
+        .as_str(),
+        Some("false|true|true"),
+        "truecolor and osc52 come through the same mirror"
+    );
+}

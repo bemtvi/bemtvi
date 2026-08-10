@@ -147,6 +147,14 @@ impl EditHost {
                             .set_clipboard(Box::new(crate::clipboard::Osc52Clipboard::new(state)));
                     }
                 }
+                // Mirror what this client reported into `nx.ui.caps()` and fire
+                // `UIEnter`. This is the first (and only) point a plugin can learn what
+                // the terminal can do — the config and `VimEnter` both ran before any
+                // client attached — so a keymap that needs `keyboard_protocol` (a
+                // `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` chord, which a legacy terminal
+                // folds onto `<BS>` / `<Tab>` / `<CR>` / `<Esc>`) installs itself here.
+                let _ = self.lua.set_ui_caps(kbd, cap("truecolor"), cap("osc52"));
+                self.fire_ui_enter();
                 // The resize assigns the window its first rect, so a `nx.decor`
                 // provider's viewport is only now known. Drive `run_pending` to
                 // dispatch it (and any other off-tick work the size change queued)

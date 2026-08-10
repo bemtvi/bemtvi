@@ -212,6 +212,7 @@ no autocmd listens for them they cost nothing.
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `VimEnter` | Once, after the editor has finished starting (config sourced, first frame imminent). | `vim.v.vim_did_enter` is `1` from this point on. The built-in plugin manager's first-run prompt hooks it. |
+| `UIEnter` | Each time a client attaches its UI — after `VimEnter`, since startup completes before any client connects. | `nx.ui.caps()` describes the client that just attached (`keyboard_protocol` / `truecolor` / `osc52`) and is refreshed immediately before this fires. Hook it for setup that depends on what the terminal can do — notably a `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` mapping, which is only distinguishable from `<BS>` / `<Tab>` / `<CR>` / `<Esc>` under the kitty keyboard protocol. Fires again on a daemon re-dial (a second attach), so a handler must be idempotent. |
 
 ## Quitting & exit
 

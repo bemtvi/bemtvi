@@ -1070,6 +1070,21 @@ impl EditHost {
         self.run_pending();
     }
 
+    /// Fire `UIEnter` — a client has attached and `nx.ui.caps()` now describes its
+    /// terminal. Fires per attach (a daemon re-dial attaches again, like neovim's
+    /// per-UI `UIEnter`), and it is the earliest point capability-dependent setup can
+    /// run: startup, `init.lua` and `VimEnter` all complete before any client is
+    /// connected. Errors surface on the message line rather than tearing down the
+    /// attach.
+    pub(crate) fn fire_ui_enter(&mut self) {
+        if let Err(e) = self.lua.exec("nx.autocmd.exec('UIEnter', {})") {
+            self.editor
+                .echo(format!("E5117: Error executing UIEnter autocommands: {e}"));
+        }
+        self.apply_lua_effects();
+        self.run_pending();
+    }
+
     /// Re-apply the current window's effective directory to the process cwd after a
     /// window / tab focus change (vim's `fix_current_dir`). With `:lcd` / `:tcd` in
     /// play the effective dir differs per window / tab, so a switch must `chdir` so

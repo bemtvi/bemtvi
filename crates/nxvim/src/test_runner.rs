@@ -141,9 +141,22 @@ async fn run(dir: PathBuf, files: Vec<PathBuf>) -> Result<bool> {
 
     // Attach a UI so the server projects redraws (the `nx._ui` mirror a test's
     // `t:float()` / `t:message()` read from is populated on redraw).
+    //
+    // Declared with the kitty keyboard protocol on, because this client genuinely has
+    // it: a spec's `t:feed` hands the server key NOTATION, so `<C-h>` and `<BS>` arrive
+    // as the distinct keys they were typed as — no terminal is in the way to fold them.
+    // That also makes `nx.ui.caps().keyboard_protocol` true, so a plugin that installs a
+    // `<C-h>`/`<C-i>`/`<C-m>`/`<C-[>` mapping only on a capable client is testable here.
     rpc.request(
         "nx_ui_attach",
-        vec![Value::from(80u64), Value::from(24u64), Value::Map(vec![])],
+        vec![
+            Value::from(80u64),
+            Value::from(24u64),
+            Value::Map(vec![(
+                Value::from("keyboard_protocol"),
+                Value::Boolean(true),
+            )]),
+        ],
     )
     .await
     .map_err(|e| anyhow!("attaching the test UI: {e}"))?;

@@ -4073,6 +4073,22 @@ impl LuaRuntime {
         set.call(entered)
     }
 
+    /// Mirror the attaching client's terminal capabilities into `nx.ui.caps()`.
+    /// Refreshed at every UI attach, right before the `UIEnter` autocmd fires, so a
+    /// handler reads the capabilities of the client that just arrived. A plugin gates
+    /// a `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` mapping on `keyboard_protocol`: without
+    /// it the terminal can't tell those from `<BS>` / `<Tab>` / `<CR>` / `<Esc>`, so
+    /// the mapping would shadow the named key.
+    pub fn set_ui_caps(
+        &self,
+        keyboard_protocol: bool,
+        truecolor: bool,
+        osc52: bool,
+    ) -> mlua::Result<()> {
+        let set: mlua::Function = self.nx()?.get("_set_ui_caps")?;
+        set.call((keyboard_protocol, truecolor, osc52))
+    }
+
     /// Mirror the focused window cursor's screen position (1-based row/col, the
     /// whole-screen coordinates `vim.fn.screenrow()` / `vim.fn.screencol()`
     /// return), pushed alongside the buffer mirror. A popup plugin reads them to

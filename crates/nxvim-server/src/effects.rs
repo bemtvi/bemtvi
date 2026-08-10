@@ -1496,7 +1496,18 @@ impl EditHost {
         // or straight to the editor — by `drain_feedkeys` at the batch / settle
         // boundary, never re-entrantly here.
         for op in self.lua.take_feedkeys() {
-            let keys = nxvim_core::parse_keys(&op.keys);
+            // Parsed the way this client's keys are parsed (`input`) and the way a
+            // mapping's LHS is compiled (`Keymaps::build_for`): under the kitty keyboard
+            // protocol `<C-h>`/`<C-i>`/`<C-m>`/`<C-[>` stay distinct, otherwise they fold
+            // onto `<BS>`/`<Tab>`/`<CR>`/`<Esc>`. Folding unconditionally here would put
+            // typeahead out of step with the maps it is fed through — a fed `<C-h>` would
+            // arrive as `<BS>` and miss the `<C-h>` mapping that a protocol-on client
+            // registered.
+            let keys = if self.keyboard_protocol {
+                nxvim_core::parse_keys_raw(&op.keys)
+            } else {
+                nxvim_core::parse_keys(&op.keys)
+            };
             if op.insert {
                 // Insert at the front while preserving the keys' own order.
                 for key in keys.into_iter().rev() {

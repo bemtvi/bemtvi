@@ -1700,6 +1700,17 @@ function api.nvim_list_bufs()
   return nx.buf.list()
 end
 
+-- `nx.buf.alternate()` -> bufnr | nil: the **alternate buffer** (vim's `#`, the
+-- `<C-^>` target), or nil when there is none. This is the handle, not the name:
+-- `vim.fn.expand("#")` answers what `:e #` would reopen — a name that outlives a
+-- `:bdelete` of the buffer it came from — while this answers which *open* buffer a
+-- list flags `#` (what `:ls` and the `buffers` picker mark). A buffer that has been
+-- closed is nobody's alternate here, so the two disagree exactly when they should.
+function nx.buf.alternate()
+  local b = nx._alt_buf or 0
+  return b ~= 0 and nx._bufs[b] and b or nil
+end
+
 -- `nx.list_uis()` [alias `nvim_list_uis`]: the attached UIs. nxvim drives one client
 -- at a time, so this reports a single UI sized to the editor screen
 -- (`vim.o.columns`/`lines`), with the fields a layout calculation reads. The `ext_*`
@@ -1884,12 +1895,13 @@ function nx.screen.pos(win, lnum, col)
 end
 vim.fn.screenpos = nx.screen.pos
 
+nx.bufinfo = nx.bufinfo or {}
 -- `nx.bufinfo.get([arg])` [alias `vim.fn.getbufinfo`]: per-buffer info dicts. `arg` is a
 -- bufnr (one buffer), an opts table ({buflisted=1, bufloaded=1, …} — filters), or
 -- absent (all buffers). nxvim's core doesn't model `buflisted`, so every buffer
--- reports listed/loaded and the filters only narrow; `changed` / `changedtick` are
--- real (the buffer's modified flag and its change counter).
-nx.bufinfo = nx.bufinfo or {}
+-- reports listed/loaded and the filters only narrow; `changed` / `changedtick` /
+-- `lnum` are real (the buffer's modified flag, its change counter, and the cursor
+-- line `:ls` reports for it).
 function nx.bufinfo.get(arg)
   local function info(id, buf)
     local windows = nx.win.findbuf(id)
@@ -1901,7 +1913,11 @@ function nx.bufinfo.get(arg)
       hidden = #windows == 0 and 1 or 0,
       listed = 1,
       loaded = 1,
-      lnum = 1,
+      -- The buffer's last-known cursor line, from the mirror the core fills with the
+      -- same value `:ls` prints as `line N` (live cursor for the current buffer, the
+      -- position stashed on switch for any other) — not the placeholder `1` this used
+      -- to report for every buffer.
+      lnum = buf.lnum or 1,
       linecount = (buf.lines and #buf.lines) or 0,
       variables = {},
       windows = windows,
@@ -1935,12 +1951,16 @@ vim.fn.getbufinfo = nx.bufinfo.get
 vim.fn.bufname = nx.buf.name
 
 -- `nx.buf.nr(expr)` [alias `vim.fn.bufnr`]: the buffer number for `expr`. `""` / `"%"` / nil
--- / 0 -> current buffer; `"$"` -> the last (largest) buffer number; a string -> the
+-- / 0 -> current buffer; `"#"` -> the alternate buffer (`-1` when there is none);
+-- `"$"` -> the last (largest) buffer number; a string -> the
 -- loaded buffer whose name matches (exact, else suffix), -1 when none. Backed by
 -- the Phase-6 `nx._bufs` mirror.
 function nx.buf.nr(expr)
   if expr == nil or expr == 0 or expr == "" or expr == "%" then
     return (nx._cur_buf or {}).bufnr or 0
+  end
+  if expr == "#" then
+    return nx.buf.alternate() or -1
   end
   if expr == "$" then
     local max = 0

@@ -1603,6 +1603,13 @@ nx._cur_buf = nx._cur_buf or { bufnr = 0, name = "", filetype = "" }
 -- it outlives a `:bdelete` of the buffer it named, exactly as vim's `#` does.
 nx._alt_file = nx._alt_file or ""
 
+-- `nx._alt_buf`: the alternate buffer's *handle* (vim's `#` as a bufnr, `0` when there
+-- is none), refreshed beside `nx._alt_file`. The handle is the fact a buffer *list*
+-- needs — which row to flag `#` (`:ls`, the `buffers` picker) — while the name above is
+-- what `:e #` reopens; they part ways the moment the alternate's buffer is deleted.
+-- Read through `nx.buf.alternate()` / `vim.fn.bufnr("#")`.
+nx._alt_buf = nx._alt_buf or 0
+
 function nx._set_cur_buf(bufnr, name, filetype)
   nx._cur_buf = { bufnr = bufnr or 0, name = name or "", filetype = filetype or "" }
 end

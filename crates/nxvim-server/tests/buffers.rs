@@ -1108,6 +1108,74 @@ async fn hash_expands_to_the_alternate_file() {
     std::fs::remove_file(&b).ok();
 }
 
+/// The Lua buffer mirror carries the two per-buffer facts `:ls` prints that it used
+/// to lack: the alternate as a live **handle** (`nx.buf.alternate()` /
+/// `vim.fn.bufnr("#")`) beside the alternate *name*, and each buffer's last cursor
+/// line (`getbufinfo().lnum`, which reported a hardcoded `1` for every buffer).
+#[tokio::test]
+async fn the_mirror_carries_the_alternate_handle_and_each_buffers_line() {
+    let a = temp_file("mirrorinfo", "a1\na2\na3\n");
+    let b = temp_file("mirrorinfo", "b1\nb2\nb3\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    feed(&rpc, "j"); // a's cursor rests on line 2 when it is switched away from
+    lines(&rpc).await; // round-trip so the move lands before the switch stashes it
+    command(&rpc, &format!("e {}", name(&b))).await;
+    feed(&rpc, "G"); // b (current) sits on line 3
+    lines(&rpc).await;
+
+    let a_nr = exec_lua(&rpc, &format!("return vim.fn.bufnr('{}')", name(&a)))
+        .await
+        .as_u64()
+        .expect("a's bufnr");
+
+    // `#` as a handle: the buffer a list flags, not the name `:e #` reopens.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.buf.alternate()").await.as_u64(),
+        Some(a_nr)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.bufnr('#')").await.as_u64(),
+        Some(a_nr)
+    );
+
+    // Each buffer's last cursor line — the stashed one for the hidden buffer, the
+    // live one for the current buffer, exactly what `:ls` prints as `line N`.
+    assert_eq!(
+        exec_lua(&rpc, &format!("return vim.fn.getbufinfo({a_nr})[1].lnum"))
+            .await
+            .as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getbufinfo(vim.fn.bufnr('%'))[1].lnum")
+            .await
+            .as_u64(),
+        Some(3)
+    );
+
+    // The handle and the name part ways where vim says they must: deleting the
+    // alternate's buffer leaves `#` naming the file (`:e #` still reopens it) but
+    // there is no longer an open buffer to flag.
+    command(&rpc, &format!("bd {a_nr}")).await;
+    assert!(
+        exec_lua(&rpc, "return nx.buf.alternate()").await.is_nil(),
+        "a deleted buffer is nobody's alternate handle"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.expand('#')")
+            .await
+            .as_str()
+            .unwrap_or_default(),
+        name(&a),
+        "the alternate NAME outlives the buffer, as vim's `#` does"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
 #[tokio::test]
 async fn hash_survives_deleting_the_buffer_it_names() {
     // vim's `#` is a *file name*, not a live buffer handle: `:bd` unlists a buffer but

@@ -2311,6 +2311,8 @@ impl EditHost {
                 name,
                 changedtick: tick,
                 focused: focused_bufs.contains(&id),
+                // 1-based, the `:ls` convention (and neovim's `getbufinfo().lnum`).
+                lnum: self.editor.buffer_last_line(id).unwrap_or(0) as u64 + 1,
             });
         }
         // Drop tick entries for buffers that no longer exist, so the map can't grow
@@ -2464,6 +2466,11 @@ impl EditHost {
         let _ = self
             .lua
             .set_alt_file(&self.editor.alternate_file_name().unwrap_or_default());
+        // …and `#` as a live handle beside it (`0` ⇒ no alternate), which is the form a
+        // buffer list marks a row with — see `LuaRuntime::set_alt_buf`.
+        let _ = self
+            .lua
+            .set_alt_buf(self.editor.alternate_buffer().map_or(0, |b| b.0));
         let _ = self.lua.set_bo_mirror(&bo);
         // …and the tier those buffers were born from, so `vim.go.tabstop` /
         // `vim.opt_global` read the core's global value rather than a Lua-side echo.

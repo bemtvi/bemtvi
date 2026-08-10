@@ -368,6 +368,14 @@ pub struct BufMirror {
     /// the per-region buffer list — the buffer list is scoped per layer (see
     /// `OpenBuffer::layer` in core).
     pub focused: bool,
+    /// The buffer's **last-known cursor line** (1-based) — the live cursor when it is
+    /// the current buffer, the position stashed on switch otherwise. Exactly what `:ls`
+    /// prints as `line N` (both read the core's
+    /// [`buffer_last_line`](nxvim_core::Editor::buffer_last_line)), so `nx.bufinfo.get`
+    /// and the `buffers` picker report the same line the listing does instead of a
+    /// placeholder. Always carried — one integer, and the buffer whose line a caller
+    /// wants is usually one whose text did *not* change this tick.
+    pub lnum: u64,
 }
 
 /// One buffer's wired buffer-local options (`nx._bo_mirror[bufnr]`) read by
@@ -3639,6 +3647,16 @@ impl LuaRuntime {
     /// tracks `#` as a name rather than a live buffer handle.
     pub fn set_alt_file(&self, name: &str) -> mlua::Result<()> {
         self.nx()?.set("_alt_file", name)
+    }
+
+    /// Publish the alternate buffer's **handle** (vim's `#` as a bufnr, `0` when there
+    /// is none) into `nx._alt_buf`, beside the alternate *name* above. The two are
+    /// deliberately different facts: the name outlives the buffer it named (so `:e #`
+    /// still reopens a `:bdelete`d file), while the handle is what a buffer *list*
+    /// marks with `#` — `nx.buf.alternate()` / `vim.fn.bufnr("#")` and the `buffers`
+    /// picker's flag column read this one.
+    pub fn set_alt_buf(&self, bufnr: u64) -> mlua::Result<()> {
+        self.nx()?.set("_alt_buf", bufnr)
     }
 
     /// Publish the editor's current effective working directory into the `nx._cwd`

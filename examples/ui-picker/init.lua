@@ -35,7 +35,10 @@ vim.g.mapleader = "\\"
 -- 1. The shipped sources.
 --    \ff  files     — fuzzy file finder (streams `rg --files`, matched locally)
 --    \fg  live_grep — live grep      (re-runs `rg` after you pause typing; dynamic)
---    \fb  buffers   — pick an open buffer (in-memory; no process)
+--    \fb  buffers   — pick an open buffer (in-memory; no process). Each row
+--                    leads with the `:ls` facts: bufnr, `%` current / `#`
+--                    alternate, `a`ctive/`h`idden, `+` modified, and the
+--                    buffer's last cursor line — type-this: `:ls` and compare.
 --------------------------------------------------------------------------------
 -- Dynamic sources (live_grep) debounce: they re-run only after you stop typing for
 -- `nx.picker.debounce` ms (default 250), the in-flight search is cancelled when you

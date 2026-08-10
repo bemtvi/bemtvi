@@ -1369,6 +1369,64 @@ async fn picker_align_and_margin_place_the_box_in_a_corner_with_a_gap() {
     assert!(r >= 8, "bottom-right pins the box to the bottom (row={r})");
 }
 
+/// The `buffers` picker shows the same per-buffer facts `:ls` does — the buffer
+/// number, the `%` current / `#` alternate flag, the `a`ctive / `h`idden flag, the
+/// `+` modified flag and the buffer's last cursor line — as a fixed metadata column
+/// ahead of the name (the row's fuzzy-matched body). Before this, a row was the bare
+/// file name: which buffer you were in, which was the alternate and which had unsaved
+/// changes were all invisible.
+#[tokio::test]
+async fn buffers_picker_rows_carry_the_ls_buffer_info() {
+    let dir = temp_dir("picker_buffers_info");
+    let alpha = dir.join("alpha.txt");
+    let beta = dir.join("beta.txt");
+    std::fs::write(&alpha, "a1\na2\na3\n").unwrap();
+    std::fs::write(&beta, "b1\nb2\nb3\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // alpha first (cursor parked on line 2), then beta — so alpha is the alternate
+    // `#` and beta the current `%`. beta is edited and left unwritten: the `+` flag.
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", alpha.display())).await;
+    feed(&rpc, "j");
+    lines(&rpc).await; // round-trip so the cursor lands before the switch stashes it
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", beta.display())).await;
+    feed(&rpc, "GA!<Esc>");
+    lines(&rpc).await;
+
+    let alpha_nr = exec_lua(&rpc, &format!("return vim.fn.bufnr('{}')", alpha.display()))
+        .await
+        .as_u64()
+        .expect("alpha bufnr");
+    let beta_nr = exec_lua(&rpc, "return nx.buf.current()")
+        .await
+        .as_u64()
+        .expect("beta bufnr");
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let items = menu_items(&menu);
+    let row = |name: &str| {
+        items
+            .iter()
+            .find(|i| i.contains(name))
+            .unwrap_or_else(|| panic!("{name} is listed, got {items:?}"))
+            .clone()
+    };
+
+    // The current buffer: `%a`, modified, cursor on line 3 (`G` in a 3-line file).
+    assert!(
+        row("beta.txt").starts_with(&format!("{beta_nr:>3} %a + 3  ")),
+        "the current buffer's row carries its number, `%a`, `+` and its line: {:?}",
+        row("beta.txt")
+    );
+    // The alternate: `#h`, unmodified, its cursor stashed on line 2.
+    assert!(
+        row("alpha.txt").starts_with(&format!("{alpha_nr:>3} #h   2  ")),
+        "the alternate buffer's row carries `#h` and its stashed line: {:?}",
+        row("alpha.txt")
+    );
+}
+
 #[tokio::test]
 async fn buffers_source_lists_open_buffers() {
     let dir = temp_dir("picker_buffers");
@@ -1385,6 +1443,67 @@ async fn buffers_source_lists_open_buffers() {
     assert!(
         items.iter().any(|i| i.contains("hello.txt")),
         "buffers picker lists the open buffer, got {items:?}"
+    );
+}
+
+/// The `buffers` picker lists an **unnamed** buffer too, as `[No Name]` — the same
+/// membership `:ls` has. It used to skip every buffer without a name, so a scratch
+/// buffer (`:enew`, the startup buffer) was unreachable from the picker even while
+/// `:ls` listed it. The row carries the flags like any other and is confirmable; it
+/// has no path, so there is nothing for the preview pane to read.
+#[tokio::test]
+async fn buffers_picker_lists_unnamed_buffers_like_ls() {
+    let dir = temp_dir("picker_buffers_noname");
+    let file = dir.join("named.txt");
+    std::fs::write(&file, "hi\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // A named buffer, a scratch buffer, then back to the named one — so the scratch
+    // is hidden (`#h`) and reaching it again is exactly what the picker is for.
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    let named_buf = cur_buf(&rpc).await;
+    exec_lua(&rpc, "vim.cmd('enew')").await;
+    let scratch = cur_buf(&rpc).await;
+    command(&rpc, &format!("b {named_buf}")).await;
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let items = menu_items(&menu);
+
+    let noname = items
+        .iter()
+        .find(|i| i.contains("[No Name]"))
+        .unwrap_or_else(|| panic!("the unnamed buffer is listed, got {items:?}"));
+    assert!(
+        noname.starts_with(&format!("{scratch:>3} #h ")),
+        "the unnamed row carries its number and flags like any other: {noname:?}"
+    );
+    assert!(
+        items.iter().any(|i| i.contains("named.txt")),
+        "the named buffer is still listed, got {items:?}"
+    );
+    // One picker row per `:ls` row — the two listings agree on membership.
+    let ls_rows = exec_lua(&rpc, "return #nx.buf.list({ focused = true })")
+        .await
+        .as_u64()
+        .expect("the focused layer's buffer count");
+    assert_eq!(items.len() as u64, ls_rows, "got {items:?}");
+
+    // And the row confirms: `[` narrows to it (no path contains one), `<CR>` switches.
+    feed(&rpc, "[No");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered menu"));
+    let preview = preview_of(&menu).expect("the picker carries a preview pane");
+    assert_eq!(
+        preview_lines(&preview),
+        vec!["No preview"],
+        "an unnamed row has no path, so the pane says so instead of reading a file          literally named `[No Name]`"
+    );
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+    assert_eq!(
+        cur_buf(&rpc).await,
+        scratch,
+        "picking the [No Name] row switched to the unnamed buffer"
     );
 }
 

@@ -356,8 +356,9 @@ end
 -- The candidate set for a buffer argument: every named buffer, by name, from the
 -- authoritative buffer mirror (`nx._bufs`). The name is both the shown label and the
 -- inserted token (`:buffer {name}` resolves it by substring), and the docs pane shows
--- the buffer number. Unnamed buffers are skipped — there is no name to complete to
--- (switch to one by number) — matching the `buffers` picker source.
+-- the buffer number. Unnamed buffers are skipped — there is no name to complete to,
+-- so `:b {nr}` (or the `buffers` picker, which does list them as `[No Name]`) is how
+-- you reach one.
 local function buffer_candidates()
   local out = {}
   local bufs = nx._bufs or {}

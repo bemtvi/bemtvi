@@ -466,6 +466,30 @@ impl Editor {
         self.buffers_in_layer(self.focused_layer)
     }
 
+    /// vim's alternate buffer (`#`) as a **live handle** — the `<C-^>` target — or
+    /// `None` until a switch sets one. The twin of
+    /// [`Editor::alternate_file_name`](Self::alternate_file_name), which is the *name*
+    /// `#` expands to and deliberately outlives the buffer that named it: the handle
+    /// is what a buffer *list* (`:ls`'s `#` flag, the `buffers` picker) marks a row
+    /// with, the name is what `:e #` reopens.
+    pub fn alternate_buffer(&self) -> Option<BufferId> {
+        self.alternate
+    }
+
+    /// Buffer `id`'s last-known cursor line (0-based): the **live** cursor when it is
+    /// the current buffer, otherwise the position stashed when it was switched away
+    /// from. This is what `:ls` reports as `line N` — one accessor so the listing, the
+    /// Lua buffer mirror (`nx.bufinfo.get().lnum`, the `buffers` picker's line column)
+    /// and any later reader can never drift apart. `None` if no such buffer is open.
+    pub fn buffer_last_line(&self, id: BufferId) -> Option<usize> {
+        let ob = self.buffers.map.get(&id)?;
+        Some(if id == self.cur_buffer() {
+            self.cursor.line
+        } else {
+            ob.saved_cursor.line
+        })
+    }
+
     /// Make `id` the current buffer (the `nvim_set_current_buf` entry point).
     /// A no-op if `id` is not an open buffer.
     pub fn set_current_buffer(&mut self, id: BufferId) {
@@ -2533,7 +2557,6 @@ impl Editor {
     pub(crate) fn ex_buffers(&mut self) {
         let current = self.cur_buffer();
         let alternate = self.alternate;
-        let live_cursor = self.cursor.line;
         let mut lines = Vec::new();
         let mut current_row = 0;
         // `:ls` is scoped to the **focused layer** — a dock lists only its own
@@ -2563,11 +2586,7 @@ impl Editor {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "[No Name]".to_string());
-            let lnum = if id == current {
-                live_cursor
-            } else {
-                ob.saved_cursor.line
-            } + 1;
+            let lnum = self.buffer_last_line(id).unwrap_or(0) + 1;
             lines.push(format!(
                 "{:>3} {flag}{active} {modified} \"{name}\" line {lnum}",
                 id.0

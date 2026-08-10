@@ -1261,8 +1261,28 @@ nx.picker.source({
 -- disjoint buffer lists, so picking a buffer never yanks a document into a dock
 -- (or vice versa). Names come from the authoritative buffer mirror (`nx._bufs`);
 -- `nx.buf.name` short-circuits the *current* buffer to a separately-tracked field
--- that can lag, so reading the mirror lists every named buffer including the
--- focused one.
+-- that can lag, so reading the mirror lists every buffer including the focused one.
+--
+-- The listing matches `:ls` buffer for buffer — an unnamed one is a row too
+-- (`[No Name]`, no path, so no preview), because a scratch buffer you can see in
+-- `:ls` but can't pick is a hole, not a tidy list. Each row carries the same facts
+-- `:ls` prints — the buffer number, the `%` current / `#` alternate flag, `a`ctive /
+-- `h`idden, `+` modified, and the buffer's last cursor line — as a fixed-width
+-- **head** column ahead of the name:
+--
+-- ```
+--   3 %a + 12  /home/me/src/main.rs
+--   2 #h    3  /home/me/README.md
+--   1  h    1  [No Name]
+-- ```
+--
+-- Laid out as a leading column rather than `:ls`'s trailing `"name" line N` for two
+-- reasons: the widget aligns and always shows a declared head (a narrow list elides
+-- the *body*, so the flags can't be the thing that scrolls off), and the label is
+-- what the fuzzy matcher scores — a trailing `line 12` would put the letters of
+-- "line" in every row, so typing `in` would match the whole buffer list. The row
+-- also declares an empty `match` at the file's base name, which windows an
+-- over-long path so the name stays visible without highlighting anything.
 nx.picker.source({
   name = "buffers",
   title = "Buffers",
@@ -1270,12 +1290,52 @@ nx.picker.source({
   preview = "file", -- preview the buffer's backing file (named buffers only)
   items = function(ctx)
     local bufs = nx._bufs or {}
+    local cur, alt = nx.buf.current(), nx.buf.alternate()
+    -- Collect first: the line column is sized to the widest line number in the list,
+    -- so every name starts at the same cell (a 5-wide column for a 12-line file
+    -- would be dead space in a narrow picker).
+    local rows, lnum_w = {}, 1
     for _, b in ipairs(nx.buf.list({ focused = true })) do
       local entry = bufs[b]
       local name = (entry and entry.name) or nx.buf.name(b)
-      if name and name ~= "" then
-        ctx.push({ text = name, bufnr = b, path = name })
-      end
+      local lnum = (entry and entry.lnum) or 1
+      -- An unnamed buffer (`:enew`, the startup scratch) is listed as `[No Name]`,
+      -- the way `:ls` lists it — the two surfaces show the same buffers, and a
+      -- scratch buffer stays reachable from the picker. It carries no `path`, so the
+      -- preview pane says "no preview" instead of reading a file that isn't there.
+      local named = name ~= nil and name ~= ""
+      rows[#rows + 1] = {
+        bufnr = b,
+        label = named and name or "[No Name]",
+        path = named and name or nil,
+        lnum = lnum,
+      }
+      lnum_w = math.max(lnum_w, #tostring(lnum))
+    end
+    for _, r in ipairs(rows) do
+      local flag = (r.bufnr == cur and "%") or (r.bufnr == alt and "#") or " "
+      -- `a`ctive is the current buffer, everything else `h`idden — the same rule the
+      -- core's `:ls` applies, so the two listings never disagree about a row.
+      local active = r.bufnr == cur and "a" or "h"
+      local modified = nx.bo[r.bufnr].modified and "+" or " "
+      -- The base name's 1-based CHAR offset, pushed as an empty `match` range: "the
+      -- interesting part starts here" without a highlight, so a path too long for the
+      -- list column keeps its tail instead of its leading directories.
+      local at = charlen(r.label:match("^.*/") or "") + 1
+      ctx.push({
+        head = string.format(
+          "%3d %s%s %s %" .. lnum_w .. "d  ",
+          r.bufnr,
+          flag,
+          active,
+          modified,
+          r.lnum
+        ),
+        text = r.label,
+        match = { at, at - 1 },
+        bufnr = r.bufnr,
+        path = r.path,
+      })
     end
   end,
   confirm = function(item, mode, layer)

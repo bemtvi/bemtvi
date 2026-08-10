@@ -244,6 +244,82 @@ async fn colorscheme_sources_the_file_and_fires_the_autocmd() {
 }
 
 #[tokio::test]
+async fn a_colorscheme_keeps_the_name_it_gave_itself() {
+    // `g:colors_name` belongs to the colorscheme, not to the `:colorscheme`
+    // argument. A theme with flavours writes the flavour it actually loaded
+    // (catppuccin: `:colorscheme catppuccin` -> `catppuccin-mocha`), and plugins
+    // key off that name — nxvim-line looks up `lualine/themes/<colors_name>.lua`,
+    // so overwriting it with the typed name silently costs the theme its own
+    // statusline palette. Neovim never assigns it; the scheme's own script does.
+    let dir = temp_dir("colo_name");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4' })\n\
+         vim.g.colors_name = 'cat-mocha'\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    feed(&rpc, ":colorscheme cat<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.colors_name").await.as_str(),
+        Some("cat-mocha"),
+        "the flavour the scheme recorded must survive the load"
+    );
+    // …and the query form reports that, not what was typed.
+    let map = redraw_after(&rpc, &mut incoming, ":colorscheme<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("cat-mocha")
+    );
+}
+
+#[tokio::test]
+async fn a_colorscheme_that_names_nothing_takes_the_typed_name() {
+    // A scheme that never writes `g:colors_name` (every bundled one, and any
+    // minimal file) still has to be reportable and re-loadable, so the requested
+    // name stands in. Without it `:colorscheme` would answer `default` right
+    // after a successful load, and the attach-time default-scheme guard
+    // (`dispatch.rs`, which skips when a scheme is already recorded) would
+    // re-theme over the user's choice.
+    let dir = temp_dir("colo_unnamed");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("plain.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    feed(&rpc, ":colorscheme plain<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.colors_name").await.as_str(),
+        Some("plain"),
+    );
+}
+
+#[tokio::test]
+async fn reloading_a_flavoured_colorscheme_keeps_the_flavour() {
+    // Loading the same scheme twice must not drift: the second load starts with
+    // the flavour already recorded, and the scheme writes the same value again —
+    // a "did the value change?" test would read that as "the scheme named
+    // nothing" and fall back to the typed name.
+    let dir = temp_dir("colo_reload");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.g.colors_name = 'cat-mocha'\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    feed(&rpc, ":colorscheme cat<CR>");
+    feed(&rpc, ":colorscheme cat<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.colors_name").await.as_str(),
+        Some("cat-mocha"),
+    );
+}
+
+#[tokio::test]
 async fn init_lua_colorscheme_themes_the_first_frame() {
     // A colorscheme loaded from init.lua must be in effect before the first
     // frame is served — so the startup redraw already carries resolved chrome,

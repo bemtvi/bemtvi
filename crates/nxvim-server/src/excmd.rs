@@ -674,7 +674,7 @@ impl EditHost {
 
     /// Load a colorscheme by name: source `colors/<name>.lua` off the
     /// runtimepath (whose body populates the highlight registry via
-    /// `nvim_set_hl`), record `g:colors_name`, and fire the `ColorScheme`
+    /// `nvim_set_hl`), settle `g:colors_name`, and fire the `ColorScheme`
     /// autocmd. With no name, report the active colorscheme. The drain happens
     /// in the caller's `run_pending` fixpoint loop, so any `vim.cmd(...)` the
     /// theme queues is still resolved.
@@ -734,6 +734,16 @@ impl EditHost {
         // defined, with the OUTGOING theme's colours — and a plugin re-deriving its
         // defaults there would skip them as "already styled".
         let _ = self.lua.clear_hl_mirror_rows(&dropped);
+        // `g:colors_name` is the SCHEME's to write, not the argument's. A theme with
+        // flavours records the flavour it actually loaded — `:colorscheme catppuccin`
+        // leaves `catppuccin-mocha` — and plugins key off that name (nxvim-line looks
+        // up `lualine/themes/<colors_name>.lua`), so stamping the typed name over it
+        // silently costs the theme its own statusline palette. Neovim never assigns
+        // the variable at all; the scheme's own script does. Clearing it here makes
+        // the read below the scheme's own answer rather than a diff against the
+        // previous value, which a reload of the same scheme would misread as "the
+        // scheme named nothing".
+        let _ = self.lua.clear_global_var("colors_name");
         if let Err(e) = self.lua.exec(&src) {
             self.editor
                 .echo(format!("E5108: Error loading colorscheme {name}: {e}"));
@@ -742,7 +752,13 @@ impl EditHost {
         // are the groups this scheme owns, and the next load drops exactly them.
         self.scheme_groups = self.lua.peek_global_highlight_names().into_iter().collect();
         self.apply_lua_effects();
-        let _ = self.lua.set_global_var("colors_name", name);
+        // A scheme that names nothing (every bundled one, and any minimal file) still
+        // has to be reportable and re-loadable, so the requested name stands in: the
+        // `:colorscheme` query form answers it, and the attach-time default-scheme
+        // guard reads it to know the user already picked one.
+        if self.lua.get_global_var("colors_name").is_none() {
+            let _ = self.lua.set_global_var("colors_name", name);
+        }
         let r = self.lua.fire_autocmd("ColorScheme", name);
         self.report_autocmd_err("ColorScheme", r);
         self.apply_lua_effects();

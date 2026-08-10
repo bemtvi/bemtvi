@@ -3286,6 +3286,16 @@ impl LuaRuntime {
         g.set(key, value)
     }
 
+    /// Clear `vim.g[key]` from Rust. Used to hand `g:colors_name` to the
+    /// colorscheme about to be sourced: cleared first, the variable reads back
+    /// as the *scheme's* own answer, so the loader can tell "the scheme named
+    /// itself" from "the scheme named nothing" without comparing against a
+    /// previous value (which a reload of the same scheme would get wrong).
+    pub fn clear_global_var(&self, key: &str) -> mlua::Result<()> {
+        let g: Table = self.vim()?.get("g")?;
+        g.set(key, mlua::Value::Nil)
+    }
+
     /// Read a string-valued `vim.g[key]` from Rust, or `None` when it's unset (or
     /// not a string). Used to check whether the user's config already picked a
     /// colorscheme (`g:colors_name`) before defaulting one in at UI attach.

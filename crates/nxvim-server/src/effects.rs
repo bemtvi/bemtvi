@@ -550,7 +550,23 @@ impl EditHost {
     /// definitions fold into the core registry, queued ex-commands run against
     /// the editor, and the final captured `print` / `nvim_echo` line becomes the
     /// message.
+    ///
+    /// Wrapped in a core scroll gesture so a *navigation* that runs from Lua slides
+    /// like the native one: a keymap RHS such as the built-in `]d`
+    /// (`nx.diagnostic.goto_next` → an `LspOp` drained below) never reaches
+    /// [`Editor::input`], which is where a typed `G`/`n`/`<C-o>` takes its own
+    /// viewport snapshot — so without this the viewport teleports. The core decides
+    /// whether to animate (mode, an intervening edit, a buffer switch, the
+    /// `'scrollanim'` options, a move of more than one line).
     pub(crate) fn apply_lua_effects(&mut self) {
+        self.editor.begin_scroll_gesture();
+        let pre_tick = self.editor.buffer().changedtick;
+        self.apply_lua_effects_inner();
+        let edited = self.editor.buffer().changedtick != pre_tick;
+        self.editor.end_scroll_gesture(edited);
+    }
+
+    fn apply_lua_effects_inner(&mut self) {
         // Refresh the autocmd cache before running any queued command, so a
         // `nx.cmd('edit …')` (which runs through `editor.command` here, not the
         // `run_command` RPC path) sees an up-to-date `bufreadcmd_active` and defers a

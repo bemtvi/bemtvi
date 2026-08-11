@@ -2494,6 +2494,38 @@ impl Editor {
         }
     }
 
+    /// Open a scroll-animation gesture around work that moves the viewport from
+    /// *outside* the key-input path: the Lua-effects convergence — a keymap RHS
+    /// that navigates (`]d` → `nx.diagnostic.goto_next`), a picker confirm, a
+    /// queued `nx.cmd`, an async LSP landing. [`input`](Self::input) and
+    /// [`mouse`](Self::mouse) snapshot for themselves; this is the third entry
+    /// point, so a jump driven from Lua slides exactly like the same jump driven
+    /// by a native key instead of teleporting. Paired with
+    /// [`end_scroll_gesture`](Self::end_scroll_gesture).
+    ///
+    /// Skipped in insert / command mode (where the viewport tracks typing or the
+    /// incsearch preview and must stay crisp — the same rule `input` applies), and
+    /// while a snapshot is already open, so a nested convergence rides the outer
+    /// gesture rather than replacing it.
+    pub fn begin_scroll_gesture(&mut self) {
+        if self.scroll_from.is_some() || self.mode.is_insert() || self.mode == Mode::Command {
+            return;
+        }
+        self.scroll_from = Some((self.top, self.cursor.line));
+    }
+
+    /// Close the gesture [`begin_scroll_gesture`](Self::begin_scroll_gesture)
+    /// opened: animate the slide unless the work `edited` the buffer, which keeps
+    /// a Lua-driven edit as crisp as a typed one (again mirroring `input`). A
+    /// buffer/tab/window switch in between already dropped the snapshot itself, so
+    /// a navigation that landed somewhere else entirely has no slide to play.
+    pub fn end_scroll_gesture(&mut self, edited: bool) {
+        if edited {
+            self.scroll_from = None;
+        }
+        self.finalize_scroll_gesture();
+    }
+
     /// Turn a recorded `scroll_from` into a `pending_scroll` animation when the
     /// focused window's viewport moved more than a line — an explicit scroll, an
     /// off-screen motion, or the mouse wheel. A one-line shift (holding `j`/`k` at

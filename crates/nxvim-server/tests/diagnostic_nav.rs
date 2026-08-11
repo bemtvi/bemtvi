@@ -12,8 +12,10 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, exec_lua, feed, lines, panel_is_open, spawn, write_n_lines,
+    attach, cursor, exec_lua, feed, field, lines, panel_is_open, redraw_after_matching, spawn,
+    write_n_lines,
 };
+use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -153,5 +155,73 @@ async fn user_map_overrides_the_default() {
         cursor(&rpc).await.0,
         1,
         "the overridden default did not also jump"
+    );
+}
+
+/// The 0-based buffer line a `scroll` band row points at. The band is laid out in
+/// **screen rows** (`to_cursor_row` & co. are offsets into it), so a row is mapped
+/// back to a buffer line through the band's own 1-based `numbers` array.
+fn scroll_band_line(map: &[(Value, Value)], row_key: &str) -> u64 {
+    let Some(Value::Map(s)) = field(map, "scroll") else {
+        panic!("no scroll gesture on the redraw");
+    };
+    let get = |k: &str| {
+        s.iter()
+            .find(|(kk, _)| kk.as_str() == Some(k))
+            .map(|(_, v)| v)
+    };
+    let row = get(row_key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("scroll.{row_key} missing")) as usize;
+    get("numbers")
+        .and_then(Value::as_array)
+        .and_then(|a| a.get(row))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("scroll band row {row} has no buffer line"))
+        - 1
+}
+
+/// An off-screen `]d` **animates** the slide, exactly like the native jumps
+/// (`G`, `n`, `<C-o>`) do: the input's redraw carries the one-shot `scroll`
+/// gesture the client eases the viewport along, instead of the viewport
+/// teleporting. The navigation runs from Lua (the default `]d` map ->
+/// `nx.diagnostic.goto_next` -> an `LspOp`) and so never reaches `Editor::input`,
+/// where a typed jump takes its own viewport snapshot — the gesture has to be
+/// built around the Lua-effects convergence too.
+#[tokio::test]
+async fn bracket_d_animates_an_off_screen_jump() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_n_lines("diagnostic_nav_scroll", 300);
+    feed(&rpc, &format!(":e {path}<CR>"));
+    exec_lua(
+        &rpc,
+        r#"
+        nx.diagnostic.set(nx.ns.create("scrolltest"), 0, {
+          { lnum = 200, col = 0, message = "far away", severity = nx.diagnostic.severity.ERROR },
+        })
+        return true
+        "#,
+    )
+    .await;
+
+    // The cursor starts on line 1 and the only diagnostic sits on 0-based line
+    // 200 - far past the bottom of the 24-row viewport, so the jump scrolls.
+    let has_scroll = |m: &[(Value, Value)]| matches!(field(m, "scroll"), Some(Value::Map(_)));
+    let map = redraw_after_matching(&rpc, &mut incoming, "]d", has_scroll).await;
+    assert_eq!(
+        scroll_band_line(&map, "to_cursor_row"),
+        200,
+        "the slide ends on the diagnostic's line"
+    );
+    assert_eq!(cursor(&rpc).await.0, 201, "`]d` landed on the diagnostic");
+
+    // ...and back: `[d` wraps to the same diagnostic from the other side, an
+    // upward slide that animates too.
+    feed(&rpc, "gg");
+    let back = redraw_after_matching(&rpc, &mut incoming, "[d", has_scroll).await;
+    assert_eq!(
+        scroll_band_line(&back, "to_cursor_row"),
+        200,
+        "`[d` animates its jump as well"
     );
 }

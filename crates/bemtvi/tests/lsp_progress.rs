@@ -111,7 +111,7 @@ async fn initialize_advertises_window_work_done_progress() {
     // under load (the polling loop below can exhaust its tries before the process
     // has even spawned).
     assert_eq!(
-        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
         "1",
         "the mock client should be attached before we read its recorded initialize"
     );

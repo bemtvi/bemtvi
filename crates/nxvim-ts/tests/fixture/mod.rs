@@ -36,12 +36,22 @@ impl Drop for TempDir {
 /// from `src_dir` into `<root>/parser/<lang>.so` via the system C compiler —
 /// mirroring how a user installs a parser, but hermetic.
 pub fn compile_grammar(root: &Path, lang: &str, src_dir: &Path) {
+    compile_grammar_as(root, lang, lang, src_dir)
+}
+
+/// [`compile_grammar`], but installed under a different name than the one the
+/// sources export: the loader looks up `tree_sitter_<lang>`, so `real`'s export is
+/// renamed to `lang`'s with a `-D`. Lets one real grammar stand in for several
+/// distinct languages, which is how a test gets more than one *cold grammar load*
+/// out of the two grammars the registry gives us.
+pub fn compile_grammar_as(root: &Path, lang: &str, real: &str, src_dir: &Path) {
     let dir = root.join("parser");
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join(format!("{lang}.so"));
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = std::process::Command::new(compiler)
         .args(["-shared", "-fPIC", "-O1"])
+        .arg(format!("-Dtree_sitter_{real}=tree_sitter_{lang}"))
         .arg("-I")
         .arg(src_dir)
         .arg(src_dir.join("parser.c"))
@@ -91,6 +101,16 @@ pub fn install_rust_grammar(root: &Path) {
         "highlights",
         tree_sitter_rust::HIGHLIGHTS_QUERY,
     );
+}
+
+/// Install the Rust grammar under an assumed *other* language's name — a distinct
+/// grammar as far as the engine is concerned (its own `.so` to `dlopen`, its own
+/// queries to compile), so a document can inject several languages that each cost a
+/// real cold load.
+pub fn install_rust_grammar_as(root: &Path, lang: &str) {
+    let src = registry_crate_dir("tree-sitter-rust-0.24.2").join("src");
+    compile_grammar_as(root, lang, "rust", &src);
+    write_query(root, lang, "highlights", tree_sitter_rust::HIGHLIGHTS_QUERY);
 }
 
 /// Install the Markdown block grammar + its bundled queries under `root` — a

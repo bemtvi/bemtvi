@@ -31,12 +31,17 @@ const LINE_TYPE: LineType = LineType::LF_CR;
 /// than a hang. Generous enough that a normal incremental reparse never trips it.
 const PARSE_DEADLINE: Duration = Duration::from_millis(50);
 
-/// Wall-clock budget for **all** of a buffer's child (injection) parses on one
-/// refresh, the injection analogue of [`PARSE_DEADLINE`]. Injected regions reparse
-/// per edit, so an adversarial config (many regions, or a pathological child
-/// grammar) could otherwise stall the edit path. On expiry the remaining child
-/// parses are cancelled and their last-good (edit-shifted) trees are kept, so the
-/// cost is one frame of stale injected highlights rather than a hang.
+/// Wall-clock budget for **all** of a buffer's child (injection) work on one
+/// refresh — grammar loads included — the injection analogue of [`PARSE_DEADLINE`].
+/// Injected regions reparse per edit, so an adversarial config (many regions, or a
+/// pathological child grammar) could otherwise stall the edit path. On expiry the
+/// remaining child parses are cancelled and their last-good (edit-shifted) trees are
+/// kept, so the cost is one frame of stale injected highlights rather than a hang.
+///
+/// A region with no last-good tree — a `<script lang="ts">` on the frame the file
+/// opened — is not lost by expiry: it is kept pending and resumed a budget at a time
+/// on later frames ([`PendingInjection`]), so it colours in shortly *after* the file
+/// paints instead of holding the paint up.
 const INJECTION_DEADLINE: Duration = Duration::from_millis(50);
 
 /// How deep injected layers may nest (host → injected → injected-within-injected →
@@ -114,7 +119,11 @@ struct PendingInjection {
     /// than one resumed against bytes it never started on.
     ranges: Vec<Range<usize>>,
     /// Holds the outstanding parse; `parse` on it resumes rather than restarts.
-    parser: Parser,
+    /// `None` for a region the pass deferred *before* starting it — a first region
+    /// of a language whose grammar was still uncached when the frame's budget ran
+    /// out (see [`Engine::build_injection_layers`]). It gets a fresh parser when the
+    /// next frame reaches it.
+    parser: Option<Parser>,
 }
 
 /// One injected sub-language layer: a child grammar's parse of the host buffer
@@ -776,16 +785,15 @@ impl Engine {
             resumable = std::mem::take(&mut state.pending_injections);
         }
         let started = Instant::now();
-        // Time spent loading child grammars, which the budget below discounts. A
-        // language's first region pays a `dlopen` plus a compile of every `.scm` it
-        // ships — tens of milliseconds. Charged to the parse budget (as it once was)
-        // that alone exhausted it, so the very parse it was meant to bound was
-        // cancelled before it started and the region silently kept the host's flat
-        // paint: a vue file's `<script setup lang="ts">` never coloured until the
-        // first keystroke. The bound is meant for pathological *parsing*, and the
-        // load is one-off per language per session, so it is excluded rather than
-        // counted.
-        let mut loading = Duration::ZERO;
+        // One wall-clock budget for the whole pass, load time included: what this
+        // bounds is the *frame*, and a cold `dlopen` plus a compile of every `.scm` a
+        // language ships is as real a stall as a pathological parse (hundreds of ms
+        // for typescript). A language's first region therefore usually spends the
+        // whole budget arriving and parses nothing — that is fine and is not the same
+        // as being dropped: it is kept as a [`PendingInjection`], `parse_pending`
+        // reports it, and the next frame resumes it with a full budget against a
+        // grammar that is now cached. The region colours in a frame or two after the
+        // file paints rather than stalling the paint it belongs to.
         let mut layers = Vec::with_capacity(regions.len());
         let mut still_pending: Vec<PendingInjection> = Vec::new();
         // (language, ranges, depth, injector) — `injector` is the language that
@@ -796,21 +804,13 @@ impl Engine {
             .collect();
 
         while let Some((language, mut ranges, depth, injector)) = queue.pop_front() {
-            // Lazily load (cache) the child grammar; skip silently if it is missing
-            // or broken — the region just keeps the host's flat paint.
-            let load_started = Instant::now();
-            let child_language = match self.grammar(&language) {
-                Slot::Loaded(g) => g.language.clone(),
-                _ => continue,
-            };
-            loading += load_started.elapsed();
-
             // `included_ranges` must be ascending and non-overlapping. A combined
             // pattern can match *nested* nodes (a section inside a section), whose
             // ranges overlap — passed through raw, `set_included_ranges` would
             // reject them and the whole layer would silently drop. Merge each
             // overlap into its union (identical coverage for both the child parse
-            // and the painter's clipping).
+            // and the painter's clipping). Merged before the load below so a region
+            // deferred there keys the same way as one that got this far.
             ranges.sort_by_key(|r| r.start);
             ranges.dedup_by(|next, prev| {
                 if next.start <= prev.end {
@@ -820,6 +820,36 @@ impl Engine {
                     false
                 }
             });
+
+            // A grammar not yet cached costs a `dlopen` plus a compile of every
+            // `.scm` it ships — hundreds of ms for typescript, none of it
+            // interruptible. So no load *starts* on a frame that has already spent
+            // its budget: the region it belongs to can't be parsed on that frame
+            // anyway, and a document with fenced code in eight languages would
+            // otherwise pay all eight loads at once. Deferring costs nothing — the
+            // region stays pending, so the next frame comes right back and spends
+            // its budget here — and the file keeps painting while its injections
+            // arrive over the frames after it.
+            //
+            // Keyed on *unattempted*, not on "not loaded": a language whose load
+            // already failed (or that isn't installed) is a cached lookup below,
+            // costs nothing, and drops the region — deferring that one instead would
+            // leave it pending forever and the server repainting to resolve it.
+            let cold = !self.grammars.contains_key(&language);
+            if cold && started.elapsed() >= INJECTION_DEADLINE {
+                still_pending.push(PendingInjection {
+                    language,
+                    ranges,
+                    parser: None,
+                });
+                continue;
+            }
+            // Lazily load (cache) the child grammar; skip silently if it is missing
+            // or broken — the region just keeps the host's flat paint.
+            let child_language = match self.grammar(&language) {
+                Slot::Loaded(g) => g.language.clone(),
+                _ => continue,
+            };
             // The parser that already holds this region's cancelled parse, if the
             // last refresh left one — resuming it continues from where the budget
             // ran out, where a fresh parser would restart the region from scratch.
@@ -828,12 +858,9 @@ impl Engine {
             let resumed = resumable
                 .iter()
                 .position(|p| p.language == language && p.ranges == ranges)
-                .map(|i| resumable.remove(i));
+                .and_then(|i| resumable.remove(i).parser);
             let resuming = resumed.is_some();
-            let mut parser = match resumed {
-                Some(p) => p.parser,
-                None => Parser::new(),
-            };
+            let mut parser = resumed.unwrap_or_else(Parser::new);
             if !resuming && parser.set_language(&child_language).is_err() {
                 continue;
             }
@@ -857,7 +884,7 @@ impl Engine {
                 continue;
             }
             let tree = {
-                let mut budget = deadline_budget(started + loading, INJECTION_DEADLINE);
+                let mut budget = deadline_budget(started, INJECTION_DEADLINE);
                 let options = ParseOptions::new().progress_callback(&mut budget);
                 let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
                 parser.parse_with_options(&mut callback, old.as_ref(), Some(options))
@@ -880,7 +907,7 @@ impl Engine {
                         None => still_pending.push(PendingInjection {
                             language,
                             ranges,
-                            parser,
+                            parser: Some(parser),
                         }),
                     }
                     continue;

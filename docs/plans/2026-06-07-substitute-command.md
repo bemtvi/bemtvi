@@ -11,16 +11,16 @@
 > tested. Phased and TDD-driven per the project workflow.
 >
 > **Note on file paths below.** This plan was written against the pre-refactor
-> single-file `crates/nxvim-core/src/editor.rs`. That file has since been split
-> into per-concern modules under `crates/nxvim-core/src/editor/`; the substitute
+> single-file `crates/bemtvi-core/src/editor.rs`. That file has since been split
+> into per-concern modules under `crates/bemtvi-core/src/editor/`; the substitute
 > code now lives in `editor/ex.rs` (range parsing, `ex_substitute`,
 > `run_substitute`, and the `SubstConfirm` confirm walk) with the confirm-key
 > intercept in `editor/mod.rs`. Line numbers in the prose are historical.
 
 ## Why this document exists
 
-nxvim has `/` and `?` search (canonical-regex, line-by-line — see
-`crates/nxvim-core/src/search.rs`) but no `:s`. Today a `:1,5s/foo/bar/`
+bemtvi has `/` and `?` search (canonical-regex, line-by-line — see
+`crates/bemtvi-core/src/search.rs`) but no `:s`. Today a `:1,5s/foo/bar/`
 doesn't even parse: `execute_ex` (`editor.rs:6205`) treats a bare number as a
 "jump to line N" and otherwise splits off an *alphabetic* command name, so a
 leading range like `1,5s…` produces an empty command name and is silently
@@ -37,13 +37,13 @@ don't exist yet:
 
 ## Design decisions
 
-**Dialect: canonical regex, matching `/` search — *not* vim magic.** nxvim made a
+**Dialect: canonical regex, matching `/` search — *not* vim magic.** bemtvi made a
 deliberate choice (documented at the top of `search.rs`) that `/` speaks the
 `regex` crate's PCRE-style dialect: `+ ? * ( ) | { } [ ] ^ $ .` are operators,
 a leading `\` escapes to literal, inline `(?i)`/`(?-i)` for case. `:s` shares
 the **same engine and dialect** by compiling its pattern through the existing
 `SearchRegex::compile`. The vim-magic translation layer in
-`crates/nxvim-lua/src/vimregex.rs` is a `vim.fn.substitute` Lua-compat shim and
+`crates/bemtvi-lua/src/vimregex.rs` is a `vim.fn.substitute` Lua-compat shim and
 stays walled off there — it does **not** back the editor's `:s`.
 
 **Replacement syntax: regex-crate `$`-captures + a backslash-escape pass.**
@@ -182,7 +182,7 @@ the parser without needing `:s` yet).
    bare-`:s` repeat, and set `last_search` to the pattern so `n` and `hlsearch`
    pick it up (matches vim: `:s` sets the search register).
 
-**Tests (Phase 1)** — in `crates/nxvim-server/tests/editing.rs`:
+**Tests (Phase 1)** — in `crates/bemtvi-server/tests/editing.rs`:
 - current-line `:s/foo/baz<CR>`;
 - `:%s/foo/bar/g` across multiple lines;
 - range `:1,2s/…`;
@@ -254,8 +254,8 @@ still takes precedence over `c` (a counting pass never prompts); any other key
 leaves the prompt up (vim beeps).
 
 The `^E`/`^Y` peek reuses the normal-mode one-line scroll (`<C-e>`/`<C-y>`, added
-alongside this — `Editor::scroll_line` in `editor/cursor.rs`). One nxvim-specific
-wrinkle: nxvim re-runs `ensure_visible` on every redraw, so it can't let the
+alongside this — `Editor::scroll_line` in `editor/cursor.rs`). One bemtvi-specific
+wrinkle: bemtvi re-runs `ensure_visible` on every redraw, so it can't let the
 cursor scroll off the match the way vim does. Instead the cursor rides the view
 to stay on screen during the peek — harmless, because the pending match lives in
 the confirm state (`cur`), not in the cursor, so the eventual `y`/`n` still lands
@@ -320,22 +320,22 @@ default `:g` command). Both go through `push_undo`, so they coalesce under `:g`.
 
 ## Touch list (as built)
 
-- `crates/nxvim-core/src/editor/ex.rs` — `parse_ex_range`, `execute_ex` wiring,
+- `crates/bemtvi-core/src/editor/ex.rs` — `parse_ex_range`, `execute_ex` wiring,
   `ex_substitute` / `repeat_substitute` / `run_substitute`, and the Phase-3
   confirm walk (`SubstConfirm`, `begin_subst_confirm`, `subst_confirm_seek` /
   `_key` / `_apply` / `_skip` / `_finish`, `next_char_boundary`).
-- `crates/nxvim-core/src/editor/mod.rs` — the `last_substitute` / `subst_confirm`
+- `crates/bemtvi-core/src/editor/mod.rs` — the `last_substitute` / `subst_confirm`
   state fields and the `subst_confirm_key` input intercept in `Editor::input`.
-- `crates/nxvim-core/src/editor/cursor.rs` + `editor/command.rs` — the normal-mode
+- `crates/bemtvi-core/src/editor/cursor.rs` + `editor/command.rs` — the normal-mode
   one-line scroll `<C-e>`/`<C-y>` (`scroll_line` / `scroll_view_line`,
   `NormalCmd::ScrollLine`), which the confirm `^E`/`^Y` peek reuses.
-- `crates/nxvim-core/src/editor/ex.rs` (Phase 4) — `ex_global` / `split_global`,
+- `crates/bemtvi-core/src/editor/ex.rs` (Phase 4) — `ex_global` / `split_global`,
   the `:g`/`:v`/`:d`/`:p` `execute_ex` arms, and `ex_delete` / `ex_print`; the
   `in_global` re-entrancy flag lives on `Editor` in `editor/mod.rs`.
-- `crates/nxvim-core/src/search.rs` — `SearchRegex::substitute_line` and
+- `crates/bemtvi-core/src/search.rs` — `SearchRegex::substitute_line` and
   `match_replacement` (the Phase-3 single-match primitive) + the replacement-dialect
   module note.
-- `crates/nxvim-server/tests/editing.rs` — the `substitute_*` /
+- `crates/bemtvi-server/tests/editing.rs` — the `substitute_*` /
   `substitute_confirm_*` (Phases 0–3) and `global_*` / `ex_delete_*` (Phase 4) tests.
 - `docs/architecture.md` / `docs/known-approximations.md` — `:s` is implemented;
   the replacement dialect shares `/` search's canonical regex.

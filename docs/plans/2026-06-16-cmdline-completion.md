@@ -47,19 +47,19 @@ plugin must appear in that list *the same way* a built-in does (the unified payo
 ## Design
 
 The repo already has a **unified float-list widget** (`Menu`/`MenuView`,
-`docs/specs/2026-06-14-nx-ui-float-widget.md`) with four orchestrations — picker,
-`nx.ui.select`, insert-completion, and the insert-completion **docs sidebar**
+`docs/specs/2026-06-14-btv-ui-float-widget.md`) with four orchestrations — picker,
+`btv.ui.select`, insert-completion, and the insert-completion **docs sidebar**
 (`project_complete_docs`). Command-line completion is the **fifth orchestration** on
 the same widget: a `MenuKind::Cmdline` menu, placed above the command line, driven by
-a bundled `nx.cmdline_complete` Lua plugin that owns the command catalog.
+a bundled `btv.cmdline_complete` Lua plugin that owns the command catalog.
 
-Engine (Rust core) vs policy (nx.* Lua):
+Engine (Rust core) vs policy (btv.* Lua):
 - **Core** extracts the token being completed from `Editor::cmdline`, ranks the
   candidates (`crate::fuzzy`), renders the menu (reusing `Menu`/`MenuView`), and
   applies the accept by rewriting the command-line token. It never knows *what*
   commands exist.
 - **Lua** (`prelude/cmdline_complete.lua`) owns the curated command catalog (names,
-  abbrevs, synopsis, help) merged with `nx.user_command.get()`, and returns the
+  abbrevs, synopsis, help) merged with `btv.user_command.get()`, and returns the
   candidate set for a given command line.
 
 The insert-completion engine (`editor/complete.rs`) is **not** reused directly — it is
@@ -80,7 +80,7 @@ bound to buffer/insert semantics. We reuse its *types and patterns* (`Menu`,
 The catalog filter is a microsecond table scan, so there is no async / generation
 machinery (that exists for slow insert sources — rg / lsp). `<Tab>` (and each edit
 while the menu is open) sets `Editor::cmdline_complete_request`; the server resolves it
-in one Lua round-trip (`nx._cmdline_complete_run(line, col)` → candidates) and rebuilds
+in one Lua round-trip (`btv._cmdline_complete_run(line, col)` → candidates) and rebuilds
 the menu via `Editor::open_cmdline_menu`.
 
 ## Phases (commit + pause between each)
@@ -100,9 +100,9 @@ the menu via `Editor::open_cmdline_menu`.
   per command, a non-gated `project_cmdline_docs` emits a bottom-aligned float
   beside the wildmenu box (text-area-absolute cells), and TUI/GUI/web render it
   (TUI/GUI offset from the box's `cmd_area`-grown position; web renders directly).
-- **Phase 4** ✅ — Unified plugin commands: `nx.user_command.create`/`buf_create`
+- **Phase 4** ✅ — Unified plugin commands: `btv.user_command.create`/`buf_create`
   store an optional `desc` (parallel to the body registry; surfaced by
-  `nx.user_command.get()`/`buf_get`), and `_cmdline_complete_run` appends the
+  `btv.user_command.get()`/`buf_get`), and `_cmdline_complete_run` appends the
   registered user commands (current-buffer-locals shadowing globals, deduped against
   the built-ins) so a plugin command ranks + previews like a built-in. A coverage
   test runs every catalog name via `nvim_command` and asserts none is `E492` (drift
@@ -114,9 +114,9 @@ the menu via `Editor::open_cmdline_menu`.
   `editor/mod.rs`, `lib.rs`, `view.rs`.
 - Server: `runtime.rs`, `install.rs`, `effects.rs`, `redraw.rs`.
 - Lua: `prelude/cmdline_complete.lua` (new, registered in `PRELUDE_MODULES`),
-  `prelude/keymap.lua`, `prelude/autocmd.lua` (the `nx.user_command` `desc` store +
+  `prelude/keymap.lua`, `prelude/autocmd.lua` (the `btv.user_command` `desc` store +
   `get()`/`buf_get` surfacing — Phase 4).
-- Tests: `crates/nxvim-server/tests/cmdline_complete.rs` (new).
+- Tests: `crates/bemtvi-server/tests/cmdline_complete.rs` (new).
 
 ## Verification
 Black-box harness tests on the redraw `menu` map (names listed, narrowing, accept,

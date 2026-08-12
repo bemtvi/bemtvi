@@ -1,8 +1,8 @@
--- ~~~ nxvim shada: cross-session state — :wshada / :rshada + persistence ~~~
+-- ~~~ bemtvi shada: cross-session state — :wshada / :rshada + persistence ~~~
 --
 -- shada ("shared data") is the durable store of editor state that outlives the
 -- process: your registers, marks, search/ex history, the jumplist, the
--- changelist, and the numbered marks '0–'9. nxvim keeps it in a per-instance
+-- changelist, and the numbered marks '0–'9. bemtvi keeps it in a per-instance
 -- redb file under  stdpath("state")/shada/  and merges it back on the next
 -- launch — so a yank in one session pastes in the next, `A jumps to the file
 -- you marked, `" reopens a file at its last cursor, and /history survives.
@@ -11,14 +11,14 @@
 -- never touches your real ~/.local/state. From the repo root:
 --
 --     # First session — seed some state, then quit with :qa
---     XDG_STATE_HOME=/tmp/nxvim-shada-demo NXVIM_CONFIG=examples/shada \
---       cargo run -p nxvim -- examples/shada/sample.txt
+--     XDG_STATE_HOME=/tmp/bemtvi-shada-demo BEMTVI_CONFIG=examples/shada \
+--       cargo run -p bemtvi -- examples/shada/sample.txt
 --
 --     # Second session — the state from the first is restored
---     XDG_STATE_HOME=/tmp/nxvim-shada-demo NXVIM_CONFIG=examples/shada \
---       cargo run -p nxvim -- examples/shada/sample.txt
+--     XDG_STATE_HOME=/tmp/bemtvi-shada-demo BEMTVI_CONFIG=examples/shada \
+--       cargo run -p bemtvi -- examples/shada/sample.txt
 --
--- (Delete /tmp/nxvim-shada-demo to start fresh.)
+-- (Delete /tmp/bemtvi-shada-demo to start fresh.)
 --
 -- What to do in the FIRST session:
 --   :SeedShada     stash a register, set global mark A, push a search

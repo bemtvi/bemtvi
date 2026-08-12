@@ -5,7 +5,7 @@ Status: **done** — Phases 1, 2, 3 and 4 shipped. Author-date: 2026-08-01.
 Phase 1 (`cb3ac0cc`) put the buffer tier in the core and split `:set` / `:setlocal` /
 `:setglobal`. Phase 2 (`994e4944`) put the Lua surface on top: `vim.opt` / `vim.o` write
 both tiers, `vim.bo` / `vim.opt_local` only the buffer, `vim.go` / `vim.opt_global` only
-the tier (`nx.opt_local` and `nx.opt_global` were aliases of `nx.opt` before). Phase 3
+the tier (`btv.opt_local` and `btv.opt_global` were aliases of `btv.opt` before). Phase 3
 finished the model: window options got the same two tiers, and the three map-backed buffer
 nouns (`commentstring`, `foldexpr`, `foldmarker`) got a read-time global fallback.
 
@@ -45,12 +45,12 @@ windows by inheritance. Buffers have no such copy step, so nothing propagates.
 
 ## Why it doesn't already work
 
-There is no tier to fall back to. nxvim's option model is three structs of **concrete**
+There is no tier to fall back to. bemtvi's option model is three structs of **concrete**
 values with no "unset" state:
 
 | scope | storage | written by |
 | --- | --- | --- |
-| global | `Editor::global_base` → merged into `Editor::options` (with the `nx.wso` overlay on top) | `set_global_option_*` |
+| global | `Editor::global_base` → merged into `Editor::options` (with the `btv.wso` overlay on top) | `set_global_option_*` |
 | window | `Window::options: WindowOptions`, one per window | `windows.cur_mut().options.*` |
 | buffer | `Buffer::options: BufferOptions`, one per buffer | `buffer_mut().options.*` |
 
@@ -61,7 +61,7 @@ values with no "unset" state:
   "setl"` to `ex_set`; `:setglobal` is an unknown ex command.
 - **`:setlocal` is `:set`.** `options.rs:22` — *"`:setlocal`, which is identical here"*.
 - **`vim.go.tabstop` is inert.** `go_set` (`prelude/state.lua`) only reaches the core for
-  names the catalog scopes `Global`; a buffer/window name falls into the `nx._o_store`
+  names the catalog scopes `Global`; a buffer/window name falls into the `btv._o_store`
   catch-all — readable back, never honored.
 - **`vim.opt_local` / `vim.opt_global` are aliases of `vim.opt`** — *"the forced-scope
   distinction neovim draws is collapsed"*.
@@ -76,7 +76,7 @@ instance local value:
 - `:setlocal {opt}={v}` — writes only the current instance's local.
 - `:setglobal {opt}={v}` — writes only the global value.
 - a **new buffer** is born from the global values;
-- a **new window** copies the current window's locals (vim, and what nxvim already does);
+- a **new window** copies the current window's locals (vim, and what bemtvi already does);
   the global value is what `:setglobal` reads/writes and what seeds a window with no
   source to copy from.
 - reads: `:set {opt}?` / `vim.o` / `vim.bo` / `vim.wo` report the **local** value;
@@ -117,7 +117,7 @@ a `BufferOptions` field fails to compile until it is classified.
    (`E5xx: {opt} has no global value`), never a silent store. Phase 3 gives the three that
    want one (`foldexpr`, `foldmarker`, `commentstring`) a real fallback.
 
-Tests (`crates/nxvim-server/tests/options.rs`): a new file opened after `:set tabstop=3`
+Tests (`crates/bemtvi-server/tests/options.rs`): a new file opened after `:set tabstop=3`
 carries it; `:setlocal` doesn't leak to the next buffer; `:setglobal` doesn't touch the
 current one but does reach the next; `:set {opt}?` vs `:setglobal {opt}?` disagree after a
 `:setlocal`; and a `:setglobal` twin of the catalog-driven
@@ -125,12 +125,12 @@ current one but does reach the next; `:set {opt}?` vs `:setglobal {opt}?` disagr
 
 ## Phase 2 — the Lua surface (shipped)
 
-- `nx.o` / `vim.o`: a buffer-scoped name currently forwards to `vim.bo` (local only). Route
+- `btv.o` / `vim.o`: a buffer-scoped name currently forwards to `vim.bo` (local only). Route
   it to a **both-tiers** setter instead, matching `:set`.
-- `vim.bo` / `nx.opt_local`: unchanged, local only — un-alias `nx.opt_local` from `nx.opt`.
-- `vim.go` / `nx.opt_global`: reach the tier for buffer-scoped names instead of dropping
-  into `nx._o_store`.
-- A `nx._bo_global` mirror pushed beside `BoMirror` so a `vim.go` read is honest.
+- `vim.bo` / `btv.opt_local`: unchanged, local only — un-alias `btv.opt_local` from `btv.opt`.
+- `vim.go` / `btv.opt_global`: reach the tier for buffer-scoped names instead of dropping
+  into `btv._o_store`.
+- A `btv._bo_global` mirror pushed beside `BoMirror` so a `vim.go` read is honest.
 - Book/prelude docstrings for the three surfaces (markdown rules in CLAUDE.md).
 
 ## Phase 3 — windows, and the map-backed buffer nouns (shipped)
@@ -152,10 +152,10 @@ lists that had drifted from the catalog, so `vim.opt.foldmethod = "marker"` — 
 `foldexpr`, `foldmarker`, `commentstring`, `indentemptylines`, `foldnestmax`,
 `foldminlines`, `foldcolumn`, `foldenable`, `foldlevel`, `breakindent`, `showbreak`,
 `breakindentopt`, `sidescroll`, `sidescrolloff`, `padding` — fell into the unmodeled
-`nx._o_store` and silently did nothing while `:set foldmethod=marker` worked.
+`btv._o_store` and silently did nothing while `:set foldmethod=marker` worked.
 
 Every table that routes an option name is now **derived from core's option catalog**
-(`nx._set_options_catalog`, fed by `options_catalog()` before any config runs), the
+(`btv._set_options_catalog`, fed by `options_catalog()` before any config runs), the
 same list `:set` resolves against, so the Lua and ex surfaces can no longer disagree:
 
 - `O_WIN` / `O_BUF` come from the catalog's `scope` column; `WO_GLOBAL_TIER` /
@@ -174,7 +174,7 @@ same list `:set` resolves against, so the Lua and ex surfaces can no longer disa
   `set_window_option_*`), a catalog row for `'winhighlight'` (honored by the core,
   absent from the catalog, so `:set winhl=` was `E518`), and the mirror fields
   `vim.wo` / `vim.bo` needed to read any of them back honestly.
-- `:setglobal` reached `nx.cmdline_complete` (neither the command name nor its
+- `:setglobal` reached `btv.cmdline_complete` (neither the command name nor its
   option-name argument completed).
 
 Guarded by `every_scoped_option_is_routed_by_vim_opt` — the Lua twin of

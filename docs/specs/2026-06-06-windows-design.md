@@ -17,10 +17,10 @@ window. Read [`docs/architecture.md`](../architecture.md) first — especially
 [*View protocol*](../architecture.md#protocols) (the protocol that must grow to
 carry many windows).
 
-The relevant code is `crates/nxvim-core/src/editor.rs` (window state is inline on
-`Editor` today), `crates/nxvim-core/src/view.rs` (the single-window `View`),
-`crates/nxvim-server/src/lib.rs` (the `redraw()` projection, the `nvim_*` surface,
-per-buffer syntax routing), and `crates/nxvim-tui/src/render.rs` (the client
+The relevant code is `crates/bemtvi-core/src/editor.rs` (window state is inline on
+`Editor` today), `crates/bemtvi-core/src/view.rs` (the single-window `View`),
+`crates/bemtvi-server/src/lib.rs` (the `redraw()` projection, the `nvim_*` surface,
+per-buffer syntax routing), and `crates/bemtvi-tui/src/render.rs` (the client
 layout, which currently lays out one text area + one status line).
 
 ---
@@ -72,7 +72,7 @@ Key decisions, each checkable against vim:
   not in the motions/operators.
 - **The core owns the layout tree and rect computation.** Splits, sizes,
   equalization, and `<C-w>` resizing are editor state (you can script and resize
-  them), so the tree lives in `nxvim-core`, matching neovim where the editor owns
+  them), so the tree lives in `bemtvi-core`, matching neovim where the editor owns
   the window layout and the UI just paints. The client keeps owning *chrome* (the
   bottom command/message line) and *how* each window's gutter/status/text looks —
   but *where* each window sits now comes from the core.
@@ -91,7 +91,7 @@ Key decisions, each checkable against vim:
   docked at the bottom, exactly as vim shows the cmdline below all splits. They do
   not multiply.
 
-What does **not** change: `nxvim-core` stays pure/sync; the buffer store, undo,
+What does **not** change: `bemtvi-core` stays pure/sync; the buffer store, undo,
 edit journal, `changedtick`; the register and options (still global — window-local
 options like `wrap` are future work alongside buffer-local options). The trailing-
 `\n` invariant and byte-offset model are untouched.
@@ -105,7 +105,7 @@ Pure refactor — every existing test passes unchanged, no new user-facing behav
 This is the largest mechanical churn and is deliberately isolated, mirroring
 Phase 1 of the buffers work.
 
-**Changes (`crates/nxvim-core/src/editor.rs`):**
+**Changes (`crates/bemtvi-core/src/editor.rs`):**
 
 - Add `WindowId(u64)` (public; the RPC layer and tests name windows by it).
 - Add `Window { buffer: BufferId, saved_cursor: Cursor, saved_top: usize, rect:
@@ -181,7 +181,7 @@ The `redraw` msgpack map gains a `windows` array (each a sub-map) and a
 `separators` array; the per-window fields move under each entry. Bump/extend the
 client decode in lockstep.
 
-**Changes (`crates/nxvim-tui/src/render.rs`, `view.rs`):**
+**Changes (`crates/bemtvi-tui/src/render.rs`, `view.rs`):**
 
 - Decode the `windows` list and separators.
 - Replace the single text-area layout with: lay out each `WindowView` at its
@@ -197,7 +197,7 @@ client decode in lockstep.
 
 **Tests:** the existing `screen.rs` Tier 2 suite (single window) must stay green —
 that is the proof the protocol move is behavior-preserving. Add one Tier 1 paint
-test (`crates/nxvim-tui/tests/paint.rs`) feeding a hand-built two-window `View`
+test (`crates/bemtvi-tui/tests/paint.rs`) feeding a hand-built two-window `View`
 (two stacked rects, a separator, two status lines) and asserting the cell grid —
 so the multi-window *renderer* is covered before any core command produces one.
 
@@ -255,7 +255,7 @@ end-to-end through the Phase 2 renderer.
   `:new`/`:vnew` (split + `:enew`), `:clo[se]`, `:on[ly]`. Optional `+cmd`/file
   arg: `:split foo.txt` splits then edits `foo.txt` in the new window.
 
-**Tests** (`crates/nxvim-server/tests/windows.rs`, new file; same `start`/`feed`/
+**Tests** (`crates/bemtvi-server/tests/windows.rs`, new file; same `start`/`feed`/
 `lines`/`cursor` helpers, plus a `redraw`-based `windows()` reader taking the
 **latest** queued redraw — see CLAUDE.md's take-latest rule):
 
@@ -350,7 +350,7 @@ remote clients) manage windows the same way they manage buffers.
 - `nvim_open_win` (split form only for now — `relative` floats are deferred with
   tabs/floats below): create a split bound to a given buffer.
 
-**Lua (`nxvim-lua` prelude + the queue/drain seam):** expose the above as
+**Lua (`bemtvi-lua` prelude + the queue/drain seam):** expose the above as
 `vim.api.nvim_*` — window *mutations* queue like `vim.cmd` (`WindowOp`s drained
 into the core each tick, the established "Lua queues, core mutates" flow), window
 *reads* resolve synchronously against a snapshot. Add `vim.api.nvim_win_get_*` /
@@ -365,11 +365,11 @@ into the existing autocmd machinery (see the
 `BufLeave` already fire on the buffer change a window switch causes — make sure
 the ordering matches vim (`WinLeave` → `BufLeave` → `BufEnter` → `WinEnter`).
 
-**Tests:** `crates/nxvim-server/tests/windows.rs` — `nvim_list_wins` after splits;
+**Tests:** `crates/bemtvi-server/tests/windows.rs` — `nvim_list_wins` after splits;
 `nvim_set_current_win` moves focus (assert focused `WindowView`); `nvim_win_get_
 cursor`/`set_cursor` on a non-current window reads/writes its saved position;
 `nvim_win_close` removes it; a Lua test that `vim.api.nvim_open_win` + autocmd
-fires (extend `crates/nxvim-server/tests/autocmds.rs` for `WinEnter`/`WinClosed`).
+fires (extend `crates/bemtvi-server/tests/autocmds.rs` for `WinEnter`/`WinClosed`).
 
 ---
 
@@ -474,7 +474,7 @@ separate spec rather than a sixth phase):
    entered via `<C-w>w` cycling (focusable ones) or `nvim_set_current_win`, and
    many (hover) are **non-focusable**. `focus_window` and the directional-motion
    rule both need a float branch.
-5. **Consolidating nxvim's existing hand-rolled overlays** — the completion
+5. **Consolidating bemtvi's existing hand-rolled overlays** — the completion
    **pmenu**, the **hover doc preview**, and arguably the bottom **panel** are
    bespoke `View` fields with their own client paint paths today. The float
    primitive is the chance to rebuild those on one general overlay path (or share

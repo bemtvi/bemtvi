@@ -4,7 +4,7 @@ Date: 2026-06-24
 
 ## Problem
 
-In the in-browser python demo (and the plain `nxvim-web`/edithost wasm build), the
+In the in-browser python demo (and the plain `bemtvi-web`/edithost wasm build), the
 catppuccin colorscheme is loaded by `demo-seed/init.lua`
 (`require("catppuccin").load("mocha")`) and **populates the core highlight registry**
 correctly — but the editor still renders in the hardcoded One Dark look. The
@@ -77,8 +77,8 @@ port-natively / no-special-casing ethos.
 
 ## Files
 
-- `crates/nxvim-server/src/redraw.rs` — `CHROME` table; new `theme` / `theme_gen` export.
-- `crates/nxvim-edithost/web/index.html` — `applyChrome()` rewrite + call site; theme
+- `crates/bemtvi-server/src/redraw.rs` — `CHROME` table; new `theme` / `theme_gen` export.
+- `crates/bemtvi-edithost/web/index.html` — `applyChrome()` rewrite + call site; theme
   hook in `setFrame`.
-- `crates/nxvim-edithost/web/highlight.js` — runtime theme override + `setHlTheme`.
-- `crates/nxvim-edithost/web/verify-colorscheme.mjs` — new verify.
+- `crates/bemtvi-edithost/web/highlight.js` — runtime theme override + `setHlTheme`.
+- `crates/bemtvi-edithost/web/verify-colorscheme.mjs` — new verify.

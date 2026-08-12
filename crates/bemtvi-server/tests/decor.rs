@@ -1,0 +1,1272 @@
+//! Behavior tests for `btv.decor` — viewport-scoped decoration providers
+//! (`docs/specs/2026-06-11-native-plugin-api.md` §6;
+//! `docs/plans/2026-06-15-btv-decor-viewport-decorations.md`).
+//!
+//! Phase 2: the provider registry + the off-tick dispatch + the `ctx` snapshot. A
+//! provider records the `ctx` it was handed into a Lua global; the test drives
+//! scrolling over the same msgpack-RPC a UI uses and reads the global back through
+//! `nvim_exec_lua` — proving the provider is dispatched off the viewport signal, that
+//! the snapshot tracks the visible range (top advances on scroll), and that the
+//! `bufs.filetype` filter skips non-matching buffers.
+//!
+//! Phase 3 (this file too): the publish path → render. A provider that `publish`es
+//! `hl` marks has them lowered into its namespace in the extmark layer and painted —
+//! asserted through the redraw highlight map: the rainbow spans land on the right
+//! cells, scrolling re-colours the newly-revealed lines, and a publish carrying a
+//! generation the window has already scrolled past (a stale gen) paints nothing.
+
+use bemtvi_rpc::{Incoming, Rpc};
+use bemtvi_server::ServerInit;
+use bemtvi_test_harness::{
+    attach, drain_to_latest_redraw, exec_lua, feed, lua_u64, spawn, temp_dir, wait_redraw,
+    window0_field,
+};
+use rmpv::Value;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
+/// An `init.lua` registering a `lua`-scoped probe provider (records its `ctx` into a
+/// global) and a `rust`-scoped one (sets a flag if it ever runs — it must not, on a
+/// `lua` buffer). Each also `publish`es a mark, exercising the publish path.
+const PROBE_INIT: &str = r#"
+_G.probe = nil
+_G.rust_ran = false
+btv.decor.provider {
+  name = "probe",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.probe = { top = ctx.top, bot = ctx.bot, n = #ctx.lines, ft = ctx.filetype, gen = ctx.gen }
+    publish({ { ctx.top, 0, end_col = 1, hl = "Comment" } })
+  end,
+}
+btv.decor.provider {
+  name = "rust_only",
+  bufs = { filetype = { "rust" } },
+  on_range = function(_ctx, _publish)
+    _G.rust_ran = true
+  end,
+}
+"#;
+
+/// A rainbow-delimiters provider scoped to `lua` buffers: colours every bracket by
+/// nesting depth across three named groups (defined here so they resolve to real
+/// styles), publishing one `hl` mark per bracket. The flagship `btv.decor` shape — the
+/// render tests assert these marks land on the right cells.
+const RAINBOW_INIT: &str = r##"
+local R = { "Rainbow1", "Rainbow2", "Rainbow3" }
+local COLORS = { "#ff0000", "#00ff00", "#0000ff" }
+for i, g in ipairs(R) do
+  btv.hl.define(0, g, { fg = COLORS[i] })
+end
+btv.decor.provider {
+  name = "rainbow",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    local marks, depth = {}, 0
+    for i, line in ipairs(ctx.lines) do
+      local row = ctx.top + i - 1
+      for col = 1, #line do
+        local c = line:sub(col, col)
+        if c == "(" or c == "[" or c == "{" then
+          marks[#marks + 1] = { row, col - 1, end_col = col, hl = R[depth % 3 + 1] }
+          depth = depth + 1
+        elseif c == ")" or c == "]" or c == "}" then
+          depth = math.max(0, depth - 1)
+          marks[#marks + 1] = { row, col - 1, end_col = col, hl = R[depth % 3 + 1] }
+        end
+      end
+    end
+    publish(marks)
+  end,
+}
+"##;
+
+/// A provider that only *records* its viewport `ctx` (win/buf/gen) and never
+/// publishes — the baseline for the stale-drop test, where the marks come from a
+/// hand-issued `btv._decor_publish` carrying a chosen generation.
+const RECORD_INIT: &str = r#"
+_G.vp = nil
+btv.decor.provider {
+  name = "record",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, _publish)
+    _G.vp = { win = ctx.win, buf = ctx.buf, gen = ctx.gen }
+  end,
+}
+"#;
+
+/// Write a `.lua` file with `n` numbered lines, in `dir`, and return its path. Each
+/// line carries a `{ … }` so the rainbow provider has a bracket to colour on it.
+fn write_big_lua(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
+    let body: String = (0..n)
+        .map(|i| format!("local x{i} = {{ {i} }}\n"))
+        .collect();
+    let path = dir.join("big.lua");
+    std::fs::write(&path, body).expect("write big.lua");
+    path
+}
+
+/// The highlight spans on screen `row` of the focused window, as
+/// `(start_col, end_col, group)` — the redraw highlight tuple
+/// `[start, end, group, style_id]` with the style-palette id dropped.
+fn row_spans(map: &[(Value, Value)], row: usize) -> Vec<(u64, u64, String)> {
+    let rows = match window0_field(map, "highlights").and_then(Value::as_array) {
+        Some(rows) => rows,
+        None => return Vec::new(),
+    };
+    let Some(spans) = rows.get(row).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    spans
+        .iter()
+        .filter_map(|span| {
+            let span = span.as_array()?;
+            let start = span.first()?.as_u64()?;
+            let end = span.get(1)?.as_u64()?;
+            let group = span.get(2)?.as_str()?.to_string();
+            Some((start, end, group))
+        })
+        .collect()
+}
+
+/// Whether any span on screen `row` carries highlight group `group`.
+fn row_has_group(map: &[(Value, Value)], row: usize, group: &str) -> bool {
+    row_spans(map, row).iter().any(|(_, _, g)| g == group)
+}
+
+/// The highlight group covering cell `col` on screen `row` (the span whose
+/// `[start, end)` contains `col`), if any. Adjacent same-group cells are coalesced
+/// into one span by the projection, so address a *cell*, not a span boundary.
+fn group_at(map: &[(Value, Value)], row: usize, col: u64) -> Option<String> {
+    row_spans(map, row)
+        .into_iter()
+        .find(|(s, e, _)| *s <= col && col < *e)
+        .map(|(_, _, g)| g)
+}
+
+// ===== Phase 2: dispatch + snapshot ==========================================
+
+#[tokio::test]
+async fn provider_is_dispatched_with_the_visible_slice_and_tracks_scroll() {
+    let dir = temp_dir("decor_scroll");
+    let (rpc, _incoming) = start(&dir, PROBE_INIT).await;
+    let path = write_big_lua(&dir, 200);
+
+    // Open the file — switching to the `lua` buffer is a viewport change, so the
+    // provider runs with the freshly-visible top-of-file slice.
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let top0 = lua_u64(&rpc, "return _G.probe and _G.probe.top").await;
+    assert_eq!(top0, Some(0), "first dispatch sees the top of the file");
+    let ft = exec_lua(&rpc, "return _G.probe.ft").await;
+    assert_eq!(
+        ft.as_str(),
+        Some("lua"),
+        "ctx.filetype is the buffer filetype"
+    );
+    let n = lua_u64(&rpc, "return _G.probe.n").await.unwrap();
+    let bot0 = lua_u64(&rpc, "return _G.probe.bot").await.unwrap();
+    // `lines` is exactly the [top, bot] slice — a full screen, well short of 200.
+    assert_eq!(n, bot0 + 1, "ctx.lines covers exactly top..=bot");
+    assert!(
+        (10..200).contains(&n),
+        "a viewport-sized slice, not the whole buffer: {n}"
+    );
+
+    // The `rust`-scoped provider never fires on a `lua` buffer (the bufs filter).
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rust_ran").await.as_bool(),
+        Some(false),
+        "a filetype-scoped provider skips non-matching buffers"
+    );
+
+    // Jump to the bottom: the viewport scrolls, so the provider re-runs with an
+    // advanced top reflecting the new visible range.
+    feed(&rpc, "G");
+    let top1 = lua_u64(&rpc, "return _G.probe.top").await.unwrap();
+    assert!(
+        top1 > 0,
+        "scrolling re-dispatches with the moved viewport: {top1}"
+    );
+}
+
+#[tokio::test]
+async fn publish_records_normalized_marks() {
+    let dir = temp_dir("decor_publish");
+    let (rpc, _incoming) = start(&dir, PROBE_INIT).await;
+    let path = write_big_lua(&dir, 50);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    // The probe publishes one mark per dispatch — recorded Lua-side for inspection. It
+    // is normalized into the canonical positional→named form the extmark layer takes.
+    let row = lua_u64(&rpc, "return btv._decor.last.marks[1].row").await;
+    assert_eq!(row, Some(0), "positional row survives normalization");
+    let end_col = lua_u64(&rpc, "return btv._decor.last.marks[1].end_col").await;
+    assert_eq!(end_col, Some(1), "named end_col is carried through");
+    let hl = exec_lua(&rpc, "return btv._decor.last.marks[1].hl").await;
+    assert_eq!(
+        hl.as_str(),
+        Some("Comment"),
+        "the hl group is carried through"
+    );
+}
+
+#[tokio::test]
+async fn a_mark_without_an_hl_fails_loud() {
+    // v1 renders `hl` only; a mark carrying no `hl` can render nothing, so rather than
+    // silently no-op it routes through the provider-error path (Decision 6). The
+    // provider is isolated (the dispatch survives), and the error is surfaced.
+    let dir = temp_dir("decor_no_hl");
+    let init = r#"
+_G.err = nil
+btv.notify = function(msg, _level) _G.err = msg end
+btv.decor.provider {
+  name = "no_hl",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    publish({ { ctx.top, 0, end_col = 1 } })   -- no hl
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let err = exec_lua(&rpc, "return _G.err").await;
+    assert!(
+        err.as_str().is_some_and(|m| m.contains("hl")),
+        "a hl-less mark is reported loud, not dropped: {err:?}"
+    );
+}
+
+// ===== Phase 3: publish → render =============================================
+
+#[tokio::test]
+async fn colours_on_startup_without_any_interaction() {
+    // The real path: the file is opened at boot (the command-line arg), not via a `:e`
+    // keystroke. The marks must be on the FIRST frame the client paints after attach —
+    // a fresh session shouldn't need a keypress to colour. (`btv_ui_attach` assigns the
+    // window its first rect, so the provider's viewport is only then known; the attach
+    // arm drives `run_pending` to dispatch it before that frame.) Without the fix this
+    // test times out: no interaction ever produces a coloured frame.
+    let dir = temp_dir("decor_startup");
+    std::fs::write(dir.join("init.lua"), RAINBOW_INIT).expect("write init.lua");
+    let path = dir.join("nest.lua");
+    std::fs::write(&path, "return (())\n").expect("write nest.lua");
+    let init = ServerInit {
+        file: Some(path.to_string_lossy().into_owned()),
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // No feed — the very first frame must already be coloured.
+    let map = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "Rainbow1")).await;
+    assert_eq!(
+        group_at(&map, 0, 7).as_deref(),
+        Some("Rainbow1"),
+        "the startup frame colours the brackets with no keypress: {:?}",
+        row_spans(&map, 0)
+    );
+}
+
+#[tokio::test]
+async fn rainbow_marks_render_on_the_bracket_cells() {
+    let dir = temp_dir("decor_render");
+    let (rpc, mut incoming) = start(&dir, RAINBOW_INIT).await;
+    // `return (())` — the brackets nest 0,1 then unwind: ( @col7 depth0→R1,
+    // ( @col8 depth1→R2, ) @col9 →R2, ) @col10 →R1.
+    let path = dir.join("nest.lua");
+    std::fs::write(&path, "return (())\n").expect("write nest.lua");
+
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    // Wait for the frame carrying the published marks (the provider runs off-tick in
+    // run_pending; the marks fold into the next redraw).
+    let map = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "Rainbow1")).await;
+
+    // Address cells (not span boundaries — adjacent same-group cells coalesce): the
+    // `( ( ) )` at cells 7,8,9,10 colour R1, R2, R2, R1 by nesting depth.
+    let spans = row_spans(&map, 0);
+    assert_eq!(
+        group_at(&map, 0, 7).as_deref(),
+        Some("Rainbow1"),
+        "outer ( at depth 0: {spans:?}"
+    );
+    assert_eq!(
+        group_at(&map, 0, 8).as_deref(),
+        Some("Rainbow2"),
+        "inner ( at depth 1: {spans:?}"
+    );
+    assert_eq!(
+        group_at(&map, 0, 9).as_deref(),
+        Some("Rainbow2"),
+        "inner ) closes depth 1: {spans:?}"
+    );
+    assert_eq!(
+        group_at(&map, 0, 10).as_deref(),
+        Some("Rainbow1"),
+        "outer ) closes depth 0: {spans:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_on_screen_edit_recolors_without_scrolling() {
+    // The viewport key carries the buffer's changedtick, so an edit that leaves the
+    // visible range unchanged (typing a bracket on screen — no scroll, same top/bot)
+    // still re-dispatches the provider. Without it a fresh bracket would stay
+    // uncoloured until the next scroll — the central rainbow case.
+    let dir = temp_dir("decor_edit");
+    let (rpc, mut incoming) = start(&dir, RAINBOW_INIT).await;
+    let path = dir.join("e.lua");
+    std::fs::write(&path, "return x\n").expect("write e.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    // No brackets on line 0 yet.
+    let opened = wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    assert!(
+        !row_has_group(&opened, 0, "Rainbow1"),
+        "no bracket, no rainbow span yet"
+    );
+
+    // Append `()` to `return x` → `return x()`: `(` at col 8, `)` at col 9, both depth 0.
+    feed(&rpc, "A()<Esc>");
+    let map = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "Rainbow1")).await;
+    assert_eq!(
+        group_at(&map, 0, 8).as_deref(),
+        Some("Rainbow1"),
+        "the just-typed ( colours without a scroll: {:?}",
+        row_spans(&map, 0)
+    );
+}
+
+#[tokio::test]
+async fn scrolling_recolors_the_newly_revealed_lines() {
+    let dir = temp_dir("decor_render_scroll");
+    let (rpc, mut incoming) = start(&dir, RAINBOW_INIT).await;
+    let path = write_big_lua(&dir, 200);
+
+    // Top of file: the first line's `{ … }` colours immediately.
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let top = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "Rainbow1")).await;
+    assert!(
+        row_has_group(&top, 0, "Rainbow1"),
+        "the top line's bracket is coloured on open"
+    );
+    // The opening line of a content buffer is buffer line 0 — far below 200 is off
+    // screen, so its bracket cannot already be in this frame.
+    let last_screen_row = window0_field(&top, "lines")
+        .and_then(Value::as_array)
+        .map(|l| l.len())
+        .unwrap_or(0);
+    assert!(
+        last_screen_row < 200,
+        "the whole file does not fit on screen"
+    );
+
+    // Jump to the bottom: the now-visible high-numbered lines must colour as they
+    // come into view (the provider re-ran for the moved viewport and republished).
+    feed(&rpc, "G");
+    let bottom = wait_redraw(&mut incoming, |m| {
+        // The last buffer line is `return { … }`-shaped; find any coloured bracket on
+        // a row that wasn't visible at the top (use the final visible content row).
+        (0..24).any(|r| row_has_group(m, r, "Rainbow1"))
+    })
+    .await;
+    // The final content line (buffer line 199) is visible and coloured. Its `{` sits
+    // after `local x199 = ` — assert *some* visible row past the original viewport
+    // carries a rainbow span (the file's first screen was rows 0..~22).
+    let coloured_rows: Vec<usize> = (0..24)
+        .filter(|&r| row_has_group(&bottom, r, "Rainbow1"))
+        .collect();
+    assert!(
+        !coloured_rows.is_empty(),
+        "scrolling to the bottom colours the freshly-revealed brackets"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_publish_paints_nothing() {
+    // The gen-gate (Decision 4): a publish stamped with a generation the window has
+    // already scrolled past is dropped before any mark is set, so a viewport the user
+    // left never paints. Driven deterministically by hand-issuing `btv._decor_publish`
+    // with a future (never-stamped) generation, then with the live one.
+    let dir = temp_dir("decor_stale");
+    let (rpc, mut incoming) = start(&dir, RECORD_INIT).await;
+    exec_lua(&rpc, "btv.hl.define(0, 'StaleMark', { fg = '#ff00ff' })").await;
+    // A multi-line file (its visible range differs from the empty start buffer) so the
+    // record provider dispatches and stamps _G.vp with the live generation.
+    let path = write_big_lua(&dir, 40);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    // The live viewport generation (and the provider's namespace + window/buffer).
+    let _ = exec_lua(&rpc, "return _G.vp").await;
+    let win = lua_u64(&rpc, "return _G.vp.win").await.unwrap();
+    let buf = lua_u64(&rpc, "return _G.vp.buf").await.unwrap();
+    let gen = lua_u64(&rpc, "return _G.vp.gen").await.unwrap();
+    let ns = lua_u64(&rpc, "return btv._decor.providers[1].ns")
+        .await
+        .unwrap();
+
+    // A publish carrying a generation that is *ahead* of the live one — as if a newer
+    // scroll had already superseded it. The server drops it: nothing paints.
+    let stale = format!(
+        "btv._decor_publish({ns}, {g}, {win}, {buf}, {{0}}, {{0}}, {{0}}, {{1}}, {{'StaleMark'}}, {{-1}})",
+        g = gen + 50
+    );
+    // `nvim_exec_lua` itself repaints (the RPC handler emits a frame after draining the
+    // chunk's effects), so the publish lands in the very next frame — no cursor move.
+    exec_lua(&rpc, &stale).await;
+    let after_stale = wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    let after_stale = drain_to_latest_redraw(&mut incoming, |_| true).unwrap_or(after_stale);
+    assert!(
+        !row_has_group(&after_stale, 0, "StaleMark"),
+        "a publish from a superseded generation paints nothing: {:?}",
+        row_spans(&after_stale, 0)
+    );
+
+    // The same publish with the *live* generation paints — proving the drop above was
+    // the gen-gate, not a broken publish path. It shows on the next frame with no input.
+    let live = format!(
+        "btv._decor_publish({ns}, {gen}, {win}, {buf}, {{0}}, {{0}}, {{0}}, {{1}}, {{'StaleMark'}}, {{-1}})"
+    );
+    exec_lua(&rpc, &live).await;
+    let after_live = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "StaleMark")).await;
+    assert!(
+        row_has_group(&after_live, 0, "StaleMark"),
+        "the live-generation publish paints: {:?}",
+        row_spans(&after_live, 0)
+    );
+}
+
+// ===== Phase 4: async, debounce, robustness, per-buffer ======================
+
+/// A `lua`-scoped provider that publishes from a **promise continuation** rather than
+/// inline: `btv.promise.delay` fulfils on a later tick, and the publish lands then. The
+/// generation token makes the late response safe to fold (no scroll superseded it), and
+/// the publish queue is drained every `run_pending` round — so a publish off a later
+/// tick already works with no extra machinery (Decision 8).
+const ASYNC_INIT: &str = r##"
+btv.hl.define(0, "AsyncMark", { fg = "#ff00ff" })
+btv.decor.provider {
+  name = "async",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    btv.promise.delay(5):next(function()
+      publish({ { ctx.top, 0, end_col = 1, hl = "AsyncMark" } })
+    end)
+  end,
+}
+"##;
+
+#[tokio::test]
+async fn an_async_provider_publishes_from_a_promise_continuation() {
+    let dir = temp_dir("decor_async");
+    let (rpc, mut incoming) = start(&dir, ASYNC_INIT).await;
+    let path = dir.join("a.lua");
+    std::fs::write(&path, "return x\n").expect("write a.lua");
+
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    // The mark is published from a delayed promise, off a tick after the dispatch; the
+    // gen token keeps it valid and it folds into a later frame.
+    let map = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "AsyncMark")).await;
+    assert_eq!(
+        group_at(&map, 0, 0).as_deref(),
+        Some("AsyncMark"),
+        "an async provider's continuation publish renders: {:?}",
+        row_spans(&map, 0)
+    );
+}
+
+#[tokio::test]
+async fn a_debounced_provider_coalesces_a_burst_to_one_run() {
+    // `debounce = ms` collapses a fast continuous scroll into one provider run
+    // (Decision 2): each viewport change re-arms a per-window trailing debounce, so a
+    // burst fires `on_range` exactly once after the window stops moving. Driven by a
+    // synchronous burst of dispatches in one Lua chunk — the timer can't fire mid-chunk
+    // (single-threaded, off-tick), so the coalescing is deterministic, not wall-clock
+    // racing. Scoped to a filetype no real buffer has, so only the burst dispatches it.
+    let dir = temp_dir("decor_debounce");
+    let init = r#"
+_G.runs = 0
+btv.decor.provider {
+  name = "deb",
+  bufs = { filetype = { "debft" } },
+  debounce = 20,
+  on_range = function(_ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({ { 0, 0, end_col = 1, hl = "Comment" } })
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let burst = r#"
+for i = 1, 6 do
+  btv._decor_dispatch({ win = 0, buf = 0, top = 0, bot = 0, lines = { "x" }, filetype = "debft", gen = 100 + i })
+end
+return _G.runs
+"#;
+    let during = lua_u64(&rpc, burst).await;
+    assert_eq!(
+        during,
+        Some(0),
+        "the burst arms the debounce but fires nothing during it"
+    );
+    // After the quiet period the trailing edge fires exactly once for the whole burst.
+    let mut runs = None;
+    for _ in 0..200 {
+        runs = lua_u64(&rpc, "return _G.runs").await;
+        if runs == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        runs,
+        Some(1),
+        "the debounced provider runs once for the coalesced burst"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_is_disabled_after_three_consecutive_errors() {
+    // Decision 7: a throwing `on_range` is surfaced loud (E5108-style) and, after three
+    // consecutive failures (neovim's CB_MAX_ERROR analog), the provider is disabled —
+    // skipped rather than spamming the message line every scroll. Driven by a
+    // synchronous burst of six dispatches; a provider that always throws runs exactly
+    // three times before the gate stops dispatching it.
+    let dir = temp_dir("decor_disable");
+    let init = r#"
+_G.attempts = 0
+_G.msgs = {}
+btv.notify = function(m, _l) _G.msgs[#_G.msgs + 1] = m end
+btv.decor.provider {
+  name = "boom",
+  bufs = { filetype = { "boomft" } },
+  on_range = function(_ctx, _publish)
+    _G.attempts = _G.attempts + 1
+    error("kaboom")
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let burst = r#"
+for i = 1, 6 do
+  btv._decor_dispatch({ win = 0, buf = 0, top = 0, bot = 0, lines = {}, filetype = "boomft", gen = i })
+end
+return _G.attempts
+"#;
+    let attempts = lua_u64(&rpc, burst).await;
+    assert_eq!(
+        attempts,
+        Some(3),
+        "the provider stops being dispatched after three consecutive errors"
+    );
+    let saw_e5108 = exec_lua(
+        &rpc,
+        "for _, m in ipairs(_G.msgs) do if m:match('E5108') then return true end end return false",
+    )
+    .await;
+    assert_eq!(
+        saw_e5108.as_bool(),
+        Some(true),
+        "the error is surfaced E5108-style (loud), not swallowed"
+    );
+    let saw_disabled = exec_lua(
+        &rpc,
+        "for _, m in ipairs(_G.msgs) do if m:match('disabled') then return true end end return false",
+    )
+    .await;
+    assert_eq!(
+        saw_disabled.as_bool(),
+        Some(true),
+        "the disable is announced loud"
+    );
+}
+
+#[tokio::test]
+async fn a_buffer_scoped_provider_runs_only_for_its_buffer() {
+    // `bufs.buf` per-buffer opt-in: a provider scoped to a buffer id runs only there,
+    // matched against the real `ctx.buf`. Open a real `lua` buffer, register one
+    // provider scoped to it and one scoped to a buffer that does not exist, then drive a
+    // real viewport change (an on-screen edit bumps the changedtick) — only the matching
+    // provider runs.
+    let dir = temp_dir("decor_perbuf");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let path = dir.join("p.lua");
+    std::fs::write(&path, "return x\n").expect("write p.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let buf = lua_u64(&rpc, "return btv.buf.current()").await.unwrap();
+
+    let reg = format!(
+        r#"
+_G.hit = nil
+_G.miss = false
+btv.decor.provider {{
+  name = "scoped",
+  bufs = {{ buf = {buf} }},
+  on_range = function(ctx, publish)
+    _G.hit = ctx.buf
+    publish({{ {{ ctx.top, 0, end_col = 1, hl = "Comment" }} }})
+  end,
+}}
+btv.decor.provider {{
+  name = "elsewhere",
+  bufs = {{ buf = {other} }},
+  on_range = function(_ctx, _publish)
+    _G.miss = true
+  end,
+}}
+"#,
+        other = buf + 1000
+    );
+    exec_lua(&rpc, &reg).await;
+    // An on-screen edit re-dispatches the visible window's providers (changedtick moves).
+    feed(&rpc, "ax<Esc>");
+
+    let hit = lua_u64(&rpc, "return _G.hit").await;
+    assert_eq!(
+        hit,
+        Some(buf),
+        "the buffer-scoped provider runs for its buffer, seeing the real buf id"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.miss").await.as_bool(),
+        Some(false),
+        "a provider scoped to another buffer never runs here"
+    );
+}
+
+#[tokio::test]
+async fn custom_highlights_survive_undo_without_flashing() {
+    // Decor marks are ephemeral viewport state, not document history, so undo must not
+    // swap them out. The undo ROOT snapshot is captured at buffer load — before any
+    // provider runs — so undoing back to it wiped the marks until the off-tick
+    // re-dispatch republished them: a flash the user sees on the first undo back to that
+    // state. A provider that publishes ONCE and never republishes turns that flash into
+    // a *permanent* loss, making the fix deterministically observable: with the
+    // carry-live-marks-across-undo fix the mark is still painted after the undo; without
+    // it the root restore drops it and nothing republishes.
+    let dir = temp_dir("decor_undo");
+    let init = r##"
+_G.published = false
+btv.hl.define(0, "OnceMark", { fg = "#ff00ff" })
+btv.decor.provider {
+  name = "once",
+  bufs = { filetype = { "lua" } },   -- so the startup empty buffer doesn't consume the publish
+  on_range = function(_ctx, publish)
+    if not _G.published then
+      _G.published = true
+      publish({ { 0, 0, end_col = 1, hl = "OnceMark" } })
+    end
+    -- later dispatches publish nothing: the mark stands (Decision 3)
+  end,
+}
+"##;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = dir.join("u.lua");
+    std::fs::write(&path, "abc\n").expect("write u.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let opened = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "OnceMark")).await;
+    assert!(
+        row_has_group(&opened, 0, "OnceMark"),
+        "the once-published mark renders on open"
+    );
+
+    // Append '!' (an undoable edit), then undo across it — the pre-edit state is the
+    // root node (captured before the provider published), so this is the flash case.
+    feed(&rpc, "A!<Esc>");
+    feed(&rpc, "u");
+    let after = wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    let after = drain_to_latest_redraw(&mut incoming, |_| true).unwrap_or(after);
+    assert!(
+        row_has_group(&after, 0, "OnceMark"),
+        "the decor mark survives undo back to the root (no flash): {:?}",
+        row_spans(&after, 0)
+    );
+}
+
+/// Two providers, each scoped to a distinct `buftype`: one to ordinary buffers (`""`),
+/// one to the quickfix window (`"quickfix"`). Each records the `ctx.buftype` it saw.
+const BUFTYPE_INIT: &str = r#"
+_G.normal_bt = nil
+_G.qf_bt = nil
+btv.decor.provider {
+  name = "normal-only",
+  bufs = { buftype = { "" } },
+  on_range = function(ctx, _publish) _G.normal_bt = ctx.buftype end,
+}
+btv.decor.provider {
+  name = "qf-only",
+  bufs = { buftype = { "quickfix" } },
+  on_range = function(ctx, _publish) _G.qf_bt = ctx.buftype end,
+}
+"#;
+
+#[tokio::test]
+async fn buftype_scopes_a_provider_to_buffer_kind() {
+    // `bufs.buftype` scopes a provider to a buffer kind. bemtvi models the kinds it
+    // distinguishes: `""` (ordinary file/scratch) and `"quickfix"` (the quickfix /
+    // location-list display buffer). A provider scoped to one kind runs only there.
+    let dir = temp_dir("decor_buftype");
+    let (rpc, _incoming) = start(&dir, BUFTYPE_INIT).await;
+    let path = dir.join("n.lua");
+    std::fs::write(&path, "return x\n").expect("write n.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    // The ordinary file is buftype "" → only the normal-scoped provider runs.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.normal_bt").await.as_str(),
+        Some(""),
+        "an ordinary buffer is buftype \"\""
+    );
+    assert!(
+        exec_lua(&rpc, "return _G.qf_bt").await.is_nil(),
+        "a quickfix-scoped provider does not run on an ordinary buffer"
+    );
+
+    // Populate the quickfix list and open it → its display buffer is buftype "quickfix",
+    // so opening the window dispatches the quickfix-scoped provider there.
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", { lines = { "a.c:1:boom" }, efm = "%f:%l:%m" })"#,
+    )
+    .await;
+    feed(&rpc, ":copen<CR>");
+    let qf_bt = exec_lua(&rpc, "return _G.qf_bt").await;
+    assert_eq!(
+        qf_bt.as_str(),
+        Some("quickfix"),
+        "the quickfix window's buffer is buftype \"quickfix\": {qf_bt:?}"
+    );
+}
+
+/// window 0's `line_bg` layer as `(row, style_id)` pairs — the full-width line
+/// backgrounds (neovim's `line_hl_group`) painted under the text.
+fn window0_line_bg(map: &[(Value, Value)]) -> Vec<(u64, Option<u64>)> {
+    match window0_field(map, "line_bg").and_then(Value::as_array) {
+        Some(a) => a
+            .iter()
+            .filter_map(|e| {
+                let e = e.as_array()?;
+                Some((e.first()?.as_u64()?, e.get(1).and_then(Value::as_u64)))
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn line_hl_group_extmark_renders_as_a_line_bg_layer() {
+    // The public `btv.buf.set_extmark(..., { line_hl_group = <group> })` backs a whole line
+    // with a full-width background — projected as the per-window `line_bg` layer painted
+    // under the text (the `'cursorline'` model), so syntax spans compose on top. Set one on
+    // the middle line of a real buffer under `:colorscheme bemtvi` and read it back.
+    let dir = temp_dir("decor_line_hl");
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    std::fs::write(dir.join("init.lua"), "vim.cmd('colorscheme bemtvi')").expect("write init");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        file: Some(file.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    exec_lua(
+        &rpc,
+        "local ns = btv.ns.create('line-hl-test')\n\
+         btv.buf.set_extmark(0, ns, 1, 0, { line_hl_group = '@markup.raw.block' })",
+    )
+    .await;
+
+    // Row 1 (0-based, the "two" line) now carries a resolved line background; the other
+    // rows do not.
+    let map = wait_redraw(&mut incoming, |m| {
+        window0_line_bg(m).iter().any(|(r, _)| *r == 1)
+    })
+    .await;
+    let line_bg = window0_line_bg(&map);
+    assert!(
+        matches!(line_bg.iter().find(|(r, _)| *r == 1), Some((_, Some(_)))),
+        "the line_hl_group line carries a resolved line_bg: {line_bg:?}"
+    );
+    assert!(
+        !line_bg.iter().any(|(r, _)| *r == 0 || *r == 2),
+        "only the marked line is backed, not its neighbours: {line_bg:?}"
+    );
+}
+
+#[tokio::test]
+async fn line_hl_group_survives_the_mirror_refresh_in_get_extmarks() {
+    // Regression: `nvim_buf_get_extmarks(details = true)` must keep returning a mark's
+    // `line_hl_group` AFTER the tick, once the server has refreshed the `btv._extmarks`
+    // mirror from the core store — not just from the same-chunk write-through. The
+    // server's `ExtmarkMirror` push dropped `line_hl_group` (only `sign_text` /
+    // `line_fill` round-tripped), so a details read in a *later* chunk lost it — which
+    // broke, e.g., bemtvi-help's async code-block token overlay (it reads the code row's
+    // marks a tick after placing them). Set the mark in one chunk, read it in another.
+    let dir = temp_dir("decor_line_hl_roundtrip");
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        file: Some(file.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // Chunk 1: place the mark (its `ns` is stable across chunks by name).
+    exec_lua(
+        &rpc,
+        "btv.buf.set_extmark(0, btv.ns.create('rt'), 1, 0, { line_hl_group = 'BtvRtBg' })",
+    )
+    .await;
+
+    // Chunk 2 (a fresh tick — the server refreshed the mirror in between): the details
+    // read must still surface `line_hl_group`.
+    let got = exec_lua(
+        &rpc,
+        "local m = btv.buf.extmarks(0, btv.ns.create('rt'), 0, -1, { details = true })\n\
+         return m[1] and m[1][4] and m[1][4].line_hl_group",
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("BtvRtBg"),
+        "line_hl_group must round-trip through the server mirror refresh; got {got:?}"
+    );
+}
+
+/// A provider whose marks come from *plugin* state (`_G.blame`) rather than from the
+/// buffer text — the async-data shape: the answer arrives long after the viewport
+/// settled, so nothing the viewport detector watches (buffer, top, bot, changedtick)
+/// ever moves again. It counts its runs so a test can prove it was (or was not)
+/// re-dispatched, on top of what it paints.
+const INVALIDATE_INIT: &str = r##"
+_G.blame = false
+_G.runs = 0
+btv.hl.define(0, "BlameMark", { fg = "#ff00ff" })
+btv.decor.provider {
+  name = "blame",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs = _G.runs + 1
+    if not _G.blame then
+      return publish({})
+    end
+    publish({ { ctx.top, 0, end_col = 1, hl = "BlameMark" } })
+  end,
+}
+"##;
+
+#[tokio::test]
+async fn invalidate_redispatches_a_provider_whose_data_changed() {
+    // `btv.decor.invalidate`: the "I have new content to draw" edge. The viewport signal
+    // only wakes a provider when the visible range or the changedtick moves, so data
+    // that arrives on its own schedule (git blame off a promise, an LSP response) would
+    // never repaint. Arriving data is simulated by flipping `_G.blame` from a separate
+    // Lua chunk — no key is pressed, no buffer edited, the viewport is untouched.
+    let dir = temp_dir("decor_invalidate");
+    let (rpc, mut incoming) = start(&dir, INVALIDATE_INIT).await;
+    let path = dir.join("b.lua");
+    std::fs::write(&path, "return x\n").expect("write b.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let opened = wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    assert!(
+        !row_has_group(&opened, 0, "BlameMark"),
+        "nothing painted before the data arrives: {:?}",
+        row_spans(&opened, 0)
+    );
+
+    // The data lands. On its own that changes nothing on screen — the guard that makes
+    // this test fail if `invalidate` were a no-op that merely rode some ambient
+    // re-dispatch.
+    let before = lua_u64(&rpc, "_G.blame = true\nreturn _G.runs").await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.runs").await,
+        before,
+        "an unchanged viewport re-dispatches nothing by itself"
+    );
+
+    // Signal it, and the provider runs again and paints — with no key pressed.
+    exec_lua(&rpc, "btv.decor.invalidate({ buf = 0 })").await;
+    let painted = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "BlameMark")).await;
+    assert_eq!(
+        group_at(&painted, 0, 0).as_deref(),
+        Some("BlameMark"),
+        "invalidate re-runs the provider and its marks render: {:?}",
+        row_spans(&painted, 0)
+    );
+    let after = lua_u64(&rpc, "return _G.runs").await;
+    assert!(
+        after > before,
+        "the provider was dispatched again ({before:?} -> {after:?})"
+    );
+}
+
+#[tokio::test]
+async fn invalidate_from_a_promise_continuation_paints_without_input() {
+    // The real shape end-to-end: the provider itself kicks off async work and calls
+    // `invalidate` when the answer lands, off a later tick and outside any input
+    // handling. The re-dispatch has to come from the server's own drain — no keystroke
+    // follows — and the second run must not re-arm the fetch, or it would spin.
+    let dir = temp_dir("decor_invalidate_async");
+    let init = r##"
+btv.hl.define(0, "LateMark", { fg = "#00ffff" })
+_G.data = nil
+btv.decor.provider {
+  name = "late",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    if _G.data then
+      return publish({ { ctx.top, 0, end_col = 1, hl = "LateMark" } })
+    end
+    publish({})
+    if not _G.fetching then
+      _G.fetching = true
+      btv.promise.delay(5):next(function()
+        _G.data = "blame"
+        btv.decor.invalidate({ buf = ctx.buf })
+      end)
+    end
+  end,
+}
+"##;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = dir.join("l.lua");
+    std::fs::write(&path, "return x\n").expect("write l.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let painted = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "LateMark")).await;
+    assert_eq!(
+        group_at(&painted, 0, 0).as_deref(),
+        Some("LateMark"),
+        "the provider's own late invalidate repaints with no further input: {:?}",
+        row_spans(&painted, 0)
+    );
+}
+
+#[tokio::test]
+async fn invalidate_scopes_to_a_buffer_and_to_a_window() {
+    // The scope selects *windows*: `buf` wakes every window showing that buffer (a
+    // buffer can be in several splits, each with its own viewport), `win` wakes exactly
+    // one. Two splits on two different files give both cases something to miss.
+    let dir = temp_dir("decor_invalidate_scope");
+    let init = r#"
+_G.runs = {}
+btv.decor.provider {
+  name = "counter",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs[ctx.win] = (_G.runs[ctx.win] or 0) + 1
+    publish({})
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let top = dir.join("t.lua");
+    let bottom = dir.join("o.lua");
+    std::fs::write(&top, "return t\n").expect("write t.lua");
+    std::fs::write(&bottom, "return o\n").expect("write o.lua");
+    feed(&rpc, &format!(":e {}<CR>", top.display()));
+    let top_win = lua_u64(&rpc, "return btv.win.current()").await.unwrap();
+    let top_buf = lua_u64(&rpc, "return btv.buf.current()").await.unwrap();
+    feed(&rpc, &format!(":split {}<CR>", bottom.display()));
+    let other_win = lua_u64(&rpc, "return btv.win.current()").await.unwrap();
+    assert_ne!(other_win, top_win, "the split is a second window");
+
+    let runs = |win: u64| format!("return _G.runs[{win}] or 0");
+    let top_before = lua_u64(&rpc, &runs(top_win)).await.unwrap();
+    let other_before = lua_u64(&rpc, &runs(other_win)).await.unwrap();
+
+    // Buffer scope: only the window showing that buffer re-runs.
+    exec_lua(
+        &rpc,
+        &format!("btv.decor.invalidate({{ buf = {top_buf} }})"),
+    )
+    .await;
+    assert_eq!(
+        lua_u64(&rpc, &runs(top_win)).await,
+        Some(top_before + 1),
+        "the window showing the invalidated buffer re-runs"
+    );
+    assert_eq!(
+        lua_u64(&rpc, &runs(other_win)).await,
+        Some(other_before),
+        "a window showing another buffer is untouched"
+    );
+
+    // Window scope: only that window, even though both show a matching filetype.
+    exec_lua(
+        &rpc,
+        &format!("btv.decor.invalidate({{ win = {other_win} }})"),
+    )
+    .await;
+    assert_eq!(
+        lua_u64(&rpc, &runs(other_win)).await,
+        Some(other_before + 1),
+        "the named window re-runs"
+    );
+    assert_eq!(
+        lua_u64(&rpc, &runs(top_win)).await,
+        Some(top_before + 1),
+        "the other window is untouched by a window-scoped invalidate"
+    );
+
+    // Unscoped: every visible window.
+    exec_lua(&rpc, "btv.decor.invalidate()").await;
+    assert_eq!(
+        lua_u64(&rpc, &runs(top_win)).await,
+        Some(top_before + 2),
+        "an unscoped invalidate wakes every visible window (top)"
+    );
+    assert_eq!(
+        lua_u64(&rpc, &runs(other_win)).await,
+        Some(other_before + 2),
+        "an unscoped invalidate wakes every visible window (split)"
+    );
+}
+
+#[tokio::test]
+async fn invalidate_rejects_a_scope_it_does_not_implement() {
+    // No silent stubs: the scope is a window scope, not a per-provider one. A `name`
+    // key reads like a provider filter, so accepting-and-ignoring it would quietly
+    // re-run every provider; it fails loud instead. Same for the two scopes together,
+    // which are alternatives rather than a conjunction.
+    let dir = temp_dir("decor_invalidate_bad");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(btv.decor.invalidate, { name = 'blame' })\nreturn tostring(e)",
+    )
+    .await;
+    assert!(
+        err.as_str().unwrap_or_default().contains("unknown option"),
+        "an unknown scope key fails loud: {err:?}"
+    );
+    let both = exec_lua(
+        &rpc,
+        "local ok, e = pcall(btv.decor.invalidate, { buf = 1, win = 1 })\nreturn tostring(e)",
+    )
+    .await;
+    assert!(
+        both.as_str().unwrap_or_default().contains("not both"),
+        "buf and win together fail loud: {both:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_self_invalidating_provider_is_paced_not_looped() {
+    // A provider that unconditionally asks to be re-run from its own `on_range` — the
+    // shape that would loop forever if the ask were served on demand. It is not an
+    // error (the ask is a hint, like every other thing a plugin hands the decoration
+    // engine): the engine simply serves each window at most once per pass, so the run
+    // count settles instead of spinning, and the editor keeps answering throughout.
+    let dir = temp_dir("decor_selfloop");
+    let init = r#"
+_G.runs = 0
+_G.err = nil
+btv.decor.provider {
+  name = "loopy",
+  bufs = { filetype = { "lua" } },
+  on_range = function(_ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({})
+    local ok, e = pcall(btv.decor.invalidate)
+    _G.err = ok and "ok" or tostring(e)
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = dir.join("s.lua");
+    std::fs::write(&path, "return x\n").expect("write s.lua");
+    let t = std::time::Instant::now();
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err").await.as_str(),
+        Some("ok"),
+        "the ask is optimistic — a provider is never told 'no' about drawing"
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "the editor kept answering while the provider re-asked ({:?})",
+        t.elapsed()
+    );
+    // Bounded: the opening dispatch plus the one invalidation the pass serves.
+    let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        (1..=4).contains(&settled),
+        "the pass serves the ask once, it does not loop: {settled}"
+    );
+    // …and it is not free-running: sitting idle for a while adds nothing beyond the
+    // pass each measurement RPC itself drives. (A loop served on demand would add
+    // thousands of runs over this window; the pacing makes the cost O(1) per pass,
+    // which is what a provider dispatched per keystroke already costs.)
+    //
+    // Measured over the *second* idle window. The first absorbs the one-off repaint
+    // this buffer's grammar causes when it finishes loading — that load runs off the
+    // editor thread now, so it lands a little after the open rather than during it.
+    // One repaint is not what this test is about; a spin would show in both windows.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let idle = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        idle - settled <= 2,
+        "idling adds at most the measurement's own pass, not a spin: {settled} -> {idle}"
+    );
+
+    // Still a working provider: a real viewport change dispatches it as usual, and the
+    // ask that was paced is served alongside — bounded again.
+    feed(&rpc, "ay<Esc>");
+    let after = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        after > idle && after <= idle + 4,
+        "a later pass dispatches normally, still bounded ({idle} -> {after})"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_may_invalidate_a_different_window() {
+    // The guard is aimed at the self-loop, not at cross-window work: a provider that
+    // invalidates *another* window (a side panel it feeds, a preview) is legitimate and
+    // must still be served.
+    let dir = temp_dir("decor_crosswin");
+    let init = r#"
+_G.asked = false
+_G.err = nil
+btv.decor.provider {
+  name = "lua-side",
+  bufs = { filetype = { "lua" } },
+  on_range = function(_ctx, publish)
+    publish({})
+    -- Wake the other window once (guarded, so this test is not itself a runaway).
+    if _G.target and not _G.asked then
+      _G.asked = true
+      local ok, e = pcall(btv.decor.invalidate, { win = _G.target })
+      _G.err = ok and "ok" or tostring(e)
+    end
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let side = dir.join("side.txt");
+    let lua = dir.join("main.lua");
+    std::fs::write(&side, "side\n").expect("write side.txt");
+    std::fs::write(&lua, "return x\n").expect("write main.lua");
+    feed(&rpc, &format!(":e {}<CR>", side.display()));
+    let side_win = lua_u64(&rpc, "return btv.win.current()").await.unwrap();
+    let side_buf = lua_u64(&rpc, "return btv.buf.current()").await.unwrap();
+    // Scope the side provider by buffer id — deterministic, unlike guessing the
+    // filetype bemtvi gives a `.txt` file.
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"
+_G.other_runs = 0
+btv.decor.provider {{
+  name = "side",
+  bufs = {{ buf = {side_buf} }},
+  on_range = function(_ctx, publish)
+    _G.other_runs = _G.other_runs + 1
+    publish({{}})
+  end,
+}}
+"#
+        ),
+    )
+    .await;
+    feed(&rpc, &format!(":split {}<CR>", lua.display()));
+    let before = lua_u64(&rpc, "return _G.other_runs").await.unwrap();
+
+    // Arm the cross-window invalidate, then drive one dispatch of the lua provider.
+    exec_lua(&rpc, &format!("_G.target = {side_win}")).await;
+    feed(&rpc, "ax<Esc>");
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err").await.as_str(),
+        Some("ok"),
+        "invalidating another window from on_range is allowed"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return _G.other_runs").await,
+        Some(before + 1),
+        "and the other window really was re-dispatched"
+    );
+}
+
+#[tokio::test]
+async fn a_re_armed_invalidate_loop_is_paced_and_recovers() {
+    // The loop the call site cannot see: the ask is re-armed from a scheduled callback,
+    // so it is raised outside `on_range` — but still lands inside the same convergence,
+    // which is exactly what would spin the fixpoint. The once-per-pass pacing bounds it
+    // without the plugin ever being refused, and a real viewport change still
+    // dispatches normally afterwards.
+    let dir = temp_dir("decor_runaway");
+    let init = r#"
+_G.runs = 0
+btv.decor.provider {
+  name = "rearm",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({})
+    btv.schedule(function()
+      btv.decor.invalidate({ buf = ctx.buf })
+    end)
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = dir.join("r.lua");
+    std::fs::write(&path, "return x\n").expect("write r.lua");
+    let t = std::time::Instant::now();
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let after_open = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "the editor kept answering while the provider re-armed ({:?})",
+        t.elapsed()
+    );
+    assert!(
+        (1..=4).contains(&after_open),
+        "the pass serves the re-armed ask once, not without end: {after_open}"
+    );
+    // Not free-running: idling adds nothing beyond the pass the measurement itself
+    // drives, where an on-demand loop would add thousands of runs over this window.
+    // Measured over the second window, so the one-off repaint from this buffer's
+    // grammar finishing its (off-thread) load doesn't count as a spin.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let idle = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        idle - settled <= 2,
+        "idling adds at most the measurement's own pass, not a spin: {settled} -> {idle}"
+    );
+
+    // Recovery: a real viewport change is never paced, so decoration still works after
+    // a provider has been re-asking.
+    feed(&rpc, "ay<Esc>");
+    let after_edit = lua_u64(&rpc, "return _G.runs").await.unwrap();
+    assert!(
+        after_edit > idle,
+        "a real viewport change still dispatches ({idle} -> {after_edit})"
+    );
+}

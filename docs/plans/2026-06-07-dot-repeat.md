@@ -1,13 +1,13 @@
 # Dot-repeat (`.`) — replay the last change
 
-Today nxvim has no `.` command: pressing `.` in normal mode is a dead-end
+Today bemtvi has no `.` command: pressing `.` in normal mode is a dead-end
 (`parse_command`'s final `_ => Reset`). This plan adds vim's single most-reached-for
 editing primitive — **repeat the last buffer-changing command**, including the text
 typed during an insert session it entered. `dw` then `.` deletes another word; `ciwfoo<Esc>`
 then `.` changes the next word's text object to `foo`; `x...` rubs out four characters;
 `A;<Esc>` then `j.` appends `;` to the next line.
 
-The approach mirrors vim's own: nxvim records the **raw key stream** of the last
+The approach mirrors vim's own: bemtvi records the **raw key stream** of the last
 change into a redo buffer and, on `.`, re-feeds those keys through the existing
 input path. This is deliberately *not* a structured "record the `ResolvedCommand`"
 design — replaying keys reuses the entire grammar (counts, operators, registers,
@@ -23,7 +23,7 @@ Verified in the current tree before planning:
 - **There is exactly one key chokepoint, and it already sees post-mapping keys
   one at a time.** Every front end's keystroke reaches the core through
   `Editor::input(key)` (`mod.rs:678`); the server's keymap matcher interposes
-  *above* it (`nxvim-server/src/input.rs:28` → `editor.input(key)` at `:98`/`:103`/…),
+  *above* it (`bemtvi-server/src/input.rs:28` → `editor.input(key)` at `:98`/`:103`/…),
   so by the time a key lands at `input()` it is already the mapped, literal key.
   Recording there records precisely what should be replayed, and replay can re-enter
   the same `input()`. No new plumbing in the server.
@@ -147,7 +147,7 @@ NormalCmd::DotRepeat => self.repeat_change(),
 ```rust
 fn repeat_change(&mut self) {
     if self.last_change.is_empty() {
-        return;                       // nothing to repeat (vim beeps; nxvim has no bell)
+        return;                       // nothing to repeat (vim beeps; bemtvi has no bell)
     }
     // `.` itself must never become the new last change, so subsequent `.`
     // replay the *original* — mark this window non-repeatable.
@@ -196,7 +196,7 @@ keys).
   Because the dispatch is the typed `ResolvedCommand`, the keymap oracle
   `command_status` recognizes `.` as a complete command for free (no take-latest
   harness interaction — pure grammar).
-- **Tests** (`crates/nxvim-server/tests/editing.rs`, the black-box harness — feed
+- **Tests** (`crates/bemtvi-server/tests/editing.rs`, the black-box harness — feed
   notation via `nvim_input`, assert `nvim_buf_get_lines`/cursor):
   - `x` then `.` deletes two chars; `3x` then `.` deletes 3 + 3.
   - `dw` then `.` deletes a second word; `dd` then `.` deletes a second line.

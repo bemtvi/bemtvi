@@ -4,17 +4,17 @@
 
 ## Why this document exists
 
-nxvim highlights *everything* with tree-sitter — including the fenced code blocks
+bemtvi highlights *everything* with tree-sitter — including the fenced code blocks
 inside LSP-generated documentation (hover, completion docs). Those blocks are not
 programs. They are:
 
 1. **fragments of the real language** — a struct field (`field: Vec<String>`), a
    statement, a signature with no body; and
 2. **not the language at all** — an annotation dialect the server invents for
-   display. `lua_ls` emits `function nx.tbl.get(t: table, ...: string)` in a
+   display. `lua_ls` emits `function btv.tbl.get(t: table, ...: string)` in a
    ` ```lua ` fence; `tsserver` prefixes `(method) `; neither is valid source.
 
-Both are handed to `Engine::highlight_text` (`crates/nxvim-core/src/editor/float.rs`
+Both are handed to `Engine::highlight_text` (`crates/bemtvi-core/src/editor/float.rs`
 → `Editor::preview_highlights`) as if they were a whole file.
 
 ### What actually happens today (measured)
@@ -27,7 +27,7 @@ Probed against the rust fixture grammar and a real installed `lua.so`:
 | `let x = some_call(a, b)` | 0% | correct |
 | `field: Vec<String>` | 94% | `Vec` / `String` → `constructor` — **wrong** |
 | `(method) Foo::bar(x: u32) -> bool` | 97% | `x`, `u32`, `bool` unpainted |
-| `function nx.tbl.get(t: table, ...: string)` (lua_ls) | 98% | `function` **loses its keyword colour**; `table` / `string` → `variable.parameter`; `get` → `variable.member` |
+| `function btv.tbl.get(t: table, ...: string)` (lua_ls) | 98% | `function` **loses its keyword colour**; `table` / `string` → `variable.parameter`; `get` → `variable.member` |
 | `local x: string` (lua_ls) | 50% | `string` → `module.builtin` |
 
 Three conclusions, and they set the whole design:
@@ -95,7 +95,7 @@ Recovers the structure Phase 1 conservatively refuses to guess at. A snippet tha
 doesn't parse on its own is tried inside each of its language's framings in turn,
 and the **first that parses cleanly** wins; its spans are mapped back onto the
 snippet's own lines and columns. Measured on `field: Vec<String>` inside
-`struct __nx { … }`: 94% → 0% error, `Vec` / `String` go `constructor` → **`type`**,
+`struct __btv { … }`: 94% → 0% error, `Vec` / `String` go `constructor` → **`type`**,
 and `field` gains `property`.
 
 **Only a clean parse is accepted** — no "lowest error coverage wins". The original
@@ -109,14 +109,14 @@ carry error cost), so a framing that only parses by having a token invented for 
 doesn't count either. This also made the confidence *metric* unnecessary — a
 boolean is all the selection rule needs.
 
-The framings are per-language data, so they live in Lua (dogfood `nx.*`), with
+The framings are per-language data, so they live in Lua (dogfood `btv.*`), with
 shipped defaults for rust, lua, javascript, typescript, tsx, go, c, cpp and java:
 
 ```lua
-nx.treesitter.fragment_context("rust", { "struct __nx {\n%s\n}", "fn __nx() {\n%s\n}" })
+btv.treesitter.fragment_context("rust", { "struct __btv {\n%s\n}", "fn __btv() {\n%s\n}" })
 ```
 
-A same-line framing (`"fn __nx() { return %s }"` — the shape an *expression* needs)
+A same-line framing (`"fn __btv() { return %s }"` — the shape an *expression* needs)
 works too: the mapping shifts the line index by the prefix's newline count and the
 *first* line's columns by the prefix's trailing width, then clips anything the
 framing owns (including a suffix sharing the fragment's last line). A template
@@ -129,7 +129,7 @@ A `%s` that follows **only whitespace** on its line means something different fr
 a same-line opener: the whitespace is the block level the whole fragment sits at,
 not a prefix its first line continues. So an indenting framing repeats the indent
 on *every* fragment line and takes that width back off *every* line's columns.
-Without it, `"class __nx:\n    %s"` over a two-line fragment produces a header, one
+Without it, `"class __btv:\n    %s"` over a two-line fragment produces a header, one
 indented line and then a dedent — a syntax error rather than a block.
 
 The rule needs no new template syntax: whether the opener is pure whitespace
@@ -150,9 +150,9 @@ Against the real grammars, on the hover shapes servers actually send:
 | python | `class Foo(Base)`, `if x > 1`, `for i in items`, `@property`+`def …` | same rung — a body-less *header* is the commonest python hover there is |
 | go | `Name string` | framed as a struct body → `Name` member, `string` type |
 | go | `Read(p []byte) (n int, err error)` | framed as an interface body → `Read` method, parameters typed |
-| javascript | `get name()`, `async fetchAll(ids)` | framed by `class __nx {\n%s {}\n}` → `get`/`async` keywords, `name`/`fetchAll` methods |
+| javascript | `get name()`, `async fetchAll(ids)` | framed by `class __btv {\n%s {}\n}` → `get`/`async` keywords, `name`/`fetchAll` methods |
 | json | `"key": 1` | framed by `{%s}` → `key` property, `1` number |
-| lua | `field = 5,` | framed by `local __nx = {\n%s\n}` → `field` property |
+| lua | `field = 5,` | framed by `local __btv = {\n%s\n}` → `field` property |
 | rust | `field: Vec<String>` | framed as a struct body → `Vec`/`String` types, `field` property |
 
 Two honest notes from the same measurements:
@@ -168,7 +168,7 @@ Two honest notes from the same measurements:
   -> str` on consecutive lines) has no framing: each line would need its own colon
   and body. It falls through to the repaint, which is the right answer.
 
-Extending `nx.treesitter.highlight` with a `fragment = true` option was left out:
+Extending `btv.treesitter.highlight` with a `fragment = true` option was left out:
 no caller wants it yet, and the surface it exists for (the help window's `>lua`
 blocks) is whole-file content.
 
@@ -194,10 +194,10 @@ blocks) is whole-file content.
 
 | file | change |
 |---|---|
-| `crates/nxvim-ts/src/engine.rs` | `highlight_fragment` (public); the shared snippet path grows a fragment mode; `extract_spans` takes the suppress ranges + fallback tokens |
-| `crates/nxvim-core/src/syntax.rs` | `SyntaxEngine::highlight_fragment`, defaulting to `highlight_text` so the wasm JS-side engine is unaffected |
-| `crates/nxvim-core/src/editor/syntax.rs` | `Editor::preview_highlights_fragment` |
-| `crates/nxvim-core/src/editor/float.rs` | `render_markdown_into` highlights each fenced block through the fragment path |
+| `crates/bemtvi-ts/src/engine.rs` | `highlight_fragment` (public); the shared snippet path grows a fragment mode; `extract_spans` takes the suppress ranges + fallback tokens |
+| `crates/bemtvi-core/src/syntax.rs` | `SyntaxEngine::highlight_fragment`, defaulting to `highlight_text` so the wasm JS-side engine is unaffected |
+| `crates/bemtvi-core/src/editor/syntax.rs` | `Editor::preview_highlights_fragment` |
+| `crates/bemtvi-core/src/editor/float.rs` | `render_markdown_into` highlights each fenced block through the fragment path |
 
 **A separate bug the end-to-end test flushed out.** `render_markdown_into` joined a
 block's lines with `\n` and **no trailing newline**, but the highlighter treats a
@@ -208,16 +208,16 @@ highlighted", independent of any fragment reasoning. `redraw.rs`'s preview
 projection already normalized this; `float.rs` now does too.
 
 **Untouched on purpose:** the picker/`:help` preview (`redraw.rs`) and
-`nx.treesitter.highlight` (`effects.rs`) — whole-file surfaces.
+`btv.treesitter.highlight` (`effects.rs`) — whole-file surfaces.
 
 **Tests**
 
-- `crates/nxvim-ts/tests/fragment_highlight.rs` — the engine behavior: the wrong
+- `crates/bemtvi-ts/tests/fragment_highlight.rs` — the engine behavior: the wrong
   structural capture is gone, a literal's own capture survives, a *structurally*
   captured keyword (the `lua_ls` shape, reproduced with a one-pattern query over the
   same compiled parser) is recovered, and a clean fragment is byte-identical to
   `highlight_text`.
-- `crates/nxvim/tests/syntax.rs` — end-to-end through the completion-docs float (a
+- `crates/bemtvi/tests/syntax.rs` — end-to-end through the completion-docs float (a
   Lua completion source whose `doc` is a fenced fragment), against the compiled
   fixture grammar, asserting the float's painted groups; plus the one-line-block
   regression above.
@@ -234,27 +234,27 @@ one-line block with no spans at all.
 
 | file | change |
 |---|---|
-| `crates/nxvim-ts/src/engine.rs` | `FragmentContext` (a template split at its `%s`), the `fragment_contexts` registry, `set_fragment_context`, `parses_cleanly`, the ladder in `highlight_fragment`, `unwrap_spans` |
-| `crates/nxvim-core/src/syntax.rs` | `SyntaxEngine::set_fragment_context` (default: ignore — an engine that does no off-buffer highlighting has no ladder to configure) |
-| `crates/nxvim-core/src/editor/syntax.rs` | `Editor::set_ts_fragment_context` |
-| `crates/nxvim-lua/src/ops.rs` + `install.rs` | `TsOp::SetFragmentContext`, `nx._ts_fragment_context` |
-| `crates/nxvim-server/src/effects.rs` | the op → editor. **No cfg split**, unlike `TsOp::SetQuery`: the prelude ships defaults for nine languages, so a loud wasm arm would greet every browser session with a wall of errors about a surface that isn't there |
-| `crates/nxvim-lua/src/prelude/nx.lua` | `nx.treesitter.fragment_context` + the shipped defaults (22 languages) |
+| `crates/bemtvi-ts/src/engine.rs` | `FragmentContext` (a template split at its `%s`), the `fragment_contexts` registry, `set_fragment_context`, `parses_cleanly`, the ladder in `highlight_fragment`, `unwrap_spans` |
+| `crates/bemtvi-core/src/syntax.rs` | `SyntaxEngine::set_fragment_context` (default: ignore — an engine that does no off-buffer highlighting has no ladder to configure) |
+| `crates/bemtvi-core/src/editor/syntax.rs` | `Editor::set_ts_fragment_context` |
+| `crates/bemtvi-lua/src/ops.rs` + `install.rs` | `TsOp::SetFragmentContext`, `btv._ts_fragment_context` |
+| `crates/bemtvi-server/src/effects.rs` | the op → editor. **No cfg split**, unlike `TsOp::SetQuery`: the prelude ships defaults for nine languages, so a loud wasm arm would greet every browser session with a wall of errors about a surface that isn't there |
+| `crates/bemtvi-lua/src/prelude/btv.lua` | `btv.treesitter.fragment_context` + the shipped defaults (22 languages) |
 | `examples/fragment-highlighting/` | a completion source that fakes the four hover shapes (fragment / statement / body-less signature / dialect), plus `:FragmentLadderOff` |
 
 **Tests**
 
-- `crates/nxvim-ts/tests/fragment_highlight.rs` — the ladder: a clean framing
+- `crates/bemtvi-ts/tests/fragment_highlight.rs` — the ladder: a clean framing
   recovers real structure, ordering (first clean framing wins), same-line column
   mapping, a dialect falling through to the repaint, and inert handling of an empty
   or `%s`-less list.
-- `crates/nxvim/tests/syntax.rs` — the shipped framings reaching the engine from the
+- `crates/bemtvi/tests/syntax.rs` — the shipped framings reaching the engine from the
   prelude (mutation-checked by dropping the op), against the ladder-off run that
   isolates Phase 1's repaint.
 
 The example was verified end-to-end with a throwaway harness test (removed before
-commit, per the examples convention) — which is how a bad `nx.command.create` call
-in it was caught: the real API is `nx.command(name, fn, opts)`.
+commit, per the examples convention) — which is how a bad `btv.command.create` call
+in it was caught: the real API is `btv.command(name, fn, opts)`.
 
 ---
 
@@ -263,7 +263,7 @@ in it was caught: the real API is `nx.command(name, fn, opts)`.
 Probing the shipped javascript framings through a bare `Engine` returned almost no
 spans, which looked like a mapping bug. It isn't: nvim-treesitter's javascript
 query is `; inherits: ecma,jsx` plus ~56 lines of its own, and the inherit chain is
-merged by `crates/nxvim-server/src/treesitter.rs` at startup — a bare `Engine` never
+merged by `crates/bemtvi-server/src/treesitter.rs` at startup — a bare `Engine` never
 sees it. With the chain merged by hand the framings paint correctly (`get` keyword,
 `name` method, `async` coroutine keyword). Worth knowing when reading engine-level
 output: **`Engine` alone under-highlights every inherits-based grammar**, and any
@@ -312,9 +312,9 @@ four of them painted nothing but brackets and operators. tsserver's dotted
 `(property) Foo.bar: number` still doesn't frame after the peel — `Foo.bar` is not a
 member name in any TS framing — and correctly leaves no label span.
 
-**Tests** — `crates/nxvim-ts/tests/fragment_highlight.rs`: the peel (structure +
+**Tests** — `crates/bemtvi-ts/tests/fragment_highlight.rs`: the peel (structure +
 columns), a peel whose body still fails leaving no trace, an item split across two
 different rungs, blank lines and per-item labels riding it, and one unresolvable
-line dropping the whole split. `crates/nxvim/tests/syntax.rs`: both shapes in one
+line dropping the whole split. `crates/bemtvi/tests/syntax.rs`: both shapes in one
 doc float through the shipped framings (mutation-checked by disabling the peel and
 the split).

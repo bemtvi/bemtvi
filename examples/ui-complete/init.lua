@@ -1,12 +1,12 @@
--- ~~~ nxvim nx.complete playground: the native completion engine ~~~
+-- ~~~ bemtvi btv.complete playground: the native completion engine ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/ui-complete \
---       cargo run -p nxvim -- examples/ui-complete/sample.txt
+--     BEMTVI_CONFIG=examples/ui-complete \
+--       cargo run -p bemtvi -- examples/ui-complete/sample.txt
 --
--- `nx.complete` is the native completion engine on the unified float-list widget
--- (docs/specs/2026-06-14-nx-ui-float-widget.md, Phase 4). Unlike the picker, the
+-- `btv.complete` is the native completion engine on the unified float-list widget
+-- (docs/specs/2026-06-14-btv-ui-float-widget.md, Phase 4). Unlike the picker, the
 -- BUFFER is the query: the popup floats over the text while your typing flows on
 -- to the document, and the SERVER (Rust) owns trigger detection, the fuzzy
 -- matcher (matched chars are highlighted), navigation, and the accept-edit. No
@@ -14,7 +14,7 @@
 --
 -- The built-in `buffer` source (Phase 4-A) is a rope-side scan of the words
 -- already in your buffer — pure core, no Lua per keystroke. Phase 4-B adds
--- `nx.complete.source{}`: register your own ASYNC source whose `complete` function
+-- `btv.complete.source{}`: register your own ASYNC source whose `complete` function
 -- streams candidates for the current prefix off the input path (debounced,
 -- generation-gated, so a reply for a prefix you've typed past is dropped). The
 -- `lsp` / `snippets` built-ins and the docs preview land in later sub-phases;
@@ -37,8 +37,8 @@ vim.g.mapleader = "\\"
 -- receives the live prefix in `ctx.prefix`, streams matching candidates via
 -- `ctx.push` (a string, or `{ text = label, insert = applied-text }`), and signals
 -- completion by RETURNING — synchronously here, or a promise for a real async
--- source. The same shape drives an LSP/HTTP/`nx.run_stream` source wrapped in
--- `nx.async`: register a `ctx.on_cancel` reaper (e.g. `stream:kill()`) and the
+-- source. The same shape drives an LSP/HTTP/`btv.run_stream` source wrapped in
+-- `btv.async`: register a `ctx.on_cancel` reaper (e.g. `stream:kill()`) and the
 -- engine kills the in-flight job when you type past the prefix.
 --------------------------------------------------------------------------------
 local KEYWORDS = {
@@ -49,7 +49,7 @@ local KEYWORDS = {
   "connection",
   "configuration",
 }
-nx.complete.source {
+btv.complete.source {
   name = "keywords",
   -- Trailing delay (ms) before this source runs after a keystroke; coalesces a
   -- fast typist's keystrokes into one query. `0` would run on every key.
@@ -69,7 +69,7 @@ nx.complete.source {
   -- (here just a string) runs once per landed-on row, not for every candidate. It
   -- returns a PROMISE of the docs (a doc string, or an item whose `.doc` is used).
   resolve = function(item)
-    return nx.promise.resolve { doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)" }
+    return btv.promise.resolve { doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)" }
   end,
 }
 
@@ -88,7 +88,7 @@ local EMOJI = {
   { ":tada:", "🎉" },
   { ":thumbsup:", "👍" },
 }
-nx.complete.source {
+btv.complete.source {
   name = "emoji",
   debounce = 0,
   trigger = { chars = { ":" } },
@@ -109,7 +109,7 @@ nx.complete.source {
 -- we ALSO bind <CR> to accept, for folks who prefer Enter-to-confirm (the default
 -- leaves <CR> as a literal newline so it never eats a line break unexpectedly).
 --------------------------------------------------------------------------------
-nx.complete.setup {
+btv.complete.setup {
   sources = {
     { "buffer", min_chars = 2 },
     { "keywords" },
@@ -128,7 +128,7 @@ nx.complete.setup {
 }
 
 -- The same thing is available as a Lua API — map it yourself if you prefer:
---   nx.keymap.set("i", "<C-x><C-n>", nx.complete.trigger)
+--   btv.keymap.set("i", "<C-x><C-n>", btv.complete.trigger)
 
 -- Try it: open the sample, enter insert mode, and start retyping one of the long
 -- identifiers (`config`, `connection`, `completion`, …). The popup offers the

@@ -2,7 +2,7 @@
 
 ## The problem
 
-`push_buf_mirror` (`crates/nxvim-server/src/effects.rs:1893`) re-serializes a
+`push_buf_mirror` (`crates/bemtvi-server/src/effects.rs:1893`) re-serializes a
 buffer's **entire** line array whenever its `changedtick` moves:
 
 ```rust
@@ -13,8 +13,8 @@ let lines = if fresh {
 };
 ```
 
-and `nx._set_buf_mirror` (`crates/nxvim-lua/src/prelude/state.lua:1827`) replaces
-`nx._bufs` wholesale, carrying the previous `lines` over only for buffers whose
+and `btv._set_buf_mirror` (`crates/bemtvi-lua/src/prelude/state.lua:1827`) replaces
+`btv._bufs` wholesale, carrying the previous `lines` over only for buffers whose
 tick did *not* move.
 
 So one keystroke in insert mode on a 50k-line buffer costs 50k Rust `String`
@@ -30,7 +30,7 @@ which is the normal loaded-plugin case.
 ## Considered and rejected: a pull-based getter
 
 The obviously-cheapest design is to stop mirroring lines at all and have
-`nx.buf.lines(b, s, e)` call a Rust function that reads the rope for just the
+`btv.buf.lines(b, s, e)` call a Rust function that reads the rope for just the
 requested range — O(requested), not O(buffer).
 
 Rejected: it breaks the architecture's load-bearing invariant that **Lua never
@@ -44,7 +44,7 @@ push incremental.
 ## Design: a fifth edit journal
 
 The core already records exactly what is needed. `BufferEdit`
-(`crates/nxvim-core/src/buffer.rs:26`) carries `start_point` / `old_end_point` /
+(`crates/bemtvi-core/src/buffer.rs:26`) carries `start_point` / `old_end_point` /
 `new_end_point` as `(row, byte-col)`, and `EditBatch` pairs the edits with a
 `resync` flag set when the whole rope was replaced.
 
@@ -91,40 +91,40 @@ the fold then — not speculatively.
 
 - **Double-apply.** Splicing is not idempotent the way a full replace is, so a
   Lua-side write-through would corrupt the array. There is none:
-  `nx.buf.set_lines` / `set_text` validate synchronously and only *queue* a
-  `BufOp` (`crates/nxvim-lua/src/install.rs:2337`), landing through the core,
+  `btv.buf.set_lines` / `set_text` validate synchronously and only *queue* a
+  `BufOp` (`crates/bemtvi-lua/src/install.rs:2337`), landing through the core,
   which journals it like any other edit. (The doc comment on
   `LuaRuntime::set_buf_mirror` claiming "`set_lines` write-through mutates this
   same mirror" is stale and gets fixed.)
 - **Aliasing.** In-place splicing would be visible to anyone holding the array.
-  `nx.buf.lines` copies into a fresh table (`api.lua:418`), so no caller holds it.
+  `btv.buf.lines` copies into a fresh table (`api.lua:418`), so no caller holds it.
 
 ## Phases
 
 ### Phase 1 — the incremental path, end to end  *(done)*
 
-- `crates/nxvim-core/src/buffer.rs`: `mirror_edits` / `mirror_resync` fields,
+- `crates/bemtvi-core/src/buffer.rs`: `mirror_edits` / `mirror_resync` fields,
   written in `record()` and cleared/flagged in `mark_resync()`, drained by
   `take_mirror_edits()`.
-- `crates/nxvim-core/src/editor/buffers.rs`: `take_mirror_edits_of(id)`,
+- `crates/bemtvi-core/src/editor/buffers.rs`: `take_mirror_edits_of(id)`,
   alongside `take_lua_ts_edits_of`.
-- `crates/nxvim-lua/src/runtime.rs`: `BufMirror.lines` gains a delta form; the
+- `crates/bemtvi-lua/src/runtime.rs`: `BufMirror.lines` gains a delta form; the
   serializer carries `{ start, old_end, lines }`.
-- `crates/nxvim-server/src/effects.rs`: drain the journal in `push_buf_mirror`,
+- `crates/bemtvi-server/src/effects.rs`: drain the journal in `push_buf_mirror`,
   coalesce, and emit full-or-delta.
-- `crates/nxvim-lua/src/prelude/state.lua`: `nx._set_buf_mirror` splices a delta
+- `crates/bemtvi-lua/src/prelude/state.lua`: `btv._set_buf_mirror` splices a delta
   into the retained array; full and absent behave as today.
 - Correctness tests: the mirror's contents after a delta must be identical to a
   full push — single-line edit, multi-line insert, multi-line delete, join,
   whole-buffer replace, undo/redo, `:e` reload, a first-seen buffer, a queued
-  `nx.buf.set_lines` round-trip, and `on_lines`/`on_bytes` still firing right.
+  `btv.buf.set_lines` round-trip, and `on_lines`/`on_bytes` still firing right.
 
 ### Phase 2 — remaining
 
 The regression guard landed with Phase 1 rather than after it, since shipping the
 fix unguarded made no sense:
 `typing_in_a_large_buffer_does_not_scale_with_the_buffer` in
-`crates/nxvim-server/tests/buf_mirror.rs` feeds 300 keystrokes into a 20k-line
+`crates/bemtvi-server/tests/buf_mirror.rs` feeds 300 keystrokes into a 20k-line
 buffer with an autocmd handler registered (so the mirror pushes every key).
 
 Measured on that exact run, debug build:
@@ -218,7 +218,7 @@ The measured win is unaffected. If multi-edit batches ever show up hot, do the f
 properly rather than widening the window heuristically.
 
 The lesson for the test suite: every original extmark test drove edits with one `feed`
-per tick, so none of them ever built a multi-edit batch. Queued `nx.buf.set_lines` /
+per tick, so none of them ever built a multi-edit batch. Queued `btv.buf.set_lines` /
 `set_text` calls in a single Lua chunk do, and that is what
 `a_row_preserving_batch_that_shrinks_the_buffer_does_not_crash` uses.
 
@@ -243,7 +243,7 @@ keystrokes / 5000 marks run:
 
 | | of the ~2.5 s over a mark-free buffer |
 | --- | --- |
-| redraw projections (`nxvim-server/src/extmarks.rs`) | **1927 ms (77%)** |
+| redraw projections (`bemtvi-server/src/extmarks.rs`) | **1927 ms (77%)** |
 | `Buffer::virt_lines_by_line` | 350 ms (14%) |
 | `ExtmarkStore::shift` | **51 ms (2%)** |
 | undo-snapshot `extmarks.clone()` | 0 ms |

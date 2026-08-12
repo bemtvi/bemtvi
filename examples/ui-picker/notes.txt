@@ -1,4 +1,4 @@
-nx.picker preview pane (Phase 3)
+btv.picker preview pane (Phase 3)
 ================================
 
 This second file exists so the file-preview pickers have more than one file to

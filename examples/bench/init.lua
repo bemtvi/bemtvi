@@ -1,4 +1,4 @@
--- ~~~ nxvim Lua micro-benchmarks: PUC Lua (5.4, default) vs alternative backends ~~~
+-- ~~~ bemtvi Lua micro-benchmarks: PUC Lua (5.4, default) vs alternative backends ~~~
 --
 -- A backend-agnostic suite of the operations plugins do on hot paths
 -- (tokenizing, string building, sorting candidates, fuzzy scoring, OOP
@@ -6,7 +6,7 @@
 --
 -- Run it (from the repo root) — use --release, debug timings are meaningless:
 --
---     NXVIM_CONFIG=examples/bench cargo run --release -p nxvim -- examples/bench/sample.txt
+--     BEMTVI_CONFIG=examples/bench cargo run --release -p bemtvi -- examples/bench/sample.txt
 --
 -- Then, in the editor:
 --
@@ -42,7 +42,7 @@ end
 
 local KEYWORDS = {
   "local", "function", "return", "end", "if", "then", "else", "for", "in",
-  "pairs", "ipairs", "require", "vim", "nx", "buffer", "window", "config",
+  "pairs", "ipairs", "require", "vim", "btv", "buffer", "window", "config",
   "setup", "opts", "true", "false", "nil", "string", "format", "table",
   "insert", "concat", "gsub", "match", "find", "pcall", "select", "type",
 }
@@ -251,14 +251,14 @@ local function timeit(b)
 end
 
 for idx, b in ipairs(BENCHES) do
-  nx.user_command.create("bench" .. idx, function()
+  btv.user_command.create("bench" .. idx, function()
     local _, line = timeit(b)
     print(line)
   end, {})
 end
 
-nx.user_command.create("benchall", function()
-  print(string.format("== nxvim Lua microbench  [%s]  SCALE=%d ==", _VERSION, SCALE))
+btv.user_command.create("benchall", function()
+  print(string.format("== bemtvi Lua microbench  [%s]  SCALE=%d ==", _VERSION, SCALE))
   local total = 0
   for _, b in ipairs(BENCHES) do
     local dt, line = timeit(b)

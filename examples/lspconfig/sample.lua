@@ -5,13 +5,13 @@
 
 local M = {}
 
--- Step 3: put the cursor on `nx.buf` and press K for a hover float.
+-- Step 3: put the cursor on `btv.buf` and press K for a hover float.
 local function current_line_count()
-  return #nx.buf.lines(0, 0, -1, false)
+  return #btv.buf.lines(0, 0, -1, false)
 end
 
 -- Step 4: `undefined_global` is not defined anywhere and is not a known global,
--- so lua_ls reports it. `nx` on the line above does NOT report, because section 2
+-- so lua_ls reports it. `btv` on the line above does NOT report, because section 2
 -- of init.lua declared it — that contrast is the diagnostic worth looking at.
 local function broken()
   return undefined_global.field

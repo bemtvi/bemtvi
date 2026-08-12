@@ -4,5 +4,5 @@
 -- the daemon served this plugin and the client ran it.
 
 vim.api.nvim_create_user_command("RemotePlugin", function()
-  nx.notify("This :RemotePlugin command came from a plugin the daemon served.")
+  btv.notify("This :RemotePlugin command came from a plugin the daemon served.")
 end, {})

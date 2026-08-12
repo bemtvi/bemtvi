@@ -1,15 +1,15 @@
--- ~~~ nxvim nx.view.component persistence: a sidebar that survives a restart ~~~
+-- ~~~ bemtvi btv.view.component persistence: a sidebar that survives a restart ~~~
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/view-persist \
---       cargo run -p nxvim -- --workspace examples/view-persist
+--     BEMTVI_CONFIG=examples/view-persist \
+--       cargo run -p bemtvi -- --workspace examples/view-persist
 --
 -- `--workspace` makes this a session-scoped launch (the editor captures + restores the
--- window/tab layout), and `nx.shada.save_layout(true)` below opts the layout capture in.
--- The sidebar is an `nx.view.component` mounted with a stable `persist` id: the editor
+-- window/tab layout), and `btv.shada.save_layout(true)` below opts the layout capture in.
+-- The sidebar is an `btv.view.component` mounted with a stable `persist` id: the editor
 -- round-trips only that id and the view's slot — never its content. The component owns the
--- content, loading and saving it through `ctx.store` (its own `nx.shada.plugin()` slice,
+-- content, loading and saving it through `ctx.store` (its own `btv.shada.plugin()` slice,
 -- keyed by the same id). One mount call; the framework picks fresh-vs-restore for you.
 --
 -- TRY IT:
@@ -23,7 +23,7 @@
 -- this plugin's own store. Closing the view for good drops the saved notes — the editor
 -- never GCs your data for you.
 
-nx.shada.save_layout(true) -- opt the window/tab layout into the session capture
+btv.shada.save_layout(true) -- opt the window/tab layout into the session capture
 
 local PERSIST_ID = "notes" -- the stable id this view rides the session by
 local STORE_KEY = "view:" .. PERSIST_ID -- where this plugin keeps its own state
@@ -33,7 +33,7 @@ local STORE_KEY = "view:" .. PERSIST_ID -- where this plugin keeps its own state
 -- framework picks — and owns the side effects (load, key binds, persistence). `render` is
 -- pure: it maps the current notes to the lines on screen and the framework re-runs it
 -- automatically on every mutation.
-local Notes = nx.view.component({
+local Notes = btv.view.component({
   setup = function(ctx)
     -- The notes, loaded from this component's own cross-session store (`ctx.store`, keyed by
     -- the same persist id), or a friendly default on first run. Held as reactive state, so a
@@ -55,7 +55,7 @@ local Notes = nx.view.component({
 
     -- <CR> echoes the note under the cursor.
     ctx.view:on_select(function(line)
-      nx.notify("note: " .. (notes.list[line] or ""))
+      btv.notify("note: " .. (notes.list[line] or ""))
     end)
 
     -- The editor never deletes your saved state — drop it yourself when the user closes the
@@ -95,7 +95,7 @@ local Notes = nx.view.component({
 -- handler, no VimEnter fallback, no manual save/render wiring: the component owns all of it.
 Notes.mount({
   name = "Notes",
-  filetype = "nxnotes",
+  filetype = "btvnotes",
   persist = PERSIST_ID,
   dock = "left",
   size = 36,

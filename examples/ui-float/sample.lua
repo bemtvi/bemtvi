@@ -1,4 +1,4 @@
--- nx.ui.float — the list-less content float
+-- btv.ui.float — the list-less content float
 -- ==========================================
 --
 -- Maps this config wires (leader = "\"):
@@ -9,7 +9,7 @@
 --   \s   LSP signature help
 --
 -- A content float is transient: press any key to dismiss it. It never grabs
--- input — unlike nx.ui.select, the key you press is still handled normally (so
+-- input — unlike btv.ui.select, the key you press is still handled normally (so
 -- K then j moves down after the hover closes).
 --
 -- For K: put the cursor on a stdlib symbol below and press it. lua-language-

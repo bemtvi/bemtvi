@@ -76,7 +76,7 @@ menu; they don't overlap, so z-order is fine.
 
 **Wrap is a configurable option, default on.** Add a `docs_wrap: bool` field to the
 completion config (`CompleteConfig`, `complete.rs:112`, default `true`), surfaced via
-`nx.complete.setup { docs_wrap = true|false }`. When true the docs float sets its
+`btv.complete.setup { docs_wrap = true|false }`. When true the docs float sets its
 window `wrap` option so a doc line wider than the float wraps within it; when false it
 does not (long lines truncate at the edge). Default-on also makes horizontal scroll
 unnecessary in the common case — reinforcing the `hscroll` deletion in Phase 2. Height
@@ -122,7 +122,7 @@ docs window always wraps (plain help text, no per-surface config).
 **Phase 3 — delete client rendering + view decode.**
 - TUI `render_menu_docs` (`render.rs:2844`) + call site; GUI docs block
   (`render.rs:2638`); web docs block (`index.html:2341`) + `.pmenu-doc` CSS.
-- `nxvim-view::MenuDocs` + `MenuData.docs` decode — **only if** cmdline wildmenu docs
+- `bemtvi-view::MenuDocs` + `MenuData.docs` decode — **only if** cmdline wildmenu docs
   are also migrated (see Decision). Otherwise these stay for the cmdline path. Commit.
 
 **Phase 4 — tests + web verify.**
@@ -138,7 +138,7 @@ docs window always wraps (plain help text, no per-surface config).
 they become a real doc-float window (bottom-anchored beside the wildmenu box, plain
 text — no markdown render needed there, so a plain `open_doc_float` with an empty
 filetype). This fully deletes the `menu.docs` wire, all three client `MenuDocs`
-renderers, and `nxvim-view::MenuDocs`. The completion docs use the markdown path;
+renderers, and `bemtvi-view::MenuDocs`. The completion docs use the markdown path;
 the cmdline docs use the plain path — both on the shared doc-float window infra.
 
 ## Risks

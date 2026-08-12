@@ -1,20 +1,20 @@
--- ~~~ nxvim nx.cmdline_complete playground: command-line completion ~~~
+-- ~~~ bemtvi btv.cmdline_complete playground: command-line completion ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/cmdline-completion \
---       cargo run -p nxvim -- examples/cmdline-completion/sample.txt
+--     BEMTVI_CONFIG=examples/cmdline-completion \
+--       cargo run -p bemtvi -- examples/cmdline-completion/sample.txt
 --
--- `nx.cmdline_complete` is the wildmenu on the unified float-list widget — its
--- FIFTH orchestration (picker / nx.ui.select / insert-completion / the docs
--- sidebar being the prior four; docs/specs/2026-06-14-nx-ui-float-widget.md,
+-- `btv.cmdline_complete` is the wildmenu on the unified float-list widget — its
+-- FIFTH orchestration (picker / btv.ui.select / insert-completion / the docs
+-- sidebar being the prior four; docs/specs/2026-06-14-btv-ui-float-widget.md,
 -- docs/plans/2026-06-16-cmdline-completion.md). Press <Tab> on an ex command line
 -- (`:`) and a fuzzy list of matching command NAMES floats just above the line,
 -- anchored under the command-name token.
 --
 -- Engine in Rust core, policy in Lua: core extracts the token, fuzzy-ranks the
 -- catalog (matched chars are highlighted), renders the menu, and applies the
--- accept; the bundled `nx.cmdline_complete` plugin owns the curated command
+-- accept; the bundled `btv.cmdline_complete` plugin owns the curated command
 -- catalog. No input loop runs in Lua (ADR 0002 rule 4).
 --
 -- WHAT TO TRY (open the command line with `:` first):
@@ -53,7 +53,7 @@
 --                      finish it, e.g. `:set tabstop=4`)
 --
 -- FILE-PATH COMPLETION — a fuzzy PICKER for file/dir arguments:
---   :e <Tab>           open the nx.picker overlay OVER the still-open command line (a
+--   :e <Tab>           open the btv.picker overlay OVER the still-open command line (a
 --                      centered fuzzy finder titled "Select file", with a preview
 --                      pane), listing the cwd with directories first — the SAME-LEVEL
 --                      entries ranked ahead of anything deeper. The `:` line stays
@@ -77,14 +77,14 @@
 -- `:set`, sourced from what the editor already knows so it can never drift):
 --   :buffer <Tab>      list the loaded buffers by name (`:bdelete` / `:bwipeout`
 --                      share it); type to fuzzy-narrow, <CR> accepts a name
---   :colorscheme <Tab> list every available color scheme — the bundled `nxvim` plus
+--   :colorscheme <Tab> list every available color scheme — the bundled `bemtvi` plus
 --                      any `colors/<name>.lua` on the runtimepath (a plugin theme
 --                      shows the instant it's installed)
 --   :highlight <Tab>   list the defined highlight groups (e.g. `:highlight Comment`)
---   :setfiletype <Tab> list the filetypes nxvim recognizes (`rust`, `lua`, `python`, …)
---   :TSInstall <Tab>   list the tree-sitter languages nxvim can highlight (`:TSUpdate`
+--   :setfiletype <Tab> list the filetypes bemtvi recognizes (`rust`, `lua`, `python`, …)
+--   :TSInstall <Tab>   list the tree-sitter languages bemtvi can highlight (`:TSUpdate`
 --                      shares it) — takes several, so every argument completes
---   :autocmd <Tab>     list the autocmd events nxvim emits (`:autocmd BufWrite<Tab>`);
+--   :autocmd <Tab>     list the autocmd events bemtvi emits (`:autocmd BufWrite<Tab>`);
 --                      `:augroup <Tab>` lists the defined autocommand groups
 --   :put <Tab>         list the registers that currently hold content (with a preview)
 --   :move <Tab>        list address landmarks — `.`, `$`, `0`, and the current
@@ -110,10 +110,10 @@
 -- (`docs = true` — the synopsis/help float beside the highlighted row); pass
 -- `docs = false` for a names-only wildmenu. (A config that re-runs setup wins over
 -- the default, since the last setup call applies.)
-nx.cmdline_complete.setup {}
+btv.cmdline_complete.setup {}
 
 -- A plugin command with a `desc`: it joins the wildmenu catalog automatically (via
--- nx.user_command.get()), ranked and previewed exactly like a built-in.
-nx.user_command.create("Greet", function()
-  nx.notify("Hello from a plugin command!")
+-- btv.user_command.get()), ranked and previewed exactly like a built-in.
+btv.user_command.create("Greet", function()
+  btv.notify("Hello from a plugin command!")
 end, { desc = "Print a friendly greeting" })

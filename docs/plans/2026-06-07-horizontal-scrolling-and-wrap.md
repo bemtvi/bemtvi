@@ -2,26 +2,26 @@
 
 ## Why this document exists
 
-nxvim has **no horizontal scrolling and no line wrapping**. Every text window
+bemtvi has **no horizontal scrolling and no line wrapping**. Every text window
 projects raw buffer lines that the TUI paints with a ratatui `Paragraph`, which
 **clips at the right edge**, and the terminal cursor is placed at an absolute
 `cursor_screen_col`. Two consequences, both wrong:
 
-| situation | neovim | nxvim today | where |
+| situation | neovim | bemtvi today | where |
 | --- | --- | --- | --- |
 | cursor moves right past the window's text width (long line) | the viewport scrolls horizontally (`w_leftcol`) to keep the cursor visible | the line stays clipped, the cursor pins at the edge — text never scrolls | `view.rs` `window_view`, `render.rs` `render_text` |
 | a line longer than the window, `wrap` on (neovim default) | the line wraps onto extra display rows | the line is clipped; `wrap` does not exist | — |
 | `:set nowrap` / `:set wrap` | toggles the above | `E518: Unknown option: wrap` | `options.rs` `canonical` |
 
 This is the "major oversight" the flag refers to: there is no `leftcol` and no
-`wrap`. nxvim's *only* text-window behavior is "clip and don't scroll", which is
+`wrap`. bemtvi's *only* text-window behavior is "clip and don't scroll", which is
 neither vim's `wrap` (the default) nor a working `nowrap`.
 
 This plan adds both, **phased deliberately by their cost**:
 
 - **Phase 1 — horizontal scrolling (`nowrap`).** A per-window `leftcol` screen-
   column offset that mirrors the existing vertical `top` exactly. Small, contained,
-  and it is the behavior nxvim *already* approximates (minus the scroll), so it
+  and it is the behavior bemtvi *already* approximates (minus the scroll), so it
   needs no new display-row model. **This is the first deliverable.**
 - **Phase 2 — line wrapping (`wrap`), MVP.** Introduces the `wrap` option and a
   **display-row projection** in the core: one buffer line becomes one *or more*
@@ -104,7 +104,7 @@ scroll a wrapped window).
 
 The render pipeline, end to end:
 
-- **`crates/nxvim-core/src/editor.rs`** owns scroll/cursor state. `Editor.top` is
+- **`crates/bemtvi-core/src/editor.rs`** owns scroll/cursor state. `Editor.top` is
   the focused window's first visible buffer line; `Window.saved_top` /
   `WindowLayout.top` carry it for non-focused windows. `ensure_visible()` (~6335)
   re-clamps `top` after every motion and is called from ~20 sites.
@@ -113,26 +113,26 @@ The render pipeline, end to end:
   `WindowOptions` (`options.rs`), routed by `:set` through `apply_set_bool`
   (~5985, `number`/`relativenumber` → `windows.cur_mut().options`) and
   `apply_set_num` (~6016, currently buffer-local only).
-- **`crates/nxvim-core/src/view.rs`** `window_view()` (~249) projects each
+- **`crates/bemtvi-core/src/view.rs`** `window_view()` (~249) projects each
   `WindowLayout` into a `WindowView`: raw `lines` (tabs intact), absolute
   screen-column `selection`/`cursor_screen_col`, 1-based `numbers`, and — for the
   new floats — a bordered float's content is the rect **inset by one cell**
   (`inset`, `content_width`, `width = content_width − number_width`, lines
   255–269). `WindowLayout` (editor.rs ~981) carries `floating`/`border`/`title`.
-- **`crates/nxvim-server/src/redraw.rs`** `window_value()` (~116) serializes the
+- **`crates/bemtvi-server/src/redraw.rs`** `window_value()` (~116) serializes the
   `WindowView` map (`lines`, `cursor_screen_col`, `number_width`, `tabstop`,
   `floating`, `border`, …) and resolves syntax/diagnostics to **absolute** screen-
   column spans. The pmenu anchor column is computed near line 67.
-- **`crates/nxvim-tui/src/render.rs`** `render_window` (~202) → the single
+- **`crates/bemtvi-tui/src/render.rs`** `render_window` (~202) → the single
   `render_text(...)` call (~306) → `highlight_line` (~489): expands tabs
   (`expand_tabs`), walks cells left-to-right keying styles on the absolute screen
   `col`, and the cursor is placed at `inner.x + cursor_screen_col` (~166). Floats
   reuse `render_window`, so anything threaded there covers floats for free.
-- **`crates/nxvim-tui/src/view.rs`** parses the window map into the TUI's own
+- **`crates/bemtvi-tui/src/view.rs`** parses the window map into the TUI's own
   `WindowView` (`map_u16`/`map_u64`, ~278).
 
-Tests: `crates/nxvim-server/tests/editing.rs` asserts on the `redraw` View
-(`start`/`feed`/`latest_redraw`/`view_*` helpers); `crates/nxvim/tests/screen.rs`
+Tests: `crates/bemtvi-server/tests/editing.rs` asserts on the `redraw` View
+(`start`/`feed`/`latest_redraw`/`view_*` helpers); `crates/bemtvi/tests/screen.rs`
 (Tier 2) paints the real `View` and asserts on the cell grid (`GUTTER` const,
 `paint`).
 
@@ -210,7 +210,7 @@ The full, in-scope deliverable. No display-row model; `leftcol` mirrors `top`.
   focused `leftcol` from the pmenu anchor column (~67) so the completion popup
   tracks the scrolled text.
 
-### 1e. Client paint (`nxvim-tui` `view.rs`, `render.rs`)
+### 1e. Client paint (`bemtvi-tui` `view.rs`, `render.rs`)
 
 - TUI `WindowView`: add `leftcol: u16`, parsed `map_u16(m, "leftcol")`.
 - Thread `win.leftcol` into the single `render_text(...)` → `highlight_line`:
@@ -298,7 +298,7 @@ Each is an independent, testable add-on; none blocks Phases 1–2.
 ## Suggested order & scoreboard
 
 Phase 1 makes long lines usable (the reported oversight) and is low-risk —
-`leftcol` is one integer that shadows `top`. Phase 2 makes nxvim's default text
+`leftcol` is one integer that shadows `top`. Phase 2 makes bemtvi's default text
 window match vim's mental model for paragraphs once `wrap` is opted into; it is the
 projection rewrite. Phase 3 is fidelity polish.
 
@@ -315,17 +315,17 @@ Scoreboard — the surface a user exercises:
 
 ## Testing appendix
 
-- Editing-tier (`crates/nxvim-server/tests/editing.rs`): assert on the `redraw`
+- Editing-tier (`crates/bemtvi-server/tests/editing.rs`): assert on the `redraw`
   View's `leftcol`, `cursor_screen_col`, and (P2) the per-display-row `lines`/
   `numbers` counts. Drive with `feed`; read with the take-latest helpers (never the
   first queued redraw — see CLAUDE.md / `redraw-test-helpers-take-latest`).
-- Screen-tier (`crates/nxvim/tests/screen.rs`): paint and assert the cell grid;
+- Screen-tier (`crates/bemtvi/tests/screen.rs`): paint and assert the cell grid;
   the gutter is `GUTTER` cells, text/cursor offset past it.
-- Commands: `cargo test -p nxvim-server --test editing <name>`,
-  `cargo test -p nxvim --test screen <name>`, then `cargo test --workspace`.
+- Commands: `cargo test -p bemtvi-server --test editing <name>`,
+  `cargo test -p bemtvi --test screen <name>`, then `cargo test --workspace`.
   Lint `cargo clippy --all-targets -- -D warnings` + `cargo fmt --all`. **Default
   features only — never `--all-features`** (CLAUDE.md: the Lua backend features are
-  mutually exclusive). Manual check: `cargo run -p nxvim -- <long-lined file>`.
+  mutually exclusive). Manual check: `cargo run -p bemtvi -- <long-lined file>`.
 
 ---
 
@@ -333,9 +333,9 @@ Scoreboard — the surface a user exercises:
 
 - **Wide-char / tab straddling the `leftcol` boundary** (P1) renders a one-cell
   left-edge artifact (the partial glyph is skipped). Acceptable for MVP; vim paints
-  a `<` fill only with `listchars`, which nxvim does not have.
+  a `<` fill only with `listchars`, which bemtvi does not have.
 - **No `listchars` `extends`/`precedes` markers** (the `<`/`>` off-screen
-  indicators) — out of scope; nxvim has no `listchars`.
+  indicators) — out of scope; bemtvi has no `listchars`.
 - **`sidescroll`/`sidescrolloff` modeled window-local** for simplicity (vim makes
   `sidescroll` global, `sidescrolloff` global-local). Note the divergence; promote
   later if a plugin depends on the global scope.

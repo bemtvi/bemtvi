@@ -1,10 +1,10 @@
--- ~~~ nxvim file explorer playground (the in-window directory listing) ~~~
+-- ~~~ bemtvi file explorer playground (the in-window directory listing) ~~~
 --
--- nxvim opens a DIRECTORY the way vim's netrw does: as a read-only listing you
+-- bemtvi opens a DIRECTORY the way vim's netrw does: as a read-only listing you
 -- navigate in the window, not as text. Open the sample tree (from the repo root):
 --
---     NXVIM_CONFIG=examples/explorer \
---       cargo run -p nxvim -- examples/explorer/tree
+--     BEMTVI_CONFIG=examples/explorer \
+--       cargo run -p bemtvi -- examples/explorer/tree
 --
 -- You can also reach it from inside the editor with `:e examples/explorer/tree`
 -- (or `:e .` for the current directory).

@@ -1,9 +1,9 @@
--- ~~~ nxvim 'laststatus' playground: per-window vs. one global status line ~~~
+-- ~~~ bemtvi 'laststatus' playground: per-window vs. one global status line ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/laststatus \
---       cargo run -p nxvim -- examples/laststatus/sample.txt
+--     BEMTVI_CONFIG=examples/laststatus \
+--       cargo run -p bemtvi -- examples/laststatus/sample.txt
 --
 -- 'laststatus' decides WHERE status lines are drawn:
 --

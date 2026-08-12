@@ -1,22 +1,22 @@
--- Example: nxvim's native package / plugin manager — `nx.plugins`.
+-- Example: bemtvi's native package / plugin manager — `btv.plugins`.
 --
--- There is no third-party plugin-manager layer in nxvim; the manager is built in
+-- There is no third-party plugin-manager layer in bemtvi; the manager is built in
 -- (ADR 0002 / docs/specs/2026-06-11-native-plugin-api.md). You DECLARE the set you
--- want, and the manager clones/updates them via `nx.git_local` (first-party gix, no
+-- want, and the manager clones/updates them via `btv.git_local` (first-party gix, no
 -- `git` binary, over the async runtime — never blocking the editor) and loads each
 -- one — eagerly at startup or lazily on a trigger.
 --
--- IMPORTANT: nxvim is its OWN editor, not a neovim build, and claims no neovim
--- compatibility. Plugins are written against the `nx.*` API (see the spec's worked
+-- IMPORTANT: bemtvi is its OWN editor, not a neovim build, and claims no neovim
+-- compatibility. Plugins are written against the `btv.*` API (see the spec's worked
 -- examples — picker/complete/statusline/snippet sources, decoration providers, tree
 -- views). A neovim plugin like telescope or which-key would clone fine but error on
--- load against nxvim's API. So the specs below are nxvim-native plugins, plus a
--- **colorscheme** — colorschemes are nxvim's own pure-Lua modules that fill the
+-- load against bemtvi's API. So the specs below are bemtvi-native plugins, plus a
+-- **colorscheme** — colorschemes are bemtvi's own pure-Lua modules that fill the
 -- highlight registry through the highlight API (`vim.cmd.colorscheme` / the
 -- `nvim_set_hl` alias), so a catppuccin-style colorscheme repo loads as-is.
 --
 -- Try it:
---   NXVIM_CONFIG=examples/plugins cargo run -p nxvim
+--   BEMTVI_CONFIG=examples/plugins cargo run -p bemtvi
 --   :Plugins        -- the lazy-style dashboard: every plugin grouped by load state,
 --                      LIVE clone/pull progress, and the action keys —
 --                      UPPER-case acts on EVERYTHING:
@@ -38,7 +38,7 @@
 --
 --   :PluginUpdate catppuccin        -- fast-forward JUST that plugin; every other
 --                                      checkout AND lockfile entry is untouched
---   :PluginSync nx-files            -- install/realize one plugin (its dependencies
+--   :PluginSync btv-files            -- install/realize one plugin (its dependencies
 --                                      come with it — a plugin whose dependency is
 --                                      missing does not load)
 --   :PluginRestore catppuccin       -- roll back only the plugin that broke
@@ -46,11 +46,11 @@
 --                                      catppuccin then gives you a fresh copy
 --   :PluginLock catppuccin          -- pin the one plugin you have finished testing
 --
--- Same thing from Lua: `nx.plugins.update({ plugins = "catppuccin" })` (a name or a
+-- Same thing from Lua: `btv.plugins.update({ plugins = "catppuccin" })` (a name or a
 -- list of names). Same thing in the dashboard: put the cursor on a row and press the
 -- lower-case key.
 --
--- THE LOCKFILE. After the first `:PluginSync` you'll find `nxvim-lock.json` in this
+-- THE LOCKFILE. After the first `:PluginSync` you'll find `bemtvi-lock.json` in this
 -- example dir (the config dir) recording the exact commit each plugin resolved to.
 -- Commit that next to your init.lua and another machine reproduces the same tree.
 -- Try it: `:PluginUpdate` (advances + re-records), then `:PluginRestore` (back to
@@ -58,44 +58,44 @@
 -- differs from the lockfile.
 --
 -- Clones land under stdpath("data")/plugins (overridable with
--- nx.plugins.setup_manager).
+-- btv.plugins.setup_manager).
 
 -- Optional: point the install root somewhere of your choosing.
--- nx.plugins.setup_manager({ root = vim.fn.stdpath("data") .. "/plugins" })
+-- btv.plugins.setup_manager({ root = vim.fn.stdpath("data") .. "/plugins" })
 
-nx.plugins({
+btv.plugins({
   -- A COLORSCHEME (a pure-Lua module that fills the highlight registry). Loaded
   -- eagerly; `config` runs once it is on the runtimepath, so `colorscheme`
   -- resolves the freshly-installed colors/.
   {
-    "nxvim/catppuccin-nxvim",
+    "bemtvi/catppuccin-bemtvi",
     name = "catppuccin",
     config = function()
       vim.cmd("colorscheme catppuccin")
     end,
   },
 
-  -- An nx.*-native plugin, lazy by command: the body is not loaded until the first
+  -- An btv.*-native plugin, lazy by command: the body is not loaded until the first
   -- `:Emoji`, which then re-dispatches against the real command the plugin defines.
-  -- (An `nx.complete.source` / `nx.picker.source`-shaped plugin — see the spec.)
+  -- (An `btv.complete.source` / `btv.picker.source`-shaped plugin — see the spec.)
   {
-    "nxvim/nx-emoji",
+    "bemtvi/btv-emoji",
     cmd = "Emoji",
     config = function()
-      require("nx-emoji").setup({})
+      require("btv-emoji").setup({})
     end,
     enabled = false,
   },
 
-  -- An nx.*-native fuzzy-finder plugin (picker sources), lazy by key: pressing the
+  -- An btv.*-native fuzzy-finder plugin (picker sources), lazy by key: pressing the
   -- lhs loads the plugin, then the keypress is fed back so its own mapping handles
   -- it. Dependencies load first.
   {
-    "nxvim/nx-files",
+    "bemtvi/btv-files",
     keys = { "<leader>ff" },
-    dependencies = { "nxvim/nx-async-utils" },
+    dependencies = { "bemtvi/btv-async-utils" },
     config = function()
-      require("nx-files").setup({})
+      require("btv-files").setup({})
     end,
     enabled = false,
   },
@@ -103,7 +103,7 @@ nx.plugins({
   -- Pin to a tag (or `commit = "<sha>"`): a pinned plugin is cloned at that ref and
   -- never auto-updated by :PluginUpdate.
   {
-    "davidrios/nx-statusline-extras",
+    "davidrios/btv-statusline-extras",
     tag = "v0.1.0",
     enabled = false, -- illustrative; flip on to actually fetch it
   },
@@ -117,9 +117,9 @@ nx.plugins({
 
 -- ----- First-run recommended set (for a distribution / starter config) --------
 --
--- Register a curated set with nx.plugins.recommend{}. On a FRESH setup — the user
--- has declared no plugins of their own and hasn't been asked before — nxvim opens a
--- WELCOME checklist at startup (VimEnter): nxvim ships minimal, and the recommended
+-- Register a curated set with btv.plugins.recommend{}. On a FRESH setup — the user
+-- has declared no plugins of their own and hasn't been asked before — bemtvi opens a
+-- WELCOME checklist at startup (VimEnter): bemtvi ships minimal, and the recommended
 -- set is presented pre-ticked so the user can untick anything they don't want
 -- (<Space> toggle · a all · <CR> install · <Esc> skip). The chosen subset is written
 -- to the user's config (a managed lua/plugins.lua that init.lua requires) and
@@ -131,8 +131,8 @@ nx.plugins({
 --
 -- `desc` is a short blurb shown next to each item in the first-run welcome checklist.
 --
--- nx.plugins.recommend({
+-- btv.plugins.recommend({
 --   { "catppuccin/nvim", name = "catppuccin", desc = "Soothing pastel colorscheme",
 --     config = [[ vim.cmd("colorscheme catppuccin") ]] },
---   { "author/nx-files", desc = "Fuzzy file finder", keys = { "<leader>ff" } },
+--   { "author/btv-files", desc = "Fuzzy file finder", keys = { "<leader>ff" } },
 -- })

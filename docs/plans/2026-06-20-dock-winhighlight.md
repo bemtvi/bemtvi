@@ -5,15 +5,15 @@ Status: **COMPLETE** — all 6 phases done (2026-06-20). Phases 1–3 (parse/sto
 channel), phase 5 across **all three clients** — TUI (paint-tested), GUI
 (code-complete; pixels not agent-verifiable), web (Playwright-verified in headless
 Chromium on the real wasm edit-host) — and phase 6 (runnable
-`examples/dock-winhighlight/`, the `nx.wo.winhighlight` window-scope surface, and
-doc cleanup) are committed. `winhighlight` works end-to-end: `nx.dock.opt(side)` or
-`nx.wo`/`vim.wo` remaps per window; a dock paints like a VSCode sidebar.
+`examples/dock-winhighlight/`, the `btv.wo.winhighlight` window-scope surface, and
+doc cleanup) are committed. `winhighlight` works end-to-end: `btv.dock.opt(side)` or
+`btv.wo`/`vim.wo` remaps per window; a dock paints like a VSCode sidebar.
 
 ## Goal
 
-Make `nx.dock.opt(side).winhighlight = 'Normal:NormalSB,SignColumn:NormalSB,EndOfBuffer:Hidden'`
+Make `btv.dock.opt(side).winhighlight = 'Normal:NormalSB,SignColumn:NormalSB,EndOfBuffer:Hidden'`
 actually recolor that dock, replacing the current fail-loud stub
-(`crates/nxvim-core/src/editor/dock.rs:524`).
+(`crates/bemtvi-core/src/editor/dock.rs:524`).
 
 `winhighlight` is vim's per-window highlight **remap table**: a comma-separated
 list of `from:to` pairs. While rendering a window that has it set, every group
@@ -25,25 +25,25 @@ accepted silently** (vim-faithful — verified against `vendor/neovim`
 
 The setter surface is dock-only today, but the resolution machinery is identical
 for any window. We build the mechanism **per-window** (`WindowOptions`) and let
-docks be a thin shorthand over it, so `:set winhighlight` / `nx.wo` later is free.
+docks be a thin shorthand over it, so `:set winhighlight` / `btv.wo` later is free.
 
 ## Why this is more than a setter
 
 There is exactly **one global `Normal` background** today, resolved once in
-`chrome_styles()` (`crates/nxvim-server/src/redraw.rs:925`) and painted
-client-side from a single `view.normal` style (`crates/nxvim-tui/src/render.rs:67-73,903-910`).
+`chrome_styles()` (`crates/bemtvi-server/src/redraw.rs:925`) and painted
+client-side from a single `view.normal` style (`crates/bemtvi-tui/src/render.rs:67-73,903-910`).
 Nothing per-window crosses the wire. `winhighlight` forces highlight resolution to
 become **window-aware** at every site that resolves a group name *for a window*:
 
 - the window background (`Normal` / `NormalFloat`),
 - gutter groups (`LineNr`, `CursorLineNr`, `SignColumn`, `FoldColumn`),
 - `CursorLine`, `EndOfBuffer`,
-- treesitter captures (`highlights_for`, `crates/nxvim-server/src/treesitter.rs:273`),
+- treesitter captures (`highlights_for`, `crates/bemtvi-server/src/treesitter.rs:273`),
 - extmark / diagnostic / decor overlays (`overlay_highlights_for`).
 
 ## Approach: remap late, in the server projection layer (decided)
 
-Keep `nxvim-core/src/highlight.rs` **pure and window-agnostic** — `resolve` /
+Keep `bemtvi-core/src/highlight.rs` **pure and window-agnostic** — `resolve` /
 `resolve_capture` stay as-is. The remap is a small per-window table carried on
 `WindowView` and applied in the server's per-window projection via a
 `resolve_remapped(group, &winhl)` helper that rewrites the name (one level) before
@@ -51,8 +51,8 @@ calling the existing `highlights.resolve(...)`.
 
 Rejected alternatives:
 - *Remap inside the registry* (vim's hidden-namespace approach): would thread
-  window context into core's pure highlight layer — against `nxvim-core` staying
-  pure, and nxvim's namespaces are an extmark concept, not a window one.
+  window context into core's pure highlight layer — against `bemtvi-core` staying
+  pure, and bemtvi's namespaces are an extmark concept, not a window one.
 - *Dock-only chrome map* (`dock_left_normal` keys): blocks per-window
   `winhighlight` later and special-cases docks the layer-swap model deliberately
   avoids.
@@ -64,7 +64,7 @@ projection layer, not the editing layer.
 ## Phase 1 — Parse + store (no rendering change yet)
 
 Add `winhighlight: String` to `WindowOptions` and to `DockOptions`
-(`crates/nxvim-core/src/options.rs:584`). Replace the fail-loud arm at
+(`crates/bemtvi-core/src/options.rs:584`). Replace the fail-loud arm at
 `dock.rs:524` with a store into `dock_options[idx].winhighlight`, then
 `relayout()` (mirrors the `title` path).
 
@@ -75,13 +75,13 @@ dropped per vim — but `echo` a one-line warning so it isn't a *silent* drop
 unknown *group names*).
 
 **Verification:** a Lua test that sets `winhighlight`, reads it back through a new
-`nx._dock_opts`-style accessor, and confirms the parsed pairs. No redraw assertion
+`btv._dock_opts`-style accessor, and confirms the parsed pairs. No redraw assertion
 yet. The existing `dock_winhighlight_is_reported_not_silently_ignored` test
 (`tests/dock.rs:913`) is **deleted/inverted here** — it asserts the old stub.
 
 ## Phase 2 — Carry the remap onto `WindowView`
 
-Add the parsed remap to `WindowView` (`crates/nxvim-core/src/view.rs`), populated
+Add the parsed remap to `WindowView` (`crates/bemtvi-core/src/view.rs`), populated
 in `window_view()` from the window's `WindowOptions.winhighlight`, falling back to
 the dock's `DockOptions.winhighlight` for windows in a dock region (`region` is
 already computed there). Same plumbing shape as the existing `region` field.
@@ -151,7 +151,7 @@ from the main area's and resolves to `NormalSB`'s color.
 The per-window background only renders once each client prefers the window's
 `normal` over the global one:
 
-- **TUI** — `window_bg()` (`crates/nxvim-tui/src/render.rs:67`) takes the
+- **TUI** — `window_bg()` (`crates/bemtvi-tui/src/render.rs:67`) takes the
   per-window style, falling back to `view.normal`. Straightforward.
 - **GUI** (wgpu) — same per-window background wiring or it diverges from TUI.
 - **web** (wasm `EditHost`) — needs explicit attention: highlights were
@@ -163,14 +163,14 @@ The per-window background only renders once each client prefers the window's
 covers the wire). GUI is not screencapturable from the agent shell
 (`memory/gui-window-not-screencapturable-from-agent.md`) — confirm the pipeline
 runs clean and ask the user to eyeball pixels. Web is Playwright-driveable via the
-`window.__nxvim` hook.
+`window.__bemtvi` hook.
 
 ## Phase 6 — Example config + docs
 
 Ship a runnable `examples/dock-winhighlight/` (a left dock styled like a VSCode
 sidebar: `Normal:NormalSB`, dimmed `EndOfBuffer`), per the example-config
-convention. Update the `nx.dock` doc comment block in
-`crates/nxvim-lua/src/prelude/nx.lua` and drop the "not implemented" language in
+convention. Update the `btv.dock` doc comment block in
+`crates/bemtvi-lua/src/prelude/btv.lua` and drop the "not implemented" language in
 `dock.rs` / `ops.rs` / `install.rs`.
 
 ## Gotchas

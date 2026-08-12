@@ -1,4 +1,4 @@
--- A sample buffer for the nx.decor todo-keywords provider. Open it under the
+-- A sample buffer for the btv.decor todo-keywords provider. Open it under the
 -- example config and the keywords below colour by kind.
 
 local M = {}

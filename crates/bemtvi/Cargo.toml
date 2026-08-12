@@ -1,0 +1,51 @@
+[package]
+name = "bemtvi"
+description = "A modal, vim-style editor, written in Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bemtvi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+# Re-enable `native` explicitly (the workspace dep is `default-features = false`):
+# this binary depends on native-gated server items, so it must not rely on feature
+# unification from a `--workspace` build to turn `native` on.
+bemtvi-server = { workspace = true, features = ["native"] }
+# Direct dep for `--extract-lua-runtime` (prelude source + stdpath resolver).
+bemtvi-lua.workspace = true
+bemtvi-tui.workspace = true
+bemtvi-lsp.workspace = true
+# The `--test-plugin` runner drives an embedded server as an RPC client (the same
+# msgpack wire a UI uses), so the transport + value type are runtime deps, not just
+# test deps.
+bemtvi-rpc.workspace = true
+rmpv.workspace = true
+
+[dev-dependencies]
+ratatui.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-md.workspace = true
+serde_json.workspace = true
+# The integration tests speak the msgpack-RPC wire directly to drive the server.
+bemtvi-rpc.workspace = true
+# The screen/syntax/lsp tests build a `View` from a redraw and paint it.
+bemtvi-view.workspace = true
+rmpv.workspace = true
+# Shared black-box test harness (backend threaded via this crate's features).
+bemtvi-test-harness.workspace = true
+
+# `kill(2)` / `tcgetattr(3)` in the PTY e2e tests: killing the editor and then
+# inspecting the tty it left behind (`killing_the_editor_leaves_a_usable_terminal`).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

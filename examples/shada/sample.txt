@@ -1,10 +1,10 @@
-nxvim shada — cross-session state that survives a restart
+bemtvi shada — cross-session state that survives a restart
 =========================================================
 
 Run this file TWICE against a scratch state dir (see init.lua header):
 
-  XDG_STATE_HOME=/tmp/nxvim-shada-demo NXVIM_CONFIG=examples/shada \
-    cargo run -p nxvim -- examples/shada/sample.txt
+  XDG_STATE_HOME=/tmp/bemtvi-shada-demo BEMTVI_CONFIG=examples/shada \
+    cargo run -p bemtvi -- examples/shada/sample.txt
 
 needle in this haystack   <- :SeedShada pushes "needle" onto the / history
                              and drops global mark A on whatever line you ran it
@@ -21,6 +21,6 @@ SECOND session (same command — the state from session one is back):
   :ShadaShow    print whether register "a was restored
 
 Mid-session reconcile:
-  <space>r / :rshada    re-read the store — picks up another nxvim instance's
+  <space>r / :rshada    re-read the store — picks up another bemtvi instance's
                         state once that instance has exited (its file unlocks)
   :rshada!              overwrite a register you've already set this session

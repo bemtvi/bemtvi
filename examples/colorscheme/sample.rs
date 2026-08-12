@@ -1,4 +1,4 @@
-// A small Rust sample so `:colorscheme nxvim` has something colorful to paint:
+// A small Rust sample so `:colorscheme bemtvi` has something colorful to paint:
 // keywords, strings, numbers, types, and comments all get their One Dark hue.
 
 /// Greet someone by name, the classic way.
@@ -19,7 +19,7 @@ struct Config {
 fn main() {
     let cfg = Config { verbose: true, retries: 5 };
     if cfg.verbose {
-        print!("{}", greet("nxvim"));
+        print!("{}", greet("bemtvi"));
     }
     println!("retries = {}", cfg.retries);
 }

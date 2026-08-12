@@ -9,9 +9,9 @@ remote daemon's machine**, not the local client's disk. They are *fetched* over
 the daemon connection and *run locally* in the client's Lua VM — "fetched and
 loaded from the remote, run locally."
 
-Today this is the opposite. `run_edit_host_session` (`crates/nxvim/src/main.rs`)
-resolves `config_dir` + `runtimepath` via `nxvim_server::default_runtime()` — the
-**local** client's `$NXVIM_CONFIG` / `$XDG_CONFIG_HOME/nxvim` / `$HOME/.config/nxvim`
+Today this is the opposite. `run_edit_host_session` (`crates/bemtvi/src/main.rs`)
+resolves `config_dir` + `runtimepath` via `bemtvi_server::default_runtime()` — the
+**local** client's `$BEMTVI_CONFIG` / `$XDG_CONFIG_HOME/bemtvi` / `$HOME/.config/bemtvi`
 and its local `pack/*/start/*`. The seam comment is explicit: *"Config and the
 keystroke path stay local; only fs/process/watch/LSP cross to the daemon."* That
 is the line we are moving.
@@ -20,7 +20,7 @@ is the line we are moving.
 
 Startup sourcing (`source_init` / `source_plugins`) runs inside the async `run()`
 and *could* await the daemon. But Lua `require()`, `package.path`, and
-`get_runtime_file` (`crates/nxvim-lua/src/host.rs`) resolve files **synchronously
+`get_runtime_file` (`crates/bemtvi-lua/src/host.rs`) resolve files **synchronously
 inside Lua callbacks** — they cannot await, and blocking-over-async there hits the
 PUC-Lua `pcall`-yield trap. So we fetch the whole config surface up front, write it
 to a local cache, and point `config_dir` + `runtimepath` at the **local** copy.
@@ -33,7 +33,7 @@ then works unchanged against fetched files.
 - **Freshness:** re-fetch fresh on every connect (simple, always correct).
 - **Scope:** `config_dir` + everything reachable via `runtimepath`
   (`init.lua`, `pack/*/start/*`, `plugin/`, `after/plugin/`, `lua/` modules for
-  `require`). Runtime `nx.fs` / `vim.fn` file reads already route to the daemon via
+  `require`). Runtime `btv.fs` / `vim.fn` file reads already route to the daemon via
   the existing `fs_jobs` / `luafs` legs — out of scope here. Raw `io.*`/`os.*`
   redirection is explicitly out of scope.
 
@@ -41,7 +41,7 @@ then works unchanged against fetched files.
 
 "Reloading the whole editor under the remote environment" is handled by the
 **launch path**, not a live switch. When the process starts with a daemon target
-(`--connect-daemon` / `nxvim://` URI), the entire editor is *born* remote: the Lua
+(`--connect-daemon` / `bemtvi://` URI), the entire editor is *born* remote: the Lua
 VM (`LuaRuntime::new(runtimepath)`), `package.path`, config sourcing, plugin
 sourcing, and lifecycle all initialize against the remote-derived
 `config_dir`/`runtimepath`. There is no prior local editor to reload *from*, so no
@@ -67,8 +67,8 @@ writes the files under a local cache root, rebases `config_dir` + each
 `runtimepath` entry onto the cache, and feeds those local paths into `ServerInit`.
 
 ```
-remote /home/u/.config/nxvim/init.lua
-  →  $XDG_CACHE_HOME/nxvim/remote/<conn>/home/u/.config/nxvim/init.lua   (local)
+remote /home/u/.config/bemtvi/init.lua
+  →  $XDG_CACHE_HOME/bemtvi/remote/<conn>/home/u/.config/bemtvi/init.lua   (local)
 ```
 
 `require("foo")` → local `package.path` (seeded from the rebased runtimepath) →
@@ -86,8 +86,8 @@ tree-sitter compilation produces the parser objects in the local cache as usual.
 **Lazily install the remote's parser set (via Lua).** Skipping the binaries would leave
 a remote session without highlighting for languages the remote had set up. So
 `config_bundle` also carries the daemon's **installed parser language list**
-(`nxvim_ts::installed_parsers`). The server filters it to languages not already installed
-here and hands the rest to Lua — `nx._remote_ts_autoinstall(langs)` registers a `FileType`
+(`bemtvi_ts::installed_parsers`). The server filters it to languages not already installed
+here and hands the rest to Lua — `btv._remote_ts_autoinstall(langs)` registers a `FileType`
 autocmd that `:TSInstall`s a language the first time a buffer of that type opens (deduped
 per session). Dogfoods the public `FileType` + `:TSInstall` surface; the only Rust glue is
 `set_up_remote_ts_autoinstall` passing the list (`ServerInit.ts_autoinstall`) to Lua,
@@ -107,21 +107,21 @@ Each phase commits independently and pauses for review (repo cadence).
   unreadable roots (no silent empty bundle).
 - Client decoder + a `RemoteConfig { rpc }` handle on `DaemonClient` (reuses the
   fs-leg connection's `Rpc`), exposing `async fn fetch() -> RemoteConfigBundle`.
-- Test `crates/nxvim-server/tests/daemon_config.rs`: drive a daemon over an
-  in-process pipe with `NXVIM_CONFIG` pointed at a temp dir containing `init.lua`
+- Test `crates/bemtvi-server/tests/daemon_config.rs`: drive a daemon over an
+  in-process pipe with `BEMTVI_CONFIG` pointed at a temp dir containing `init.lua`
   + a `pack/*/start/*` plugin; assert the bundle returns both with correct
   roots/paths/bytes.
 
 ### Phase 2 — client materialize + rebase, wired into the session ✅ done
 
-- New `crates/nxvim-server/src/remote_config.rs` (server crate so it's reusable and
+- New `crates/bemtvi-server/src/remote_config.rs` (server crate so it's reusable and
   testable with the daemon harness): `materialize(bundle) -> (PathBuf, Vec<PathBuf>)`
-  — write files under `$XDG_CACHE_HOME/nxvim/remote/<conn>/…` (cleared fresh per
+  — write files under `$XDG_CACHE_HOME/bemtvi/remote/<conn>/…` (cleared fresh per
   connect), return the rebased local `config_dir` + `runtimepath`.
 - Wire into `run_edit_host_session` (`main.rs:567`): replace the local
   `default_runtime()` with `client.config.fetch().await` → `materialize(..)` →
   feed the rebased roots into `ServerInit`. Cover both the stdio split
-  (`run_with_daemon`) and QUIC (`run_with_daemon_quic`), and the `nx_eval` path if
+  (`run_with_daemon`) and QUIC (`run_with_daemon_quic`), and the `btv_eval` path if
   it also runs over a daemon.
 - Test: materialize a synthetic bundle to a temp cache, assert the rebased
   `config_dir`/`runtimepath` resolve the right local files.
@@ -152,26 +152,26 @@ the roots at it" ports directly, with MEMFS as the cache.
   `decode_config_bundle_bytes(&[u8])` (rmpv) so the wasm side can reconstruct the bundle
   from raw msgpack. The native daemon client reuses the same decoder.
 - `EditHost::apply_remote_config(bundle)` (`#[cfg(not(native))]`, in `lib.rs`): materialize
-  into `/nxvim/remote` (MEMFS) via `materialize_remote_config_into`, seed the rebased
-  runtimepath into the VM (`LuaRuntime::add_runtimepath` — the typed twin of `nx._add_rtp`),
-  seed the daemon's cwd, register `nx._remote_ts_autoinstall`, then `source_init` +
+  into `/bemtvi/remote` (MEMFS) via `materialize_remote_config_into`, seed the rebased
+  runtimepath into the VM (`LuaRuntime::add_runtimepath` — the typed twin of `btv._add_rtp`),
+  seed the daemon's cwd, register `btv._remote_ts_autoinstall`, then `source_init` +
   `source_plugins` — the exact native order, over the staged FS.
 - FFI `eh_apply_remote_config(h, ptr, len)` + a `_eh_apply_remote_config` export.
 - `web/worker.mjs`: in a `?daemon=` session, fetch `config_bundle`, re-encode the reply to
   msgpack, hand the bytes to Rust, and **skip** the serverless OPFS config path (born
   remote). Shada stays local (out of scope, as on native).
-- Test `web/verify-remote-config.mjs`: a real `nxvim --daemon` with `NXVIM_CONFIG` on Node's
+- Test `web/verify-remote-config.mjs`: a real `bemtvi --daemon` with `BEMTVI_CONFIG` on Node's
   disk (unreadable by the page origin) ships an `init.lua` (sets an option), a `lua/` module
   (`require`d), and a `pack/*/start/*` plugin; the browser asserts all three took effect —
   proving config + plugins + `require` came from the daemon over WebTransport.
 
 ## Touch list
 
-- `crates/nxvim-server/src/daemon.rs` — `CONFIG_BUNDLE` constant, encode/decode,
+- `crates/bemtvi-server/src/daemon.rs` — `CONFIG_BUNDLE` constant, encode/decode,
   client `RemoteConfig` handle, `DaemonClient` field.
-- `crates/nxvim-server/src/lib.rs` — daemon-side handler in `run_daemon_io`.
-- `crates/nxvim-server/src/remote_config.rs` — new: materialize + rebase.
-- `crates/nxvim/src/main.rs` — `run_edit_host_session` fetch+materialize wiring.
+- `crates/bemtvi-server/src/lib.rs` — daemon-side handler in `run_daemon_io`.
+- `crates/bemtvi-server/src/remote_config.rs` — new: materialize + rebase.
+- `crates/bemtvi/src/main.rs` — `run_edit_host_session` fetch+materialize wiring.
 - Tests: `daemon_config.rs`, `remote_config` unit-ish via harness, an e2e suite.
 - `examples/remote-config/`.
 

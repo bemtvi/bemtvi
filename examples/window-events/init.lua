@@ -2,7 +2,7 @@
 -- Window lifecycle events — what fires when a window displays a buffer.
 --
 -- Run:
---   NXVIM_CONFIG=examples/window-events cargo run -p nxvim -- examples/window-events/sample.txt
+--   BEMTVI_CONFIG=examples/window-events cargo run -p bemtvi -- examples/window-events/sample.txt
 --
 -- Background: docs/autocmd-events.md, "Buffer lifecycle" and "Window, tab and
 -- editor lifecycle". The rules these sections demonstrate are neovim's, measured
@@ -31,12 +31,12 @@ for _, event in ipairs({
   "WinResized",
   "TabEnter",
 }) do
-  nx.on(event, function(a)
+  btv.on(event, function(a)
     log[#log + 1] = event .. "(" .. tail(a.file) .. ")"
   end)
 end
 
-nx.command("Events", function()
+btv.command("Events", function()
   print(#log == 0 and "no events" or table.concat(log, "  "))
   log = {}
 end)
@@ -119,7 +119,7 @@ end)
 -- own 'colorcolumn', cycling through a few positions, so you can see that the
 -- handler really ran once per window rather than once per file.
 --
--- `nx.wo` works here because the handler runs with the window that displayed as
+-- `btv.wo` works here because the handler runs with the window that displayed as
 -- the current one — the editor's focus does not move, but "current" inside the
 -- handler is that window, so per-window state lands where it belongs even for a
 -- window a session restore filled in the background.
@@ -127,9 +127,9 @@ end)
 -- That holds for the handler's synchronous run. If yours awaits something first,
 -- capture the window before the await and write through the explicit handle:
 --
---     nx.on("BufWinEnter", function()
---       local win = nx.win.current()
---       return some_async_thing():next(function() nx.wo[win].colorcolumn = "20" end)
+--     btv.on("BufWinEnter", function()
+--       local win = btv.win.current()
+--       return some_async_thing():next(function() btv.wo[win].colorcolumn = "20" end)
 --     end)
 --
 -- Type-this:  :vsplit sample.txt<CR>   then   :vsplit sample.txt<CR>
@@ -140,10 +140,10 @@ end)
 local columns = { "20", "40", "60" }
 local shown = 0
 
-nx.on("BufWinEnter", function(a)
+btv.on("BufWinEnter", function(a)
   if tail(a.file) ~= "sample.txt" then
     return
   end
   shown = shown + 1
-  nx.wo.colorcolumn = columns[(shown - 1) % #columns + 1]
+  btv.wo.colorcolumn = columns[(shown - 1) % #columns + 1]
 end)

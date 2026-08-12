@@ -2,18 +2,18 @@
 
 ## Context
 
-nxvim has no way to run a shell or interactive program inside the editor. This adds
+bemtvi has no way to run a shell or interactive program inside the editor. This adds
 a neovim-style `:terminal` — a PTY-backed buffer whose contents are driven by a live
 child process, with interactive input, ANSI/256-color rendering, scrollback, window-resize
 → PTY resize, and a *terminal-normal* mode for scrolling/yanking output. It works in the
-native clients (PTY local) **and** in the browser (PTY on the `nxvim --daemon`, over
+native clients (PTY local) **and** in the browser (PTY on the `bemtvi --daemon`, over
 WebTransport).
 
 The work follows the architecture's established split: a **native engine** (PTY transport +
-a vt100 terminal emulator + per-cell color projection) under a **thin `nx.terminal` Lua
+a vt100 terminal emulator + per-cell color projection) under a **thin `btv.terminal` Lua
 control surface** — the treesitter/LSP shape ([ADR 0001](../decisions/0001-native-engines-vendored-lua-apis.md),
 [ADR 0002](../decisions/0002-native-plugin-system.md): "native engine for editor behavior, a
-Lua scripting layer on top"). `nxvim-core` stays pure/synchronous.
+Lua scripting layer on top"). `bemtvi-core` stays pure/synchronous.
 
 ### A cleaner layering (key realization from the edit-host work)
 
@@ -32,9 +32,9 @@ So the emulator is transport-agnostic; only the leg that ships raw bytes differs
 This reuses what already exists rather than inventing machinery:
 
 1. **`portable-pty` (=0.9.0) + `vt100` (=0.16.2)** — already pinned in root `Cargo.toml`
-   (used today only by the e2e harness; see `crates/nxvim/tests/e2e.rs`).
+   (used today only by the e2e harness; see `crates/bemtvi/tests/e2e.rs`).
 2. **The `pending_*` core→server seam** (`take_pending_opens`/`saves`/… in
-   `crates/nxvim-server/src/effects.rs`, results re-entering via `inbound.rs`) — for the
+   `crates/bemtvi-server/src/effects.rs`, results re-entering via `inbound.rs`) — for the
    core→server terminal ops.
 3. **The redraw highlight model** — per-row spans `[start,end,group,style_id]` + a deduped
    `StyleTable` palette (`redraw.rs`/`treesitter.rs::highlights_for`). A terminal grid's
@@ -50,7 +50,7 @@ This reuses what already exists rather than inventing machinery:
 
 ```
 key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─┐
-:terminal (nx.terminal) ─▶ core: open_terminal ─▶ pending_terminal(Open) ─┤
+:terminal (btv.terminal) ─▶ core: open_terminal ─▶ pending_terminal(Open) ─┤
                                                                   ▼ drained in settle
                                   ┌──────────────── transport leg (per build) ────────────────┐
                                   │ native: TerminalManager (portable-pty Send actor)          │
@@ -62,7 +62,7 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
               redraw.rs: terminal buffer ⇒ grid cells → highlight spans + styles palette (shared)
 ```
 
-## Phase 1 — Core: mode, buffer type, input, outbound queue (`nxvim-core`, pure/sync)
+## Phase 1 — Core: mode, buffer type, input, outbound queue (`bemtvi-core`, pure/sync)
 
 - **`src/mode.rs`** — add `Mode::Terminal` (label `"TERMINAL"`, short code). Terminal-insert:
   keystrokes go to the child.
@@ -83,7 +83,7 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
     `<C-\><C-n>` → `Mode::Normal` (terminal-normal, read-only navigable); `i`/`a`/`A` re-enter
     `Mode::Terminal`. Mode transitions are intrinsic to the mode machine (like Insert), so core.
 
-## Phase 2 — Server-side vt100 engine, shared by native + wasm (`nxvim-server`, feature-agnostic)
+## Phase 2 — Server-side vt100 engine, shared by native + wasm (`bemtvi-server`, feature-agnostic)
 
 - **New module `src/terminal.rs`** — an `EditHost`-owned `HashMap<BufferId, TermEmu>` where
   `TermEmu { parser: vt100::Parser, scrollback, last_size }`. Compiles in **both** builds
@@ -95,7 +95,7 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   - (Verify exact `vt100` 0.16 API during impl — `Parser::new/process/screen/set_size`,
     `Screen::cell/cursor_position`, `Cell::fgcolor/bgcolor/bold/...`; e2e.rs shows the pattern.)
 
-## Phase 3 — Native PTY transport (`nxvim-server`, `#[cfg(feature = "native")]`)
+## Phase 3 — Native PTY transport (`bemtvi-server`, `#[cfg(feature = "native")]`)
 
 - **`src/terminal.rs` (native section)** — `TerminalManager`, a `Send` actor modeled on
   `EventLoop` (`evloop.rs`) / `LspManager`: own command channel + a `TermEvent` result channel,
@@ -112,7 +112,7 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   `editor.terminal_closed`. Resize: at redraw compare each terminal window's text rect to
   `last_size` and send `Resize` when it changed (server-side detection).
 
-## Phase 4 — Color projection (`nxvim-server/src/redraw.rs` + `treesitter.rs`, shared)
+## Phase 4 — Color projection (`bemtvi-server/src/redraw.rs` + `treesitter.rs`, shared)
 
 - In `highlights_for` (`treesitter.rs:103+`): if the buffer has a `TermEmu`, **skip treesitter**
   and project the grid — per row emit per-cell `(fg,bg,sp,attrs)` from `Cell`, coalescing adjacent
@@ -120,11 +120,11 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   `StyleTable`. No new wire fields; clients render via their existing styling path. Runs in both
   builds (the wasm redraw projection is the same `EditHost` code).
 
-## Phase 5 — Thin `nx.terminal` Lua control surface
+## Phase 5 — Thin `btv.terminal` Lua control surface
 
-- A bundled Lua control module (`nxvim-lua/src/prelude/`, exposed as `nx.terminal`) registers
-  **`:terminal` / `:term [cmd]`** and calls `nx.terminal.open(opts)`. Per "Lua queues, core
-  mutates", `nx.terminal.open` queues a Lua op drained in `effects.rs` into
+- A bundled Lua control module (`bemtvi-lua/src/prelude/`, exposed as `btv.terminal`) registers
+  **`:terminal` / `:term [cmd]`** and calls `btv.terminal.open(opts)`. Per "Lua queues, core
+  mutates", `btv.terminal.open` queues a Lua op drained in `effects.rs` into
   `Editor::open_terminal(argv, cwd)` (default shell from `$SHELL`/`%COMSPEC%` resolved
   server-side). `:terminal` routes through the existing unknown-cmd → `deferred_commands` →
   Lua-user-command path, so no core ex-command arm is needed. Mode keys stay intrinsic (Phase 1).
@@ -180,9 +180,9 @@ key (Terminal mode) ─▶ core: Key→bytes ─▶ pending_terminal(Send) ─�
   0.5s (release), buffer capped near 10k rows. `Editor::terminal_update` takes `(replace_from,
   tail)` and splices that region, enabling the screen-only-region rewrite on no-scroll frames.
 
-## Phase 7 — Web terminal over the daemon (`nxvim-edithost` + daemon, wasm-gated)
+## Phase 7 — Web terminal over the daemon (`bemtvi-edithost` + daemon, wasm-gated)
 
-Extends the Phase 6d proc leg into a **streaming** terminal leg. The daemon (`nxvim --daemon`,
+Extends the Phase 6d proc leg into a **streaming** terminal leg. The daemon (`bemtvi --daemon`,
 native) runs the real PTY via Phase 3's `TerminalManager`; the browser owns the vt100 emulation
 (Phase 2 `EditHost`, shared) and the rendering.
 
@@ -197,7 +197,7 @@ native) runs the real PTY via Phase 3's `TerminalManager`; the browser owns the 
   `eh_terminal_exit(buf, code)` call `host.terminal_feed` / `editor.terminal_closed` (the wasm
   twins of the native `on_term_events` arm). The async-park machinery must keep the reader live
   while a terminal is open (extend the `liveProcs`/`armedWatches` gate with `liveTerms`).
-- **Daemon (`nxvim-server`):** a `serve_terminal_daemon_on` analogous to `serve_proc_daemon_on`
+- **Daemon (`bemtvi-server`):** a `serve_terminal_daemon_on` analogous to `serve_proc_daemon_on`
   — the daemon's `TerminalManager` streams `Data`/`Exit` back as pushes and accepts
   write/resize/kill. (The daemon already runs the native engine from Phases 2–3.)
 - **Native gating:** non-web `:terminal` continues to use the local `TerminalManager`. The
@@ -224,12 +224,12 @@ native) runs the real PTY via Phase 3's `TerminalManager`; the browser owns the 
 ## Out of scope / deferred (note in code, no silent stubs)
 
 - Cursor-shape styling in the terminal cell, `TermOpen`/`TermClose` autocmds, `:terminal` split
-  flags, the public `nx.spawn`/`nx.terminal` API polish beyond the funnel. Windows conpty works
+  flags, the public `btv.spawn`/`btv.terminal` API polish beyond the funnel. Windows conpty works
   via portable-pty but is verified only on macOS/Linux here.
 
 ## Verification
 
-Black-box RPC integration tests (`crates/nxvim-server/tests/terminal.rs`, `#[cfg(feature =
+Black-box RPC integration tests (`crates/bemtvi-server/tests/terminal.rs`, `#[cfg(feature =
 "native")]`, POSIX commands for hermeticity; add a "poll `nvim_buf_get_lines` until expected /
 timeout" helper since PTY output is async — reuse the harness redraw-polling style, `serial_lock`):
 
@@ -243,10 +243,10 @@ timeout" helper since PTY output is async — reuse the harness redraw-polling s
   reachable and `G` returns to the live bottom.
 - **Mode/label**: `redraw` `mode_label == "TERMINAL"` in terminal-insert.
 
-Web (Phase 7): a headless-Chromium harness mirroring `web/verify-proc.mjs` (real `nxvim --daemon
+Web (Phase 7): a headless-Chromium harness mirroring `web/verify-proc.mjs` (real `bemtvi --daemon
 --listen` + WebTransport) — open a terminal, round-trip `printf` output to the rendered frame,
 echo `cat` input, and confirm a kill ends it.
 
-App run: `cargo run -p nxvim` → `:terminal` → interactive `ls`/resize/`<C-\><C-n>` scroll. Full
+App run: `cargo run -p bemtvi` → `:terminal` → interactive `ls`/resize/`<C-\><C-n>` scroll. Full
 suite `cargo test --workspace`; `cargo clippy --all-targets -- -D warnings`; `cargo fmt --all`.
-For the web build, `crates/nxvim-edithost/build.sh` + its verify harness.
+For the web build, `crates/bemtvi-edithost/build.sh` + its verify harness.

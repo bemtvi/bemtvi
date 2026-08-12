@@ -1,6 +1,6 @@
 # Multi-cursor mode
 
-A Helix/kakoune/Sublime-style multi-cursor, built on top of nxvim's vim grammar
+A Helix/kakoune/Sublime-style multi-cursor, built on top of bemtvi's vim grammar
 rather than replacing it. You drop several cursors, then every motion, operator,
 visual selection, and insert acts at all of them at once — `cw`, `x`, typing,
 `o`, `p`, even per-cursor visual mode.

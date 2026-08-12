@@ -8,12 +8,12 @@ against a real daemon's filesystem from the browser.
 Running gopls's *"Extract declarations to new file"* code action fails:
 
 ```
-nx.lsp: 'gopls.extract_to_new_file' failed: No such method workspace/applyEdit (jsonrpc error -32601)
+btv.lsp: 'gopls.extract_to_new_file' failed: No such method workspace/applyEdit (jsonrpc error -32601)
 ```
 
 The action is a bare `command`, so the editor dispatches `workspace/executeCommand`; the
 server then does the actual work by asking the *client* to apply a `WorkspaceEdit` —
-`workspace/applyEdit`, a **server→client request**. nxvim answers every unmodelled
+`workspace/applyEdit`, a **server→client request**. bemtvi answers every unmodelled
 server→client request with method-not-found (native, via `async-lsp`'s router default) or
 with a bare `null` (wasm `SyncLspClient`, which is worse: the server thinks it succeeded
 and the edit is silently dropped). Either way the refactor never lands.
@@ -62,7 +62,7 @@ and flattens the rest into an unordered `(Url, Vec<TextEdit>)` list.
    `applied: false` with a reason) since neither has an in-memory analogue; Phase 2 below
    implements them.
 
-One wrinkle the create path turned up: nxvim's rope always carries a trailing phantom
+One wrinkle the create path turned up: bemtvi's rope always carries a trailing phantom
 newline, so a "created" buffer is `"\n"` where the server's document model is `""`. Left
 alone, the paste inserts *before* the phantom and the new file ends with a spurious blank
 line. The fill's last edit consumes the phantom instead (`apply_workspace_edit`, guarded to
@@ -85,7 +85,7 @@ buffer cuts the declaration out of `main.go` and leaves `helper.go` holding exac
 ## Phase 2 — `rename` / `delete`
 
 Both move real bytes, which must work identically local / native-daemon / browser, so they
-ride an **editor-owned off-tick fs job**: the same `FsJob` seam `nx.fs` uses (native-bare →
+ride an **editor-owned off-tick fs job**: the same `FsJob` seam `btv.fs` uses (native-bare →
 the event-loop actor, native-daemon + wasm → the `luafs_op` leg, serverless → OPFS), queued
 through the ordinary `LoopOp::Fs` path under an id from `WORKSPACE_FS_JOB_BASE`. The two
 landing sites (native `LoopEvent::FsResult`, wasm `EditHost::fs_op_result`) classify by id
@@ -143,7 +143,7 @@ operation costs an extra round trip (an `ignoreIfExists` probe, or any daemon-se
 latency). They now run **one at a time, in order**: `queue_workspace_fs_job` appends to a
 FIFO with at most one in flight, and each landing starts the next.
 
-That is also what makes a failure strategy implementable, so nxvim now declares one:
+That is also what makes a failure strategy implementable, so bemtvi now declares one:
 
 - **`failureHandling: abort`.** When a change fails, the ones before it stay applied and
   the ones after it are dropped (`drop_workspace_group`), and the response carries
@@ -190,15 +190,15 @@ edit's earlier changes leave it.
 ## Phase 6 — nobody waits forever, and the edit is reachable from Lua
 
 1. **A watchdog over the file operations.** `workspace/applyEdit` is a *request*: the
-   server is blocked until nxvim answers, and Phase 2 made that answer wait for the
+   server is blocked until bemtvi answers, and Phase 2 made that answer wait for the
    `rename`/`delete`/`mkdir` to land. An fs leg that stops answering rather than
    erroring (a daemon link that goes quiet) therefore blocked the server *forever*.
    A one-shot timer — re-armed per dispatched operation, disarmed when the queue
    drains — fails the stalled operation through the ordinary result path, so it takes
    the same `abort` route a real error does. The reason is hedged (`ETIMEDOUT … it may
    still complete`) because giving up is not proof the operation failed. Default 30s,
-   `$NXVIM_WORKSPACE_FS_TIMEOUT_MS` for the test that drives the give-up path (a real
-   stall: an `nx.fs` job leg pointed at a duplex nobody serves).
+   `$BEMTVI_WORKSPACE_FS_TIMEOUT_MS` for the test that drives the give-up path (a real
+   stall: an `btv.fs` job leg pointed at a duplex nobody serves).
    Two smaller holes closed with it: a late result for an abandoned job is now
    swallowed by id (`on_workspace_fs_result` classifies on `WORKSPACE_FS_JOB_BASE`
    alone, as its doc always claimed) rather than handed to a Lua callback that never
@@ -207,11 +207,11 @@ edit's earlier changes leave it.
    exactly what a watchdog timer over these jobs would have ended. A server that exits
    mid-apply also drops its held-back response now, instead of leaving a record that
    can only be settled into the void.
-2. **The Lua entry existed but had no caller.** `nx._lsp_apply_workspace_edit` /
-   `nx._lsp_show_document` were wired end to end from Phase 7 of the LSP plan, yet
-   `vim.lsp.util` was never defined — so the example in `nx.lsp.commands`'s own
+2. **The Lua entry existed but had no caller.** `btv._lsp_apply_workspace_edit` /
+   `btv._lsp_show_document` were wired end to end from Phase 7 of the LSP plan, yet
+   `vim.lsp.util` was never defined — so the example in `btv.lsp.commands`'s own
    documentation (`vim.lsp.util.show_document(loc)`) errored on a nil table. Both are
-   now public as `nx.lsp.apply_workspace_edit` / `nx.lsp.show_document`, with the
+   now public as `btv.lsp.apply_workspace_edit` / `btv.lsp.show_document`, with the
    `vim.lsp.util.*` spellings aliased onto them. Resource operations work through this
    path exactly as through a server reply, which is what the new test asserts.
 
@@ -242,12 +242,12 @@ filesystem" as "there is nothing there".
 
 1. **`changeAnnotations`.** A server can split one edit into named groups and mark some
    of them `needsConfirmation` — the point being that the safe half of a refactor
-   applies while the half you should look at asks first. nxvim now carries them
+   applies while the half you should look at asks first. bemtvi now carries them
    (`WorkspaceEditData` gained the annotation map; every `WorkspaceChange` carries the
    id it was tagged with, and a document's edits split into runs when they are tagged
    differently, so a declined group takes only its own edits), advertises
-   `changeAnnotationSupport.groupsOnLabel`, and asks: one `nx.ui.confirm` per distinct
-   **label**, driven from Lua (`nx.lsp._confirm_edit`) because the confirm UI, its keys
+   `changeAnnotationSupport.groupsOnLabel`, and asks: one `btv.ui.confirm` per distinct
+   **label**, driven from Lua (`btv.lsp._confirm_edit`) because the confirm UI, its keys
    and its rendering already live there and work identically in every build. Nothing of
    the edit applies while the question is open, and a server-initiated
    `workspace/applyEdit` waits with it — the server asked whether its edit was applied,
@@ -258,7 +258,7 @@ filesystem" as "there is nothing there".
    One thing had to be fixed underneath: **`lsp-types` drops a text edit's
    `annotationId`.** Its `OneOf<TextEdit, AnnotatedTextEdit>` is `#[serde(untagged)]`
    and `TextEdit` accepts unknown fields, so an annotated edit deserializes as a plain
-   one *before* any nxvim code sees it — the confirm gate would have been dead on
+   one *before* any bemtvi code sees it — the confirm gate would have been dead on
    arrival, silently applying exactly the changes a server wanted a human to see. So
    normalization now runs on the **raw JSON** (`normalize_workspace_edit_value`), and
    every path that carries a `WorkspaceEdit` was rewired to keep it: the inbound
@@ -306,17 +306,17 @@ the server doesn't use.
    an abandoned apply and `settle_workspace_create` wrote the file out. The one abort
    path that cleaned up (the resolve-time one) did it inline; the cleanup moved into
    `drop_workspace_group`, where both paths get it.
-5. **`nx.lsp.apply_workspace_edit` read columns at an encoding it didn't document.** It
+5. **`btv.lsp.apply_workspace_edit` read columns at an encoding it didn't document.** It
    used the *current* buffer's first server's encoding (utf-8 when there is none) while
    the docstring promised the protocol's utf-16, so a utf-16 edit on a line with any
    multi-byte character landed wrong — and `vim.lsp.util.apply_workspace_edit(edit,
    encoding)` accepted and discarded the encoding neovim honors. It now takes
-   `opts.encoding`, defaulting to utf-16 like its sibling `nx.lsp.show_document`, and
+   `opts.encoding`, defaulting to utf-16 like its sibling `btv.lsp.show_document`, and
    the `vim.lsp.util` alias passes its positional argument through.
 
 Plus the remaining "waits forever" hole on the other side of Phase 6's watchdog: the
-confirm chain only answered on the happy path, so a rejected `nx.ui.confirm` parked the
-edit — and the server blocked on it — indefinitely. `nx.lsp._confirm_edit` now answers
+confirm chain only answered on the happy path, so a rejected `btv.ui.confirm` parked the
+edit — and the server blocked on it — indefinitely. `btv.lsp._confirm_edit` now answers
 once, whatever happens to the chain.
 
 And one piece of dead weight: Phase 8 moved every edit-carrying path to the raw shape,
@@ -374,7 +374,7 @@ And three smaller things the same read turned up:
   module is `#[cfg(not(feature = "native"))]`), a warning in the build that actually
   compiles it — the wasm-eligible one.
 - **`vim.lsp.util.show_document`'s third argument was discarded silently.** neovim's
-  `{ reuse_win, focus }`: nxvim's jump is always a focused `'switchbuf'`-aware one, so
+  `{ reuse_win, focus }`: bemtvi's jump is always a focused `'switchbuf'`-aware one, so
   `reuse_win` is the behavior anyway, but `focus = false` asks for something this path
   cannot do — and now says so rather than focusing regardless.
 
@@ -386,7 +386,7 @@ line that landed) in `lsp_offtick.rs`.
 
 ## Phase 11 — a `create` creates the file, and stops there
 
-Phase 3's deliberate deviation is reverted, at the user's call: nxvim now does what
+Phase 3's deliberate deviation is reverted, at the user's call: bemtvi now does what
 neovim does. A `create` resource operation puts the file on disk **empty**, and the
 content the edits after it put in its buffer stays there — modified, unsaved, yours to
 `:w` — exactly the in-memory contract every *other* change in a workspace edit gets. The
@@ -402,7 +402,7 @@ Phase 3 for the content write and now with no callers, is gone.
 
 Writing the placeholder ourselves means telling **both** change detectors that the write
 was ours, or each reports it straight back as an external change to a modified buffer — a
-W12 conflict over nxvim's own file:
+W12 conflict over bemtvi's own file:
 
 - **Locally**, re-snapshot the buffer's disk baseline (`Editor::restamp_disk_baseline`).
   It had none, never having been read, and that is load-bearing twice over: without it a

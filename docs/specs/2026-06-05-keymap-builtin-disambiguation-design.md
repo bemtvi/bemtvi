@@ -6,10 +6,10 @@
 `timeoutlen` idle flush (D4). Every multi-key built-in (`gg`, `dd`/`dw`,
 `f{char}`/`;`/`,`, `r{char}`, `diw`/`ciw`, and the visual / visual-line variants)
 now fires instantly under a colliding user-mapping prefix — no idle flush, no
-next key. The pure parser lives in `nxvim-core/src/editor.rs` (`parse_step` +
+next key. The pure parser lives in `bemtvi-core/src/editor.rs` (`parse_step` +
 `command_status`); the matcher consults it as a read-only oracle in
-`nxvim-server/src/keymap.rs`. Coverage is the disambiguation + edge-audit blocks
-in `crates/nxvim-server/tests/keymaps.rs`. Per-phase notes are inline below.
+`bemtvi-server/src/keymap.rs`. Coverage is the disambiguation + edge-audit blocks
+in `crates/bemtvi-server/tests/keymaps.rs`. Per-phase notes are inline below.
 
 **Sanity-checked against the code (2026-06-05).** The root cause, the cited line
 refs (`keymap.rs:323`, `:328-340`; `keymaps.rs:267`/`:246`), and the "8 pending
@@ -49,9 +49,9 @@ Typing `gg` does **not** jump to the top immediately — it resolves only on the
 *next* keystroke or after the `timeoutlen` idle flush. neovim has no such lag: `gg`
 is instant, and a key-hint popup shows `gg`, `gh`, … as peers under the `g` prefix.
 
-### Why nxvim lags (root cause)
+### Why bemtvi lags (root cause)
 
-The keymap engine (`crates/nxvim-server/src/keymap.rs`) is, by design **D1**,
+The keymap engine (`crates/bemtvi-server/src/keymap.rs`) is, by design **D1**,
 *editor-unaware*: its prefix trie holds only **user mappings** (`gh`). It does not
 know `gg` is a complete built-in. So:
 
@@ -63,7 +63,7 @@ know `gg` is a complete built-in. So:
 
 The editor receives only one `g`; the second waits for the next key or the flush.
 The existing test even encodes the limitation —
-`crates/nxvim-server/tests/keymaps.rs:267` feeds `"gg0"` with a comment admitting
+`crates/bemtvi-server/tests/keymaps.rs:267` feeds `"gg0"` with a comment admitting
 the `0` is there "to flush that buffered `g`."
 
 neovim never re-examines that trailing `g` alone, because it disambiguates against
@@ -81,7 +81,7 @@ editor instead of re-holding it as a speculative mapping prefix.
 ## Why unified (and not a separate oracle)
 
 A cheaper option is a second, standalone grammar function that mirrors the
-dispatcher. It works, but it has one fatal property **in this codebase**: nxvim
+dispatcher. It works, but it has one fatal property **in this codebase**: bemtvi
 uses **black-box integration tests only** (architecture.md → *Testing philosophy*;
 no unit tests, by rule). A standalone mirror is therefore never directly tested, so
 any divergence from the real dispatcher is a **silent failure** — a future
@@ -97,7 +97,7 @@ editor.rs refactor this requires is the correct cost to pay.
 
 ### Two non-negotiables (unchanged)
 
-1. **`nxvim-core` stays pure and synchronous.** The new parser is pure; no async,
+1. **`bemtvi-core` stays pure and synchronous.** The new parser is pure; no async,
    no I/O, no transport types. (Buffer mutation stays in the executor, as today.)
 2. **The matcher stays a pure function of its inputs.** It consults a **read-only**
    classifier — the pure `command_status` free function — but mutates nothing,
@@ -108,7 +108,7 @@ editor.rs refactor this requires is the correct cost to pay.
 
 ### The core split: parse → execute
 
-Today `Editor::handle_normal` (`crates/nxvim-core/src/editor.rs`) interleaves three
+Today `Editor::handle_normal` (`crates/bemtvi-core/src/editor.rs`) interleaves three
 things in one pass: it reads pending state (8 scattered fields — `count`,
 `op_count`, `operator`, `gpending`, `pending_replace`, `pending_textobject`,
 `pending_find`, plus search-operator state), *decides* whether a key extends /
@@ -317,7 +317,7 @@ Execute in order. Each ends green on `cargo test --workspace` +
 
 > **Landed (commit `refactor(core): Phase 1`).** `parse_step`, `PendingCommand`,
 > `Stage`, `ResolvedCommand`/`ParseStep`, and the typed `Motion`/`ObjectKind`/
-> `FindKind`/`NormalCmd` sub-enums are in `nxvim-core/src/editor.rs`. The 8
+> `FindKind`/`NormalCmd` sub-enums are in `bemtvi-core/src/editor.rs`. The 8
 > scattered pending fields are gone — one `PendingCommand` on `Editor`, with
 > `last_find` kept as cross-command memory. `handle_normal` is now a thin
 > `parse_step → execute` loop; `execute` dispatches on the typed `ResolvedCommand`
@@ -353,7 +353,7 @@ Execute in order. Each ends green on `cargo test --workspace` +
   field consolidation — as the real work and risk of Phase 1.
 
 **No new behavior.** The proof is the existing suite: **every** test in
-`crates/nxvim-server/tests/editing.rs` (and the rest of the workspace) stays green,
+`crates/bemtvi-server/tests/editing.rs` (and the rest of the workspace) stays green,
 unchanged. If the phase proves too large for one window, split operators into a
 follow-up via a strangler step (`parse_step` returns a `Fallthrough` for
 not-yet-migrated arms; `handle_normal` keeps the old path for those), then remove the
@@ -369,7 +369,7 @@ pending fields are gone; `parse_step` is the sole normal-mode decision point.
 > **Landed (commit `feat(keymap): Phase 2`).** `pub enum CommandStatus` +
 > `pub fn command_status(mode, &[Key])` (a fold over `parse_step`, reset-on-
 > `Complete`) are exported from the crate root. The matcher calls
-> `nxvim_core::command_status` **directly** (no injected closure — D1 holds because
+> `bemtvi_core::command_status` **directly** (no injected closure — D1 holds because
 > the call is pure). The break-path release rule is implemented as pinned in
 > *Matcher integration → Made precise*: `resolve_buffered` returns the raw-replayed
 > run (the raw-replay gate), and `feed_key` releases the trailing key to the editor
@@ -386,8 +386,8 @@ pending fields are gone; `parse_step` is the sole normal-mode decision point.
   as a thin fold over `parse_step`; export from the crate root.
 - Give the matcher access to `command_status`. **[refined] Simpler than the original
   plan:** `command_status` is a *pure free function* and `keymap.rs` already depends
-  on `nxvim_core` (it imports `parse_keys`, `Key`, `Mode`), so the matcher can call
-  `nxvim_core::command_status(mode, &keys)` **directly** — no `&dyn Fn`/trait
+  on `bemtvi_core` (it imports `parse_keys`, `Key`, `Mode`), so the matcher can call
+  `bemtvi_core::command_status(mode, &keys)` **directly** — no `&dyn Fn`/trait
   threaded through `feed`/`flush`/`feed_key`/`resolve_buffered`. A pure call touches
   no editor state, so D1 ("the engine never touches the editor") is intact; the
   injection the original sketched buys nothing here (there are no unit tests to mock

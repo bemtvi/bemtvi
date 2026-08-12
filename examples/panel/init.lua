@@ -1,13 +1,13 @@
--- ~~~ nxvim nx.panel playground: a transient, focus-grabbing bottom overlay ~~~
+-- ~~~ bemtvi btv.panel playground: a transient, focus-grabbing bottom overlay ~~~
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/panel \
---       cargo run -p nxvim -- examples/panel/sample.txt
+--     BEMTVI_CONFIG=examples/panel \
+--       cargo run -p bemtvi -- examples/panel/sample.txt
 --
--- `nx.panel` is the transient, input-grabbing bottom overlay — the surface the
+-- `btv.panel` is the transient, input-grabbing bottom overlay — the surface the
 -- built-in listings (`:messages`, `:registers`, `:ls`, `:marks`, …) ride. Unlike
--- `nx.view` (a *persistent* dockable sidebar), a panel is *modal*: opening it shrinks
+-- `btv.view` (a *persistent* dockable sidebar), a panel is *modal*: opening it shrinks
 -- the main window into the rows above and **locks focus** to the panel — `<C-w>`
 -- navigation is inert — until you dismiss it. Its content is an ordinary `nomodifiable`
 -- buffer, so you get everything a real buffer has: motions navigate, and selection /
@@ -27,34 +27,34 @@ local FRUITS = { "apple", "banana", "cherry", "date", "elderberry", "fig" }
 -- exactly like `:ls` / quickfix / the file explorer. The autocmd fires when the panel
 -- is opened with `filetype = "fruitpanel"`, and `args.buf` is the panel's buffer, so the
 -- `<CR>` map is buffer-local and never leaks to other buffers. `q` / `<Esc>` to close are
--- installed automatically by the built-in `nxpanel`/`nxlisting`/`nxbuffers` ftplugin — a
+-- installed automatically by the built-in `btvpanel`/`btvlisting`/`btvbuffers` ftplugin — a
 -- panel with its *own* filetype (like this one) opts out, so we add a close map too.
-nx.autocmd.create("FileType", {
+btv.autocmd.create("FileType", {
   pattern = "fruitpanel",
   callback = function(args)
-    nx.keymap.set("n", "<CR>", function()
-      local choice = tostring(nx.current_line())
-      nx.panel.close() -- a "choose" action: dismiss, then act on the picked line
-      nx.schedule(function()
+    btv.keymap.set("n", "<CR>", function()
+      local choice = tostring(btv.current_line())
+      btv.panel.close() -- a "choose" action: dismiss, then act on the picked line
+      btv.schedule(function()
         vim.notify("you chose: " .. choice)
       end)
     end, { buffer = args.buf, desc = "Choose fruit" })
 
-    nx.keymap.set("n", "q", nx.panel.close, { buffer = args.buf, desc = "Close panel" })
-    nx.keymap.set("n", "<Esc>", nx.panel.close, { buffer = args.buf, desc = "Close panel" })
+    btv.keymap.set("n", "q", btv.panel.close, { buffer = args.buf, desc = "Close panel" })
+    btv.keymap.set("n", "<Esc>", btv.panel.close, { buffer = args.buf, desc = "Close panel" })
   end,
 })
 
--- `<leader>p` mounts the panel. `nx.panel.open{ name?, lines, filetype?, height? }` creates
+-- `<leader>p` mounts the panel. `btv.panel.open{ name?, lines, filetype?, height? }` creates
 -- (or reuses, keyed by `name`) a read-only buffer holding `lines`, tags the filetype (which
 -- fires the autocmd above), and shows it in the focus-locked bottom overlay. The `name`
 -- makes it unique: re-opening replaces its content, and it shows up under `:lspanels`.
-nx.keymap.set("n", "<leader>p", function()
-  nx.panel.open({ name = "[Fruit]", lines = FRUITS, filetype = "fruitpanel", height = 8 })
+btv.keymap.set("n", "<leader>p", function()
+  btv.panel.open({ name = "[Fruit]", lines = FRUITS, filetype = "fruitpanel", height = 8 })
 end, { desc = "Open the fruit panel" })
 
 -- The built-in listings ride the very same mechanism — try `:messages`, `:ls`,
 -- `:registers`, `:marks`, and `:lspanels` to list the panels themselves (dismiss with `q`).
 -- Panel buffers are hidden from `:ls` (they're surfaces, not documents) and always open as
 -- panels — `:b [Fruit]` re-opens the panel rather than showing it in the main window.
-print("nx.panel example loaded — press <leader>p, or try :messages / :ls / :lspanels")
+print("btv.panel example loaded — press <leader>p, or try :messages / :ls / :lspanels")

@@ -15,12 +15,12 @@ This namespace is **not** the `--shada-namespace` workspace scope (which chooses
 remote. A plugin's data therefore follows the same store the rest of shada
 follows, with no extra wiring.
 
-## Surface (`nx.shada.plugin`)
+## Surface (`btv.shada.plugin`)
 
 ```lua
 -- Opt in: an isolated, persistent key/value store for THIS plugin. No argument —
 -- the namespace is ASSIGNED from where this code lives, not chosen.
-local store = nx.shada.plugin()
+local store = btv.shada.plugin()
 
 store:set("recent", { "a.txt", "b.txt" }) -- value: any JSON-able Lua value
 local recent = store:get("recent")        -- the table back, or nil
@@ -30,10 +30,10 @@ store:clear()                              -- drop every key in this namespace
 ```
 
 - Values are any JSON-encodable Lua value (table / string / number / bool /
-  nil), serialized with the same `lua_to_json` rule `nx.json.encode` uses.
+  nil), serialized with the same `lua_to_json` rule `btv.json.encode` uses.
 - **The namespace is assigned, not chosen.** It is derived from the calling
   chunk's source file → the runtimepath / plugin directory that contains it
-  (`debug.getinfo` + `nx._runtime_paths()`; the dir's basename is the namespace,
+  (`debug.getinfo` + `btv._runtime_paths()`; the dir's basename is the namespace,
   the user's config root maps to a reserved `user`). A plugin therefore can't name
   — and so can't read or clobber — another plugin's slice. Isolation from *core*
   shada is also structural (a separate redb table).
@@ -50,10 +50,10 @@ store:clear()                              -- drop every key in this namespace
 
 `PersistState` already carries non-core transport fields the edit-host
 fills/consumes (`session`). Plugin data is the same: a pure pass-through field
-that `nxvim-core` never reads or writes. The Lua runtime owns the live map; the
+that `bemtvi-core` never reads or writes. The Lua runtime owns the live map; the
 edit-host moves it in (load) and out (flush).
 
-### Data model (`nxvim-core/persist.rs`)
+### Data model (`bemtvi-core/persist.rs`)
 
 ```rust
 pub plugin_data: Vec<PluginNamespace>,   // new PersistState field
@@ -65,7 +65,7 @@ pub struct PluginEntry      { pub key: String, pub value: String }   // value = 
 `Editor::export_persist` sets it empty; `import_persist`/`apply_persist` ignore
 it (not editor state). It is a carrier only.
 
-### Store (`nxvim-server/shada.rs`)
+### Store (`bemtvi-server/shada.rs`)
 
 A new `plugin` table keyed `(namespace, key)` → msgpack `StoredPlugin { value,
 ts }`, mirroring `MARKS_FILE` exactly:
@@ -73,23 +73,23 @@ ts }`, mirroring `MARKS_FILE` exactly:
 - clear-then-rewrite this instance's rows in `write_state`, stamped `ts`;
 - `build_state` groups the merged rows back into `Vec<PluginNamespace>`.
 
-### Lua runtime (`nxvim-lua`)
+### Lua runtime (`bemtvi-lua`)
 
-`nxvim-lua` does **not** depend on `nxvim-core`, so the live map is a plain
+`bemtvi-lua` does **not** depend on `bemtvi-core`, so the live map is a plain
 `BTreeMap<String, BTreeMap<String, String>>` on `Shared`, and the accessors trade
 plain tuples (`Vec<(String, Vec<(String, String)>)>`), which the edit-host
 converts to/from the `PersistState` types.
 
-- `nx._shada_plugin_set(ns, key, value)` — `lua_to_json` → store the string.
-- `nx._shada_plugin_get(ns, key)` — stored string → `json_to_lua`, or nil.
-- `nx._shada_plugin_delete(ns, key)`, `_keys(ns)`, `_clear(ns)`.
-- `nx.shada.plugin(ns)` returns the method handle (built in `install.rs` beside
-  the existing `nx.shada.namespace` / `save_layout`).
+- `btv._shada_plugin_set(ns, key, value)` — `lua_to_json` → store the string.
+- `btv._shada_plugin_get(ns, key)` — stored string → `json_to_lua`, or nil.
+- `btv._shada_plugin_delete(ns, key)`, `_keys(ns)`, `_clear(ns)`.
+- `btv.shada.plugin(ns)` returns the method handle (built in `install.rs` beside
+  the existing `btv.shada.namespace` / `save_layout`).
 
 `LuaRuntime::plugin_shada_export()` / `plugin_shada_seed(data)` /
 `plugin_shada_merge(data, replace)` bridge the map to the edit-host.
 
-### Edit-host wiring (`nxvim-server/lib.rs`)
+### Edit-host wiring (`bemtvi-server/lib.rs`)
 
 - `shada_load`: take `state.plugin_data` out (like `session`) before
   `import_persist`, then `self.lua.plugin_shada_seed(plugin_data)`.
@@ -113,16 +113,16 @@ namespaces (a refinement over a chosen string — see below), the
 ## Assigned namespaces (refinement)
 
 A self-chosen namespace string makes isolation only cooperative — any code could
-claim any string. So `nx.shada.plugin()` takes **no argument** and the namespace is
+claim any string. So `btv.shada.plugin()` takes **no argument** and the namespace is
 *assigned* from where the calling code lives:
 
 - `caller_source()` walks the Lua stack to the nearest `@<path>` chunk (every
   config / plugin / `require`d file is sourced with one; the prelude and C frames
   aren't).
 - `assign_namespace(src)` attributes that path to the longest runtimepath entry
-  (`nx._runtime_paths()`) that contains it, then resolves the namespace in order:
+  (`btv._runtime_paths()`) that contains it, then resolves the namespace in order:
   the canonical **name the package manager registered** for that dir, when the plugin
-  was loaded through `nx.plugins` (`nx.plugins._namespace_for(dir)` — tightest
+  was loaded through `btv.plugins` (`btv.plugins._namespace_for(dir)` — tightest
   identity, since a `name = …` spec can differ from the dir basename); the reserved
   `user` for the config root (`stdpath("config")`); otherwise the dir's **basename**
   (a plugin loaded outside the manager, e.g. a `pack/*/start/*` dir).
@@ -133,12 +133,12 @@ claim any string. So `nx.shada.plugin()` takes **no argument** and the namespace
 
 Keying on *attribution success* (rather than "is there a source file" / "is the
 path absolute") is what makes this robust to both the synthetic exec chunk names
-and a relative `NXVIM_CONFIG`.
+and a relative `BEMTVI_CONFIG`.
 
 **Phase 3 — per-namespace size budget (done).** A namespace is capped at **1 MiB**
 (`PLUGIN_SHADA_BUDGET`, summed `key + serialized-value` bytes) so a runaway plugin
 can't bloat the shared store and slow every launch's recency-merge. Enforced
-fail-loud at write time in `nx._shada_plugin_set`: a `set` that would cross the cap
+fail-loud at write time in `btv._shada_plugin_set`: a `set` that would cross the cap
 *upward* raises (the prior value is left intact); a *shrink* is always allowed, so a
 plugin can recover from a legacy/merge-bloated namespace. Not enforced on load /
 `:rshada` merge (those carry existing data, which the shrink rule lets a plugin trim
@@ -147,13 +147,13 @@ down).
 **Phase 4 — lifecycle (done).** The store is now lifecycle-managed so plugin data
 doesn't outlive the plugin:
 
-- `nx.shada.namespaces()` (native `nx._shada_plugin_namespaces`) lists every
+- `btv.shada.namespaces()` (native `btv._shada_plugin_namespaces`) lists every
   non-empty stored namespace, sorted — an audit of what plugins have stowed. After a
   shada load the map holds *all* persisted namespaces, not just this session's
   openers, so the list is complete.
-- `nx.shada.forget(name)` prunes one namespace (over `nx._shada_plugin_clear`); it
+- `btv.shada.forget(name)` prunes one namespace (over `btv._shada_plugin_clear`); it
   stops being written at the next flush.
-- `nx.plugins.clean()` (`:PluginClean`) forgets a removed plugin's namespace as it
+- `btv.plugins.clean()` (`:PluginClean`) forgets a removed plugin's namespace as it
   prunes its directory: a managed plugin lives at `root()/<name>` and keys its store
   on that same `<name>`, so the directory name *is* the namespace to drop. Only the
   dirs `clean()` actively removes are forgotten (no blanket "undeclared" sweep — that
@@ -167,6 +167,6 @@ inline, but the wasm front goes through `EditHost::export_persist` /
 Those two methods now fold plugin shada out of / back into the Lua runtime, so the
 OPFS blob round-trips it exactly as the redb store does natively. (Native is
 unchanged — its inline harvest stays; the cfg-split keeps the two fronts' EditHost
-impls separate.) `web/verify-shada.mjs` gains a round-trip: `nx.shada.plugin():set`
+impls separate.) `web/verify-shada.mjs` gains a round-trip: `btv.shada.plugin():set`
 → flush to OPFS → reload the page (fresh Worker + editor) → `:get` returns the
 value; the value is also asserted present in the on-disk OPFS blob.

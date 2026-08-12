@@ -11,11 +11,11 @@ function M.setup()
   _G.beta_reads = {}
   _G.beta_filetypes = {}
 
-  nx.on("BufReadPost", {}, function(a)
+  btv.on("BufReadPost", {}, function(a)
     table.insert(_G.beta_reads, a.file)
   end)
 
-  nx.on("FileType", {}, function(a)
+  btv.on("FileType", {}, function(a)
     table.insert(_G.beta_filetypes, a.match)
   end)
 end

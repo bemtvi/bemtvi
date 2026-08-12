@@ -1,13 +1,13 @@
 # Testing plugins
 
-nxvim plugins are pure Lua over the `nx.*` API ([ADR 0002](decisions/0002-native-plugin-system.md)),
+bemtvi plugins are pure Lua over the `btv.*` API ([ADR 0002](decisions/0002-native-plugin-system.md)),
 so their tests are too. A plugin repo carries a `test/*_spec.lua` suite that drives
 a **real** editor — feeds vim keys, then asserts on the resulting buffer, cursor, or
-UI — run headlessly by **`nxvim --test-plugin`**. No mocks, no stubs: the same
-end-to-end philosophy as nxvim's own Rust black-box harness
-(`crates/nxvim-test-harness`), reachable from your plugin's own repo and CI.
+UI — run headlessly by **`bemtvi --test-plugin`**. No mocks, no stubs: the same
+end-to-end philosophy as bemtvi's own Rust black-box harness
+(`crates/bemtvi-test-harness`), reachable from your plugin's own repo and CI.
 
-The framework is **`nx.test`** — `describe` / `it` / `expect` with a small async
+The framework is **`btv.test`** — `describe` / `it` / `expect` with a small async
 context — shaped like a familiar BDD test runner (busted / Jest), so a spec reads
 the way you'd expect.
 
@@ -17,15 +17,15 @@ Put specs under `test/` in your plugin repo (each file must end `_spec.lua`):
 
 ```lua
 -- test/my_plugin_spec.lua
-nx.test.describe("my-plugin", function()
-  nx.test.before_each(function()
+btv.test.describe("my-plugin", function()
+  btv.test.before_each(function()
     require("my-plugin").setup({})
   end)
 
-  nx.test.it("inserts text", function(t)
+  btv.test.it("inserts text", function(t)
     t:feed("itext<Esc>")                          -- type in insert mode, then escape
-    nx.test.expect(t:lines()).to_equal({ "text" })
-    nx.test.expect(t:mode()).to_be("n")
+    btv.test.expect(t:lines()).to_equal({ "text" })
+    btv.test.expect(t:mode()).to_be("n")
   end)
 end)
 ```
@@ -33,8 +33,8 @@ end)
 Run it — defaults to the current directory:
 
 ```sh
-nxvim --test-plugin                 # runs ./test/**/*_spec.lua
-nxvim --test-plugin path/to/plugin  # or an explicit plugin dir
+bemtvi --test-plugin                 # runs ./test/**/*_spec.lua
+bemtvi --test-plugin path/to/plugin  # or an explicit plugin dir
 ```
 
 The runner boots an embedded editor with your plugin on the runtimepath (so
@@ -56,7 +56,7 @@ state mirrors refresh **before each Lua entry**. So a single synchronous chunk t
 feeds *then* reads would see stale state (the Rust harness uses a fresh RPC
 round-trip per assertion for exactly this reason).
 
-`nx.test` handles it for you: every `it` body runs inside an `nx.async` coroutine,
+`btv.test` handles it for you: every `it` body runs inside an `btv.async` coroutine,
 and the context's **driving methods await internally**. `t:feed(...)` queues the
 keys *and awaits one tick*, so by the next line the keys have drained and the reads
 are current. You write straight-line code; the awaits are under the hood.
@@ -66,10 +66,10 @@ debounced popup, a timer, a file watch — won't be ready on the next line; awai
 with `t:wait_for(predicate)`:
 
 ```lua
-nx.test.it("shows a debounced popup", function(t)
+btv.test.it("shows a debounced popup", function(t)
   t:feed("<Space>")
   local float = t:wait_for(function() return t:float() end)
-  nx.test.expect(float.text).to_contain("write")
+  btv.test.expect(float.text).to_contain("write")
 end)
 ```
 
@@ -79,14 +79,14 @@ end)
 
 | Call | Meaning |
 | --- | --- |
-| `nx.test.describe(name, fn)` | A group; nestable. |
-| `nx.test.it(name, fn)` | A test; `fn` receives the context `t`. |
-| `nx.test.before_each(fn)` / `after_each(fn)` | Hooks, resolved per test along the describe chain (order-independent, busted-style — a hook declared after an `it` in the same block still applies to it). |
+| `btv.test.describe(name, fn)` | A group; nestable. |
+| `btv.test.it(name, fn)` | A test; `fn` receives the context `t`. |
+| `btv.test.before_each(fn)` / `after_each(fn)` | Hooks, resolved per test along the describe chain (order-independent, busted-style — a hook declared after an `it` in the same block still applies to it). |
 
-### Assertions — `nx.test.expect(value)`
+### Assertions — `btv.test.expect(value)`
 
 Matchers are called with a dot; prefix any with `.never` to invert
-(`nx.test.expect(x).never.to_equal(y)`):
+(`btv.test.expect(x).never.to_equal(y)`):
 
 | Matcher | Passes when |
 | --- | --- |
@@ -125,26 +125,26 @@ Matchers are called with a dot; prefix any with `.never` to invert
 
 For plugins that touch the clipboard or the filesystem:
 
-- **`nx.test.clipboard.seed(text[, linewise])`** — put text on `"+` / `"*` as if an
-  external app set it. **`nx.test.clipboard.peek()`** → `text, linewise` (what a
-  plugin wrote). **`nx.test.clipboard.clear()`**.
-- **`nx.test.tempdir()`** — a fresh, already-created unique directory; pair with
-  `nx.fs` to exercise a plugin's file I/O without collisions.
+- **`btv.test.clipboard.seed(text[, linewise])`** — put text on `"+` / `"*` as if an
+  external app set it. **`btv.test.clipboard.peek()`** → `text, linewise` (what a
+  plugin wrote). **`btv.test.clipboard.clear()`**.
+- **`btv.test.tempdir()`** — a fresh, already-created unique directory; pair with
+  `btv.fs` to exercise a plugin's file I/O without collisions.
 
 ## A real example
 
-[`nxvim-keys-helper`](https://github.com/nxvim/nxvim-keys-helper) (the
+[`bemtvi-keys-helper`](https://github.com/bemtvi/bemtvi-keys-helper) (the
 first-party which-key) ships a real suite,
-[`test/popup_spec.lua`](https://github.com/nxvim/nxvim-keys-helper): it feeds a
+[`test/popup_spec.lua`](https://github.com/bemtvi/bemtvi-keys-helper): it feeds a
 leader prefix, `t:wait_for`s the debounced popup, and asserts on `t:float().text` —
 group names, leaf descriptions, the built-in `z` grammar, and close-on-abort. It is
 a compact model of a UI plugin tested entirely through its observable surface.
 
 ## Gating
 
-The whole surface is **off** in a normal editor session: `nx.test` is `nil` and the
-UI mirror it reads (`nx._ui`) is unpopulated. It is turned on only by the
-`--test-plugin` runner (via the `nx_enable_test_mode` RPC), so a config or plugin
+The whole surface is **off** in a normal editor session: `btv.test` is `nil` and the
+UI mirror it reads (`btv._ui`) is unpopulated. It is turned on only by the
+`--test-plugin` runner (via the `btv_enable_test_mode` RPC), so a config or plugin
 can't accidentally depend on the test API, and a normal session pays none of the
 per-redraw mirror cost.
 
@@ -154,8 +154,8 @@ per-redraw mirror cost.
 
 ## See also
 
-- [Writing nxvim plugins](plugin-authoring.md) — the anatomy a spec tests.
-- [Async & promises](async.md) — the `nx.async` / `t:wait_for` machinery the context
+- [Writing bemtvi plugins](plugin-authoring.md) — the anatomy a spec tests.
+- [Async & promises](async.md) — the `btv.async` / `t:wait_for` machinery the context
   is built on.
 - [Native plugin API design](specs/2026-06-11-native-plugin-api.md) — why plugins
   are pure Lua, hence testable as pure Lua.

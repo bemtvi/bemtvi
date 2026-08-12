@@ -5,8 +5,8 @@ target/
 **/target/
 .git/
 **/node_modules/
-crates/nxvim-web/pkg/
-crates/nxvim-web/dist/
+crates/bemtvi-web/pkg/
+crates/bemtvi-web/dist/
 **/*.wasm
 vendor/neovim/
 .basedpyright-src

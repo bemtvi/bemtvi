@@ -1,8 +1,8 @@
 # Extending the content float — persistence, edge placement, segment highlights
 
 **Status:** **proposed (2026-06-15).** Extends the list-less **content float**
-(`nx.ui.float`; the LSP hover / signature-help surface —
-[float-widget spec](../specs/2026-06-14-nx-ui-float-widget.md), "What stays out
+(`btv.ui.float`; the LSP hover / signature-help surface —
+[float-widget spec](../specs/2026-06-14-btv-ui-float-widget.md), "What stays out
 of this widget") from a fire-and-forget transient into a surface rich enough to
 back a **faithful native which-key plugin**, without disturbing the menu widget
 or the shared `FloatConfig` placement layer.
@@ -11,37 +11,37 @@ or the shared `FloatConfig` placement layer.
 
 A which-key-style popup (appears when you pause mid-key-sequence, lists the
 available continuations, dismisses or refreshes as keys arrive) is exactly the
-kind of feature that should be an `nx.*` Lua plugin (ADR 0002 — dogfood the
+kind of feature that should be an `btv.*` Lua plugin (ADR 0002 — dogfood the
 plugin API), and the observer primitives it needs already exist:
 
-- `nx.on_key(fn, ns)` — fires **before dispatch** for every key
-  (`crates/nxvim-server/src/input.rs:28`), so a plugin can rebuild the pending
+- `btv.on_key(fn, ns)` — fires **before dispatch** for every key
+  (`crates/bemtvi-server/src/input.rs:28`), so a plugin can rebuild the pending
   prefix itself.
-- `nx.keymap.get(mode)` — enumerates mappings with `lhs`/`rhs`/`desc`.
-- `nx.timer(fn, ms)` / `vim.defer_fn` — the `timeoutlen` delay.
+- `btv.keymap.get(mode)` — enumerates mappings with `lhs`/`rhs`/`desc`.
+- `btv.timer(fn, ms)` / `vim.defer_fn` — the `timeoutlen` delay.
 
 This is the modern (which-key v3) **observer** architecture: no input-grab, no
 blocking `getcharstr` read loop (which can't yield under PUC Lua anyway). The
-only gap is the **render surface**. `nx.ui.float` today is too constrained on
+only gap is the **render surface**. `btv.ui.float` today is too constrained on
 three axes:
 
 1. **Auto-dismiss.** The next key clears the float
-   (`crates/nxvim-core/src/editor/mod.rs:1431`). A which-key popup must persist
+   (`crates/bemtvi-core/src/editor/mod.rs:1431`). A which-key popup must persist
    while you keep typing the sequence.
 2. **Placement.** Only `relative = "cursor" | "editor"`
    (`MenuPlacement::{Cursor, Editor}`). which-key's signature look is a
    bottom-anchored bar.
 3. **Plain text only.** The client renders `Span::raw`
-   (`crates/nxvim-tui/src/render.rs:1934`); keys can't be colored distinctly
+   (`crates/bemtvi-tui/src/render.rs:1934`); keys can't be colored distinctly
    from their descriptions.
 
 All three live in the one pipeline:
 
 ```
-nx.ui.float(ui.lua) → UiFloatReq(ops.rs) → Editor::open_content_float(float.rs)
+btv.ui.float(ui.lua) → UiFloatReq(ops.rs) → Editor::open_content_float(float.rs)
   → ContentFloat(core) → ContentFloatView(view.rs)
-  → project_content_float(redraw.rs) → ContentFloatData(nxvim-view)
-  → render_content_float(nxvim-tui)
+  → project_content_float(redraw.rs) → ContentFloatData(bemtvi-view)
+  → render_content_float(bemtvi-tui)
 ```
 
 ## Non-goals
@@ -52,12 +52,12 @@ nx.ui.float(ui.lua) → UiFloatReq(ops.rs) → Editor::open_content_float(float.
   z-order, focus). One content float at a time remains the model; persistence
   just gives that single float an explicit lifetime instead of next-key death.
 - **Not** an input-grab. The float never steals keys; the plugin observes via
-  `nx.on_key` and the editor keeps dispatching normally.
+  `btv.on_key` and the editor keeps dispatching normally.
 
-## The extended `nx.ui.float` surface
+## The extended `btv.ui.float` surface
 
 ```lua
-local handle = nx.ui.float(contents, {
+local handle = btv.ui.float(contents, {
   relative   = "cursor" | "editor" | "bottom" | "top",  -- Phase 2 adds bottom/top
   border     = "rounded",        -- unchanged
   title      = "…",              -- unchanged
@@ -87,7 +87,7 @@ help / diagnostics are unaffected.
   that id; `:is_open()` reads a Lua-side flag cleared on close. Non-persistent
   path unchanged.
 - **Bridge (`ops.rs` / `install.rs` / `runtime.rs`)** — `UiFloatReq` carries
-  `id: u64` (0 = transient) and a `close: bool` op; add `nx._ui_float_close(id)`.
+  `id: u64` (0 = transient) and a `close: bool` op; add `btv._ui_float_close(id)`.
   Keep a single ordered `ui_floats` queue so open-then-close within one chunk
   preserves order.
 - **Core (`editor/float.rs`, `editor/mod.rs`)** — `ContentFloat` gains
@@ -123,9 +123,9 @@ help / diagnostics are unaffected.
 
 ### Phase 4 — `examples/which-key/`  *(dogfood + end-to-end verify)*
 
-- A native `nx.*` plugin driven by the **`KeyPending` event** (below), not a key
+- A native `btv.*` plugin driven by the **`KeyPending` event** (below), not a key
   observer: each event carries `{ mode, keys, continuations }`; the plugin
-  debounces with `nx.debounce` (its show-delay policy) and renders the
+  debounces with `btv.debounce` (its show-delay policy) and renders the
   persistent, bottom-anchored, highlighted float; an empty payload (prefix
   resolved / cleared) closes it.
 - Ship a runnable `examples/which-key/` config + sample, verified end-to-end
@@ -133,7 +133,7 @@ help / diagnostics are unaffected.
 
 ## The pending-key event (the oracle) — design decisions (2026-06-15)
 
-> **Source A LANDED (2026-06-16).** `nx.on_key_pending(fn)` ships the
+> **Source A LANDED (2026-06-16).** `btv.on_key_pending(fn)` ships the
 > engine-computed `KeyPending` signal over the **mapped-prefix trie** (user +
 > native-default maps): the server computes the pending context once per input
 > batch (`Keymaps::pending_context`), fires on *change* (a server-side
@@ -143,8 +143,8 @@ help / diagnostics are unaffected.
 > and distinguish a completing `map` from a `group` that only leads deeper; a
 > *cleared* context is `keys = ""` so a popup closes. The emit is gated on a
 > registered listener (no which-key ⇒ no trie walk, no re-entry), drained inside the
-> `run_pending` fixpoint next to `nx.decor` so a handler that opens a float settles
-> in the same tick. Tests: `crates/nxvim-server/tests/key_pending.rs`.
+> `run_pending` fixpoint next to `btv.decor` so a handler that opens a float settles
+> in the same tick. Tests: `crates/bemtvi-server/tests/key_pending.rs`.
 > **Still source A only** — the built-in command grammar (B) and active-widget key
 > tables (C) below are the follow-up; the mapped-prefix (leader-key) which-key is
 > what A unblocks.
@@ -156,14 +156,14 @@ shape, after working it through:
 - **Push, not pull.** A `KeyPending` event fires whenever the pending key-context
   **changes** (a prefix grows, or clears), carrying `{ mode, keys,
   continuations }` where each continuation is `{ key, desc, kind = map|group }`.
-  No standalone `nx.keymap.pending()` query for now (YAGNI — add later if a
+  No standalone `btv.keymap.pending()` query for now (YAGNI — add later if a
   statusline/showcmd wants on-demand reads).
 - **Fires immediately; the plugin debounces.** The engine pushes on every
   pending-change with no built-in delay — show-delay is UI policy, kept in Lua
-  via `nx.debounce`. This also dissolves the "close on timeout" problem: the
+  via `btv.debounce`. This also dissolves the "close on timeout" problem: the
   idle-flush clearing the prefix just emits an empty `KeyPending`, so the popup
   closes with no re-polling.
-- **`nx.on_key` is removed.** The per-keystroke Lua observer had zero consumers,
+- **`btv.on_key` is removed.** The per-keystroke Lua observer had zero consumers,
   wasn't in the ADR 0002 whitelist, and contradicted rule 4 (*no per-keystroke
   Lua*). Its only legitimate solo use (keystroke-cast overlays) is re-addable
   later as a narrow `KeyPressed` event if ever needed. which-key + showcmd-class
@@ -174,9 +174,9 @@ shape, after working it through:
   `handle_picker_key`; the `<C-r>` register case). `KeyPending` must fire from the
   union of these, not the matcher alone, to match real which-key coverage.
 
-A general **`nx.utils.debounce(fn, ms)`** helper (trailing-edge, with `:cancel()`
-/ `:flush()`) lands alongside this in the new **`nx.utils`** namespace — the home
-for generally-useful helpers the `nx.*` surface exposes to plugin authors, not a
+A general **`btv.utils.debounce(fn, ms)`** helper (trailing-edge, with `:cancel()`
+/ `:flush()`) lands alongside this in the new **`btv.utils`** namespace — the home
+for generally-useful helpers the `btv.*` surface exposes to plugin authors, not a
 which-key private.
 
 ## Testing (black-box, per the no-unit-test rule)

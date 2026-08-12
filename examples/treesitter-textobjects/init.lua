@@ -1,12 +1,12 @@
--- ~~~ nxvim tree-sitter text objects: select by syntax (vif, vaf, dia, …) ~~~
+-- ~~~ bemtvi tree-sitter text objects: select by syntax (vif, vaf, dia, …) ~~~
 --
 -- Run it (from the repo root) against the sample file:
 --
---     NXVIM_CONFIG=examples/treesitter-textobjects \
---       cargo run -p nxvim -- examples/treesitter-textobjects/sample.rs
+--     BEMTVI_CONFIG=examples/treesitter-textobjects \
+--       cargo run -p bemtvi -- examples/treesitter-textobjects/sample.rs
 --
 -- A *text object* is a region you name after an operator or in visual mode: `diw`
--- deletes a word, `ci"` changes inside quotes. nxvim adds **tree-sitter** objects
+-- deletes a word, `ci"` changes inside quotes. bemtvi adds **tree-sitter** objects
 -- that name a region by its place in the *syntax tree* instead of by punctuation —
 -- so you can select a whole function, an argument, a comment, or a type no matter
 -- how it is bracketed or spaced. As with every text object, `i` means *inside* and
@@ -51,12 +51,12 @@ vim.o.cursorline = true
 --------------------------------------------------------------------------------
 -- CUSTOM objects: bind more of what the grammar already captures. The Rust query
 -- (like most languages') also tags loops, calls, blocks, conditionals, and returns
--- — `nx.textobject.map` gives them keys. `i`/`a` stays the introducer; the capture
--- is used *verbatim*, so you choose the spelling (nxvim's `.inner`/`.outer`, or
+-- — `btv.textobject.map` gives them keys. `i`/`a` stays the introducer; the capture
+-- is used *verbatim*, so you choose the spelling (bemtvi's `.inner`/`.outer`, or
 -- Helix's `.inside`/`.around` if you drop Helix's `textobjects.scm` on the
 -- runtimepath, or any capture your own query defines).
 --------------------------------------------------------------------------------
-nx.textobject.map({
+btv.textobject.map({
   il = "@loop.inner",
   al = "@loop.outer", -- vil / val — inside / around a loop
   ik = "@call.inner",
@@ -66,7 +66,7 @@ nx.textobject.map({
 })
 -- Overriding a built-in key is allowed too, e.g. to follow Helix's naming after
 -- installing Helix's queries:
---   nx.textobject.map({ ["if"] = "@function.inside", ["af"] = "@function.around" })
+--   btv.textobject.map({ ["if"] = "@function.inside", ["af"] = "@function.around" })
 
 --------------------------------------------------------------------------------
 -- A convenience command to remind you of the keys while you experiment.
@@ -75,7 +75,7 @@ vim.api.nvim_create_user_command("TextObjects", function()
   vim.notify(
     "tree-sitter text objects — i=inside a=around:\n"
       .. "  built-in:  f function   a argument   c comment   t type\n"
-      .. "  custom:    l loop   k call   r return   (via nx.textobject.map)\n"
+      .. "  custom:    l loop   k call   r return   (via btv.textobject.map)\n"
       .. "try: vif  vaf  dia  cic  vit  2vif  vil  vak   (needs :TSInstall rust)"
   )
 end, {})
@@ -91,7 +91,7 @@ end, {})
 --   * Cursor on the `struct Point` block, `vit` → the type; `dat` → deletes it.
 --   * Cursor on a `//` comment line, `vic` / `dac` → the comment object.
 --   * Cursor in `total`'s for-loop, `vil` → inside the loop; `vak` on a call →
---     the whole call (both are CUSTOM objects mapped via nx.textobject.map above).
+--     the whole call (both are CUSTOM objects mapped via btv.textobject.map above).
 --   * Press `di` (or `vi`) and pause: the object menu lists the built-in f/a/c/t
 --     AND your custom l/k/r.
 --   * `:TextObjects` reprints the cheatsheet at any time.

@@ -1,6 +1,6 @@
--- ~~~ nxvim built-in diagnostic navigation: `]d`/`[d`, `]e`/`[e`, `<C-w>d` ~~~
+-- ~~~ bemtvi built-in diagnostic navigation: `]d`/`[d`, `]e`/`[e`, `<C-w>d` ~~~
 --
--- These keymaps ship in nxvim's CORE, exactly as in upstream neovim — you do NOT
+-- These keymaps ship in bemtvi's CORE, exactly as in upstream neovim — you do NOT
 -- bind them, they are always on:
 --
 --   ]d / [d   jump to the next / previous diagnostic (any severity)
@@ -8,19 +8,19 @@
 --   <C-w>d    show the diagnostics under the cursor in a float
 --             (<C-w><C-d> is the same)
 --
--- `]d`/`[d` and `]e`/`[e` are prelude default keymaps over `nx.diagnostic.goto_*`;
+-- `]d`/`[d` and `]e`/`[e` are prelude default keymaps over `btv.diagnostic.goto_*`;
 -- `<C-w>d` rides the native `<C-w>` window grammar. Being defaults, any of them can
--- be overridden (`nx.keymap.set("n", "]d", ...)`) or disabled (map it to an empty
+-- be overridden (`btv.keymap.set("n", "]d", ...)`) or disabled (map it to an empty
 -- function) in your own config.
 --
 -- This example needs no language server: it seeds a fixed set of diagnostics with
--- `nx.diagnostic.set` (the client-set surface — the same one a linter plugin uses)
+-- `btv.diagnostic.set` (the client-set surface — the same one a linter plugin uses)
 -- so you can try the motions immediately.
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/diagnostic-nav \
---       cargo run -p nxvim -- examples/diagnostic-nav/sample.txt
+--     BEMTVI_CONFIG=examples/diagnostic-nav \
+--       cargo run -p bemtvi -- examples/diagnostic-nav/sample.txt
 --
 -- Then press `]d` a few times to walk the diagnostics (it wraps at the end), `]e`
 -- to stop only on the errors, and `<C-w>d` while sitting on a flagged line to read
@@ -29,18 +29,18 @@
 --------------------------------------------------------------------------------
 -- Show the signs + inline messages so the seeded diagnostics are visible.
 --------------------------------------------------------------------------------
-nx.diagnostic.config({
+btv.diagnostic.config({
   signs = true, -- the gutter letters (E / W / I / H)
   underline = true, -- squiggles under the flagged span
   virtual_text = true, -- the end-of-line message
 })
 
 -- One namespace owns the demo diagnostics (a real plugin would use its own).
-local ns = nx.ns.create("diagnostic-nav-demo")
-local S = nx.diagnostic.severity
+local ns = btv.ns.create("diagnostic-nav-demo")
+local S = btv.diagnostic.severity
 
 -- The fixed "lint" result, keyed to `sample.txt`. `lnum`/`col` are 0-based; this
--- mirrors the shape an LSP server or a linter plugin hands `nx.diagnostic.set`.
+-- mirrors the shape an LSP server or a linter plugin hands `btv.diagnostic.set`.
 local DIAGS = {
   { lnum = 2, col = 2, message = "undefined function `prnit` (did you mean `print`?)", severity = S.ERROR },
   { lnum = 3, col = 9, message = "undefined variable `naem` (did you mean `name`?)", severity = S.ERROR },
@@ -53,9 +53,9 @@ local DIAGS = {
 
 -- Re-seed the diagnostics whenever the sample file is entered, so they survive a
 -- reload / buffer switch.
-nx.autocmd.create({ "BufReadPost", "BufEnter" }, {
+btv.autocmd.create({ "BufReadPost", "BufEnter" }, {
   pattern = "*sample.txt",
   callback = function(args)
-    nx.diagnostic.set(ns, args.buf, DIAGS)
+    btv.diagnostic.set(ns, args.buf, DIAGS)
   end,
 })

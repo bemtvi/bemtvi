@@ -22,24 +22,24 @@ snippet rows just need to carry a `doc`.
 
 ## What exists today (map)
 
-- `MenuItem` (`nxvim-core/src/editor/menu.rs:160`) carries `label`, `insert`,
+- `MenuItem` (`bemtvi-core/src/editor/menu.rs:160`) carries `label`, `insert`,
   `doc`, `resolve`, … but **no `kind`**.
 - `MenuGeom.rows` is `Vec<(String, Vec<Range>)>` (label + match spans); redraw
   projects `items` + `match_spans` only (`redraw.rs:1803`). `menu_marked_window`
   (`menu.rs:1705`) is the template for a parallel per-row accessor.
 - LSP already computes a numeric kind: `CompletionItemData.kind: u8` via
-  `kind_code` (`nxvim-lsp/src/convert.rs:189`) — but it is **dropped** in
-  `complete_lsp_push` (`nxvim-server/src/lsp/completion.rs:116`) because `MenuItem`
+  `kind_code` (`bemtvi-lsp/src/convert.rs:189`) — but it is **dropped** in
+  `complete_lsp_push` (`bemtvi-server/src/lsp/completion.rs:116`) because `MenuItem`
   has nowhere to put it.
 - Snippet rows built in `snippet.rs:58` with `doc: None`.
-- Lua source push contract: `nx._complete_push(gen, labels, inserts, docs, resolves,
+- Lua source push contract: `btv._complete_push(gen, labels, inserts, docs, resolves,
   accepts)` — 6 parallel arrays, decoded into `CompletePush` (`runtime.rs`),
   drained in `effects.rs:1196`. No kind slot.
 - Docs float: `sync_complete_docs_float` (`effects.rs:3323`) →
   `selected_complete_docs_md` (`effects.rs:3343`) reads `MenuItem.doc`, else LSP
   cache. Renders via `Editor::open_completion_docs_float`.
-- Clients paint rows from `MenuData.items` (`nxvim-view/src/view.rs:593`): TUI
-  `render_menu` (`nxvim-tui/src/render.rs:2710`), GUI (`nxvim-gui/src/render.rs:2657`).
+- Clients paint rows from `MenuData.items` (`bemtvi-view/src/view.rs:593`): TUI
+  `render_menu` (`bemtvi-tui/src/render.rs:2710`), GUI (`bemtvi-gui/src/render.rs:2657`).
   A retired `pmenu_row` (`gui/render.rs:3585`) already right-aligns a `detail`
   column — template for the kind column.
 
@@ -52,7 +52,7 @@ Deliver the visible win end-to-end for the two sources whose kind we know native
    picker, select) to set it — `None` everywhere except where a source knows it.
 2. **Core accessor**: add `menu_kinds_window(start, count) -> Vec<Option<String>>`
    next to `menu_marked_window` (`menu.rs:1705`), reading `all_items[item_at(i)].kind`.
-3. **LSP source**: add `kind_label(u8) -> Option<&'static str>` in `nxvim-lsp`
+3. **LSP source**: add `kind_label(u8) -> Option<&'static str>` in `bemtvi-lsp`
    (beside `kind_code`) mapping 1→"Text" … 25→"TypeParameter". Populate
    `MenuItem.kind` in `complete_lsp_push` from `item.kind`.
 4. **Snippets source**: `kind: Some("Snippet".into())` in `snippet.rs:58`.
@@ -62,24 +62,24 @@ Deliver the visible win end-to-end for the two sources whose kind we know native
 6. **Redraw**: project a `kinds` array parallel to `items`
    (`redraw.rs:1803`) — `Value::Nil` for a kind-less row.
 7. **Client mirror**: `MenuData.kinds: Vec<Option<String>>`
-   (`nxvim-view/src/view.rs`), parsed beside `items`.
+   (`bemtvi-view/src/view.rs`), parsed beside `items`.
 8. **Clients**: right-align the kind in `render_menu` (TUI + GUI), styled with a
    dim/`CmpItemKind`-ish group. Reuse the retired `pmenu_row` right-align logic.
    Widen the popup to fit `label + gap + kind`.
-9. **Tests**: `nxvim-server/tests/complete.rs` — assert the `kinds` array in the
+9. **Tests**: `bemtvi-server/tests/complete.rs` — assert the `kinds` array in the
    projected `menu` map (snippet row → `"Snippet"`, LSP row → `"Function"` via the
    mock, buffer row → nil). Mutation-check by breaking the mapping.
 
 ## Phase 2 — Lua source kind + snippet doc preview — ✅ DONE
 
-1. **Lua push contract**: add a `kinds` array to `nx._complete_push` and read
+1. **Lua push contract**: add a `kinds` array to `btv._complete_push` and read
    `item.kind` in `complete.lua`'s `push` (accept a string; default nil). Thread
    through `CompletePush` + the `effects.rs:1196` drain. Document the item shape.
 2. **Snippet doc preview**: populate `MenuItem.doc` on snippet rows
    (`snippet.rs:58`) with a rendered preview — a fenced code block of the snippet
    **body** (tabstops shown), optionally a description line. Flows through the
    existing `selected_complete_docs_md` → docs float with zero new plumbing.
-   - If we add an optional `description` to `SnippetEntry` / `nx.snippet.add`, show
+   - If we add an optional `description` to `SnippetEntry` / `btv.snippet.add`, show
      it above the body. (Stretch — keep to body-only if the API add is noisy.)
 3. **Tests**: Lua source kind round-trips to the `kinds` projection; snippet doc
    float opens with the body when a snippet row is selected.

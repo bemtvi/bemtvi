@@ -1,11 +1,11 @@
--- ~~~ nxvim keymap Phase 4 playground: the `timeoutlen` idle flush ~~~
+-- ~~~ bemtvi keymap Phase 4 playground: the `timeoutlen` idle flush ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/phase4-config \
---       cargo run -p nxvim -- examples/phase4-config/sample.txt
+--     BEMTVI_CONFIG=examples/phase4-config \
+--       cargo run -p bemtvi -- examples/phase4-config/sample.txt
 --
--- Phase 4 closes the "trailing-prefix lag" (design D4). nxvim's server has no
+-- Phase 4 closes the "trailing-prefix lag" (design D4). bemtvi's server has no
 -- input timer, so a key that is a *live prefix* of a mapping is withheld until
 -- the next keystroke. The TUI now arms a timeoutlen timer (~1s, vim's default)
 -- after each key and, on idle, nudges the server to resolve that withheld key —

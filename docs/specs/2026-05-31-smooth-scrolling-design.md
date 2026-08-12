@@ -5,7 +5,7 @@
 
 ## Goal
 
-Add neoscroll.nvim-style **animated jumps** to nxvim: the scroll commands
+Add neoscroll.nvim-style **animated jumps** to bemtvi: the scroll commands
 `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>` should *slide* the viewport over a short
 duration (~80–160ms) instead of teleporting. The final editor state is identical
 to today — only the visual transition is animated.
@@ -24,7 +24,7 @@ the client's local clock. The server stays authoritative and applies every scrol
 single `redraw`. The client renders the transition at its own native resolution.
 
 This was chosen over server-driven animation (server emitting a stream of
-intermediate frames) for two reasons that matter to nxvim's roadmap:
+intermediate frames) for two reasons that matter to bemtvi's roadmap:
 
 1. **Remote seamlessness.** Server-driven animation would send one notification
    per frame; over a laggy link they arrive bunched and janky. Client-driven
@@ -42,7 +42,7 @@ transient render content (the visible lines) every frame; this design merely
 and persists nothing across the animation beyond the frames it is drawing.
 
 Server-in-core timers were rejected outright: they would violate the
-`nxvim-core` "pure & synchronous" invariant the whole architecture rests on.
+`bemtvi-core` "pure & synchronous" invariant the whole architecture rests on.
 
 ## Protocol changes (the `View` / `redraw`)
 
@@ -81,7 +81,7 @@ The server's policy — *which* commands animate (only the four scroll commands)
 lives entirely server-side via the presence of the `scroll` flag. The client only
 decides *how* to render the transition.
 
-## Client animation loop (`nxvim-tui`)
+## Client animation loop (`bemtvi-tui`)
 
 The client's `tokio::select!` gains a third arm (an animation tick) and a small
 piece of animation state:
@@ -128,7 +128,7 @@ highlighting slides correctly too.
 
 ## Core & server changes
 
-**`nxvim-core` (`editor.rs`):**
+**`bemtvi-core` (`editor.rs`):**
 - New field `pending_scroll: Option<ScrollAnim>` (struct mirrors the protocol
   descriptor).
 - `scroll_half` / `scroll_page` snapshot `top` + `cursor.line` before moving, then
@@ -138,7 +138,7 @@ highlighting slides correctly too.
 - `duration_ms` = server-side function of distance, capped, e.g.
   `clamp(distance · 8, 80, 160)` ms. Hardcoded (no options system yet).
 
-**`nxvim-core` (`view.rs`):**
+**`bemtvi-core` (`view.rs`):**
 - `View` gains `base_line: usize` and `scroll: Option<ScrollAnim>`.
 - The line builder and `selection_spans` iterate `[base_line, base_line + window_len)`
   instead of `[top, top + height)` — a small change that reduces to today's
@@ -146,7 +146,7 @@ highlighting slides correctly too.
 - `Editor::view(&mut self, …)` clears `pending_scroll` after projecting, so the
   animation fires exactly once.
 
-**`nxvim-server` (`lib.rs`):** `redraw()` serializes `base_line` and `scroll` into
+**`bemtvi-server` (`lib.rs`):** `redraw()` serializes `base_line` and `scroll` into
 the notification map. Still one `redraw` per input; nothing else changes.
 
 ## Edge cases
@@ -165,7 +165,7 @@ The contract under test is **the protocol**, not the wall-clock animation — wh
 fits the project's black-box, no-unit-test rule (test functionality through the
 running server).
 
-Add to `crates/nxvim-server/tests/editing.rs` a small accessor for the last
+Add to `crates/bemtvi-server/tests/editing.rs` a small accessor for the last
 redraw's `scroll` / `base_line`, then assert:
 
 - `<C-d>` on a tall buffer → `scroll` present with correct

@@ -5,13 +5,13 @@
 > edit-host (`f93b21c`) — by a simpler route than the plan sketched (see that phase).
 > Registers, global + per-file marks (incl. `` `" `` last-cursor), search/ex history,
 > the jumplist, the changelist, and the numbered marks `'0`–`'9` all survive a restart
-> (native) and a page reload (web). Verified by `crates/nxvim-server/tests/shada.rs`
-> (native respawn/merge) and `crates/nxvim-edithost/web/verify-shada.mjs` (OPFS reload).
+> (native) and a page reload (web). Verified by `crates/bemtvi-server/tests/shada.rs`
+> (native respawn/merge) and `crates/bemtvi-edithost/web/verify-shada.mjs` (OPFS reload).
 > **Only Phase 7b (file-mark count caps, the `'100`-style newest-N-files cap) remains —
 > explicitly deferred, not a silent stub; file marks are currently uncapped.**
 
-Today nxvim keeps no state across sessions. Registers (`Registers`,
-`crates/nxvim-core/src/editor/registers.rs:34`), the global `A`–`Z` file marks
+Today bemtvi keeps no state across sessions. Registers (`Registers`,
+`crates/bemtvi-core/src/editor/registers.rs:34`), the global `A`–`Z` file marks
 (`global_marks`, `mod.rs:424`), per-buffer `a`–`z`/special marks
 (`Buffer.marks`), and the search/ex history (`search_history`/`ex_history`,
 `mod.rs:507`/`:511`) all die with the process. This plan adds neovim's **shada**
@@ -20,17 +20,17 @@ back on the next launch — so a yank in one session pastes in the next, `'A`
 still jumps to the file you marked, `` `" `` reopens a file at its last cursor,
 and `/` history survives.
 
-It is **not** a transliteration of neovim's `shada.c`. nxvim's topology is
+It is **not** a transliteration of neovim's `shada.c`. bemtvi's topology is
 different in two ways that change the right design, and we lean into both:
 
-1. **The daemon is long-lived.** A single `nxvim --server` outlives client
+1. **The daemon is long-lived.** A single `bemtvi --server` outlives client
    connections, so cross-session state already lives in one authoritative
    process between attaches. The on-disk file is for durability across daemon
    restart / reboot / crash — not, as in neovim, the *only* shared memory
    between otherwise-isolated short-lived processes.
 2. **There can be several writers.** Multiple editor servers may run on one
-   machine (several local `nxvim` instances; or, in the remote-SSH topology,
-   several `nxvim --server`s sharing one host's state dir). They must reconcile.
+   machine (several local `bemtvi` instances; or, in the remote-SSH topology,
+   several `bemtvi --server`s sharing one host's state dir). They must reconcile.
 
 We persist into a **per-instance [redb](https://docs.rs/redb) store** — pure-Rust,
 ACID, copy-on-write B-tree, single-file — and reconcile concurrent writers by a
@@ -168,28 +168,28 @@ Verified in the current tree before planning:
   `HostEffects` impl, not a rewrite.
 - **Core already does dependency injection for impure providers.** The syntax
   engine (`Option<Box<dyn SyntaxEngine>>`, `mod.rs`) and the clipboard
-  (`Option<Box<dyn Clipboard>>`, the registers plan) keep `nxvim-core` pure while
+  (`Option<Box<dyn Clipboard>>`, the registers plan) keep `bemtvi-core` pure while
   the server supplies the real implementation. Persistence follows the *same*
   pattern inverted: core exposes plain `export_persist`/`import_persist`
   accessors and the server owns every byte of I/O. No purity violation — serde
   *derives* on a plain struct are pure (no I/O), matching the "no I/O beyond
   `Buffer` read/write" rule.
 - **There is one clean quit point and a ready debounce mechanism.** The server's
-  `select!` loop checks `server.editor.should_quit` and emits `nxvim_exit`
-  (`crates/nxvim-server/src/lib.rs:819`, again `:883`) — the single place a final
+  `select!` loop checks `server.editor.should_quit` and emits `bemtvi_exit`
+  (`crates/bemtvi-server/src/lib.rs:819`, again `:883`) — the single place a final
   flush hooks in. The evloop actor already arms wall-clock timers
   (`LoopCommand::TimerStart { id, delay, repeat }`, `evloop.rs:38`) off the
   editor thread; the debounced background flush reuses that machinery rather than
   inventing a timer.
-- **`stdpath("state")` already resolves.** `crates/nxvim-lua/src/host.rs:190`
-  maps `state` → `$XDG_STATE_HOME/nxvim` (or `~/.local/state/nxvim`) — exactly
+- **`stdpath("state")` already resolves.** `crates/bemtvi-lua/src/host.rs:190`
+  maps `state` → `$XDG_STATE_HOME/bemtvi` (or `~/.local/state/bemtvi`) — exactly
   where neovim 0.10+ keeps shada (`stdpath('state')/shada/`). The store dir is a
   `shada/` subdir of that, no new path logic.
 - **serde + msgpack are already in the workspace.** `serde = "=1.0.228"` (with
   `derive`) and `rmpv = "=1.3.1"` are pinned in the root `Cargo.toml`. We add
   `redb` and `rmp-serde` (the serde↔msgpack bridge) as the only new exact-pinned
   deps, both pure-Rust (no C — keeps the cross-platform/wasm posture; note shada
-  is a *server* concern, so the wasm `nxvim-core` build never links redb anyway).
+  is a *server* concern, so the wasm `bemtvi-core` build never links redb anyway).
 
 ---
 
@@ -197,11 +197,11 @@ Verified in the current tree before planning:
 
 ### The snapshot type lives in core; all I/O lives in the server
 
-`nxvim-core` gains a small `persist` module of plain owned data — no redb, no
+`bemtvi-core` gains a small `persist` module of plain owned data — no redb, no
 serde-of-I/O, just the schema and the two accessors:
 
 ```rust
-// crates/nxvim-core/src/editor/persist.rs
+// crates/bemtvi-core/src/editor/persist.rs
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct PersistState {
     pub version: u32,                       // schema version, bumped on change
@@ -238,7 +238,7 @@ splits that no longer exist.
 **Changelist.** Core's changelist is *per-buffer* (`Buffer.changelist`), so it
 persists **per file**, keyed by path alongside that file's marks — restored when
 the file is reopened, the same lazy-by-path resolution. (Note: stock neovim does
-*not* put the changelist in shada; persisting it is an nxvim improvement, cheap
+*not* put the changelist in shada; persisting it is an bemtvi improvement, cheap
 because the data is already per-buffer owned state.)
 
 **Numbered marks `'0`–`'9` (the unlocked feature).** These have **no live core
@@ -255,7 +255,7 @@ exists is dropped on jump (the existing `E20`/`E37` path), a cursor past EOF is
 re-clamped by the canonical `set_cursor_char` — restoring never trusts the file
 blindly.
 
-### The store: `nxvim-server/src/shada.rs`
+### The store: `bemtvi-server/src/shada.rs`
 
 A server module, sibling to `save.rs`/`daemon.rs`, implementing the `ShadaStore`
 seam. It never holds the `!Send` editor; `load` hands a `PersistState` out,
@@ -337,7 +337,7 @@ Shada is **editor** state, so it lives wherever the editor (= the server) runs �
 **never on the daemon**:
 
 - **Local:** `stdpath("state")/shada/` on the local machine (redb-over-file).
-- **Edit-host split** (`nxvim --daemon` serves remote fs/proc, editor is local):
+- **Edit-host split** (`bemtvi --daemon` serves remote fs/proc, editor is local):
   **local** — consistent with the standing split-brain rule that editor state,
   plugins, and caches stay local while only *project*-facing fs routes remote. The
   marks' stored paths are remote-project paths, but the store is local.
@@ -418,12 +418,12 @@ host, is being removed, so there is no "shada on the remote host" case.)
    OPFS**, written via the existing off-tick write path — a single tab needs no
    multi-instance merge, so the redb B-tree + sibling recency-fold earn nothing here.
    Core gains an optional `serde` feature (derives only, dormant for the native build);
-   `nxvim-server` exposes `EditHost::export_persist`/`import_persist` pass-throughs; the
+   `bemtvi-server` exposes `EditHost::export_persist`/`import_persist` pass-throughs; the
    edit-host adds the `eh_export_shada` / `eh_load_shada` FFI and performs the same
    numbered-mark shift (`'0` ← last-exit cursor) on load that native's store does.
    `worker.mjs` restores the blob at boot and runs a debounced checkpoint + a
    flush-with-exit-cursor on tab hide; `index.html` wires `visibilitychange` + the
-   `__nxvim.shadaFlush` hook. The native `RedbFileStore` is unchanged. Verified by
+   `__bemtvi.shadaFlush` hook. The native `RedbFileStore` is unchanged. Verified by
    `verify-shada.mjs` (set registers + history → reload the page → assert they return
    from OPFS).
 7. **Phase 7a — `:wshada`/`:rshada` + the concurrent merge. ✅ DONE.** The explicit
@@ -445,7 +445,7 @@ host, is being removed, so there is no "shada on the remote host" case.)
    conflict semantics. History caps already ship (the `HISTORY_CAP` merge cap, Phase 3).
 7. **Phase 7b — file-mark count caps (newest-N files). DEFERRED (not yet built).**
    neovim's `'100`-style cap keeps marks for only the most-recently-*used* N files. That
-   needs a per-file **last-used timestamp** — but nxvim stamps every mark in a flush with
+   needs a per-file **last-used timestamp** — but bemtvi stamps every mark in a flush with
    the *same* `now_ms` (the write time, the merge key), so files marked in one session
    are indistinguishable and a cap test would be non-deterministic. Doing it right means
    teaching core to track per-buffer last-used time and carrying it through

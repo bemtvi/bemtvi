@@ -1,4 +1,4 @@
-nx.picker sample buffer
+btv.picker sample buffer
 =======================
 
 Open a picker with one of the leader maps (leader is "\"):

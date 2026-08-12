@@ -1,4 +1,4 @@
-nxvim mouse playground — every gesture below is server-hit-tested.
+bemtvi mouse playground — every gesture below is server-hit-tested.
 
 CLICK to place the cursor on any character on this line: the quick brown fox.
 DOUBLE-CLICK a word like marmalade or constellation to select just that word.

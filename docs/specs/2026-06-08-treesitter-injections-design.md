@@ -24,13 +24,13 @@ masks named children unless `injection.include-children` (`content_ranges`).
 own injections to `MAX_INJECTION_DEPTH`; the painter clips a layer's captures to
 its `ranges` (so a combined node spanning the gap paints only within them). A
 second fixture grammar, `tree-sitter-md`, drives cross-language / nested / combined
-tests. Tested in [`syntax.rs`](../../crates/nxvim/tests/syntax.rs) "injections
+tests. Tested in [`syntax.rs`](../../crates/bemtvi/tests/syntax.rs) "injections
 bridge, Phase 0/1/2/3" (markdown → rust fence, markdown → rust → rust nesting,
 `injection.self`, combined split-comment).
 *Phase 4* — the platform half needed no new plumbing: the snapshot parser binding
 already honors `set_included_ranges` and `LanguageTree.new` resolves its injection
 query via the bridge's `query.get`, so the vendored `LanguageTree:parse(true)`
-builds injected child trees over nxvim's snapshot. Verified end to end —
+builds injected child trees over bemtvi's snapshot. Verified end to end —
 `children()` / `language_for_range` / `get_node(…, ignore_injections=false)` resolve
 the injected language (`treesitter_lua.rs`), and a **drift oracle** asserts the
 engine's paint agrees with the vendored `_get_injections` for the same buffer
@@ -67,8 +67,8 @@ text as belonging to another grammar:
  (#set! injection.language "regex"))
 ```
 
-The native engine ([`nxvim-ts`](../../crates/nxvim-ts)) parses **one tree per
-buffer with one grammar** ([`engine.rs::BufferState`](../../crates/nxvim-ts/src/engine.rs)
+The native engine ([`bemtvi-ts`](../../crates/bemtvi-ts)) parses **one tree per
+buffer with one grammar** ([`engine.rs::BufferState`](../../crates/bemtvi-ts/src/engine.rs)
 holds a single `tree: Option<Tree>` and one `language: String`). It never runs the
 injection query, never spawns a child parser, and `extract_spans` runs only the
 host grammar's highlights query over that single tree. So every injected region is
@@ -77,7 +77,7 @@ one flat `@string`, the Lua in `vim.cmd[[…]]` is one flat string, a markdown c
 block is undifferentiated prose.
 
 The vendored Lua side already has the full machinery — `LanguageTree` in
-[`languagetree.lua`](../../crates/nxvim-lua/src/vendor/nvim/vim/treesitter/languagetree.lua)
+[`languagetree.lua`](../../crates/bemtvi-lua/src/vendor/nvim/vim/treesitter/languagetree.lua)
 has `_get_injections` / `_add_injections` / `set_included_regions` / child trees —
 but nothing drives it onto the paint, and (per the constraint below) it *can't* drive
 the synchronous redraw.
@@ -110,7 +110,7 @@ What the engine must port from neovim is **not** query merging (rejected in the
 query bridge for good reason — it drifts) but the much smaller, far more stable
 **injection directive vocabulary**: how to turn injection-query *captures* into
 `(language, ranges, combined?)`. That logic lives in
-[`languagetree.lua::_get_injections`](../../crates/nxvim-lua/src/vendor/nvim/vim/treesitter/languagetree.lua)
+[`languagetree.lua::_get_injections`](../../crates/bemtvi-lua/src/vendor/nvim/vim/treesitter/languagetree.lua)
 and is a fixed handful of directives — `injection.language`, `injection.content`,
 `injection.combined`, `injection.include-children`, `injection.self`,
 `injection.parent`, and the `@injection.<lang>` capture-name shorthand. Unlike the
@@ -141,7 +141,7 @@ Three structural additions to the engine:
 1. **A third pushed query name.** `injections` joins `highlights`/`indents` in
    `Engine::set_query` / `set_query_overlay` and in `Grammar` (a new
    `injections: Option<Query>` field). The buffer-open trigger
-   ([`treesitter.rs::resolve_ts_queries_for`](../../crates/nxvim-server/src/treesitter.rs))
+   ([`treesitter.rs::resolve_ts_queries_for`](../../crates/bemtvi-server/src/treesitter.rs))
    resolves `injections` too. **Phase 0**, and it's nearly free — the bridge
    plumbing already exists.
 
@@ -288,7 +288,7 @@ position, not just the root.
 
 The vendored `languagetree.lua` already implements `_get_injections` /
 `_add_injections` / child trees in pure Lua, over the snapshot primitives
-(`nx._create_ts_parser` & co.). The work here is plumbing the snapshot side so a
+(`btv._create_ts_parser` & co.). The work here is plumbing the snapshot side so a
 `LanguageTree:parse(true)` actually runs injections over the pushed snapshot and
 builds children — i.e. ensuring `included_ranges` / `set_included_regions` are honored
 by the primitive parser binding. This is independent of the engine's internal layers
@@ -306,12 +306,12 @@ the ported Rust directive logic and upstream's Lua is caught.
 
 | Concern | File | Change |
 | --- | --- | --- |
-| Third query name | [`loader.rs`](../../crates/nxvim-ts/src/loader.rs) | `Grammar.injections: Option<Query>`; load/compile it |
-| Push `injections` | [`engine.rs`](../../crates/nxvim-ts/src/engine.rs) | `set_query`/`set_query_overlay`/`recompile_query` accept `"injections"` |
-| Resolve at open | [`treesitter.rs`](../../crates/nxvim-server/src/treesitter.rs) | `resolve_ts_queries_for` iterates `injections` too |
-| Injection layers | [`engine.rs`](../../crates/nxvim-ts/src/engine.rs) | `BufferState` child layers; build after reparse; directive interpreter |
-| Layered paint | [`engine.rs`](../../crates/nxvim-ts/src/engine.rs) | `extract_spans` gathers host + child captures with layer rank |
-| Platform children | [`languagetree.lua`](../../crates/nxvim-lua/src/vendor/nvim/vim/treesitter/languagetree.lua) (driven via primitives) | honor `included_ranges` on the snapshot parser binding |
+| Third query name | [`loader.rs`](../../crates/bemtvi-ts/src/loader.rs) | `Grammar.injections: Option<Query>`; load/compile it |
+| Push `injections` | [`engine.rs`](../../crates/bemtvi-ts/src/engine.rs) | `set_query`/`set_query_overlay`/`recompile_query` accept `"injections"` |
+| Resolve at open | [`treesitter.rs`](../../crates/bemtvi-server/src/treesitter.rs) | `resolve_ts_queries_for` iterates `injections` too |
+| Injection layers | [`engine.rs`](../../crates/bemtvi-ts/src/engine.rs) | `BufferState` child layers; build after reparse; directive interpreter |
+| Layered paint | [`engine.rs`](../../crates/bemtvi-ts/src/engine.rs) | `extract_spans` gathers host + child captures with layer rank |
+| Platform children | [`languagetree.lua`](../../crates/bemtvi-lua/src/vendor/nvim/vim/treesitter/languagetree.lua) (driven via primitives) | honor `included_ranges` on the snapshot parser binding |
 
 No new RPC, no new effect: injections ride the **existing** `TsOp::SetQuery` effect
 and the existing buffer-open resolve path. The engine API surface gains only internal
@@ -341,7 +341,7 @@ now returning host + injected spans merged.
 Black-box, per [the conventions](../../CLAUDE.md): drive Lua / set up an on-disk
 `injections.scm`, then assert the redraw `highlights` payload shows injected captures
 the single-tree paint could not produce. Reuses the bridge suite's helpers in
-[`syntax.rs`](../../crates/nxvim/tests/syntax.rs) (`row0_has_group`,
+[`syntax.rs`](../../crates/bemtvi/tests/syntax.rs) (`row0_has_group`,
 `wait_for_highlights`, the `query_overlay_runtimepath` fixture).
 
 - **Phase 0:** `query.set('rust','injections', …)` and an on-disk `injections.scm`

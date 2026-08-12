@@ -1,12 +1,12 @@
--- ~~~ nxvim nx.ui.select playground: the floating selectable-list widget ~~~
+-- ~~~ bemtvi btv.ui.select playground: the floating selectable-list widget ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/ui-select \
---       cargo run -p nxvim -- examples/ui-select/sample.txt
+--     BEMTVI_CONFIG=examples/ui-select \
+--       cargo run -p bemtvi -- examples/ui-select/sample.txt
 --
--- `nx.ui.select(items, opts)` returns a PROMISE of the chosen item (nil on
--- cancel) — react with `:next(fn)`, or await it inside `nx.async`. The SERVER
+-- `btv.ui.select(items, opts)` returns a PROMISE of the chosen item (nil on
+-- cancel) — react with `:next(fn)`, or await it inside `btv.async`. The SERVER
 -- owns the widget: it floats a bordered list under the cursor, grabs every key,
 -- and resolves to one choice. Lua only renders the labels up front and reacts to
 -- the result — nothing blocks, no input loop runs in Lua (ADR 0002 / the
@@ -28,12 +28,12 @@
 --------------------------------------------------------------------------------
 vim.g.mapleader = "\\"
 
-nx.keymap.set("n", "<leader>p", function()
-  nx.ui.select({ "apple", "banana", "cherry" }, { prompt = "Pick a fruit:" }):next(function(item)
+btv.keymap.set("n", "<leader>p", function()
+  btv.ui.select({ "apple", "banana", "cherry" }, { prompt = "Pick a fruit:" }):next(function(item)
     if item == nil then
-      nx.notify("nothing picked (cancelled)")
+      btv.notify("nothing picked (cancelled)")
     else
-      nx.notify("picked " .. item)
+      btv.notify("picked " .. item)
     end
   end)
 end)
@@ -41,15 +41,15 @@ end)
 --------------------------------------------------------------------------------
 -- 2. <leader>c — choose a command to run.
 --    Shows that the resolved value can act on the editor: each entry carries a
---    command string, run via nx.cmd when chosen. TYPE:  \c  then pick one.
+--    command string, run via btv.cmd when chosen. TYPE:  \c  then pick one.
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "<leader>c", function()
+btv.keymap.set("n", "<leader>c", function()
   local actions = {
     { label = "Save file", cmd = "write" },
     { label = "Split window", cmd = "split" },
     { label = "Show messages", cmd = "messages" },
   }
-  nx.ui.select(actions, {
+  btv.ui.select(actions, {
     prompt = "Action:",
     -- format_item renders the display label; the promise still resolves to the
     -- ORIGINAL table, so the chosen entry's `cmd` round-trips even though only
@@ -59,7 +59,7 @@ nx.keymap.set("n", "<leader>c", function()
     end,
   }):next(function(choice)
     if choice then
-      nx.cmd(choice.cmd)
+      btv.cmd(choice.cmd)
     end
   end)
 end)
@@ -67,17 +67,17 @@ end)
 --------------------------------------------------------------------------------
 -- 3. A long list scrolls, AWAITED linearly. <leader>n opens twenty entries; the
 --    box caps its height and scrolls to keep the highlight visible as you j/k
---    through it. Here the chooser is awaited inside `nx.async` — `nx.await` of the
+--    through it. Here the chooser is awaited inside `btv.async` — `btv.await` of the
 --    select promise reads like a blocking read, but nothing blocks (the coroutine
 --    suspends and resumes when you confirm).
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "<leader>n", nx.async(function()
+btv.keymap.set("n", "<leader>n", btv.async(function()
   local nums = {}
   for i = 1, 20 do
     nums[i] = "line " .. i
   end
-  local item = nx.await(nx.ui.select(nums, { prompt = "Jump near:" }))
+  local item = btv.await(btv.ui.select(nums, { prompt = "Jump near:" }))
   if item then
-    nx.notify("chose " .. item)
+    btv.notify("chose " .. item)
   end
 end))

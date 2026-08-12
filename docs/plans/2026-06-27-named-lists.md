@@ -1,15 +1,15 @@
 # Named lists — a window-independent quickfix/location list
 
 > **Status: shipped (all phases).** The design below is as-planned; the **Lua
-> surface changed during implementation** — the `nx.qf.dynamic` (named,
+> surface changed during implementation** — the `btv.qf.dynamic` (named,
 > function-sourced) abstraction was dropped in favour of a direct
-> `nx.qf.list` / `show` / `drop` API (see *Lua surface* and *Phases* for what
+> `btv.qf.list` / `show` / `drop` API (see *Lua surface* and *Phases* for what
 > actually landed). The authoritative current-state reference is
 > [`docs/features/quickfix-dock-lists.md`](../features/quickfix-dock-lists.md).
 
 ## Motivation
 
-nxvim models lists two ways (`QfWhich`):
+bemtvi models lists two ways (`QfWhich`):
 
 - **Quickfix** — one global list (`Editor::qf`), shown in a single reused bottom-dock
   tab. `:copen` focuses it from any window. Window-independent, but there is only **one**
@@ -20,7 +20,7 @@ nxvim models lists two ways (`QfWhich`):
   display tab** (`remove_window` drops the `Window`, `discard_loclist_display` closes the
   `:lopen` tab). A split inherits a *clone*.
 
-A plugin that wants a persistent, named panel — e.g. nxvim-dap's "All Breakpoints" — fits
+A plugin that wants a persistent, named panel — e.g. bemtvi-dap's "All Breakpoints" — fits
 neither: the quickfix collides with grep, and a loclist evaporates when you close the code
 window it was anchored to (and reopening it from elsewhere spawns a duplicate, since
 `:lopen` is current-window-relative).
@@ -59,7 +59,7 @@ distinct *instance* per name, so it never collides with the global quickfix.
 ## Lua surface
 
 > **Changed during implementation.** The plan routed named lists through the
-> existing `nx.qf.dynamic` (named, function-sourced) abstraction with a new
+> existing `btv.qf.dynamic` (named, function-sourced) abstraction with a new
 > `kind = "list"`. Mid-build that abstraction was judged redundant once a named
 > list is the primitive — a plugin can push items directly instead of registering
 > a `source` callback — so **the whole dynamic feature (every kind) was removed**
@@ -69,16 +69,16 @@ distinct *instance* per name, so it never collides with the global quickfix.
 
 What shipped:
 
-- `nx.qf.list(name, items[, opts])` — create / replace a named list in place
+- `btv.qf.list(name, items[, opts])` — create / replace a named list in place
   (`opts.title`, `opts.action` = `"r"` default / `" "` / `"a"`); repaints its tab
   if open, never opens one. Queues a `QfSetOp` with a `named` target.
-- `nx.qf.show(name)` — open / focus a named list's tab by name (the clean reopen),
+- `btv.qf.show(name)` — open / focus a named list's tab by name (the clean reopen),
   sequenced server-side after any same-tick `list` (a `NamedListOp::Show` drained
   after the `QfSetOp`s), so no `set_current` + `on_next_tick` dance.
-- `nx.qf.drop(name)` — close its tab and forget the core list
+- `btv.qf.drop(name)` — close its tab and forget the core list
   (`NamedListOp::Drop`).
 
-(`nx.qf.dynamic` / `nx.qf.refresh` and the `_dynamic_lists` registry were deleted,
+(`btv.qf.dynamic` / `btv.qf.refresh` and the `_dynamic_lists` registry were deleted,
 along with the `examples/dynamic-lists` config — replaced by `examples/named-lists`.)
 
 ## Phases
@@ -91,10 +91,10 @@ along with the `examples/dynamic-lists` config — replaced by `examples/named-l
    `qf_context_of_buffer` + `qf_focus_target_window`, monotonic (never-reused)
    `BufferId`s, and the generic dock-tab / mouse handling already covered `<CR>`
    jump, close-keeps-registry, and tab click/scroll.
-4. **Lua API** ✅ — landed first *through* `nx.qf.dynamic{ kind = "list" }`, then
-   **superseded** by the direct `nx.qf.list` / `show` / `drop` API above (dynamic
+4. **Lua API** ✅ — landed first *through* `btv.qf.dynamic{ kind = "list" }`, then
+   **superseded** by the direct `btv.qf.list` / `show` / `drop` API above (dynamic
    removed). The `QfSetOp.named` + `NamedListOp` plumbing is the lasting part.
-5. **dap plugin** ✅ — `:DapBreakpoints` switched to a named list (`nx.qf.list` +
+5. **dap plugin** ✅ — `:DapBreakpoints` switched to a named list (`btv.qf.list` +
    `show`); deleted the owner-window binding and the `refresh():next(lopen)` dance
    (there was no `on_next_tick` hack in the end). The latent loclist bug also lived
    in the `examples/dynamic-lists` demo, replaced by `examples/named-lists`.

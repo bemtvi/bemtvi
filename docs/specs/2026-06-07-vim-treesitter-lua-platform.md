@@ -1,22 +1,22 @@
 # The `vim.treesitter` Lua platform — design
 
 **Status:** phases 1–4 shipped — the plugin-facing API is complete. The vendored
-neovim `vim.treesitter` Lua runs on nxvim's bespoke primitives:
+neovim `vim.treesitter` Lua runs on bemtvi's bespoke primitives:
 `get_parser(buf):parse()` parses real buffers off the pushed snapshot,
 `get_string_parser` parses literals, and `query.parse` + `iter_captures` /
 `iter_matches` evaluate predicates (`#eq?`, `#match?`, …) and directives over a
 faithful, **unfiltered** query cursor ported from neovim's `treesitter.c`. The
-vendored Lua is embedded under `crates/nxvim-lua/src/vendor/nvim/` and registered
-into `package.preload`; the Rust primitives live in `crates/nxvim-ts/src/lua.rs`;
+vendored Lua is embedded under `crates/bemtvi-lua/src/vendor/nvim/` and registered
+into `package.preload`; the Rust primitives live in `crates/bemtvi-ts/src/lua.rs`;
 the snapshot/`nvim_buf_attach` seam is adapted in
-`crates/nxvim-lua/src/prelude/treesitter.lua`; all tested end to end in
-`crates/nxvim/tests/treesitter_lua.rs`. Phase 5 (injections / decoration-provider
+`crates/bemtvi-lua/src/prelude/treesitter.lua`; all tested end to end in
+`crates/bemtvi/tests/treesitter_lua.rs`. Phase 5 (injections / decoration-provider
 highlighting / Lua-driven indent) remains deferred. Builds the
 `vim.treesitter` Lua
 API as a **plugin platform** — Lua-owned parsers/trees/queries exposed as
 userdata over the in-process tree-sitter trees — so treesitter-consuming plugins
 (textobjects, context/sticky-scroll, incremental selection, AST/query tools)
-run unmodified, the same way nxvim already runs real catppuccin and
+run unmodified, the same way bemtvi already runs real catppuccin and
 nvim-lspconfig.
 
 This **does not supersede** the in-process treesitter engine
@@ -36,32 +36,32 @@ spec expands into a real plan.
 The original ask was "don't reimplement nvim-treesitter's indent — run theirs."
 Investigating that surfaced a **load-bearing constraint** that reshapes the goal.
 
-### The constraint: nxvim's Lua bridge is a snapshot, not live editor access
+### The constraint: bemtvi's Lua bridge is a snapshot, not live editor access
 
 Unlike neovim — where Lua holds a *live* handle to the editor and the C core
 calls *into* Lua synchronously mid-keystroke (how `indentexpr=v:lua…` works) —
-nxvim's Lua bridge is a **snapshot + effect-queue** (`runtime.rs`, `nvim_api.lua`):
+bemtvi's Lua bridge is a **snapshot + effect-queue** (`runtime.rs`, `nvim_api.lua`):
 
 - Before running a Lua chunk/callback, the server **pushes a snapshot** of buffer
-  state into Lua (`nx._bufs[bufnr] = { lines, name, loaded }`).
+  state into Lua (`btv._bufs[bufnr] = { lines, name, loaded }`).
 - Lua getters (`nvim_buf_get_lines`, `nvim_win_get_cursor`, …) read **that
   snapshot**, not the live editor.
 - Lua mutations **queue effects** (`buf_ops`, `window_ops`, …) that the server
   drains and applies to the live editor *after* the chunk.
 
-This is exactly what lets `nxvim-core` stay pure and synchronous with no Lua
+This is exactly what lets `bemtvi-core` stay pure and synchronous with no Lua
 dependency. It is a feature, not an accident — and it draws a hard line:
 
 > **Lua can read a buffer snapshot and return data/effects. Lua cannot be a
-> synchronous oracle that `nxvim-core` consults mid-edit.**
+> synchronous oracle that `bemtvi-core` consults mid-edit.**
 
 ### What that line allows and forbids
 
 | Capability | Fits the architecture? | Why |
 |---|---|---|
 | Plugins that **query** a tree and return data/effects (textobjects, context, AST tools, query-based motions) | ✅ yes | They read the snapshot tree and queue effects — the normal chunk/callback flow. **This is the platform.** |
-| **Highlighting** sourced from a Lua-owned tree | ✅ feasible later | Redraw is server-side (owns editor *and* Lua); it can refresh the snapshot and query. But "real `vim.treesitter.start`" = decoration-providers + extmarks, a separate subsystem nxvim lacks. Out of scope here. |
-| **Indent via real `indent.lua`** during `o`/`O`/insert-`<CR>` | ⚠️ fights the architecture | `get_indent(lnum)` wants the *live* buffer mid-keystroke; indent is computed deep in pure `nxvim-core`, which has no Lua handle. Would require lifting insert-mode indent into the server or giving Lua live access. **Out of scope.** |
+| **Highlighting** sourced from a Lua-owned tree | ✅ feasible later | Redraw is server-side (owns editor *and* Lua); it can refresh the snapshot and query. But "real `vim.treesitter.start`" = decoration-providers + extmarks, a separate subsystem bemtvi lacks. Out of scope here. |
+| **Indent via real `indent.lua`** during `o`/`O`/insert-`<CR>` | ⚠️ fights the architecture | `get_indent(lnum)` wants the *live* buffer mid-keystroke; indent is computed deep in pure `bemtvi-core`, which has no Lua handle. Would require lifting insert-mode indent into the server or giving Lua live access. **Out of scope.** |
 
 So the platform delivers the strategic prize — the **plugin ecosystem** — and the
 Rust hot path keeps owning the latency-sensitive, core-side decisions it already
@@ -92,11 +92,11 @@ primitives it stands on. The required primitive surface (confirmed against
 upstream `languagetree.lua` / `query.lua` / `language.lua`) is small:
 
 ```text
-nx._create_ts_parser(lang)            -> TSParser userdata
-nx._ts_has_language(lang)             -> bool
-nx._ts_add_language(path, lang)       -> (via vim.treesitter.language.add)
-nx._ts_inspect_language(lang)         -> symbols/fields table (language.inspect)
-nx._ts_parse_query(lang, query_str)   -> TSQuery userdata
+btv._create_ts_parser(lang)            -> TSParser userdata
+btv._ts_has_language(lang)             -> bool
+btv._ts_add_language(path, lang)       -> (via vim.treesitter.language.add)
+btv._ts_inspect_language(lang)         -> symbols/fields table (language.inspect)
+btv._ts_parse_query(lang, query_str)   -> TSQuery userdata
 
 TSParser:  :parse(old_tree|nil, source, include_ranges?) -> {TSTree,...}
            :set_included_ranges(ranges)  :reset()  :_set_logger(...)
@@ -113,12 +113,12 @@ TSQuery:   query iteration consumed by query.lua's iter_captures/iter_matches
 
 **`source`** passed to `:parse()` is where the snapshot plugs in. neovim's C
 parser reads the buffer directly; ours reads the **pushed snapshot**
-(`nx._bufs[bufnr].lines`, or a literal string for `get_string_parser`). The
+(`btv._bufs[bufnr].lines`, or a literal string for `get_string_parser`). The
 adapter materializes the snapshot text and hands its bytes to tree-sitter's read
 callback — no live editor access required.
 
 `vim.api.nvim_get_runtime_file` (parser/query discovery) and the grammar load
-already exist (`nxvim-ts::loader`, `host::get_runtime_file`); `language.add`
+already exist (`bemtvi-ts::loader`, `host::get_runtime_file`); `language.add`
 routes to the existing loader instead of neovim's `.so` resolution.
 
 ---
@@ -150,32 +150,32 @@ Invariants that make the lifetime erasure sound, stated so the impl upholds them
   (lua51); `Rc<Tree>` fits. No `Send`/`Sync` is introduced.
 
 A `TSParser` userdata owns a `tree_sitter::Parser` + the loaded `Grammar`
-(`Language`, queries) from `nxvim-ts::loader`, plus the last `Rc<Tree>` for
+(`Language`, queries) from `bemtvi-ts::loader`, plus the last `Rc<Tree>` for
 incremental reuse.
 
 ---
 
 ## Crate seam
 
-Heavy C deps (tree-sitter, libloading) must stay in **`nxvim-ts`**
+Heavy C deps (tree-sitter, libloading) must stay in **`bemtvi-ts`**
 (architecture invariant). So the binding lives there, behind an optional Lua
 feature, reusing the existing `loader`/`Engine` internals:
 
-- `nxvim-ts/Cargo.toml`: add `mlua` (optional, `lua` feature, workspace-pinned to
-  match `nxvim-lua`'s version + `lua51`). No new heavy dep; tree-sitter already
+- `bemtvi-ts/Cargo.toml`: add `mlua` (optional, `lua` feature, workspace-pinned to
+  match `bemtvi-lua`'s version + `lua51`). No new heavy dep; tree-sitter already
   present.
-- `nxvim-ts/src/lua.rs`: `pub fn install(lua: &mlua::Lua, data_dir: &Path)` —
-  registers the userdata types and the `nx._ts_*` / `nx._create_ts_parser`
+- `bemtvi-ts/src/lua.rs`: `pub fn install(lua: &mlua::Lua, data_dir: &Path)` —
+  registers the userdata types and the `btv._ts_*` / `btv._create_ts_parser`
   primitives onto the shared VM.
-- `nxvim-lua` gains a dep on `nxvim-ts` (feature `lua`) and calls
-  `nxvim_ts::lua::install(&lua, …)` during runtime construction, then loads the
+- `bemtvi-lua` gains a dep on `bemtvi-ts` (feature `lua`) and calls
+  `bemtvi_ts::lua::install(&lua, …)` during runtime construction, then loads the
   vendored `vim/treesitter/*.lua` off the runtimepath. tree-sitter stays out of
-  `nxvim-lua`'s own code; only the binding crate links it.
+  `bemtvi-lua`'s own code; only the binding crate links it.
 - `vendor/nvim-treesitter-runtime/` (or reuse `vendor/neovim/runtime/lua/vim/`):
   the vendored upstream treesitter Lua, added to the runtimepath like
   nvim-lspconfig.
 
-`nxvim-core` is untouched — it never sees Lua or tree-sitter, per its invariant.
+`bemtvi-core` is untouched — it never sees Lua or tree-sitter, per its invariant.
 
 ---
 
@@ -203,7 +203,7 @@ gain. Keep them separate until a concrete consumer forces the merge.
 ## Non-goals (explicitly deferred)
 
 - **`vim.treesitter.start` / decoration-provider highlighting** — needs an
-  extmark/decoration layer nxvim doesn't have. The Rust highlighter stays.
+  extmark/decoration layer bemtvi doesn't have. The Rust highlighter stays.
 - **Lua-driven indent** (`o`/`O`/`<CR>`/`=` via `indent.lua`) — fights the
   snapshot bridge; the Rust indent stays. (`@indent.align` fidelity, if wanted,
   is a separate Rust-side task per the in-process spec's phase 6.)
@@ -220,8 +220,8 @@ gain. Keep them separate until a concrete consumer forces the merge.
 
 All coverage is end-to-end through the server via `:lua`, asserting on values the
 chunk writes back (e.g. `print`/`vim.g`/a scratch buffer), reusing the existing
-grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
-`tree-sitter-rust`, point `NXVIM_DATA_DIR` at it):
+grammar-fixture machinery from `crates/bemtvi/tests/{syntax,indent}.rs` (compile
+`tree-sitter-rust`, point `BEMTVI_DATA_DIR` at it):
 
 - **Primitives & lifetime:** a `:lua` chunk parses a string, walks
   `root → children`, asserts node `:type()`/`:range()`; holds a node across a
@@ -239,29 +239,29 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
 
 ## Implementation phases
 
-1. **Userdata + lifetime model.** ✅ **Done.** `nxvim-ts/src/lua.rs`: `TSNode`/
+1. **Userdata + lifetime model.** ✅ **Done.** `bemtvi-ts/src/lua.rs`: `TSNode`/
    `TSTree`/`TSQuery` userdata over tree-sitter with the `Rc<TreeInner>` erasure
    (the `Rc` co-owns the `Tree` *and* the `LoadedLanguage` whose dylib the node
-   types live in); the `nx._create_ts_parser` / `nx._ts_has_language` /
-   `nx._ts_parse_query` primitives; `TSParser:parse(source)` reading a
+   types live in); the `btv._create_ts_parser` / `btv._ts_has_language` /
+   `btv._ts_parse_query` primitives; `TSParser:parse(source)` reading a
    **string** and returning `(tree, changed_ranges)` (matching neovim's
    `parser_parse`, not the `{TSTree,…}` sketch above). The full upstream
    `TSNode` method surface is implemented so phases 2–3 vendor the Lua against no
-   Rust gaps. A new `nxvim-ts::loader::LoadedLanguage` loads a grammar's parser
+   Rust gaps. A new `bemtvi-ts::loader::LoadedLanguage` loads a grammar's parser
    *without* requiring `highlights.scm` (the platform needs only the `Language`).
-   mlua wired behind nxvim-ts's optional `lua` feature; `install()` called from
-   `nxvim-lua::LuaRuntime::new`. Black-box tests (`tests/treesitter_lua.rs`):
+   mlua wired behind bemtvi-ts's optional `lua` feature; `install()` called from
+   `bemtvi-lua::LuaRuntime::new`. Black-box tests (`tests/treesitter_lua.rs`):
    parse a string, walk nodes, hold a node across a reparse *and* a GC of its
    source tree, incremental `tree:edit` reparse, query compile + loud error,
    missing-grammar loud error. *No high-level API yet — proves the hardest part.*
 2. **Vendor neovim treesitter Lua + `get_parser` over buffers.** ✅ **Done.**
    The vendored `vim/treesitter/*.lua` (plus the `vim.func` / `vim.F` /
-   `nx._core.util` / `vim.pos._util` helpers it stands on) is embedded under
-   `crates/nxvim-lua/src/vendor/nvim/` and registered into `package.preload` by
+   `btv._core.util` / `vim.pos._util` helpers it stands on) is embedded under
+   `crates/bemtvi-lua/src/vendor/nvim/` and registered into `package.preload` by
    `runtime.rs` (hermetic — no runtime dependency on the `vendor/neovim`
-   submodule). `prelude/treesitter.lua` wires it: defines `nx._defer_require`,
+   submodule). `prelude/treesitter.lua` wires it: defines `btv._defer_require`,
    sets `vim.func`/`vim.F`, requires `vim.treesitter`, and adapts the two snapshot
-   seams — `TSParser:parse(bufnr)` reads `nx._bufs[bufnr].lines`, and a
+   seams — `TSParser:parse(bufnr)` reads `btv._bufs[bufnr].lines`, and a
    buffer-sourced `LanguageTree` re-reads that snapshot each `:parse()` (full
    reparse, no `nvim_buf_attach`). New primitives: `_ts_get_language_version` /
    `_ts_get_minimum_language_version` / `_ts_inspect_language` / parse-from-bufnr /
@@ -269,7 +269,7 @@ grammar-fixture machinery from `crates/nxvim/tests/{syntax,indent}.rs` (compile
 3. **Query surface.** ✅ **Done.** `query.parse` / `iter_captures` /
    `iter_matches`, predicates (`#eq?`, `#match?` via `vim.regex`, `#any-of?`, …),
    directives, and metadata all run via the vendored `query.lua`. The bespoke core
-   is `nx._create_ts_querycursor` + `TSQuery:inspect()`, ported from neovim's
+   is `btv._create_ts_querycursor` + `TSQuery:inspect()`, ported from neovim's
    `treesitter.c` over the raw tree-sitter cursor FFI so matches are returned
    **unfiltered** (predicate evaluation stays in Lua, bug-for-bug with upstream —
    the safe Rust iterator's text-predicate filtering would diverge on `#match?`'s
@@ -298,15 +298,15 @@ plus the one further bespoke piece — the unfiltered query cursor.
 - **Lifetime erasure soundness** — mitigated by the immutable-snapshot +
   co-owned-`Rc` invariants above; phase 1's hold-across-reparse test guards it.
 - **mlua version skew** — the binding must use the *same* pinned mlua + `lua51`
-  feature as `nxvim-lua`, or the shared `Lua` userdata registration won't link.
+  feature as `bemtvi-lua`, or the shared `Lua` userdata registration won't link.
   Pin in `[workspace.dependencies]`; never `--all-features` (the existing
   `lua51`/`luajit` exclusivity rule).
 - **Vendored Lua reaching for absent `vim.*`** — upstream treesitter Lua may call
   `vim.func._memoize`, `vim.validate`, `vim.deprecate`, `vim.iter`, etc. Most
-  exist; any gap fails *loud* (`nx._notimpl`) per the no-silent-stubs rule and is
+  exist; any gap fails *loud* (`btv._notimpl`) per the no-silent-stubs rule and is
   filled as found, exactly like the lspconfig bring-up.
 - **Snapshot staleness** — a plugin that parses then reads stale lines sees the
-  snapshot at chunk entry. This matches how every other nxvim Lua getter already
+  snapshot at chunk entry. This matches how every other bemtvi Lua getter already
   behaves; documented, not worked around.
 - **Grammar segfault** — unchanged posture (neovim's): user-installed grammars,
   ABI-probed on load; a poison grammar can crash the process.

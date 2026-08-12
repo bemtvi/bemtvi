@@ -1,0 +1,39 @@
+[package]
+name = "bemtvi-core"
+description = "Editor model and logic for bemtvi (buffers, modes, motions, operators, rendering)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The real vim regexp engine (`bemtvi-regex`, vendored C) behind
+# `:set regexsyntax=vim`. Off by default: it pulls in a C build, so a consumer that
+# wants a pure-Rust core can stay C-free. Host builds enable it via `bemtvi-server`'s
+# dependency (and the wasm `bemtvi-edithost` build, whose C compiles under emscripten),
+# so the whole workspace (and its tests) compiles it in through feature unification.
+default = []
+vim-regex = ["dep:bemtvi-regex"]
+# Derive serde on the persistence snapshot ([`PersistState`] & friends) so a consumer can
+# serialize it directly. Off by default — the native server has its own redb/msgpack
+# encoding and doesn't need it; the wasm edit-host turns it on to write the snapshot as a
+# single JSON blob to OPFS. Pure derives, no I/O, so the core stays pure.
+serde = ["dep:serde"]
+
+[dependencies]
+anyhow.workspace = true
+ropey.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+regex.workspace = true
+# Glob parsing for the pure `bemtvi_core::glob` module (behind `btv.glob`). Translator
+# only: we compile its `Glob::regex()` output with the `regex` crate above so path
+# style stays an explicit option instead of a host `#[cfg]`. See `glob.rs`.
+globset.workspace = true
+nucleo-matcher.workspace = true
+encoding_rs.workspace = true
+pulldown-cmark.workspace = true
+bemtvi-regex = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }

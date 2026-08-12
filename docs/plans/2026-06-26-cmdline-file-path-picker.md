@@ -2,13 +2,13 @@
 
 Status: DONE (2026-06-26) — all four phases landed; `cmdline_complete.rs` 37 tests
 green (incl. the file-picker e2e + example-loads guard), `picker.rs` 56 green,
-full `nxvim-server` suite green, native + `--no-default-features` build, clippy
-clean. (Pre-existing unrelated failure: `nxvim` `code_action_lists_then_applies…`
+full `bemtvi-server` suite green, native + `--no-default-features` build, clippy
+clean. (Pre-existing unrelated failure: `bemtvi` `code_action_lists_then_applies…`
 fails on a clean tree too.)
 
 ## The gap
 
-The command-line completion engine (`nx.cmdline_complete`,
+The command-line completion engine (`btv.cmdline_complete`,
 `docs/plans/2026-06-16-cmdline-completion.md`) completes command **names** and
 `:set` **option** names, but not file paths: `:e <Tab>` opens nothing (the
 `non_set_command_args_open_no_menu` test pins that). This adds file-path
@@ -18,7 +18,7 @@ completion for the file-taking commands.
 
 Two product decisions (asked of the user):
 
-- **Surface:** the full `nx.picker` overlay (centered float, file preview pane),
+- **Surface:** the full `btv.picker` overlay (centered float, file preview pane),
   not the inline wildmenu. So `<Tab>` on a file argument *hands off* from the
   command line to the picker.
 - **Matching:** fuzzy, but **prioritize same-level candidates** — the entries of
@@ -26,7 +26,7 @@ Two product decisions (asked of the user):
 
 Why a handoff (vs. extending the inline wildmenu): the wildmenu source is
 resolved **synchronously** (one round-trip in `effects.rs`), but file listing is
-**async-only** (`nx.fs`, the no-blocking-IO principle; sync `read_dir` would also
+**async-only** (`btv.fs`, the no-blocking-IO principle; sync `read_dir` would also
 break over the daemon/wasm). The picker is already an async, streaming,
 fuzzy-matched overlay — exactly the right engine. The cmdline just becomes a
 launcher into it.
@@ -37,9 +37,9 @@ launcher into it.
 :e src/ed<Tab>
    │  core: arg region of a file-taking command
    ▼
-nx._cmdline_complete_run(line, col)        (Lua policy owns "which commands take files")
+btv._cmdline_complete_run(line, col)        (Lua policy owns "which commands take files")
    │  stores ctx { line_prefix = line[:anchor], dirs_only }
-   │  nx.picker.open("cmdline_files", { query = "src/ed" })   ← queued
+   │  btv.picker.open("cmdline_files", { query = "src/ed" })   ← queued
    │  returns the PICKER-LAUNCHED sentinel
    ▼
 server: editor.cancel_cmdline()  → Normal mode (the ":" line is dismissed)
@@ -48,7 +48,7 @@ server: editor.cancel_cmdline()  → Normal mode (the ":" line is dismissed)
 picker overlay, prompt pre-filled "src/ed", same-level entries first
    │  confirm(item)
    ▼
-nx.cmd(line_prefix .. item.path)           e.g. nx.cmd("e src/editor/mod.rs")
+btv.cmd(line_prefix .. item.path)           e.g. btv.cmd("e src/editor/mod.rs")
 ```
 
 `line_prefix` is everything left of the argument token (`line:sub(1, anchor)`),
@@ -65,15 +65,15 @@ STATIC source; a DYNAMIC source bypasses the matcher (it filters itself from
 `open_picker`: `filtered = (!query.is_empty() && !dynamic).then(Vec::new)`.
 
 Make a picker open with a pre-filled prompt that filters the initial run.
-Independently useful (`nx.picker.open(name, { query = … })`).
+Independently useful (`btv.picker.open(name, { query = … })`).
 
 - `ops.rs` `PickerOpenReq`: add `query: String`.
-- `install.rs` `nx._picker_open`: add a trailing `query` arg → `PickerOpenReq`.
+- `install.rs` `btv._picker_open`: add a trailing `query` arg → `PickerOpenReq`.
 - `menu.rs` `open_picker(...)`: accept an initial prompt string; seed
   `Prompt { text, cursor=end }` instead of `Prompt::default()`.
 - Server picker-open drain + initial run: kick gen-0 with the seed query, not `""`.
-- `picker.lua` `nx.picker.open(name, opts)`: pass `opts.query` (default `""`)
-  through `nx._picker_open`; document it.
+- `picker.lua` `btv.picker.open(name, opts)`: pass `opts.query` (default `""`)
+  through `btv._picker_open`; document it.
 - Test: open `files` with `{ query = "…" }`, assert the list is pre-filtered.
 
 ### Phase 2 — cmdline→picker handoff (server + Lua) ⬜
@@ -94,16 +94,16 @@ Independently useful (`nx.picker.open(name, { query = … })`).
 
 ### Phase 3 — the same-level file source (Lua) ⬜
 
-`nx.picker.source{ name = "cmdline_files", dynamic = true, preview = "file", … }`:
+`btv.picker.source{ name = "cmdline_files", dynamic = true, preview = "file", … }`:
 
 - Read `ctx.query`; split at the last `/` into `(dir, leaf)`. Resolve `dir`
   against `ctx.cwd`, handling `~` and absolute paths.
-- `nx.fs.readdir(dir)` (async). Rank entries against `leaf`: exact-prefix tier
+- `btv.fs.readdir(dir)` (async). Rank entries against `leaf`: exact-prefix tier
   before subsequence tier; **directories before files** within a tier;
   directories shown with a trailing `/`. Push them — these are the **same-level**
   candidates, first.
 - `item.path` is the path to splice (relative when the prefix was relative,
-  re-rooted on each `/`). `confirm(item, …)`: `nx.cmd(M._pending.line_prefix ..
+  re-rooted on each `/`). `confirm(item, …)`: `btv.cmd(M._pending.line_prefix ..
   item.path)`; if `item` is a directory, instead re-open the picker one level
   deeper (descend) rather than execute.
 - `dirs_only` variant filters `readdir` to directories (for `:cd`).
@@ -123,7 +123,7 @@ Independently useful (`nx.picker.open(name, { query = … })`).
 
 Three follow-up changes after the first landing:
 
-1. **Picker box title** (general, reusable): `nx.picker.open(name, { title = … })`
+1. **Picker box title** (general, reusable): `btv.picker.open(name, { title = … })`
    renders a single title on the box's top border. Threaded core
    (`Menu.title`/`MenuView.title`) → `PickerOpenReq.title` → projection
    (`menu.title`) → `MenuData.title` → **all three clients** (TUI `title_top`, GUI
@@ -133,7 +133,7 @@ Three follow-up changes after the first landing:
 2. **The cmdline file picker pastes, it does not execute.** `<Tab>` no longer
    cancels the command line — the picker opens OVER it (a `Picker` key context wins
    over Command mode in `feed_matcher`, so the picker grabs input while the `:` line
-   stays open). Confirm calls `nx._cmdline_set_arg(path)` → `Editor::cmdline_replace_arg`
+   stays open). Confirm calls `btv._cmdline_set_arg(path)` → `Editor::cmdline_replace_arg`
    (replaces the argument token in place, reusing `cmdline_complete_token`'s anchor),
    leaving the filled line for the user to run with `<CR>`. Title: "Select file" /
    "Select directory". `line_prefix` dropped from the handoff state.
@@ -154,7 +154,7 @@ Tests: `file_command_arg_pastes_the_chosen_path_into_the_open_cmdline`,
   Floats keep their left-aligned titles (the flag is opt-in per call).
 - **Built-in picker titles**: `files` → "Find Files", `live_grep` → "Live Grep",
   `buffers` → "Buffers" (a `title` field on the source spec).
-- **`multiselect` toggle**: `nx.picker.open{ multiselect = false }` (also a source
+- **`multiselect` toggle**: `btv.picker.open{ multiselect = false }` (also a source
   field) makes `<Tab>` marking a no-op — threaded `Menu.multiselect` and gated in
   `apply_picker_action("toggle_select")`. The cmdline file picker sets it false.
 - **`<select directory>` row**: inside a sub-directory (non-empty base, empty leaf)
@@ -166,9 +166,9 @@ Tests: `file_command_arg_pastes_the_chosen_path_into_the_open_cmdline`,
 
 ## Notes / invariants
 
-- No blocking IO: the source is `nx.fs`-only (async), so it works native, over
+- No blocking IO: the source is `btv.fs`-only (async), so it works native, over
   the daemon, and on wasm/OPFS.
-- The picker confirm re-executes through `nx.cmd`, so `'switchbuf'`, splits,
+- The picker confirm re-executes through `btv.cmd`, so `'switchbuf'`, splits,
   tabs, and modifiers all behave exactly as typing the command would.
 - `<Esc>` in the picker cancels the whole gesture (the `:` line was already
   dismissed); v1 does not restore the half-typed command line.

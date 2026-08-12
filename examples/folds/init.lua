@@ -1,12 +1,12 @@
--- ~~~ nxvim code folding: indent, tree-sitter, LSP, and manual folds ~~~
+-- ~~~ bemtvi code folding: indent, tree-sitter, LSP, and manual folds ~~~
 --
 -- Run it (from the repo root) against the sample file:
 --
---     NXVIM_CONFIG=examples/folds \
---       cargo run -p nxvim -- examples/folds/sample.lua
+--     BEMTVI_CONFIG=examples/folds \
+--       cargo run -p bemtvi -- examples/folds/sample.lua
 --
 -- A *fold* hides a range of lines behind a single placeholder row so you can
--- collapse the parts of a file you aren't reading. nxvim folds the same way vim
+-- collapse the parts of a file you aren't reading. bemtvi folds the same way vim
 -- does, from any of five sources — and the model (the `z` commands, fold-aware
 -- motion, the `foldcolumn` gutter, operators acting on a whole closed fold) is
 -- shared by all of them:

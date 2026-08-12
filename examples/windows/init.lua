@@ -1,9 +1,9 @@
--- ~~~ nxvim windows playground: splits, the layout tree, and the nvim_win_* API ~~~
+-- ~~~ bemtvi windows playground: splits, the layout tree, and the nvim_win_* API ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/windows \
---       cargo run -p nxvim -- examples/windows/sample.txt
+--     BEMTVI_CONFIG=examples/windows \
+--       cargo run -p bemtvi -- examples/windows/sample.txt
 --
 -- A "window" is a viewport onto a buffer; splitting tiles more of them. This
 -- config wires up the window autocmds and a few helper commands so you can watch
@@ -64,13 +64,13 @@ end, {})
 --    current buffer, parks its cursor a few lines down, then reports the layout.
 --    (Mutation from Lua goes through `vim.cmd` — the "Lua queues, core mutates"
 --    flow — so the new window only exists on the NEXT tick; read its id there
---    with nx.on_next_tick.)
+--    with btv.on_next_tick.)
 --------------------------------------------------------------------------------
 vim.api.nvim_create_user_command("WinDemo", function()
   vim.cmd("vsplit")
-  nx.on_next_tick(function()
+  btv.on_next_tick(function()
     local win = vim.api.nvim_get_current_win()
-    nx.win.set_cursor(win, 3, 0)
+    btv.win.set_cursor(win, 3, 0)
     vim.notify("[WinDemo] opened window " .. tostring(win)
       .. "; now " .. #vim.api.nvim_list_wins() .. " windows. Try :WinList")
   end)

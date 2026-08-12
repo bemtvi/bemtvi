@@ -4,12 +4,12 @@
 
 ## The problem
 
-nxvim's rope always ends with a `\n` (`line_count == rope.len_lines() - 1`; the final
+bemtvi's rope always ends with a `\n` (`line_count == rope.len_lines() - 1`; the final
 phantom line is never edited or shown). That invariant is load-bearing: every byte
 offset, `line_start`, mark/extmark shift, tree-sitter point, cursor clamp and motion
 assumes it.
 
-But nxvim stores **only** the rope, so it has no way to record the one fact the rope
+But bemtvi stores **only** the rope, so it has no way to record the one fact the rope
 can't express: *the file on disk had no final newline*. Consequences today:
 
 - `:w` on a file read as `a\nb` writes `a\nb\n`. Silently. There is no opt-out.
@@ -23,9 +23,9 @@ can't express: *the file on disk had no final newline*. Consequences today:
 ## The reframe: the invariant is not the bug
 
 Vim's buffer is a list of lines with an *implicit* newline after every line, including
-the last. nxvim's rope-with-mandatory-trailing-`\n` is the same model spelled
+the last. bemtvi's rope-with-mandatory-trailing-`\n` is the same model spelled
 differently — the phantom `\n` **is** vim's implicit final newline. What vim has that
-nxvim doesn't is the pair of options that record and control the on-disk fact:
+bemtvi doesn't is the pair of options that record and control the on-disk fact:
 
 ```
 $ nvim --headless -u NONE   (probe, 2026-07-26)
@@ -42,7 +42,7 @@ put an "is this the last line?" branch through the entire core for one bit of
 information, and vim doesn't do it either.
 
 `'endofline'` is structurally identical to `'bomb'`, which already exists: detected on
-read, consumed only on write, mirrored to `nx.bo`, zero effect on the rope. Follow that
+read, consumed only on write, mirrored to `btv.bo`, zero effect on the rope. Follow that
 precedent exactly.
 
 ## The model
@@ -87,17 +87,17 @@ reproduce `ML_EMPTY` for a buffer **emptied by editing**; see divergence 3.
 ### Three deliberate, documented divergences from vim
 
 1. **`nofixeol` on a buffer that never read a no-eol file.** `:enew`, `:set nofixeol`,
-   type `x`, `:w` → nxvim writes `x`, vim writes `x\n` (vim reports `eol=1` for a
-   buffer with no file behind it). nxvim's answer is the one the option literally asks
+   type `x`, `:w` → bemtvi writes `x`, vim writes `x\n` (vim reports `eol=1` for a
+   buffer with no file behind it). bemtvi's answer is the one the option literally asks
    for, and it falls straight out of the honest definition. Invisible under the default
    `fixeol`.
 2. **A write updates `'endofline'`.** After a `'fixendofline'` write appended the
-   newline, nxvim sets `endofline = true` — the file on disk really does end with one.
+   newline, bemtvi sets `endofline = true` — the file on disk really does end with one.
    Vim leaves `&eol` stale at `0` (probed above). Keeping it accurate matters here
    because the LSP sync path keys off it (below): a stale `false` would keep telling
    every server the file is unterminated when it no longer is.
 3. **A buffer emptied by *editing* keeps the terminator its file had.** `ggdG` on a
-   file read as `a\n`, then `:w` → nxvim writes `\n`, vim writes 0 bytes (`0L, 0B`).
+   file read as `a\n`, then `:w` → bemtvi writes `\n`, vim writes 0 bytes (`0L, 0B`).
    Vim's 0 is `ML_EMPTY`, not `'eol'`: probed, `&eol` is still `1` after the `ggdG`,
    so this is precisely the second hidden bit — and it is load-bearing for *undo*.
    With one honest flag, clearing it when the document goes empty would make
@@ -123,7 +123,7 @@ reproduce `ML_EMPTY` for a buffer **emptied by editing**; see divergence 3.
 5. Read detection in `Buffer::from_file` and in the off-tick landing
    `Editor::load_bytes_into_enc` (daemon / wasm / `:e`).
 6. Surface wiring, following `'bomb'` exactly: `apply_set_bool` slots,
-   `set_buffer_option_bool` (`nx.bo`), `BoMirror` + `BUF_OPT_CANON` / `BUF_OPT_DEFAULT`
+   `set_buffer_option_bool` (`btv.bo`), `BoMirror` + `BUF_OPT_CANON` / `BUF_OPT_DEFAULT`
    in `prelude/state.lua`, `StatuslineCtx` + the `[noeol]` default-statusline flag +
    the `&endofline` / `&fixendofline` statusline-expr resolvers (both, since `&eol`
    alone can't tell a *preserved* missing terminator from one about to be supplied).
@@ -132,7 +132,7 @@ reproduce `ML_EMPTY` for a buffer **emptied by editing**; see divergence 3.
 flag is honestly off for an *empty* document too, and reporting that as a missing
 newline puts `[noeol]` on `[No Name]` and on every brand-new file (vim shows `[New]`
 there, and reports `'eol'` on). The marker also belongs only to a **document**, not to
-editor chrome — a panel/listing/`nx.view`/terminal is never written to disk, so it is
+editor chrome — a panel/listing/`btv.view`/terminal is never written to disk, so it is
 gated on `buftype == ""` (the canonical kind signal, threaded into `StatuslineCtx`
 alongside `%{&buftype}`; a scratch buffer's *name* is `[Messages]`, so its `path` is not
 the signal). Both gates hold for the two places the cue appears:
@@ -143,7 +143,7 @@ the signal). Both gates hold for the two places the cue appears:
   (`PendingSave::noeol` ← `Buffer::save_is_unterminated`), so the daemon ack reports
   the bytes that crossed the wire rather than the buffer whenever the ack landed.
 
-Tests (`crates/nxvim-server/tests/editing/endofline.rs` — its own submodule beside the
+Tests (`crates/bemtvi-server/tests/editing/endofline.rs` — its own submodule beside the
 `'fileformat'` / eol-shaped coverage): every row of the table above, `dos` + noeol,
 a non-UTF-8 encoding + noeol, `:set noeol` / `:set nofixeol` round-trips, and the
 same over the daemon (`--test daemon_save`).
@@ -166,7 +166,7 @@ honoring `'endofline'` here *is* the reference behavior.
   *sequence* of edits, each addressing the document as the previous one left it, so:
   append the phantom, replay the journal verbatim in the rope coordinates it was
   written in, delete the phantom. Every intermediate state the server passes through is
-  one nxvim really passed through — that is what makes it correct rather than merely
+  one bemtvi really passed through — that is what makes it correct rather than merely
   plausible — and the shadow ends each batch equal to the document the server holds.
 
   The two brackets are **independent**, which is what carries a buffer across a
@@ -244,10 +244,10 @@ The clamp is now a document-end short-circuit: past the last row *is* the end, w
 a terminated buffer is the byte the old code already produced (so nothing else moves) and
 for an unterminated one is `document_len_bytes()`. Guarded by
 `formatting_replaces_the_whole_document_when_it_has_no_trailing_newline` in
-`crates/nxvim/tests/lsp_features.rs`, which also asserts a second format is a no-op.
+`crates/bemtvi/tests/lsp_features.rs`, which also asserts a second format is a no-op.
 
 The bug had hidden behind the tests' own shape: three of this feature's LSP tests
-re-issued `nx.lsp.format()` on a 25 ms timer until the result appeared, so a second
+re-issued `btv.lsp.format()` on a 25 ms timer until the result appeared, so a second
 request could carry the *first* one's now-stale range and mangle the formatted text — a
 different test failing on each run. They now issue once and await the promise, which is
 the idiom the rest of the file already used, and the suite is stable across repeated runs.

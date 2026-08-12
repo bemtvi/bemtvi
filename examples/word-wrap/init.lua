@@ -1,9 +1,9 @@
--- ~~~ nxvim word wrap: long lines fold onto the next row, they don't clip ~~~
+-- ~~~ bemtvi word wrap: long lines fold onto the next row, they don't clip ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/word-wrap \
---       cargo run -p nxvim -- examples/word-wrap/sample.txt
+--     BEMTVI_CONFIG=examples/word-wrap \
+--       cargo run -p bemtvi -- examples/word-wrap/sample.txt
 --
 -- With `:set wrap` a line wider than the text area is laid out across several
 -- screen rows instead of scrolling sideways (vim's default, the counterpart to

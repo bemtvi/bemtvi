@@ -1,7 +1,7 @@
 padding demo — breathing room around the text body
 ===================================================
 
-'padding' is nxvim's own window-local option (no vim equivalent). It leaves a
+'padding' is bemtvi's own window-local option (no vim equivalent). It leaves a
 per-side blank margin, in screen cells, around a window's whole content box:
 the number gutter, the text, and the status line all sit inside the margin.
 

@@ -1,11 +1,11 @@
--- ~~~ nxvim per-region tab pages: every region has its own tabline ~~~
+-- ~~~ bemtvi per-region tab pages: every region has its own tabline ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/per-region-tabs \
---       cargo run -p nxvim -- examples/per-region-tabs/sample.txt
+--     BEMTVI_CONFIG=examples/per-region-tabs \
+--       cargo run -p bemtvi -- examples/per-region-tabs/sample.txt
 --
--- nxvim's tab pages are PER REGION. The main editor area and *each* open dock
+-- bemtvi's tab pages are PER REGION. The main editor area and *each* open dock
 -- (the VSCode-style edge panels — see examples/dock/) carry their own independent
 -- set of regular vim tab pages, each drawn as its OWN tabline:
 --
@@ -36,8 +36,8 @@
 -- add a second tab). `showtabline = 2` = always show this region's tabline;
 -- the global default (1) would only show it once a region has >1 of its own tabs.
 --------------------------------------------------------------------------------
-nx.dock.open({ side = "left", size = 28, title = "EXPLORER", showtabline = 2 })
-nx.dock.open({ side = "bottom", size = 8, title = "TERMINAL", showtabline = 2 })
+btv.dock.open({ side = "left", size = 28, title = "EXPLORER", showtabline = 2 })
+btv.dock.open({ side = "bottom", size = 8, title = "TERMINAL", showtabline = 2 })
 
 -- Main's tabline always on too, so all three regions show their strips at once.
 vim.o.showtabline = 2
@@ -54,11 +54,11 @@ vim.o.number = true
 -- It just runs `:tabnew` against the focused region — `:tabnew` already targets
 -- whichever region holds focus, which is the whole point of per-region tabs. (We
 -- deliberately don't switch focus *inside* this command: a config callback queues
--- its `nx.dock.focus` and its `:tabnew` on separate effect queues that drain in a
+-- its `btv.dock.focus` and its `:tabnew` on separate effect queues that drain in a
 -- fixed order, so focus + tab edits can't be interleaved from one callback — do
 -- the focus switch with the interactive `<C-w><C-w>` keys instead.)
 --------------------------------------------------------------------------------
-nx.command("T", function(o)
+btv.command("T", function(o)
   local n = tonumber(o.fargs[1]) or 1
   for _ = 1, n do
     vim.cmd("tabnew")

@@ -1,12 +1,12 @@
--- ~~~ nxvim nx.ui.float playground: the list-less content float ~~~
+-- ~~~ bemtvi btv.ui.float playground: the list-less content float ~~~
 --
 -- Run it (from the repo root). For the LSP hover map (`K`) you need
 -- `lua-language-server` on your PATH; the `\f` / `\F` maps work without it:
 --
---     NXVIM_CONFIG=examples/ui-float \
---       cargo run -p nxvim -- examples/ui-float/sample.lua
+--     BEMTVI_CONFIG=examples/ui-float \
+--       cargo run -p bemtvi -- examples/ui-float/sample.lua
 --
--- `nx.ui.float(contents, opts)` is the list-LESS sibling of `nx.ui.select` —
+-- `btv.ui.float(contents, opts)` is the list-LESS sibling of `btv.ui.select` —
 -- both sit on the server's shared float layer (the float-widget spec, "What
 -- stays out of this widget"). It renders plain content (a string, or a list of
 -- line strings) in a bordered box; there is NO list, NO selection, NO input
@@ -14,7 +14,7 @@
 -- float, its placement, and its dismissal — Lua just hands it the lines.
 --
 -- This is the same surface LSP hover and signature help render through natively
--- (see `nx.lsp.hover` below).
+-- (see `btv.lsp.hover` below).
 --
 --   opts.border   = "none" | "single" | "rounded" | "double" | "solid"  (default "rounded")
 --   opts.title    = a string drawn on the top border
@@ -27,9 +27,9 @@ vim.g.mapleader = "\\"
 --    TYPE:  \f          A bordered box floats by the cursor. Press any key to
 --    dismiss it (it never grabs input — the key is still handled normally).
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "<leader>f", function()
-  nx.ui.float(
-    "nx.ui.float\n\nThe list-less content float.\nPress any key to dismiss.",
+btv.keymap.set("n", "<leader>f", function()
+  btv.ui.float(
+    "btv.ui.float\n\nThe list-less content float.\nPress any key to dismiss.",
     { title = " info " }
   )
 end)
@@ -37,8 +37,8 @@ end)
 --------------------------------------------------------------------------------
 -- 2. <leader>F — a centered float from a list of lines, no border.
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "<leader>F", function()
-  nx.ui.float(
+btv.keymap.set("n", "<leader>F", function()
+  btv.ui.float(
     { "centered over the editor", "", "relative = 'editor'" },
     { relative = "editor", border = "double" }
   )
@@ -46,24 +46,24 @@ end)
 
 --------------------------------------------------------------------------------
 -- 3. K — LSP hover through the content float.
---    nx.lsp.hover() requests hover for the symbol under the cursor; the
+--    btv.lsp.hover() requests hover for the symbol under the cursor; the
 --    reply opens the float server-side (same surface as \f / \F above). Open
 --    `sample.lua`, put the cursor on a stdlib symbol (e.g. `string` or `print`),
 --    and press K. With no server attached it echoes "No language server attached".
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "K", nx.lsp.hover)
+btv.keymap.set("n", "K", btv.lsp.hover)
 -- Signature help (typically insert mode); manual trigger from normal mode here:
-nx.keymap.set("n", "<leader>s", nx.lsp.signature_help)
+btv.keymap.set("n", "<leader>s", btv.lsp.signature_help)
 
 --------------------------------------------------------------------------------
 -- Attach lua-language-server to `lua` buffers so K has a server to ask, using the
--- declarative nx.lsp control surface: nx.lsp.config registers the server (cmd /
--- filetypes / root_markers), nx.lsp.enable turns it on, and the engine starts it on
+-- declarative btv.lsp control surface: btv.lsp.config registers the server (cmd /
+-- filetypes / root_markers), btv.lsp.enable turns it on, and the engine starts it on
 -- the first `lua` buffer. (lua-language-server takes ~20s to index on first attach;
 -- hover is empty until it warms up.)
-nx.lsp.config("lua_ls", {
+btv.lsp.config("lua_ls", {
   cmd = { "lua-language-server" },
   filetypes = { "lua" },
   root_markers = { ".luarc.json", ".git" },
 })
-nx.lsp.enable("lua_ls")
+btv.lsp.enable("lua_ls")

@@ -1,0 +1,36 @@
+[package]
+name = "bemtvi-lsp"
+description = "In-process LSP client for bemtvi: spawns and supervises language servers, bridging their JSON-RPC to the editor's LspCommand/LspEvent channel pair."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["native"]
+# The async client surface — the tokio + `async-lsp` `MainLoop`/`Router`, the
+# per-server supervisor (`manager`), the process `transport`, the async
+# request/notification `dispatch`, and the scripted `mock` server. Default-on, so
+# every native binary and the test suite are unchanged; turning it *off*
+# (`--no-default-features`) compiles only the wasm-eligible subset — the plain-data
+# `protocol`, the pure `convert`/`caps` transforms, the silent `log`, and the
+# synchronous byte-driven `sync_client` (the browser edit-host's LSP client over
+# the daemon's raw `lsp_*` stdio wire, Phase 6e). It drops tokio/async-lsp, none of
+# which target `wasm32-unknown-emscripten`. See
+# docs/plans/2026-06-09-edit-host-and-browser-lua.md → Phase 6e.
+native = ["dep:anyhow", "dep:tokio", "dep:tokio-util", "dep:futures", "dep:async-lsp"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+async-lsp = { workspace = true, optional = true }
+# Always on: the protocol types + JSON layer the sync client reuses are wasm-safe
+# (pure data / serde), so they compile for both the native async client and the
+# browser sync client.
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true

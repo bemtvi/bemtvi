@@ -1,12 +1,12 @@
--- ~~~ nxvim unified window-geometry playground ~~~
+-- ~~~ bemtvi unified window-geometry playground ~~~
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/window-geometry \
---       cargo run -p nxvim -- examples/window-geometry/sample.txt
+--     BEMTVI_CONFIG=examples/window-geometry \
+--       cargo run -p bemtvi -- examples/window-geometry/sample.txt
 --
--- nxvim has ONE geometry vocabulary every windowed surface shares — floats,
--- `nx.view`, pickers, and the bottom panel:
+-- bemtvi has ONE geometry vocabulary every windowed surface shares — floats,
+-- `btv.view`, pickers, and the bottom panel:
 --
 --   * SIZE     `width` / `height` accept cells (a number) OR a viewport fraction
 --              string: "50vw" (50% of the editor width), "30vh", or "50%". A
@@ -38,11 +38,11 @@ vim.g.mapleader = " "
 -- Only one demo float is up at a time, so a single module-level handle suffices.
 local active
 
-nx.autocmd.create("FileType", {
-  pattern = "nxgeom",
+btv.autocmd.create("FileType", {
+  pattern = "btvgeom",
   callback = function(args)
     for _, key in ipairs({ "q", "<Esc>" }) do
-      nx.keymap.set("n", key, function()
+      btv.keymap.set("n", key, function()
         if active then
           active:unmount()
           active = nil
@@ -53,11 +53,11 @@ nx.autocmd.create("FileType", {
 })
 
 --------------------------------------------------------------------------------
--- 1) Floats placed by `align` + `margin`, sized with viewport fractions. `nx.view`
+-- 1) Floats placed by `align` + `margin`, sized with viewport fractions. `btv.view`
 --    is the read-only content surface; `:mount{ float = … }` takes the full
 --    geometry. A grabbing float (the default) locks focus until dismissed.
 local function corner_float()
-  active = nx.view.create({ filetype = "nxgeom" })
+  active = btv.view.create({ filetype = "btvgeom" })
   active:set_lines({
     "  top-right float   ",
     "",
@@ -81,7 +81,7 @@ local function corner_float()
 end
 
 local function centered_float()
-  active = nx.view.create({ filetype = "nxgeom" })
+  active = btv.view.create({ filetype = "btvgeom" })
   active:set_lines({
     "  centered float            ",
     "",
@@ -96,7 +96,7 @@ end
 
 --------------------------------------------------------------------------------
 -- 2) A picker placed in a corner with a margin (it used to be centered-only).
-nx.picker.source({
+btv.picker.source({
   name = "colours",
   items = function(ctx)
     for _, c in ipairs({ "crimson", "cerulean", "chartreuse", "amber", "indigo", "teal" }) do
@@ -104,12 +104,12 @@ nx.picker.source({
     end
   end,
   confirm = function(item)
-    nx.notify("picked " .. item.text, 2)
+    btv.notify("picked " .. item.text, 2)
   end,
 })
 
 local function corner_picker()
-  nx.picker.open("colours", {
+  btv.picker.open("colours", {
     width = "40vw",
     height = "40vh",
     align = "bottom-left",
@@ -121,7 +121,7 @@ end
 -- 3) The bottom panel: a fractional height + a gap from the screen edges. The
 --    panel stays bottom-anchored; `margin` lifts it off the left/right/bottom.
 local function frac_panel()
-  nx.panel.open({
+  btv.panel.open({
     lines = {
       "scripted panel - height = 30vh, margin = 1",
       "",
@@ -136,7 +136,7 @@ local function frac_panel()
 end
 
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "<leader>gf", corner_float, { desc = "geometry: top-right float" })
-nx.keymap.set("n", "<leader>gc", centered_float, { desc = "geometry: centered float" })
-nx.keymap.set("n", "<leader>gp", corner_picker, { desc = "geometry: bottom-left picker" })
-nx.keymap.set("n", "<leader>gn", frac_panel, { desc = "geometry: 30vh bottom panel" })
+btv.keymap.set("n", "<leader>gf", corner_float, { desc = "geometry: top-right float" })
+btv.keymap.set("n", "<leader>gc", centered_float, { desc = "geometry: centered float" })
+btv.keymap.set("n", "<leader>gp", corner_picker, { desc = "geometry: bottom-left picker" })
+btv.keymap.set("n", "<leader>gn", frac_panel, { desc = "geometry: 30vh bottom panel" })

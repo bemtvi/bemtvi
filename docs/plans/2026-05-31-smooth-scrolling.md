@@ -2,9 +2,9 @@
 
 **Goal:** Make the scroll commands `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>` *slide* the viewport over ~80–160ms (neoscroll.nvim style) instead of teleporting, with the animation driven entirely by the client.
 
-**Architecture:** The server stays authoritative and applies each scroll instantly, but attaches a self-contained `scroll` descriptor to the `redraw` (the from/to viewport+cursor lines, a duration hint, and the band of buffer lines spanning the slide). The client animates against its *local* clock by interpolating `top`/cursor and slicing the band per frame. The steady-state render path is unchanged; only animation reads the new payload. This keeps `nxvim-core` pure/synchronous, keeps the client the only place that knows about *time*, and lets a future GUI render the same descriptor at pixel resolution.
+**Architecture:** The server stays authoritative and applies each scroll instantly, but attaches a self-contained `scroll` descriptor to the `redraw` (the from/to viewport+cursor lines, a duration hint, and the band of buffer lines spanning the slide). The client animates against its *local* clock by interpolating `top`/cursor and slicing the band per frame. The steady-state render path is unchanged; only animation reads the new payload. This keeps `bemtvi-core` pure/synchronous, keeps the client the only place that knows about *time*, and lets a future GUI render the same descriptor at pixel resolution.
 
-**Tech Stack:** Rust, tokio (single-threaded runtimes), ratatui/crossterm (TUI client), msgpack-RPC (`rmpv`). Black-box integration tests in `crates/nxvim-server/tests/editing.rs`.
+**Tech Stack:** Rust, tokio (single-threaded runtimes), ratatui/crossterm (TUI client), msgpack-RPC (`rmpv`). Black-box integration tests in `crates/bemtvi-server/tests/editing.rs`.
 
 **Design source:** `docs/specs/2026-05-31-smooth-scrolling-design.md`. Two intentional deviations from the spec, both noted below: (1) the over-scan window lives *inside* the `scroll` payload rather than widening the main `View`, lowering regression risk; (2) the scroll commands are made to move `top` directly (vim-faithful) because today they don't, which would leave the animation with nothing to slide.
 
@@ -12,11 +12,11 @@
 
 ## File Structure
 
-- `crates/nxvim-core/src/editor.rs` — **modify.** Add `PendingScroll` type + two `Editor` fields; rewrite `scroll_half`/`scroll_page` to move the viewport via a new `scroll_by`; record the gesture at the end of `input`; expose + clear it from `view`.
-- `crates/nxvim-core/src/view.rs` — **modify.** Add `ScrollAnim` type and `View::scroll`; build the self-contained window (lines + selection) from `PendingScroll`. Generalize the line/selection builders to an arbitrary `[base, base+count)` range so they serve both the viewport and the window.
-- `crates/nxvim-server/src/lib.rs` — **modify.** Serialize `scroll` into the `redraw` notification map.
-- `crates/nxvim-server/tests/editing.rs` — **modify.** Add a `redraw`-observation helper and the protocol tests.
-- `crates/nxvim-tui/src/lib.rs` — **modify.** Parse the `scroll` payload; add an animation tick to the `select!` loop; interpolate + slice frames; settle/interrupt.
+- `crates/bemtvi-core/src/editor.rs` — **modify.** Add `PendingScroll` type + two `Editor` fields; rewrite `scroll_half`/`scroll_page` to move the viewport via a new `scroll_by`; record the gesture at the end of `input`; expose + clear it from `view`.
+- `crates/bemtvi-core/src/view.rs` — **modify.** Add `ScrollAnim` type and `View::scroll`; build the self-contained window (lines + selection) from `PendingScroll`. Generalize the line/selection builders to an arbitrary `[base, base+count)` range so they serve both the viewport and the window.
+- `crates/bemtvi-server/src/lib.rs` — **modify.** Serialize `scroll` into the `redraw` notification map.
+- `crates/bemtvi-server/tests/editing.rs` — **modify.** Add a `redraw`-observation helper and the protocol tests.
+- `crates/bemtvi-tui/src/lib.rs` — **modify.** Parse the `scroll` payload; add an animation tick to the `select!` loop; interpolate + slice frames; settle/interrupt.
 
 ---
 
@@ -25,7 +25,7 @@
 The black-box suite has no way to read `redraw` notifications yet (tests use `_incoming`). Add a deterministic helper and a baseline assertion to lock the tool in before we change behavior.
 
 **Files:**
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Add the helper and accessors** near the other helpers (after the `cursor` fn, around line 90).
 
@@ -124,13 +124,13 @@ async fn redraw_has_no_scroll_for_plain_motion() {
 
 - [ ] **Step 3: Run it (green — establishes the observation tool).**
 
-Run: `cargo test -p nxvim-server --test editing redraw_has_no_scroll_for_plain_motion`
+Run: `cargo test -p bemtvi-server --test editing redraw_has_no_scroll_for_plain_motion`
 Expected: PASS. (No product code changed yet; this proves the helper observes the existing redraw shape, where `scroll` is simply absent.)
 
 - [ ] **Step 4: Commit.**
 
 ```bash
-git add crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-server/tests/editing.rs
 git commit -m "test: add redraw-observation helper for scroll gestures"
 ```
 
@@ -141,12 +141,12 @@ git commit -m "test: add redraw-observation helper for scroll gestures"
 Because the suite is black-box, the *only* observable contract is the `redraw` payload — so the core viewport change, the `View` projection, and the server serialization land together as one behavior, verified end to end. Write the tests first.
 
 **Files:**
-- Test: `crates/nxvim-server/tests/editing.rs`
-- Modify: `crates/nxvim-core/src/editor.rs`
-- Modify: `crates/nxvim-core/src/view.rs`
-- Modify: `crates/nxvim-server/src/lib.rs:184-237` (the `redraw` fn)
+- Test: `crates/bemtvi-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
+- Modify: `crates/bemtvi-core/src/view.rs`
+- Modify: `crates/bemtvi-server/src/lib.rs:184-237` (the `redraw` fn)
 
-- [ ] **Step 1: Write the failing tests** at the end of `crates/nxvim-server/tests/editing.rs`.
+- [ ] **Step 1: Write the failing tests** at the end of `crates/bemtvi-server/tests/editing.rs`.
 
 ```rust
 #[tokio::test]
@@ -210,10 +210,10 @@ async fn scroll_window_pads_past_end_of_buffer() {
 
 - [ ] **Step 2: Run the tests to verify they fail.**
 
-Run: `cargo test -p nxvim-server --test editing ctrl_d_emits_half_page_scroll`
+Run: `cargo test -p bemtvi-server --test editing ctrl_d_emits_half_page_scroll`
 Expected: FAIL — `scroll` is absent, so `scroll_u64`/`scroll_lines_len` panic with "scroll present".
 
-- [ ] **Step 3: Add the `PendingScroll` type and `Editor` fields** in `crates/nxvim-core/src/editor.rs`.
+- [ ] **Step 3: Add the `PendingScroll` type and `Editor` fields** in `crates/bemtvi-core/src/editor.rs`.
 
 Add this type immediately above `pub struct Editor` (just after the `MoveAxis` block, ~line 61):
 
@@ -250,7 +250,7 @@ Initialize both in `with_buffer` (just after `visual_anchor: Cursor::default(),`
             pending_scroll: None,
 ```
 
-- [ ] **Step 4: Make scroll commands move the viewport and record the gesture.** In `crates/nxvim-core/src/editor.rs`, replace the existing `scroll_half` and `scroll_page` (lines ~1412-1430) with:
+- [ ] **Step 4: Make scroll commands move the viewport and record the gesture.** In `crates/bemtvi-core/src/editor.rs`, replace the existing `scroll_half` and `scroll_page` (lines ~1412-1430) with:
 
 ```rust
     fn scroll_half(&mut self, down: bool) {
@@ -276,7 +276,7 @@ Initialize both in `with_buffer` (just after `visual_anchor: Cursor::default(),`
     }
 ```
 
-- [ ] **Step 5: Build the `PendingScroll` at the end of `input`.** In `crates/nxvim-core/src/editor.rs`, in `pub fn input(&mut self, key: Key)`, replace the trailing `self.ensure_visible();` (line ~173) with:
+- [ ] **Step 5: Build the `PendingScroll` at the end of `input`.** In `crates/bemtvi-core/src/editor.rs`, in `pub fn input(&mut self, key: Key)`, replace the trailing `self.ensure_visible();` (line ~173) with:
 
 ```rust
         self.ensure_visible();
@@ -297,7 +297,7 @@ Initialize both in `with_buffer` (just after `visual_anchor: Cursor::default(),`
         }
 ```
 
-- [ ] **Step 6: Expose + clear the gesture from `view`.** In `crates/nxvim-core/src/editor.rs`, replace the body of `pub fn view` (lines ~191-194) with:
+- [ ] **Step 6: Expose + clear the gesture from `view`.** In `crates/bemtvi-core/src/editor.rs`, replace the body of `pub fn view` (lines ~191-194) with:
 
 ```rust
     pub fn view(&mut self, width: usize, height: usize) -> View {
@@ -316,7 +316,7 @@ And add a crate-visible accessor next to `dims` (after `pub(crate) fn dims`, ~li
     }
 ```
 
-- [ ] **Step 7: Add `ScrollAnim` + `View::scroll` and the window builders.** Replace the entire contents of `crates/nxvim-core/src/view.rs` with:
+- [ ] **Step 7: Add `ScrollAnim` + `View::scroll` and the window builders.** Replace the entire contents of `crates/bemtvi-core/src/view.rs` with:
 
 ```rust
 //! The renderable view of the editor: semantic regions, not a baked grid.
@@ -524,7 +524,7 @@ fn selection_spans(
 }
 ```
 
-- [ ] **Step 8: Serialize `scroll` into the redraw.** In `crates/nxvim-server/src/lib.rs`, inside `fn redraw`, just before `let map = vec![` (line ~203), build the scroll value:
+- [ ] **Step 8: Serialize `scroll` into the redraw.** In `crates/bemtvi-server/src/lib.rs`, inside `fn redraw`, just before `let map = vec![` (line ~203), build the scroll value:
 
 ```rust
         let scroll = match &view.scroll {
@@ -566,7 +566,7 @@ Then add this entry to the `map` vec (after the `selection` entry, ~line 233):
 
 - [ ] **Step 9: Run the new tests to verify they pass.**
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: PASS for `ctrl_d_emits_half_page_scroll`, `ctrl_f_emits_full_page_scroll`, `ctrl_u_at_top_is_not_a_scroll`, `scroll_window_pads_past_end_of_buffer`, and the existing suite (including `redraw_has_no_scroll_for_plain_motion`).
 
 - [ ] **Step 10: Lint.**
@@ -577,8 +577,8 @@ Expected: no warnings.
 - [ ] **Step 11: Commit.**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-core/src/view.rs \
-        crates/nxvim-server/src/lib.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-core/src/view.rs \
+        crates/bemtvi-server/src/lib.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "feat: emit scroll-animation descriptor on viewport scrolls
 
 Scroll commands now move the viewport (top) directly, vim-style, and attach a
@@ -593,9 +593,9 @@ lines spanning the slide) to the redraw. The client will animate it."
 Mirror the new `scroll` field into the client's `View`. No behavior change yet; this is the data plumbing the animation loop will consume. The TUI is UI/time code, so per the project's testing philosophy it's verified by build + clippy here and manually at the end of Task 4 (no unit tests).
 
 **Files:**
-- Modify: `crates/nxvim-tui/src/lib.rs`
+- Modify: `crates/bemtvi-tui/src/lib.rs`
 
-- [ ] **Step 1: Add imports** at the top of `crates/nxvim-tui/src/lib.rs` (after the existing `use` block, ~line 25):
+- [ ] **Step 1: Add imports** at the top of `crates/bemtvi-tui/src/lib.rs` (after the existing `use` block, ~line 25):
 
 ```rust
 use std::time::Duration;
@@ -666,13 +666,13 @@ struct ScrollData {
 
 - [ ] **Step 5: Build (warnings expected).**
 
-Run: `cargo build -p nxvim-tui`
+Run: `cargo build -p bemtvi-tui`
 Expected: compiles successfully. It **will** emit `dead_code` warnings because `ScrollData` and `View::scroll` are written but not yet read — that is correct; Task 4 consumes them. Do **not** run `clippy -D warnings` here (it would fail on those warnings) and do **not** silence them with `#[allow]`. The strict clippy gate runs in Task 4 Step 5 once the fields are used.
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add crates/nxvim-tui/src/lib.rs
+git add crates/bemtvi-tui/src/lib.rs
 git commit -m "feat(tui): parse scroll-animation descriptor from redraw"
 ```
 
@@ -683,7 +683,7 @@ git commit -m "feat(tui): parse scroll-animation descriptor from redraw"
 Drive the animation from the client's local clock: when a redraw carries a `scroll`, interpolate `top`/cursor over its duration, slicing the band per frame; settle on the destination; let any new redraw supersede (the interrupt path).
 
 **Files:**
-- Modify: `crates/nxvim-tui/src/lib.rs`
+- Modify: `crates/bemtvi-tui/src/lib.rs`
 
 - [ ] **Step 1: Add the `Animation` struct and a lerp helper.** Add the import for `Instant` by changing the Step-1 import from Task 3 to:
 
@@ -768,7 +768,7 @@ Then replace the whole `loop { tokio::select! { ... } }` body (lines ~69-101) wi
                         anim = view.scroll.as_ref().map(Animation::new);
                         terminal.draw(|frame| render(frame, &view, anim.as_ref()))?;
                     }
-                    "nxvim_exit" => break,
+                    "bemtvi_exit" => break,
                     _ => {}
                 },
                 Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
@@ -873,8 +873,8 @@ Expected: all pass, including the Task 1/2 redraw tests.
 
 ```bash
 # Make a long file and open it.
-seq 1 500 > /tmp/nxvim_scroll_demo.txt
-cargo run -p nxvim -- /tmp/nxvim_scroll_demo.txt
+seq 1 500 > /tmp/bemtvi_scroll_demo.txt
+cargo run -p bemtvi -- /tmp/bemtvi_scroll_demo.txt
 ```
 In the editor, confirm:
 - `<C-f>` / `<C-d>` slide the viewport (a quick eased line-stepped scroll), not an instant jump; `<C-b>` / `<C-u>` slide back.
@@ -886,7 +886,7 @@ Then `:q` to exit.
 - [ ] **Step 8: Commit.**
 
 ```bash
-git add crates/nxvim-tui/src/lib.rs
+git add crates/bemtvi-tui/src/lib.rs
 git commit -m "feat(tui): animate scroll commands with a local-clock slide
 
 Interpolate top/cursor over the server's suggested duration, slicing the scroll

@@ -2,11 +2,11 @@
 
 **Status:** approved design, pending implementation
 **Date:** 2026-05-30
-**Scope:** `nxvim-core`, `nxvim-server`, `nxvim-tui`, integration tests
+**Scope:** `bemtvi-core`, `bemtvi-server`, `bemtvi-tui`, integration tests
 
 ## Problem
 
-nxvim's rope stores UTF-8 correctly and its editing *primitives* already snap to
+bemtvi's rope stores UTF-8 correctly and its editing *primitives* already snap to
 char boundaries (`floor`/`ceil_char_boundary`, `len_utf8`, `advance_chars`), so
 multibyte text is never corrupted and typing `café` or `日本語` inserts fine. The
 breakage is entirely in **navigation** and **display**:
@@ -89,7 +89,7 @@ core assumes — satisfied by the client expanding tabs itself.
 
 ## Component changes
 
-### `nxvim-core`
+### `bemtvi-core`
 
 **New `unicode` module** — pure, synchronous helpers operating on a line `&str`
 (lines are cheap to materialize via `Buffer::line`, which sidesteps ropey
@@ -109,7 +109,7 @@ chunk-boundary handling for within-line motion):
 
 **Dependencies:** add `unicode-width` and `unicode-segmentation` (already present
 transitively via ratatui) to `[workspace.dependencies]` pinned `=x.y.z`, and pull
-into `nxvim-core` with `<dep>.workspace = true`. Both are pure/synchronous and do
+into `bemtvi-core` with `<dep>.workspace = true`. Both are pure/synchronous and do
 not violate core's purity rule (they are computational, like `ropey`).
 
 **Editor changes (`editor.rs`):**
@@ -134,12 +134,12 @@ not violate core's purity rule (they are computational, like `ropey`).
 cursor on its line). `cursor_col` stays the byte column. Update the module doc
 (which currently says "one display cell per byte").
 
-### `nxvim-server`
+### `bemtvi-server`
 
 - `redraw()` adds `cursor_screen_col` to the notification map.
 - `nvim_win_get_cursor` unchanged (byte column).
 
-### `nxvim-tui`
+### `bemtvi-tui`
 
 - Cursor placement uses `cursor_screen_col` instead of `cursor_col`.
 - Expand tabs → spaces at `tabstop` (8) when rendering the text lines, so painted
@@ -176,7 +176,7 @@ nvim_win_get_cursor: cursor.col (bytes) — unchanged
 
 ## Testing
 
-Black-box integration tests in `crates/nxvim-server/tests/editing.rs`, using the
+Black-box integration tests in `crates/bemtvi-server/tests/editing.rs`, using the
 existing `start`/`feed`/`lines`/`cursor` helpers, plus **one new helper** that
 reads the latest `redraw` notification from the client's `incoming` channel and
 returns `cursor_screen_col` — this is how display-column correctness is asserted
@@ -198,12 +198,12 @@ end-to-end.
 ## Affected files
 
 - `Cargo.toml` — pin `unicode-width`, `unicode-segmentation`.
-- `crates/nxvim-core/Cargo.toml` — add the two deps.
-- `crates/nxvim-core/src/unicode.rs` — new helpers.
-- `crates/nxvim-core/src/editor.rs` — grapheme motion, virtual desired column,
+- `crates/bemtvi-core/Cargo.toml` — add the two deps.
+- `crates/bemtvi-core/src/unicode.rs` — new helpers.
+- `crates/bemtvi-core/src/editor.rs` — grapheme motion, virtual desired column,
   word motions, snapping.
-- `crates/nxvim-core/src/view.rs` — `cursor_screen_col`.
-- `crates/nxvim-server/src/lib.rs` — plumb `cursor_screen_col`.
-- `crates/nxvim-tui/src/lib.rs` — cursor placement, tab expansion, mirror field.
-- `crates/nxvim-server/tests/editing.rs` — new tests + redraw helper.
+- `crates/bemtvi-core/src/view.rs` — `cursor_screen_col`.
+- `crates/bemtvi-server/src/lib.rs` — plumb `cursor_screen_col`.
+- `crates/bemtvi-tui/src/lib.rs` — cursor placement, tab expansion, mirror field.
+- `crates/bemtvi-server/tests/editing.rs` — new tests + redraw helper.
 - `docs/architecture.md` — update the "one cell per byte" caveat once done.

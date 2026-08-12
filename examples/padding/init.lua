@@ -1,11 +1,11 @@
--- ~~~ nxvim window-local 'padding': a blank margin around the text body ~~~
+-- ~~~ bemtvi window-local 'padding': a blank margin around the text body ~~~
 --
 -- Run it (from the repo root) against the sample file:
 --
---     NXVIM_CONFIG=examples/padding \
---       cargo run -p nxvim -- examples/padding/sample.txt
+--     BEMTVI_CONFIG=examples/padding \
+--       cargo run -p bemtvi -- examples/padding/sample.txt
 --
--- 'padding' is nxvim's OWN window-local option — there is no vim equivalent. It
+-- 'padding' is bemtvi's OWN window-local option — there is no vim equivalent. It
 -- leaves a per-side blank margin (in screen cells) around the window's whole
 -- content box: the number gutter, the text, and the status line all inset by it,
 -- so the window reads with breathing room from its rect edges. All-zero (no

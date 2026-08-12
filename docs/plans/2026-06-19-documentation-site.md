@@ -14,12 +14,12 @@ by a single generator (`book/gen/generate.py`, stdlib-only Python 3):
    *imported verbatim* into the book with their relative links rewritten to
    absolute GitHub URLs, so a single edit to the canonical doc updates the book.
 
-2. **`nx.*` API reference** — auto-extracted from the Lua prelude
-   (`crates/nxvim-lua/src/prelude/*.lua`). Every public declaration
-   (`function nx.NS.name(args)` or `nx.NS.name = function(args)`; `nx._private`
+2. **`btv.*` API reference** — auto-extracted from the Lua prelude
+   (`crates/bemtvi-lua/src/prelude/*.lua`). Every public declaration
+   (`function btv.NS.name(args)` or `btv.NS.name = function(args)`; `btv._private`
    excluded) plus the contiguous `--` doc-comment block above it becomes an
-   entry, grouped into one page per top-level namespace (`nx.buf`, `nx.fs`,
-   `nx.lsp`, …). This is the canonical surface per ADR 0002.
+   entry, grouped into one page per top-level namespace (`btv.buf`, `btv.fs`,
+   `btv.lsp`, …). This is the canonical surface per ADR 0002.
 
 The generator also renders `book/src/SUMMARY.md` from `SUMMARY.template.md` (a
 `{{API_REFERENCE}}` placeholder is replaced with the generated namespace list),
@@ -51,7 +51,7 @@ book/
     guide/*.md               # curated getting-started (committed)
     plugins/*.md             # curated plugin-dev (committed)
     architecture/*.md        # imported from docs/ (git-ignored)
-    api/*.md                 # generated nx.* reference (git-ignored)
+    api/*.md                 # generated btv.* reference (git-ignored)
     appendix/*.md            # imported from docs/ (git-ignored)
 .github/workflows/docs.yml  # build + deploy to GitHub Pages
 ```
@@ -61,7 +61,7 @@ book/
 1. **Plan** (this doc).
 2. **Scaffold** — `book.toml`, `SUMMARY.template.md`, committed curated chapters,
    `.gitignore` entries.
-3. **Generator** — `generate.py`: doc-import (with link rewriting) + nx.* API
+3. **Generator** — `generate.py`: doc-import (with link rewriting) + btv.* API
    extraction + SUMMARY rendering. Fail-loud if the prelude dir or a referenced
    source doc is missing (no silent empty pages — per CLAUDE.md).
 4. **Local verify** — install mdBook, run generator + `mdbook build`, confirm the

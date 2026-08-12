@@ -1,4 +1,4 @@
-nx.complete buffer-source playground
+btv.complete buffer-source playground
 =====================================
 
 The buffer source completes from words already present in THIS buffer. To see it

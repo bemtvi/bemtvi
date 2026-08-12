@@ -16,20 +16,20 @@
 > transparently. Phase 3 adds the **`vim.lsp.semantic_tokens` Lua surface** —
 > `start`/`stop`/`force_refresh`/`get_at_pos`, the editor-wide `enable` gate, and
 > `client.server_capabilities.semanticTokensProvider` — over a per-buffer enable
-> flag and a Rust→Lua token mirror; `highlight_token` stays a loud `nx._notimpl`
+> flag and a Rust→Lua token mirror; `highlight_token` stays a loud `btv._notimpl`
 > gap. The remaining gaps are the per-phase *approximations* below (one group per
 > cell, theme-gated, no `range`, `highlight_token`).
 
 ## Why this document exists
 
 ADR 0001 names three highlight bridges of one shape — a vendored/async enrichment
-projected into nxvim's own highlight layer at the right priority, always *over* the
+projected into bemtvi's own highlight layer at the right priority, always *over* the
 synchronous treesitter floor so a slow or absent server degrades to "syntactic but
 correct," never to blank. Two are built (`vim.treesitter.start`, the query
 bridge). The third — **semantic tokens** — is described there as the open wire:
 
 > **LSP semantic tokens** — async, server-side. Cached on arrival and projected as
-> extmarks *above* the treesitter floor. Request plumbing exists in `nxvim-lsp`;
+> extmarks *above* the treesitter floor. Request plumbing exists in `bemtvi-lsp`;
 > the response→extmark projection is the open wire.
 
 Semantic tokens are the server's *authoritative* classification of every token in
@@ -40,28 +40,28 @@ A real nvim setup paints them at priority `125`, just over the treesitter floor
 
 The fail-loud, no-silent-stub rule from the
 [LSP completion plan](2026-06-05-lsp-completion.md) applies: a part of the API we
-don't honor yet stays a documented approximation or raises through `nx._notimpl`
+don't honor yet stays a documented approximation or raises through `btv._notimpl`
 — never a silent no-op that looks like it worked.
 
 ## What's already in place (the seams these phases extend)
 
 - **The projection / merge layer.** `Server::highlights_for`
-  (`crates/nxvim-server/src/treesitter.rs`) already merges treesitter spans
-  (priority `nxvim_core::TS_HL_PRIORITY = 100`) with the line's hl_group extmarks
-  (`nxvim_core::DEFAULT_PRIORITY = 4096`) through
+  (`crates/bemtvi-server/src/treesitter.rs`) already merges treesitter spans
+  (priority `bemtvi_core::TS_HL_PRIORITY = 100`) with the line's hl_group extmarks
+  (`bemtvi_core::DEFAULT_PRIORITY = 4096`) through
   `crate::extmarks::merge_intervals`, emitting one non-overlapping winning span
   list under the `highlights` window key. Semantic tokens become a **third source
   of `HlInterval`s** at priority `125` — no new render key, no client change.
-- **The per-buffer LSP state.** `LspDocState` (`crates/nxvim-server/src/lsp/mod.rs`)
+- **The per-buffer LSP state.** `LspDocState` (`crates/bemtvi-server/src/lsp/mod.rs`)
   holds the document-sync bookkeeping and the `diagnostics` cache, keyed by
   `BufferId` in `Server::lsp_states`. The token cache is a new field beside it.
 - **Per-server runtime + caps capture.** `ServerRuntime` (encoding, sync_kind,
   client_id) is built from the `initialize` reply in `Server::on_lsp_event`
-  (`lsp/sync.rs`), out of `ServerCaps` (`nxvim-lsp/protocol.rs`), itself distilled
-  by `provider_caps` / `encoding_of` / `sync_kind_of` (`nxvim-lsp/client.rs`). The
+  (`lsp/sync.rs`), out of `ServerCaps` (`bemtvi-lsp/protocol.rs`), itself distilled
+  by `provider_caps` / `encoding_of` / `sync_kind_of` (`bemtvi-lsp/client.rs`). The
   **legend** rides the same path as a new distilled field.
 - **The typed request/reply machinery.** `LspRequest`/`LspReply`
-  (`nxvim-lsp/protocol.rs`), `LspReqKind` + the generation/tick stale-drop gate
+  (`bemtvi-lsp/protocol.rs`), `LspReqKind` + the generation/tick stale-drop gate
   (`lsp/mod.rs`, `lsp/request.rs`). Semantic tokens add one `LspReqKind`, one
   `LspRequest` variant, one `LspReply` variant — but request *whole-buffer*, not
   at the cursor, and refresh on edit rather than on cursor move.
@@ -69,11 +69,11 @@ don't honor yet stays a documented approximation or raises through `nx._notimpl`
   `virtcol` tab/wide-char screen-column mapping the diagnostics underline uses are
   exactly what decode needs (LSP char offsets → bytes → screen columns).
 - **The client capabilities handshake.** `client_capabilities()`
-  (`nxvim-lsp/client.rs`) is where we advertise `textDocument.semanticTokens` so
+  (`bemtvi-lsp/client.rs`) is where we advertise `textDocument.semanticTokens` so
   the server returns its legend and answers the request.
-- **The scripted mock + redraw test harness.** `nxvim-lsp/src/mock.rs` scripts
-  deterministic replies per method; the `crates/nxvim/tests/lsp/` and
-  `crates/nxvim-server/tests/` suites drive it over the in-process pipe and assert
+- **The scripted mock + redraw test harness.** `bemtvi-lsp/src/mock.rs` scripts
+  deterministic replies per method; the `crates/bemtvi/tests/lsp/` and
+  `crates/bemtvi-server/tests/` suites drive it over the in-process pipe and assert
   on `nvim_buf_get_lines` / the `redraw` view. A `semantic_tokens` script field +
   a `highlights`-key assertion is the test shape.
 
@@ -101,46 +101,46 @@ establishes the legend-decode machinery and the third-source merge the later
 phases reuse.
 
 **Scope (files).**
-- `crates/nxvim-lsp/src/client.rs` — `client_capabilities()` advertises
+- `crates/bemtvi-lsp/src/client.rs` — `client_capabilities()` advertises
   `text_document.semantic_tokens` (`SemanticTokensClientCapabilities`: request the
   `full` token set, declare the token-type/modifier vocabulary we understand,
   formats `relative`). Add a `legend` field to the distilled `ServerCaps` (the
   `semanticTokensProvider.legend.{tokenTypes,tokenModifiers}` string arrays), set
   by a new `semantic_legend(caps)` distiller beside `provider_caps`; surface a
   `semantic_tokens: bool` in `ProviderCaps`.
-- `crates/nxvim-lsp/src/protocol.rs` — `LspRequest::SemanticTokensFull { uri }`;
+- `crates/bemtvi-lsp/src/protocol.rs` — `LspRequest::SemanticTokensFull { uri }`;
   `LspReply::SemanticTokens(SemanticTokensData)` where `SemanticTokensData` carries
   the server's `result_id: Option<String>` and the raw `data: Vec<u32>` (the
   manager forwards the packed array verbatim — decode happens editor-side, where
   the buffer text and encoding live, mirroring how completion edit ranges stay in
   the negotiated encoding for the editor to convert). `ServerCaps.legend`.
-- `crates/nxvim-lsp/src/manager.rs` / `dispatch.rs` — issue the typed
+- `crates/bemtvi-lsp/src/manager.rs` / `dispatch.rs` — issue the typed
   `semanticTokens/full` request and normalize the `SemanticTokens` /
   `SemanticTokensPartialResult` reply shapes to `SemanticTokensData`; carry the
   legend on `LspEvent::Initialized`.
-- `crates/nxvim-server/src/lsp/mod.rs` — `LspReqKind::SemanticTokens`; store the
+- `crates/bemtvi-server/src/lsp/mod.rs` — `LspReqKind::SemanticTokens`; store the
   legend on `ServerRuntime`; a `SemanticTokens` cache type on `LspDocState`
   (`result_id`, the raw `data`, and the decoded **per-line byte spans** keyed like
   the syntax `spans`, each `{ start, end, group }`).
-- `crates/nxvim-server/src/lsp/sync.rs` — capture `legend` into `ServerRuntime` on
+- `crates/bemtvi-server/src/lsp/sync.rs` — capture `legend` into `ServerRuntime` on
   `Initialized`; fire a `semanticTokens/full` request when a buffer opens and after
   a `didChange` is flushed (gated on the server advertising support), under the
   same dirty/coalescing the sync loop already runs — debounced to the post-change
   flush, not per keystroke.
-- `crates/nxvim-server/src/lsp/request.rs` — register/dispatch the request; on the
+- `crates/bemtvi-server/src/lsp/request.rs` — register/dispatch the request; on the
   reply, decode `data` against the server's legend + encoding into per-line byte
   spans and cache them; mark `lsp_dirty`. The stale-drop gate is **content-version
   (`tick`)**, not cursor (tokens are whole-buffer): a reply computed against
   superseded text is dropped, exactly like the formatting apply-guard.
-- `crates/nxvim-server/src/lsp/semantic.rs` *(new)* — the decode + projection:
+- `crates/bemtvi-server/src/lsp/semantic.rs` *(new)* — the decode + projection:
   `decode_semantic_tokens(data, legend, encoding, buffer)` (cumulative
   `(deltaLine, deltaStartChar, length, tokenType, tokenModifiers)` 5-tuples →
   absolute `(line, char, len)` → bytes → per-line spans, resolving each token to
   its **most-specific resolvable** `@lsp.*` group) and `semantic_intervals(buffer,
   line_idx)` returning the line's `HlInterval`s at priority `125`.
-- `crates/nxvim-server/src/treesitter.rs` — `highlights_for` folds the semantic
+- `crates/bemtvi-server/src/treesitter.rs` — `highlights_for` folds the semantic
   intervals in as a third merge source (between TS and extmarks by priority).
-- `crates/nxvim-lsp/src/mock.rs` — a `semantic_tokens` script field (a legend +
+- `crates/bemtvi-lsp/src/mock.rs` — a `semantic_tokens` script field (a legend +
   packed `data`) returned for `semanticTokens/full`, plus the legend in the mock's
   advertised `initialize` capabilities.
 
@@ -166,16 +166,16 @@ phases reuse.
 - **Priority `125`.** Neovim's `vim.highlight.priorities.semantic_tokens`. Above
   `TS_HL_PRIORITY` (100), below `DEFAULT_PRIORITY` (4096), so a user extmark still
   wins. Add `SEMANTIC_HL_PRIORITY = 125` next to the others in
-  `nxvim-core/src/extmark.rs`.
-- **One group per cell (approximation).** nxvim's `cell_style` takes the *winning*
+  `bemtvi-core/src/extmark.rs`.
+- **One group per cell (approximation).** bemtvi's `cell_style` takes the *winning*
   span and does not blend stacked hl_groups, so a token paints its single
   most-specific resolvable group rather than neovim's stack of
   type + per-modifier extmarks. This matches how the merge layer already resolves
   treesitter/extmark overlaps to one winner — recorded as an approximation, not a
   silent divergence.
 
-**Tests** (`crates/nxvim/tests/lsp/` via the scripted mock + redraw, and a Tier-2
-paint test under `crates/nxvim-server/tests/`):
+**Tests** (`crates/bemtvi/tests/lsp/` via the scripted mock + redraw, and a Tier-2
+paint test under `crates/bemtvi-server/tests/`):
 - a `semanticTokens/full` reply with a legend + packed data paints the named token
   span in the window's `highlights` with the resolved `@lsp.type.*` style, over the
   treesitter group it overlaps;
@@ -202,7 +202,7 @@ packed `SemanticTokensData`) are issued from `sync_lsp` on open + after each
 normalized in `dispatch.rs`. The reply is stale-dropped on the *issuing buffer's*
 content (`tick`) change, decoded against that buffer's legend + encoding into the
 per-line `SemanticTokensCache.spans` on `LspDocState`
-(`crates/nxvim-server/src/lsp/semantic.rs`), and projected by `semantic_intervals`
+(`crates/bemtvi-server/src/lsp/semantic.rs`), and projected by `semantic_intervals`
 at `SEMANTIC_HL_PRIORITY = 125` as a third source folded into `highlights_for`'s
 `merge_intervals` (between treesitter at 100 and extmarks at 4096). Resolution is
 server-side and a token whose candidate `@lsp.*` groups all fail to resolve is
@@ -211,8 +211,8 @@ Verified by `semantic_tokens_paint_over_the_treesitter_floor` /
 `an_undefined_semantic_group_is_dropped_so_treesitter_shows` /
 `semantic_token_columns_are_encoding_correct` /
 `editing_re_requests_and_repaints_semantic_tokens`
-(`crates/nxvim/tests/lsp/semantic.rs`), and end-to-end against real `lua_ls` (it
-advertises a legend → nxvim captures it → `→ semanticTokens/full` fires on open and
+(`crates/bemtvi/tests/lsp/semantic.rs`), and end-to-end against real `lua_ls` (it
+advertises a legend → bemtvi captures it → `→ semanticTokens/full` fires on open and
 change). Runnable demo: `examples/semantic-tokens/`.
 
 *Known approximations:* one resolvable group per cell (no neovim-style
@@ -239,13 +239,13 @@ real editor uses for the steady-state. It is a pure optimization over Phase 1's
 cache — same paint, less wire.
 
 **Scope.**
-- `crates/nxvim-lsp/src/protocol.rs` — `LspRequest::SemanticTokensDelta { uri,
+- `crates/bemtvi-lsp/src/protocol.rs` — `LspRequest::SemanticTokensDelta { uri,
   previous_result_id }`; the reply normalizes both `SemanticTokens` (a fresh full
   set) and `SemanticTokensDelta` (an `edits: [{ start, deleteCount, data }]` list)
   into the existing `SemanticTokensData` plus an `edits` discriminant.
-- `crates/nxvim-lsp/src/manager.rs` / `client.rs` — declare `delta` support in the
+- `crates/bemtvi-lsp/src/manager.rs` / `client.rs` — declare `delta` support in the
   client capability; issue `full/delta` when a `previousResultId` is known.
-- `crates/nxvim-server/src/lsp/{request.rs,semantic.rs}` — choose `full` vs.
+- `crates/bemtvi-server/src/lsp/{request.rs,semantic.rs}` — choose `full` vs.
   `full/delta` by whether the cache holds a `result_id`; apply the splice edits
   (`data.splice(start..start+deleteCount, new)`) to the cached array, then
   re-decode the whole (cheap) array. A delta whose `previousResultId` no longer
@@ -266,9 +266,9 @@ and correct — the win is wire size, not decode cost, which is already negligib
 **Done when.** ✅ Once a buffer has cached a `resultId` *and* its server advertised
 `semanticTokensProvider.full.delta`, every refresh sends
 `LspRequest::SemanticTokensDelta { previous_result_id }` instead of `…Full` (the
-choice is in `request_semantic_tokens`, `crates/nxvim-server/src/lsp/semantic.rs`,
+choice is in `request_semantic_tokens`, `crates/bemtvi-server/src/lsp/semantic.rs`,
 gated on the new `ServerRuntime.semantic_tokens_delta` captured from caps by
-`semantic_tokens_delta(caps)` in `nxvim-lsp/client.rs`). The reply
+`semantic_tokens_delta(caps)` in `bemtvi-lsp/client.rs`). The reply
 (`LspReply::SemanticTokens`) is now a `SemanticTokensData::{Full,Delta}` enum
 normalized in `dispatch.rs`: a `TokensDelta`/`PartialTokensDelta` becomes `Delta`,
 a `Tokens` (the server's full-set fallback) becomes `Full`. `on_semantic_tokens_reply`
@@ -282,8 +282,8 @@ the cache and re-requests `full`. The client advertises
 prior `resultId`) / `a_delta_patches_the_cached_token_array` (a scripted edit
 repaints to match the equivalent full set) /
 `a_delta_request_answered_with_a_full_set_replaces_the_cache` (the Tokens-variant
-fallback) (`crates/nxvim/tests/lsp/semantic.rs`), the scripted-delta mock
-(`nxvim-lsp/src/mock.rs`), and the extended `examples/semantic-tokens/`.
+fallback) (`crates/bemtvi/tests/lsp/semantic.rs`), the scripted-delta mock
+(`bemtvi-lsp/src/mock.rs`), and the extended `examples/semantic-tokens/`.
 
 **Depends on.** Phase 1 (the cache + decode).
 
@@ -303,18 +303,18 @@ feature off per buffer or forces a refresh, and how an `on_attach` branches on
 `client.server_capabilities.semanticTokensProvider`.
 
 **Scope.**
-- `crates/nxvim-lsp/src/protocol.rs` / `client.rs` — `ProviderCaps.semantic_tokens`
+- `crates/bemtvi-lsp/src/protocol.rs` / `client.rs` — `ProviderCaps.semantic_tokens`
   → `provider_caps_to_lua` so `client.server_capabilities.semanticTokensProvider`
   reads truthy (Phase 1 already plumbs the bool; this exposes it to Lua).
-- `crates/nxvim-lua/src/prelude/lsp.lua` — `vim.lsp.semantic_tokens` table:
+- `crates/bemtvi-lua/src/prelude/lsp.lua` — `vim.lsp.semantic_tokens` table:
   `start(bufnr, client_id, opts)` / `stop(bufnr, client_id)` →
-  `nx._lsp_semantic(bufnr, on)` ops enabling/disabling the per-buffer projection;
+  `btv._lsp_semantic(bufnr, on)` ops enabling/disabling the per-buffer projection;
   `force_refresh(bufnr)` → re-request; `get_at_pos(bufnr, row, col)` → the cached
   token(s) under a position (read from the mirror). `highlight_token` (the
-  per-token highlight-customization callback) stays `nx._notimpl` for v1 — it
+  per-token highlight-customization callback) stays `btv._notimpl` for v1 — it
   needs a Lua callback on the decode hot path, out of scope — recorded as a loud
   gap.
-- `crates/nxvim-lua/src/ops.rs` + `crates/nxvim-server/src/lsp/sync.rs` — the
+- `crates/bemtvi-lua/src/ops.rs` + `crates/bemtvi-server/src/lsp/sync.rs` — the
   enable/disable/refresh ops; a per-buffer `semantic_enabled` flag on `LspDocState`
   consulted by the projection (auto-on when the server advertises support, off when
   `stop`ped or globally disabled).
@@ -339,7 +339,7 @@ deep-customization hooks fail loud.
 **Done when.** ✅ `vim.lsp.semantic_tokens.start`/`stop`/`force_refresh`/`get_at_pos`
 drive the per-buffer projection from user Lua, `semanticTokensProvider` is readable
 on `client.server_capabilities`, an editor-wide gate disables the feature, and the
-genuinely-unimplemented `highlight_token` raises through `nx._notimpl` rather than
+genuinely-unimplemented `highlight_token` raises through `btv._notimpl` rather than
 no-op.
 
 The capability exposure threads `ProviderCaps.semantic_tokens` (Phase 1) →
@@ -347,7 +347,7 @@ The capability exposure threads `ProviderCaps.semantic_tokens` (Phase 1) →
 `caps.set("semanticTokensProvider", …)` in `LuaRuntime::set_lsp_client`, so
 `client.server_capabilities.semanticTokensProvider` reads truthy for a server that
 advertised a legend, falsy otherwise. The control surface
-(`crates/nxvim-lua/src/prelude/lsp.lua`) resolves `0`/`nil` → the current buffer
+(`crates/bemtvi-lua/src/prelude/lsp.lua`) resolves `0`/`nil` → the current buffer
 and enqueues an `LspOp`: `start`/`stop` → `LspOp::SemanticTokensEnable { bufnr,
 enabled }` (sets the per-buffer `LspDocState::semantic_enabled` override —
 `Some(false)` hides the paint, the cache surviving so `start` repaints without a
@@ -357,18 +357,18 @@ round-trip, and `start` re-requests a cold cache); `force_refresh` →
 `Server::semantic_tokens_enabled` gate, re-requesting every attached buffer when
 flipped back on). Both `semantic_intervals` (the projection) and
 `request_semantic_tokens` consult the global gate and the per-buffer flag.
-`get_at_pos` reads a new Rust→Lua mirror `nx._semantic_tokens[bufnr]` (the
+`get_at_pos` reads a new Rust→Lua mirror `btv._semantic_tokens[bufnr]` (the
 diagnostics-mirror analogue): `on_semantic_tokens_reply` pushes the decoded tokens
 (`{ line, start_col, end_col, type, modifiers, client_id }`, byte columns) via
 `LuaRuntime::set_semantic_tokens` each reply, built from the `SemanticSpan`'s new
-`ty`/`mods` fields. `highlight_token` raises `nx._notimpl`. Verified by
+`ty`/`mods` fields. `highlight_token` raises `btv._notimpl`. Verified by
 `stop_hides_the_paint_and_start_restores_it` /
 `the_editor_wide_gate_off_hides_all_semantic_paint` /
 `force_refresh_re_issues_a_full_request` /
 `server_capabilities_reports_the_semantic_tokens_provider` /
 `server_without_a_legend_reports_no_semantic_tokens_provider` /
 `get_at_pos_returns_the_token_under_the_position`
-(`crates/nxvim/tests/lsp/semantic.rs`). The demo's `on_attach` branches on
+(`crates/bemtvi/tests/lsp/semantic.rs`). The demo's `on_attach` branches on
 `client.server_capabilities.semanticTokensProvider`, with keymaps for
 stop/start/force_refresh/get_at_pos (`examples/semantic-tokens/`).
 
@@ -376,7 +376,7 @@ stop/start/force_refresh/get_at_pos (`examples/semantic-tokens/`).
 per-buffer enable flag (a `stop`ped buffer still answers from its surviving cache —
 neovim returns nothing once a buffer is stopped); auto-enable is the default and
 `start`/`stop` are a per-buffer override (no per-client granularity — `client_id`
-is accepted but nxvim keeps one semantic cache per buffer); `highlight_token` is a
+is accepted but bemtvi keeps one semantic cache per buffer); `highlight_token` is a
 loud gap.
 
 **Depends on.** Phase 1 (the projection + cache). Independent of Phase 2.
@@ -385,7 +385,7 @@ loud gap.
 
 ## Known approximations to expect
 
-- **One group per cell.** nxvim's `cell_style` takes the winning span and does not
+- **One group per cell.** bemtvi's `cell_style` takes the winning span and does not
   blend stacked hl_groups; a token paints its single most-specific resolvable
   `@lsp.*` group, not neovim's stack of `@lsp.type.<t>` + one
   `@lsp.mod.<m>` / `@lsp.typemod.<t>.<m>` per modifier. (Same single-winner model
@@ -397,7 +397,7 @@ loud gap.
   `semanticTokens/range` (the viewport-scoped request neovim uses for huge files)
   is unsupported — the whole document is tokenized.
 - **`highlight_token` is a loud gap.** The per-token highlight-customization
-  callback raises `nx._notimpl` (it would put a Lua call on the decode path).
+  callback raises `btv._notimpl` (it would put a Lua call on the decode path).
 - **`update_in_insert`-equivalent is always on.** Tokens repaint as soon as a reply
   lands, including mid-insert; neovim can defer. Out of scope.
 

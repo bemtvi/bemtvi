@@ -2,7 +2,7 @@
 -- Async event model — what a handler may return, and what the editor guarantees.
 --
 -- Run:
---   NXVIM_CONFIG=examples/async-events cargo run -p nxvim -- examples/async-events/sample.txt
+--   BEMTVI_CONFIG=examples/async-events cargo run -p bemtvi -- examples/async-events/sample.txt
 --
 -- Background: docs/autocmd-events.md, "Hot-path events are synchronous" and
 -- "What happens when a handler is async".
@@ -21,14 +21,14 @@
 -- The async work below still runs; it is simply not RETURNED. Uncomment the
 -- `return` to see the raise:
 --     E5108: ... CursorMoved handlers must be synchronous (registered at ...):
---     ... Start the async work with nx.schedule / nx.on_next_tick ...
+--     ... Start the async work with btv.schedule / btv.on_next_tick ...
 --------------------------------------------------------------------------------
 local moves = 0
-nx.autocmd.create("CursorMoved", {
+btv.autocmd.create("CursorMoved", {
   callback = function()
     moves = moves + 1
     -- return                      -- <- uncomment this word to see the hard error
-    nx.promise.delay(1):next(function()
+    btv.promise.delay(1):next(function()
       print("cursor moves: " .. moves .. "  (async work, not returned)")
     end)
   end,
@@ -46,18 +46,18 @@ nx.autocmd.create("CursorMoved", {
 --             Without gating you would instead see FileType fire first, with the
 --             extension-derived filetype, and a second FileType afterwards.
 --------------------------------------------------------------------------------
-nx.autocmd.create("BufReadPost", {
+btv.autocmd.create("BufReadPost", {
   pattern = "*/sample.txt",
   callback = function(a)
     print("2. BufReadPost start (async, 50ms)")
-    return nx.promise.delay(50):next(function()
-      nx.bo[a.buf].filetype = "demo"
+    return btv.promise.delay(50):next(function()
+      btv.bo[a.buf].filetype = "demo"
       print("2. BufReadPost done (async)")
     end)
   end,
 })
 
-nx.autocmd.create("FileType", {
+btv.autocmd.create("FileType", {
   pattern = "demo",
   callback = function(a)
     print("2. FileType = " .. a.match .. " (after the async read handler settled)")
@@ -79,11 +79,11 @@ nx.autocmd.create("FileType", {
 -- Note it fires ONCE. Delivery is filtered by registration order, so handlers
 -- that already ran are never re-run.
 --------------------------------------------------------------------------------
-nx.autocmd.create("FileType", {
+btv.autocmd.create("FileType", {
   pattern = "demo",
   callback = function()
-    return nx.promise.delay(10):next(function()
-      nx.autocmd.create("FileType", {
+    return btv.promise.delay(10):next(function()
+      btv.autocmd.create("FileType", {
         pattern = "demo",
         callback = function(a)
           print("3. late subscriber ran for " .. a.match)
@@ -109,11 +109,11 @@ nx.autocmd.create("FileType", {
 -- Raise `timeout` for a handler you know is legitimately slow (a first LSP
 -- spawn, say) so it does not warn on every open.
 --------------------------------------------------------------------------------
-nx.autocmd.create("BufWinEnter", {
+btv.autocmd.create("BufWinEnter", {
   pattern = "*/sample.txt",
   timeout = 40,
   callback = function()
-    return nx.promise.delay(400):next(function()
+    return btv.promise.delay(400):next(function()
       print("4. the slow handler finally finished")
     end)
   end,
@@ -123,21 +123,21 @@ nx.autocmd.create("BufWinEnter", {
 -- 5. A handler that NEVER settles stays visible.
 --
 -- It never reports completion, so it would otherwise be invisible. It is listed
--- in nx.autocmd.pending() with its event, site, elapsed time and budget.
+-- in btv.autocmd.pending() with its event, site, elapsed time and budget.
 --
--- Type-this:  :lua print(vim.inspect(nx.autocmd.pending()))<CR>
+-- Type-this:  :lua print(vim.inspect(btv.autocmd.pending()))<CR>
 -- See-that:   one entry, event = "User", site = this file, elapsed_ms growing.
 --------------------------------------------------------------------------------
-nx.autocmd.create("User", {
+btv.autocmd.create("User", {
   pattern = "NeverSettles",
   timeout = 50,
   callback = function()
-    return nx.promise.new(function() end) -- nobody ever resolves this
+    return btv.promise.new(function() end) -- nobody ever resolves this
   end,
 })
-nx.autocmd.create("VimEnter", {
+btv.autocmd.create("VimEnter", {
   callback = function()
-    nx.autocmd.exec("User", { pattern = "NeverSettles" })
-    print("5. fired User NeverSettles — see :lua print(vim.inspect(nx.autocmd.pending()))")
+    btv.autocmd.exec("User", { pattern = "NeverSettles" })
+    print("5. fired User NeverSettles — see :lua print(vim.inspect(btv.autocmd.pending()))")
   end,
 })

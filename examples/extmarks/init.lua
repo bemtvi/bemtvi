@@ -1,14 +1,14 @@
--- ~~~ nxvim extmarks playground: paint highlights from Lua, watch them track ~~~
+-- ~~~ bemtvi extmarks playground: paint highlights from Lua, watch them track ~~~
 --
--- This drives the decoration layer — neovim's extmark API on nxvim. An *extmark*
+-- This drives the decoration layer — neovim's extmark API on bemtvi. An *extmark*
 -- anchors a highlight group to a byte range in a buffer; it shifts with edits and
 -- is grouped under a *namespace* you can clear all at once. LSP semantic tokens,
 -- git-status-gutter plugins, and diagnostics-as-marks are all built on this surface.
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/extmarks \
---       cargo run -p nxvim -- examples/extmarks/sample.txt
+--     BEMTVI_CONFIG=examples/extmarks \
+--       cargo run -p bemtvi -- examples/extmarks/sample.txt
 --
 -- On startup a few marks are painted (see below). Then try the commands.
 

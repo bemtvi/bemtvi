@@ -1,5 +1,5 @@
 # git-cliff configuration — https://git-cliff.org
-# Conventional-commit changelog for nxvim. The rolling `edge` tag is ignored so
+# Conventional-commit changelog for bemtvi. The rolling `edge` tag is ignored so
 # it is never treated as a release boundary.
 
 [changelog]

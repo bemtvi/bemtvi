@@ -8,8 +8,8 @@ In a daemon/SSH session the **edit-host runs locally** while files live on the
 1. **The daemon's process cwd** (remote). Relative `:e foo.txt` resolves against
    it, because `drain_pending_opens` ships the *raw* relative path over `fs_read`
    and the daemon resolves it against its own `std::env::current_dir()`. This is
-   why `:e /`, the remote explorer, and `nx.fs` reads all see the remote fs.
-2. **The edit-host's `DirState`** (`crates/nxvim-server/src/cwd.rs`), seeded from
+   why `:e /`, the remote explorer, and `btv.fs` reads all see the remote fs.
+2. **The edit-host's `DirState`** (`crates/bemtvi-server/src/cwd.rs`), seeded from
    the **local** `std::env::current_dir()` at startup (`lib.rs:1024`). `:cd`,
    `:pwd`, `vim.fn.getcwd`, and `fix_current_dir` all drive / read it via
    `std::env::set_current_dir` / `current_dir` (`excmd.rs:244-294`,
@@ -33,7 +33,7 @@ remote-only path can't be `set_current_dir`'d locally anyway). Concretely:
   at the newly-focused window's effective dir — so per-window `:lcd` still scopes
   relative resolution correctly with one remote cwd.
 - **`:pwd` / `getcwd()`** read the authoritative cwd (the `DirState` effective
-  dir / a `nx._cwd` mirror), not `std::env`. Equivalent to today for local
+  dir / a `btv._cwd` mirror), not `std::env`. Equivalent to today for local
   sessions; correct for remote.
 - **Startup** seeds `DirState` from the daemon's cwd (handshake), so a fresh
   remote session's `:pwd` already shows the remote dir.
@@ -59,9 +59,9 @@ sessions unchanged. `:cd` still local-only after this phase (Phase 2).
   `main.rs` into a new `ServerInit.remote_cwd: Option<PathBuf>`, and have
   `lib.rs run()` seed `DirState::new(remote_cwd.unwrap_or_else(local cwd))`.
 - **Authoritative-cwd mirror.** The server already keeps `DirState` as the source
-  of truth; expose the current effective dir to Lua as `nx._cwd` (set wherever the
+  of truth; expose the current effective dir to Lua as `btv._cwd` (set wherever the
   buffer/cursor mirrors are refreshed in `effects.rs`, and on `:cd`/focus change).
-  Re-point `vim.fn.getcwd()` to read `nx._cwd` (fall back to `std::env` when the
+  Re-point `vim.fn.getcwd()` to read `btv._cwd` (fall back to `std::env` when the
   mirror is unset, preserving the local path math). Keep the mirror equal to the
   process cwd in local sessions so nothing observable changes there.
 - **`ex_pwd` reads `DirState::effective`** instead of `std::env::current_dir()`.
@@ -89,14 +89,14 @@ absolutizes its own relative paths against `DirState` before they cross the wire
   — *no* process chdir. `serve_chdir` in the `serve_fs_daemon` request arm;
   `RemoteHostFs::chdir` + a `HostFsAsync::chdir` (default = loud "Unsupported", so a
   backend without it fails rather than silently succeeding).
-- **No `nxvim-core` change.** `:cd` is already a *server*-side ex-command
+- **No `bemtvi-core` change.** `:cd` is already a *server*-side ex-command
   (`excmd.rs`), so the off-tick job stays server-side (no `PendingChdir` in core).
   `ex_chdir`'s remote branch resolves `-` (DirState.prev) and relative args (join
   `DirState::effective`) edit-host-side, passes `""`/`~`/absolute through for the
   daemon, then calls `HostEffects::fs_chdir(target, ChdirCtx{scope,win,tab})`.
 - **Apply on ack.** `NativeEffects::fs_chdir` spawns the daemon `fs_chdir`; the
   reply lands on the run loop's `chdir_done_rx` arm → `on_chdir_dones` →
-  `apply_chdir`: on `["ok", canonical]` it `DirState::set` + refreshes `nx._cwd` +
+  `apply_chdir`: on `["ok", canonical]` it `DirState::set` + refreshes `btv._cwd` +
   fires `DirChanged`; on error it echoes the daemon's `E344` — no silent swallow.
 - **Relative opens follow `:cd`.** `drain_pending_opens` absolutizes a *relative*
   open against `DirState::effective` before `fs_fetch` (the daemon has no per-session
@@ -104,7 +104,7 @@ absolutizes its own relative paths against `DirState` before they cross the wire
   remote `:e foo` now names its buffer with the absolute path — consistent with the
   all-absolute remote-buffer convention, and it keeps reload identity stable.)
 - **`fix_current_dir` remote-aware.** Already handled in Phase 1: in a daemon
-  session it only refreshes the `nx._cwd` mirror to the focused window's effective
+  session it only refreshes the `btv._cwd` mirror to the focused window's effective
   dir (no local `set_current_dir`, no daemon round trip — the daemon is stateless,
   so a focus switch just re-points which `DirState` entry `getcwd` reads).
 
@@ -118,7 +118,7 @@ Phase 2 made `:cd` validate remotely but land a *tick later*, so a quick `:cd X`
 then relative `:e Y` (or `getcwd`) saw the **old** cwd until the ack. Phase 3
 closes that race and adds the focus-switch announce.
 
-- **Optimistic move.** `ex_chdir`'s remote branch now moves `DirState` + `nx._cwd`
+- **Optimistic move.** `ex_chdir`'s remote branch now moves `DirState` + `btv._cwd`
   *immediately* (lexically resolving `-`/relative/absolute targets; `""`/`~` still
   defer, since only the daemon knows its `$HOME`), so an `:e`/`getcwd` in the same
   tick sees the new dir. The announcing `DirChanged` is deferred to the ack.

@@ -15,7 +15,7 @@ func Greet(name string) {
 
 func Configure() {
 	// golangci-lint (errcheck): the returned error is dropped on the floor.
-	os.Mkdir("/tmp/nxvim-example", 0o755)
+	os.Mkdir("/tmp/bemtvi-example", 0o755)
 
 	// golangci-lint (ineffassign): assigned, then overwritten before any read.
 	count := 1

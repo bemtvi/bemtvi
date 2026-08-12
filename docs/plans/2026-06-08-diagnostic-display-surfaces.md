@@ -1,7 +1,7 @@
 # Diagnostic display surfaces — completion plan
 
 > **Status: complete (Phases 1–3 done).**
-> nxvim caches `publishDiagnostics` per buffer and paints the underline squiggles,
+> bemtvi caches `publishDiagnostics` per buffer and paints the underline squiggles,
 > the inline **virtual text** (Phase 1), and the gutter **sign column** (Phase 2),
 > plus an under-cursor message line, the `:LspDiagnostics` loclist, `[d`/`]d`
 > navigation, and the on-demand **float** (`vim.diagnostic.open_float`, Phase 3).
@@ -12,7 +12,7 @@
 > typing goes quiet, or until `InsertLeave`, whichever comes first);
 > `open_float` honors the `float` surface (only the `config.float` defaults that
 > pre-style it, and the filter keys, stay stored Lua-side but **inert** — the
-> `INCOMPLETE` tag in `crates/nxvim-lua/src/prelude/diagnostic.lua`). All three
+> `INCOMPLETE` tag in `crates/bemtvi-lua/src/prelude/diagnostic.lua`). All three
 > diagnostic surfaces neovim users expect now ship.
 
 ## Why this document exists
@@ -32,15 +32,15 @@ no-op that looks like it worked.
 ## What's already in place (the seams these phases extend)
 
 - **Cache + mirror.** `Server::diagnostics_of(buffer)` → `(&[Diagnostic],
-  PositionEncoding)`; the Lua mirror `nx._diagnostics` (keyed by bufnr).
+  PositionEncoding)`; the Lua mirror `btv._diagnostics` (keyed by bufnr).
 - **Per-window projection.** `Server::diagnostics_for(buffer, &numbers, styles)`
-  (`crates/nxvim-server/src/lsp/diagnostics.rs`) builds the per-row underline
+  (`crates/bemtvi-server/src/lsp/diagnostics.rs`) builds the per-row underline
   spans; `redraw.rs::window_value` attaches them under the `diagnostics` key;
   `WindowView.diagnostics: Vec<Vec<DiagSpan>>`
-  (`crates/nxvim-view/src/view.rs`); `render_text` composes the underline last.
-- **Config bridge.** `vim.diagnostic.config` → `nx._diagnostic_config(underline)`
+  (`crates/bemtvi-view/src/view.rs`); `render_text` composes the underline last.
+- **Config bridge.** `vim.diagnostic.config` → `btv._diagnostic_config(underline)`
   (`install.rs`) → `LspOp::DiagnosticConfig { underline }`
-  (`crates/nxvim-lua/src/ops.rs`) → `Server::diagnostics_underline`
+  (`crates/bemtvi-lua/src/ops.rs`) → `Server::diagnostics_underline`
   (`lsp/sync.rs`).
 - **Severity helpers.** `severity_code` / `severity_group` / `severity_short`
   and the `DiagnosticUnderline*` highlight groups (`lsp/mod.rs`).
@@ -73,22 +73,22 @@ per-window *decoration* projection (text positioned relative to a row, not a
 column span) that signs and the float reuse.
 
 **Scope.**
-- `crates/nxvim-server/src/lib.rs` — replace `diagnostics_underline: bool` with a
+- `crates/bemtvi-server/src/lib.rs` — replace `diagnostics_underline: bool` with a
   `DiagnosticConfig { underline, virtual_text, signs }` struct (defaults
   `underline = true`, `virtual_text = false`, `signs = false` — neovim's 0.10
   default is signs+underline on, virt-text off; we keep virt-text opt-in).
-- `crates/nxvim-server/src/lsp/diagnostics.rs` — `diagnostics_virt_text_for(buffer,
+- `crates/bemtvi-server/src/lsp/diagnostics.rs` — `diagnostics_virt_text_for(buffer,
   &numbers)`: per visible row, the highest-severity (`severity_sort`-aware)
   diagnostic *starting* on that row → `{ text, severity, style_id }`, prefixed
   per config (`prefix`, default `■`). Reuses `severity_code` / the
   `DiagnosticVirtualText*` highlight groups (added alongside the underline ones).
-- `crates/nxvim-view/src/view.rs` — `WindowView.diagnostics_virt: Vec<Option<DiagVirt>>`.
-- `crates/nxvim-server/src/redraw.rs` — project it under a `diagnostics_virt`
+- `crates/bemtvi-view/src/view.rs` — `WindowView.diagnostics_virt: Vec<Option<DiagVirt>>`.
+- `crates/bemtvi-server/src/redraw.rs` — project it under a `diagnostics_virt`
   window key.
-- `crates/nxvim-tui/src/render.rs` — in `render_text`, after a row's text + EOL
+- `crates/bemtvi-tui/src/render.rs` — in `render_text`, after a row's text + EOL
   gap, paint the virt-text span (clamped to the window width, after a one-cell
   gap), styled by the resolved group or a built-in severity color.
-- `crates/nxvim-lua/src/{ops.rs,install.rs}` + `prelude/diagnostic.lua` — thread
+- `crates/bemtvi-lua/src/{ops.rs,install.rs}` + `prelude/diagnostic.lua` — thread
   `virtual_text` (bool, and `prefix` from the table form) through the config op.
 
 **Approach.** Mirror `diagnostics_for` exactly, but emit one optional decoration
@@ -97,8 +97,8 @@ per row (not a span list) carrying display text. The text is the diagnostic's
 diagnostics start on the row. Virt-text lives only in the input frame's window
 projection — it is persistent state (redraw take-latest is safe).
 
-**Tests** (`crates/nxvim-server/tests/editing/` via `nvim_exec_lua` + the redraw
-view, or `crates/nxvim/tests/lsp.rs` via the scripted mock):
+**Tests** (`crates/bemtvi-server/tests/editing/` via `nvim_exec_lua` + the redraw
+view, or `crates/bemtvi/tests/lsp.rs` via the scripted mock):
 - a published diagnostic with `virtual_text = true` surfaces its message on the
   diagnostic's row in `diagnostics_virt`, prefixed;
 - `virtual_text = false` (default) shows nothing there;
@@ -115,11 +115,11 @@ bool; the projection is `Server::diagnostics_virt_text_for` → the
 → `highlight_line` paints it after end-of-text (one-cell gap, truncated to the
 viewport, severity foreground or the resolved `DiagnosticVirtualText*` group). The
 config threads `virtual_text` (bool, plus the table form's `prefix`) through
-`nx._diagnostic_config` → `LspOp::DiagnosticConfig`. The `INCOMPLETE` note in
+`btv._diagnostic_config` → `LspOp::DiagnosticConfig`. The `INCOMPLETE` note in
 `diagnostic.lua` lost its `virtual_text` clause. Verified by
 `vim_diagnostic_config_virtual_text_paints_the_message_inline` /
 `virtual_text_picks_the_highest_severity_on_a_row_and_honors_a_prefix`
-(`crates/nxvim/tests/lsp/diagnostic_api.rs`) and the Tier-2 paint test
+(`crates/bemtvi/tests/lsp/diagnostic_api.rs`) and the Tier-2 paint test
 `inline_virtual_text_is_painted_after_the_line` (`tests/lsp/diagnostics.rs`).
 Runnable demo: `examples/diagnostics/`.
 
@@ -142,17 +142,17 @@ that has a diagnostic, colored by the highest severity on that line — the
 gutter, which nothing else has carved yet, so it is its own phase.
 
 **Scope.**
-- `crates/nxvim-server/src/lsp/diagnostics.rs` — `diagnostics_signs_for(buffer,
+- `crates/bemtvi-server/src/lsp/diagnostics.rs` — `diagnostics_signs_for(buffer,
   &numbers)`: per visible row, `Option<{ glyph, severity, style_id }>` for the
   highest-severity diagnostic on that buffer line, gated on
   `DiagnosticConfig.signs`. Glyphs from config `text` (`{ [severity] = "E" }`)
   or the built-in severity letters; style from the `DiagnosticSign*` groups.
-- `crates/nxvim-view/src/view.rs` — `WindowView.diagnostics_signs: Vec<Option<DiagSign>>`
+- `crates/bemtvi-view/src/view.rs` — `WindowView.diagnostics_signs: Vec<Option<DiagSign>>`
   and a `sign_column: bool` (whether to reserve the column — true once any sign
   exists, matching vim's `signcolumn=auto`).
-- `crates/nxvim-server/src/redraw.rs` — project under `diagnostics_signs` /
+- `crates/bemtvi-server/src/redraw.rs` — project under `diagnostics_signs` /
   `sign_column`.
-- `crates/nxvim-tui/src/render.rs` — carve a 2-cell sign column *left of* the
+- `crates/bemtvi-tui/src/render.rs` — carve a 2-cell sign column *left of* the
   number gutter when `sign_column`; `render_gutter` (or a new
   `render_sign_column`) paints the glyph + style per row, blank for rows with no
   sign. The text-inner rect shifts right by the sign-column width.
@@ -183,14 +183,14 @@ buffer has ≥1 diagnostic — vim's `signcolumn=auto`) →
 the number gutter (severity foreground or the resolved `DiagnosticSign*` group),
 and `text_inner_rect` mirrors the carve so the completion popup still anchors past
 both gutters. The config threads `signs` (bool, plus the table form's `text` map)
-through `nx._diagnostic_config` → `LspOp::DiagnosticConfig`. Verified by
+through `btv._diagnostic_config` → `LspOp::DiagnosticConfig`. Verified by
 `signs_are_on_by_default_and_reserve_a_column` /
 `signs_pick_the_highest_severity_on_a_line` / `signs_false_reserves_no_column` /
-`signs_honor_a_custom_text_glyph` (`crates/nxvim/tests/lsp/diagnostic_api.rs`) and
+`signs_honor_a_custom_text_glyph` (`crates/bemtvi/tests/lsp/diagnostic_api.rs`) and
 the Tier-2 paint test `a_diagnostic_sign_is_painted_in_the_gutter`
 (`tests/lsp/diagnostics.rs`). Runnable demo: `examples/diagnostics/`.
 
-*Known approximations:* the sign column is **client-side only** — `nxvim-core`
+*Known approximations:* the sign column is **client-side only** — `bemtvi-core`
 computes `text_width` from `rect.width - number_width` and has no view of the
 diagnostics cache, so it doesn't subtract the 2-cell sign column; under `nowrap` a
 full-width line with signs on can clip its last two cells / nudge the horizontal
@@ -212,12 +212,12 @@ the *full* message (virt-text is truncated to one line). Configs bind it
 directly; it completes the trio.
 
 **Scope.**
-- `crates/nxvim-server/src/lsp/diagnostics.rs` — `diagnostics_open_float()`:
+- `crates/bemtvi-server/src/lsp/diagnostics.rs` — `diagnostics_open_float()`:
   collect the cursor line's diagnostics (sorted by severity then column),
   format `severity  source: message [code]` lines, and open them via the
   existing `Editor::open_panel` / float surface (reuse `show_hover`'s path).
-- `crates/nxvim-lua/src/{ops.rs,install.rs}` + `prelude/diagnostic.lua` —
-  `vim.diagnostic.open_float` → `nx._diagnostic_open_float()` →
+- `crates/bemtvi-lua/src/{ops.rs,install.rs}` + `prelude/diagnostic.lua` —
+  `vim.diagnostic.open_float` → `btv._diagnostic_open_float()` →
   `LspOp::DiagnosticOpenFloat`. No-op (loud nothing) when the line is clean.
 - Optionally wire `config.float` later; the function is the deliverable.
 
@@ -225,7 +225,7 @@ directly; it completes the trio.
 formatting the cursor line's diagnostics into lines and routing through the
 existing `open_panel`. No new render surface.
 
-**Tests** (`crates/nxvim-server/tests/editing/` or `lsp.rs`):
+**Tests** (`crates/bemtvi-server/tests/editing/` or `lsp.rs`):
 - with the cursor on a diagnostic line, `vim.diagnostic.open_float()` opens the
   panel/float carrying the full message(s);
 - a clean line opens nothing;
@@ -233,7 +233,7 @@ existing `open_panel`. No new render surface.
 
 **Done when.** ✅ `vim.diagnostic.open_float()` shows the cursor line's full
 diagnostics in a float. The projection is `Server::diagnostics_open_float`
-(`crates/nxvim-server/src/lsp/diagnostics.rs`): it collects the cursor line's
+(`crates/bemtvi-server/src/lsp/diagnostics.rs`): it collects the cursor line's
 diagnostics (those *starting* on the line, neovim's `lnum` scope), severity- then
 column-sorts them, formats each via the free `diagnostic_float_lines`
 (`E  source: <first message line> [code]` header + any remaining message lines,
@@ -241,14 +241,14 @@ every line control-sanitized like `first_line`), and opens them through the
 existing `Editor::open_panel` ("Diagnostics" title) — the same float surface hover
 uses. A clean cursor line is a *loud* no-op: `echo("No diagnostics under cursor")`,
 no panel. The op threads `vim.diagnostic.open_float` →
-`nx._diagnostic_open_float()` (`install.rs`) → `LspOp::DiagnosticOpenFloat`
+`btv._diagnostic_open_float()` (`install.rs`) → `LspOp::DiagnosticOpenFloat`
 (`ops.rs`) → `Server::diagnostics_open_float` (`sync.rs`), reading the cursor at
 apply time. The `INCOMPLETE` note in `diagnostic.lua` lost its bare `float`
 clause (only the `config.float` pre-style defaults remain inert). Verified by
 `vim_diagnostic_open_float_shows_the_cursor_lines_diagnostics` /
 `vim_diagnostic_open_float_on_a_clean_line_opens_nothing` /
 `vim_diagnostic_open_float_lists_all_diagnostics_severity_sorted`
-(`crates/nxvim/tests/lsp/diagnostic_api.rs`). Runnable demo: `examples/diagnostics/`
+(`crates/bemtvi/tests/lsp/diagnostic_api.rs`). Runnable demo: `examples/diagnostics/`
 (`<leader>d`).
 
 *Known approximations:* `opts` (scope/severity filters, `format`, `header`,

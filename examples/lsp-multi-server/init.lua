@@ -1,10 +1,10 @@
--- ~~~ nxvim TWO language servers on ONE buffer — gopls + golangci-lint ~~~
+-- ~~~ bemtvi TWO language servers on ONE buffer — gopls + golangci-lint ~~~
 --
 -- Run it (from the repo root) — needs `gopls`, `golangci-lint-langserver` and
 -- `golangci-lint` on your PATH:
 --
---     NXVIM_CONFIG=examples/lsp-multi-server \
---       cargo run -p nxvim -- examples/lsp-multi-server/sample.go
+--     BEMTVI_CONFIG=examples/lsp-multi-server \
+--       cargo run -p bemtvi -- examples/lsp-multi-server/sample.go
 --
 -- Every server enabled for a filetype attaches. There is no "primary" server and
 -- no "the" client: a buffer carries a SET of them, each syncing its own copy of
@@ -26,7 +26,7 @@
 -- them, and the editor would look broken while both servers were healthy. That is
 -- the `pyright` + `ruff` bug in its purest form.
 --
--- What nxvim does with the set:
+-- What bemtvi does with the set:
 --
 --   * diagnostics MERGE — every server's set renders, none replaces another, and
 --     each carries the `client_id` that published it;
@@ -51,7 +51,7 @@
 -- Type this / see that:
 --
 --   1. Wait for both to come up, then `<leader>li`.  →  `2 clients: golangci_lint,
---      gopls`. `nx.lsp.clients{bufnr=0}` returns a LIST — indexing `[1]` and calling
+--      gopls`. `btv.lsp.clients{bufnr=0}` returns a LIST — indexing `[1]` and calling
 --      it "the" server is the bug this example exists to prevent.
 --   2. `<leader>ld` lists the merged diagnostics with the client that published
 --      each.  →  FOUR entries: gopls on line 13, and golangci-lint on 13, 18 and
@@ -137,7 +137,7 @@ vim.g.mapleader = "\\"
 --------------------------------------------------------------------------------
 -- 1. The type-checker. gopls needs the module root before it offers anything,
 -- which is why this example ships a `go.mod`.
-nx.lsp.config("gopls", {
+btv.lsp.config("gopls", {
   cmd = { "gopls" },
   filetypes = { "go" },
   root_markers = { "go.mod", ".git" },
@@ -156,7 +156,7 @@ nx.lsp.config("gopls", {
 -- diagnostics. Which linters run is decided by the `.golangci.yml` beside this
 -- file, which deliberately leaves `govet` enabled so that one problem is reported
 -- by BOTH servers — see step 3. Read that file for the remedy.
-nx.lsp.config("golangci_lint", {
+btv.lsp.config("golangci_lint", {
   cmd = { "golangci-lint-langserver" },
   filetypes = { "go" },
   root_markers = { "go.mod", ".git" },
@@ -168,43 +168,43 @@ nx.lsp.config("golangci_lint", {
 })
 
 -- Enabling takes a list. Both are dispatched on the same `FileType go`.
-nx.lsp.enable({ "gopls", "golangci_lint" })
+btv.lsp.enable({ "gopls", "golangci_lint" })
 
 --------------------------------------------------------------------------------
 -- 3. Keymaps. None of them names a server — routing is the editor's job, and that
 -- is exactly what makes a config portable across "one server" and "three".
-nx.keymap.set("n", "K", nx.lsp.hover)
-nx.keymap.set("n", "gd", nx.lsp.definition)
-nx.keymap.set({ "n", "v" }, "<leader>ca", function()
-  nx.lsp.code_action()
+btv.keymap.set("n", "K", btv.lsp.hover)
+btv.keymap.set("n", "gd", btv.lsp.definition)
+btv.keymap.set({ "n", "v" }, "<leader>ca", function()
+  btv.lsp.code_action()
 end)
 
 -- …except formatting, which is the one verb where naming is the point: on a buffer
 -- where several servers advertise `documentFormatting` they do different things, so
 -- "whoever sorts first" is not a choice you want made for you.
-nx.keymap.set("n", "<leader>lf", function()
-  nx.lsp.format({ name = "gopls" })
+btv.keymap.set("n", "<leader>lf", function()
+  btv.lsp.format({ name = "gopls" })
 end)
 
 -- The other half of that guarantee: a name that is NOT attached reports itself
 -- rather than silently falling back to a different server. Asking for `ruff` and
 -- quietly getting pyright's formatting is exactly what the option prevents.
-nx.keymap.set("n", "<leader>lF", function()
-  nx.lsp.format({ name = "nosuch" })
+btv.keymap.set("n", "<leader>lF", function()
+  btv.lsp.format({ name = "nosuch" })
 end)
 
 -- …and `name` is not a formatting option, it is a ROUTING one: every language verb
 -- takes it, and the ex-commands take it as a bare argument (`:LspHover gopls`).
 -- Route to a server that is attached but does not advertise the feature and it says
 -- so — it does not fall through to the server that does.
-nx.keymap.set("n", "<leader>lh", function()
-  nx.lsp.hover({ name = "golangci_lint" })
+btv.keymap.set("n", "<leader>lh", function()
+  btv.lsp.hover({ name = "golangci_lint" })
 end)
 
 -- The merging verbs take it too, where it means "this client's list ALONE" instead
 -- of every capable server's merged. `:LspReferences gopls` is the ex twin.
-nx.keymap.set("n", "<leader>lr", function()
-  nx.lsp.references({ name = "gopls" })
+btv.keymap.set("n", "<leader>lr", function()
+  btv.lsp.references({ name = "gopls" })
 end)
 
 --------------------------------------------------------------------------------
@@ -214,19 +214,19 @@ end)
 -- Which clients are on this buffer. A `bufnr` filter can return more than one, so
 -- iterate it; filter by `name`, or by what a client advertises, when you need a
 -- specific one.
-nx.keymap.set("n", "<leader>li", function()
+btv.keymap.set("n", "<leader>li", function()
   local names = {}
-  for _, c in ipairs(nx.lsp.clients({ bufnr = 0 })) do
+  for _, c in ipairs(btv.lsp.clients({ bufnr = 0 })) do
     names[#names + 1] = c.name
   end
   table.sort(names)
-  nx.print(#names .. " clients: " .. table.concat(names, ", "))
+  btv.print(#names .. " clients: " .. table.concat(names, ", "))
 end)
 
 -- What each server advertised at `initialize` — the input every routing decision
 -- is made from. A config that branches on "is the linter attached?" should ask
 -- this, not guess from names.
-nx.keymap.set("n", "<leader>lc", function()
+btv.keymap.set("n", "<leader>lc", function()
   local features = {
     "hoverProvider",
     "definitionProvider",
@@ -239,7 +239,7 @@ nx.keymap.set("n", "<leader>lc", function()
     "workspaceSymbolProvider",
   }
   local rows = {}
-  for _, c in ipairs(nx.lsp.clients({ bufnr = 0 })) do
+  for _, c in ipairs(btv.lsp.clients({ bufnr = 0 })) do
     local on = {}
     for _, f in ipairs(features) do
       if c.server_capabilities[f] then
@@ -249,13 +249,13 @@ nx.keymap.set("n", "<leader>lc", function()
     rows[#rows + 1] = c.name .. " => " .. (next(on) and table.concat(on, ", ") or "(none)")
   end
   table.sort(rows)
-  nx.print(table.concat(rows, "   |   "))
+  btv.print(table.concat(rows, "   |   "))
 end)
 
 -- The merged diagnostics, tagged with the client that published each. The tag is
 -- the point: `vim.diagnostic.get` returns one flat list, and without `client_id`
 -- there would be no way to tell the type-checker's errors from the linter's.
-nx.keymap.set("n", "<leader>ld", function()
+btv.keymap.set("n", "<leader>ld", function()
   local rows = {}
   for _, d in ipairs(vim.diagnostic.get(0)) do
     local client = d.client_id and vim.lsp.get_client_by_id(d.client_id)
@@ -268,9 +268,9 @@ nx.keymap.set("n", "<leader>ld", function()
   end
   table.sort(rows)
   if #rows == 0 then
-    nx.print("no diagnostics yet — the servers may still be starting")
+    btv.print("no diagnostics yet — the servers may still be starting")
   else
-    nx.print(table.concat(rows, "   |   "))
+    btv.print(table.concat(rows, "   |   "))
   end
 end)
 
@@ -295,12 +295,12 @@ end)
 -- the rank changes no outcome — which is exactly when you want it in the config
 -- anyway: it is the line that keeps working when the second server grows a feature
 -- the first one has, and stops the answer from silently moving.
-nx.keymap.set("n", "<leader>lp", function()
+btv.keymap.set("n", "<leader>lp", function()
   local rows = {}
-  for _, c in ipairs(nx.lsp.clients({ bufnr = 0 })) do
-    local cfg = nx.lsp.get_config(c.name)
+  for _, c in ipairs(btv.lsp.clients({ bufnr = 0 })) do
+    local cfg = btv.lsp.get_config(c.name)
     rows[#rows + 1] = c.name .. " priority=" .. tostring(cfg.priority or 0)
   end
   table.sort(rows)
-  nx.print(table.concat(rows, "   |   "))
+  btv.print(table.concat(rows, "   |   "))
 end)

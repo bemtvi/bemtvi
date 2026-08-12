@@ -6,8 +6,8 @@ code-grounded direction, split out of
 [`2026-06-04-autocmd-lifecycle-design.md`](2026-06-04-autocmd-lifecycle-design.md)
 during its sanity check. Flesh it into a full phased plan before executing.
 
-**Depends on:** the autocmd lifecycle doc (Phases 1–2: `nx._fire` buffer args, the
-`nx._cur_buf` snapshot, `fire_autocmd_buf`/`set_buf_snapshot`).
+**Depends on:** the autocmd lifecycle doc (Phases 1–2: `btv._fire` buffer args, the
+`btv._cur_buf` snapshot, `fire_autocmd_buf`/`set_buf_snapshot`).
 **Consumer:** format-on-save (its own design; this only lays the pre-write seam).
 
 ## Why this is its own doc
@@ -42,7 +42,7 @@ server.
 
 ## Direction: core-side write deferral
 
-nxvim already has the exact pattern this needs — core records an intent and the
+bemtvi already has the exact pattern this needs — core records an intent and the
 server fulfills it after regaining control. Three existing precedents:
 
 - **`pending_sleep`** — `:sleep` sets `self.pending_sleep = Some(ms)`
@@ -60,7 +60,7 @@ Model `BufWritePre` the same way. Sketch:
    new queue (analogous to `deferred_commands`).
 2. **Server fulfills it** in the `run_pending` fixpoint (so a callback's queued
    `vim.cmd` / future buffer edits drain in the same loop): for each pending write,
-   push the `nx._cur_buf` snapshot, fire `BufWritePre` via `fire_autocmd_buf`, run
+   push the `btv._cur_buf` snapshot, fire `BufWritePre` via `fire_autocmd_buf`, run
    `apply_lua_effects()` so callback edits land on the buffer, **then** perform the
    write through a core method (e.g. `editor.do_write(id, path)`) that does the disk
    I/O, sets `saved_seq` (`editor.rs:3106`), and echoes the `"N L, B written"` line.
@@ -90,11 +90,11 @@ Model `BufWritePre` the same way. Sketch:
   must be byte-for-byte unchanged (file written, `saved_seq` set, same echo). The
   server can short-circuit straight to the write; the deferral path only matters when
   a hook exists. Guard regressions with the existing write tests in
-  `crates/nxvim-server/tests/{editing,buffers}.rs`.
+  `crates/bemtvi-server/tests/{editing,buffers}.rs`.
 
 ## Tests (when designed)
 
-Black-box in `crates/nxvim-server/tests/` (per the no-unit-test rule):
+Black-box in `crates/bemtvi-server/tests/` (per the no-unit-test rule):
 
 - `:w` (typed via `nvim_input(":w<CR>")` **and** via `nvim_command`) fires
   `BufWritePre` before the file is written.

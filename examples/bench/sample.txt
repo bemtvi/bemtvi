@@ -1,4 +1,4 @@
-nxvim Lua micro-benchmark playground
+bemtvi Lua micro-benchmark playground
 =====================================
 
 This buffer is just a place to land. The benchmarks live in init.lua and are

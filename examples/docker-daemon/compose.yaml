@@ -1,7 +1,7 @@
-# podman-compose / docker compose front-end for the nxvim remote daemon + web client.
+# podman-compose / docker compose front-end for the bemtvi remote daemon + web client.
 #
 #     # Build the wasm bundle once on the host (needs emcc + node):
-#     crates/nxvim-edithost/build.sh
+#     crates/bemtvi-edithost/build.sh
 #
 #     podman compose -f examples/docker-daemon/compose.yaml up --build
 #     # or: docker compose -f examples/docker-daemon/compose.yaml up --build
@@ -10,27 +10,27 @@
 #     examples/docker-daemon/connect.sh        # native TUI client → daemon
 #     examples/docker-daemon/connect-web.sh    # browser URL → daemon
 services:
-  nxvim-daemon:
+  bemtvi-daemon:
     build:
       # Build context is the repo root — the Containerfile compiles the whole crate.
       context: ../..
       dockerfile: examples/docker-daemon/Containerfile
-    image: nxvim-daemon
-    container_name: nxvim-daemon
+    image: bemtvi-daemon
+    container_name: bemtvi-daemon
     ports:
       # QUIC is UDP. Published on ALL host interfaces (no 127.0.0.1 prefix) so the daemon
       # is reachable off-host — the per-launch token + TOFU cert are the auth gate. Drop
       # the bind back to "127.0.0.1:8765:8765/udp" if you only want local access.
       - "8765:8765/udp"
 
-  nxvim-web:
+  bemtvi-web:
     build:
       # Context is the edit-host crate dir (where the prebuilt web/ + dist/ live); the
       # dockerfile path is relative to that context.
-      context: ../../crates/nxvim-edithost
+      context: ../../crates/bemtvi-edithost
       dockerfile: ../../examples/docker-daemon/Containerfile.web
-    image: nxvim-web
-    container_name: nxvim-web
+    image: bemtvi-web
+    container_name: bemtvi-web
     ports:
       # Plain HTTP, published on ALL host interfaces. NOTE: WebTransport needs a secure
       # context — that holds on http://localhost, but NOT when the page is reached over

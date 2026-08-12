@@ -1,6 +1,6 @@
 # Remote daemon in a container (podman / docker)
 
-nxvim can split itself in two: a thin **edit-host** (your keystrokes, the UI) talking
+bemtvi can split itself in two: a thin **edit-host** (your keystrokes, the UI) talking
 to a remote **daemon** that owns the filesystem, processes, file watches and language
 servers. This example puts that daemon in a container and connects to it two ways over
 the same transport — **QUIC** (so: UDP):
@@ -36,7 +36,7 @@ Containerfile.web    web image: a slim node server for the prebuilt wasm bundle 
 compose.yaml         podman-compose / docker compose front-end for both containers
 connect.sh           reads the daemon's connect URI from the logs and launches the native TUI client
 connect-web.sh       prints the browser URL (?daemon=…) pointing the web client at the daemon
-local/init.lua       the config used when you run nxvim normally (no daemon)
+local/init.lua       the config used when you run bemtvi normally (no daemon)
 daemon/init.lua      the config the container serves over the wire
 daemon/lua/whereami.lua   a require-able module, fetched too (proves the whole runtimepath crosses)
 workspace/sample.txt the file you edit — it lives on the daemon (in the container)
@@ -45,8 +45,8 @@ workspace/sample.txt the file you edit — it lives on the daemon (in the contai
 ## 1. See the local config first (baseline, no container)
 
 ```sh
-NXVIM_CONFIG=examples/docker-daemon/local \
-  cargo run -p nxvim -- examples/docker-daemon/workspace/sample.txt
+BEMTVI_CONFIG=examples/docker-daemon/local \
+  cargo run -p bemtvi -- examples/docker-daemon/workspace/sample.txt
 ```
 
 `:WhoAmI` → *LOCAL config*, `:set tabstop?` → `2`. This is the embedded server: one
@@ -57,8 +57,8 @@ process, everything on this machine.
 From the **repo root** (the build context is the whole workspace):
 
 ```sh
-podman build -f examples/docker-daemon/Containerfile -t nxvim-daemon .
-podman run --rm -d -p 127.0.0.1:8765:8765/udp --name nxvim-daemon nxvim-daemon
+podman build -f examples/docker-daemon/Containerfile -t bemtvi-daemon .
+podman run --rm -d -p 127.0.0.1:8765:8765/udp --name bemtvi-daemon bemtvi-daemon
 ```
 
 or with compose:
@@ -71,11 +71,11 @@ Swap `podman` → `docker` throughout if that's what you have (`CONTAINER_CLI=do
 for the connect script). **The published port must be `/udp`** — QUIC runs on UDP.
 
 The daemon prints its connect URI to stdout at startup; you can see it with
-`podman logs nxvim-daemon`:
+`podman logs bemtvi-daemon`:
 
 ```
-nxvim daemon listening on 0.0.0.0:8765
-  connect with: nxvim --connect-daemon 'nxvim://0.0.0.0:8765/<token>?cert=<hash>'
+bemtvi daemon listening on 0.0.0.0:8765
+  connect with: bemtvi --connect-daemon 'bemtvi://0.0.0.0:8765/<token>?cert=<hash>'
 ```
 
 The `<token>` (a 32-byte bearer secret) and `<hash>` (the self-signed cert, pinned
@@ -98,7 +98,7 @@ Now compare with step 1:
 - `:set tabstop?` → `8`
 - `:pwd` → `/work` (the daemon's cwd, inside the container)
 - `:r !hostname` → the **container's** hostname (the process leg runs on the daemon)
-- `:lua nx.notify(_G.WHERE)` → proves `require("whereami")` resolved from the
+- `:lua btv.notify(_G.WHERE)` → proves `require("whereami")` resolved from the
   container's `lua/` tree, fetched and materialized locally
 
 Same client binary, same keystrokes — but the config and the filesystem are the
@@ -117,14 +117,14 @@ config came back local; the filesystem and processes stay on the daemon.
 
 ## 4. Or connect from the browser (second container)
 
-The browser build of nxvim is arch-independent wasm served as static files. Build the
+The browser build of bemtvi is arch-independent wasm served as static files. Build the
 bundle once on the host (needs `emcc` + `node`), then serve it from its own container:
 
 ```sh
-crates/nxvim-edithost/build.sh        # → crates/nxvim-edithost/dist/ + web/vendor/
+crates/bemtvi-edithost/build.sh        # → crates/bemtvi-edithost/dist/ + web/vendor/
 
-podman build -f examples/docker-daemon/Containerfile.web -t nxvim-web crates/nxvim-edithost
-podman run --rm -d -p 127.0.0.1:8088:8088 --name nxvim-web nxvim-web
+podman build -f examples/docker-daemon/Containerfile.web -t bemtvi-web crates/bemtvi-edithost
+podman run --rm -d -p 127.0.0.1:8088:8088 --name bemtvi-web bemtvi-web
 ```
 
 (or `podman compose … up --build -d`, which brings up both containers at once.)
@@ -158,11 +158,11 @@ Notes:
 
 ## How it works
 
-- `nxvim --daemon --listen 0.0.0.0:8765` binds a QUIC listener and serves the
+- `bemtvi --daemon --listen 0.0.0.0:8765` binds a QUIC listener and serves the
   fs/process/watch/LSP host plus a one-shot `config_bundle` request. No editor, no UI.
-- The container sets `NXVIM_CONFIG=/etc/nxvim`, so the daemon resolves `daemon/` as
-  its config (the same precedence a local launch uses: `$NXVIM_CONFIG`, then
-  `$XDG_CONFIG_HOME/nxvim`, then `$HOME/.config/nxvim`).
+- The container sets `BEMTVI_CONFIG=/etc/bemtvi`, so the daemon resolves `daemon/` as
+  its config (the same precedence a local launch uses: `$BEMTVI_CONFIG`, then
+  `$XDG_CONFIG_HOME/bemtvi`, then `$HOME/.config/bemtvi`).
 - With `--remote-config` (or any web session), the client fetches that config over the
   wire, materializes it into a per-process cache, and runs it locally — Lua's
   synchronous `require`/runtimepath can't await the network, so the files must be local,
@@ -177,6 +177,6 @@ Notes:
 ## Teardown
 
 ```sh
-podman rm -f nxvim-daemon nxvim-web
+podman rm -f bemtvi-daemon bemtvi-web
 # or: podman compose -f examples/docker-daemon/compose.yaml down
 ```

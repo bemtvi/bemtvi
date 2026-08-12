@@ -1,6 +1,6 @@
 # Image previews
 
-Open an image file and nxvim renders the **picture** inline instead of its raw
+Open an image file and bemtvi renders the **picture** inline instead of its raw
 bytes — image.nvim's behavior, built in, with no terminal-specific plugin to
 wire up. Each client draws it the native way: ratatui-image in the terminal
 (Kitty/Sixel/iTerm2 graphics, with a block-cell fallback), a textured quad in the
@@ -10,10 +10,10 @@ The feature is opt-in through one option.
 
 ## Enabling it
 
-`'imagepreview'` (nxvim-native, **off by default**) turns it on:
+`'imagepreview'` (bemtvi-native, **off by default**) turns it on:
 
 ```lua
-nx.o.imagepreview = true        -- or :set imagepreview
+btv.o.imagepreview = true        -- or :set imagepreview
 ```
 
 With it on, opening a file with an image extension —

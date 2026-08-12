@@ -6,7 +6,7 @@
 
 ## Context
 
-nxvim today has exactly two window concepts: the per-tab split tree (`Editor::windows`, a
+bemtvi today has exactly two window concepts: the per-tab split tree (`Editor::windows`, a
 `WindowTree`) and a single read-only bottom overlay (`Editor::panel`, the `:messages`/`:ls`
 list). There is no way to keep an *editable* region pinned to a screen edge that survives
 splits, window switches, and tab changes.
@@ -20,11 +20,11 @@ screen edge that the main editing area can never disturb. Locked-in decisions:
   focused layer; `<C-w><C-w>{cmd}` crosses to the other layer (main ↔ panels) and runs the
   command there. Once focus is in a panel, single `<C-w>v`/`<C-w>l`/`<C-w>s` operate inside it;
   `<C-w><C-w>` returns to main.
-- **Creation** — an `nx.*` Lua API plus a thin ex-command wrapper.
+- **Creation** — an `btv.*` Lua API plus a thin ex-command wrapper.
 - **Top dock placement** — the top dock sits **above the tabline** (owns the very top rows).
 
 ### Naming
-Use **`Dock`** internally and **`nx.dock.*`** for the Lua surface, to avoid collision with the
+Use **`Dock`** internally and **`btv.dock.*`** for the Lua surface, to avoid collision with the
 existing read-only `Panel` (`editor/panel.rs`, `Editor::panel`) and the existing `vim.panel.*`
 Lua table. (User-facing term stays "panel"; the code type is `Dock`.)
 
@@ -154,9 +154,9 @@ layer). Guard the per-tab-specific arms in `execute_window` when `focused_layer 
 
 **Coordinate ownership (key finding):** `ViewRect` is **windows-area-relative**, not absolute
 (view.rs:89). The core lays the main tree out at origin (0,0); each **client** computes the
-windows-area origin itself and offsets — TUI via a ratatui `Layout::vertical` (nxvim-tui
+windows-area origin itself and offsets — TUI via a ratatui `Layout::vertical` (bemtvi-tui
 `render.rs:185`, `window_area` at `render.rs:325`), GUI via `origin=(0,tabline_rows)`
-(nxvim-gui `render.rs:539`), web in JS. The server (`redraw.rs` `rect_value`/`separator_value`,
+(bemtvi-gui `render.rs:539`), web in JS. The server (`redraw.rs` `rect_value`/`separator_value`,
 ~l.578) sends rects as-is. So docks **cannot** be made visible by core/server alone — each client
 must learn the dock bands.
 
@@ -181,30 +181,30 @@ Core changes:
 - `redraw.rs` — encode `region` on each window and the band sizes.
 
 Client changes (TUI, GUI, web):
-- **TUI** (`crates/nxvim-tui/src/render.rs`) — extend the vertical `Layout` with top/bottom dock
+- **TUI** (`crates/bemtvi-tui/src/render.rs`) — extend the vertical `Layout` with top/bottom dock
   bands, split the middle row horizontally into `[left | wins | right]`, offset each window by its
   region origin, paint dock separators/borders.
-- **GUI** (`crates/nxvim-gui/src/render.rs`) — same band math against the cell grid `origin`.
-- **Web** (`crates/nxvim-web` edithost JS) — mirror the band math in the JS renderer.
+- **GUI** (`crates/bemtvi-gui/src/render.rs`) — same band math against the cell grid `origin`.
+- **Web** (`crates/bemtvi-web` edithost JS) — mirror the band math in the JS renderer.
 
 **Checkpoint:** redraw assertion shows dock content + single cursor (Phase 7 test 11); manual
 verify in TUI (`cargo run`), GUI, and web (Playwright).
 
 ---
 
-## Phase 6 — Creation API (`nx.dock.*` + ex command)
+## Phase 6 — Creation API (`btv.dock.*` + ex command)
 
-**Goal:** user-facing surface, dogfooding the nx API.
+**Goal:** user-facing surface, dogfooding the btv API.
 
 - **Effect op** — `DockOp { Open{side,size,buf}, Close{side}, Focus{side} }` in
-  `nxvim-lua/src/ops.rs` (beside `WindowOp` ops.rs:419 / `PanelOp` ops.rs:33); drain in
-  `nxvim-server/src/effects.rs` (beside `apply_window_op` effects.rs:394) into the Phase 3 methods.
-- **Lua surface** — `nx.dock` table in `nxvim-lua/src/install.rs` (mirror `vim.panel`,
+  `bemtvi-lua/src/ops.rs` (beside `WindowOp` ops.rs:419 / `PanelOp` ops.rs:33); drain in
+  `bemtvi-server/src/effects.rs` (beside `apply_window_op` effects.rs:394) into the Phase 3 methods.
+- **Lua surface** — `btv.dock` table in `bemtvi-lua/src/install.rs` (mirror `vim.panel`,
   install.rs:140) with `open/close/focus` pushing `DockOp`s, validating `side` loudly (no silent
-  fallback — cf. `FloatAnchor::from_keyword`, windows.rs:69). Reads via an `nx._docks` mirror like
-  `nx._wins` (api.lua:73): `nx.dock.is_open/list`.
+  fallback — cf. `FloatAnchor::from_keyword`, windows.rs:69). Reads via an `btv._docks` mirror like
+  `btv._wins` (api.lua:73): `btv.dock.is_open/list`.
 - **Ex command** — `:DockOpen`/`:DockClose`/`:DockFocus` defined in the Lua prelude in terms of
-  `nx.dock.*` (dogfood directive).
+  `btv.dock.*` (dogfood directive).
 
 **Risk note (highest):** `switch_tab`/`new_tab` swap `self.windows`; if a dock tree is live there
 both tab and layer state corrupt. The Phase-1 cross-to-main-first fix is mandatory; `docks` are
@@ -216,7 +216,7 @@ inside a dock resizes intra-dock splits only — resizing the dock's reserved si
 (later: `<C-w><C-w>>` adjusts `dock_sizes`, or separator drag via `resize_window_id`,
 windows.rs:1630). Tabline window-count (windows.rs:838) keeps counting main-tree windows only.
 
-**Checkpoint:** `nx.dock.open/close/focus` and the ex-commands drive docks end-to-end.
+**Checkpoint:** `btv.dock.open/close/focus` and the ex-commands drive docks end-to-end.
 
 ---
 
@@ -224,10 +224,10 @@ windows.rs:1630). Tabline window-count (windows.rs:838) keeps counting main-tree
 
 **Goal:** prove behavior end-to-end; ship a runnable example.
 
-Black-box integration tests in `crates/nxvim-server/tests/dock.rs` (harness per CLAUDE.md — feed
+Black-box integration tests in `crates/bemtvi-server/tests/dock.rs` (harness per CLAUDE.md — feed
 vim keys, assert `nvim_buf_get_lines`/cursor/redraw):
 
-1. `nx.dock.open{side='left',size=30}` → left window + separator appears, main shrinks,
+1. `btv.dock.open{side='left',size=30}` → left window + separator appears, main shrinks,
    `nvim_list_wins` count grows.
 2. `<C-w><C-w>h` focuses the left dock; typed text lands in the dock buffer, not main; a cross
    returns to main.
@@ -239,7 +239,7 @@ vim keys, assert `nvim_buf_get_lines`/cursor/redraw):
    to main.
 8. Close last dock window collapses the dock; main reclaims space.
 9. Four docks open at once: each edge reserved, main rect non-degenerate.
-10. `nx.dock.close{side='left'}` removes it; buffer stays loaded (`nvim_list_bufs`).
+10. `btv.dock.close{side='left'}` removes it; buffer stays loaded (`nvim_list_bufs`).
 11. Terminal cursor drawn only in the focused layer (redraw assertion).
 12. Top dock renders **above** the tabline (redraw row ordering).
 
@@ -251,16 +251,16 @@ Ship a runnable `examples/dock/` config + sample (per project convention).
 
 ## Critical files
 
-- `crates/nxvim-core/src/editor/mod.rs` — Editor struct, layer/dock fields, swap helpers.
-- `crates/nxvim-core/src/editor/windows.rs` — `relayout`, `window_layouts`, per-tree layout,
+- `crates/bemtvi-core/src/editor/mod.rs` — Editor struct, layer/dock fields, swap helpers.
+- `crates/bemtvi-core/src/editor/windows.rs` — `relayout`, `window_layouts`, per-tree layout,
   separators, id-targeted window APIs.
-- `crates/nxvim-core/src/editor/dock.rs` — new: open/close/focus.
-- `crates/nxvim-core/src/editor/command.rs` — `Stage`, `LayerWindowCmd`, `execute_window_layer`.
-- `crates/nxvim-core/src/editor/tabs.rs` — cross-to-main fix in `switch_tab`/`new_tab`.
-- `crates/nxvim-core/src/view.rs` — `from_editor`, `all_separators`.
-- `crates/nxvim-lua/src/ops.rs` + `crates/nxvim-server/src/effects.rs` +
-  `crates/nxvim-lua/src/install.rs` — `DockOp` + `nx.dock` surface.
-- `crates/nxvim-server/tests/dock.rs` — new: integration tests.
+- `crates/bemtvi-core/src/editor/dock.rs` — new: open/close/focus.
+- `crates/bemtvi-core/src/editor/command.rs` — `Stage`, `LayerWindowCmd`, `execute_window_layer`.
+- `crates/bemtvi-core/src/editor/tabs.rs` — cross-to-main fix in `switch_tab`/`new_tab`.
+- `crates/bemtvi-core/src/view.rs` — `from_editor`, `all_separators`.
+- `crates/bemtvi-lua/src/ops.rs` + `crates/bemtvi-server/src/effects.rs` +
+  `crates/bemtvi-lua/src/install.rs` — `DockOp` + `btv.dock` surface.
+- `crates/bemtvi-server/tests/dock.rs` — new: integration tests.
 
 ## Follow-up
 

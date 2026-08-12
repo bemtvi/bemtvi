@@ -1,21 +1,21 @@
 # LSP end-to-end suite
 
 This directory installs the **real** language-server binaries that
-[`crates/nxvim/tests/lsp_e2e.rs`](../../crates/nxvim/tests/lsp_e2e.rs) drives. That
-test answers a specific question — *does nxvim's nvim-lspconfig support actually
+[`crates/bemtvi/tests/lsp_e2e.rs`](../../crates/bemtvi/tests/lsp_e2e.rs) drives. That
+test answers a specific question — *does bemtvi's nvim-lspconfig support actually
 work with real servers?* — by, for each of the ten most popular servers:
 
 1. laying down a real mini-project with a **deliberate** error
-   (`crates/nxvim/tests/fixtures/lsp-e2e/<server>/`),
+   (`crates/bemtvi/tests/fixtures/lsp-e2e/<server>/`),
 2. configuring the server **only** through the vendored
    [`vendor/nvim-lspconfig`](../../vendor/nvim-lspconfig) — an `init.lua` that does
    nothing but `vim.lsp.enable('<server>')` (+ optional `settings`), so the
    vendored `lsp/<server>.lua` resolves the `cmd`, `filetypes`, and root, and
 3. opening the file with the real server and asserting the real
-   `textDocument/publishDiagnostics` surfaces in nxvim.
+   `textDocument/publishDiagnostics` surfaces in bemtvi.
 
 A diagnostic arriving is end-to-end proof of the whole round trip: `initialize` →
-`didOpen` → the server analysing real code → `publishDiagnostics` → nxvim
+`didOpen` → the server analysing real code → `publishDiagnostics` → bemtvi
 projecting it into the view.
 
 ## The ten servers
@@ -36,12 +36,12 @@ projecting it into the view.
 > **Why zls and not eslint?** The original target list's tenth server was
 > `eslint`. `vscode-eslint-language-server` only ever validates after a
 > VS Code-specific server→client handshake (dynamic registration plus bespoke
-> `eslint/*` requests) that nxvim's deliberately-minimal LSP client doesn't
+> `eslint/*` requests) that bemtvi's deliberately-minimal LSP client doesn't
 > implement — it initializes and accepts `didOpen` but never lints headlessly.
 > Rather than ship a permanently-red case, the suite drives **zls** (the Zig
 > language server), another extremely popular, single-binary server that reports
 > diagnostics over plain LSP. The eslint gap is a real, known limitation of
-> nxvim's client.
+> bemtvi's client.
 
 Exact versions live in [`manifest.json`](manifest.json) (single binaries + gopls)
 and [`npm/package.json`](npm/package.json) (node servers). The sha256s in
@@ -72,10 +72,10 @@ scripts/lsp-e2e/lsp-e2e.sh install
 export PATH="$PWD/.lsp-e2e/bin:$PATH"
 
 # 3. Run the gated suite (serialized; --nocapture shows per-server progress)
-NXVIM_LSP_E2E=1 cargo test -p nxvim --test lsp_e2e -- --nocapture --test-threads=1
+BEMTVI_LSP_E2E=1 cargo test -p bemtvi --test lsp_e2e -- --nocapture --test-threads=1
 ```
 
-Without `NXVIM_LSP_E2E=1` every case is a passing no-op, so a normal
+Without `BEMTVI_LSP_E2E=1` every case is a passing no-op, so a normal
 `cargo test --workspace` never touches a real server.
 
 Other subcommands:
@@ -101,8 +101,8 @@ scripts/lsp-e2e/lsp-e2e.sh install <name>...   # install a subset (e.g. clangd g
 
 ## No treesitter grammars required
 
-The suite asserts on LSP diagnostics, never on syntax highlighting. nxvim's
+The suite asserts on LSP diagnostics, never on syntax highlighting. bemtvi's
 filetype detection is a pure file-extension table
-(`nxvim_server::filetype_of`) with no treesitter involvement, and the syntax
+(`bemtvi_server::filetype_of`) with no treesitter involvement, and the syntax
 worker degrades gracefully when a grammar is missing. So a CI host with zero
 grammars installed runs this suite fine.

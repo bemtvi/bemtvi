@@ -7,11 +7,11 @@ The `BufWritePre` write seam (which format-on-save hooks) is split into its own
 design —
 [`2026-06-04-bufwritepre-write-seam-design.md`](2026-06-04-bufwritepre-write-seam-design.md).
 
-All three phases below are landed and covered by `crates/nxvim-server/tests/autocmds.rs`:
+All three phases below are landed and covered by `crates/bemtvi-server/tests/autocmds.rs`:
 the registration/dispatch bridge (Phase 1), the `BufReadPost`/`FileType`/`BufEnter`
 buffer lifecycle events (Phase 2), and `InsertEnter` (Phase 3).
 
-This document is both the design for nxvim's autocommand event lifecycle **and** a
+This document is both the design for bemtvi's autocommand event lifecycle **and** a
 phase-by-phase implementation plan. Each phase is written to be handed off to a
 fresh context window: prerequisites, the exact files it touches, the surface it
 adds, the tests that prove it, and a hard "done when" gate. Read the *Design* half
@@ -19,11 +19,11 @@ first, then execute the phases in order.
 
 ## Goal
 
-nxvim already has the **spine** of an autocmd system — `vim.api.nvim_create_autocmd`
-registers callbacks (`crates/nxvim-lua/src/prelude.lua`), `nx._fire(event, pattern)`
+bemtvi already has the **spine** of an autocmd system — `vim.api.nvim_create_autocmd`
+registers callbacks (`crates/bemtvi-lua/src/prelude.lua`), `btv._fire(event, pattern)`
 dispatches them, and `LuaRuntime::fire_autocmd` drives it from Rust
-(`crates/nxvim-lua/src/lib.rs`). It is proven end-to-end: `:colorscheme` works by
-firing `ColorScheme` (`crates/nxvim-server/src/lib.rs`).
+(`crates/bemtvi-lua/src/lib.rs`). It is proven end-to-end: `:colorscheme` works by
+firing `ColorScheme` (`crates/bemtvi-server/src/lib.rs`).
 
 But `ColorScheme` is the **only** event the editor ever emits, autocmd callbacks
 get **no buffer context**, and augroups don't **clear**. Real configs and the
@@ -47,18 +47,18 @@ establishes. It is its own design:
 ### How autocmds work today
 
 - **Registration** (`prelude.lua`): `nvim_create_autocmd(event, opts)` appends
-  `{id, event, opts}` to `nx._autocmds`; `nvim_create_augroup(name, opts)` stores
-  a sequence id in `nx._augroups` and **ignores `opts`** (no `clear`).
-- **Dispatch** (`prelude.lua`): `nx._fire(event, pattern)` linearly scans
-  `nx._autocmds`, matches on event + `opts.pattern`, and invokes
+  `{id, event, opts}` to `btv._autocmds`; `nvim_create_augroup(name, opts)` stores
+  a sequence id in `btv._augroups` and **ignores `opts`** (no `clear`).
+- **Dispatch** (`prelude.lua`): `btv._fire(event, pattern)` linearly scans
+  `btv._autocmds`, matches on event + `opts.pattern`, and invokes
   `opts.callback({id, event, match, file})` or runs `opts.command`. **No `buf`.**
-- **Emission** (`crates/nxvim-server/src/lib.rs`): `LuaRuntime::fire_autocmd`
-  calls `nx._fire`. The **only** caller is `set_colorscheme`.
+- **Emission** (`crates/bemtvi-server/src/lib.rs`): `LuaRuntime::fire_autocmd`
+  calls `btv._fire`. The **only** caller is `set_colorscheme`.
 
 ### The model this phase establishes
 
 **1. The server emits buffer/mode events centrally, by diffing editor state after
-each applied input.** `nxvim-core` stays pure (no Lua, no event types) — so the
+each applied input.** `bemtvi-core` stays pure (no Lua, no event types) — so the
 server compares the editor's current state against what it last announced and fires
 the events the transition implies. The diff runs **per applied input** — after each
 `Server::input` key (`editor.input(key)`), and after the `nvim_command` and
@@ -75,7 +75,7 @@ New `Server` tracking fields: `last_buffer_id`, `last_mode`, and an
 Ordering on first opening a *file* mirrors neovim closely enough:
 `BufReadPost` → `FileType` → `BufEnter`. `BufReadPost` and `FileType` fire **once**
 per buffer and **only for file-backed buffers** — a fresh `:enew`/`[No Name]` (and
-the bare-`nxvim` startup buffer) was never read from a file, so it fires only
+the bare-`bemtvi` startup buffer) was never read from a file, so it fires only
 `BufEnter`. A plain buffer **switch** (no read) fires only `BufEnter`. `FileType`'s
 pattern is the filetype derived from the path via `filetype_of` (skipped when it
 detects nothing); `BufEnter` fires on **every** entry.
@@ -83,14 +83,14 @@ detects nothing); `BufEnter` fires on **every** entry.
 **2. Buffer context via a current-buffer snapshot.** Callbacks need to know *which*
 buffer fired (`args.buf`) and resolve it (`vim.api.nvim_buf_get_name(0)`,
 `vim.fn.expand('%:p:h')`). Until Lua has a real buffer registry, the server pushes
-a small snapshot — `nx._cur_buf = {bufnr, name}` — into the VM immediately before
-firing, and `nvim_buf_get_name`/`expand('%')` read it. `nx._fire` gains optional
+a small snapshot — `btv._cur_buf = {bufnr, name}` — into the VM immediately before
+firing, and `nvim_buf_get_name`/`expand('%')` read it. `btv._fire` gains optional
 `buf`/`file` params so `args` carries the real bufnr and path. Existing
 `ColorScheme` callers pass nothing and are unaffected.
 
 ### Key decisions
 
-- **D1 — Central server-side emission, not core hooks.** Keeps `nxvim-core` pure
+- **D1 — Central server-side emission, not core hooks.** Keeps `bemtvi-core` pure
   and gives one place to reason about event ordering. Buffer/mode events are a
   function of *observable editor state*, so the server diffs that state after each
   applied input (model §1) instead of threading an event bus through the synchronous
@@ -100,7 +100,7 @@ firing, and `nvim_buf_get_name`/`expand('%')` read it. `nx._fire` gains optional
   design decision here rather than a separate doc. `BufWritePre` is **not** modeled
   this way: a pre-action write hook can't be reconstructed from after-the-fact state,
   so it gets its own core-deferral design (the write-seam doc).
-- **D2 — Snapshot for buffer context.** A `nx._cur_buf` snapshot backs
+- **D2 — Snapshot for buffer context.** A `btv._cur_buf` snapshot backs
   `nvim_buf_get_name(0)`/`expand('%')` synchronously during dispatch. No async
   window exists (the core is single-message-at-a-time; `vim.schedule` runs inline),
   so the snapshot can't go stale mid-callback. A real per-bufnr registry is a later
@@ -113,20 +113,20 @@ firing, and `nvim_buf_get_name`/`expand('%')` read it. `nx._fire` gains optional
 
 ### Files
 
-- `crates/nxvim-lua/src/prelude.lua` — `nx._fire` args; augroup `clear` + per-autocmd
-  `group`; `nx._cur_buf` snapshot; `nvim_exec_autocmds`; `nvim_del_autocmd`.
-- `crates/nxvim-lua/src/lib.rs` — `fire_autocmd` gains buffer context
+- `crates/bemtvi-lua/src/prelude.lua` — `btv._fire` args; augroup `clear` + per-autocmd
+  `group`; `btv._cur_buf` snapshot; `nvim_exec_autocmds`; `nvim_del_autocmd`.
+- `crates/bemtvi-lua/src/lib.rs` — `fire_autocmd` gains buffer context
   (`fire_autocmd_buf`/`set_buf_snapshot`); add the **Lua** binding
   `vim.api.nvim_buf_get_name` and the minimal `vim.fn.expand('%'...)`, both backed by
   the snapshot. (Note: a `nvim_buf_get_name` *RPC* method already exists on the server
   — `lib.rs:276`, core-backed — and is separate; the Lua binding is snapshot-backed as
   an interim until a real per-bufnr registry exists.)
-- `crates/nxvim-server/src/lib.rs` — the `emit_lifecycle_events()` diff step
+- `crates/bemtvi-server/src/lib.rs` — the `emit_lifecycle_events()` diff step
   (`last_buffer_id`, `last_mode`, `announced`), called after each applied input — the
   per-key loop in `Server::input` (`lib.rs:356`), the `nvim_command` and
   `nvim_set_current_buf` arms, and once at startup after `source_init` (`lib.rs:166`);
   new `Server` fields. (No `:w` interception — that's the separate write-seam doc.)
-- Tests in `crates/nxvim-server/tests/autocmds.rs` (new file, sibling to `buffers.rs`)
+- Tests in `crates/bemtvi-server/tests/autocmds.rs` (new file, sibling to `buffers.rs`)
   — black-box via `nvim_input` / RPC, asserting on observable effects (a callback that
   runs `:` commands or `print`s a marker), per the project's no-unit-test rule. It
   carries its own `start`/`start_with_config`/`feed`/`lines` helpers, copied from the
@@ -144,8 +144,8 @@ firing. Independently testable with **zero** editor lifecycle wiring, via
 **Prerequisites.** None.
 
 **Scope (in).**
-- `nx._fire(event, pattern, buf, file)` → callback `args = {id, event, match, buf, file}`.
-- `nx._cur_buf = {bufnr, name}` snapshot + `nx._set_cur_buf`; add the Lua
+- `btv._fire(event, pattern, buf, file)` → callback `args = {id, event, match, buf, file}`.
+- `btv._cur_buf = {bufnr, name}` snapshot + `btv._set_cur_buf`; add the Lua
   `vim.api.nvim_buf_get_name(bufnr)` binding (0 / snapshot bufnr → snapshot name) and a
   minimal `vim.fn.expand` for `%`, `%:p`, `%:h`, `%:t`. `%` is the path as stored on
   the buffer; `%:p` wants an absolute path, so the snapshot should carry an absolute
@@ -160,7 +160,7 @@ firing. Independently testable with **zero** editor lifecycle wiring, via
 **Scope (out).** Any editor-emitted events (Phases 2–3). A real per-bufnr buffer
 registry (snapshot only).
 
-**Tests** (`crates/nxvim-server/tests/autocmds.rs`).
+**Tests** (`crates/bemtvi-server/tests/autocmds.rs`).
 - A callback registered for a custom event runs on `nvim_exec_autocmds` and sees
   the right `args.buf`/`args.match` (assert via a command the callback runs).
 - `nvim_create_augroup(name, {clear=true})` re-run drops the prior callback (no

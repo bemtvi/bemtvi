@@ -1,6 +1,6 @@
 # Helix mode — selection-first editing
 
-An opt-in **selection-first** editing model, alongside — not replacing — nxvim's
+An opt-in **selection-first** editing model, alongside — not replacing — bemtvi's
 vim grammar. Where vim is *verb→noun* on a point cursor (`d` waits for a motion),
 Helix is *noun→verb* on a persistent `anchor..head` **range**: a motion re-selects
 on every keystroke, and a verb acts on the current selection immediately, with no
@@ -12,24 +12,24 @@ not its keybindings bolted on. The hard part isn't rebinding keys; it's that a
 motion *means something different*: `w` moves **and re-selects** the next word on
 every selection, so `wd` deletes a word with no motion-wait in between. That
 semantic change is why the model is native Rust (a genuine core-grammar change),
-while the **key layout** ships as the bundled `nx.helix` plugin.
+while the **key layout** ships as the bundled `btv.helix` plugin.
 
 Vim behavior is untouched. Helix is per-session and off by default.
 
 ## Turning it on
 
 ```lua
--- ~/.config/nxvim/init.lua
-nx.helix.enable()          -- enter Helix normal mode at startup
+-- ~/.config/bemtvi/init.lua
+btv.helix.enable()          -- enter Helix normal mode at startup
 ```
 
-Or interactively: `:helix` toggles it (and `nx.helix.disable()` turns it off).
+Or interactively: `:helix` toggles it (and `btv.helix.disable()` turns it off).
 Both are idempotent. The status line reads `HELIX` (normal) or `HELIX-SEL`
 (select); the mode codes are `hn` / `hs`, distinct from vim's `n`/`v` so plugins
 and `ModeChanged` can tell them apart.
 
 Search defaults to **smart-case** in Helix without touching the global
-`ignorecase`/`smartcase`; opt out with `nx.helix.enable{ smart_case = false }`.
+`ignorecase`/`smartcase`; opt out with `btv.helix.enable{ smart_case = false }`.
 
 ## The two modes
 
@@ -124,7 +124,7 @@ The text-object alphabet is the full shared set — vim objects (`w` `W` `p` `s`
 pairs `(` `{` `[` `<`, quotes `"` `'` `` ` ``) **and the tree-sitter captures**
 `f` function / `a` argument / `c` comment / `t` class — so `mif` selects the
 enclosing function body, `maf` the whole function, `mia` the argument. (Requires a
-grammar with `textobjects.scm`; `nx.textobject.map` keys work here too.)
+grammar with `textobjects.scm`; `btv.textobject.map` keys work here too.)
 
 ## Regex selection (`s` / `S` / `K` / `Alt-K`)
 
@@ -153,7 +153,7 @@ e.g. `%sfoo<CR>c…`.
 
 ## Menus (the plugin layer)
 
-The bundled `nx.helix` plugin binds the keys a bare grammar key can't reach:
+The bundled `btv.helix` plugin binds the keys a bare grammar key can't reach:
 
 - **Insert entry** — `i` `a` `I` `A` `o` `O` (all per-selection).
 - **Goto menu** `g` — `gg` file start, `ge` last line, `gh` / `gl` line
@@ -165,7 +165,7 @@ The bundled `nx.helix` plugin binds the keys a bare grammar key can't reach:
 
 ### which-key
 
-The native which-key (`nx.on_key_pending`, see [UI primitives](ui-primitives.md))
+The native which-key (`btv.on_key_pending`, see [UI primitives](ui-primitives.md))
 lights up for Helix too — both the plugin menus (`g`, `<Space>`) and the native
 sub-grammars: `m` match mode, `mi`/`ma` (the object alphabet, tree-sitter captures
 included), `z` view, `f`/`t` find, `r` replace, and `"` register.
@@ -175,14 +175,14 @@ included), `z` view, `f`/`t` find, `r` replace, and `"` register.
 Both Helix modes share one keymap bucket, `helix`, which **falls through** to the
 native grammar on no match (so Helix stays fully usable with no config — the
 plugin only *adds* keys). Every verb is exposed by name through
-`nx.helix.actions.<name>`, so any key is rebindable:
+`btv.helix.actions.<name>`, so any key is rebindable:
 
 ```lua
 -- alias X to "extend line" (x); user maps win over defaults
-nx.keymap.set("helix", "X", nx.helix.actions.extend_line_below)
+btv.keymap.set("helix", "X", btv.helix.actions.extend_line_below)
 
 -- add a goto entry: gm -> last line (a count typed before it still applies)
-nx.keymap.set("helix", "gm", nx.helix.actions.goto_last_line, { desc = "Last line" })
+btv.keymap.set("helix", "gm", btv.helix.actions.goto_last_line, { desc = "Last line" })
 ```
 
 The action names mirror Helix's own command names (`extend_line_below`,
@@ -195,7 +195,7 @@ The [`examples/helix`](../../examples/helix/init.lua) config is a runnable,
 annotated walkthrough:
 
 ```sh
-NXVIM_CONFIG=examples/helix cargo run -p nxvim -- examples/helix/sample.txt
+BEMTVI_CONFIG=examples/helix cargo run -p bemtvi -- examples/helix/sample.txt
 ```
 
 ## How it works (in brief)

@@ -1,6 +1,6 @@
 # Plugin view persistence
 
-Persist and restore **plugin-owned views** (`nx.view`) across sessions, so a workspace
+Persist and restore **plugin-owned views** (`btv.view`) across sessions, so a workspace
 restore rebuilds not just file windows but the file tree, symbol list, terminal panel,
 etc. — each in its exact slot, with the plugin in charge of its own content.
 
@@ -11,7 +11,7 @@ Persistence today already splits into two halves that nothing currently rejoins:
 - **Core owns layout/structure.** `SessionState` persists the full tab+split tree, dock
   bands, sizes, per-window cursor/scroll (`persist.rs:128–195`). Buffers resolve by
   **path**, never by session-local id — that's why file windows survive a restart.
-- **Plugins own opaque data.** `nx.shada.plugin()` already gives every plugin a
+- **Plugins own opaque data.** `btv.shada.plugin()` already gives every plugin a
   namespaced, budgeted (1 MiB) KV store keyed by plugin identity (`stdlib.lua:210–312`).
 
 The gap: plugin-owned `View` buffers (`BufferKind::View`, read-only) are **deliberately
@@ -29,7 +29,7 @@ what's worth saving.
 
 ## The hard constraint: restore runs before plugins load
 
-Boot order (`nxvim-server/src/lib.rs`):
+Boot order (`bemtvi-server/src/lib.rs`):
 
 1. `host.shada_load()` (2865) → `editor.restore_session()` (2215) — layout rebuilt
    **eagerly, once, here**.
@@ -54,9 +54,9 @@ plugin.
 
 ## Design decisions
 
-1. **Identifier = plugin-chosen string, namespaced by core.** `nx.view.create{ persist =
+1. **Identifier = plugin-chosen string, namespaced by core.** `btv.view.create{ persist =
    "explorer:1" }`. Core captures it together with the plugin's shada **namespace**
-   (resolved the same way `nx.shada.plugin()` resolves it — `assign_namespace`,
+   (resolved the same way `btv.shada.plugin()` resolves it — `assign_namespace`,
    `stdlib.lua:180–208`: longest-matching-rtp-entry → manager name / `"user"` / dir
    basename), so the stored key is `(namespace, id)`. Restore dispatch is then *exact*
    (route to the owning plugin), and an orphan is unambiguous (namespace has no loaded
@@ -64,11 +64,11 @@ plugin.
    responsibility. `persist` absent ⇒ today's behavior (ephemeral, not persisted) — fully
    opt-in.
 
-   **Escape hatch (symmetric with `nx.shada.plugin`).** The `debug.getinfo` stack walk only
+   **Escape hatch (symmetric with `btv.shada.plugin`).** The `debug.getinfo` stack walk only
    resolves when `create` is called *from a file under a runtimepath entry*. A context that
    attributes to nothing — a bare `:lua`, an RPC `exec_lua`, a test, or a shared helper
    module on a different rtp path — can't be auto-namespaced. So `create` takes an optional
-   `namespace` field with the **same contract as `nx.shada.plugin(dev_namespace)`**
+   `namespace` field with the **same contract as `btv.shada.plugin(dev_namespace)`**
    (`stdlib.lua:244–268`): it is *required* when attribution fails, and is an *error* when
    attribution succeeds (the namespace there is always the assigned one — passing it would
    let a plugin masquerade as another). This keeps the two persistence surfaces consistent
@@ -78,19 +78,19 @@ plugin.
 2. **Slot ownership: core-reserved placeholder; plugin adopts.** Restore inverts
    `view:mount` — today the plugin creates the window; on restore *core* owns the
    window/geometry and the plugin supplies the buffer. New primitive `view:place_in(win)`
-   (Lua) / `nx.view._adopt(view_id, win)` (bridge) retargets an existing reserved window to
+   (Lua) / `btv.view._adopt(view_id, win)` (bridge) retargets an existing reserved window to
    the view's backing buffer and installs the view keymaps.
 
-3. **Restore timing: a registry fired after `source_plugins()`.** `nx.view.on_restore(fn)`
+3. **Restore timing: a registry fired after `source_plugins()`.** `btv.view.on_restore(fn)`
    registers a restorer; core invokes it for each pending claim belonging to that plugin's
    namespace. Fired after step 3, at/just-before `VimEnter`. Cross-tick safe: the reserved
    `win` is a real, already-existing window id (synchronous), and a freshly-created view's
    bufnr is known synchronously in core at create time (`view.lua:117` mirror is only for
    *reading later*; `_create`+`_adopt` queue in one tick) — so neither hits the
-   `nx.schedule` winid trap noted in CLAUDE.md.
+   `btv.schedule` winid trap noted in CLAUDE.md.
 
 4. **Lifecycle / GC.** The plugin deletes its own shada key on permanent close (via its
-   existing `on_close` + `nx.shada.plugin():delete(key)`). Core collapses unclaimed
+   existing `on_close` + `btv.shada.plugin():delete(key)`). Core collapses unclaimed
    reserved slots at the end of the restore-event tick. An orphan-namespace shada sweep
    (uninstalled plugins leaking keys) is noted in Phase 3 but kept minimal.
 
@@ -105,25 +105,25 @@ plugin.
 
 ```lua
 -- create with a stable, plugin-chosen persist id (namespaced by core)
-local v = nx.view.create{ name = "Explorer", filetype = "nxtree", persist = "main" }
+local v = btv.view.create{ name = "Explorer", filetype = "btvtree", persist = "main" }
 
 -- escape hatch: a context that attributes to no rtp entry (bare :lua / RPC / test /
 -- off-path helper) must name its namespace explicitly; passing it from a real plugin
--- file is an error (same contract as nx.shada.plugin(dev_namespace)).
-local v = nx.view.create{ persist = "main", namespace = "my-plugin" }
+-- file is an error (same contract as btv.shada.plugin(dev_namespace)).
+local v = btv.view.create{ persist = "main", namespace = "my-plugin" }
 
 -- register a restorer; core calls it for each of THIS plugin's pending views
-nx.view.on_restore(function(id, place)
+btv.view.on_restore(function(id, place)
   -- id == "main" (the string this plugin passed to create last session)
-  local data = nx.shada.plugin():get("view:" .. id)   -- plugin's own stored state
-  local view = nx.view.create{ name = "Explorer", filetype = "nxtree", persist = id }
+  local data = btv.shada.plugin():get("view:" .. id)   -- plugin's own stored state
+  local view = btv.view.create{ name = "Explorer", filetype = "btvtree", persist = id }
   view:set_lines(rebuild_lines(data))                 -- plugin rebuilds its content
   view:on_select(...)                                 -- plugin re-wires callbacks
   place(view)   -- drop `view` into core's reserved window/slot (calls _adopt)
 end)
 ```
 
-`nx.view.pending_restores()` (returns `{ {id=, win=}, … }` for the calling plugin's
+`btv.view.pending_restores()` (returns `{ {id=, win=}, … }` for the calling plugin's
 namespace) backs the registry and is the black-box test hook; kept internal-ish.
 
 ## Phases
@@ -132,8 +132,8 @@ Per the big-feature cadence: commit + pause for review between phases.
 
 ### Phase 1 — Plumb the id (capture + restore-to-placeholder)
 
-- `nx.view.create{ persist = }`: derive the namespace (reuse `nx.shada`'s resolver),
-  pass `(namespace, id)` through `nx.view._create`.
+- `btv.view.create{ persist = }`: derive the namespace (reuse `btv.shada`'s resolver),
+  pass `(namespace, id)` through `btv.view._create`.
 - Core: store `(namespace, persist_id)` for the view buffer (a side map on the editor,
   keyed by the view handle/buffer id).
 - `SessionWindow`: add `view_persist: Option<(String, String)>` with
@@ -143,28 +143,28 @@ Per the big-feature cadence: commit + pause for review between phases.
 - `restore_session` / `build_layout` / `build_leaf_buffer` (`persist.rs:599–712`): for a
   view-persist leaf, mint a **reserved placeholder window** (empty ordinary buffer) and
   record `{namespace, id, win}` on a `pending_view_restores` list on the editor.
-- Expose `nx.view.pending_restores()` (per-namespace filter).
+- Expose `btv.view.pending_restores()` (per-namespace filter).
 - **End-of-Phase-1 behavior:** with no claimant yet, reserved slots collapse at the end
   of the restore tick (net: same as today). The id round-trip is observable via the
   pending list.
 - **Tests** (`tests/session.rs`): session 1 mounts a persisted view in a vsplit and a
-  dock; session 2 restore → `nx.view.pending_restores()` returns both ids with valid
+  dock; session 2 restore → `btv.view.pending_restores()` returns both ids with valid
   reserved win ids; an *un*persisted view leaves no pending entry.
 
 ### Phase 2 — The claim handshake (adopt into the reserved slot)
 
-- `nx.view.on_restore(fn)` registry; core dispatches each pending claim to the restorer
+- `btv.view.on_restore(fn)` registry; core dispatches each pending claim to the restorer
   registered by the owning namespace, after `source_plugins()` (wire the firing point in
   `lib.rs` near 2909/2956).
-- `view:place_in(win)` / `nx.view._adopt(view_id, win)`: retarget the reserved window to
-  the view's backing buffer; install view keymaps (`nx._install_view_keymaps`); the
+- `view:place_in(win)` / `btv.view._adopt(view_id, win)`: retarget the reserved window to
+  the view's backing buffer; install view keymaps (`btv._install_view_keymaps`); the
   placeholder buffer is discarded.
 - Orphan collapse: any pending claim not adopted by the end of the restore-event tick →
   close the reserved window, collapse the split / empty the dock (reuse the missing-file
   collapse path).
 - **Tests:** full round-trip — session 1 mounts a persisted file-tree view (content +
   geometry, in both a dock and a split-in-a-second-tab); session 2's config registers
-  `on_restore` and rebuilds from `nx.shada.plugin()`; assert lines, dock side/size, split
+  `on_restore` and rebuilds from `btv.shada.plugin()`; assert lines, dock side/size, split
   orientation, and active focus all match. Plus: an unclaimed id (no `on_restore`
   registered) collapses its slot cleanly.
 
@@ -181,7 +181,7 @@ Per the big-feature cadence: commit + pause for review between phases.
   `lifecycle.rs`, shared) provided that path also calls `restore_persisted_views`.
 - **GC.** Document the `on_close` → `shada:delete` convention; consider an
   orphan-namespace sweep on flush for uninstalled plugins (keep minimal / optional).
-- **Docs.** Update the `nx.view` section of the native plugin API spec
+- **Docs.** Update the `btv.view` section of the native plugin API spec
   (`docs/specs/2026-06-11-native-plugin-api.md`) with `persist` / `on_restore` /
   `place_in`.
 - **Example.** `examples/view-persist/` — a runnable mini "pinned notes" view plugin that
@@ -198,4 +198,4 @@ Per the big-feature cadence: commit + pause for review between phases.
   feel tempted to let core cache view *lines*, that's the `unnamed_contents` mistake for
   plugin buffers — don't.
 - `place_in` is the one genuinely new core primitive; everything else extends existing
-  capture/restore and the `nx.view` handle.
+  capture/restore and the `btv.view` handle.

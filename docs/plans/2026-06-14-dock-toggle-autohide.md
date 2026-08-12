@@ -7,7 +7,7 @@
 >
 > **Status: ✅ all four phases landed 2026-06-14.** Hidden-state model + hide/show/
 > toggle, the `autohide` option with a `switch_layer` focus-leave hook, the
-> `nx.dock.toggle`/`hide`/`show` + `:Dock*` surface, and the `tests/dock.rs`
+> `btv.dock.toggle`/`hide`/`show` + `:Dock*` surface, and the `tests/dock.rs`
 > coverage + example all in. One infra fix rode along: a waiting predicate-drain
 > `wait_redraw` was added to the test harness to kill the take-latest redraw race
 > that the extra tests exposed; `all_window_ids` now also excludes hidden docks so
@@ -21,7 +21,7 @@ landed. A dock is a global, cross-tab `WindowTree` parked in `Editor::dock_tabs:
 [Option<TabStack>; 4]`; the *focused* layer's active tab is swapped live onto
 `Editor::windows`. `editor/dock.rs` owns open/close/focus.
 
-Today the only way to make a dock disappear is `close_dock` (`nx.dock.close`), which
+Today the only way to make a dock disappear is `close_dock` (`btv.dock.close`), which
 **drops the whole `TabStack`** — every tab's tree. Reopening mints a fresh scratch
 buffer: internal splits, the dock's tab pages, cursor positions and scroll are all
 lost. VSCode's panel toggle instead **preserves** the panel's contents across
@@ -88,7 +88,7 @@ Steps:
    - `show_dock(side)`: no-op unless `dock_exists`. Clear `dock_hidden[idx]`, then
      `focus_dock(side)` (show + focus, matching "bring up the panel"). `relayout()`.
    - `toggle_dock(side)`: visible → `hide_dock`; hidden (exists) → `show_dock`;
-     absent → echo `nx.dock: no dock on {side} to toggle` (opening a fresh dock is
+     absent → echo `btv.dock: no dock on {side} to toggle` (opening a fresh dock is
      `:DockOpen`'s job, since toggle has no size/buffer to mint one from).
 5. String-keyed wrappers beside the existing `*_named` (loud `E474` on bad side):
    `hide_dock_named`/`show_dock_named`/`toggle_dock_named`, and a read
@@ -104,15 +104,15 @@ redefinition is inert while nothing is hidden). Commit, pause for review.
 **Goal:** a dock marked `autohide` collapses itself the moment focus crosses out of
 it; re-showing (toggle/focus) brings its preserved content back.
 
-Files: `options.rs`, `editor/dock.rs`, `nxvim-lua/src/prelude/nx.lua`.
+Files: `options.rs`, `editor/dock.rs`, `bemtvi-lua/src/prelude/btv.lua`.
 
 Steps:
 1. Add `pub auto_hide: bool` to `DockOptions` (options.rs:199). Doc it as the
    VSCode-style collapse-on-blur flag.
 2. `set_dock_option_num` (dock.rs:344): `"autohide" => self.dock_options[s.idx()]
    .auto_hide = value != 0`. Add `autohide` to the prelude's `DOCK_OPT_DEFAULT`
-   (nx.lua:51) and the known-options list (nx.lua:90) so `nx.dock.opt(side).autohide
-   = true` and inline `nx.dock.open{ autohide = true }` validate.
+   (btv.lua:51) and the known-options list (btv.lua:90) so `btv.dock.opt(side).autohide
+   = true` and inline `btv.dock.open{ autohide = true }` validate.
 3. Focus-leave hook. The chokepoint for layer focus changes is `switch_layer`
    (dock.rs:174). Capture `let prev = self.focused_layer;` at the top; after the swap
    and `self.focused_layer = target;`, if `prev` was a `Dock(s)` with
@@ -132,31 +132,31 @@ Steps:
 
 **Verify (new `tests/dock.rs` cases):** open an `autohide` left dock, type in it,
 `<C-w><C-w>l` (or click main) → dock collapses (zero band, main reclaims space);
-`nx.dock.toggle('left')` brings it back with the typed text intact. A non-autohide
+`btv.dock.toggle('left')` brings it back with the typed text intact. A non-autohide
 dock stays put when focus leaves. Commit, pause.
 
 ---
 
 ## Phase 3 — Lua / RPC / ex surface
 
-**Goal:** user-facing `toggle`/`hide`/`show`, dogfooding the nx API.
+**Goal:** user-facing `toggle`/`hide`/`show`, dogfooding the btv API.
 
-Files: `nxvim-lua/src/ops.rs`, `nxvim-server/src/effects.rs`,
-`nxvim-lua/src/install.rs`, `nxvim-lua/src/prelude/nx.lua`.
+Files: `bemtvi-lua/src/ops.rs`, `bemtvi-server/src/effects.rs`,
+`bemtvi-lua/src/install.rs`, `bemtvi-lua/src/prelude/btv.lua`.
 
 Steps:
 1. `DockOp` (ops.rs:61): add `Toggle { side: String }`, `Hide { side: String }`,
    `Show { side: String }` beside `Close`/`Focus`.
 2. effects.rs drain (effects.rs:173): route them to `toggle_dock_named` /
    `hide_dock_named` / `show_dock_named`.
-3. install.rs (after the `focus` binding, ~l.253): add `nx.dock.toggle/hide/show`,
+3. install.rs (after the `focus` binding, ~l.253): add `btv.dock.toggle/hide/show`,
    each a one-arg `create_function` pushing its `DockOp` (mirror `close`/`focus`).
-4. prelude nx.lua (after the `:DockFocus` block, ~l.114): `:DockToggle` / `:DockHide`
-   / `:DockShow` ex-commands wrapping `nx.dock.toggle/hide/show`. Keep them thin like
+4. prelude btv.lua (after the `:DockFocus` block, ~l.114): `:DockToggle` / `:DockHide`
+   / `:DockShow` ex-commands wrapping `btv.dock.toggle/hide/show`. Keep them thin like
    the existing `:DockClose`/`:DockFocus`.
 
-**Verify:** `nx.dock.toggle('left')`, `:DockToggle left`, and an `autohide` set via
-`nx.dock.opt('left').autohide = true` all drive docks end-to-end over RPC. Commit,
+**Verify:** `btv.dock.toggle('left')`, `:DockToggle left`, and an `autohide` set via
+`btv.dock.opt('left').autohide = true` all drive docks end-to-end over RPC. Commit,
 pause.
 
 ---
@@ -165,9 +165,9 @@ pause.
 
 **Goal:** prove behavior end-to-end; ship a runnable showcase; record the design.
 
-Black-box tests in `crates/nxvim-server/tests/dock.rs` (harness per CLAUDE.md):
+Black-box tests in `crates/bemtvi-server/tests/dock.rs` (harness per CLAUDE.md):
 1. **Content survives toggle**: open a left dock, `<C-w>v` to split it + type text +
-   move the cursor, cross to main, `nx.dock.toggle('left')` (hide) → dock gone, main
+   move the cursor, cross to main, `btv.dock.toggle('left')` (hide) → dock gone, main
    reclaims columns, `nvim_list_wins` count drops; toggle again (show) → the *same*
    two windows, text, and cursor position return (not a fresh scratch).
 2. **Hidden ≠ closed**: after hiding, `nvim_list_bufs` still lists the dock's buffer
@@ -182,7 +182,7 @@ Black-box tests in `crates/nxvim-server/tests/dock.rs` (harness per CLAUDE.md):
    no-dock); showing it restores the band — mirrors the Phase-5 docks redraw asserts.
 
 Example: extend `examples/dock/init.lua` (or `examples/per-region-tabs/`) with a
-toggle keymap (e.g. `<leader>e` → `nx.dock.toggle('left')`) and one `autohide` dock,
+toggle keymap (e.g. `<leader>e` → `btv.dock.toggle('left')`) and one `autohide` dock,
 verified by a `*_example_config_runs` test.
 
 Docs/memory: add a *toggle / auto-hide* note to the docks bullet in
@@ -199,7 +199,7 @@ new dock memory) with the hidden-state model.
 **Why:** a fully-invisible hidden dock gives no hint it exists. User chose a
 **statusline-chip** affordance over an edge rail (keeps the main area full-size).
 
-**Design:** a hidden dock shows a clickable chip `▸{label}` (its `nx.dock` title, or
+**Design:** a hidden dock shows a clickable chip `▸{label}` (its `btv.dock` title, or
 the side keyword when untitled) on the **command-line row when idle** — the one
 global, full-width bottom row present at every `laststatus` (the literal global
 statusline only exists at `laststatus=3`; default is `2`). Chips render only when
@@ -213,7 +213,7 @@ Steps:
 2. Core `view.rs`: `View.hidden_docks: Vec<String>` (labels), populated in
    `from_editor`. Empty ⇒ nothing hidden.
 3. Server `redraw.rs`: encode `hidden_docks` as a string array.
-4. `nxvim-view`: parse `hidden_docks: Vec<String>`.
+4. `bemtvi-view`: parse `hidden_docks: Vec<String>`.
 5. Clients (TUI/GUI/web): on the command row, when `hidden_docks` non-empty &&
    message empty && not command mode, paint `▸{label}` chips from col 0.
 6. Core `mouse.rs`: `hidden_chip_at(row, col)` mirroring the chip geometry on the

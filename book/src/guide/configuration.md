@@ -1,12 +1,12 @@
 # Configuration
 
-nxvim reads a Lua config. On startup it resolves a **config directory** — the
-first of `$NXVIM_CONFIG`, `$XDG_CONFIG_HOME/nxvim`, or `~/.config/nxvim` — and
+bemtvi reads a Lua config. On startup it resolves a **config directory** — the
+first of `$BEMTVI_CONFIG`, `$XDG_CONFIG_HOME/bemtvi`, or `~/.config/bemtvi` — and
 sources `<config>/init.lua` before the first frame. The **runtimepath** is that
 dir plus every `pack/*/start/*` entry under it:
 
 ```
-~/.config/nxvim/
+~/.config/bemtvi/
 ├── init.lua                      # sourced at startup
 └── pack/
     └── plugins/
@@ -15,26 +15,26 @@ dir plus every `pack/*/start/*` entry under it:
 ```
 
 ```lua
--- ~/.config/nxvim/init.lua
+-- ~/.config/bemtvi/init.lua
 require("myplugin").setup()
 ```
 
-## `nx.*` vs `vim.*`
+## `btv.*` vs `vim.*`
 
-The editor's own config API is the **`nx.*` namespace** — see the
+The editor's own config API is the **`btv.*` namespace** — see the
 [API reference](../api/index.md). The only `vim.*` is a closed whitelist of
 **muscle-memory aliases** (`vim.g`, `vim.o`/`vim.opt`, `vim.cmd`,
 `vim.keymap.set`, autocmds, `vim.notify`, and friends), each a 1:1 alias over its
-`nx.*` equivalent, so config can be written in familiar spellings:
+`btv.*` equivalent, so config can be written in familiar spellings:
 
 ```lua
 vim.g.mapleader = " "
 vim.o.number = true
-nx.keymap.set("n", "<leader>w", "<cmd>w<cr>", { desc = "Save" })
+btv.keymap.set("n", "<leader>w", "<cmd>w<cr>", { desc = "Save" })
 ```
 
 The full whitelist lives in
-[ADR 0002](https://github.com/davidrios/nxvim/blob/main/docs/decisions/0002-native-plugin-system.md).
+[ADR 0002](https://github.com/davidrios/bemtvi/blob/main/docs/decisions/0002-native-plugin-system.md).
 A neovim colorscheme reaches for a handful of those aliases (notably the
 `nvim_set_hl` highlight helper) and nothing more.
 
@@ -59,7 +59,7 @@ per-instance surfaces — what a filetype rule uses, so one buffer's indent does
 become everyone's default:
 
 ```lua
-nx.on("FileType", { pattern = "go", callback = function()
+btv.on("FileType", { pattern = "go", callback = function()
   vim.opt_local.expandtab = false   -- Go files only
 end })
 ```
@@ -101,19 +101,19 @@ window to copy — a dock, the quickfix tab — is born from.
 
 Dropping a checkout under `pack/*/start/*` works, but the ergonomic path is the
 **built-in package manager**: there is no third-party manager layer because the
-manager ships with nxvim. You *declare* a set of plugins in `init.lua` with
-`nx.plugins{}`; it clones/updates them over the async runtime (via `nx.git_local`
+manager ships with bemtvi. You *declare* a set of plugins in `init.lua` with
+`btv.plugins{}`; it clones/updates them over the async runtime (via `btv.git_local`
 — first-party `gix`, no `git` binary) and loads each one — adds its directory to the runtimepath so `require`
 and its `colors/` / `queries/` / `lsp/` resolve without a restart, sources its
 `plugin/` scripts, and runs its `config`. Nothing blocks: every step is a
 promise, so the UI paints before plugins finish loading.
 
 ```lua
--- ~/.config/nxvim/init.lua
-nx.plugins({
+-- ~/.config/bemtvi/init.lua
+btv.plugins({
   -- "owner/repo" shorthand expands to a GitHub clone.
-  { "nxvim/nxvim-keys-helper",
-    config = function() require("nxvim-keys-helper").setup({}) end },
+  { "bemtvi/bemtvi-keys-helper",
+    config = function() require("bemtvi-keys-helper").setup({}) end },
 
   -- Lazy-load on a trigger: any of cmd / event / ft / keys makes it lazy.
   { "someone/markdown-tools", ft = "markdown" },
@@ -153,18 +153,18 @@ restore · `X` clean (plus `<C-r>` refresh, `<CR>` details, `q` quit).
 | `:PluginsWelcome` | Reopen the first-run offer of recommended plugins |
 
 Every verb command above (all but `:PluginList` / `:PluginsWelcome`) takes an
-**optional plugin list** — `:PluginUpdate nxvim-tree`, `:PluginSync nxvim-dap
-nxvim-line` — and `<Tab>` completes the declared names. Scoped that way it acts on
+**optional plugin list** — `:PluginUpdate bemtvi-tree`, `:PluginSync bemtvi-dap
+bemtvi-line` — and `<Tab>` completes the declared names. Scoped that way it acts on
 those plugins (and their dependencies, which a plugin needs to load at all) and
 leaves every other plugin's checkout *and its lockfile entry* exactly as they were:
 you get the one fix you were waiting for, not eleven other people's changes. The
 same scope is a `plugins` option on the Lua verbs —
-`nx.plugins.update({ plugins = "nxvim-tree" })`. `:PluginClean` is the one verb
+`btv.plugins.update({ plugins = "bemtvi-tree" })`. `:PluginClean` is the one verb
 whose scope does *not* pull in dependencies (deleting a checkout nobody named is
 destruction by inference), and it refuses outright to delete a local `dir`
 plugin's checkout — that is your own working tree, not a managed clone.
 
-nxvim ships minimal; on a fresh setup it offers a recommended first-party set as
+bemtvi ships minimal; on a fresh setup it offers a recommended first-party set as
 one decision, with `c` opening a checklist to pick individually — see
 [Recommended plugins](recommended-plugins.md) for what's in it. See
 [Writing plugins](../plugins/authoring.md) for authoring your own.
@@ -172,7 +172,7 @@ one decision, with `c` opening a checklist to pick individually — see
 ### The lockfile
 
 Every install / update / sync records the commit each managed plugin resolved to in
-`<config>/nxvim-lock.json`, and installing **reproduces** those commits. **Commit it**
+`<config>/bemtvi-lock.json`, and installing **reproduces** those commits. **Commit it**
 alongside your `init.lua`: config + lockfile is the pair that pins the exact plugin tree,
 so a second machine gets the same code instead of whatever each remote's `HEAD` happens to
 be that day.
@@ -180,7 +180,7 @@ be that day.
 ```json
 {
   "catppuccin": { "branch": "main", "commit": "0b0a9a1…" },
-  "nxvim-line": { "commit": "ada94b5…", "tag": "v2.1.0" }
+  "bemtvi-line": { "commit": "ada94b5…", "tag": "v2.1.0" }
 }
 ```
 
@@ -192,10 +192,10 @@ records the commit *and* the declaration it resolved — the `branch` the plugin
 artifact), and neither does one that isn't installed yet — but neither *loses* an entry
 another machine wrote for it, since the file you commit must not be strip-mined by whichever
 machine happens to sync. Only a plugin your config no longer declares is dropped.
-`nx.plugins.lock()` writes it on demand (`:PluginLock`) and `nx.plugins.locked()` returns
+`btv.plugins.lock()` writes it on demand (`:PluginLock`) and `btv.plugins.locked()` returns
 the current contents; a **malformed** lockfile — including an entry with no commit — is a
 hard error naming the file rather than being treated as "nothing pinned". Relocate it with
-`nx.plugins.setup_manager{ lockfile = … }`.
+`btv.plugins.setup_manager{ lockfile = … }`.
 
 **Which revision wins.** Highest first:
 
@@ -223,7 +223,7 @@ of having one.
 
 - **`:PluginSync`** *reproduces* the lockfile. Missing plugins are installed at their
   locked commits, and a plugin whose checkout has drifted from what the file records is
-  moved back onto it — so pulling a colleague's newer `nxvim-lock.json` and syncing gets
+  moved back onto it — so pulling a colleague's newer `bemtvi-lock.json` and syncing gets
   you the tree it names. Realizing your declared state never moves a plugin *past* the
   recorded revision. (`:PluginInstall` only clones what is missing; it never moves an
   existing checkout, and records only the clones it made.)
@@ -240,7 +240,7 @@ with only a `commit`), `:PluginUpdate` fails loud rather than guessing a branch:
 
 **Going back.** `:PluginRestore` (or `R` in the dashboard) checks every plugin out at the
 commit the lockfile records — the "that update broke my editor" verb, and the reason
-recording commits is worth anything. Check out an older `nxvim-lock.json` from your config
+recording commits is worth anything. Check out an older `bemtvi-lock.json` from your config
 repo and restore to get exactly that plugin tree back.
 
 Restore reaches commits a shallow clone does not contain: it deepens the clone
@@ -256,12 +256,12 @@ your config promises.
 
 ## Runnable examples
 
-The [`examples/`](https://github.com/davidrios/nxvim/tree/main/examples)
+The [`examples/`](https://github.com/davidrios/bemtvi/tree/main/examples)
 directory has ~85 self-contained, end-to-end-verified configs — one per feature
 (treesitter, LSP, floats, registers, tabs, mouse, statusline, completion,
 picker, snippets, decor, docks, quickfix, image previews, …). Each is a config
-dir you point nxvim at:
+dir you point bemtvi at:
 
 ```sh
-NXVIM_CONFIG=examples/treesitter cargo run -p nxvim -- examples/treesitter/sample.rs
+BEMTVI_CONFIG=examples/treesitter cargo run -p bemtvi -- examples/treesitter/sample.rs
 ```

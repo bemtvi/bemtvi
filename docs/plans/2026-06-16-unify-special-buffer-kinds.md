@@ -1,8 +1,8 @@
 # Unify the special-buffer-kind grab-bag
 
 Status: **Phases 1 & 2 landed** — 2026-06-16; **`BufferKind` enum landed** — 2026-06-17
-(see [Identity](#identity-the-bufferkind-enum--done-2026-06-17)). A refactor to consolidate nxvim's
-accreted "non-ordinary buffer" mechanisms before more is built on them (the `nx.view`
+(see [Identity](#identity-the-bufferkind-enum--done-2026-06-17)). A refactor to consolidate bemtvi's
+accreted "non-ordinary buffer" mechanisms before more is built on them (the `btv.view`
 work exposed how out of hand this has gotten). No new user-facing feature — a
 consistency / correctness cleanup that also closes a real read-only hole. Phase 1
 (one read-only mechanism + the regression net) and Phase 2 (converge explorer + view
@@ -11,14 +11,14 @@ tested. The bottom panel remains a separate later effort (see below).
 
 ## Problem
 
-nxvim has grown **six** kinds of non-ordinary buffer, each marked, made read-only,
-routed, and rendered a *different* way. Adding `nx.view` made it seven mechanisms in
+bemtvi has grown **six** kinds of non-ordinary buffer, each marked, made read-only,
+routed, and rendered a *different* way. Adding `btv.view` made it seven mechanisms in
 five styles — a seventh parallel copy, not a generalization.
 
 | kind | marked by | read-only via | input routing | render |
 |---|---|---|---|---|
 | explorer | `Buffer.dir: Option<PathBuf>` (`buffer.rs:166`) | input-routing **only** (NOT `modifiable()`) | `KeyContext::Explorer` → `'E'` bucket | ordinary `WindowView` |
-| view (`nx.view`) | `Buffer.view: Option<u64>` (`buffer.rs:175`) | `modifiable()` **+** input-routing | `KeyContext::View` → `'W'` bucket | ordinary `WindowView` |
+| view (`btv.view`) | `Buffer.view: Option<u64>` (`buffer.rs:175`) | `modifiable()` **+** input-routing | `KeyContext::View` → `'W'` bucket | ordinary `WindowView` |
 | terminal | `Buffer.terminal: bool` (`buffer.rs:184`) | `modifiable()` + `Mode::Terminal` | `Mode::Terminal` (forwards to PTY) | ordinary `WindowView` |
 | image | `Buffer.image: bool` (`buffer.rs:197`) | empty rope (nothing to edit) | none | `WindowView.image: ImageView` |
 | quickfix / loclist | `Editor.qf_bufnr` + per-window `Window.loclist_bufnr` registry | `modifiable()` + special-cased `<CR>` in `input()` | none (`KeyContext::Editing`); `<CR>` hard-coded | ordinary `WindowView` |
@@ -30,7 +30,7 @@ Three concrete problems fall out of this:
    (`terminal.rs:143`, now `!terminal && !is_quickfix_buffer() && !is_view_buffer()`)
    is consulted at the edit chokepoints, but the **explorer** isn't in it — its
    inertness rides input-routing only, so an ex-command (`:d`, `:s`, `:put`) edits a
-   netrw listing despite its doc claiming it "can't be corrupted." (The `nx.view`
+   netrw listing despite its doc claiming it "can't be corrupted." (The `btv.view`
    work already hit this and added the three ex-command guards in `ex.rs`; the
    explorer is the same latent bug, unfixed.) Two mechanisms enforcing one property,
    neither completely.
@@ -78,7 +78,7 @@ buffers distinguished only by their identity marker, their content source, and t
 one or two special keys — and even quickfix's `<CR>` stops being an editor hard-code.
 **`input()` ends with zero special-buffer branches.** In vim, quickfix's `<CR>` is a
 buffer-local mapping (`nnoremap <buffer> <CR> …`) installed by its ftplugin — *that*
-is the model, not a branch in the input loop. nxvim's current hard-coded quickfix
+is the model, not a branch in the input loop. bemtvi's current hard-coded quickfix
 `<CR>` (`mod.rs:1565`) is itself a bespoke hard-code to remove.
 
 ## Phase 1 — one read-only mechanism, consulted everywhere (the quickfix way; small) — **DONE**
@@ -95,10 +95,10 @@ This *is* ingredient 1, applied uniformly. No new abstraction.
   `operators.rs:55/711/796`, `ex.rs` s/d/put, `multicursor.rs:524`, `snippet.rs:113`,
   `command.rs:2081`) — each refuses with `refuse_edit()` (E21). No new chokepoints
   needed.
-- ✅ Tests: `crates/nxvim-server/tests/readonly.rs` — `:d`/`:s`/`:put` refused with
+- ✅ Tests: `crates/bemtvi-server/tests/readonly.rs` — `:d`/`:s`/`:put` refused with
   E21 on explorer, view, quickfix, image (terminal already covered in `terminal.rs`).
   Confirmed failing before the `modifiable()` change (explorer + image were the open
-  holes); the regression net for Phase 2. (`:normal` isn't an nxvim ex-command, so the
+  holes); the regression net for Phase 2. (`:normal` isn't an bemtvi ex-command, so the
   battery is the three native chokepoint commands.)
 
 Ships independently; fixes the bug. After this, the explorer/view input-routing
@@ -114,11 +114,11 @@ keymaps** (vim's ftplugin model). What shipped, versus the original sketch below
 - ✅ **Deleted from `input()`** (`mod.rs`): the explorer early-return, the view
   early-return, and the hard-coded quickfix `<CR>` — all three. `input()` has **no**
   special-buffer branch now.
-- ✅ **Activation keys are buffer-local default maps.** The explorer (`filetype=nxdir`)
+- ✅ **Activation keys are buffer-local default maps.** The explorer (`filetype=btvdir`)
   and quickfix (`filetype=qf`) install theirs from a prelude **`FileType` autocmd**
-  (the vim model the user chose); the qf bridge `nx._qf_action("jump")` +
-  `Editor::apply_qf_action` is the one new bridge. `nx.view` installs its `<CR>` →
-  `confirm` map **at create time** (`nx._install_view_keymaps`, called server-side
+  (the vim model the user chose); the qf bridge `btv._qf_action("jump")` +
+  `Editor::apply_qf_action` is the one new bridge. `btv.view` installs its `<CR>` →
+  `confirm` map **at create time** (`btv._install_view_keymaps`, called server-side
   right after `create_view`) rather than off a `FileType` autocmd — a view's filetype
   is *content-semantic* (drives treesitter, e.g. `markdown`) so it can't double as the
   widget tag, and a view is created off-screen and may never be the current buffer when
@@ -128,7 +128,7 @@ keymaps** (vim's ftplugin model). What shipped, versus the original sketch below
   path extension), for non-file-backed buffers too, and re-fires whenever a buffer's
   filetype changes — tracked by a new `fired_filetype` map separate from `announced`.
   The change-refire is essential: `:e dir` reuses a throwaway buffer **in place** (same
-  id, already announced), and only the ft change (`""` → `nxdir`) re-fires `FileType`
+  id, already announced), and only the ft change (`""` → `btvdir`) re-fires `FileType`
   to install the maps.
 - ✅ **Deleted the dead apparatus:** `KeyContext::Explorer`/`View` + their `key_context`
   branches; the `'E'`/`'W'` buckets in `widget_bucket`/`mode_buckets`/`mode_code`;
@@ -136,9 +136,9 @@ keymaps** (vim's ftplugin model). What shipped, versus the original sketch below
   `apply_explorer_action`/`apply_view_action` (kept `open`/`up`, `confirm`). Navigation
   is ordinary normal-mode motion on the `nomodifiable` buffers now.
 - ✅ **Tests:** `widget_keys.rs` explorer tests rewritten for the new model (buffer-local
-  rebind via a `FileType nxdir` autocmd; global maps now apply on the ordinary explorer
+  rebind via a `FileType btvdir` autocmd; global maps now apply on the ordinary explorer
   buffer; `j`/`k`/`gg`/`G` are normal motions); `quickfix.rs` gains
-  `quickfix_enter_is_rebindable` (the new capability); `nx_view.rs` / `daemon_explorer.rs`
+  `quickfix_enter_is_rebindable` (the new capability); `btv_view.rs` / `daemon_explorer.rs`
   pass unchanged; one `autocmds.rs` introspection test rescoped now that built-in
   `FileType` autocmds exist. Whole workspace green (default + `--no-default-features`),
   clippy clean.
@@ -162,22 +162,22 @@ Phase 1).
 **Activation keys become buffer-local default maps** installed the vim way — by a
 prelude `FileType` autocmd, keyed off each kind's filetype/buftype:
 - quickfix/loclist (`buftype=quickfix`): `<CR>` → jump to entry.
-- explorer (give the listing a filetype, e.g. `netrw`/`nxdir`): `<CR>` → open, `-` → parent.
-- view (its `nx.view.create{ filetype = … }`, falling back to a default `nxview` ft):
+- explorer (give the listing a filetype, e.g. `netrw`/`btvdir`): `<CR>` → open, `-` → parent.
+- view (its `btv.view.create{ filetype = … }`, falling back to a default `btvview` ft):
   `<CR>` → fire `on_select`.
 
 Each map's RHS is a thin Lua function calling the **existing native action bridge**
-(`nx._explorer_action("open")`, `nx._view_action("confirm")`, and a new
-`nx._qf_action("jump")` for quickfix — the only new bridge), so the core jump/open/
+(`btv._explorer_action("open")`, `btv._view_action("confirm")`, and a new
+`btv._qf_action("jump")` for quickfix — the only new bridge), so the core jump/open/
 select logic is unchanged; only the *trigger* moves from a hard-coded branch to a
 buffer-local map. `default = true` keeps them user-overridable via the standard
-`nx.keymap.set(mode, lhs, rhs, { buffer = … })` — no bespoke bucket.
+`btv.keymap.set(mode, lhs, rhs, { buffer = … })` — no bespoke bucket.
 
 **Delete the now-dead apparatus:**
 - `KeyContext::Explorer` / `KeyContext::View` (`mode.rs`) and their two branches in
   `key_context()` (`menu.rs:944`);
 - the `'E'` / `'W'` buckets and their entries in `widget_bucket` / `mode_buckets` /
-  `mode_code` (`nxvim-server/src/keymap.rs`);
+  `mode_code` (`bemtvi-server/src/keymap.rs`);
 - `handle_explorer_text` / `handle_view_text`;
 - the **nav** arms of `apply_explorer_action` / `apply_view_action`
   (`next`/`prev`/`first`/`last`/`half`/`page` — normal motions already do these); keep
@@ -195,7 +195,7 @@ mechanism needs already exist:
 
 The remaining task: the explorer and quickfix display buffers **don't carry a filetype
 today** (only the view does, via `set_filetype` in `create_view`). So Phase 2 must give
-the explorer listing a filetype (e.g. `nxdir`) and the qf display buffer `qf`, and
+the explorer listing a filetype (e.g. `btvdir`) and the qf display buffer `qf`, and
 ensure `FileType` fires for these core-created buffers (it's keyed off naming/announce —
 verify the dir-named explorer buffer and the qf buffer reach the announce path; make
 them if not). This is correct vim behavior regardless (vim's quickfix is `filetype=qf`,
@@ -260,8 +260,8 @@ strip — not a buffer-in-a-window. Rather than reproduce it as one bespoke "pan
 it was **dissolved into the two general mechanisms** the editor already had: read-only
 scratch buffers (a new `'modifiable'` option) for the text listings (`:messages` / `:ls`
 / `:registers` / `:marks` / `:jumps` / `:changes` / LSP info), and real **location lists**
-for the navigable LSP reference / diagnostic lists. Code actions moved to `nx.ui.select`.
-The whole `Panel` / `PanelView` / `'L'`-bucket / `vim.panel.*` / `nxvim_panel_*` stack is
+for the navigable LSP reference / diagnostic lists. Code actions moved to `btv.ui.select`.
+The whole `Panel` / `PanelView` / `'L'`-bucket / `vim.panel.*` / `bemtvi_panel_*` stack is
 **deleted**; word-wrap was dropped (a buffer-wide gap to implement once, for all buffers).
 
 ## Out of scope
@@ -270,7 +270,7 @@ The whole `Panel` / `PanelView` / `'L'`-bucket / `vim.panel.*` / `nxvim_panel_*`
   only its read-only-ness joins the unified `modifiable()` (already true).
 - The float widgets (picker / select / content-float) — transient grabbing overlays,
   a different axis; they keep their buckets.
-- Any change to the public `nx.view` Lua surface — internal consolidation only.
+- Any change to the public `btv.view` Lua surface — internal consolidation only.
 
 ## Sequencing & risk
 

@@ -6,7 +6,7 @@
 
 ## Goal
 
-A self-contained, **static** web demo of nxvim (no backend, deployable to Netlify) that
+A self-contained, **static** web demo of bemtvi (no backend, deployable to Netlify) that
 ships:
 
 - a real, multi-file **python project** with a guided tour,
@@ -92,7 +92,7 @@ process-host coordinator) + `web/pyodide-worker.mjs`; `worker.mjs` carries only 
 hook (`let localHost = null`; dynamic-`import`s `local-host.mjs` and installs it iff
 `BUILD.localHost && serverless`), so the standard build never even loads the demo module. The
 shared-core fixes (the `proc_host` gate rename, the `terminal_exit` projection) live in the
-wasm and benefit both builds. Serve the demo with `NXVIM_SERVE_ROOT=demo-site node web/serve.mjs`;
+wasm and benefit both builds. Serve the demo with `BEMTVI_SERVE_ROOT=demo-site node web/serve.mjs`;
 `verify-pyodide-terminal.mjs` runs against `demo-site/`, the standard verifies against `web/`
 (with a guard asserting `localHost=false`).
 
@@ -202,10 +202,10 @@ sees what the editor shows and edits are visible to the interpreter.
   the Worker answers with `proc-spawned`/`proc-stdout`/`proc-exited` → the existing daemon
   `proc_*` landings (`eh_proc_spawned`/`eh_proc_stdout`/`eh_proc_exited`); `liveProcs` keeps the
   run loop on its non-blocking park so the pushes are received. The ctx gains `liveProcs`.
-- `web/pyodide-worker.mjs` `__nx_proc_run` mirrors the daemon `host.rs` contract: stdout/stderr
+- `web/pyodide-worker.mjs` `__btv_proc_run` mirrors the daemon `host.rs` contract: stdout/stderr
   captured **separately** (via `contextlib.redirect_stdout/redirect_stderr`, isolated from the
   terminal's `curBuf` routing) with an exit code, run in a fresh `__main__` namespace with
-  `sys.argv`/`sys.stdin`/`cwd`/`env` set + restored. A **streaming** spawn (`nx.run_stream`)
+  `sys.argv`/`sys.stdin`/`cwd`/`env` set + restored. A **streaming** spawn (`btv.run_stream`)
   pushes newline-stripped stdout lines through `proc-stdout` as they're produced and returns
   empty stdout with the exit (already streamed); a plain spawn returns the whole capture.
 - Invocation forms: `python -c CODE`, a script `FILE` (path rebased onto the `/project` OPFS
@@ -213,10 +213,10 @@ sees what the editor shows and edits are visible to the interpreter.
   command-not-found (exit 127, stderr names it), exactly as a shell reports a missing binary (a
   localized failure, not a host crash). Kill = SIGINT via the shared interrupt buffer (best-effort
   — one buffer, single-threaded interpreter).
-- **Verified:** `verify-pyodide-proc.mjs` — serverless `nx.run{python -c …}` computes
+- **Verified:** `verify-pyodide-proc.mjs` — serverless `btv.run{python -c …}` computes
   `sum(0..100)=5050` on stdout with a distinct line on stderr (captured separately), `sys.exit(3)`
   → code 3, an uncaught exception → code 1 + traceback on stderr, a non-python binary → 127,
-  piped stdin read back, and `nx.run_stream` delivers all five streamed lines. No regressions:
+  piped stdin read back, and `btv.run_stream` delivers all five streamed lines. No regressions:
   `verify-pyodide-terminal.mjs` (script) + `verify-pyodide-repl.mjs` (REPL) — the shared Pyodide
   Worker is unaffected.
 
@@ -243,19 +243,19 @@ sees what the editor shows and edits are visible to the interpreter.
   - **Workspace under `/w`, disjoint from `/typeshed`:** with the editor's natural root
     (`file:///`) basedpyright treats typeshed's ~5000 stubs as workspace sources and never analyzes
     the user's file. Every `file://` uri is rebased `file:///…` ↔ `file:///w/…` across the bridge.
-  - **Synthesize `workspaceFolders`:** nxvim sends only `rootUri`; browser-basedpyright keys its
+  - **Synthesize `workspaceFolders`:** bemtvi sends only `rootUri`; browser-basedpyright keys its
     workspace off `workspaceFolders`, so without one it falls to an empty `<default>` workspace.
   - **`pyright/createFile` before `didOpen`:** the server only analyzes a file once it exists on
     its FS; the didOpen overlay then supplies live text. Also: guarantee `initializationOptions.files`
     is an object (it destructures it) and drop `rootPath`.
-- **Verified:** `verify-basedpyright-lsp.mjs` — serverless `nx.run`-free: a python type error
+- **Verified:** `verify-basedpyright-lsp.mjs` — serverless `btv.run`-free: a python type error
   (`add("x", 1)`) yields a real basedpyright diagnostic (`"Literal['x']" is not assignable to
-  "int"`) in `nx.diagnostic.get()` (proving typeshed loaded — `int` resolves) and a hover request
+  "int"`) in `btv.diagnostic.get()` (proving typeshed loaded — `int` resolves) and a hover request
   returns the inferred signature `def add(a: int, b: int) -> int`. No regressions: terminal / repl /
   proc / core verifies green.
 - *Deferred:* the cursor-anchored hover **float UI** drops the reply on a `cursor_moved`/`buffer_changed`
   staleness check in the serverless async round-trip (the protocol round-trip itself is correct — the
-  verify issues hover via `nx.lsp.request`); completion/go-to-def UX and multi-file project seeding
+  verify issues hover via `btv.lsp.request`); completion/go-to-def UX and multi-file project seeding
   (cross-file analysis) are later slices. The demo's `init.lua` LSP config lands in Phase 6.
 
 ### Phase 5 — single-file plugin bundle (amalgamation) — *medium (spike #2)* — ✅ DONE
@@ -269,7 +269,7 @@ sees what the editor shows and edits are visible to the interpreter.
   `-- comment`; duplicate module names across plugins error (no silent clobber). Both a CLI
   (`-o OUT.lua PLUGIN_DIR…`, or stdout) and an exported `amalgamate(dirs)` the verifier calls.
 - **Boot wiring (`web/worker.mjs`):** `bootWithConfig` sources `/plugins-bundle.lua` from OPFS
-  **before** `/init.lua`, so an `init.lua` that `require("nxvim-line")`-class resolves it from the
+  **before** `/init.lua`, so an `init.lua` that `require("bemtvi-line")`-class resolves it from the
   preload table. Absent (the standard editor seeds none) → skipped, exactly like an absent
   init.lua; a broken bundle is surfaced non-fatally. The wrapper is sound for any module (a valid
   Lua chunk is a valid function body → top-level locals stay module-scoped, the file's `return`
@@ -290,25 +290,25 @@ sees what the editor shows and edits are visible to the interpreter.
   of bounds`). The 352 KB plugin bundle hit it; a large user `init.lua` would have too. Bumping
   the stack to 8 MB fixes it for both builds (verified: the full bundle sources + all 6 plugins
   `setup()` cleanly).
-- **`build-plugins.sh`** — clones the recommended set (`davidrios/{nxvim-keys-helper,nxvim-tree,
-  nxvim-line,nxvim-lspconfig,nxvim-diff}`) + `nxvim/catppuccin-nxvim` at **pinned commits**
+- **`build-plugins.sh`** — clones the recommended set (`davidrios/{bemtvi-keys-helper,bemtvi-tree,
+  bemtvi-line,bemtvi-lspconfig,bemtvi-diff}`) + `bemtvi/catppuccin-bemtvi` at **pinned commits**
   (full clone + checkout SHA, so an arbitrary pin resolves), then runs `amalgamate-plugins.mjs`
   over all six `lua/` trees → `web/vendor/plugins/plugins-bundle.lua`. Idempotent (`--force`),
-  clones cached in `.plugins-src` (gitignored), `NXVIM_PLUGINS_BASE` overrides the host.
+  clones cached in `.plugins-src` (gitignored), `BEMTVI_PLUGINS_BASE` overrides the host.
 - **Boot wiring:** `web/build-config.js` gains `plugins:false`; `package-site.sh --demo` flips it
   true, runs `build-plugins.sh`, and ships the bundle (standard flavor strips `web/vendor/plugins`).
   `worker.mjs` (demo build only, `BUILD.plugins`) fetches + sources the vendored bundle BEFORE the
-  OPFS bundle / init.lua, so the config's `require("nxvim-line")`-class resolves from
+  OPFS bundle / init.lua, so the config's `require("bemtvi-line")`-class resolves from
   `package.preload`. Missing/broken → non-fatal.
 - **`web/demo-init.lua`** — the demo config: catppuccin mocha (`require("catppuccin").load()` —
   the colorscheme path a runtimepath-less browser can't source), which-key (keys-helper), the
   tree sidebar (`<leader>e`), the lualine-style statusline (`theme="auto"`), the LSP keymaps
-  (lspconfig), the diff commands, and the python LSP via `nx.lsp.config/enable("basedpyright")`
+  (lspconfig), the diff commands, and the python LSP via `btv.lsp.config/enable("basedpyright")`
   (the Phase-4 path; the local host routes any spawn to the bundled basedpyright worker).
   *(Auto-seeding this into OPFS on first boot rides Phase 7; the verify seeds it directly.)*
 - **Verified:** `verify-plugin-demo.mjs` (against `demo-site/`) — all six modules load from the
   bundle (`package.loaded`), catppuccin mocha applied (`Normal` = `#cdd6f4`/`#1e1e2e` from the
-  real hl registry), the nxvim-line statusline renders (the `NORMAL` mode segment is in the
+  real hl registry), the bemtvi-line statusline renders (the `NORMAL` mode segment is in the
   redraw frame the client paints), and basedpyright is configured + enabled. No regressions:
   `verify.mjs` / `verify-config.mjs` / `verify-plugin-bundle.mjs` / `verify-pyodide-terminal.mjs`.
 
@@ -320,7 +320,7 @@ sees what the editor shows and edits are visible to the interpreter.
   config (`init.lua`, moved here from `demo-init.lua`), a small real typed python project
   (`main.py` + `geometry.py`), the guided tour (`TOUR.md`), and a `manifest.json`. On first boot
   (demo build, `BUILD.demoSeed`) `bootWithConfig` fetches the manifest + each file and writes them
-  into OPFS, guarded by a sentinel (`/.nxvim/.demo-seeded`) so it runs **once** — a user's later
+  into OPFS, guarded by a sentinel (`/.bemtvi/.demo-seeded`) so it runs **once** — a user's later
   edits persist across reloads, never clobbered. Runs before the init.lua read so the seeded
   config applies on that same boot. `package-site.sh --demo` ships `web/demo-seed/` + flips the flag.
 - **Tour opens on boot:** `init.lua` ends with `edit /TOUR.md` (harmless if absent → empty buffer).
@@ -334,8 +334,8 @@ sees what the editor shows and edits are visible to the interpreter.
   in it) instead of the seeded startup buffer.
 
 ### Phase 8 — deployment / packaging — *medium* — ✅ DONE (deploy wiring; revisit for plugins)
-- Two separate Netlify sites from one repo: **nxvim** (standard editor) via the root
-  `netlify.toml` → `netlify-build.sh` → `_site/`; **nxvim-demo** (python demo) via
+- Two separate Netlify sites from one repo: **bemtvi** (standard editor) via the root
+  `netlify.toml` → `netlify-build.sh` → `_site/`; **bemtvi-demo** (python demo) via
   `netlify-build-demo.sh` → `_site-demo/` (configured in the dashboard, documented in that
   script's header + the root `netlify.toml`). Shared toolchain provisioning extracted to
   `netlify-provision.sh`; the publish layout is `package-site.sh` (now copies `build-config.js`
@@ -348,7 +348,7 @@ sees what the editor shows and edits are visible to the interpreter.
   + `web/demo-seed/`, and flips `build-config` `plugins`/`demoSeed` true; the standard flavor strips
   `web/vendor/plugins` and ships neither. So the `netlify-build-demo.sh` deploy is complete.
 - **Verified:** the packaged **standard** `_site/` boots green (`verify.mjs` via
-  `NXVIM_SERVE_ROOT=_site` — also proving the `build-config.js` packaging fix), and the
+  `BEMTVI_SERVE_ROOT=_site` — also proving the `build-config.js` packaging fix), and the
   packaged **demo** site (`build-demo.sh` → `package-site --demo`) runs `:terminal python`
   (`verify-pyodide-terminal.mjs`), loads the plugin set (`verify-plugin-demo.mjs`), and seeds the
   project/tour (`verify-demo-seed.mjs`).
@@ -356,10 +356,10 @@ sees what the editor shows and edits are visible to the interpreter.
 ### Phase 9 — minimal POSIX shell in `:terminal` — *medium* — ✅ DONE
 - **Bare `:terminal` now opens a minimal shell** (was: fail-loud 127). `:terminal python [file]`
   stays the REPL/script path; the core passes an **empty argv** for bare `:terminal`
-  (`nxvim-core/.../terminal.rs` — empty argv = default shell), which `pyodide-worker.mjs open()`
+  (`bemtvi-core/.../terminal.rs` — empty argv = default shell), which `pyodide-worker.mjs open()`
   routes to the shell. Reuses the REPL's cooked-mode line editor (echo/Backspace/Enter/Ctrl-C/D),
   the SAB interrupt (a runaway `python` stage is `Ctrl-C`-able), and the Pyodide `/project` mount.
-- **The shell executor is python (`__nx_sh_exec`), so builtins share python's exact FS view.** A
+- **The shell executor is python (`__btv_sh_exec`), so builtins share python's exact FS view.** A
   line is tokenized with `shlex(posix, punctuation_chars)` (quotes + operators), split on
   `;`/`&&`/`||`, then per statement into a `|` pipeline with `>`/`>>`/`<` redirects; each stage
   threads stdout→stdin as a string. Builtins (`cd pwd ls cat echo mkdir rm mv cp touch head tail
@@ -368,7 +368,7 @@ sees what the editor shows and edits are visible to the interpreter.
   in-process (stdin-aware); anything else → `command not found` (127).
 - **Write-back to OPFS only (no live editor-buffer refresh, per the decision):** the
   `mountNativeFS` handle is captured and `nativeFs.syncfs()` runs after each command line, so file
-  mutations (`echo hi > f`, `mkdir`, `rm`) persist to OPFS. `nxvim-tree`'s `nx.fs` watch shows new
+  mutations (`echo hi > f`, `mkdir`, `rm`) persist to OPFS. `bemtvi-tree`'s `btv.fs` watch shows new
   files; an already-open editor buffer is not auto-reloaded (a `:e!` re-reads it).
 - **Verified:** `verify-pyodide-shell.mjs` — `pwd`/`ls` (sees the seeded project), `echo … > f` +
   `cat f` (and the bytes land in OPFS), a `cat … | python -c …` pipe (stdin into a python stage),

@@ -1,18 +1,18 @@
--- ~~~ nxvim format-on-save: BufWritePre fires (and awaits) before the bytes ~~~
+-- ~~~ bemtvi format-on-save: BufWritePre fires (and awaits) before the bytes ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/format-on-save \
---       cargo run -p nxvim -- examples/format-on-save/sample.txt
+--     BEMTVI_CONFIG=examples/format-on-save \
+--       cargo run -p bemtvi -- examples/format-on-save/sample.txt
 --
 -- vim's `BufWritePre` fires *before* the buffer is written to disk, so a handler
--- may mutate the buffer and the mutation is what gets saved. nxvim honors that —
+-- may mutate the buffer and the mutation is what gets saved. bemtvi honors that —
 -- and goes one step further: a `BufWritePre` handler may be **async** (return a
 -- promise), and the write *waits* for it to settle before serializing. That makes
--- an async formatter (e.g. `nx.lsp.format()`) usable for format-on-save.
+-- an async formatter (e.g. `btv.lsp.format()`) usable for format-on-save.
 --
 -- Buffer text is mutated the vim way — `vim.cmd` running an ex-command — since the
--- Lua `nvim_*` surface is read-only. Two nxvim details to note:
+-- Lua `nvim_*` surface is read-only. Two bemtvi details to note:
 --   * Regex is PCRE by default (`'regexsyntax'`), so one-or-more is a bare `+`:
 --     the trailing-whitespace pattern is `\s+$`, NOT vim's `\s\+$`.
 --   * `:s` has no `e` flag, so each handler first checks (reading the buffer
@@ -61,9 +61,9 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 
 -- ~~~ 3. ASYNC format-on-save (the write awaits the promise) ~~~~~~~~~~~~~~~~~~~~
 --
--- The handler returns a promise; nxvim holds the write until it settles, so an
+-- The handler returns a promise; bemtvi holds the write until it settles, so an
 -- async formatter's edits still make it into the saved file. Here we simulate a
--- formatter that takes ~50ms (a real one would be `nx.lsp.format()`): after the
+-- formatter that takes ~50ms (a real one would be `btv.lsp.format()`): after the
 -- delay it rewrites `FIXME` to `TODO`.
 --
 -- The point: `:w` does not write the un-formatted bytes and format afterwards — it
@@ -75,7 +75,7 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 vim.api.nvim_create_autocmd("BufWritePre", {
   pattern = "*.txt",
   callback = function(args)
-    return nx.promise.delay(50):next(function()
+    return btv.promise.delay(50):next(function()
       sub_if(args.buf, "FIXME", [[%s/FIXME/TODO/g]])
     end)
   end,

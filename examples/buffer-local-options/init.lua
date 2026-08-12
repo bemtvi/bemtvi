@@ -1,15 +1,15 @@
--- ~~~ nxvim buffer-local options: tabstop / shiftwidth / softtabstop / expandtab ~~~
+-- ~~~ bemtvi buffer-local options: tabstop / shiftwidth / softtabstop / expandtab ~~~
 --
 -- Run it (from the repo root) against the sample Lua buffer:
 --
---     NXVIM_CONFIG=examples/buffer-local-options \
---       cargo run -p nxvim -- examples/buffer-local-options/two.lua
+--     BEMTVI_CONFIG=examples/buffer-local-options \
+--       cargo run -p bemtvi -- examples/buffer-local-options/two.lua
 --
 -- Buffer-local options live on each buffer, so two files can indent differently.
 -- A `FileType` autocmd is the idiomatic place to set them: it fires for whichever
 -- buffer just loaded, and `vim.bo[buf]` targets *that* buffer.
 --
--- nxvim's defaults already break with vim: tabstop=4, and shiftwidth/softtabstop
+-- bemtvi's defaults already break with vim: tabstop=4, and shiftwidth/softtabstop
 -- *follow* it via their sentinels (shiftwidth=0 -> follow tabstop, softtabstop=-1
 -- -> follow shiftwidth). So the one `tabstop` knob sets the whole indent width;
 -- setting `vim.bo.tabstop = 2` below makes Tab move by 2 as well, automatically.

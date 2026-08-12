@@ -1,6 +1,6 @@
 # Remote config & plugins (and shada)
 
-In an edit-host (daemon) session, nxvim can run **either** your local config or the
+In an edit-host (daemon) session, bemtvi can run **either** your local config or the
 **daemon's** config and plugins — you choose with `--remote-config`. Native clients
 default to **local**; `--remote-config` opts into the daemon's config. (The web client,
 which has no local disk, is always remote.) Shada (marks/registers/history) follows the
@@ -12,7 +12,7 @@ same choice:
 | `--remote-config` | the **daemon's** config + plugins | on the **daemon** (`stdpath('state')/shada/remote-session.shada` there) |
 
 With `--remote-config`, the daemon's config is fetched over the wire (one `config_bundle`
-request), materialized into a local per-process cache (`$XDG_CACHE_HOME/nxvim/remote/<pid>`),
+request), materialized into a local per-process cache (`$XDG_CACHE_HOME/bemtvi/remote/<pid>`),
 and run locally — Lua's synchronous `require`/runtimepath can't await the network, so the
 files must be local, but the source of truth is the remote. The remote shada is staged to
 a local redb store that syncs back to the daemon after each flush.
@@ -22,25 +22,25 @@ the mechanism working.
 
 ## Run it on one machine (local two-process split)
 
-`--connect-daemon` spawns `nxvim --daemon` as a child over stdio; the child inherits
-`NXVIM_CONFIG`, so it serves this directory. Add `--remote-config` to actually run it
+`--connect-daemon` spawns `bemtvi --daemon` as a child over stdio; the child inherits
+`BEMTVI_CONFIG`, so it serves this directory. Add `--remote-config` to actually run it
 (without the flag you get your *local* config instead):
 
 ```sh
-NXVIM_CONFIG=examples/remote-config \
-  cargo run -p nxvim -- --connect-daemon --remote-config examples/remote-config/sample.txt
+BEMTVI_CONFIG=examples/remote-config \
+  cargo run -p bemtvi -- --connect-daemon --remote-config examples/remote-config/sample.txt
 ```
 
-Drop `--remote-config` and the same command runs your own `~/.config/nxvim` over the
+Drop `--remote-config` and the same command runs your own `~/.config/bemtvi` over the
 daemon's filesystem — a quick way to see the two modes side by side.
 
 ## Run it across machines (real remote over SSH)
 
-Put this directory at `~/.config/nxvim` on the **remote** host, then from the local one:
+Put this directory at `~/.config/bemtvi` on the **remote** host, then from the local one:
 
 ```sh
-NXVIM_DAEMON_CMD='ssh your-host nxvim --daemon' \
-  cargo run -p nxvim -- --connect-daemon --remote-config
+BEMTVI_DAEMON_CMD='ssh your-host bemtvi --daemon' \
+  cargo run -p bemtvi -- --connect-daemon --remote-config
 ```
 
 Only fs/process/LSP — this config fetch, and (with `--remote-config`) the shada sync —
@@ -60,15 +60,15 @@ Launch a listening daemon serving this directory, then open the web client point
 with `?daemon=<uri>`:
 
 ```sh
-NXVIM_CONFIG=examples/remote-config cargo run -p nxvim -- --daemon --listen 127.0.0.1:0
-# copy the printed nxvim://… URI, then open the web build with ?daemon=<uri>
+BEMTVI_CONFIG=examples/remote-config cargo run -p bemtvi -- --daemon --listen 127.0.0.1:0
+# copy the printed bemtvi://… URI, then open the web build with ?daemon=<uri>
 ```
 
 The browser fetches the same `config_bundle` over WebTransport, stages it into its
 in-memory FS, and sources the daemon's `init.lua` + plugins — so `require`, the remote
 command, and the remote option all work in the browser too (the local OPFS `init.lua` is
 skipped: in daemon mode the config surface is entirely the daemon's). See
-`crates/nxvim-edithost/web/verify-remote-config.mjs` for an end-to-end check.
+`crates/bemtvi-edithost/web/verify-remote-config.mjs` for an end-to-end check.
 
 ## Verify the remote config is live
 
@@ -76,7 +76,7 @@ skipped: in daemon mode the config surface is entirely the daemon's). See
 - `:RemoteHello` — a command from the remote `init.lua`.
 - `:RemotePlugin` — a command from a plugin the daemon served (`pack/demo/start/…`).
 - `:set tabstop?` → `7` (set by the remote `init.lua`).
-- `:lua nx.notify(_G.REMOTE_GREETING)` — proves `require` resolved a module from the
+- `:lua btv.notify(_G.REMOTE_GREETING)` — proves `require` resolved a module from the
   remote `lua/` tree.
 
 ## What's here
@@ -93,12 +93,12 @@ sample.txt                                a buffer with the checklist above
 This example uses a `pack/*/start` plugin, which rides the `config_bundle`: it comes
 *from* the daemon and is materialized into the local cache alongside the config.
 
-A plugin declared with **`nx.plugins`** (the git-clone manager) is different — it is
+A plugin declared with **`btv.plugins`** (the git-clone manager) is different — it is
 **always managed on the local disk**, in every session, even `--remote-config`. That is
 deliberate: a plugin loads into the *local* Lua VM (its dir is added to the local
 runtimepath and `require`d), so `:PluginSync` clones into your local
 `stdpath('data')/plugins` with the local `git`, never onto the daemon. (A loaded plugin's
-own runtime `nx.fs` / `nx.run` still route to the daemon — it edits the remote's files.)
+own runtime `btv.fs` / `btv.run` still route to the daemon — it edits the remote's files.)
 So both plugin styles end up on the local disk where the VM can load them; they just
 arrive by different routes.
 

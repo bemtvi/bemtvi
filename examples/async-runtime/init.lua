@@ -1,9 +1,9 @@
--- ~~~ nxvim async Lua runtime playground: the event loop ~~~
+-- ~~~ bemtvi async Lua runtime playground: the event loop ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/async-runtime \
---       cargo run -p nxvim -- examples/async-runtime/sample.txt
+--     BEMTVI_CONFIG=examples/async-runtime \
+--       cargo run -p bemtvi -- examples/async-runtime/sample.txt
 --
 -- Before this feature, all Lua ran synchronously on the input tick: vim.schedule
 -- ran its callback inline and vim.defer_fn raised "not implemented". Now a

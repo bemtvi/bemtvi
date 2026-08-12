@@ -1,21 +1,21 @@
-# nxvim architecture
+# bemtvi architecture
 
-nxvim is a modal, vim-style editor written in Rust: vim's editing language
+bemtvi is a modal, vim-style editor written in Rust: vim's editing language
 (keystrokes, modes, ex-commands) on an idiomatic, rust-native, fully-async,
-client-server design. nxvim is its own editor, not a
+client-server design. bemtvi is its own editor, not a
 [neovim](https://neovim.io) build: editing behavior tracks vim/neovim's
-observable behavior, but every API is nxvim's own — configuration and
-extensibility live in the `nx.*` Lua namespace
-([the `nx` API](specs/2026-06-11-native-plugin-api.md);
+observable behavior, but every API is bemtvi's own — configuration and
+extensibility live in the `btv.*` Lua namespace
+([the `btv` API](specs/2026-06-11-native-plugin-api.md);
 [ADR 0002](decisions/0002-native-plugin-system.md)) — and the `vim.*` that
-remains is small and closed: a whitelist of muscle-memory aliases over `nx`
+remains is small and closed: a whitelist of muscle-memory aliases over `btv`
 (`vim.g`, `vim.o`, …, plus the highlight-registration helpers a colorscheme
 touches), so config and colorschemes can be written in familiar terms. They are
 aliases, not a separate API.
 
 A pristine copy of neovim is vendored at [`vendor/neovim`](../vendor/neovim) (a
 shallow git submodule) and used purely as a behavioral and source-layout
-reference. nxvim does not link against or embed any neovim code.
+reference. bemtvi does not link against or embed any neovim code.
 
 ---
 
@@ -24,39 +24,39 @@ reference. nxvim does not link against or embed any neovim code.
 1. **Editing compatibility first.** Keystrokes, modes, ex-commands, and options
    should match vim/neovim's observable behavior. When in doubt, the reference
    in `vendor/neovim`
-   is the source of truth. *Note:* nxvim does **not** aim for neovim
+   is the source of truth. *Note:* bemtvi does **not** aim for neovim
    *UI/client* wire-compatibility — there is no `ext_linegrid` protocol and
-   external neovim GUIs are not a target. The client↔server protocol is nxvim's
+   external neovim GUIs are not a target. The client↔server protocol is bemtvi's
    own.
-2. **A native plugin system; `nx.*` is the only API.**
-   Extensibility is nxvim's own provider-based plugin API
-   ([the `nx` design](specs/2026-06-11-native-plugin-api.md),
+2. **A native plugin system; `btv.*` is the only API.**
+   Extensibility is bemtvi's own provider-based plugin API
+   ([the `btv` design](specs/2026-06-11-native-plugin-api.md),
    [ADR 0002](decisions/0002-native-plugin-system.md)): the server owns every
    UI surface and the frame; plugins supply data and behavior, asynchronously.
-   Configuration is the same namespace: `init.lua` is written against `nx.*`.
+   Configuration is the same namespace: `init.lua` is written against `btv.*`.
    A closed whitelist of **muscle-memory aliases** (`vim.g`, `vim.o`/`vim.opt`,
    `vim.cmd`, `vim.keymap.set`, autocmd / user-command / highlight
    registration, `vim.notify`, the pure `vim.tbl_*`-style helpers, … — the
    canonical list is [ADR 0002](decisions/0002-native-plugin-system.md))
-   maps 1:1 onto the same `nx` objects, so config can be written in familiar
+   maps 1:1 onto the same `btv` objects, so config can be written in familiar
    muscle-memory terms — aliases, not an API;
-   beyond them there is no `vim.*` API. nxvim does not host neovim plugins —
+   beyond them there is no `vim.*` API. bemtvi does not host neovim plugins —
    they are
    imperative programs written
    against neovim's runtime model (synchronous re-entrant state, blocking
    reads, libuv as a public API, frame-time render hooks), which this
    snapshot + effect-queue, client-server design deliberately is not.
-   Colorschemes are nxvim's own: a colorscheme is Lua that registers highlight
-   groups through the `nx` highlight API (and its `vim.*` aliases), nothing
+   Colorschemes are bemtvi's own: a colorscheme is Lua that registers highlight
+   groups through the `btv` highlight API (and its `vim.*` aliases), nothing
    more. Supporting legacy Vimscript
    (`.vim` plugins, the `eval.c` language) is likewise an explicit non-goal.
-3. **Dogfood the plugin API: first-party features are `nx` plugins.**
-   Everything that *can* reasonably be built as an `nx.*` Lua plugin *is* built
-   as one. nxvim's own surfaces — the fuzzy picker, completion, statusline
+3. **Dogfood the plugin API: first-party features are `btv` plugins.**
+   Everything that *can* reasonably be built as an `btv.*` Lua plugin *is* built
+   as one. bemtvi's own surfaces — the fuzzy picker, completion, statusline
    segments, snippets, tree docks, and the features layered on top of them — are
-   the plugin API's first and most demanding consumer, shipped as bundled `nx`
+   the plugin API's first and most demanding consumer, shipped as bundled `btv`
    plugins rather than as bespoke Rust. If a feature can't be expressed against
-   `nx.*`, that is a gap in the API to close, not a reason to reach behind it —
+   `btv.*`, that is a gap in the API to close, not a reason to reach behind it —
    so the API is proven by the editor that depends on it. The line is the one
    the architecture already draws: Rust owns the pure core, the frame /
    renderer, and the native engines (treesitter, LSP, regex) — a Lua plugin
@@ -79,28 +79,28 @@ reference. nxvim does not link against or embed any neovim code.
 The workspace is split into crates that map onto neovim's `src/nvim/`
 subsystems:
 
-| nxvim crate     | neovim counterpart                                   | responsibility                                                        |
+| bemtvi crate     | neovim counterpart                                   | responsibility                                                        |
 | --------------- | ---------------------------------------------------- | -------------------------------------------------------------------- |
-| `nxvim-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
-| `nxvim-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (nxvim's own protocol; msgpack is just the framing). |
-| `nxvim-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library, embedded on its own thread by the `nxvim` / `nxvim-gui` binaries; the `--daemon` role reuses it as the remote fs/process half of the edit-host split. |
-| `nxvim-lua`     | `lua/`                                                | Embedded Lua runtime (vendored PUC Lua 5.4, the single backend) and the `nx.*` Lua prelude (plus its bounded `vim.*` alias layer). |
-| `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
-| `nxvim-ts`      | `tree_sitter/`                                       | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
-| `nxvim-lsp`     | `lsp/`                                                | The native **LSP client**: protocol, transport, manager — nxvim's own stdio spawning, driving the in-core editing features. `nxvim-server/src/lsp/` is the editing-loop glue on top. |
-| `nxvim-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C (engine-global mutex): Lua's `vim.regex` / `vim.fn.substitute`, and `/` search + `:s` under `:set regexsyntax=vim`. |
-| `nxvim-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
-| `nxvim-gui`     | (a GUI frontend)                                     | The native GUI **client** on winit + wgpu + glyphon; the GUI sibling of `nxvim-tui`, consuming the same `View`. |
-| `nxvim-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
-| `nxvim-test-harness` | —                                               | The shared black-box integration-test harness (a `publish = false` dev-dependency of `nxvim` and `nxvim-server`): spawns a real server over an in-process RPC pipe and drives it as a UI client would. See [*Testing philosophy*](#testing-philosophy). |
-| `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
+| `bemtvi-core`    | `buffer.c`, `normal.c`, `ops.c`, `edit.c`, `ex_docmd.c`, `undo.c`, `option.c` | The editor model: buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
+| `bemtvi-rpc`     | `msgpack_rpc/`                                        | Async msgpack-RPC transport (bemtvi's own protocol; msgpack is just the framing). |
+| `bemtvi-server`  | `main.c`, `event/`, `api/`                            | The headless server: owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. A library, embedded on its own thread by the `bemtvi` / `bemtvi-gui` binaries; the `--daemon` role reuses it as the remote fs/process half of the edit-host split. |
+| `bemtvi-lua`     | `lua/`                                                | Embedded Lua runtime (vendored PUC Lua 5.4, the single backend) and the `btv.*` Lua prelude (plus its bounded `vim.*` alias layer). |
+| `bemtvi-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
+| `bemtvi-ts`      | `tree_sitter/`                                       | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `bemtvi-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
+| `bemtvi-lsp`     | `lsp/`                                                | The native **LSP client**: protocol, transport, manager — bemtvi's own stdio spawning, driving the in-core editing features. `bemtvi-server/src/lsp/` is the editing-loop glue on top. |
+| `bemtvi-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C (engine-global mutex): Lua's `vim.regex` / `vim.fn.substitute`, and `/` search + `:s` under `:set regexsyntax=vim`. |
+| `bemtvi-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
+| `bemtvi-gui`     | (a GUI frontend)                                     | The native GUI **client** on winit + wgpu + glyphon; the GUI sibling of `bemtvi-tui`, consuming the same `View`. |
+| `bemtvi-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
+| `bemtvi-test-harness` | —                                               | The shared black-box integration-test harness (a `publish = false` dev-dependency of `bemtvi` and `bemtvi-server`): spawns a real server over an in-process RPC pipe and drives it as a UI client would. See [*Testing philosophy*](#testing-philosophy). |
+| `bemtvi`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
 
 Dependency direction is strictly one-way:
 
 ```
-        nxvim (bin)
+        bemtvi (bin)
         /         \
- nxvim-server   nxvim-tui
+ bemtvi-server   bemtvi-tui
   / | | \         /    \
 core rpc lua ts  rpc  view
       \_______/
@@ -108,19 +108,19 @@ core rpc lua ts  rpc  view
 ```
 
 The diagram shows the principal spine; the same one-way graph also carries the
-edges it elides — `nxvim` and `nxvim-server` both onto `nxvim-lsp`, `nxvim-lua`
-onto `nxvim-ts` (the treesitter query/control bridge), `nxvim-gui` onto
-`nxvim-server` + `nxvim-view`, and `nxvim-lua` onto `nxvim-regex` (with
-`nxvim-core`'s optional `vim-regex` feature — enabled by `nxvim-server` —
+edges it elides — `bemtvi` and `bemtvi-server` both onto `bemtvi-lsp`, `bemtvi-lua`
+onto `bemtvi-ts` (the treesitter query/control bridge), `bemtvi-gui` onto
+`bemtvi-server` + `bemtvi-view`, and `bemtvi-lua` onto `bemtvi-regex` (with
+`bemtvi-core`'s optional `vim-regex` feature — enabled by `bemtvi-server` —
 putting the same engine behind `:set regexsyntax=vim`).
 
-The treesitter engine is a normal crate dependency now: `nxvim-server`
+The treesitter engine is a normal crate dependency now: `bemtvi-server`
 constructs it and installs it on the editor (which owns a `Box<dyn SyntaxEngine>`
-defined in `nxvim-core`), then queries it **synchronously** at redraw. See
+defined in `bemtvi-core`), then queries it **synchronously** at redraw. See
 [*Syntax highlighting*](#syntax-highlighting-treesitter) below and the design at
 [`docs/specs/2026-06-06-in-process-treesitter-and-indentation-design.md`](specs/2026-06-06-in-process-treesitter-and-indentation-design.md).
 
-`nxvim-core` has no async, no I/O beyond file read/write, and no transport
+`bemtvi-core` has no async, no I/O beyond file read/write, and no transport
 dependencies. That keeps the hard part — vim semantics — testable and portable,
 and lets every front end share identical behavior.
 
@@ -130,9 +130,9 @@ and lets every front end share identical behavior.
 
 ```
 ┌──────────────────────────┐         msgpack-RPC          ┌──────────────────────────┐
-│  Client (nxvim-tui)      │  ───── nx_input ─────────▶   │  Server (nxvim-server)   │
-│  • crossterm input       │  ◀──── redraw events ─────── │  • nxvim-core (model)    │
-│  • paints the grid       │  ───── nx_command ───────▶   │  • nxvim-lua (nx.*)      │
+│  Client (bemtvi-tui)      │  ───── btv_input ─────────▶   │  Server (bemtvi-server)   │
+│  • crossterm input       │  ◀──── redraw events ─────── │  • bemtvi-core (model)    │
+│  • paints the grid       │  ───── btv_command ───────▶   │  • bemtvi-lua (btv.*)      │
 │  • owns NO editor state  │  ◀──── responses ──────────  │  • nvim_* API surface    │
 └──────────────────────────┘                              └──────────────────────────┘
         main thread                                              its own thread
@@ -145,7 +145,7 @@ one server, without the server caring — exactly like neovim.
 
 ### Embedded vs. remote
 
-The default `nxvim` invocation runs an **embedded** server: a headless editor on
+The default `bemtvi` invocation runs an **embedded** server: a headless editor on
 its own OS thread, and the TUI client on the main thread, connected by an
 in-process [`tokio::io::duplex`] pipe. The boundary is the same RPC every client
 speaks, so the embedded and edit-host-split cases are *one code path*. Putting
@@ -154,28 +154,28 @@ rendering can never stall editor processing, and vice versa.
 
 There is deliberately **no** "whole editor runs remote, thin client local" role.
 That topology — every keystroke round-tripping to a server on the far side of the
-wire — is structurally laggy, and nxvim has a better answer for editing on another
-machine: open an SSH session and run `nxvim` there (the editor is then fully local
+wire — is structurally laggy, and bemtvi has a better answer for editing on another
+machine: open an SSH session and run `bemtvi` there (the editor is then fully local
 to that host), or use the edit-host split below.
 
 The **inverse remote** topology — the *edit-host / daemon split*, where the editor +
-Lua run locally and only an `nxvim --daemon` serving fs/process lives on the remote
+Lua run locally and only an `bemtvi --daemon` serving fs/process lives on the remote
 — moves the network boundary *below* the editor, so typing, motions, operators, and
 undo are all local (zero round-trips) and only fs/process/watch/LSP traffic crosses
-the wire. The local half (`nxvim --connect-daemon [file]`, or a `nxvim://…` URI for
+the wire. The local half (`bemtvi --connect-daemon [file]`, or a `bemtvi://…` URI for
 the QUIC transport) is the same embedded editor as the default role, with its host
-seams (`nxvim_core::HostFs`, `nxvim_server::HostProc`, the async `HostFsAsync`, the
-LSP transport, and the Lua-facing `nxvim_lua::LuaFs`) pointed at the daemon instead
+seams (`bemtvi_core::HostFs`, `bemtvi_server::HostProc`, the async `HostFsAsync`, the
+LSP transport, and the Lua-facing `bemtvi_lua::LuaFs`) pointed at the daemon instead
 of the local disk. The **GUI** also reaches this split at runtime via `:connect` —
-`:connect [user@]host[:port][/file]` spawns `ssh … nxvim --daemon` over stdio (with
+`:connect [user@]host[:port][/file]` spawns `ssh … bemtvi --daemon` over stdio (with
 interactive prompts routed to a native dialog via `SSH_ASKPASS`, so auth works from a
-windowed launch with no tty), and `:connect nxvim://…` dials the QUIC listener. The
+windowed launch with no tty), and `:connect bemtvi://…` dials the QUIC listener. The
 editor stays local; `:connect` swaps onto a *fresh local server* whose seams point at
-the daemon and re-attaches the same window (`nxvim_gui::run`'s session loop), since the
+the daemon and re-attaches the same window (`bemtvi_gui::run`'s session loop), since the
 editor transport is always the in-process duplex. See
 [the edit-host plan](plans/2026-06-09-edit-host-and-browser-lua.md). It forces a
 **split-brain filesystem rule** for the Lua bridge, decided up front: the
-*project-facing* fs API — the async `nx.fs.*` (there are no synchronous Lua fs
+*project-facing* fs API — the async `btv.fs.*` (there are no synchronous Lua fs
 builtins) — routes
 through the `LuaFs` seam — local disk by default, the remote daemon in a split — so
 file-picker previewers, root detection, and VCS-status providers see the *project*; while raw Lua
@@ -189,14 +189,14 @@ has no local disk, is always remote-config. See [the edit-host split](edit-host-
 Because the editor is local, a **dropped connection must not tear the session down** — the
 buffers, undo, cursor, windows, and Lua state all live on the local side and would be lost
 with it. So an ssh/stdio daemon link is **reconnectable**: a supervisor on a dedicated link
-thread (`nxvim_server::connect_daemon_reconnecting`) keeps the seam handles the editor holds
+thread (`bemtvi_server::connect_daemon_reconnecting`) keeps the seam handles the editor holds
 fixed and swaps the *connection beneath them* (a `LinkRpc` cell per leg group). On EOF (a
 laptop sleeping past QUIC's idle timeout, an ssh hop dropping) it auto-retries with bounded
-backoff (`ReconnectPolicy`: 5 attempts over 0.5 → 8 s), re-spawning `ssh … nxvim --daemon`;
+backoff (`ReconnectPolicy`: 5 attempts over 0.5 → 8 s), re-spawning `ssh … bemtvi --daemon`;
 on success the seams rebind and editing continues. If the budget is spent it parks and tells
 the user to run `:reconnect` (`:disconnect` drops it on demand). The link's `DaemonStatus`
 (`Connected` / `Reconnecting{attempt,max}` / `Disconnected`) rides a `watch` channel into the
-run loop, which mirrors it to `nx.daemon.status()` and fires a `User DaemonStatusChanged`
+run loop, which mirrors it to `btv.daemon.status()` and fires a `User DaemonStatusChanged`
 autocmd so a statusline component can render it (green / yellow / red). A re-dialed daemon is
 a **fresh process** that knows nothing of the prior session, so on a genuine reconnect the
 editor **re-syncs the seams** off the tick: it re-opens LSP servers against the new connection
@@ -215,7 +215,7 @@ Both sides run on single-threaded tokio runtimes (the editor core, like
 neovim's, is single-threaded; concurrency comes from async I/O, not parallel
 mutation):
 
-- `nxvim-rpc::connect` spawns independent reader and writer tasks, so encoding,
+- `bemtvi-rpc::connect` spawns independent reader and writer tasks, so encoding,
   decoding, and socket back-pressure never block the consumer.
 - The **client** multiplexes terminal input and incoming redraws with
   `tokio::select!`. Keystrokes are sent the instant they arrive; redraws are
@@ -229,7 +229,7 @@ onto a shared pool.
 
 #### Multi-source scheduling & event ordering
 
-The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **ten**
+The server's `tokio::select!` loop (`bemtvi-server::run`) multiplexes **ten**
 event sources against the single-threaded editor: RPC input from the UI, the LSP
 manager, the async-runtime actor (`evloop.rs` — timers and child processes),
 terminal child output, off-tick file opens, write-acks, and `:cd` completions
@@ -241,7 +241,7 @@ edit-host/daemon, and treesitter-install features. Treesitter highlighting is
 during `redraw`, so it needs no channel or arm. Each source is an mpsc
 channel (the link status a `watch`); the
 matching async actor (a `Send` background task) only ever ferries ids / bytes /
-durations back, never the `!Send` editor or Lua state. This is nxvim's analog of
+durations back, never the `!Send` editor or Lua state. This is bemtvi's analog of
 neovim's main-thread + worker-thread model, where workers hand results to the one
 editor thread by enqueuing events.
 
@@ -253,7 +253,7 @@ Two ordering properties hold, and one is a deliberate divergence worth recording
   `redraw`) so a callback's deferred work converges and repaints at a
   redraw-followed point, never "too early". Two events can never interleave their
   mutations: neovim's "editor logic never runs concurrently with itself"
-  guarantee, enforced here by the crate boundary (`nxvim-core` is pure/sync) and
+  guarantee, enforced here by the crate boundary (`bemtvi-core` is pure/sync) and
   the `!Send` VM rather than by neovim's runtime `recursive`-abort.
 - **Per-source order (FIFO).** Each channel delivers in arrival order, and the
   per-arm coalescing (`while try_recv()`) drains a burst in order before one
@@ -296,7 +296,7 @@ review of the now-highest-priority arm.
 
 ## Protocols
 
-### RPC framing (`nxvim-rpc`)
+### RPC framing (`bemtvi-rpc`)
 
 A standard msgpack-RPC framing — chosen because it's a good async binary
 protocol, **not** for neovim interop. Messages are msgpack arrays:
@@ -306,16 +306,16 @@ protocol, **not** for neovim interop. Messages are msgpack arrays:
 - Notification: `[2, method, params]`
 
 The client-protocol verbs — the ones a UI actually speaks (input, attach,
-resize) — are `nx_*`: `nx_input`, `nx_input_mouse`, `nx_ui_attach`,
-`nx_ui_try_resize`, `nx_command`. The editing-API methods keep the familiar
+resize) — are `btv_*`: `btv_input`, `btv_input_mouse`, `btv_ui_attach`,
+`btv_ui_try_resize`, `btv_command`. The editing-API methods keep the familiar
 neovim spelling (`nvim_buf_get_lines`, `nvim_open_win`, `nvim_win_set_cursor`,
-…) as muscle-memory names, but they are nxvim's own methods with nxvim's own
+…) as muscle-memory names, but they are bemtvi's own methods with bemtvi's own
 semantics (a read-heavy subset is also aliased into Lua as `vim.api.*`; the
 window/tab *mutation* verbs are RPC-only).
 
 ### View protocol (UI)
 
-The core projects editor state into a [`View`](../crates/nxvim-core/src/view.rs):
+The core projects editor state into a [`View`](../crates/bemtvi-core/src/view.rs):
 a **list of windows** plus the global chrome. Each `WindowView` carries one
 window's `rect`, focus flag, visible text rows, cursor, selection/search spans,
 gutter numbers, and status-line data (file name, modified flag, ruler); the
@@ -386,7 +386,7 @@ global command/message line (the panel, being an ordinary bottom-split window,
 is just another `WindowView`). The terminal cursor is drawn only in the
 `focused` window. Because the core lays out the windows (vertical splits divide
 width), the client reports **both** dimensions of the windows area on
-`nx_ui_attach`/`nx_ui_try_resize`. There is still no grid, no cell encoding,
+`btv_ui_attach`/`btv_ui_try_resize`. There is still no grid, no cell encoding,
 and no `ext_linegrid`.
 
 **Folds collapse in the projection, not the buffer.** A *fold* is a per-window
@@ -404,11 +404,11 @@ linewise operators that act on a whole closed fold) goes through the same
 fold **structure** comes from one of five sources behind a shared spine
 (`fold.rs`): `manual` (`zf`/`:fold`), `foldmethod=indent`, `foldmethod=marker`
 (folds bounded by the literal `'foldmarker'` strings, default `{{{`/`}}}`),
-`foldmethod=expr` (the native tree-sitter foldexpr nxvim recognizes as a marker and
+`foldmethod=expr` (the native tree-sitter foldexpr bemtvi recognizes as a marker and
 computes from `folds.scm`, or a generic Lua `'foldexpr'` the server evaluates per
 line with `v:lnum` and pushes in), and LSP `textDocument/foldingRange` (selected by
-the `nx.lsp.foldexpr` marker, requested per buffer and pushed in). The generic-expr
-and LSP are *external* sources: nxvim-core can't run Lua or talk to a language server, so the
+the `btv.lsp.foldexpr` marker, requested per buffer and pushed in). The generic-expr
+and LSP are *external* sources: bemtvi-core can't run Lua or talk to a language server, so the
 server computes them out-of-band and pushes the result into a per-buffer store the
 core builds the same nested structure from — and manual folds (with their closed
 state) round-trip through shada, restored into the window that reopens the file.
@@ -432,7 +432,7 @@ draws the border around. (See [*Windows*](#windows).)
 
 ## Text model
 
-Buffers are backed by a [ropey](https://docs.rs/ropey) 2.0 rope (`nxvim-core`'s
+Buffers are backed by a [ropey](https://docs.rs/ropey) 2.0 rope (`bemtvi-core`'s
 `Buffer`). Indices are **byte offsets** — ropey 2.0's native metric, and the
 same column model vim uses — with lines tracked via ropey's `LineType::LF_CR`
 (so both Unix `\n` and DOS `\r\n` files split correctly). Editing operations
@@ -442,7 +442,7 @@ invariant: **the rope always ends with a trailing `\n`**, so an empty buffer is
 `"\n"` (one empty line) and the editable line count is `rope.len_lines() - 1`.
 The phantom final line is never displayed or edited.
 
-That phantom `\n` is nxvim's spelling of the implicit newline vim's line model puts
+That phantom `\n` is bemtvi's spelling of the implicit newline vim's line model puts
 after *every* line, including the last — the same model, not a different one. It
 follows that the rope cannot say whether the file on disk really ended with one, so
 that fact lives in two buffer-local options instead: `'endofline'` (set from the
@@ -456,7 +456,7 @@ sends it as the document text and reads server edit ranges against it. See
 
 The rope is **always UTF-8** (mirroring neovim, whose internal encoding is UTF-8);
 the on-disk byte form is a separate concern named by the buffer's `'fileencoding'`.
-All charset conversion lives at the byte↔rope seam (`nxvim-core`'s `encoding`
+All charset conversion lives at the byte↔rope seam (`bemtvi-core`'s `encoding`
 module): on read, `decode_to_rope` tries `'fileencodings'` in order — BOM sniff,
 strict UTF-8, then a `latin1` (windows-1252) fallback that, being a *total,
 bijective* single-byte codec, opens any byte stream (latin1, utf-16, even
@@ -485,7 +485,7 @@ closer to neovim's `undo.c` than the original two-stack model.
 ## Buffers
 
 The editor holds **multiple open buffers** and switches the one window between
-them. `nxvim-core`'s `Editor` separates the two concerns vim keeps apart:
+them. `bemtvi-core`'s `Editor` separates the two concerns vim keeps apart:
 
 - **Buffer state** (the "file"): the rope text, path, `modified`,
   `changedtick`, the edit journal, **and** per-buffer undo/redo history. These
@@ -499,7 +499,7 @@ them. `nxvim-core`'s `Editor` separates the two concerns vim keeps apart:
   - The indentation options (`tabstop` / `shiftwidth` / `softtabstop` /
     `expandtab`) are **buffer-local** — a `BufferOptions` lives on each `Buffer`,
     set via `:set`/`:setlocal`/`vim.bo`, so two buffers can indent differently.
-    nxvim's defaults differ from vim's: `tabstop` is 4, and
+    bemtvi's defaults differ from vim's: `tabstop` is 4, and
     `shiftwidth`/`softtabstop` follow it via their `0`/`-1` sentinels
     (`softtabstop → shiftwidth → tabstop`), so one knob sets the indent width.
   - The number-gutter options (`number` / `relativenumber`) are **window-local** —
@@ -555,7 +555,7 @@ re-opening. (See [*Syntax highlighting*](#syntax-highlighting-treesitter).)
 ## Windows
 
 A **window** is a viewport onto a buffer; splitting creates more of them, tiled
-by a layout tree. nxvim mirrors the buffer split: just as buffer state was
+by a layout tree. bemtvi mirrors the buffer split: just as buffer state was
 factored out of `Editor`, **window state** is now multiplied. `Editor` holds a
 `WindowTree` — a `BTreeMap<WindowId, Window>` keyed by a monotonic, never-reused
 `WindowId`, plus a `Node` tree (`Leaf(WindowId)` | `Split { dir, children,
@@ -585,10 +585,10 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   `0` = current), `nvim_win_get_width`/`height` + setters, `nvim_win_close`,
   `nvim_win_get_config`/`nvim_win_get_position`, and `nvim_open_win` (both the
   split form and the float form). Window *reads* (plus `nvim_set_current_win`)
-  are aliased into Lua and resolve against the `nx._wins` mirror the server
+  are aliased into Lua and resolve against the `btv._wins` mirror the server
   pushes before each Lua entry; the window *mutation* verbs are **RPC-only** —
   internally they queue a `WindowOp` drained into the core (the same queue the
-  private `nx._open_win`/`nx._win_*` bridges feed for `nx.view` and the UI
+  private `btv._open_win`/`btv._win_*` bridges feed for `btv.view` and the UI
   primitives), but no public Lua `nvim_open_win`/`nvim_win_set_*` binding
   exists.
 - **Floating windows.** A float is a `Window` the layout tree does **not** own: it
@@ -598,7 +598,7 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   absolutely by a second `layout()` pass after the tiled rects are known — so it
   steals no space from its siblings and paints on top. `nvim_open_win` with a
   non-empty `relative` opens one (an RPC verb, via `WindowOp::OpenFloat`; from
-  Lua, floats come from `nx.view:mount{ float = … }` / `nx.ui.float`);
+  Lua, floats come from `btv.view:mount{ float = … }` / `btv.ui.float`);
   the client draws it as an opaque, bordered, titled overlay above the tiled
   layout (see [*View protocol*](#view-protocol-ui)). Focus, the window list, and
   close already span floats because they key off `WindowId`.
@@ -619,7 +619,7 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   diff fires `WinNew`/`WinEnter`/`WinClosed` for floats and `WinResized` when
   `set_config` changes a float's size.
 - **Permanent docks.** A **dock** is a global (cross-tab) editable window region
-  pinned to a screen edge — nxvim's VSCode-style side bars and bottom tray. It
+  pinned to a screen edge — bemtvi's VSCode-style side bars and bottom tray. It
   reuses the tab-swap trick along a second axis: `Layer::{Main, Dock(Left | Right |
   Top | Bottom)}`, with the *focused* layer's tree always live on `Editor::windows`
   (the rest park per *Tab pages* above), so `split`/`close`/`focus`/editing/redraw
@@ -649,9 +649,9 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   and lays every layer's tree out at origin `(0,0)` in its own region; `View`
   carries the band sizes and tags each window with its `WindowRegion`, and each
   client maps region → absolute origin (the core owns *which* cells, the client
-  owns *where*). Surface: the `nx.dock.*` Lua table
+  owns *where*). Surface: the `btv.dock.*` Lua table
   (`open{side,size?,buf?,title?,showtabline?,autohide?}` / `close` / `focus`, plus the
-  per-dock option scope `nx.dock.opt(side)`) and the `:DockOpen`/`:DockClose`/
+  per-dock option scope `btv.dock.opt(side)`) and the `:DockOpen`/`:DockClose`/
   `:DockFocus` ex-commands, queued as a `DockOp` drained into the core. Mouse:
   `hit_test` resolves a click across **every** region (the focused layer plus each
   parked dock tree, via `region_geoms`), so a left-click in any dock focuses it and
@@ -661,7 +661,7 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   when shown again — distinct from *closed* (which drops the trees). `dock_is_open` is
   the visibility predicate (= present **and** not hidden) that every layout / render /
   mouse / enumeration site reads, while the tree-resolution helpers read `dock_tabs`
-  directly so a hidden dock's content stays addressable. `nx.dock.toggle`/`hide`/`show`
+  directly so a hidden dock's content stays addressable. `btv.dock.toggle`/`hide`/`show`
   (and `:DockToggle`/`:DockHide`/`:DockShow`) drive it; the per-dock `autohide` option
   hides a dock the moment focus leaves it (a hook in `switch_layer`, the one chokepoint
   for every focus cross). A hidden dock isn't invisible: `View.hidden_docks` carries a
@@ -671,7 +671,7 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   shown in (`OpenBuffer::layer`, set by `set_cur_buffer`/`set_window_buffer`), so `:ls`
   and `:bnext`/`:bprev` list only the focused region's buffers, closing a document
   falls back to a sibling in the *same* layer (never pulling a dock's buffer into the
-  main area), and `nx.buf.list{focused=true}` exposes the focused-layer list to Lua
+  main area), and `btv.buf.list{focused=true}` exposes the focused-layer list to Lua
   (`nvim_list_bufs` stays global). (Design:
   [`docs/plans/2026-06-14-permanent-docked-panels.md`](plans/2026-06-14-permanent-docked-panels.md),
   [`docs/plans/2026-06-14-dock-toggle-autohide.md`](plans/2026-06-14-dock-toggle-autohide.md).)
@@ -709,7 +709,7 @@ the tab analogue of `focus_window`, so the entire editing machine is untouched.
 and closing a **dock's** last tab closes the dock. Tab ops act on the **focused**
 region — `gt` in a focused dock cycles only that dock's tabs — while the
 `nvim_tabpage_*` API stays main-only (it crosses to main first). Reads resolve
-against a `nx._tabs` mirror and `nvim_set_current_tabpage` queues a `TabOp`, the
+against a `btv._tabs` mirror and `nvim_set_current_tabpage` queues a `TabOp`, the
 same "Lua queues, core mutates" flow as windows; the lifecycle diff fires
 `TabNew`/`TabLeave`/`TabEnter`/`TabClosed`, bracketing the window events
 (`TabLeave → WinLeave → … → WinEnter → TabEnter`).
@@ -750,7 +750,7 @@ Multi-line, browsable output — `:messages`, `:ls`/`:buffers`, `:registers`,
 transient, focus-locked overlay shown in a bottom split. A panel is **not** a
 bespoke widget with its own content model; it is an ordinary `nomodifiable`
 buffer in a `botright` split, with two properties layered on top. It is
-nxvim-native, closest in spirit to neovim's quickfix window.
+bemtvi-native, closest in spirit to neovim's quickfix window.
 
 - **It's an ordinary buffer; the core adds only displace + focus-lock.** `Editor`
   holds an `Option<PanelState>` — just the panel's `window`, the `prev_window` to
@@ -767,16 +767,16 @@ nxvim-native, closest in spirit to neovim's quickfix window.
   because the panel *is* a real window onto a real buffer, not because the input
   loop special-cases it. The activation and dismiss keys are **buffer-local
   keymaps installed by a `FileType` autocmd**, never hard-coded: the prelude's
-  `FileType nxlisting/nxbuffers/nxpanels/nxmessages/nxpanel` maps bind `q`/`<Esc>` to
-  `nx.panel.close`, and a per-listing `<CR>` action (e.g. `nx.buffers.actions.open`
+  `FileType btvlisting/btvbuffers/btvpanels/btvmessages/btvpanel` maps bind `q`/`<Esc>` to
+  `btv.panel.close`, and a per-listing `<CR>` action (e.g. `btv.buffers.actions.open`
   reads the bufnr off the cursor row and switches) is an ordinary `default` map
   that a user map overrides — rebindable the standard way.
 - **Built-in listings mount here.** `:registers`, `:marks`, `:jumps`, `:changes`
   go through `Editor::open_scratch_listing(name, lines, cursor)` (filetype
-  `nxlisting`); `:ls`/`:buffers` through `Editor::open_buffer_listing` (filetype
-  `nxbuffers`, whose `<CR>` switches buffer); the named-panel list through
-  `nxpanels`; `:messages` through `nxmessages`, whose `C` map
-  (`nx.messages.actions.clear` → `:messages clear`) empties the log and
+  `btvlisting`); `:ls`/`:buffers` through `Editor::open_buffer_listing` (filetype
+  `btvbuffers`, whose `<CR>` switches buffer); the named-panel list through
+  `btvpanels`; `:messages` through `btvmessages`, whose `C` map
+  (`btv.messages.actions.clear` → `:messages clear`) empties the log and
   re-renders the panel in place. Each opens scrolled to a chosen cursor line —
   `:messages` to the newest line, `:ls` to the current buffer.
 - **A message history feeds it.** `Editor::echo` is the one place a user-facing
@@ -787,13 +787,13 @@ nxvim-native, closest in spirit to neovim's quickfix window.
   history; adjacent blocks share their divider. The server routes
   its own messages (errors, captured `print`/`nvim_echo`) through the same call.
 - **It's scriptable.** A plugin mounts its own panel with
-  `nx.panel.open{ name?, lines, filetype?, height?, margin? }` and dismisses it
-  with `nx.panel.close()` — queued as a `PanelOp` drained by the server (the same
+  `btv.panel.open{ name?, lines, filetype?, height?, margin? }` and dismisses it
+  with `btv.panel.close()` — queued as a `PanelOp` drained by the server (the same
   "Lua queues, core mutates" flow as `vim.cmd`/`nvim_set_hl`). `name` (default
   `[Panel]`) makes the panel unique, so re-opening replaces its content;
-  `filetype` (default `nxpanel`, whose ftplugin maps `q`/`<Esc>` to close) lets a
+  `filetype` (default `btvpanel`, whose ftplugin maps `q`/`<Esc>` to close) lets a
   plugin pass its own filetype and wire its own keys. The only RPC method is the
-  read-only `nxvim_panel_is_open` (clients use it for chrome); there is no
+  read-only `bemtvi_panel_is_open` (clients use it for chrome); there is no
   separate panel content/cursor RPC because the panel *is* a window — its text,
   cursor, and scroll ride the ordinary `WindowView`, and the redraw carries no
   special `panel` map.
@@ -802,10 +802,10 @@ nxvim-native, closest in spirit to neovim's quickfix window.
   broader, server-owned mouse support (click, drag-select, multi-click,
   shift-extend, wheel scroll, divider drag, the `'mousemodel'` right-click menu,
   middle-click paste, and tabline clicks), forwarded by both clients as
-  `nx_input_mouse` with the server owning the hit-test.
+  `btv_input_mouse` with the server owning the hit-test.
 
 The same core hit-test also drives the **floating list overlays** — the insert
-completion popup, the fuzzy picker, the promptless `nx.ui.select`, and the
+completion popup, the fuzzy picker, the promptless `btv.ui.select`, and the
 command-line wildmenu. Their box geometry lives in one place,
 `Editor::menu_geom` (`editor/menu.rs`, shared with the server's `redraw` menu
 projection), and `Editor::menu_hit` inverts it: it offsets the box by the focused
@@ -814,7 +814,7 @@ client border convention to map a clicked global cell back to the list row paint
 there. A click highlights a row, a click on the already-highlighted row
 accepts/confirms it (a click off a picker box cancels it), and the wheel moves the
 highlight or scrolls a picker preview — so every front end (TUI, GUI, web) gets
-overlay mouse for free by forwarding the same raw `nx_input_mouse` cell, with no
+overlay mouse for free by forwarding the same raw `btv_input_mouse` cell, with no
 client-side geometry. (Command-line-mode mouse needs `c` in `'mouse'`; the default
 `nvi` omits it.)
 
@@ -822,7 +822,7 @@ client-side geometry. (Command-line-mode mouse needs `c` in `'mouse'`; the defau
 
 ## Lua
 
-nxvim embeds **vendored PUC Lua 5.4** via [mlua] — the single backend. Scripts run
+bemtvi embeds **vendored PUC Lua 5.4** via [mlua] — the single backend. Scripts run
 **inside the server**, exactly as in neovim, and influence the editor through the
 same mechanisms RPC clients use. The VM loads the full safe stdlib **plus
 `debug`** (real plugins call `debug.getinfo` to locate their own install dir, and
@@ -833,7 +833,7 @@ compiled to the wasm target); the prelude ships a `bit` library shim since PUC
 has no `bit` *table* (5.4's native bitwise operators notwithstanding). 5.4 over
 the old 5.1 baseline brings real 64-bit integers, native bitwise operators, the
 `utf8` library, **yieldable `pcall`** (so `pcall` can wrap a coroutine-yielding
-`nx.await`), and a generational GC; the one stdlib removal that touched the
+`btv.await`), and a generational GC; the one stdlib removal that touched the
 prelude — `loadstring` (folded into `load` in 5.2) — is restored by a one-line
 `loadstring = loadstring or load` shim at VM creation in `runtime.rs`.
 
@@ -844,36 +844,36 @@ runs, the server drains those queues into the (pure, synchronous) core — Lua
 never mutates the editor directly. The end-state is for `vim.api.nvim_*` to call
 the very same API functions remote clients invoke (`Lua → API → core`).
 
-**A config runtime.** nxvim resolves a config dir and
-**runtimepath** the way neovim does (`$NXVIM_CONFIG` / `$XDG_CONFIG_HOME/nxvim` /
-`~/.config/nxvim`, plus `pack/*/start/*` discovery and `$NXVIM_RUNTIMEPATH`
+**A config runtime.** bemtvi resolves a config dir and
+**runtimepath** the way neovim does (`$BEMTVI_CONFIG` / `$XDG_CONFIG_HOME/bemtvi` /
+`~/.config/bemtvi`, plus `pack/*/start/*` discovery and `$BEMTVI_RUNTIMEPATH`
 for tests), seeds `package.path` from it so `require` resolves config and
 colorscheme modules, and sources `<config>/init.lua` at startup — before the
 first frame. The Lua
 surface is provided as a bundled **Lua prelude**
-(the `nxvim-lua/src/prelude/` modules, the analogue of neovim's `runtime/lua/vim/`):
+(the `bemtvi-lua/src/prelude/` modules, the analogue of neovim's `runtime/lua/vim/`):
 `vim.tbl_*`, `vim.split`, `vim.inspect`, `vim.g`/`vim.o`/`vim.opt`/`vim.env`,
 `vim.notify`, `vim.log`, user commands, and autocmds; env-touching helpers
 (`vim.fn.stdpath`, …) are Rust-backed, and there are no synchronous fs
-builtins — filesystem access is the async `nx.fs`. `:colorscheme <name>`
+builtins — filesystem access is the async `btv.fs`. `:colorscheme <name>`
 sources `colors/<name>.lua` off the runtimepath and fires the `ColorScheme`
 autocmd. A colorscheme is just Lua: its `setup()` compiles a highlight table
 (typically cached as Lua bytecode under `stdpath("cache")`), and `load()`
-populates the highlight registry via the `nx` highlight API (its `nvim_set_hl`
+populates the highlight registry via the `btv` highlight API (its `nvim_set_hl`
 alias). See the [README](../README.md#configuration) to set one up.
 
 **Plugins persist isolated state.** A plugin opts into cross-session storage with
-`nx.shada.plugin()`: a key/value handle (JSON values) that lives in a dedicated
+`btv.shada.plugin()`: a key/value handle (JSON values) that lives in a dedicated
 table of the active shada store, walled off from the core registers/marks/history.
 The namespace is *assigned, not chosen* — derived from the calling code's
 runtimepath/plugin directory (via `debug.getinfo`), so a plugin reaches only its
 own slice and can't name another's. It rides the ordinary shada flush cadence; see
-the [`nx.shada.plugin` section](specs/2026-06-11-native-plugin-api.md) and
+the [`btv.shada.plugin` section](specs/2026-06-11-native-plugin-api.md) and
 `examples/plugin-shada/`.
 
 The editor's scripting namespace is its own: config files and plugins target
-the `nx.*` API ([ADR 0002](decisions/0002-native-plugin-system.md);
-[the `nx` design](specs/2026-06-11-native-plugin-api.md)). The lasting `vim.*`
+the `btv.*` API ([ADR 0002](decisions/0002-native-plugin-system.md);
+[the `btv` design](specs/2026-06-11-native-plugin-api.md)). The lasting `vim.*`
 is exactly one thing: a closed whitelist of **muscle-memory aliases** —
 variables / options / env (`vim.g`, `vim.o`/`vim.opt`, scoped variants),
 `vim.cmd` / `vim.keymap.set`, the declarative registrations (autocmds, user
@@ -881,25 +881,25 @@ commands, the `nvim_set_hl` highlight helper colorschemes use),
 the pure helpers (`vim.tbl_*`,
 `vim.split`, `vim.inspect`, …), and the callback-shaped async (`vim.notify`,
 `vim.schedule`/`vim.defer_fn`, `vim.ui.*`) — process spawning is the
-promise-based `nx.run`, not a `vim.system` alias —
-mapping 1:1 onto the `nx` equivalents so config can be written in familiar
+promise-based `btv.run`, not a `vim.system` alias —
+mapping 1:1 onto the `btv` equivalents so config can be written in familiar
 muscle-memory terms (the
 canonical list: [ADR 0002](decisions/0002-native-plugin-system.md)). The
 prelude's
 broader vim-shaped surface is donor code
-for the `nx` build-out: what serves nxvim's objectives is refactored under
-`nx.*`, the rest is deleted (see the roadmap).
+for the `btv` build-out: what serves bemtvi's objectives is refactored under
+`btv.*`, the rest is deleted (see the roadmap).
 
 ---
 
 ## Syntax highlighting (treesitter)
 
-nxvim is **treesitter-native only** — there is no regex/`syntax.vim` highlighter.
+bemtvi is **treesitter-native only** — there is no regex/`syntax.vim` highlighter.
 All highlighting comes from [tree-sitter](https://tree-sitter.github.io) grammars
 and their `highlights.scm` queries, parsed **in-process**:
 
 - **In-process, synchronous.** The editor owns the parser (a `Box<dyn
-  SyntaxEngine>` whose trait lives in `nxvim-core`, implemented by `nxvim-ts`) and
+  SyntaxEngine>` whose trait lives in `bemtvi-core`, implemented by `bemtvi-ts`) and
   queries it during `redraw`, so spans are correct in the **same frame** as the
   keypress — no worker process, no RPC, no async catch-up frame. This is neovim's
   posture: a buggy grammar (compiled C) can segfault the editor, a risk accepted
@@ -913,7 +913,7 @@ and their `highlights.scm` queries, parsed **in-process**:
   standard tree-sitter grammar + query set is drop-in usable.
 - **Incremental parsing.** The engine keeps a shadow buffer and a persistent
   parse tree per buffer; it applies only **edit deltas** (`InputEdit`) drained
-  from the `Buffer` edit journal in `nxvim-core` (`changedtick` + `BufferEdit`s),
+  from the `Buffer` edit journal in `bemtvi-core` (`changedtick` + `BufferEdit`s),
   so per-edit cost scales with the edit, not the file — huge files stay
   responsive.
 
@@ -931,23 +931,23 @@ and
 
 ### Treesitter control — declarative buffer state, not a parser API
 
-The native engine above *is* nxvim's treesitter. There is no Lua parser/AST
+The native engine above *is* bemtvi's treesitter. There is no Lua parser/AST
 platform: per [ADR 0002](decisions/0002-native-plugin-system.md) the vendored
 neovim `vim.treesitter` Lua (the `LanguageTree` / `get_parser` / `TSNode`
 machinery and the Rust primitives that backed it) was **deleted** — it existed
 only to host third-party neovim plugins, a non-goal. There is no parser-facing
-`nx.treesitter` API: the `nx.treesitter` table holds only the `foldexpr` marker
+`btv.treesitter` API: the `btv.treesitter` table holds only the `foldexpr` marker
 for `foldmethod=expr` (with `vim.treesitter.foldexpr` as its one muscle-memory
 alias — the rest of `vim.treesitter.*` is absent). What
 remains is a tiny control surface over the engine, and it is **declarative buffer
 state**, not a verb API:
 
-- **Highlight control is the two-noun model**: `nx.bo.filetype` chooses the
-  language, `nx.bo.ts_highlight` chooses whether the engine paints it. There is no
+- **Highlight control is the two-noun model**: `btv.bo.filetype` chooses the
+  language, `btv.bo.ts_highlight` chooses whether the engine paints it. There is no
   `start`/`stop` verb — setting the filetype and flipping `ts_highlight` *is* how
   you start/stop highlighting. `:set filetype` / `:setf` write the same per-buffer
   override, so there is a no-Lua path too, straight from the ex line.
-- **Query customization is the native bridge `nx._nx_set_ts_query(lang, name,
+- **Query customization is the native bridge `btv._btv_set_ts_query(lang, name,
   text|nil)`** — it queues a `TsOp::SetQuery` the server pushes straight onto the
   engine, installing a `highlights` / `injections` / `indents` override (a
   replace, `nil` to drop). There is no `;extends` / `after-queries` / runtimepath
@@ -963,7 +963,7 @@ Lua scripting layer on top** — is the same one LSP follows (a native
 async server under a Lua control surface), recorded in
 [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and carried
 forward by [ADR 0002](decisions/0002-native-plugin-system.md) (which retires
-the vendored vim-named spelling in favor of `nx.*`). ADR 0001
+the vendored vim-named spelling in favor of `btv.*`). ADR 0001
 also names the *bridge pattern* (the treesitter query bridge, LSP semantic tokens)
 by which a scripting API is wired to the native engine underneath, projecting
 into
@@ -973,23 +973,23 @@ the extmark highlight layer rather than into core's synchronous path.
 
 ## Cross-platform & the GUI
 
-nxvim targets all major OSes (Linux, macOS, Windows). The dependency choices are
+bemtvi targets all major OSes (Linux, macOS, Windows). The dependency choices are
 deliberately portable: `crossterm` for the terminal, `ropey`, `tokio`, and
 `rmpv` are all cross-platform, and the in-process transport uses no OS-specific
 IPC.
 
 The terminal client is built on [ratatui](https://ratatui.rs) (over crossterm).
-Because every front end is just a client of nxvim's own RPC, a **native GUI** —
+Because every front end is just a client of bemtvi's own RPC, a **native GUI** —
 notably a non-terminal GUI on Windows — is just another client crate consuming
 the same `View` protocol, with zero changes to the server or core.
 
-That claim is now load-bearing: **`nxvim-gui` is a native GUI client**
-([`crates/nxvim-gui`](../crates/nxvim-gui)) on **winit + wgpu + glyphon**. It is
-the GUI sibling of `nxvim-tui` and reuses the same frontend-neutral
-[`nxvim-view`](../crates/nxvim-view) decode/input layer (`View`, `Style`, `Key`,
+That claim is now load-bearing: **`bemtvi-gui` is a native GUI client**
+([`crates/bemtvi-gui`](../crates/bemtvi-gui)) on **winit + wgpu + glyphon**. It is
+the GUI sibling of `bemtvi-tui` and reuses the same frontend-neutral
+[`bemtvi-view`](../crates/bemtvi-view) decode/input layer (`View`, `Style`, `Key`,
 `notation`, `encode_paste`) — the seam the view crate was extracted for. The
-`nxvim-gui` *binary* embeds a server on its own thread exactly like the default
-`nxvim` binary, joined by the same in-process duplex RPC; the only difference from
+`bemtvi-gui` *binary* embeds a server on its own thread exactly like the default
+`bemtvi` binary, joined by the same in-process duplex RPC; the only difference from
 the TUI is the client. winit owns the main thread (its loop is not async), so the RPC runs on a
 separate IO thread that decodes each `redraw` into a `View` and forwards it to
 the event loop via an `EventLoopProxy`, while input goes the other way on a cloned
@@ -1018,24 +1018,24 @@ vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse
 — left click / drag-select / release, wheel scroll, right-click
 (`'mousemodel'`), middle-click paste, and the floating-overlay gestures (the
 completion popup, picker, `select`, wildmenu, and panel), sent as the same
-`nx_input_mouse` the TUI uses (the server owns the hit-test, so the GUI forwards a
+`btv_input_mouse` the TUI uses (the server owns the hit-test, so the GUI forwards a
 raw cell and carries no overlay geometry of its own). Wide-char + emoji rendering
 landed too (CJK cell-snapping, an emoji mask/scale pass that keeps the grid). Still
 deferred: undercurl is drawn as a plain underline.
 Because the GUI can't be black-box
 tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
 frontend-specific translation layers have Tier-1 tests — the winit→notation input
-(`crates/nxvim-gui/tests/keys.rs`), the pointer math
-(`crates/nxvim-gui/tests/mouse.rs`), and the `:connect` target / `nxvim://` URI / SSH
-askpass parsing (`crates/nxvim-gui/tests/remote.rs`); the rendered frame, and the live
+(`crates/bemtvi-gui/tests/keys.rs`), the pointer math
+(`crates/bemtvi-gui/tests/mouse.rs`), and the `:connect` target / `bemtvi://` URI / SSH
+askpass parsing (`crates/bemtvi-gui/tests/remote.rs`); the rendered frame, and the live
 `:connect` session swap, are validated by running it.
 
 ### The web build — a fully client-side WebAssembly editor
 
-**`nxvim-edithost` runs the editor *in the browser*, with no server**
-([`crates/nxvim-edithost`](../crates/nxvim-edithost)). Where the native clients move
+**`bemtvi-edithost` runs the editor *in the browser*, with no server**
+([`crates/bemtvi-edithost`](../crates/bemtvi-edithost)). Where the native clients move
 only the UI off the editor, this moves the whole thing into a browser tab — and not
-just the core: `nxvim-core` **+ the PUC Lua 5.4 VM + the full server tick** (the
+just the core: `bemtvi-core` **+ the PUC Lua 5.4 VM + the full server tick** (the
 reusable synchronous `EditHost`, autocmds, mirrors, redraw projection) compile to
 `wasm32-unknown-emscripten` and run client-side. It's the edit-host split
 (§*Embedded vs. remote*) taken to its limit: the local half is a browser tab, the
@@ -1054,22 +1054,22 @@ fs/process half is OPFS or a remote daemon over WebTransport.
 - **The renderer consumes the same `redraw` the native clients do.** `web/index.html`
   paints the server `redraw` frame as **HTML/CSS** (a per-cell-span DOM renderer —
   windows/gutter/status/tabline/panel/pmenu, selection + cursor-shape classes, smooth
-  scroll), the browser analogue of `nxvim-tui`'s layout, and translates a browser
+  scroll), the browser analogue of `bemtvi-tui`'s layout, and translates a browser
   `KeyboardEvent` to vim key-notation + mouse gestures to `eh_input_mouse`. It exposes
-  a `window.__nxvim` hook (`feed` / `mouse` / `execLua` / `lines` / `frame` / …) so a
+  a `window.__bemtvi` hook (`feed` / `mouse` / `execLua` / `lines` / `frame` / …) so a
   headless browser can drive it.
 - **The run loop parks on `Atomics.wait`, and timers fire without Asyncify.** When the
   page is cross-origin isolated the Worker runs a blocking loop parked on a
   `SharedArrayBuffer` input ring, waking on a keystroke **or** the next timer deadline;
   the same wait that blocks on input fires Worker-side timers (`vim.defer_fn` /
-  `nx.timer`) via `eh_set_clock` / `eh_next_deadline` / `eh_tick_timers` — one
+  `btv.timer`) via `eh_set_clock` / `eh_next_deadline` / `eh_tick_timers` — one
   mechanism. Without cross-origin isolation it falls back to a `postMessage`-driven
   loop (input works, timers don't fire).
 - **The browser is the filesystem — three legs.** Open/save persist to **OPFS**
   (serverless; shada is one JSON blob in OPFS), to **real local files** via the **File
   System Access API** (`:eo` / `:wo` / bare `:w` on a bound path), or to a real
-  `nxvim --daemon` over **WebTransport** (a JS msgpack-RPC client, `web/rpc.mjs`,
-  reached with `?daemon=nxvim://…`). All three ride the same off-tick `HostEffects` fs
+  `bemtvi --daemon` over **WebTransport** (a JS msgpack-RPC client, `web/rpc.mjs`,
+  reached with `?daemon=bemtvi://…`). All three ride the same off-tick `HostEffects` fs
   seam the native edit-host split uses; the Worker fulfills fs requests between ticks.
 - **Lua config runs — plugins included.** Unlike the old core-only web build,
   `init.lua` is sourced at startup: options / keymaps / autocmds / user commands /
@@ -1085,7 +1085,7 @@ fs/process half is OPFS or a remote daemon over WebTransport.
 - **Excluded from the workspace.** It targets `wasm32-unknown-emscripten` and links C
   via `emcc`, so it is in the root Cargo.toml's `[workspace] exclude` (the host
   `cargo build/test/clippy --workspace` never touches it) and pins its own
-  dependencies. Built via `crates/nxvim-edithost/build.sh` (cargo → `emcc` link →
+  dependencies. Built via `crates/bemtvi-edithost/build.sh` (cargo → `emcc` link →
   `dist/eh.{mjs,wasm}`, plus the tree-sitter highlighter assets generated once in the
   crate's `treesitter/` tooling dir and copied into `web/vendor/`). Deployed as static
   files (see `netlify.toml`); the one hard requirement is cross-origin isolation
@@ -1095,29 +1095,29 @@ fs/process half is OPFS or a remote daemon over WebTransport.
 
 ## Testing philosophy
 
-nxvim **does not use unit tests.** We test *functionality* — what the editor
+bemtvi **does not use unit tests.** We test *functionality* — what the editor
 does for a user — not internal code structure. Coverage is layered cheap →
 faithful, so the broad, fast tiers localize most failures and the slow PTY tier
 stays thin:
 
-- **RPC / `View` integration** ([`crates/nxvim-server/tests/editing.rs`](../crates/nxvim-server/tests/editing.rs))
+- **RPC / `View` integration** ([`crates/bemtvi-server/tests/editing.rs`](../crates/bemtvi-server/tests/editing.rs))
   start a real server, connect over real RPC, send vim key-notation via
-  `nx_input`, and assert on observable results: buffer contents
+  `btv_input`, and assert on observable results: buffer contents
   (`nvim_buf_get_lines`), cursor, bytes written to disk, and the semantic
   `redraw` `View`. They treat the editor as a black box and exercise the whole
   stack (RPC → server → core → Lua) end to end.
-- **Tier 1 — client paint & key translation** ([`crates/nxvim-tui/tests/`](../crates/nxvim-tui/tests/))
+- **Tier 1 — client paint & key translation** ([`crates/bemtvi-tui/tests/`](../crates/bemtvi-tui/tests/))
   render a known `View` into a cell grid via ratatui's `TestBackend`
-  (`nxvim_tui::paint`) and assert on the painted cells, and test the
-  crossterm-`KeyEvent`→key-notation translation (`nxvim_tui::encode_key`)
+  (`bemtvi_tui::paint`) and assert on the painted cells, and test the
+  crossterm-`KeyEvent`→key-notation translation (`bemtvi_tui::encode_key`)
   directly. Fast and fully deterministic — no process, no timing.
-- **Tier 2 — full-stack screen** ([`crates/nxvim/tests/screen.rs`](../crates/nxvim/tests/screen.rs))
+- **Tier 2 — full-stack screen** ([`crates/bemtvi/tests/screen.rs`](../crates/bemtvi/tests/screen.rs))
   drive the real server in-process, capture the real `redraw`, paint it with the
   real client, and assert on the cell grid — the deterministic "what the user
   sees" workhorse. Also asserts the non-blocking guarantee (a UI that never
   drains redraws can't stall the editor).
-- **Tier 3 — PTY smoke** ([`crates/nxvim/tests/e2e.rs`](../crates/nxvim/tests/e2e.rs))
-  drive the actual `nxvim` binary through a pseudo-terminal (`portable-pty`),
+- **Tier 3 — PTY smoke** ([`crates/bemtvi/tests/e2e.rs`](../crates/bemtvi/tests/e2e.rs))
+  drive the actual `bemtvi` binary through a pseudo-terminal (`portable-pty`),
   send real key bytes, and assert on the parsed terminal screen (`vt100`) a user
   would really see — proving real crossterm decode, real terminal escapes, and
   process startup/args. Deliberately small; the slow/flaky surface. Includes a
@@ -1152,7 +1152,7 @@ screen," and that is exactly the shape of these tests.
   sharing) rather than neovim's diff-based `undo.c` change records — same
   branching semantics (`:undo {N}`, `vim.fn.undotree()`), different storage.
 - **In-process treesitter** with installable grammars and incremental parsing —
-  like neovim, but kept off `nxvim-core` behind a `SyntaxEngine` trait (so the
+  like neovim, but kept off `bemtvi-core` behind a `SyntaxEngine` trait (so the
   pure core never links tree-sitter) and bounded by a parse deadline (see
   [*Syntax highlighting*](#syntax-highlighting-treesitter)).
 
@@ -1160,7 +1160,7 @@ screen," and that is exactly the shape of these tests.
 `vim.*` gaps and the silent approximations live in
 [*Known approximations & missing features*](known-approximations.md).
 
-- **The native plugin system (`nx.*`)** — the headline extensibility item:
+- **The native plugin system (`btv.*`)** — the headline extensibility item:
   server-owned UI surfaces (completion engine, fuzzy picker, statusline
   segments, snippet engine, tree docks) with plugins as async, declarative
   *providers* registered through manifest-declared contributions, plus the
@@ -1168,36 +1168,36 @@ screen," and that is exactly the shape of these tests.
   [the native plugin API](specs/2026-06-11-native-plugin-api.md); decision:
   [ADR 0002](decisions/0002-native-plugin-system.md). Suggested build order is
   in the spec (picker → completion → statusline/snippets/tree). **Landed so far:**
-  the fuzzy **picker** (`nx.picker`, with a preview pane), the **completion
-  engine** (`nx.complete`, buffer + lsp + snippets sources), the **snippet
-  engine** (`nx.snippet` — LSP snippet-syntax parsing, the tabstop session with
+  the fuzzy **picker** (`btv.picker`, with a preview pane), the **completion
+  engine** (`btv.complete`, buffer + lsp + snippets sources), the **snippet
+  engine** (`btv.snippet` — LSP snippet-syntax parsing, the tabstop session with
   `<Tab>`/`<S-Tab>` navigation and mirrored placeholders; see
-  [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)), the **statusline
-  segment registry** (`nx.statusline` — the lualine-shaped surface: built-in
-  segments resolved natively each frame plus custom `nx.statusline.segment{}`
+  [the snippet plan](plans/2026-06-15-btv-snippet-engine.md)), the **statusline
+  segment registry** (`btv.statusline` — the lualine-shaped surface: built-in
+  segments resolved natively each frame plus custom `btv.statusline.segment{}`
   providers re-rendered only on declared events / `invalidate`, composed through the
-  shared `%`-format [`layout`](../crates/nxvim-core/src/statusline.rs) so clients
+  shared `%`-format [`layout`](../crates/bemtvi-core/src/statusline.rs) so clients
   paint it unchanged; see
-  [the segment plan](plans/2026-06-15-nx-statusline-segments.md)), **viewport
-  decorations** (`nx.decor` — off-tick providers woken once per visible-range
+  [the segment plan](plans/2026-06-15-btv-statusline-segments.md)), **viewport
+  decorations** (`btv.decor` — off-tick providers woken once per visible-range
   change that publish generation-gated extmarks; v1 renders highlight (`hl`) marks
   only — `virt_text`/`sign`/`conceal` are not yet exposed in the provider API;
-  see [the decor plan](plans/2026-06-15-nx-decor-viewport-decorations.md)), the
-  **floating-widget UI layer** (`nx.ui.input`/`select`/`confirm`/`float`,
+  see [the decor plan](plans/2026-06-15-btv-decor-viewport-decorations.md)), the
+  **floating-widget UI layer** (`btv.ui.input`/`select`/`confirm`/`float`,
   promise-based; see
-  [the content-float plan](plans/2026-06-15-nx-ui-float-content-float.md)), and
-  the **tree docks** (`nx.dock` — VSCode-style permanent edge panels with
+  [the content-float plan](plans/2026-06-15-btv-ui-float-content-float.md)), and
+  the **tree docks** (`btv.dock` — VSCode-style permanent edge panels with
   per-region tablines; see
   [the docked-panels plan](plans/2026-06-14-permanent-docked-panels.md)). Every
   widget's keys are rebindable through the real keymap engine
   ([configurable widget keys](plans/2026-06-16-configurable-widget-keys.md)).
-  The **built-in package manager** has landed too: `nx.plugins` — declarative
+  The **built-in package manager** has landed too: `btv.plugins` — declarative
   specs, async git install, eager + lazy (`cmd`/`event`/`ft`/`keys`) activation,
   `:PluginSync`, and the `:Plugins` dashboard.
 - **Treesitter control.** `:TSInstall` / `:TSUpdate` / `:TSInstallInfo` have
   **landed**: the native arm fetches + compiles each grammar into the data dir
-  off the editor thread (`nxvim_ts::install`, with a pinned checksum-verified Zig
-  fetched on demand when no system `cc`/`clang`/`gcc`/`zig`/`$NXVIM_CC` is found),
+  off the editor thread (`bemtvi_ts::install`, with a pinned checksum-verified Zig
+  fetched on demand when no system `cc`/`clang`/`gcc`/`zig`/`$BEMTVI_CC` is found),
   and the browser arm fetches a *prebuilt* `.wasm` grammar instead. The
   `:set`-driven highlight toggle has landed too. (Residual `:TSInstall` edges —
   grammars needing `tree-sitter generate`, no install-from-`HEAD` — are tracked in
@@ -1206,9 +1206,9 @@ screen," and that is exactly the shape of these tests.
   [*Syntax highlighting*](#syntax-highlighting-treesitter)). Treesitter is the
   **native engine**; control is declarative buffer state (see
   [*Treesitter control*](#treesitter-control--declarative-buffer-state-not-a-parser-api)):
-  highlight on/off + language are buffer nouns (`nx.bo.filetype` /
-  `nx.bo.ts_highlight`, also reachable from `:set`), query customization is the
-  native bridge `nx._nx_set_ts_query`, and **injections** are engine-native. There
+  highlight on/off + language are buffer nouns (`btv.bo.filetype` /
+  `btv.bo.ts_highlight`, also reachable from `:set`), query customization is the
+  native bridge `btv._btv_set_ts_query`, and **injections** are engine-native. There
   is no Lua parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
   **Lua-driven indent remains the one deferred item on this axis.**
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
@@ -1221,20 +1221,20 @@ screen," and that is exactly the shape of these tests.
   [*Windows*](#windows). What remains on this axis is the long tail of vim's
   window-local options (`colorcolumn`, `scrolloff`, `signcolumn`, `foldcolumn`,
   `fillchars`, and `winhighlight` are already wired).
-- **The `nx.*` config surface** — `init.lua` targets nxvim's own API
+- **The `btv.*` config surface** — `init.lua` targets bemtvi's own API
   ([ADR 0002](decisions/0002-native-plugin-system.md)); the prelude's current
-  vim-shaped spelling is donor code, refactored under `nx` where it serves
-  nxvim's objectives and deleted where it doesn't, with the muscle-memory
+  vim-shaped spelling is donor code, refactored under `btv` where it serves
+  bemtvi's objectives and deleted where it doesn't, with the muscle-memory
   aliases as the only lasting `vim.*`. What the runtime already does: the runtimepath,
   `require`, `init.lua`,
   `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
-  (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
+  (a per-mode withhold/replay matcher in `bemtvi-server/src/keymap.rs`; multi-key
   built-ins fire instantly even under a colliding user prefix, via the shared
-  command grammar `nxvim_core::command_status` the matcher consults) are in place
+  command grammar `bemtvi_core::command_status` the matcher consults) are in place
   — enough to load a full colorscheme end to end (see [*Lua*](#lua)).
-  The **LSP and diagnostics surface** is native too: the `nxvim-lsp` crate
-  (client, protocol, manager, transport) does nxvim's own stdio spawning and
-  drives the in-core editing features, and `nx.lsp` is its Lua control surface
+  The **LSP and diagnostics surface** is native too: the `bemtvi-lsp` crate
+  (client, protocol, manager, transport) does bemtvi's own stdio spawning and
+  drives the in-core editing features, and `btv.lsp` is its Lua control surface
   (server registration, enable, on-attach) — per
   [ADR 0002](decisions/0002-native-plugin-system.md). (Design background: the
   [LSP support design](specs/2026-06-02-lsp-support-design.md) and the
@@ -1246,17 +1246,17 @@ screen," and that is exactly the shape of these tests.
   no-silent-stubs rule) — in
   [**Known approximations & missing features**](known-approximations.md). That
   doc explains how to enumerate them straight from the code (`grep -rn
-  'INCOMPLETE:'` for approximations, the `nx._notimpl` raises / runtime
-  `nx._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
+  'INCOMPLETE:'` for approximations, the `btv._notimpl` raises / runtime
+  `btv._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — the bulk of vim's options beyond the subset
-  nxvim honors (the registry is `canonical()` in
-  `crates/nxvim-core/src/editor/options.rs`: the window-local gutter / wrap /
+  bemtvi honors (the registry is `canonical()` in
+  `crates/bemtvi-core/src/editor/options.rs`: the window-local gutter / wrap /
   scroll options, the buffer-local indentation options, and a steadily growing
   set besides; many others are not wired) and richer diagnostic
   surfaces. (Blocking reads — `vim.fn.input` / `vim.fn.confirm` / `vim.fn.getcharstr`
   / `vim.wait` and the coroutine pump that hosted them — are **not** part of the
-  `nx` model: nothing in it blocks the editor, so
-  the only prompt surface is the promise-based `nx.ui.input` / `nx.ui.select`,
+  `btv` model: nothing in it blocks the editor, so
+  the only prompt surface is the promise-based `btv.ui.input` / `btv.ui.select`,
   with callback-shaped `vim.ui.*` aliases.)
   Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
@@ -1286,26 +1286,26 @@ screen," and that is exactly the shape of these tests.
   [the search design](specs/2026-06-02-search-design.md) and
   `docs/plans/2026-06-07-substitute-command.md`.)
 - **Per-buffer user commands.** *Done.* `nvim_buf_create_user_command(buffer, …)`
-  stores into a per-bufnr registry (`nx._buf_user_commands[bufnr][name]`, the
-  command analogue of the buffer-local `nx._keymaps`): `nx._resolve_user_command`
+  stores into a per-bufnr registry (`btv._buf_user_commands[bufnr][name]`, the
+  command analogue of the buffer-local `btv._keymaps`): `btv._resolve_user_command`
   gives a buffer-local command precedence over a global of the same name and hides
   it from other buffers, dispatch routes through the editor's authoritative current
   bufnr, `nvim_buf_get_commands` returns a buffer's locals, and a wiped buffer's
-  locals (commands *and* keymaps) are purged via `nx._cleanup_buffer` so a reused
+  locals (commands *and* keymaps) are purged via `btv._cleanup_buffer` so a reused
   bufnr can't inherit them.
 - **An async Lua runtime (event loop).** *Landed* (see
   [the async-runtime plan](plans/2026-06-06-async-lua-runtime.md)). A `Send` background actor
-  (`crates/nxvim-server/src/evloop.rs`, modeled on `LspManager`) owns timers and
+  (`crates/bemtvi-server/src/evloop.rs`, modeled on `LspManager`) owns timers and
   child processes; on completion it sends a typed `LoopEvent` back to the single
-  server thread, which runs the matching Lua callback by id (the `nx._cb_fns`
+  server thread, which runs the matching Lua callback by id (the `btv._cb_fns`
   registry, the keymap-callback shape applied to async work). `vim.schedule`
   defers to convergence, `vim.defer_fn` fires on wall-clock time, and process
   completions settle their promises off-tick (there is no `vim.system` —
-  spawning is the promise-based `nx.run`). neovim's libuv-as-public-API surface
+  spawning is the promise-based `btv.run`). neovim's libuv-as-public-API surface
   — `vim.uv` / `vim.loop`, both the **handle** primitives
   (`new_timer`/`new_check`/`new_fs_event`/`spawn`) and the synchronous `fs_*` /
-  scalars — is **not** part of the `nx` model and is absent entirely.
-  The `nx` async primitives (`nx.run` / `nx.timer` / `nx.fs`) are built on this
+  scalars — is **not** part of the `btv` model and is absent entirely.
+  The `btv` async primitives (`btv.run` / `btv.timer` / `btv.fs`) are built on this
   machinery ([ADR 0002](decisions/0002-native-plugin-system.md)).
 - The `vim.*` glue, kept only as far as colorschemes need
   ([ADR 0002](decisions/0002-native-plugin-system.md)).

@@ -14,7 +14,7 @@ elsewhere.
 ## What was measured
 
 Fixture: the rust grammar compiled from the cargo registry into a temp data dir
-(`crates/nxvim-ts/tests/fixture/mod.rs`), debug build, this machine.
+(`crates/bemtvi-ts/tests/fixture/mod.rs`), debug build, this machine.
 
 | step | cost |
 | --- | --- |
@@ -54,7 +54,7 @@ those five** (`highlights`), or two for a host language that injects
 
 ## Phase 1 — compile a query when something asks for it
 
-Entirely inside `nxvim-ts`; no seam, no async, no other crate. Expected to remove
+Entirely inside `bemtvi-ts`; no seam, no async, no other crate. Expected to remove
 ~60% of a real language's load cost by not doing that work at open.
 
 `Grammar`'s four optional query fields (`indents`, `injections`, `folds`,
@@ -80,7 +80,7 @@ grammar wants it immediately.
   that language is highlighted, i.e. still on the paint path. That is one compile, not
   four, and phase 2 takes it off the tick with everything else.
 
-Tests: extend `crates/nxvim-ts/tests/` — a grammar whose `folds.scm` is broken loads
+Tests: extend `crates/bemtvi-ts/tests/` — a grammar whose `folds.scm` is broken loads
 fine and highlights, and only errors when a fold asks for it; a language with all
 five queries costs measurably less to load than it does today (calibrated against a
 measured compile like `injection_budget.rs` does, not a hardcoded ms).
@@ -104,7 +104,7 @@ on arrival.
   for a language already in flight. Two new methods drain and fill:
   `take_wanted_grammars() -> Vec<String>` and an install that takes the loaded
   grammar back.
-- **Crossing the core.** The editor holds `Box<dyn SyntaxEngine>` and `nxvim-core`
+- **Crossing the core.** The editor holds `Box<dyn SyntaxEngine>` and `bemtvi-core`
   must not learn tree-sitter types, so the trait gains
   `fn wanted_grammars(&mut self) -> Vec<String>` (plain) and
   `fn install_grammar(&mut self, lang: &str, loaded: Box<dyn Any + Send>)`, with the
@@ -135,12 +135,12 @@ its error exactly once.
 ## Phase 3 — the stateless surfaces
 
 `highlight_text` / `highlight_fragment` / `preview_highlights` (picker preview, LSP
-doc floats, `nx.treesitter.highlight`) are one-shot calls that must return spans
+doc floats, `btv.treesitter.highlight`) are one-shot calls that must return spans
 *now*, so a cold language returns unpainted text and needs a later repaint.
 
 - The picker preview already owns a `PreviewCache` and a repaint path — invalidate
   the cached entry when a grammar it wanted lands.
-- `nx.treesitter.highlight` is already promise-shaped; it can resolve after the load
+- `btv.treesitter.highlight` is already promise-shaped; it can resolve after the load
   rather than resolving unpainted.
 - Doc floats repaint on the next frame like a buffer.
 

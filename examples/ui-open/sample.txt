@@ -1,8 +1,8 @@
-https://nxvim.dev/docs    <- put the cursor on this URL and press \O to open it
+https://bemtvi.dev/docs    <- put the cursor on this URL and press \O to open it
 
-nx.ui.open playground — try the maps from init.lua:
+btv.ui.open playground — try the maps from init.lua:
 
-  \o   open https://nxvim.dev in your browser (nx.ui.open + :next on the result)
+  \o   open https://bemtvi.dev in your browser (btv.ui.open + :next on the result)
   \O   open the path/URL under the cursor (gx-style, via vim.fn.expand("<cWORD>"))
   \v   open https://github.com through the vim.ui.open alias
 

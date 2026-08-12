@@ -1,11 +1,11 @@
-nx.complete — the native completion engine (unified float-list widget, Phase 4)
+btv.complete — the native completion engine (unified float-list widget, Phase 4)
 ===============================================================================
 
 What this example shows
 -----------------------
-The built-in `buffer` completion source: as you type in insert mode, nxvim offers
+The built-in `buffer` completion source: as you type in insert mode, bemtvi offers
 words already present in the buffer, fuzzy-ranked with the matched characters
-highlighted. The whole `buffer` path is native (Rust, in nxvim-core) — no Lua runs
+highlighted. The whole `buffer` path is native (Rust, in bemtvi-core) — no Lua runs
 per keystroke (ADR 0002 rule 4) — so it works the same in the TUI, the GUI, and the
 browser (wasm) build.
 
@@ -18,7 +18,7 @@ the configured control keys (move / accept / dismiss) are intercepted while the
 popup is visible. That single difference is what makes completion its own
 orchestration on the shared widget.
 
-Default keys (overridable in init.lua via `nx.complete.setup{ keys = … }`)
+Default keys (overridable in init.lua via `btv.complete.setup{ keys = … }`)
 --------------------------------------------------------------------------
   <C-n> / <Tab> / <Down>   next candidate
   <C-p> / <S-Tab> / <Up>   previous candidate
@@ -30,8 +30,8 @@ swallow newlines). This example opts <CR> in anyway, to show the override.
 
 What is NOT in this phase (4-A)
 -------------------------------
-The `lsp` and `snippets` built-in sources, third-party `nx.complete.source{}`
+The `lsp` and `snippets` built-in sources, third-party `btv.complete.source{}`
 plugins, and the markdown docs preview beside the popup. They arrive in Phases
-4-B…4-E (docs/plans/2026-06-15-nx-complete-completion-engine.md). Referencing an
-unimplemented source in `nx.complete.setup{}` fails loud rather than silently
+4-B…4-E (docs/plans/2026-06-15-btv-complete-completion-engine.md). Referencing an
+unimplemented source in `btv.complete.setup{}` fails loud rather than silently
 doing nothing.

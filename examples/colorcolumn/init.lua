@@ -1,9 +1,9 @@
--- ~~~ nxvim 'colorcolumn': a vertical ruler down the text ~~~
+-- ~~~ bemtvi 'colorcolumn': a vertical ruler down the text ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/colorcolumn \
---       cargo run -p nxvim -- examples/colorcolumn/sample.txt
+--     BEMTVI_CONFIG=examples/colorcolumn \
+--       cargo run -p bemtvi -- examples/colorcolumn/sample.txt
 --
 -- 'colorcolumn' (abbrev 'cc') highlights one or more text columns with the
 -- `ColorColumn` highlight group — a vertical guide line drawn down the whole text
@@ -12,8 +12,8 @@
 -- 'cursorline' (which tints the cursor's whole ROW).
 --
 -- It is window-local (each split carries its own rulers) and takes a
--- comma-separated list of columns. nxvim honors ABSOLUTE column numbers; vim's
--- 'textwidth'-relative "+N"/"-N" forms are accepted but skipped (nxvim models no
+-- comma-separated list of columns. bemtvi honors ABSOLUTE column numbers; vim's
+-- 'textwidth'-relative "+N"/"-N" forms are accepted but skipped (bemtvi models no
 -- 'textwidth' to anchor them). Empty (no ruler) by default, so you opt in.
 --
 -- Set it the neovim way — `vim.opt`/`vim.o` (a string or a list) or `:set cc=…`:
@@ -22,7 +22,7 @@ vim.opt.colorcolumn = "80,120"
 -- Give the rulers a clear colour out of the box. `ColorColumn` is a normal
 -- highlight group — a colorscheme usually defines it, but here (no theme loaded)
 -- we set it ourselves so the guides are obviously visible. Without any definition
--- nxvim still falls back to a subtle grey so the ruler never vanishes silently.
+-- bemtvi still falls back to a subtle grey so the ruler never vanishes silently.
 vim.api.nvim_set_hl(0, "ColorColumn", { bg = "#3a2a2a" })
 
 --------------------------------------------------------------------------------
@@ -65,7 +65,7 @@ end, {})
 -- 3. `:CC80` to keep only the 80-column guide, `:CC80120` for both, `:NoCC` to
 --    clear them. `:CCReport` to echo the current value.
 --
--- 4. `:set cc=+1` — a 'textwidth'-relative entry, which nxvim skips (no ruler),
+-- 4. `:set cc=+1` — a 'textwidth'-relative entry, which bemtvi skips (no ruler),
 --    since there is no 'textwidth'. `:set cc=100` for an absolute one instead.
 --------------------------------------------------------------------------------
 

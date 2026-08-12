@@ -1,9 +1,9 @@
--- ~~~ nxvim mouse support: the server owns every hit-test ~~~
+-- ~~~ bemtvi mouse support: the server owns every hit-test ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/mouse \
---       cargo run -p nxvim -- examples/mouse/sample.txt
+--     BEMTVI_CONFIG=examples/mouse \
+--       cargo run -p bemtvi -- examples/mouse/sample.txt
 --
 -- The mouse is wired straight into the text area. The TUI forwards nothing but a
 -- raw screen cell (`nvim_input_mouse(button, action, modifier, 0, row, col)`);

@@ -1,16 +1,16 @@
 -- A tiny bundled "plugin" that remembers the files you open, ACROSS sessions, in
 -- its own isolated shada namespace.
 --
--- It lives under  pack/demo/start/recent-files/ , so nxvim auto-sources this script
+-- It lives under  pack/demo/start/recent-files/ , so bemtvi auto-sources this script
 -- at startup (the package `plugin/` convention). Because the script lives there,
--- `nx.shada.plugin()` — called with NO argument — attributes it to its directory:
+-- `btv.shada.plugin()` — called with NO argument — attributes it to its directory:
 -- the namespace is "recent-files". The plugin neither names that namespace nor can
 -- reach any other: it cannot see the user config's "user" store, and the config
 -- cannot see this one. The namespace is assigned from *where the code lives*.
 
 -- Opt in. The handle is captured once; it stays bound to "recent-files" no matter
 -- where its methods are later called from (e.g. inside the autocmd below).
-local store = nx.shada.plugin()
+local store = btv.shada.plugin()
 
 local MAX = 10
 
@@ -42,7 +42,7 @@ vim.api.nvim_create_autocmd("BufReadPost", {
   end,
 })
 
--- Also sweep the file nxvim started on, once startup is complete. (At startup the
+-- Also sweep the file bemtvi started on, once startup is complete. (At startup the
 -- initial buffer's BufReadPost can fire before this freshly-sourced autocmd is live,
 -- so VimEnter — which runs after everything is loaded — catches that first file.)
 vim.api.nvim_create_autocmd("VimEnter", {

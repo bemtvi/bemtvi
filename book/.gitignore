@@ -8,7 +8,7 @@ src/features/
 src/architecture/
 src/appendix/
 src/guide/recommended-plugins.md
-src/plugins/nx-model.md
+src/plugins/btv-model.md
 src/plugins/first-party.md
 src/plugins/authoring.md
 src/plugins/async.md

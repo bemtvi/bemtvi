@@ -5,19 +5,19 @@ labels + find-char. Phase 2 — enumerated `g`/`z`/`<C-w>`/`<C-w><C-w>` continua
 + the A+B merge for shared prefixes (`g` + the LSP defaults) + the `available` flag
 for timed-out maps. Phase 3 — the remaining built-in states (operator-pending
 motions, text objects, registers, marks) + descriptive `keys — label` titles.
-Phase 4 — per-segment inline float highlighting: `nx.ui.float` content lines may now
+Phase 4 — per-segment inline float highlighting: `btv.ui.float` content lines may now
 be chunk runs (`{ {text, hl_group}, … }`), so the which-key example colours keys vs.
 group labels vs. descriptions and DIMS timed-out maps (no more `(×)` cue). Tested end
 to end (key_pending + which_key + ui_float suites, full workspace green).
-**Depends on:** the `nx.on_key_pending` oracle (sources A + C landed); see
-`crates/nxvim-server/src/keymap.rs` (`KeyPending`/`Continuation`/`pending_context`)
+**Depends on:** the `btv.on_key_pending` oracle (sources A + C landed); see
+`crates/bemtvi-server/src/keymap.rs` (`KeyPending`/`Continuation`/`pending_context`)
 and `effects.rs::emit_key_pending`.
 
 ## Goal
 
 Surface the **core command grammar's** "waiting for the next key" states —
 `f`/`F`/`t`/`T` find-char, `r` replace, `i`/`a` text-object, `z`/`g` prefixes,
-marks, registers, `<C-w>` — through the same `nx.on_key_pending` event, so a
+marks, registers, `<C-w>` — through the same `btv.on_key_pending` event, so a
 native which-key shows e.g. **"Find character"** when the editor is mid-`f`.
 
 Motivated by the find-char swallow in
@@ -46,7 +46,7 @@ A↔B transitions fire correctly and the cleared event still closes the popup.
 
 ## Phase 1 (this commit) — mechanism + all `Stage` variants, find-char flagship
 
-1. **nxvim-core** (`editor/command.rs` + `mod.rs`): a public
+1. **bemtvi-core** (`editor/command.rs` + `mod.rs`): a public
    `CommandPending { label: &'static str, keys: String }` and
    `Editor::command_pending() -> Option<CommandPending>`, `Some` whenever
    `pending.stage != Start`. `keys` is the showcmd-style prefix typed so far
@@ -86,7 +86,7 @@ A↔B transitions fire correctly and the cleared event still closes the popup.
 Give the finite-set prefixes real discrete `continuations` with descriptions, like
 sources A/C; surface operator-pending as an "Awaiting motion" hint.
 
-1. **nxvim-core** (`command.rs`): `CommandPending` gains `continuations:
+1. **bemtvi-core** (`command.rs`): `CommandPending` gains `continuations:
    Vec<CommandContinuation>` (`{ key, desc, group }`). `command_pending` is now a
    pure `pending_hint(&PendingCommand)`; the finite stages get curated lists built
    beside the grammar that resolves them (`z_continuations` ↔ `view_command`,
@@ -173,11 +173,11 @@ Two things made the popup cryptic: open-set states showed only a bare label (`d`
    Tested: `key_pending` (operator motions / label, text objects, register contents,
    set marks) + `which_key` (`d — Delete` titles and lists motions). The operator
    motion list overflows the popup on 80×24 — the example is single-column; a
-   columned/paged layout is a `nx.ui.float` capability question, see Phase 4.
+   columned/paged layout is a `btv.ui.float` capability question, see Phase 4.
 
 ## Phase 4 (DONE 2026-06-16) — inline float highlighting for a "pretty" which-key
 
-`nx.ui.float` content was plain `Vec<String>` lines rendered single-style (only the
+`btv.ui.float` content was plain `Vec<String>` lines rendered single-style (only the
 selectable-list `Menu` had per-row highlight). So the which-key example could only
 *text-cue* an unavailable row (a trailing `(×)`), not truly **gray** it — and more
 broadly a which-key couldn't colour keys vs. descriptions, group `+prefix` labels.
@@ -189,12 +189,12 @@ content-float line is now a **chunk run** (`Vec<Vec<VirtChunk>>`), the same shap
 ships `[[text, style_id], …]` (the existing `virt_chunks_value` + `StyleTable`), so a
 renderer that already paints `virt_lines` style ids needs almost no new code.
 
-Threaded: `nx.ui.float` (Lua `float_lines` normalizes a string row, a chunk-list row,
+Threaded: `btv.ui.float` (Lua `float_lines` normalizes a string row, a chunk-list row,
 or a mix) → `_ui_float` (`Vec<Vec<VirtChunkData>>`, parsed by the existing
 `virt_chunks_from_table`) → `UiFloatReq` → `effects.rs` lowers to `VirtChunk` →
 `Editor::open_styled_float` → `ContentFloat`/`ContentFloatView`
 (`Vec<Vec<VirtChunk>>`) → `project_content_float` (geometry from summed chunk widths;
-emits chunk runs) → `ContentFloatData` + `parse_float_lines` (nxvim-view) → the three
+emits chunk runs) → `ContentFloatData` + `parse_float_lines` (bemtvi-view) → the three
 renderers (TUI `content_float_line` via `rt`/the palette, GUI `Seg` runs, web per-
 chunk `<span>` + `styleToCss`). A plain caller (LSP hover/signature via
 `open_content_float(Vec<String>)`) becomes one un-styled chunk per line → `Nil` style

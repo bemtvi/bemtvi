@@ -4,7 +4,7 @@ Date: 2026-07-24
 
 ## Problem
 
-nxvim fires `BufWritePre` **after** the bytes are already on disk. In `ex_write`
+bemtvi fires `BufWritePre` **after** the bytes are already on disk. In `ex_write`
 (`core/editor/ex.rs`) the order is `buffer.write()` (disk IO) → `record_write()`,
 and the server later fires `BufWritePre` **and** `BufWritePost` together from the
 `write_events` queue (`fire_buf_write`, `lifecycle.rs`). So `BufWritePre` is a
@@ -22,7 +22,7 @@ Neovim's contract:
 Two requirements beyond a plain reorder (from the requester):
 
 - **All autocmd events must be async-aware** — a handler may return a promise, and
-  the firing path must not drop it (today `nx._fire` discards every handler return
+  the firing path must not drop it (today `btv._fire` discards every handler return
   except the one `*Cmd` truthy-claim path).
 - **`BufWritePre` must let its handlers settle before writing** — including *async*
   handlers (e.g. an async LSP format). The write waits for every `BufWritePre`
@@ -34,7 +34,7 @@ Two requirements beyond a plain reorder (from the requester):
   handlers to settle" cannot be a synchronous wait; it must be a continuation the
   server runs when a settle callback fires — the exact discipline `settle_lsp_promise`
   / `on_loop_event` → `FsResult` already follow.
-- `nxvim-core` stays pure/synchronous. The core can *record intent* and *commit a
+- `bemtvi-core` stays pure/synchronous. The core can *record intent* and *commit a
   write when told to*, but it cannot re-enter Lua. The server owns firing + awaiting.
 - Async settlements land through `on_loop_events` → `on_loop_event`
   (`run_callback` + `apply_lua_effects`) and end with `settle_events(true)` →
@@ -47,16 +47,16 @@ Two requirements beyond a plain reorder (from the requester):
 
 ## Existing machinery to reuse (do not build parallel mechanisms)
 
-- **Callback-id settle bridge**: `nx._next_cb_id()` / `nx._cb_fns[id]` / `nx._run_cb`
+- **Callback-id settle bridge**: `btv._next_cb_id()` / `btv._cb_fns[id]` / `btv._run_cb`
   (`prelude/runtime.lua`), settled from Rust by `run_callback(id, keep, args)`
   (`runtime.rs`). Template: `settle_lsp_promise` (`lsp/request.rs`).
-- **Promise combinators**: `nx.promise.all_settled` (`prelude/promise.lua`) is exactly
+- **Promise combinators**: `btv.promise.all_settled` (`prelude/promise.lua`) is exactly
   "resolve once every input has settled, never reject" — the right primitive for
   "await all handlers".
 - **`is_promise` convention**: `getmetatable(v) == Promise` inside promise.lua, or the
   duck-typed `type(v) == "table" and type(v.next) == "function"` used by
-  `cmdline_complete.lua` / `complete.lua`. Expose one canonical `nx._is_promise`.
-- **`*Cmd` claim plumbing** (`nx._fire_read_cmd` + `fire_autocmd_cmd` returning a value
+  `cmdline_complete.lua` / `complete.lua`. Expose one canonical `btv._is_promise`.
+- **`*Cmd` claim plumbing** (`btv._fire_read_cmd` + `fire_autocmd_cmd` returning a value
   to Rust) is the shape to generalize — a handler return that Rust consults.
 - **The `run_pending` fixpoint** (`effects.rs`) already drains `write_events`,
   `pending_checktime`, scheduled callbacks, etc., and its break-condition gates on
@@ -79,7 +79,7 @@ Two requirements beyond a plain reorder (from the requester):
 Goal: fix the ordering for synchronous handlers across **every** write path. No
 promises yet — this is the structural change, independently valuable and testable.
 
-### Core (`nxvim-core`)
+### Core (`bemtvi-core`)
 
 1. Add a `PreWrite` intent + queue on `Editor`:
    ```rust
@@ -105,7 +105,7 @@ promises yet — this is the structural change, independently valuable and testa
    fires from the pre-write drain before `enqueue_save`, so `finalize_save` must
    **not** re-fire pre.
 
-### Server (`nxvim-server`)
+### Server (`bemtvi-server`)
 
 6. Split `fire_buf_write` → **`fire_buf_write_post`** (fires `BufWritePost` only).
    `drain_write_events` calls it (post-only).
@@ -121,7 +121,7 @@ promises yet — this is the structural change, independently valuable and testa
    suppresses a nested `BufWritePre` for B (vim writes with implicit `noautocmd`).
    `MAX_ROUNDS` is the backstop.
 
-### Tests (`crates/nxvim-server/tests/autocmds.rs`, or a new `bufwrite.rs`)
+### Tests (`crates/bemtvi-server/tests/autocmds.rs`, or a new `bufwrite.rs`)
 
 - **Sync mutation lands**: `BufWritePre` handler runs
   `vim.cmd([[%s/\s\+$//e]])` (or appends a line); after `:w`, the on-disk bytes reflect
@@ -144,20 +144,20 @@ before committing.
 
 ### Lua (`prelude/autocmd.lua`, `runtime.lua`)
 
-1. Expose `nx._is_promise(v)`.
-2. Generalize `nx._fire` to **capture** each handler's return value.
-3. Add `nx._fire_gated(event, pattern, buf, file, gate_id, data)`: run handlers like
-   `nx._fire`, collecting promise returns. If none pending ⇒ return `true`
+1. Expose `btv._is_promise(v)`.
+2. Generalize `btv._fire` to **capture** each handler's return value.
+3. Add `btv._fire_gated(event, pattern, buf, file, gate_id, data)`: run handlers like
+   `btv._fire`, collecting promise returns. If none pending ⇒ return `true`
    (settled synchronously — server commits inline, preserving Phase 1 timing). If any
-   ⇒ `nx.promise.all_settled(promises):next(function() nx._au_gate_done(gate_id) end)`
+   ⇒ `btv.promise.all_settled(promises):next(function() btv._au_gate_done(gate_id) end)`
    and return `false`.
-4. `nx._au_gate_done(id)` bridge → pushes `id` to a Rust-drained `Shared` queue.
+4. `btv._au_gate_done(id)` bridge → pushes `id` to a Rust-drained `Shared` queue.
 
 ### Rust
 
 5. `fire_autocmd_buf_gated(event, pattern, buf, file, gate_id) -> mlua::Result<bool>`
-   (calls `nx._fire_gated`).
-6. `Shared.au_gate_done: Vec<u64>` + `nx._au_gate_done` install binding; drain in
+   (calls `btv._fire_gated`).
+6. `Shared.au_gate_done: Vec<u64>` + `btv._au_gate_done` install binding; drain in
    `run_pending`.
 7. `EditHost`: `next_gate_id` counter + `pending_gated_writes: HashMap<u64, PreWrite>`.
 8. `drain_pre_writes` (from Phase 1) now: fire *gated*. `Ok(true)` ⇒ commit inline
@@ -170,9 +170,9 @@ before committing.
 
 ### Tests
 
-- Async `BufWritePre`: handler returns `nx.promise.delay(ms):next(mutate)`; after `:w`
+- Async `BufWritePre`: handler returns `btv.promise.delay(ms):next(mutate)`; after `:w`
   the disk bytes reflect the mutation (proves the write waited). Mutation-test the wait.
-- Async handler that mutates via an awaited `nx.fs`/timer round-trip.
+- Async handler that mutates via an awaited `btv.fs`/timer round-trip.
 - A rejecting `BufWritePre` promise still writes (unhandled-rejection surfaces, write
   proceeds).
 - Two `BufWritePre` handlers (one sync, one async) both settle before the write.
@@ -221,15 +221,15 @@ PCRE form.
 1. Make the general (non-gating) fire path async-aware: a handler that returns a
    promise from `CursorMoved`, `BufEnter`, `FileType`, … has it **tracked** (a `:catch`
    so a rejection reports via the normal unhandled-rejection path) but the editor does
-   **not** block — fire-and-forget async. Route `nx._fire` and the `fire_and_drain`
-   sites through the promise-aware `nx._fire`.
+   **not** block — fire-and-forget async. Route `btv._fire` and the `fire_and_drain`
+   sites through the promise-aware `btv._fire`.
 2. Extend the gate to `:wall`/`:wqa` async (each buffer's `BufWritePre` gates its own
    write; `:wqa` waits for all writes before quitting — reuse the `PendingQuitAll`
    seq-gate shape).
 3. Book: document the async-autocmd contract on the autocmd API page (handlers may
    return a promise; `BufWritePre` awaits). Backtick/fence per the book rules.
 4. `examples/format-on-save/`: `init.lua` (numbered sections — sync trim-on-save via
-   `BufWritePre` + `%s`; async format via `nx.lsp.buf.format()` returning its promise)
+   `BufWritePre` + `%s`; async format via `btv.lsp.buf.format()` returning its promise)
    + `sample.txt`. Verify end-to-end, throwaway (no committed example-loading test).
 5. Update the memory `editorconfig-builtin-and-bufwritepre-gotcha` — the gotcha is
    fixed; `trim_trailing_whitespace` / `insert_final_newline` are now reachable.
@@ -244,7 +244,7 @@ Two gaps flagged in review of Phases 1–3:
    `BufWritePre` returns from its fire without awaiting a handler's promise; the async work
    still runs (the promise stays alive via its own timer/loop registration), and a rejection
    surfaces via the generic unhandled-rejection reporter. Fixed + tested in **4a** (shipped):
-   `nx._fire` now *explicitly* tracks each handler's return — a promise gets a `:catch` that
+   `btv._fire` now *explicitly* tracks each handler's return — a promise gets a `:catch` that
    surfaces the rejection on the message line **named for the event** ("autocmd `<Event>`
    handler rejected: …"). Two tests (`non_gating_event_async_handler_runs_in_background`,
    `non_gating_event_async_rejection_surfaces`, mutation-tested).
@@ -257,15 +257,15 @@ Two gaps flagged in review of Phases 1–3:
 
 Events fire on the real editor-exit path (a committed `:qa` / `:q` on the last window /
 `:wq` / `:x` / `:wqa`). `QuitPre` → `ExitPre` → `VimLeavePre` are **gated**: a handler may
-return a promise and the exit awaits every handler (`nx.promise.all_settled`) before
-advancing — the same await machinery `BufWritePre` uses (`nx._fire_gated` + `gate_id` +
-`nx._au_gate_done` → `au_gate_done`). `VimLeave` is the final non-gated notification.
+return a promise and the exit awaits every handler (`btv.promise.all_settled`) before
+advancing — the same await machinery `BufWritePre` uses (`btv._fire_gated` + `gate_id` +
+`btv._au_gate_done` → `au_gate_done`). `VimLeave` is the final non-gated notification.
 
-- **Core** (`nxvim-core`): `Editor::exit_requested` + `request_exit()` / `take_exit_requested()`.
+- **Core** (`bemtvi-core`): `Editor::exit_requested` + `request_exit()` / `take_exit_requested()`.
   `ex_quit_all`'s two `should_quit = true` sites become `request_exit()`. The `E37`
   modified-buffer guard is unchanged — it still runs *before* the sequence, so a refused
   `:qa` fires no exit events (a deliberate simplification over neovim, which fires
-  QuitPre/ExitPre *before* the check; nxvim only fires them once the quit is committed).
+  QuitPre/ExitPre *before* the check; bemtvi only fires them once the quit is committed).
 - **Server** (shared `effects.rs` / `lifecycle.rs`, so native **and** wasm get it):
   `exit_stage` (`QuitPre`/`ExitPre`/`VimLeavePre`/`Leaving`) + `exit_gate: Option<u64>`.
   `drive_exit()` — driven in the `run_pending` fixpoint — begins on `take_exit_requested()`,
@@ -289,7 +289,7 @@ advancing — the same await machinery `BufWritePre` uses (`nx._fire_gated` + `g
 - `qa_fires_quitpre_exitpre_vimleavepre_vimleave_in_order` — a clean `:qa` fires all four in
   neovim order (recorded into a global, read back before the connection tears down).
 - `async_exitpre_handler_defers_the_quit` — an `ExitPre`/`VimLeavePre` handler that returns
-  `nx.promise.delay(ms):next(...)` blocks the exit until it settles; mutation-tested (the
+  `btv.promise.delay(ms):next(...)` blocks the exit until it settles; mutation-tested (the
   editor must *not* have exited before the promise resolved).
 - `vimleave_still_fires_on_bang_quit` — `:qa!` fires the sequence too (bang skips only E37).
 - Verify `--no-default-features` compiles and a wasm-eligible test still passes.
@@ -303,6 +303,6 @@ advancing — the same await machinery `BufWritePre` uses (`nx._fire_gated` + `g
   it there too, but the core can't re-enter Lua mid-command to fire before the synchronous
   window close, and no current plugin needs it — QuitPre fires on the editor-exit path only.
 - An `ExitPre`/`VimLeavePre` handler that *cancels* the quit, or that saves a buffer to clear
-  the `E37` block (the check already ran). neovim's events are advisory too; nxvim's don't
+  the `E37` block (the check already ran). neovim's events are advisory too; bemtvi's don't
   cancel.
 - `v:exitreason` / `v:exiting` vim vars (neovim sets them around these events).

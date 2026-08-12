@@ -1,7 +1,7 @@
 # Quickfix & errorformat — implementation plan
 
 > **Status: Phases 1–4 complete — the feature is done.**
-> nxvim parses `errorformat` (a faithful port of vim's `quickfix.c`) into a
+> bemtvi parses `errorformat` (a faithful port of vim's `quickfix.c`) into a
 > structured quickfix list, populated via `setqflist` (structured items or
 > raw-lines-plus-efm) and `:cbuffer`/`:cgetbuffer`/`:caddbuffer`, read back via
 > `getqflist` (Phase 1); browses it in a real, persistent quickfix window
@@ -10,27 +10,27 @@
 > via the job machinery) and the in-process `:vimgrep`, parsing their output into the
 > list and jumping to the first error (Phase 3); and now keeps a 10-deep list-history
 > **stack** (`:colder`/`:cnewer`), per-window **location lists** with every `:l*` twin,
-> `:cfile`/`:cgetfile`/`:caddfile` ingest, and a dogfoodable `nx.qf` Lua surface with
-> `setloclist`/`getloclist` (and `nx.diagnostic.setloclist` wired onto a real loclist)
+> `:cfile`/`:cgetfile`/`:caddfile` ingest, and a dogfoodable `btv.qf` Lua surface with
+> `setloclist`/`getloclist` (and `btv.diagnostic.setloclist` wired onto a real loclist)
 > (Phase 4). This plan built the whole feature: a structured error list populated from
 > command output (`:make`, `:grep`) or ingested text (`:cfile`/`:cbuffer`/`:cexpr`),
 > parsed against a faithfully-ported vim `errorformat`, browsed in a quickfix window,
-> and exposed as a dogfoodable `nx.qf` Lua surface.
+> and exposed as a dogfoodable `btv.qf` Lua surface.
 
 ## Why this document exists
 
-The quickfix list is one of the last big everyday-vim workflows nxvim is missing:
+The quickfix list is one of the last big everyday-vim workflows bemtvi is missing:
 run a build/lint/search, get a navigable list of `file:line:col` hits, step
 through them with `:cnext`/`:cprev`, jump with `<CR>`. It is the connective tissue
 between "a tool produced diagnostics" and "I am now editing the offending line".
 
 The non-obvious enabler — and the reason this is worth porting faithfully rather
-than approximating — is that **`nxvim-regex` already vendors vim's real
-`regexp.c`** (`[[nxvim-regex-vendored-vim-engine]]`). Vim's errorformat is not its
+than approximating — is that **`bemtvi-regex` already vendors vim's real
+`regexp.c`** (`[[bemtvi-regex-vendored-vim-engine]]`). Vim's errorformat is not its
 own matcher: `errorformat` strings are compiled by `efm_to_regpat()` into ordinary
 vim regex patterns, and the parser pulls fields out of `\1..\9` submatches. Since
 we own the identical regex engine and `LineMatch.submatches` already exposes
-`\1..\9` as byte ranges (`crates/nxvim-regex/src/lib.rs:222`), a faithful port of
+`\1..\9` as byte ranges (`crates/bemtvi-regex/src/lib.rs:222`), a faithful port of
 `efm_to_regpat` plugs straight into a matcher with vim-identical semantics. That
 is the part where fidelity matters; everything else (the multiline state machine,
 the list stack, the window) is plumbing best written natively.
@@ -44,7 +44,7 @@ build (no native process spawn) **errors loudly**, never pretends to run.
 
 - **The vim regex engine.** `VimRegex::compile` / `exec_line` returning
   `LineMatch { start, end, submatches: [Option<(usize,usize)>; NSUBEXP] }`
-  (`crates/nxvim-regex/src/lib.rs`). This is what a compiled errorformat runs on.
+  (`crates/bemtvi-regex/src/lib.rs`). This is what a compiled errorformat runs on.
 - **Navigable list panel (prior art).** `panel.rs` already backs the LSP
   diagnostics location-list: `set_panel_targets(Vec<Option<(PathBuf, usize,
   usize)>>)`, `set_panel_lines`, `handle_panel` jumping via
@@ -54,16 +54,16 @@ build (no native process spawn) **errors loudly**, never pretends to run.
 - **`jump_to(&path, line, col)`** (`panel.rs` / `editor/mod.rs`) — open-or-reuse a
   window on a file and place the cursor. The jump primitive for `<CR>`/`:cc`.
 - **Ex-command dispatch.** The big `match cmd { … }` in
-  `crates/nxvim-core/src/editor/ex.rs` (~line 410+) is where `:copen`, `:cnext`,
+  `crates/bemtvi-core/src/editor/ex.rs` (~line 410+) is where `:copen`, `:cnext`,
   `:make`, etc. register, alongside `:ls`, `:terminal`, `:split`.
-- **Job / process spawn.** `nx.spawn` / `vim.system` / `jobstart` stream stdout
+- **Job / process spawn.** `btv.spawn` / `vim.system` / `jobstart` stream stdout
   through `effects.rs` (`proc_spawn`, drained via `apply_lua_effects`); native
   only — the web path already **errors loudly** that jobs require a daemon
   (`effects.rs:1196`). `:make`/`:grep` ride this exact machinery.
 - **Options plumbing.** `editor/options.rs` + `:set`; new string options
   (`errorformat`, `makeprg`, `grepprg`, `grepformat`, `switchbuf`) slot in here.
-- **`nx.fn` surface.** `crates/nxvim-lua/src/prelude/vimfn.lua` is where
-  `setqflist`/`getqflist`/`setloclist`/`getloclist` land; `nx.diagnostic.lua`'s
+- **`btv.fn` surface.** `crates/bemtvi-lua/src/prelude/vimfn.lua` is where
+  `setqflist`/`getqflist`/`setloclist`/`getloclist` land; `btv.diagnostic.lua`'s
   `setloclist` (`diagnostic.lua:130`) shows the Lua→`*Op`→core round-trip to copy.
 
 ---
@@ -76,14 +76,14 @@ build (no native process spawn) **errors loudly**, never pretends to run.
 
 ## Phase 1 — errorformat engine + core list model ✅
 
-> **Done.** `crates/nxvim-core/src/editor/quickfix.rs` ports `efm_to_regpat` +
+> **Done.** `crates/bemtvi-core/src/editor/quickfix.rs` ports `efm_to_regpat` +
 > the `qf_parse_line` state machine (multiline `%A/%C/%Z`, `%-`/`%+` flags, `%>`,
 > `%D`/`%X` dir stack, the `%f %l %c %t %n %m %p %v %s %o …` field codes) onto the
-> `nxvim-regex` engine; `QfEntry`/`QfList` live on the `Editor` behind `qf_list` /
+> `bemtvi-regex` engine; `QfEntry`/`QfList` live on the `Editor` behind `qf_list` /
 > `qf_set_items` / `qf_set_from_lines`. The `'errorformat'` option (default
 > `DFLT_EFM`) is wired through `:set`/`vim.o`. Ingest: `:cbuffer`/`:cgetbuffer`/
 > `:caddbuffer`; Lua bridge: `vim.fn.setqflist` (op) + `vim.fn.getqflist`
-> (`nx._qflist` mirror). Covered by `crates/nxvim-server/tests/quickfix.rs` (8
+> (`btv._qflist` mirror). Covered by `crates/bemtvi-server/tests/quickfix.rs` (8
 > tests: gcc single-line, `%t`/`%n` codes, multiline fold, `%D`/`%X` resolution,
 > structured round-trip, append action, `:cgetbuffer`, and an `E377` fail-loud).
 > Known simplifications deferred: `%f` env-expansion, `%b` buffer-existence and
@@ -95,7 +95,7 @@ yet — exercised end-to-end through a minimal ingest + introspection surface.
 
 **Work**
 
-- New module `crates/nxvim-core/src/editor/quickfix.rs` (and `QfEntry` / `QfList`
+- New module `crates/bemtvi-core/src/editor/quickfix.rs` (and `QfEntry` / `QfList`
   types). `QfEntry { filename: Option<PathBuf>, lnum: usize, col: usize, vcol:
   bool, text: String, kind: char /* 'E' 'W' 'I' ' ' */, nr: i32, valid: bool, …}`
   mirroring vim's `qfline_T` fields that callers actually read.
@@ -114,12 +114,12 @@ yet — exercised end-to-end through a minimal ingest + introspection surface.
   as a string option in `options.rs`.
 - **Minimal ingest + introspection (so Phase 1 is testable end-to-end):**
   `:cgetexpr`/`:cexpr {expr}` and `:cgetbuffer`/`:cbuffer [N]` to fill the list
-  from a Lua string list or a buffer; `nx.fn.setqflist(list)` and
-  `nx.fn.getqflist()` round-tripping the structured entries. (`:cexpr` opens the
+  from a Lua string list or a buffer; `btv.fn.setqflist(list)` and
+  `btv.fn.getqflist()` round-tripping the structured entries. (`:cexpr` opens the
   window in vim — defer that coupling to Phase 2; here it only fills + lets you
   read back.)
 
-**Tests** (`crates/nxvim-server/tests/quickfix.rs`, black-box): feed canonical
+**Tests** (`crates/bemtvi-server/tests/quickfix.rs`, black-box): feed canonical
 compiler output via `setqflist({lines=…, efm=…})` / `:cgetbuffer`, assert the
 parsed entries via `getqflist()` — gcc `file:line:col: error: msg`, a multiline
 `%A/%C/%Z` Java-style trace, a `%D/%X` directory-change build, the `%t`/`%n`
@@ -190,15 +190,15 @@ the end of the list.
 
 > **Done.** New options `'makeprg'` (default `make`), `'grepprg'` (default
 > `grep -n $* /dev/null`), `'grepformat'` (default [`DFLT_GREPFORMAT`]) wired through
-> `:set` *and* `vim.o`/`nx.o` (added to the prelude's `O_GLOBAL` + the `GoMirror`
+> `:set` *and* `vim.o`/`btv.o` (added to the prelude's `O_GLOBAL` + the `GoMirror`
 > push so the values round-trip — this also closed the latent gap where
 > `vim.o.errorformat`/`switchbuf` never reached the core). `:make[!]`/`:grep[!]` live
 > server-side (`EditHost::ex_make`, `excmd.rs`): they expand `'makeprg'`/`'grepprg'`
 > (`$*` → args, else appended), wrap the result in `sh -c '<cmd> 2>&1'` (vim's
 > `'shellpipe'` stderr-merge, so the directory-stack / multi-line matchers see one
-> ordered stream), and hand it to the Lua producer `nx._qf_make`. That dogfoods the
-> existing job machinery (`nx._system_async`): on the child's exit its combined
-> output is split and passed to a new `nx._qf_populate` Rust bridge, which queues a
+> ordered stream), and hand it to the Lua producer `btv._qf_make`. That dogfoods the
+> existing job machinery (`btv._system_async`): on the child's exit its combined
+> output is split and passed to a new `btv._qf_populate` Rust bridge, which queues a
 > `QfSetOp` carrying two new post-populate flags (`open` → `:cwindow`, `goto_first`
 > → `:cfirst`); the server applies them via `Editor::qf_post_populate` after parsing.
 > A no-bang run jumps to the first valid entry; `!` parses + opens but doesn't jump.
@@ -224,7 +224,7 @@ first error.
 - `'makeprg'` (default `make`), `'grepprg'` (default `grep -n $* /dev/null` /
   platform), `'grepformat'` options in `options.rs`.
 - `:make[!] [args]` — expand `'makeprg'` (`$*` substitution), spawn via the
-  existing `nx.spawn`/`jobstart` machinery in `effects.rs`, capture combined
+  existing `btv.spawn`/`jobstart` machinery in `effects.rs`, capture combined
   stdout+stderr, parse against `'errorformat'`, fill the list, `:copen` iff there
   are errors, and (without `!`) jump to the first valid entry.
 - `:grep[!]`/`:lgrep[!]` and an internal `:vimgrep` (the latter uses `VimRegex`
@@ -244,7 +244,7 @@ no external process (runs everywhere).
 
 ---
 
-## Phase 4 — Location list + list stack + `nx.qf` API ✅
+## Phase 4 — Location list + list stack + `btv.qf` API ✅
 
 > **Done.** The single `Editor::quickfix` list became a `QfStack` (vim's up-to-10
 > list history; `:colder`/`:cnewer` walk it via `Editor::ex_qf_history`, `E380`/`E381`
@@ -261,13 +261,13 @@ no external process (runs everywhere).
 > window at drain time). `:cfile`/`:cgetfile`/`:caddfile` (+ `:l*`) read a file off the
 > host fs and parse it (`Editor::ex_cfile`). Location lists are **strictly per-window**
 > (a split inherits a *clone*, not vim's shared-by-reference list — a documented
-> divergence). The Lua surface: `nx.setloclist`/`nx.getloclist` (+ `vim.fn` aliases) over
-> a per-window `nx._loclist` mirror, the canonical `nx.qf` namespace, and
-> `nx.diagnostic.setloclist`/`setqflist`/`toqflist` rebuilt to fill a real, navigable
+> divergence). The Lua surface: `btv.setloclist`/`btv.getloclist` (+ `vim.fn` aliases) over
+> a per-window `btv._loclist` mirror, the canonical `btv.qf` namespace, and
+> `btv.diagnostic.setloclist`/`setqflist`/`toqflist` rebuilt to fill a real, navigable
 > loclist (bufnr-addressed entries now resolve their file at jump time). Covered by 7
 > new black-box tests in `tests/quickfix.rs` (window-scoped set/getloclist,
 > `:colder`/`:cnewer` + `E380`, the `'r'` action, `:lvimgrep`, the read-only loclist
-> window + `<CR>` jump, `:lmake` loclist-scoping, and `nx.diagnostic.setloclist`
+> window + `<CR>` jump, `:lmake` loclist-scoping, and `btv.diagnostic.setloclist`
 > navigability), plus a runnable `examples/quickfix/`.
 >
 > **Follow-ups since (also Phase 4):** `%`/`#` (current/alternate file) expansion in
@@ -277,13 +277,13 @@ no external process (runs everywhere).
 > closing a loclist owner window now also closes its loclist window and drops the
 > orphaned display buffer (`Editor::discard_loclist_display`, hooked in
 > `remove_window`). **Deferred:** `:vimgrep` file *globbing* (`**/*.rs`, fails loud),
-> `:cexpr`/`:cgetexpr`/`:caddexpr` (intentionally not added — nxvim's `:echo`-grade
+> `:cexpr`/`:cgetexpr`/`:caddexpr` (intentionally not added — bemtvi's `:echo`-grade
 > expression evaluator can't evaluate the `system()`/variable expressions that make
 > `:cexpr` useful, and the Lua `setqflist({lines=…})` path already covers it more
 > capably), and the out-of-scope items below.
 
 **Goal:** window-local location lists, the 10-deep history stack, and the
-dogfoodable Lua surface (`[[dogfood-the-nx-plugin-api]]`).
+dogfoodable Lua surface (`[[dogfood-the-btv-plugin-api]]`).
 
 **Work**
 
@@ -294,16 +294,16 @@ dogfoodable Lua surface (`[[dogfood-the-nx-plugin-api]]`).
 - **List stack:** vim keeps the last 10 quickfix lists; `:colder`/`:cnewer`
   (`:lolder`/`:lnewer`) walk it; `setqflist` `action` `'a'` (append) / `'r'`
   (replace) / `' '` (new list) and `what = { title, nr, items, … }`.
-- **`nx.qf` surface** over `nx.fn.setqflist`/`getqflist`/`setloclist`/`getloclist`
+- **`btv.qf` surface** over `btv.fn.setqflist`/`getqflist`/`setloclist`/`getloclist`
   — the canonical API; `vim.fn`-style aliases (whitelist per ADR 0002) delegate to
-  it. Wire `nx.diagnostic.setloclist` (`diagnostic.lua:130`, today a stub-ish
+  it. Wire `btv.diagnostic.setloclist` (`diagnostic.lua:130`, today a stub-ish
   bridge) to populate a real location list now that one exists.
 - `examples/quickfix/` runnable config + sample erroring file, verified end-to-end
   (`[[example-config-for-testing]]`).
 
 **Tests:** `setloclist`/`getloclist` round-trip is window-scoped (two windows hold
 independent lists); `:colder`/`:cnewer` restore prior lists; `setqflist` `'a'`/`'r'`
-actions; `nx.diagnostic.setloclist()` fills a navigable loclist from real
+actions; `btv.diagnostic.setloclist()` fills a navigable loclist from real
 diagnostics.
 
 ---

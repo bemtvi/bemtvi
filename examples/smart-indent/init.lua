@@ -1,11 +1,11 @@
--- ~~~ nxvim smart indenting & auto-pairs: autoindent / smartindent / autopairs ~~~
+-- ~~~ bemtvi smart indenting & auto-pairs: autoindent / smartindent / autopairs ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/smart-indent \
---       cargo run -p nxvim -- examples/smart-indent/sample.txt
+--     BEMTVI_CONFIG=examples/smart-indent \
+--       cargo run -p bemtvi -- examples/smart-indent/sample.txt
 --
--- nxvim auto-indents from tree-sitter when a grammar's `indents.scm` is loaded.
+-- bemtvi auto-indents from tree-sitter when a grammar's `indents.scm` is loaded.
 -- For everything else — plain text, config snippets, a language with no indent
 -- query — three buffer-local options (off by default, just like vim/neovim) fill
 -- the gap:

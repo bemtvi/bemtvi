@@ -1,6 +1,6 @@
 # macOS Code Signing & Notarization Implementation Plan
 
-**Goal:** Developer ID sign (hardened runtime) + notarize the two macOS `nxvim` binaries in the reusable build workflow, so every macOS binary on both the `edge` and stable channels runs on any Mac.
+**Goal:** Developer ID sign (hardened runtime) + notarize the two macOS `bemtvi` binaries in the reusable build workflow, so every macOS binary on both the `edge` and stable channels runs on any Mac.
 
 **Architecture:** Three macOS-only steps (`if: matrix.os == 'macos'`) are inserted into `.github/workflows/build.yml` between the `Build` and `Package (Unix)` steps — import cert into a throwaway keychain, `codesign`, then `xcrun notarytool submit --wait`. Because `build.yml` is a reusable (`workflow_call`) workflow, the five signing secrets are declared in its `workflow_call.secrets` block and the two callers (`edge.yml`, `release.yml`) pass them with `secrets: inherit` — otherwise `${{ secrets.* }}` is empty inside `build.yml`. Signing mutates the binary before `tar`, so the existing checksums + provenance attestation (computed in the publish jobs over the archives) already cover the signed binary.
 
@@ -109,14 +109,14 @@ In `.github/workflows/build.yml`, find this exact block:
 ```yaml
       - name: Build
         shell: bash
-        run: cargo build --release -p nxvim --target ${{ matrix.target }}
+        run: cargo build --release -p bemtvi --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.os != 'windows'
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" nxvim
+          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" bemtvi
 ```
 
 Replace it with this block (the `Build` and `Package (Unix)` steps are unchanged; three new macOS-only steps are inserted between them):
@@ -124,7 +124,7 @@ Replace it with this block (the `Build` and `Package (Unix)` steps are unchanged
 ```yaml
       - name: Build
         shell: bash
-        run: cargo build --release -p nxvim --target ${{ matrix.target }}
+        run: cargo build --release -p bemtvi --target ${{ matrix.target }}
 
       - name: Import signing certificate (macOS)
         if: matrix.os == 'macos'
@@ -164,7 +164,7 @@ Replace it with this block (the `Build` and `Package (Unix)` steps are unchanged
         run: |
           # shellcheck disable=SC2154  # SIGN_KEYCHAIN/SIGN_IDENTITY arrive via $GITHUB_ENV
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/nxvim"
+          BIN="target/${{ matrix.target }}/release/bemtvi"
           codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
 
@@ -177,9 +177,9 @@ Replace it with this block (the `Build` and `Package (Unix)` steps are unchanged
           AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/nxvim"
+          BIN="target/${{ matrix.target }}/release/bemtvi"
           KEY="$RUNNER_TEMP/ac_api.p8"
-          ZIP="$RUNNER_TEMP/nxvim-notarize.zip"
+          ZIP="$RUNNER_TEMP/bemtvi-notarize.zip"
 
           echo "$AC_API_KEY_P8" | base64 --decode > "$KEY"
           ditto -c -k --keepParent "$BIN" "$ZIP"
@@ -201,7 +201,7 @@ Replace it with this block (the `Build` and `Package (Unix)` steps are unchanged
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" nxvim
+          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" bemtvi
 ```
 
 - [ ] **Step 3: Validate with actionlint**
@@ -313,10 +313,10 @@ Gatekeeper override. Confirm locally:
 
 ```sh
 # Signature, authority chain, hardened runtime (look for flags=...(runtime)):
-codesign -dv --verbose=4 nxvim
+codesign -dv --verbose=4 bemtvi
 
 # Gatekeeper assessment — "accepted" / "source=Notarized Developer ID" (needs network):
-spctl -a -t exec -vv nxvim
+spctl -a -t exec -vv bemtvi
 ```
 
 The binaries are not stapled (Apple does not support stapling a notarization ticket to a
@@ -353,17 +353,17 @@ In the Actions tab, open the triggered `edge` run. Expected: `build / x86_64-app
 - [ ] **Step 3: Verify a downloaded binary locally**
 
 ```bash
-gh release download edge --repo davidrios/nxvim --pattern 'nxvim-edge-aarch64-macos.tar.gz' --dir /tmp
-tar -xzf /tmp/nxvim-edge-aarch64-macos.tar.gz -C /tmp
-codesign -dv --verbose=4 /tmp/nxvim 2>&1 | grep -E 'Authority=Developer ID Application|flags=.*runtime|Timestamp='
-spctl -a -t exec -vv /tmp/nxvim
+gh release download edge --repo davidrios/bemtvi --pattern 'bemtvi-edge-aarch64-macos.tar.gz' --dir /tmp
+tar -xzf /tmp/bemtvi-edge-aarch64-macos.tar.gz -C /tmp
+codesign -dv --verbose=4 /tmp/bemtvi 2>&1 | grep -E 'Authority=Developer ID Application|flags=.*runtime|Timestamp='
+spctl -a -t exec -vv /tmp/bemtvi
 ```
 Expected: `codesign` shows a `Developer ID Application` authority, a `runtime` flag, and a secure `Timestamp`; `spctl` reports `accepted` with `source=Notarized Developer ID`. (Run on an Apple-Silicon Mac for the aarch64 artifact, or download the `x86_64` artifact on an Intel Mac.)
 
 - [ ] **Step 4: Confirm the attestation still verifies over the signed archive**
 
 ```bash
-gh attestation verify /tmp/nxvim-edge-aarch64-macos.tar.gz --repo davidrios/nxvim
+gh attestation verify /tmp/bemtvi-edge-aarch64-macos.tar.gz --repo davidrios/bemtvi
 ```
 Expected: `✓ Verification succeeded`.
 

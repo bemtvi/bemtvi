@@ -69,29 +69,29 @@ frame instead of hanging the editor.
 
 ## Architecture after the migration
 
-Today: `nxvim-server` holds a `SyntaxClient` that pipes
-`ts_open`/`ts_edit`/`ts_view` to the `nxvim --__ts-worker` subprocess and ingests
+Today: `bemtvi-server` holds a `SyntaxClient` that pipes
+`ts_open`/`ts_edit`/`ts_view` to the `bemtvi --__ts-worker` subprocess and ingests
 `ts_highlights` notifications into a per-buffer span cache, projected at redraw.
-`nxvim-server` has **no** compile-time tree-sitter dependency; only the `nxvim`
-binary depends on `nxvim-ts`, purely to host the worker.
+`bemtvi-server` has **no** compile-time tree-sitter dependency; only the `bemtvi`
+binary depends on `bemtvi-ts`, purely to host the worker.
 
-After: `nxvim-ts` becomes an ordinary **in-process library**. Its `Engine`
+After: `bemtvi-ts` becomes an ordinary **in-process library**. Its `Engine`
 (incremental parse + query, `engine.rs`) and `Grammar` loader (`loader.rs`) move
 over essentially **verbatim** — that logic is the valuable part and it survives.
 What's deleted is the transport and supervision scaffolding wrapped around it.
 
 The new ownership, chosen to avoid a split borrow between "the tree" and "the
-buffer": **the editor owns the engine behind a trait object.** `nxvim-core`
+buffer": **the editor owns the engine behind a trait object.** `bemtvi-core`
 defines a synchronous `SyntaxEngine` trait (an *interface* plus plain data — no
-tree-sitter, no C, no I/O, so core stays pure per its invariant). `nxvim-ts`
+tree-sitter, no C, no I/O, so core stays pure per its invariant). `bemtvi-ts`
 implements it. The server constructs the concrete engine at startup and hands it
 to the editor:
 
 ```text
-            ┌────────────────────────── nxvim-server (one process) ───────────┐
+            ┌────────────────────────── bemtvi-server (one process) ───────────┐
   keypress  │   Server::input ─► Editor::input ──────────────┐                 │
  ──────────►│                       │ owns Buffer + cursor   │                 │
-            │                       │ owns Box<dyn SyntaxEngine> ──► nxvim_ts  │
+            │                       │ owns Box<dyn SyntaxEngine> ──► bemtvi_ts  │
             │                       │   .edit(deltas)   (incremental reparse)  │
             │                       │   .indent(line)   (run indents.scm)      │
             │   Server::redraw ─────┴►.highlights(range)  (run highlights.scm) │
@@ -99,14 +99,14 @@ to the editor:
                        no subprocess, no RPC, no respawn
 ```
 
-Dependency direction (no cycle): `nxvim-core` defines the trait + data types;
-`nxvim-ts` depends on `nxvim-core` and tree-sitter; `nxvim-server` depends on
-both. `nxvim-core` never gains a tree-sitter dependency.
+Dependency direction (no cycle): `bemtvi-core` defines the trait + data types;
+`bemtvi-ts` depends on `bemtvi-core` and tree-sitter; `bemtvi-server` depends on
+both. `bemtvi-core` never gains a tree-sitter dependency.
 
-### The `SyntaxEngine` seam (in `nxvim-core`)
+### The `SyntaxEngine` seam (in `bemtvi-core`)
 
 ```rust
-// nxvim-core — interface + plain data only; keeps core pure and synchronous.
+// bemtvi-core — interface + plain data only; keeps core pure and synchronous.
 pub struct Span {            // one highlight span, buffer coordinates
     pub line: usize,
     pub start_byte: usize,   // byte column within the line
@@ -210,7 +210,7 @@ ts-indent). This is **drop-in compatible** with an existing nvim-treesitter
 `queries/` tree — the `.scm` files are reused as pure data; we never run
 nvim-treesitter's Lua.
 
-### The indent algorithm (ported to Rust in `nxvim-ts`)
+### The indent algorithm (ported to Rust in `bemtvi-ts`)
 
 The `.scm` files are data; the algorithm that interprets them is nvim-treesitter's
 `indent.lua`, ported to Rust as `Engine::indent`. It evaluates the standard
@@ -235,7 +235,7 @@ Porting `indent.lua` faithfully is the bulk of the new code; it is well-specifie
 and the `.scm` corpus is the public nvim-treesitter one. Scope v1 to the core
 captures above; `#set!` align directives and injected languages can follow.
 
-### Editor hooks (in `nxvim-core`)
+### Editor hooks (in `bemtvi-core`)
 
 A single helper centralizes the policy and the fallback chain:
 
@@ -276,37 +276,37 @@ dedenting the line) are v2; v1 delivers Enter/`o`/`O` and the `=` operators.
 ## What gets deleted / moved / added
 
 **Deleted:**
-- `crates/nxvim-server/src/syntax.rs` — `SyntaxClient`, the `supervise` /
+- `crates/bemtvi-server/src/syntax.rs` — `SyntaxClient`, the `supervise` /
   `run_worker_once` loop, the circuit breaker, `SyntaxEvent`.
-- Worker mode in `crates/nxvim/src/main.rs` — `TS_WORKER_FLAG`, `run_ts_worker()`,
+- Worker mode in `crates/bemtvi/src/main.rs` — `TS_WORKER_FLAG`, `run_ts_worker()`,
   and the `argv[1]` dispatch to it.
-- `crates/nxvim-ts/src/lib.rs` worker loop (`run`, `handle`, the `ts_*` dispatch,
-  `$NXVIM_TS_RECORD`) — replaced by a plain library root re-exporting `Engine`.
-- `crates/nxvim-rpc/src/syntax.rs` wire types (`EditWire`/`SpanWire` encode/decode)
+- `crates/bemtvi-ts/src/lib.rs` worker loop (`run`, `handle`, the `ts_*` dispatch,
+  `$BEMTVI_TS_RECORD`) — replaced by a plain library root re-exporting `Engine`.
+- `crates/bemtvi-rpc/src/syntax.rs` wire types (`EditWire`/`SpanWire` encode/decode)
   — nothing crosses a process boundary now; the engine takes `&[BufferEdit]` and
   returns `Vec<Span>` directly. (Keep only if a field shape is still convenient
   internally; otherwise remove.)
-- The async half of `crates/nxvim-server/src/treesitter.rs` — `on_syntax_event`,
+- The async half of `crates/bemtvi-server/src/treesitter.rs` — `on_syntax_event`,
   `store_spans`, `sync_syntax`'s pending/coalescing, the worker `open/edit/view`.
   `highlights_for`'s projection logic **stays** (now sourced from
   `editor.highlights()`), and a slim per-buffer memo replaces `SyntaxState`.
 
-**Moved (≈verbatim):** `nxvim-ts/src/engine.rs` (`Engine`, incremental reparse,
-`extract_spans`) and `nxvim-ts/src/loader.rs` (`Grammar`, dlopen, ABI probe,
+**Moved (≈verbatim):** `bemtvi-ts/src/engine.rs` (`Engine`, incremental reparse,
+`extract_spans`) and `bemtvi-ts/src/loader.rs` (`Grammar`, dlopen, ABI probe,
 `is_valid_language` traversal guard). The grammar data-dir layout and
-`NXVIM_DATA_DIR` override are unchanged.
+`BEMTVI_DATA_DIR` override are unchanged.
 
-**Added:** `SyntaxEngine` trait + `Span`/`IndentParams` in `nxvim-core`;
-`impl SyntaxEngine for Engine` in `nxvim-ts`; `Engine::indent` + `indents.scm`
+**Added:** `SyntaxEngine` trait + `Span`/`IndentParams` in `bemtvi-core`;
+`impl SyntaxEngine for Engine` in `bemtvi-ts`; `Engine::indent` + `indents.scm`
 loading; the editor `indent_for` helper and its three call sites; the parse
 deadline.
 
 **Cargo changes:**
-- `nxvim-ts/Cargo.toml`: drop `rmpv`, `tokio`, `nxvim-rpc`; add `nxvim-core`.
+- `bemtvi-ts/Cargo.toml`: drop `rmpv`, `tokio`, `bemtvi-rpc`; add `bemtvi-core`.
   Keep `tree-sitter`, `ropey`, `libloading`, `streaming-iterator`, `anyhow`.
-- `nxvim-server/Cargo.toml`: add `nxvim-ts` (first real tree-sitter dependency
+- `bemtvi-server/Cargo.toml`: add `bemtvi-ts` (first real tree-sitter dependency
   for the server).
-- `nxvim/Cargo.toml`: drop the direct `nxvim-ts` dep (now transitive via server).
+- `bemtvi/Cargo.toml`: drop the direct `bemtvi-ts` dep (now transitive via server).
 - Workspace deps unchanged (`tree-sitter = "=0.26.9"`, etc.).
 
 ---
@@ -332,17 +332,17 @@ deadline.
 
 ## Testing (black-box, per the no-unit-test rule)
 
-- **Highlighting** (`crates/nxvim/tests/syntax.rs`) — the fixture (compile
+- **Highlighting** (`crates/bemtvi/tests/syntax.rs`) — the fixture (compile
   `tree-sitter-rust` C into `parser/rust.so`, write `highlights.scm`) is reused,
-  but `NXVIM_TS_WORKER` and the subprocess go away, and the **poll-until-spans**
+  but `BEMTVI_TS_WORKER` and the subprocess go away, and the **poll-until-spans**
   helper collapses to a single synchronous redraw assertion (highlights are
   same-frame now). Update accordingly.
-- **Delete** the worker-only tests: `crates/nxvim-ts/tests/worker.rs` (RPC
-  round-trips), the `"__crash"` crash-resilience test, and the `$NXVIM_TS_RECORD`
+- **Delete** the worker-only tests: `crates/bemtvi-ts/tests/worker.rs` (RPC
+  round-trips), the `"__crash"` crash-resilience test, and the `$BEMTVI_TS_RECORD`
   tiny-delta test (the delta path is now an internal `Engine::edit` call; assert
   incrementality, if at all, as an in-process property).
-- **New indent tests** (`crates/nxvim-server/tests/`, black-box via the server):
-  point `NXVIM_DATA_DIR` at a fixture that adds `queries/rust/indents.scm`
+- **New indent tests** (`crates/bemtvi-server/tests/`, black-box via the server):
+  point `BEMTVI_DATA_DIR` at a fixture that adds `queries/rust/indents.scm`
   (vendored from nvim-treesitter), feed Rust source, press `o`/`Enter`/`==`/`gg=G`,
   assert `cursor`/`lines` show the expected indentation. Because everything is
   now synchronous, these are barrier tests, not polled ones.
@@ -351,10 +351,10 @@ deadline.
 
 ## Implementation phases (for the follow-up plan)
 
-1. **Library-ize `nxvim-ts`.** Strip the worker loop; expose `Engine` + `Grammar`
-   as a plain lib. Add `nxvim-core` dep. (No behavior yet; it just compiles as a
+1. **Library-ize `bemtvi-ts`.** Strip the worker loop; expose `Engine` + `Grammar`
+   as a plain lib. Add `bemtvi-core` dep. (No behavior yet; it just compiles as a
    library.)
-2. **`SyntaxEngine` trait in core + impl in `nxvim-ts`.** Define trait/`Span`/
+2. **`SyntaxEngine` trait in core + impl in `bemtvi-ts`.** Define trait/`Span`/
    `IndentParams`; `impl SyntaxEngine for Engine` (indent stubbed to `None`).
 3. **Cut the server over to in-process highlighting.** Editor owns the engine;
    server drains edits into it and queries `highlights()` at redraw; delete
@@ -370,7 +370,7 @@ deadline.
    0, the copy-previous step gated on `SyntaxEngine::indents_available` so a
    grammar-less buffer keeps vim's autoindent-off default of column 0),
    `set_line_indent`, and the wiring of `open_line`, insert-mode `Enter`, and the
-   `=` family. Black-box indent tests live in `crates/nxvim/tests/indent.rs` with
+   `=` family. Black-box indent tests live in `crates/bemtvi/tests/indent.rs` with
    a vendored rust `indents.scm` fixture.
 6. **(Later, now unblocked)** `@indent.align` (delimiter alignment) + injected
    trees, copy-previous-line nuances, `indentkeys` retriggers, `vim.treesitter`

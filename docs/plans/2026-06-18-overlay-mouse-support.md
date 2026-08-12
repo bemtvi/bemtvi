@@ -7,12 +7,12 @@ Status: **in progress** (started 2026-06-18).
 Add mouse support to the floating list/overlay widgets that today are
 keyboard-only (or, in one case, mouse-handled client-side in the TUI only):
 
-- the **insert-mode completion popup** (`nx.complete`) and its **docs sidebar**,
-- the **fuzzy picker** (`nx.picker`) — list, prompt, and preview pane — and the
-  promptless **select** (`nx.ui.select`),
-- the **command-line wildmenu** (`nx.cmdline_complete`) and its docs sidebar.
+- the **insert-mode completion popup** (`btv.complete`) and its **docs sidebar**,
+- the **fuzzy picker** (`btv.picker`) — list, prompt, and preview pane — and the
+  promptless **select** (`btv.ui.select`),
+- the **command-line wildmenu** (`btv.cmdline_complete`) and its docs sidebar.
 
-Regular tree floats (`nx.view` / `nvim_open_win`) are already core-hit-tested in
+Regular tree floats (`btv.view` / `nvim_open_win`) are already core-hit-tested in
 `mouse.rs` (border-inset aware) — they are out of scope; this is specifically the
 `Menu`-backed overlays projected by `redraw.rs::project_menu`.
 
@@ -22,8 +22,8 @@ The mouse architecture is **"core owns which cells; clients forward raw cells"**
 (`docs/architecture.md`, `editor/mouse.rs`). Every region — text, status lines,
 tablines, dock edges, split dividers, **and regular floats** — is hit-tested in
 core. The one exception is the completion popup, handled client-side in
-`nxvim-tui` (`pmenu_geometry`/`pmenu_doc_geometry` + the `nxvim_complete_select` /
-`nxvim_complete_accept` RPCs). That geometry is computed three times (core
+`bemtvi-tui` (`pmenu_geometry`/`pmenu_doc_geometry` + the `bemtvi_complete_select` /
+`bemtvi_complete_accept` RPCs). That geometry is computed three times (core
 `MenuView` → server `project_menu` → TUI mirror) and exists only in the TUI.
 
 We bring menu-box geometry into core and hit-test these overlays there, like
@@ -91,7 +91,7 @@ this phase changes no observable output.
 - **GUI + web dead-`pmenu` cleanup and bespoke-RPC removal**: the GUI (and the web
   client) carry the same dead `view.pmenu` mouse branches, which already fall
   through to raw-cell forwarding — so completion mouse works there via core *now*.
-  Their cosmetic cleanup + dropping `nxvim_complete_select`/`_accept` belongs to the
+  Their cosmetic cleanup + dropping `bemtvi_complete_select`/`_accept` belongs to the
   Phase 4 cross-client pass (where each client is verified end-to-end).
 
 ## Phase 2 — Picker + select ✅ (committed)
@@ -107,7 +107,7 @@ this phase changes no observable output.
   picker (`menu_cancel`) / no-ops a `select`; the wheel moves the highlight
   (`menu_step`) or, over the preview, scrolls it (`menu_preview_scroll`, the
   `<C-d>`/`<C-u>` half-page gesture); drag / release are swallowed.
-- Server fix: `nx_input_mouse` now runs `run_pending()` after `editor.mouse`, like
+- Server fix: `btv_input_mouse` now runs `run_pending()` after `editor.mouse`, like
   the keyboard path, so a mouse-driven confirm/cancel actually drains `menu_results`
   (and a completion accept's `complete_accept_request` — also benefits Phase 1's LSP
   path, which the native-source tests didn't cover).
@@ -135,7 +135,7 @@ this phase changes no observable output.
 - **4a — dead-code cleanup** (`24266b4`): removed the GUI's dead `view.pmenu` mouse
   handling (`render::pmenu_hit`/`PmenuHit`, the `doc_scroll` field, `mouse::within`)
   — it forwards raw cells now — and dropped the unused
-  `nxvim_complete_select`/`nxvim_complete_accept` dispatch arms. The web client
+  `bemtvi_complete_select`/`bemtvi_complete_accept` dispatch arms. The web client
   already forwarded raw cells, so it needed no change.
 - **4b — example**: `examples/mouse-widgets/` (init.lua + sample.txt) wires all four
   overlays with `mouse=a`; `complete.rs::example_mouse_widgets_config_loads_and_completion_is_clickable`
@@ -143,7 +143,7 @@ this phase changes no observable output.
 - **4c — docs**: `docs/architecture.md` mouse section gained the floating-overlay
   hit-test paragraph (menu_geom ↔ menu_hit) and the GUI mouse list was de-stale'd.
 - **4d — web verify**: added a completion-popup mouse-click check to
-  `crates/nxvim-edithost/web/verify-ui.mjs`; **all checks pass in a real browser**.
+  `crates/bemtvi-edithost/web/verify-ui.mjs`; **all checks pass in a real browser**.
   This surfaced a real bug: the wasm `EditHost::mouse` tick did `editor.mouse` +
   `redraw` but skipped the `run_pending` settle the native dispatch runs — so a
   mouse confirm/accept queued but never ran its handler. Fixed `EditHost::mouse` to
@@ -154,7 +154,7 @@ this phase changes no observable output.
 ## Testing
 
 Black-box throughout: the harness `feed_mouse` / `feed_mouse_at` + `TestClock`
-drive `nx_input_mouse`; assertions on `nvim_buf_get_lines` / cursor / the projected
+drive `btv_input_mouse`; assertions on `nvim_buf_get_lines` / cursor / the projected
 `menu` redraw surface and confirm-readback via `nvim_exec_lua`. No unit tests.
 
 ## Risks / notes

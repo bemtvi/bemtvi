@@ -1,12 +1,12 @@
--- ~~~ nxvim silent commands: the `:silent[!]` modifier and `nx.cmd`'s mods ~~~
+-- ~~~ bemtvi silent commands: the `:silent[!]` modifier and `btv.cmd`'s mods ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/silent-commands \
---       cargo run -p nxvim -- examples/silent-commands/sample.txt
+--     BEMTVI_CONFIG=examples/silent-commands \
+--       cargo run -p bemtvi -- examples/silent-commands/sample.txt
 --
 -- A command's chatter belongs to whoever typed it — not to a keymap or a plugin
--- running it on your behalf. vim's answer is the `:silent` modifier, and nxvim
+-- running it on your behalf. vim's answer is the `:silent` modifier, and bemtvi
 -- honors both halves of it:
 --
 --   :silent  {cmd}   suppress {cmd}'s ordinary output — ERRORS STILL SHOW
@@ -14,16 +14,16 @@
 --
 -- The split matters: a bare `:silent` that also ate errors would turn a broken
 -- mapping into a mapping that does nothing, quietly. Vim switches messages back
--- on the moment an error fires, and so does nxvim.
+-- on the moment an error fires, and so does bemtvi.
 --
 -- From Lua the same modifier is a table argument rather than a string prefix:
 --
---   nx.cmd("write", { silent = true })                     -- :silent write
---   nx.cmd("Foo",   { silent = true, emsg_silent = true })  -- :silent! Foo
+--   btv.cmd("write", { silent = true })                     -- :silent write
+--   btv.cmd("Foo",   { silent = true, emsg_silent = true })  -- :silent! Foo
 --
 -- `vim.cmd` (the muscle-memory alias) takes it in every form it accepts —
 -- `vim.cmd(str, opts)`, `vim.cmd{ cmd = …, mods = … }`, `vim.cmd.write{ mods = … }`
--- — all of which compile down to the very same ex modifier. A `mods` key nxvim
+-- — all of which compile down to the very same ex modifier. A `mods` key bemtvi
 -- doesn't dispatch raises by name instead of being quietly dropped.
 
 -- ~~~ 1. The modifier, typed ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -37,13 +37,13 @@
 
 -- ~~~ 2. A keymap that saves without the "written" chatter ~~~~~~~~~~~~~~~~~~~~~
 --
--- `nx.cmd(cmd, opts)` is the canonical Lua funnel; `opts` carries the modifiers.
+-- `btv.cmd(cmd, opts)` is the canonical Lua funnel; `opts` carries the modifiers.
 -- The write still happens, and a write *error* would still reach you.
 --
 -- TYPE:  <Space>w
 -- SEE:   the buffer is saved with no "…written" message (`:w` alone reports it)
 vim.keymap.set("n", "<Space>w", function()
-  nx.cmd("write", { silent = true })
+  btv.cmd("write", { silent = true })
 end, { desc = "save quietly" })
 
 -- ~~~ 3. Best-effort setup: `silent!` for a command that may not exist ~~~~~~~~~
@@ -55,7 +55,7 @@ end, { desc = "save quietly" })
 -- SEE:   nothing happens and nothing is reported (`:OptionalPluginCommand` is
 --        not defined). Drop `emsg_silent` and the same map reports E492.
 vim.keymap.set("n", "<Space>o", function()
-  nx.cmd("OptionalPluginCommand", { silent = true, emsg_silent = true })
+  btv.cmd("OptionalPluginCommand", { silent = true, emsg_silent = true })
 end, { desc = "run an optional command, quietly" })
 
 -- ~~~ 4. Errors are NOT swallowed by a bare `silent` ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -66,7 +66,7 @@ end, { desc = "run an optional command, quietly" })
 -- TYPE:  <Space>e
 -- SEE:   E492: Not an editor command: OptionalPluginCommand
 vim.keymap.set("n", "<Space>e", function()
-  nx.cmd("OptionalPluginCommand", { silent = true })
+  btv.cmd("OptionalPluginCommand", { silent = true })
 end, { desc = "silent, but errors still report" })
 
 -- ~~~ 5. The `vim.cmd` alias forms ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -86,12 +86,12 @@ end, { desc = "every vim.cmd form takes mods" })
 
 -- ~~~ 6. An unsupported modifier fails loud ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 --
--- nxvim dispatches `silent` / `emsg_silent`; anything else raises rather than
+-- bemtvi dispatches `silent` / `emsg_silent`; anything else raises rather than
 -- being silently ignored, so a config never *looks* like it applied a modifier
 -- that did nothing.
 --
 -- TYPE:  <Space>x
 -- SEE:   an error naming `keepjumps`
 vim.keymap.set("n", "<Space>x", function()
-  nx.cmd("normal! G", { keepjumps = true })
+  btv.cmd("normal! G", { keepjumps = true })
 end, { desc = "an unknown modifier raises" })

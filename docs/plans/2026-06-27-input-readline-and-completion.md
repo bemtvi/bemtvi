@@ -1,30 +1,30 @@
-# `nx.ui.input` readline + autocomplete (and the dap REPL)
+# `btv.ui.input` readline + autocomplete (and the dap REPL)
 
 Status: Phase 1 + 2 complete
 Date: 2026-06-27
 
 ## Goal
 
-Give `nx.ui.input` first-class **readline history** and **autocomplete**, as opt-in
-options every plugin can use — then dogfood both in the `nxvim-dap` debug REPL
+Give `btv.ui.input` first-class **readline history** and **autocomplete**, as opt-in
+options every plugin can use — then dogfood both in the `bemtvi-dap` debug REPL
 (history recall of past expressions; `<Tab>` completion driven by the adapter's DAP
 `completions` request).
 
 The driving request was "readline-like capabilities + autocomplete in the debug
 REPL", but the right home for it is the shared primitive, not the plugin: the
-`CmdlineKind::Prompt` that backs `nx.ui.input` already reuses the *full command-line
+`CmdlineKind::Prompt` that backs `btv.ui.input` already reuses the *full command-line
 editor* (`Editor::cmdline`), which has cursor editing, `<C-r>` register insert, and —
 already wired but **hard-gated off** for prompts — `<Up>`/`<Down>` history recall and
 the `<Tab>` wildmenu. So this is mostly *un-gating and parameterizing* existing
 machinery per-prompt.
 
-## API (the new `nx.ui.input` opts)
+## API (the new `btv.ui.input` opts)
 
 ```lua
-nx.ui.input({
+btv.ui.input({
   prompt  = "dap> ",
   default = "",
-  history = "nxvim-dap-repl",      -- string namespace: enables ↑/↓ recall + records submissions
+  history = "bemtvi-dap-repl",      -- string namespace: enables ↑/↓ recall + records submissions
   complete = function(line, col)   -- optional; returns a candidate list OR a promise of one
     -- candidate = { label = str, insert = str?, doc = str? }  (insert defaults to label)
     return { { label = "foo", insert = "foo", doc = "..." }, ... }
@@ -49,9 +49,9 @@ nx.ui.input({
 
 ---
 
-## Phase 1 — namespaced history on `nx.ui.input` (+ dap REPL)
+## Phase 1 — namespaced history on `btv.ui.input` (+ dap REPL)
 
-Core (`nxvim-core`):
+Core (`bemtvi-core`):
 - `mod.rs`: add `prompt_history: HashMap<String, Vec<String>>` and
   `prompt_history_key: Option<String>`.
 - `cmdline.rs::open_prompt(label, default, history_key)`: store the key; reset
@@ -64,16 +64,16 @@ Wiring:
 - `ops.rs::UiInputReq`: add `history: Option<String>`.
 - `install.rs::_ui_input`: accept an optional 4th arg `history`.
 - `effects.rs`: `open_prompt(req.prompt, req.default, req.history)`.
-- `ui.lua::nx.ui.input`: pass `opts.history` through to `nx._ui_input`.
+- `ui.lua::btv.ui.input`: pass `opts.history` through to `btv._ui_input`.
 
 Dogfood:
-- `nxvim-dap/repl.lua::M.prompt()`: pass `history = "nxvim-dap-repl"`.
+- `bemtvi-dap/repl.lua::M.prompt()`: pass `history = "bemtvi-dap-repl"`.
 
-Tests (`crates/nxvim-server/tests/ui_prompt.rs`): submit a value under a namespace,
+Tests (`crates/bemtvi-server/tests/ui_prompt.rs`): submit a value under a namespace,
 re-open the prompt, `<Up>` recalls it; a different namespace does not see it; `<Up>`
 with empty history is a no-op; consecutive dup collapses.
 
-## Phase 2 — autocomplete on `nx.ui.input` (+ dap REPL via DAP `completions`) ✅
+## Phase 2 — autocomplete on `btv.ui.input` (+ dap REPL via DAP `completions`) ✅
 
 Shipped as designed below, plus `complete_docs` (the side docs pane, default on when
 `complete` is set) so candidates carrying a `doc` show it beside the list — the same
@@ -84,7 +84,7 @@ only the part after the dot. The dap REPL maps DAP `CompletionItem`s
 
 Refresh debounce (`complete_debounce`, default 100ms) coalesces the live-narrowing
 re-queries so an async source is one round-trip per quiet window, not per keystroke;
-the initial `<Tab>` stays immediate. Built first-class on `nx.utils.debounce`, keyed
+the initial `<Tab>` stays immediate. Built first-class on `btv.utils.debounce`, keyed
 off a `refresh` flag core stamps on the request (initial open vs. narrowing edit).
 
 Adapter-specified replace ranges ARE honored: a candidate may carry `start`/`length`
@@ -104,7 +104,7 @@ Core:
   line (handles async staleness) and call the shared `open_cmdline_menu`.
 
 Async source bridge (Lua-owned, since the source may await a promise):
-- `ui.lua`: stash the active prompt's `complete` fn in `nx._active_prompt_complete`
+- `ui.lua`: stash the active prompt's `complete` fn in `btv._active_prompt_complete`
   (one prompt open at a time). Cleared on resolve/cancel.
 - Server drains `prompt_complete_request` → calls `lua.run_prompt_complete(line, col)`,
   which invokes the fn, resolves a list-or-promise, then queues the candidates in a
@@ -113,7 +113,7 @@ Async source bridge (Lua-owned, since the source may await a promise):
   `editor.open_prompt_complete_menu(cands)`. Sync sources land same-tick; async one
   tick later.
 
-Dogfood (`nxvim-dap`):
+Dogfood (`bemtvi-dap`):
 - `session.lua`: add `Session:completions(text, column, frame_id, cb)` →
   `completions` request, gated on `capabilities.supportsCompletionsRequest`.
 - `repl.lua::M.prompt()`: pass `complete = function(line,col) ... end` that returns a

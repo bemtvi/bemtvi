@@ -1,11 +1,11 @@
-# Testing nxvim plugins (`nx.test` + `nxvim --test-plugin`)
+# Testing bemtvi plugins (`btv.test` + `bemtvi --test-plugin`)
 
-Author guide for the native Lua test framework. nxvim plugins are pure Lua over the
-`nx.*` API ([ADR 0002](../decisions/0002-native-plugin-system.md)), so their tests
+Author guide for the native Lua test framework. bemtvi plugins are pure Lua over the
+`btv.*` API ([ADR 0002](../decisions/0002-native-plugin-system.md)), so their tests
 are too: a plugin repo carries a `test/*_spec.lua` suite that drives a **real**
-editor and asserts on its state, run headlessly by `nxvim --test-plugin`.
+editor and asserts on its state, run headlessly by `bemtvi --test-plugin`.
 
-It is the Lua sibling of the Rust black-box harness (`crates/nxvim-test-harness`):
+It is the Lua sibling of the Rust black-box harness (`crates/bemtvi-test-harness`):
 same philosophy — feed vim keys, assert on the resulting buffer / cursor / UI —
 reachable from a plugin's own repo.
 
@@ -15,15 +15,15 @@ Put specs under `test/` in your plugin repo (files must end `_spec.lua`):
 
 ```lua
 -- test/my_plugin_spec.lua
-nx.test.describe("my-plugin", function()
-  nx.test.before_each(function()
+btv.test.describe("my-plugin", function()
+  btv.test.before_each(function()
     require("my-plugin").setup({})
   end)
 
-  nx.test.it("does the thing", function(t)
+  btv.test.it("does the thing", function(t)
     t:feed("itext<Esc>")
-    nx.test.expect(t:lines()).to_equal({ "text" })
-    nx.test.expect(t:mode()).to_be("n")
+    btv.test.expect(t:lines()).to_equal({ "text" })
+    btv.test.expect(t:mode()).to_be("n")
   end)
 end)
 ```
@@ -31,8 +31,8 @@ end)
 Run it (defaults to the cwd):
 
 ```sh
-nxvim --test-plugin                 # runs ./test/**/*_spec.lua
-nxvim --test-plugin path/to/plugin  # or an explicit plugin dir
+bemtvi --test-plugin                 # runs ./test/**/*_spec.lua
+bemtvi --test-plugin path/to/plugin  # or an explicit plugin dir
 ```
 
 The runner boots an embedded editor with your plugin on the runtimepath (so
@@ -52,18 +52,18 @@ empty buffer in normal mode), so one test's edits never bleed into the next.
 Fed keys settle at the **end of a tick**, and the Lua state mirrors refresh **before
 each Lua entry** — so a single synchronous chunk that feeds then reads sees stale
 state (the Rust harness uses a separate RPC round-trip per assertion for the same
-reason). So every `it` body runs inside an `nx.async` coroutine, and the context's
-driving methods `nx.await` internally: `t:feed` queues the keys then awaits one tick,
+reason). So every `it` body runs inside an `btv.async` coroutine, and the context's
+driving methods `btv.await` internally: `t:feed` queues the keys then awaits one tick,
 so the keys drain and the mirrors refresh before the next line runs.
 
 Deterministic (synchronous) input settles in one tick. **Asynchronous** effects — a
 debounced popup, a timer, a watch — need `t:wait_for(predicate)`:
 
 ```lua
-nx.test.it("shows a debounced popup", function(t)
+btv.test.it("shows a debounced popup", function(t)
   t:feed("<Space>")
   local float = t:wait_for(function() return t:float() end)
-  nx.test.expect(float.text).to_contain("write")
+  btv.test.expect(float.text).to_contain("write")
 end)
 ```
 
@@ -73,16 +73,16 @@ end)
 
 | Call | Meaning |
 | --- | --- |
-| `nx.test.describe(name, fn)` | group; nestable |
-| `nx.test.it(name, fn)` | a test; `fn` receives the context `t` |
-| `nx.test.before_each(fn)` / `after_each(fn)` | hooks; resolved per test along the describe chain (order-independent, busted-style) |
+| `btv.test.describe(name, fn)` | group; nestable |
+| `btv.test.it(name, fn)` | a test; `fn` receives the context `t` |
+| `btv.test.before_each(fn)` / `after_each(fn)` | hooks; resolved per test along the describe chain (order-independent, busted-style) |
 
-### Assertions — `nx.test.expect(value)`
+### Assertions — `btv.test.expect(value)`
 
 `.to_equal(x)` (deep), `.to_be(x)` (identity / `==`), `.to_contain(x)` (substring or
 list element), `.to_match(pat)` (Lua pattern), `.to_be_truthy()`, `.to_be_falsy()`,
 `.to_be_nil()`, `.to_error([substr])` (`value` is a function expected to raise).
-Prefix any with `.never` to invert: `nx.test.expect(x).never.to_equal(y)`.
+Prefix any with `.never` to invert: `btv.test.expect(x).never.to_equal(y)`.
 
 ### The context `t`
 
@@ -110,29 +110,29 @@ Reads (plain, correct after an await):
 
 ### Hermetic seams
 
-- `nx.test.clipboard.seed(text[, linewise])` — put text on `"+` / `"*` as if an
-  external app set it. `nx.test.clipboard.peek()` → `text, linewise` (what a plugin
-  wrote). `nx.test.clipboard.clear()`.
-- `nx.test.tempdir()` — a fresh unique directory (already created); pair with
-  `nx.fs` to exercise a plugin's file I/O without collisions.
+- `btv.test.clipboard.seed(text[, linewise])` — put text on `"+` / `"*` as if an
+  external app set it. `btv.test.clipboard.peek()` → `text, linewise` (what a plugin
+  wrote). `btv.test.clipboard.clear()`.
+- `btv.test.tempdir()` — a fresh unique directory (already created); pair with
+  `btv.fs` to exercise a plugin's file I/O without collisions.
 
 ## A real example
 
-`nxvim-keys-helper` (the which-key plugin) ships
-[`test/popup_spec.lua`](https://github.com/nxvim/nxvim-keys-helper): it feeds a
+`bemtvi-keys-helper` (the which-key plugin) ships
+[`test/popup_spec.lua`](https://github.com/bemtvi/bemtvi-keys-helper): it feeds a
 leader prefix, waits for the debounced popup, and asserts on `t:float().text` —
 group names, leaf descriptions, the built-in `z` grammar, close-on-abort.
 
 ## Gating
 
-The whole surface is OFF in a normal editor session: `nx.test` is nil and the
-`nx._ui` mirror is unpopulated. It is turned on only by the `--test-plugin` runner
-(the `nx_enable_test_mode` RPC), so a config or plugin can't accidentally depend on
+The whole surface is OFF in a normal editor session: `btv.test` is nil and the
+`btv._ui` mirror is unpopulated. It is turned on only by the `--test-plugin` runner
+(the `btv_enable_test_mode` RPC), so a config or plugin can't accidentally depend on
 it, and a normal session pays none of the per-redraw mirror cost.
 
 ## Not yet supported
 
-A virtual/deterministic clock for `nx.timer` — tests use real time plus
+A virtual/deterministic clock for `btv.timer` — tests use real time plus
 `t:wait_for` / `t:sleep`, which covers debounce/timeout behavior. (Faking the timer
 wheel would be a larger change; tracked in
 `docs/plans/2026-06-18-lua-plugin-testing.md`.)

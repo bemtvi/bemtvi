@@ -6,10 +6,10 @@ Date: 2026-06-27
 ## Goal
 
 Two configurable options controlling command-line / search (and prompt) history —
-the knobs nxvim was missing vs neovim's `'history'` + `'shada'`.
+the knobs bemtvi was missing vs neovim's `'history'` + `'shada'`.
 
 - **`history`** (Num, global, default `10000`) — the in-memory cap on each history
-  ring (ex `:`, search `/`, and the `nx.ui.input` namespace rings). `0` disables
+  ring (ex `:`, search `/`, and the `btv.ui.input` namespace rings). `0` disables
   history. Mirrors neovim's `'history'`.
 - **`persisthistory`** (Str, global, default `"workspace,global"`) — where history
   persists across sessions, as a **priority list**: the first *available* scope wins
@@ -59,12 +59,12 @@ Caveats / scope:
   existing single-store behavior; the option still gates `none` and the primary scope.
 - wasm/EditHost has a single OPFS store, so the option is effectively `persist` vs
   `none` there.
-- Phase 2 routes the ex/search histories. The `nx.ui.input` namespace rings are capped
+- Phase 2 routes the ex/search histories. The `btv.ui.input` namespace rings are capped
   by `history` but not yet persisted (a later extension on top of this seam).
 
 ## Phases
 1. ✅ `history` option + in-memory cap (+ tests).
-2. ✅ `persisthistory`: validate (E474 on `:set`, lenient `nx.o`), resolve to a single
+2. ✅ `persisthistory`: validate (E474 on `:set`, lenient `btv.o`), resolve to a single
    `HistoryScope` (priority list), primary-store write gating (`gate_primary_history`),
    and — only when a workspace launch targets `global` — route to the injected global
    store (`ServerInit::global_shada`) opened post-config (`init_global_history`) with a
@@ -81,5 +81,5 @@ Caveats / scope:
   still loads pre-config, so those entries carry for that session — a documented edge of
   the load-before-config ordering. The default and `none` are exact.
 - The global store handle is injected (`global_shada`) so tests never touch the real
-  `~/.local/state/nxvim/shada`; the binary sets it to `default_shada()` for a local
+  `~/.local/state/bemtvi/shada`; the binary sets it to `default_shada()` for a local
   workspace launch, `None` for plain/remote.

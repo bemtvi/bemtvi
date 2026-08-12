@@ -1,4 +1,4 @@
-Command-line completion (nx.cmdline_complete) — the wildmenu demo.
+Command-line completion (btv.cmdline_complete) — the wildmenu demo.
 
 Open the command line with `:` and press <Tab> to float a fuzzy list of
 matching command names above the line. Try these:

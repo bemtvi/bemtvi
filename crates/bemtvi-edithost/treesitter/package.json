@@ -1,0 +1,29 @@
+{
+  "name": "bemtvi-edithost-treesitter",
+  "private": true,
+  "description": "Build-time tooling for the wasm edit-host's syntax highlighter: vendors the tree-sitter runtime + per-language grammar .wasm + sanitized queries from the pinned devDependencies into ./vendor/ (scripts/gen-treesitter.mjs). The parent crate's build.sh runs `npm run build:treesitter` here and copies ./vendor/ into web/vendor/. Build-time only — the edit-host ships static assets and loads no runtime CDN.",
+  "scripts": {
+    "build:treesitter": "node scripts/gen-treesitter.mjs"
+  },
+  "devDependencies": {
+    "web-tree-sitter": "0.26.9",
+    "tree-sitter-rust": "0.24.0",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "tree-sitter-json": "0.24.8",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-ruby": "0.23.1",
+    "tree-sitter-php": "0.24.2",
+    "tree-sitter-cpp": "0.23.4",
+    "tree-sitter-c": "0.24.1",
+    "tree-sitter-go": "0.25.0",
+    "tree-sitter-bash": "0.25.1",
+    "tree-sitter-css": "0.25.0",
+    "tree-sitter-html": "0.23.2",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-c-sharp": "0.23.5",
+    "@tree-sitter-grammars/tree-sitter-zig": "1.1.2",
+    "@tree-sitter-grammars/tree-sitter-lua": "0.4.1",
+    "@tree-sitter-grammars/tree-sitter-toml": "0.7.0"
+  }
+}

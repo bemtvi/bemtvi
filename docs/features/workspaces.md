@@ -1,14 +1,14 @@
 # Workspaces
 
 A **workspace** is the VSCode "open a folder" model brought to a modal editor:
-open a directory *as a workspace* — `nxvim --workspace <dir>` in the terminal, or
+open a directory *as a workspace* — `bemtvi --workspace <dir>` in the terminal, or
 the `:workspace [dir]` command in the GUI — and it becomes a persistent project
 session. The window/split/dock layout, the open files (with cursor and scroll),
 and any modified scratch buffers are saved on exit and restored on the next
 launch — and the directory becomes the working directory, so relative paths,
 `:find`, and project plugins resolve against the project root.
 
-It is opt-in: an ordinary `nxvim <dir>` does *not* start a workspace — you ask for
+It is opt-in: an ordinary `bemtvi <dir>` does *not* start a workspace — you ask for
 one with the flag or command. vim/neovim have `:mksession` for something
 adjacent, but it is manual on both ends (you save and load the session yourself)
 and global. Once a workspace is open, the save-on-exit / restore-on-launch is
@@ -20,9 +20,9 @@ automatic, per-directory, and carries its own option overrides.
 current directory). The positional `TARGET` is a *separate* optional file to open:
 
 ```sh
-nxvim --workspace ~/code/myproject          # open a directory as a workspace
-nxvim --workspace ~/code/myproject README.md  # …and open a file in it
-nxvim --workspace                           # the current directory
+bemtvi --workspace ~/code/myproject          # open a directory as a workspace
+bemtvi --workspace ~/code/myproject README.md  # …and open a file in it
+bemtvi --workspace                           # the current directory
 ```
 
 `--workspace` does three things:
@@ -69,31 +69,31 @@ portable) buffer paths resolve against the root. Pass `--workspace-no-cwd` to ke
 the directory you launched from instead:
 
 ```sh
-nxvim --workspace ~/code/myproject --workspace-no-cwd
+bemtvi --workspace ~/code/myproject --workspace-no-cwd
 ```
 
 The cd is a launch-time decision (a CLI flag), not a config option — there is no
 `init.lua` knob, so the working directory is settled from the first instruction.
 `--workspace-no-cwd` has no effect without `--workspace`.
 
-## Per-workspace option overrides — `nx.wso`
+## Per-workspace option overrides — `btv.wso`
 
-`nx.wso` is a per-workspace overlay over the global option tier: a value set
+`btv.wso` is a per-workspace overlay over the global option tier: a value set
 here **takes precedence over the global value** for this workspace only, and is
 persisted with the session. It is the place to pin project-specific settings —
 a tab width, a colorscheme toggle, search case sensitivity — without touching
 your global config.
 
 ```lua
-nx.wso.tabstop = 2             -- this project indents with 2
-nx.wso.ignorecase = true       -- case-insensitive search here
-nx.wso.tabstop = nil           -- clear the override; revert to the global value
+btv.wso.tabstop = 2             -- this project indents with 2
+btv.wso.ignorecase = true       -- case-insensitive search here
+btv.wso.tabstop = nil           -- clear the override; revert to the global value
 ```
 
 Only **global** options can be workspace-overridden (not window- or
 buffer-local ones), and the name and value type are validated on write. The
-resolution order is simply: the **`nx.wso`** overlay when present, otherwise the
-**global** value (`nx.o` / `:set`).
+resolution order is simply: the **`btv.wso`** overlay when present, otherwise the
+**global** value (`btv.o` / `:set`).
 
 ## Workspaces and the remote daemon
 

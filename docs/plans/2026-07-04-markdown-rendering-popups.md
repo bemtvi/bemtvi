@@ -3,10 +3,10 @@
 Status: **implemented** (phases 1–4) · 2026-07-04
 
 Implementation notes vs the plan:
-- **Renderer** lives in `crates/nxvim-core/src/markdown.rs`; `render(src)` (no width
+- **Renderer** lives in `crates/bemtvi-core/src/markdown.rs`; `render(src)` (no width
   param — thematic breaks / table separators emit `MdFill`s the caller expands).
-- **Lua surface** `nx.markdown.render(src) → { lines, highlights, fills }`
-  (char-column spans, `@markup.*` groups) over the native `nx._markdown_render`.
+- **Lua surface** `btv.markdown.render(src) → { lines, highlights, fills }`
+  (char-column spans, `@markup.*` groups) over the native `btv._markdown_render`.
 - **Hover** renders through `Editor::open_markdown_float` (`DOC_MD_NS` extmarks +
   per-fence `preview_highlights`).
 - **Completion docs sidebar** renders too, but **text-only** (stripped, uncolored):
@@ -17,11 +17,11 @@ Implementation notes vs the plan:
   docs sidebar.
 - **Phase 4** (tables / task lists / block-quote bar / thematic-rule fills / link-URL)
   all landed in the renderer; shipped `examples/markdown/` (renders a buffer into an
-  `nx.ui.float` popup) as the end-to-end example.
+  `btv.ui.float` popup) as the end-to-end example.
 
 ## Goal
 
-Render markdown *properly* in nxvim's read-only doc popups — starting with **LSP
+Render markdown *properly* in bemtvi's read-only doc popups — starting with **LSP
 hover** — instead of showing literal `**bold**`, `# heading`, ` ``` ` fences and
 unaligned `|` tables. We parse the markdown **at ingest** into (a) stripped
 display lines and (b) a set of highlight / decoration extmarks, then render it
@@ -46,26 +46,26 @@ existing `markup_lines` seam. It is popups-only.
 
 Confirmed in the code today:
 
-- `crates/nxvim-lsp/src/convert.rs:228` `markup_lines()` only splits the server's
+- `crates/bemtvi-lsp/src/convert.rs:228` `markup_lines()` only splits the server's
   markdown on `\n` and decodes HTML entities — its own doc comment flags styling
   as *"a follow-up, tracked with hover."* So `LspReply::Hover(Vec<String>)`
   already carries **raw markdown**, line-split.
-- Both the native path (`nxvim-lsp/src/dispatch.rs:216`) and the wasm sync path
-  (`nxvim-lsp/src/sync_client.rs:739`) build `LspReply::Hover` and both funnel
+- Both the native path (`bemtvi-lsp/src/dispatch.rs:216`) and the wasm sync path
+  (`bemtvi-lsp/src/sync_client.rs:739`) build `LspReply::Hover` and both funnel
   into the **single** render chokepoint `EditHost::show_hover`
-  (`crates/nxvim-server/src/lsp/request.rs:496`), which calls
+  (`crates/bemtvi-server/src/lsp/request.rs:496`), which calls
   `Editor::open_doc_float(name, lines, "markdown")`
-  (`crates/nxvim-core/src/editor/float.rs:192`).
+  (`crates/bemtvi-core/src/editor/float.rs:192`).
 - The doc float is a **real, scrollable, non-focusable window over a scratch
   buffer**. Its highlights come from the buffer's filetype tree-sitter pass —
-  which requires an *installed* markdown grammar (nxvim bundles none), and even
+  which requires an *installed* markdown grammar (bemtvi bundles none), and even
   then leaves the markup characters literal.
 - The primitives we need already exist: range **highlight extmarks** with an
-  `hl_group` (`ExtmarkStore::set`, `crates/nxvim-core/src/extmark.rs:200`; used by
+  `hl_group` (`ExtmarkStore::set`, `crates/bemtvi-core/src/extmark.rs:200`; used by
   the listing panel at `panel.rs:185`), `virt_lines` / `line_fill` decor
   (`VirtDecor`, `extmark.rs:134`), and a **stateless off-buffer highlighter**
   `Editor::preview_highlights` → `SyntaxEngine::highlight_text`
-  (`crates/nxvim-core/src/editor/syntax.rs:290`) that the picker preview uses to
+  (`crates/bemtvi-core/src/editor/syntax.rs:290`) that the picker preview uses to
   color arbitrary text in a language.
 - The redraw wire already ships per-line highlight spans as
   `[start, end, group, style_id]` for windows (same shape as the preview), so
@@ -73,7 +73,7 @@ Confirmed in the code today:
   the core side.
 
 Rendering at `show_hover` (not in `markup_lines`) means it works regardless of how
-the `Vec<String>` was produced (native vs wasm), keeps `nxvim-lsp` free of the
+the `Vec<String>` was produced (native vs wasm), keeps `bemtvi-lsp` free of the
 markdown dep, and leaves the transport type unchanged.
 
 ## Dependency
@@ -86,14 +86,14 @@ pulldown-cmark = { version = "=0.12.2", default-features = false }   # confirm l
 
 - `default-features = false` drops its `getopts`/CLI bits; we only want the
   pull parser. It is pure Rust with no I/O, so it satisfies the
-  "`nxvim-core` stays pure and synchronous" rule and compiles for
+  "`bemtvi-core` stays pure and synchronous" rule and compiles for
   `wasm32-unknown-emscripten` (verify in phase 2's build check).
-- Pull into `nxvim-core` with `pulldown-cmark.workspace = true`.
+- Pull into `bemtvi-core` with `pulldown-cmark.workspace = true`.
 - Enable GFM via `Options::ENABLE_TABLES | ENABLE_STRIKETHROUGH | ENABLE_TASKLISTS`.
 
 ## Where the renderer lives
 
-New **pure** module `crates/nxvim-core/src/markdown.rs`, a sibling to `buffer.rs`.
+New **pure** module `crates/bemtvi-core/src/markdown.rs`, a sibling to `buffer.rs`.
 Core is the right home: `open_doc_float`, `preview_highlights`, and the extmark
 store are all in core, and core is shared by native + wasm so the renderer serves
 every front end. (A standalone crate would tempt `#[test]` unit tests, which the
@@ -102,7 +102,7 @@ repo bans — behavior is verified end-to-end instead.)
 ### Public shape
 
 ```rust
-// crates/nxvim-core/src/markdown.rs
+// crates/bemtvi-core/src/markdown.rs
 pub struct Rendered {
     pub lines: Vec<String>,          // stripped display text, wrapped to `width`
     pub spans: Vec<MdSpan>,          // inline highlight ranges (byte offsets within a line)
@@ -152,7 +152,7 @@ New core method (extract the sizing/placement half of `open_doc_float` into a
 shared helper so both entry points reuse it):
 
 ```rust
-// crates/nxvim-core/src/editor/float.rs
+// crates/bemtvi-core/src/editor/float.rs
 pub fn open_markdown_float(&mut self, name: &str, src: &str) {
     let r = markdown::render(src, MAX_W);          // MAX_W already = 80 here
     // load r.lines into the reused scratch buffer; leave filetype EMPTY
@@ -176,7 +176,7 @@ pub fn open_markdown_float(&mut self, name: &str, src: &str) {
 Route the hover through it:
 
 ```rust
-// crates/nxvim-server/src/lsp/request.rs  show_hover()
+// crates/bemtvi-server/src/lsp/request.rs  show_hover()
 self.editor.open_markdown_float("[Hover]", &lines.join("\n"));
 ```
 
@@ -189,18 +189,18 @@ live LSP:
 
 ```lua
 -- returns { lines = {..}, highlights = { { line, col_start, col_end, group }, .. } }
-nx.markdown.render(markdown_string)
+btv.markdown.render(markdown_string)
 ```
 
-Backed by a native `nx._markdown_render` in the Lua prelude bridge (columns as
+Backed by a native `btv._markdown_render` in the Lua prelude bridge (columns as
 1-based char columns for Lua ergonomics, converted from the byte spans). Add to
-`crates/nxvim-lua/src/prelude/` and register the native fn in the server bridge.
+`crates/bemtvi-lua/src/prelude/` and register the native fn in the server bridge.
 
 ## Phases
 
 **Phase 1 — renderer + Lua surface (pure, no float).**
 - Add the dep; write `markdown.rs` `render()` + the group table; wire
-  `nx.markdown.render`.
+  `btv.markdown.render`.
 - Tests (black-box, via `exec_lua`): feed strings with heading / strong / emphasis
   / inline code / list / link / fenced block; assert `lines` are stripped (no `#`,
   `*`, backticks) and `highlights` carry the expected `@markup.*` groups at the
@@ -210,13 +210,13 @@ Backed by a native `nx._markdown_render` in the Lua prelude bridge (columns as
 - Extract the float sizing/placement helper; add `open_markdown_float` + `DOC_MD_NS`;
   route `show_hover`.
 - Fenced-code ts highlighting via `preview_highlights`.
-- Tests (via the mock LSP: `nxvim --__lsp-mock`, `$NXVIM_LSP_CMD`, `await_float` /
-  `window_lines` in `crates/nxvim/tests/lsp_config.rs` & `lsp_stderr.rs`): a hover
+- Tests (via the mock LSP: `bemtvi --__lsp-mock`, `$BEMTVI_LSP_CMD`, `await_float` /
+  `window_lines` in `crates/bemtvi/tests/lsp_config.rs` & `lsp_stderr.rs`): a hover
   reply with `# Title`, `**bold**`, and a ` ```rust ` fence renders a float whose
   lines are stripped and whose redraw carries `@markup.heading.1` / `@markup.strong`
   highlight spans and Rust highlights inside the fence.
-- **Build both configs**: `cargo build -p nxvim-server` (default) and
-  `-p nxvim-server --no-default-features` (wasm edit-host) to confirm
+- **Build both configs**: `cargo build -p bemtvi-server` (default) and
+  `-p bemtvi-server --no-default-features` (wasm edit-host) to confirm
   pulldown-cmark compiles wasm-side.
 
 **Phase 3 — reuse for the other popups.**
@@ -231,7 +231,7 @@ Backed by a native `nx._markdown_render` in the Lua prelude bridge (columns as
 ## Testing & conventions
 
 - Black-box only, per repo policy — no `#[test]` unit tests in the crates. Phase 1
-  exercises the pure renderer through `nx.markdown.render` (`exec_lua`); phases 2–3
+  exercises the pure renderer through `btv.markdown.render` (`exec_lua`); phases 2–3
   through the running server + redraw assertions.
 - **Fail-loud**: `render` never silently drops content — any unstyled construct
   still emits its text. Fenced-code highlighting fail-soft (plain when the grammar
@@ -239,7 +239,7 @@ Backed by a native `nx._markdown_render` in the Lua prelude bridge (columns as
 - Redraw helpers take the **latest** frame (`drain_to_latest_redraw`), per the
   harness rule.
 - Example config per repo convention: `examples/markdown-hover/` with an init that
-  configures a language server (or a tiny `nx.markdown.render` demo command) and a
+  configures a language server (or a tiny `btv.markdown.render` demo command) and a
   sample doc, verified end-to-end.
 
 ## Risks / decisions

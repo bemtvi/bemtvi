@@ -1,10 +1,10 @@
 This is the main editor buffer.
 
-The "Notes" sidebar on the left is a plugin-owned nx.view that PERSISTS across
+The "Notes" sidebar on the left is a plugin-owned btv.view that PERSISTS across
 restarts. Add a few notes with <leader>na, then quit with :qa and re-run:
 
-    NXVIM_CONFIG=examples/view-persist \
-      cargo run -p nxvim -- --workspace examples/view-persist
+    BEMTVI_CONFIG=examples/view-persist \
+      cargo run -p bemtvi -- --workspace examples/view-persist
 
 The sidebar comes back with your notes — the editor reserved its slot, and the
-plugin rebuilt the content from its own nx.shada.plugin() store. See init.lua.
+plugin rebuilt the content from its own btv.shada.plugin() store. See init.lua.

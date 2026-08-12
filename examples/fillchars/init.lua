@@ -1,12 +1,12 @@
--- ~~~ nxvim fillchars: choose (or hide) the end-of-buffer `~` markers ~~~
+-- ~~~ bemtvi fillchars: choose (or hide) the end-of-buffer `~` markers ~~~
 --
 -- Run it (from the repo root) against the short sample buffer:
 --
---     NXVIM_CONFIG=examples/fillchars \
---       cargo run -p nxvim -- examples/fillchars/sample.txt
+--     BEMTVI_CONFIG=examples/fillchars \
+--       cargo run -p bemtvi -- examples/fillchars/sample.txt
 --
 -- `'fillchars'` is the window-local `key:char` list that chooses the characters
--- drawn in structural spots. nxvim honors the `eob` key today: the filler char
+-- drawn in structural spots. bemtvi honors the `eob` key today: the filler char
 -- drawn on every screen row PAST the end of the buffer (vim's `~`). The sample is
 -- a few lines tall, so most of the window is end-of-buffer fill — the perfect
 -- place to see the marker.

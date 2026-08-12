@@ -1,4 +1,4 @@
-virtual text & virtual lines — an nxvim extmark demo
+virtual text & virtual lines — an bemtvi extmark demo
 
 This line gets an end-of-line (eol) note after its text.
 Inline text is spliced into the middle of this sentence.

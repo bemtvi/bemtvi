@@ -9,7 +9,7 @@ live across the wire.
 
 ## Background — where edits land
 
-`EditHost::apply_workspace_edit` (`crates/nxvim-server/src/lsp/edit.rs`) is the single
+`EditHost::apply_workspace_edit` (`crates/bemtvi-server/src/lsp/edit.rs`) is the single
 applicator every `WorkspaceEdit` flows through (rename, code action, the Lua
 `vim.lsp.util.apply_workspace_edit`). For each `(uri, edits)` it resolves the URI to a
 buffer — the open buffer it names, else it loads the file — converts each edit's LSP
@@ -17,11 +17,11 @@ range to bytes against *that* buffer, and applies via `Editor::apply_edits_to(id
 (one independent undo step per buffer).
 
 The load bridge is `Editor::ensure_buffer_loaded(path)`
-(`crates/nxvim-core/src/editor/buffers.rs`).
+(`crates/bemtvi-core/src/editor/buffers.rs`).
 
 ## Phase 1 — native (DONE)
 
-**Bug.** The default config runs `nx.explorer.enable()`, which registers a `BufReadCmd`
+**Bug.** The default config runs `btv.explorer.enable()`, which registers a `BufReadCmd`
 handler, so `should_defer_open()` is true in essentially every native session. The old
 `ensure_buffer_loaded` routed through `open_buffer` → `load_new_buffer`, which therefore
 **deferred**: it created an *empty* named buffer and enqueued an async disk fill. The
@@ -34,7 +34,7 @@ open-deferral. A workspace edit needs the bytes *now* and is not a user `:edit`,
 must not give a `BufReadCmd` handler first dibs (the explorer only ever claims
 *directories* anyway). Off-tick still returns `None` (genuinely async — Phase 2).
 
-Test: `crates/nxvim/tests/lsp_features.rs::rename_reaches_an_unopened_file`.
+Test: `crates/bemtvi/tests/lsp_features.rs::rename_reaches_an_unopened_file`.
 
 ## Phase 2 — daemon / web off-tick
 
@@ -65,6 +65,6 @@ those files are reported "could not open" — loud, but unhandled. Close the gap
    attach sees the renamed text). Clear any stranded entry in `apply_open`'s error arm.
 
 Test: a native server given an async daemon fs (so `host_fs_offtick` is on), driving
-`nx._lsp_apply_workspace_edit` with edits for an open file *and* an unopened file the
+`btv._lsp_apply_workspace_edit` with edits for an open file *and* an unopened file the
 daemon fs serves; assert the unopened file's buffer carries the edit once its fetch
 lands. Faithful because the unopened file's bytes can only come across the wire.

@@ -8,7 +8,7 @@ In a daemon (edit-host split) session — TUI over ssh-stdio, or GUI over `:conn
 
 ## Root cause
 
-nxvim's remote mode is the edit-host split: the local TUI/GUI runs the full editor +
+bemtvi's remote mode is the edit-host split: the local TUI/GUI runs the full editor +
 server and routes fs / processes / LSP / watch to a `--daemon` child (`docs/plans/
 2026-06-09-edit-host-and-browser-lua.md`). Every facility had a native client seam
 forwarding it to the daemon — except terminals:
@@ -41,18 +41,18 @@ Build the native client's Term leg, mirroring the existing `RemoteHostProc`:
    daemon is connected, else the local actor; `has_remote_term()` gates the cwd resolution.
 5. **`terminal.rs`** — the open's default cwd resolves against the daemon's `DirState`
    (which honors `:cd`/`:lcd`) in a remote session instead of the local process cwd.
-6. **`main.rs` / `nxvim-gui/session.rs`** — wire `client.host_term` into `ServerInit` for
+6. **`main.rs` / `bemtvi-gui/session.rs`** — wire `client.host_term` into `ServerInit` for
    the stdio (TUI) and QUIC (`:connect`, GUI) paths.
 
 ## Tests
 
-- `crates/nxvim-server/tests/daemon_terminal_client.rs` — a real editor whose terminal seam
+- `crates/bemtvi-server/tests/daemon_terminal_client.rs` — a real editor whose terminal seam
   is a `RemoteHostTerm` talking to a real-PTY `serve_term_daemon_on` over a duplex.
   `terminal_opens_on_the_daemon_in_its_cwd` distinguishes remote from local by seeding the
   daemon's cwd to a unique temp dir and asserting an interactive `pwd` prints it (a local
   PTY would print the test's cwd). `terminal_input_round_trips_to_the_daemon_child` proves
   the `term_write` leg.
-- `crates/nxvim/tests/daemon_quic.rs` — the multi-stream round-trip now also drives a
+- `crates/bemtvi/tests/daemon_quic.rs` — the multi-stream round-trip now also drives a
   `:terminal` PTY over the **Term** QUIC stream end to end.
 
 ## Known limitation (pre-existing, shared with the browser)

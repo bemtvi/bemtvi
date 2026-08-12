@@ -34,11 +34,11 @@ Drive docks from Lua or the ex-command wrappers:
 ```lua
 -- side is "left" / "right" / "top" / "bottom"; size is columns (left/right) or
 -- rows (top/bottom); buf is an optional existing buffer (default: a scratch).
-nx.dock.open({ side = "left", size = 28 })
-nx.dock.open({ side = "bottom", size = 6 })
+btv.dock.open({ side = "left", size = 28 })
+btv.dock.open({ side = "bottom", size = 6 })
 
-nx.dock.focus("left")   -- move focus to a dock
-nx.dock.close("left")   -- drop the dock and its content
+btv.dock.focus("left")   -- move focus to a dock
+btv.dock.close("left")   -- drop the dock and its content
 ```
 
 | Ex-command | Does |
@@ -57,8 +57,8 @@ first frame.
 
 These are different on purpose:
 
-- **`:DockClose`** (and `nx.dock.close`) drops the dock and its content.
-- **`:DockToggle` / `:DockHide` / `:DockShow`** (and `nx.dock.toggle/hide/show`)
+- **`:DockClose`** (and `btv.dock.close`) drops the dock and its content.
+- **`:DockToggle` / `:DockHide` / `:DockShow`** (and `btv.dock.toggle/hide/show`)
   collapse a dock *from view* while keeping everything — its splits, tabs,
   cursor, and text all come back exactly as they were when you show it again.
 
@@ -69,21 +69,21 @@ Toggling from a keymap uses the same path as the ex-command:
 
 ```lua
 vim.keymap.set("n", "<leader>e", function()
-  nx.dock.toggle("left")
+  btv.dock.toggle("left")
 end, { desc = "toggle the left explorer dock" })
 ```
 
 ## Per-dock options
 
-Docks have their own option scope, alongside `nx.bo` / `nx.wo` / `nx.o`. Set
-options inline in `nx.dock.open{...}` or after the fact through
-`nx.dock.opt(side)`; reads return the cached value (or its default).
+Docks have their own option scope, alongside `btv.bo` / `btv.wo` / `btv.o`. Set
+options inline in `btv.dock.open{...}` or after the fact through
+`btv.dock.opt(side)`; reads return the cached value (or its default).
 
 ```lua
-nx.dock.opt("left").title = "EXPLORER"   -- a fixed strip label
-nx.dock.opt("left").showtabline = 2      -- always show the dock's own tabline
-nx.dock.opt("bottom").autohide = true    -- collapse when focus leaves
-nx.dock.opt("left").size = 40            -- resize live
+btv.dock.opt("left").title = "EXPLORER"   -- a fixed strip label
+btv.dock.opt("left").showtabline = 2      -- always show the dock's own tabline
+btv.dock.opt("bottom").autohide = true    -- collapse when focus leaves
+btv.dock.opt("left").size = 40            -- resize live
 ```
 
 | Option | Meaning |
@@ -111,10 +111,10 @@ tabs within that dock. (Design: the
 
 ## Try it
 
-A runnable playground ships in [`examples/dock`](https://github.com/davidrios/nxvim/tree/main/examples/dock):
+A runnable playground ships in [`examples/dock`](https://github.com/davidrios/bemtvi/tree/main/examples/dock):
 
 ```sh
-NXVIM_CONFIG=examples/dock cargo run -p nxvim -- examples/dock/sample.txt
+BEMTVI_CONFIG=examples/dock cargo run -p bemtvi -- examples/dock/sample.txt
 ```
 
 It opens a titled left side bar and an `autohide` bottom tray, maps

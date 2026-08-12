@@ -31,8 +31,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── TUI (`nxvim`) ────────────────────────────────────────────────
-          # Linux: glibc (gnu), not static musl — nxvim dlopen's tree-sitter
+          # ── TUI (`bemtvi`) ────────────────────────────────────────────────
+          # Linux: glibc (gnu), not static musl — bemtvi dlopen's tree-sitter
           # grammars at runtime, which a fully-static musl binary (no dynamic
           # loader) cannot do. cargo-zigbuild pins an ancient glibc floor (see
           # the Linux build step) so the dynamically-linked binary still runs on
@@ -43,7 +43,7 @@ jobs:
           - { target: x86_64-apple-darwin,        runner: macos-15-intel,    os: macos,   kind: tui, suffix: x86_64-macos,        ext: pkg }
           - { target: aarch64-apple-darwin,       runner: macos-14,          os: macos,   kind: tui, suffix: aarch64-macos,       ext: pkg }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,    os: windows, kind: tui, suffix: x86_64-windows,      ext: zip }
-          # ── GUI (`nxvim-gui`, winit + wgpu) ──────────────────────────────
+          # ── GUI (`bemtvi-gui`, winit + wgpu) ──────────────────────────────
           # Linux: glibc (gnu) — the graphics stack won't link against static
           # musl, so the GUI ships dynamically linked (needs X11/Wayland at
           # runtime). macOS: signed + notarized + stapled .app inside a .dmg.
@@ -61,9 +61,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.kind }}" = "gui" ]; then
-            CRATE=nxvim-gui; BIN=nxvim-gui; PREFIX=nxvim-gui
+            CRATE=bemtvi-gui; BIN=bemtvi-gui; PREFIX=bemtvi-gui
           else
-            CRATE=nxvim;     BIN=nxvim;     PREFIX=nxvim
+            CRATE=bemtvi;     BIN=bemtvi;     PREFIX=bemtvi
           fi
           {
             echo "CRATE=$CRATE"
@@ -201,7 +201,7 @@ jobs:
             echo "::error::No Developer ID Installer identity found — set the MACOS_INSTALLER_CERT_P12 / MACOS_INSTALLER_CERT_PASSWORD secrets (a .pkg cannot be notarized unsigned)"
             exit 1
           fi
-          BIN="target/${{ matrix.target }}/release/nxvim"
+          BIN="target/${{ matrix.target }}/release/bemtvi"
 
           # 1. Hardened-runtime sign the binary (Developer ID Application).
           codesign --force --options runtime --timestamp \
@@ -211,10 +211,10 @@ jobs:
           # 2. Build the installer package (Developer ID Installer), → /usr/local/bin.
           ROOT="$RUNNER_TEMP/pkgroot"
           mkdir -p "$ROOT"
-          cp "$BIN" "$ROOT/nxvim"
+          cp "$BIN" "$ROOT/bemtvi"
           mkdir -p dist
           pkgbuild --root "$ROOT" \
-            --identifier com.davidrios.nxvim \
+            --identifier com.davidrios.bemtvi \
             --version "$PKG_VERSION" \
             --install-location /usr/local/bin \
             --keychain "$SIGN_KEYCHAIN" \
@@ -242,9 +242,9 @@ jobs:
         run: |
           # shellcheck disable=SC2154  # SIGN_* arrive via $GITHUB_ENV
           set -euo pipefail
-          APP="$RUNNER_TEMP/nxvim.app"
+          APP="$RUNNER_TEMP/bemtvi.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp "target/${{ matrix.target }}/release/nxvim-gui" "$APP/Contents/MacOS/nxvim-gui"
+          cp "target/${{ matrix.target }}/release/bemtvi-gui" "$APP/Contents/MacOS/bemtvi-gui"
 
           # Build the .icns app icon from the same source SVG as the AppImage.
           # macOS does not mask app icons (unlike iOS), so the SVG's own rounded
@@ -252,8 +252,8 @@ jobs:
           # size; iconutil packs the .iconset. Generated before codesign so it is
           # sealed into the bundle.
           brew install --quiet librsvg
-          SVG=crates/nxvim-gui/assets/nxvim.svg
-          ICONSET="$RUNNER_TEMP/nxvim.iconset"
+          SVG=crates/bemtvi-gui/assets/bemtvi.svg
+          ICONSET="$RUNNER_TEMP/bemtvi.iconset"
           mkdir -p "$ICONSET"
           render() { rsvg-convert -w "$1" -h "$1" "$SVG" -o "$ICONSET/$2"; }
           render 16   icon_16x16.png
@@ -266,18 +266,18 @@ jobs:
           render 512  icon_256x256@2x.png
           render 512  icon_512x512.png
           render 1024 icon_512x512@2x.png
-          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/nxvim.icns"
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/bemtvi.icns"
 
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>CFBundleName</key><string>nxvim</string>
-            <key>CFBundleDisplayName</key><string>nxvim</string>
-            <key>CFBundleIdentifier</key><string>com.davidrios.nxvim.gui</string>
-            <key>CFBundleExecutable</key><string>nxvim-gui</string>
-            <key>CFBundleIconFile</key><string>nxvim</string>
+            <key>CFBundleName</key><string>bemtvi</string>
+            <key>CFBundleDisplayName</key><string>bemtvi</string>
+            <key>CFBundleIdentifier</key><string>com.davidrios.bemtvi.gui</string>
+            <key>CFBundleExecutable</key><string>bemtvi-gui</string>
+            <key>CFBundleIconFile</key><string>bemtvi</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleVersion</key><string>$PKG_VERSION</string>
@@ -291,7 +291,7 @@ jobs:
           # Sign inner executable first, then the bundle (hardened runtime; the
           # PUC Lua backend needs no JIT entitlements).
           codesign --force --options runtime --timestamp \
-            --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP/Contents/MacOS/nxvim-gui"
+            --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP/Contents/MacOS/bemtvi-gui"
           codesign --force --options runtime --timestamp \
             --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
@@ -306,12 +306,12 @@ jobs:
         run: |
           # shellcheck disable=SC2154  # SIGN_* arrive via $GITHUB_ENV
           set -euo pipefail
-          APP="$RUNNER_TEMP/nxvim.app"
+          APP="$RUNNER_TEMP/bemtvi.app"
           STAGE="$RUNNER_TEMP/dmg"
           mkdir -p "$STAGE" dist
-          cp -R "$APP" "$STAGE/nxvim.app"
+          cp -R "$APP" "$STAGE/bemtvi.app"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "nxvim" -srcfolder "$STAGE" -ov -format UDZO "dist/$ASSET"
+          hdiutil create -volname "bemtvi" -srcfolder "$STAGE" -ov -format UDZO "dist/$ASSET"
           codesign --force --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "dist/$ASSET"
 
           # Notarize the .dmg container, then staple so a browser download (which
@@ -372,15 +372,15 @@ jobs:
 
           # Rasterize the source SVG to the 256×256 PNG linuxdeploy installs into
           # the AppDir hicolor theme (stem must match the .desktop Icon= key).
-          rsvg-convert -w 256 -h 256 crates/nxvim-gui/assets/nxvim.svg -o nxvim.png
+          rsvg-convert -w 256 -h 256 crates/bemtvi-gui/assets/bemtvi.svg -o bemtvi.png
 
           mkdir -p dist
           OUTPUT="dist/$APPIMAGE_ASSET" VERSION="$PKG_VERSION" \
             "./linuxdeploy-${ARCH}.AppImage" \
               --appdir AppDir \
-              --executable "target/${{ matrix.target }}/release/nxvim-gui" \
-              --desktop-file crates/nxvim-gui/assets/nxvim.desktop \
-              --icon-file nxvim.png \
+              --executable "target/${{ matrix.target }}/release/bemtvi-gui" \
+              --desktop-file crates/bemtvi-gui/assets/bemtvi.desktop \
+              --icon-file bemtvi.png \
               --output appimage
           test -f "dist/$APPIMAGE_ASSET"
 
@@ -406,7 +406,7 @@ jobs:
           path: dist/${{ env.APPIMAGE_ASSET }}
           if-no-files-found: error
 
-  # ── Edit-host: the editor compiled to WebAssembly (nxvim-edithost) ───────
+  # ── Edit-host: the editor compiled to WebAssembly (bemtvi-edithost) ───────
   # A self-contained static site — download the tarball, extract, and serve with any
   # static host (the bundled web/serve.mjs sets the required cross-origin-isolation
   # headers; _headers covers Netlify / Cloudflare Pages). This is the same publish
@@ -418,7 +418,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/nxvim-edithost
+        working-directory: crates/bemtvi-edithost
     steps:
       - uses: actions/checkout@v7
 
@@ -444,7 +444,7 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/nxvim-edithost
+          workspaces: crates/bemtvi-edithost
           shared-key: edithost-wasm
 
       # Vendor @msgpack/msgpack into web/vendor/ (build.sh copies it from here) so the
@@ -461,18 +461,18 @@ jobs:
         run: ./build.sh
 
       # Assemble the static publish root (web/ + dist/ siblings, _headers, serve.mjs, a
-      # serving README), then tar it. The asset name matches the `nxvim-*` glob the
+      # serving README), then tar it. The asset name matches the `bemtvi-*` glob the
       # edge/release publish jobs download, so it joins the GitHub release automatically.
       - name: Package site tarball
         run: |
           set -euo pipefail
           ./package-site.sh _site
           mkdir -p dist
-          tar -czf "dist/nxvim-edithost-${{ inputs.version }}.tar.gz" -C _site .
+          tar -czf "dist/bemtvi-edithost-${{ inputs.version }}.tar.gz" -C _site .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: nxvim-edithost-${{ inputs.version }}.tar.gz
-          path: crates/nxvim-edithost/dist/nxvim-edithost-${{ inputs.version }}.tar.gz
+          name: bemtvi-edithost-${{ inputs.version }}.tar.gz
+          path: crates/bemtvi-edithost/dist/bemtvi-edithost-${{ inputs.version }}.tar.gz
           if-no-files-found: error

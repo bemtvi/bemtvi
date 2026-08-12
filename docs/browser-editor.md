@@ -1,7 +1,7 @@
 # Browser editor
 
-nxvim runs the **real editor — entirely in a browser tab, with no server**. Not a
-cut-down demo or a syntax-highlighted textarea: `nxvim-core` **plus the PUC Lua 5.4
+bemtvi runs the **real editor — entirely in a browser tab, with no server**. Not a
+cut-down demo or a syntax-highlighted textarea: `bemtvi-core` **plus the PUC Lua 5.4
 VM plus the production server tick** (autocmds, mirrors, the redraw projection — the
 same keystroke path the native server drives) compile to WebAssembly and run
 client-side. Your `init.lua` sources, your keymaps and autocmds fire, files open and
@@ -32,11 +32,11 @@ daemon.
 | **Plugins** | `init.lua` is **one self-contained file** — a `require` through `package.path` doesn't resolve (the runtimepath is empty and storage reads are async). Multi-file plugins ship by **amalgamation**: `web/amalgamate-plugins.mjs` bundles a plugin tree into one chunk registering each module in `package.preload`, so `require` resolves from memory. |
 | **LSP** | Works both ways. A language server compiled to JS/wasm runs **serverlessly** in a Worker (the python demo ships basedpyright); a real native server runs **over the daemon** (WebTransport). Both ride the same off-tick LSP seam as native. With neither a wasm server nor a daemon, a configured server fails loud, not silently. |
 | **Native tree-sitter** | The in-process parser is gated off the build; highlighting uses the JS-side web-tree-sitter path instead. |
-| **Processes** | Serverless there is no process host: a spawn (`nx.run` / `nx.run_stream`) completes loud with a spawn-failure exit (`code = -1`) — real processes need **daemon mode** (see [Files](#files)). |
-| **Hosting** | Requires **cross-origin isolation** (COOP/COEP) for the `SharedArrayBuffer`. Without it, input still works but timers (`nx.timer` / `vim.defer_fn`) don't fire. |
+| **Processes** | Serverless there is no process host: a spawn (`btv.run` / `btv.run_stream`) completes loud with a spawn-failure exit (`code = -1`) — real processes need **daemon mode** (see [Files](#files)). |
+| **Hosting** | Requires **cross-origin isolation** (COOP/COEP) for the `SharedArrayBuffer`. Without it, input still works but timers (`btv.timer` / `vim.defer_fn`) don't fire. |
 
 Anything unavailable **fails loud** with a named error rather than faking a result —
-the same no-silent-stubs rule the rest of nxvim follows.
+the same no-silent-stubs rule the rest of bemtvi follows.
 
 ## Files
 
@@ -49,24 +49,24 @@ native edit-host split uses, so only the transport differs:
 - **Real local files.** The **File System Access API** backs `:eo` / `:wo` (and a bare
   `:w` on a bound path) — pick a real file or directory on disk through the browser's
   permission picker.
-- **A real daemon.** Open the page with `?daemon=nxvim://HOST:PORT/TOKEN?cert=HASH`
-  (the string `nxvim --daemon --listen` prints), or dial it at runtime with
-  `:connect nxvim://…`, and `:e` / `:w` operate on the **daemon's** filesystem over
+- **A real daemon.** Open the page with `?daemon=bemtvi://HOST:PORT/TOKEN?cert=HASH`
+  (the string `bemtvi --daemon --listen` prints), or dial it at runtime with
+  `:connect bemtvi://…`, and `:e` / `:w` operate on the **daemon's** filesystem over
   **WebTransport** (HTTP/3 / QUIC). Editing still happens entirely in the tab — only
   fs crosses the wire. Having no local disk, the browser is **always remote-config**:
   it runs the **daemon's** config + plugins (fetched over the wire) and keeps shada on
   the daemon, where a native client would default to local. Daemon mode also brings
-  **async processes** (`nx.run` / `nx.process`), **`:terminal`**, and **LSP** over
+  **async processes** (`btv.run` / `btv.process`), **`:terminal`**, and **LSP** over
   the wire — the daemon's real language servers, driven from the tab. A dropped
   WebTransport link **auto-reconnects** (the tab's editor is local, so your buffers
   survive): the Worker re-dials underneath the seams and re-syncs them — re-opening LSP,
   re-arming watches, and re-statting open files (a change made while disconnected is
-  caught) — exactly like the native clients. `nx.daemon.status()` reports the link state.
+  caught) — exactly like the native clients. `btv.daemon.status()` reports the link state.
 
 ## Run it locally
 
 ```sh
-cd crates/nxvim-edithost
+cd crates/bemtvi-edithost
 ./build.sh                  # cargo → emcc link → dist/eh.{mjs,wasm} + tree-sitter assets
 cd web && npm install       # once: Playwright + chromium
 node serve.mjs              # a cross-origin-isolated (COOP/COEP) dev server
@@ -87,13 +87,13 @@ headless browser (renderer, OPFS, the local-file picker, daemon mode, …).
   The two talk over `postMessage` and a shared ring.
 - **One wait drives input *and* timers.** When cross-origin isolated, the Worker parks
   on `Atomics.wait` over a `SharedArrayBuffer` input ring, waking on a keystroke **or**
-  the next timer deadline — so `nx.timer` / `vim.defer_fn` fire without Asyncify, one
+  the next timer deadline — so `btv.timer` / `vim.defer_fn` fire without Asyncify, one
   mechanism. (Without isolation it falls back to a `postMessage` loop where timers
   don't fire.)
 - **Interop is emscripten `ccall`/`cwrap`, not wasm-bindgen** — it links the C lua54
   backend + vim-regex, so the final link is `emcc`. `src/lib.rs` exports `eh_input` /
   `eh_exec_lua` / `eh_redraw_json` / the fs legs / … and the redraw returns as JSON.
-- **It's agent-drivable.** The page exposes a `window.__nxvim` hook (`feed` / `mouse` /
+- **It's agent-drivable.** The page exposes a `window.__bemtvi` hook (`feed` / `mouse` /
   `execLua` / `lines` / `frame`) so a headless browser (Playwright) can feed keys and
   assert on state — the same black-box style as the native test harness.
 - **Built outside the workspace.** It targets `wasm32-unknown-emscripten` and links C
@@ -104,7 +104,7 @@ headless browser (renderer, OPFS, the local-file picker, daemon mode, …).
 ## See also
 
 - [The edit-host split](edit-host-split.md) — the same split reached natively, with
-  the editor local and an `nxvim --daemon` serving fs / processes over ssh or QUIC.
+  the editor local and an `bemtvi --daemon` serving fs / processes over ssh or QUIC.
 - [Architecture → the web build](architecture.md#the-web-build--a-fully-client-side-webassembly-editor)
   — the crate layout and the full redraw/interop projection.
 - [The edit-host & browser-Lua plan](plans/2026-06-09-edit-host-and-browser-lua.md) —

@@ -1,9 +1,9 @@
--- ~~~ nxvim keymap Phase 2 playground ~~~
+-- ~~~ bemtvi keymap Phase 2 playground ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/phase2-config \
---       cargo run -p nxvim -- examples/phase2-config/sample.txt
+--     BEMTVI_CONFIG=examples/phase2-config \
+--       cargo run -p bemtvi -- examples/phase2-config/sample.txt
 --
 -- Each section says what to TYPE and what you should SEE. Messages print to the
 -- bottom message line. Phase 2 covers: <leader>, remap vs noremap, remap chains,

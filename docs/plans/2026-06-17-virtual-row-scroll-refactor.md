@@ -72,7 +72,7 @@ Then:
 Once a row carries everything, the scroll path never asks *what kind* a row is.
 virt_lines, wrapped continuations, folds, diff fillers are all just more rows.
 This mirrors neovim's own model (the `wlv` winline loop / screen-row grid with a
-screen-line→buffer-line map); nxvim already has the settled half and duplicates
+screen-line→buffer-line map); bemtvi already has the settled half and duplicates
 the rest.
 
 ### Wire-protocol change

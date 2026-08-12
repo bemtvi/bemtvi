@@ -18,7 +18,7 @@
 > arms (Phase 7) were tested by driving `nvim_input_mouse` directly over RPC, but
 > *neither* client forwarded those buttons (each only wired the left button), so
 > they reached no user until the press was forwarded from both clients'
-> button-press handlers (`nxvim-tui/src/lib.rs`, `nxvim-gui/src/lib.rs` via the
+> button-press handlers (`bemtvi-tui/src/lib.rs`, `bemtvi-gui/src/lib.rs` via the
 > pure `mouse::button_name` mapping; only the press is sent — the server no-ops
 > right/middle drag + release).
 
@@ -30,10 +30,10 @@
 
 ## Why this document exists
 
-nxvim today captures terminal mouse events but only wires them to **client-owned
+bemtvi today captures terminal mouse events but only wires them to **client-owned
 chrome** — the message panel and the completion pmenu. The TUI hit-tests those
-overlays itself and calls bespoke RPCs (`nxvim_panel_click`,
-`nxvim_complete_select`/`_accept`), and the scroll wheel only nudges the panel /
+overlays itself and calls bespoke RPCs (`bemtvi_panel_click`,
+`bemtvi_complete_select`/`_accept`), and the scroll wheel only nudges the panel /
 pmenu. The actual **text area is mouse-dead**: clicking a buffer does nothing,
 there is no drag-to-select, no wheel-scroll of a window, no split resize, no
 tabline click.
@@ -70,7 +70,7 @@ nvim_input_mouse(button, action, modifier, grid, row, col)
            wheel:   "up" | "down" | "left" | "right"
            move:    ignored
   modifier "C" / "S" / "A" / "D" in any order, "-" optional ("C-S", "cs", "CS")
-  grid     0  (nxvim is single-grid; always 0 — the server hit-tests)
+  grid     0  (bemtvi is single-grid; always 0 — the server hit-tests)
   row,col  zero-based screen cell, same coordinate space as redraw
 ```
 
@@ -78,7 +78,7 @@ This is the **primary** path and the one tests drive. The legacy notation forms
 (`<LeftMouse>`, `<2-LeftMouse>`, `<ScrollWheelUp>`, `<C-LeftMouse>`, …) are
 parsed by `nvim_input` so that **keymaps** can bind/remap them, but note the
 neovim data-model fact: the notation keycode carries **no coordinates** — coords
-ride a separate out-of-band token. In nxvim the encoded `nvim_input_mouse` call
+ride a separate out-of-band token. In bemtvi the encoded `nvim_input_mouse` call
 *is* that out-of-band channel, so we don't reconstruct the deprecated
 `<LeftMouse><col,row>` byte form. Notation without coords resolves against the
 server's last-known mouse position (what real neovim does via the `mouse_row` /
@@ -90,11 +90,11 @@ server's last-known mouse position (what real neovim does via the `mouse_row` /
 > buffer); the internal constant name is irrelevant since we don't share its
 > enum.
 
-### Core event — `MouseEvent` in `nxvim-core`
+### Core event — `MouseEvent` in `bemtvi-core`
 
 A new pure value type flows into `Editor`, parallel to how parsed `Key`s do
-(`nxvim-core/src/input.rs`). It stays I/O-free and synchronous per the
-[`nxvim-core` purity rule](../CLAUDE.md):
+(`bemtvi-core/src/input.rs`). It stays I/O-free and synchronous per the
+[`bemtvi-core` purity rule](../CLAUDE.md):
 
 ```rust
 pub struct MouseEvent {
@@ -113,7 +113,7 @@ from an **injectable clock** (Phase 3), and hands it to a new
 
 ### Options (new, with neovim defaults)
 
-Register four global options (`nxvim-core/src/editor/options.rs`), each gating
+Register four global options (`bemtvi-core/src/editor/options.rs`), each gating
 or tuning behavior — defaults match neovim exactly, including the two traps:
 
 | option | default | role |
@@ -181,24 +181,24 @@ anything yet except fail loud if the button/action is unknown.
 a self-contained behavior addition. Tests can already assert the gate (a click
 with `mouse=` empty is a no-op; an unknown action errors).
 
-**Scope.** `nxvim-server/src/dispatch.rs` (RPC), `nxvim-core/src/input.rs`
-(`MouseEvent`, button/action/modifier parse), `nxvim-core/src/editor/options.rs`
-(the four options), `nxvim-core/src/editor/mod.rs` (`Editor::mouse` stub that
+**Scope.** `bemtvi-server/src/dispatch.rs` (RPC), `bemtvi-core/src/input.rs`
+(`MouseEvent`, button/action/modifier parse), `bemtvi-core/src/editor/options.rs`
+(the four options), `bemtvi-core/src/editor/mod.rs` (`Editor::mouse` stub that
 matches on event and routes to per-phase handlers).
 
 **Approach.** Map `(button, action)` to the `MouseEvent` enums; reject unknown
 pairs with a named error. Add the options with neovim defaults + validation.
 `Editor::mouse` checks the `'mouse'` gate for the current mode, then matches —
-every arm `nx._notimpl`-style loud-fails for now.
+every arm `btv._notimpl`-style loud-fails for now.
 
 **Test.** `nvim_input_mouse("left","press","",0,0,0)` with `mouse=` empty → no
 state change; with a bad action → RPC error; option get/set round-trips.
 
 **Landed as:** `MouseButton`/`MouseAction`/`MouseEvent` + `MouseEvent::parse`
-(`nxvim-core/src/input.rs`); the four options in `nxvim-core/src/options.rs`
+(`bemtvi-core/src/input.rs`); the four options in `bemtvi-core/src/options.rs`
 (parse/apply in `editor/options.rs` + `editor/windows.rs`); the
-`nvim_input_mouse` RPC in `nxvim-server/src/dispatch.rs`. Tests:
-`nxvim-server/tests/mouse.rs` (`mouse_gate_disabled_ignores_click`,
+`nvim_input_mouse` RPC in `bemtvi-server/src/dispatch.rs`. Tests:
+`bemtvi-server/tests/mouse.rs` (`mouse_gate_disabled_ignores_click`,
 `unknown_mouse_action_errors`, `mousetime_option_roundtrips`).
 
 ---
@@ -230,10 +230,10 @@ the right split → `nvim_get_current_win` is the right window and
 lines land on the right byte. Click in the gutter → cursor on that line, col 0.
 
 **Landed as:** `Editor::mouse` + `hit_test` + `window_at` (new
-`nxvim-core/src/editor/mouse.rs`), reusing `unicode::byte_at_virtcol` for the
+`bemtvi-core/src/editor/mouse.rs`), reusing `unicode::byte_at_virtcol` for the
 reverse-virtcol and `window_scroll`/`window_content_size`/`number_width_for` for
 the per-window geometry; the TUI forwards non-overlay left-clicks to
-`nvim_input_mouse` (`nxvim-tui/src/lib.rs`). Tests: `left_click_moves_cursor`,
+`nvim_input_mouse` (`bemtvi-tui/src/lib.rs`). Tests: `left_click_moves_cursor`,
 `left_click_past_eol_lands_on_last_char`, `left_click_in_gutter_lands_col0`,
 `left_click_respects_tab_expansion`, `left_click_focuses_other_split`. Wrap-aware
 hit-testing is deferred to Phase 8 (nowrap only for now).
@@ -300,23 +300,23 @@ helper (e.g. `feed_mouse_at(ms, …)`); core just compares `stamp_ms` deltas.
 `mousetime+1` ms apart → two separate single clicks. Triple → line. Word-wise
 drag after double-click extends by whole words.
 
-**Landed as:** `MouseEvent.stamp_ms` (`nxvim-core/src/input.rs`), stamped by the
+**Landed as:** `MouseEvent.stamp_ms` (`bemtvi-core/src/input.rs`), stamped by the
 server from `Server::mouse_stamp_ms` — the real monotonic clock, or an injectable
 `Arc<AtomicU64>` fake (`ServerInit::mouse_clock`) tests advance for determinism.
 The multi-click state machine is `MouseSelect` { row, col, stamp_ms, count,
-anchor } on `Editor` (`nxvim-core/src/editor/mouse.rs`, replacing the Phase-2
+anchor } on `Editor` (`bemtvi-core/src/editor/mouse.rs`, replacing the Phase-2
 `mouse_anchor` field): `next_click_count` escalates a same-cell press within
 `'mousetime'`; `mouse_select_word` reuses `class_span` (the `iw` run) for the
 double-click word, `mouse_select_line` enters `VisualLine` for the triple; drags
 extend by the chosen unit (`mouse_extend_word` pivots its anchor on a backward
 drag, `mouse_extend_line` grows whole lines). Harness: `TestClock` +
-`feed_mouse_at(ms, …)` (`nxvim-test-harness`). Tests: `double_click_selects_word`,
+`feed_mouse_at(ms, …)` (`bemtvi-test-harness`). Tests: `double_click_selects_word`,
 `slow_second_click_is_not_a_double`, `second_click_elsewhere_is_not_a_double`,
 `triple_click_selects_line`, `word_wise_drag_extends_by_words`,
 `line_wise_drag_extends_by_lines`.
 
-**Deferred:** **quad-click → blockwise Visual.** nxvim has no blockwise Visual
-mode yet (the [`Mode`](../crates/nxvim-core/src/mode.rs) enum has `Visual` /
+**Deferred:** **quad-click → blockwise Visual.** bemtvi has no blockwise Visual
+mode yet (the [`Mode`](../crates/bemtvi-core/src/mode.rs) enum has `Visual` /
 `VisualLine` but no `VisualBlock`, and `<C-v>` doesn't start one), so the count
 caps at 3 rather than silently faking a block selection. Wire it once a blockwise
 Visual mode exists — then bump the `next_click_count` cap to 4 and add a
@@ -349,7 +349,7 @@ window unchanged. Wheel over the *other* split scrolls only that split. Shift =
 page. `mousescroll=ver:0` disables vertical.
 
 **Landed as:** `Editor::mouse`'s `(Wheel, _)` arm → `mouse_wheel` +
-`wheel_scroll_vertical` / `wheel_scroll_horizontal` (`nxvim-core/src/editor/mouse.rs`).
+`wheel_scroll_vertical` / `wheel_scroll_horizontal` (`bemtvi-core/src/editor/mouse.rs`).
 `window_at_cell` resolves the window without focusing it; the focused window moves
 its live `top`/`leftcol` and edge-pulls the cursor (load-bearing — the per-redraw
 `ensure_visible` would otherwise snap the scroll back), while an inactive window
@@ -360,7 +360,7 @@ by factoring `Editor::finalize_scroll_gesture` out of `input` post-processing
 focused-only). `mousescroll_steps` parses `'mousescroll'` (`ver`/`hor`, `0`
 disables); `Shift` escalates a vertical notch to a page. The TUI forwards an
 unclaimed wheel notch (over no client overlay) to `nvim_input_mouse("wheel", …)`,
-including crossterm `ScrollLeft`/`ScrollRight` for horizontal (`nxvim-tui/src/lib.rs`).
+including crossterm `ScrollLeft`/`ScrollRight` for horizontal (`bemtvi-tui/src/lib.rs`).
 Tests: `wheel_down_scrolls_three_lines`, `wheel_up_scrolls_back`,
 `wheel_over_other_split_scrolls_only_it`, `shift_wheel_scrolls_page`,
 `mousescroll_sets_vertical_step`, `mousescroll_ver_zero_disables_vertical`,
@@ -388,7 +388,7 @@ left window 45, right 35. Horizontal split status-line drag resizes heights.
 
 **Landed as:** `Editor::resize_handle_at` + `mouse_begin_resize` /
 `mouse_resize_drag` and a `ResizeDrag { win, vertical, origin, applied }` field on
-`Editor` (`nxvim-core/src/editor/mouse.rs`). `resize_handle_at` resolves a global
+`Editor` (`bemtvi-core/src/editor/mouse.rs`). `resize_handle_at` resolves a global
 cell to the grabbed edge by walking the View's `separators` (a vertical separator
 grows the window to its *left*, a horizontal one the window *above*) and treats a
 window's status row as a handle when a horizontal separator sits one row below it
@@ -400,7 +400,7 @@ for width / `SplitDir::Horizontal` for height. The press arm runs before the
 text-press arms, so a divider grab never places the cursor or starts a selection,
 and it doesn't move focus (vim). **No TUI change needed** — the TUI already
 forwards every non-overlay left press/drag/release as a raw cell; the server owns
-the new hit-test. Tests (`nxvim-server/tests/mouse.rs`):
+the new hit-test. Tests (`bemtvi-server/tests/mouse.rs`):
 `drag_separator_resizes_vertical_split`, `drag_separator_left_shrinks`,
 `drag_status_line_resizes_horizontal_split`,
 `drag_horizontal_separator_resizes_height`,
@@ -429,7 +429,7 @@ is tab 2.
 **Landed as:** `Editor::tabline_tab_at` + `mouse_click_tab` (a dedicated arm in
 `Editor::mouse`, mirroring Phase 5's `resize_handle_at` rather than adding a
 `MouseTarget` variant — the tabline is chrome, not a window, so it short-circuits
-ahead of the window hit-test) in `nxvim-core/src/editor/mouse.rs`. Because
+ahead of the window hit-test) in `bemtvi-core/src/editor/mouse.rs`. Because
 hit-testing is fully server-side here, the click regions are **computed in core at
 hit-test time** rather than emitted into the View (no wire change): `tabline_tab_at`
 walks `tab_labels()` accumulating each cell's display width via the free
@@ -442,12 +442,12 @@ arms so a tab click never places a cursor; it switches via the existing
 opts out — its cells carry no built-in click regions (vim needs explicit `%nT`
 items), so a click there is a faithful no-op; likewise the blank `TabLineFill` past
 the last cell. **No TUI change** — the client already forwards every non-overlay
-left press as a raw cell. Tests (`nxvim-server/tests/mouse.rs`):
+left press as a raw cell. Tests (`bemtvi-server/tests/mouse.rs`):
 `click_tab_switches_to_it`, `click_first_tab_switches_back`,
 `click_active_tab_is_noop`, `click_past_last_tab_is_noop`,
 `click_custom_tabline_is_noop`, `row0_click_is_text_when_tabline_hidden` (row 0 is
 text, not a tab strip, when the tabline is hidden). **Deferred:** the close
-affordance (nxvim's tabline draws no close button yet, so there's nothing to hit).
+affordance (bemtvi's tabline draws no close button yet, so there's nothing to hit).
 
 ---
 
@@ -476,7 +476,7 @@ moves the caret, mode stays Insert.
 
 **Landed as:** the right/middle arms in `Editor::mouse` plus `mouse_right_press` /
 `mouse_middle_press` and the `MouseModel` enum + `mousemodel()` / `pos_in_visual()`
-helpers (`nxvim-core/src/editor/mouse.rs`).
+helpers (`bemtvi-core/src/editor/mouse.rs`).
 
 - **Right-click** branches on `'mousemodel'` (`mousemodel()` maps the option string,
   defaulting unknown values to `popup_setpos` to match the permissive `:set` of the
@@ -494,7 +494,7 @@ helpers (`nxvim-core/src/editor/mouse.rs`).
   caret via `set_window_cursor`, whose Insert clamp allows the one-past-EOL column —
   so the caret moves and the mode stays Insert. Covered by a guard test.
 
-Tests (`nxvim-server/tests/mouse.rs`): `right_click_popup_setpos_moves_cursor`,
+Tests (`bemtvi-server/tests/mouse.rs`): `right_click_popup_setpos_moves_cursor`,
 `right_click_popup_setpos_keeps_selection_inside`,
 `right_click_popup_setpos_outside_ends_selection`,
 `right_click_extend_model_extends_selection`, `right_click_popup_model_is_noop`,
@@ -508,18 +508,18 @@ later the GUI) only wired the **left** button, so `Down(Right)` / `Down(Middle)`
 fell through their catch-all and never reached the server — these gestures were
 exercised only by tests driving `nvim_input_mouse` directly. Both clients now
 forward a right/middle **press** (the server no-ops their drag + release):
-`MouseEventKind::Down(Right | Middle)` in `nxvim-tui/src/lib.rs`, and the
-`ElementState::Pressed` arm in `nxvim-gui/src/lib.rs` mapping the winit button via
-the pure `mouse::button_name` (tested in `nxvim-gui/tests/mouse.rs`).
+`MouseEventKind::Down(Right | Middle)` in `bemtvi-tui/src/lib.rs`, and the
+`ElementState::Pressed` arm in `bemtvi-gui/src/lib.rs` mapping the winit button via
+the pure `mouse::button_name` (tested in `bemtvi-gui/tests/mouse.rs`).
 
 **Earlier — `<S-LeftMouse>` extend.** The shift-click extend half of the `popup*`
 model shipped ahead of this phase: shift+left-press keeps the existing anchor and
 moves the live end to the click — starting a charwise Visual from the cursor when
 none is active, extending in place when one is (charwise or linewise, matching the
 current mode), and a following plain drag keeps extending from the same anchor.
-Landed as `Editor::mouse_left_extend` (`nxvim-core/src/editor/mouse.rs`), gated on
+Landed as `Editor::mouse_left_extend` (`bemtvi-core/src/editor/mouse.rs`), gated on
 `MouseEvent.shift`; the TUI forwards crossterm modifiers via `mouse_modifier`
-(`nxvim-tui/src/lib.rs`) instead of a hardcoded empty string. Tests:
+(`bemtvi-tui/src/lib.rs`) instead of a hardcoded empty string. Tests:
 `shift_click_starts_selection_to_click`, `shift_click_extends_active_visual`,
 `shift_click_extends_backward`, `shift_click_extends_linewise_visual`,
 `drag_after_shift_click_keeps_extending`.
@@ -549,7 +549,7 @@ line lands on the correct mid-line byte.
 
 ## Client side (TUI) — runs alongside, mostly Phase 0–1
 
-The TUI already enables crossterm mouse capture (`nxvim-tui/src/lib.rs`,
+The TUI already enables crossterm mouse capture (`bemtvi-tui/src/lib.rs`,
 `MouseCapture`). The change is to **translate and forward** instead of
 interpreting:
 
@@ -576,7 +576,7 @@ different rasterizer.
 - **Black-box only**, via the shared harness ([CLAUDE.md](../CLAUDE.md)): tests
   drive `nvim_input_mouse` over RPC and assert on `nvim_buf_get_lines` / cursor /
   the `redraw` selection spans. Add a `feed_mouse` / `feed_mouse_at(ms, …)`
-  helper to `nxvim-test-harness` so suites share it; the `_at` variant threads
+  helper to `bemtvi-test-harness` so suites share it; the `_at` variant threads
   the fake clock for Phase 3.
 - **No silent stubs.** Unimplemented gestures fail loud with their name until
   their phase lands; the `'mouse'`-gated no-op is the deliberate exception

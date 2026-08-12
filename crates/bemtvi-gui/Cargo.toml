@@ -1,0 +1,68 @@
+[package]
+name = "bemtvi-gui"
+description = "Native (winit + wgpu) GUI client for bemtvi (a thin RPC client; renders the server's View)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "bemtvi-gui"
+path = "src/main.rs"
+
+
+[dependencies]
+anyhow.workspace = true
+# Real CLI parsing (derive), matching the `bemtvi` (TUI) binary: `--help`/`--version`,
+# unknown-flag rejection, and typed values come for free instead of hand-rolled scanning.
+clap.workspace = true
+rmpv.workspace = true
+tokio.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+# Direct dep only to turn on cosmic-text's `monospace_fallback` feature (see the
+# workspace dep note); glyphon still owns the actual text-render types we use.
+cosmic-text.workspace = true
+# `unicode_script::Script` types the `Fallback::script_fallback` impl in render.rs;
+# must be the same crate version cosmic-text (via glyphon) uses (see workspace dep).
+unicode-script.workspace = true
+# Cell-width accounting for the wide-glyph / emoji renderer (render.rs): how many
+# grid cells a cluster occupies, matching the server's column model.
+unicode-width.workspace = true
+# Grapheme-cluster segmentation for the same renderer: the off-grid test compares a
+# whole cluster's shaped advance against its display width, so a base char + its VS16
+# / combining marks (e.g. `❤️`) are weighed as one unit, not per glyph.
+unicode-segmentation.workspace = true
+pollster.workspace = true
+bemtvi-rpc.workspace = true
+bemtvi-view.workspace = true
+# Decoder for `'imagepreview'` windows: the GUI shares the local filesystem (like
+# the TUI), so it decodes the image itself and uploads it as a wgpu texture (see
+# src/images.rs). No ratatui-image here — the GUI paints pixels directly.
+image.workspace = true
+# The workspace dep is `default-features = false`, so re-enable `native`
+# explicitly — the gui's main.rs uses native-gated server items
+# (default_runtime/default_shada/ClipboardProvider). Without this the crate only
+# builds when bemtvi-server is also a build target (e.g. `cargo test --workspace`),
+# which silently turns its default `native` on via feature unification.
+bemtvi-server = { workspace = true, features = ["native"] }
+arboard.workspace = true
+# Native open/save dialog for the `:eo`/`:wn`/… pickers, on all three desktop
+# platforms (no GTK — see the rfd note in the workspace Cargo.toml).
+rfd.workspace = true
+
+# Windows host only: embeds the app icon into bemtvi-gui.exe (see build.rs). Gated
+# on the *host* (build scripts run on the host) — our CI builds Windows natively,
+# so host == target == windows. Cross-compiling Windows from another host skips
+# the embed rather than failing.
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
+# `kill(2)` in the signal e2e test: the killed binary must still run its exit
+# sequence (`tests/signal_exit.rs`).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

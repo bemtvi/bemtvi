@@ -1,9 +1,9 @@
--- ~~~ nxvim LSP work-done progress — "is the server ready yet?" ~~~
+-- ~~~ bemtvi LSP work-done progress — "is the server ready yet?" ~~~
 --
 -- Run it (from the repo root) — needs `gopls` on your PATH:
 --
---     NXVIM_CONFIG=examples/lsp-progress \
---       cargo run -p nxvim -- examples/lsp-progress/sample.go
+--     BEMTVI_CONFIG=examples/lsp-progress \
+--       cargo run -p bemtvi -- examples/lsp-progress/sample.go
 --
 -- ---------------------------------------------------------------------------
 -- What this example is about
@@ -16,9 +16,9 @@
 --
 -- LSP has a channel for saying so: `$/progress`, carrying a `WorkDoneProgress`
 -- payload. A task is a `begin` -> `report`* -> `end` sequence sharing a token, and
--- a server may run several tokens at once. nxvim surfaces the whole thing:
+-- a server may run several tokens at once. bemtvi surfaces the whole thing:
 --
---   * `nx.lsp.progress(filter)` — what every server is busy with RIGHT NOW. A
+--   * `btv.lsp.progress(filter)` — what every server is busy with RIGHT NOW. A
 --     finished task is gone from the list rather than parked at 100%, so a
 --     non-empty list means "still working".
 --   * the `LspProgress` autocmd — fired on every update, with the update's KIND
@@ -29,7 +29,7 @@
 --
 --   1. `title` arrives ONLY on `begin`. A `report` never repeats it.
 --   2. An absent `message`/`percentage` on a `report` means "unchanged", NOT
---      "cleared". nxvim folds that for you — `nx.lsp.progress()` always hands you
+--      "cleared". bemtvi folds that for you — `btv.lsp.progress()` always hands you
 --      the settled state — but if you read `args.data` off the event yourself, a
 --      nil field is "the server said nothing this time".
 --
@@ -39,7 +39,7 @@
 --      "Setting up workspace" and then "Loading packages" as it reads the module.
 --      -> a braille spinner turning beside the task's title, and a percentage when
 --      gopls sends one. It DISAPPEARS when the work finishes — the segment renders
---      nothing at all when `nx.lsp.progress()` is empty.
+--      nothing at all when `btv.lsp.progress()` is empty.
 --   2. That can be over in under a second on a module this small, so the whole
 --      thing is also recorded. `<leader>lP` dumps the transcript.  ->  every update
 --      in order, e.g.
@@ -68,24 +68,24 @@ vim.g.mapleader = " "
 
 -- 1. A server that actually reports progress. gopls sends `$/progress` for its
 --    workspace setup and package loading on every start.
-nx.lsp.config("gopls", {
+btv.lsp.config("gopls", {
   cmd = { "gopls" },
   filetypes = { "go" },
   root_markers = { "go.mod", ".git" },
 })
-nx.lsp.enable({ "gopls" })
+btv.lsp.enable({ "gopls" })
 
 -- ---------------------------------------------------------------------------
 -- 2. The transcript. `LspProgress` fires on every update; this records the raw
 --    `args.data` so step 2 can show what the SERVER sent, un-folded — including
 --    the fields it left out.
 --
---    Note `args.match`: it is the update's kind. nxvim fires the event with the
+--    Note `args.match`: it is the update's kind. bemtvi fires the event with the
 --    kind as the autocmd pattern (neovim's contract), which is what makes the
 --    `pattern = "end"` handler further down possible at all.
 local transcript = {}
 
-nx.autocmd.create("LspProgress", {
+btv.autocmd.create("LspProgress", {
   callback = function(args)
     local d = args.data
     transcript[#transcript + 1] = string.format(
@@ -100,16 +100,16 @@ nx.autocmd.create("LspProgress", {
 
 -- A handler narrowed to ONE kind by pattern. Only completions reach it, so it can
 -- say "ready" without inspecting anything.
-nx.autocmd.create("LspProgress", {
+btv.autocmd.create("LspProgress", {
   pattern = "end",
   callback = function(args)
-    local client = nx.lsp.client_by_id(args.data.client_id)
-    nx.notify(("%s finished: %s"):format(client and client.name or "?", args.data.title or ""))
+    local client = btv.lsp.client_by_id(args.data.client_id)
+    btv.notify(("%s finished: %s"):format(client and client.name or "?", args.data.title or ""))
   end,
 })
 
 -- ---------------------------------------------------------------------------
--- 3. The statusline segment — the same shape the bundled nxvim-line `lsp`
+-- 3. The statusline segment — the same shape the bundled bemtvi-line `lsp`
 --    component uses, written out here so nothing is hidden behind a plugin.
 --
 --    Two things make it cheap. The DATA needs no polling: `LspProgress`
@@ -121,13 +121,13 @@ local FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 local frame = 1
 local ticking = false
 
-nx.statusline.segment({
+btv.statusline.segment({
   name = "lspprogress",
   events = { "LspProgress", "LspAttach", "LspDetach", "BufEnter" },
   render = function(ctx)
     -- `bufnr = 0`... but `render` is per WINDOW, so use the rendered window's
     -- buffer: a server busy on another project is not this buffer's status.
-    local tasks = nx.lsp.progress({ bufnr = ctx.buf })
+    local tasks = btv.lsp.progress({ bufnr = ctx.buf })
     if #tasks == 0 then
       return nil -- nothing in flight: the segment collapses entirely
     end
@@ -153,25 +153,25 @@ nx.statusline.segment({
 })
 
 local function tick()
-  if #nx.lsp.progress() == 0 then
+  if #btv.lsp.progress() == 0 then
     ticking = false
     return -- the work is done; stop the clock rather than spin forever
   end
   frame = frame + 1
-  nx.statusline.invalidate("lspprogress")
-  nx.timer(tick, 100)
+  btv.statusline.invalidate("lspprogress")
+  btv.timer(tick, 100)
 end
 
-nx.autocmd.create("LspProgress", {
+btv.autocmd.create("LspProgress", {
   callback = function()
     if not ticking then
       ticking = true
-      nx.timer(tick, 100)
+      btv.timer(tick, 100)
     end
   end,
 })
 
-nx.statusline.setup({
+btv.statusline.setup({
   left = { "mode", "filename" },
   right = { "lspprogress", "diagnostics", "location" },
 })
@@ -180,10 +180,10 @@ nx.statusline.setup({
 -- 4. The two readouts the steps use.
 
 -- <leader>lp — what is in flight at this instant.
-nx.keymap.set("n", "<leader>lp", function()
-  local tasks = nx.lsp.progress()
+btv.keymap.set("n", "<leader>lp", function()
+  local tasks = btv.lsp.progress()
   if #tasks == 0 then
-    nx.notify("no LSP work in flight")
+    btv.notify("no LSP work in flight")
     return
   end
   local out = {}
@@ -197,17 +197,17 @@ nx.keymap.set("n", "<leader>lp", function()
       p.token
     )
   end
-  nx.notify(table.concat(out, "\n"))
+  btv.notify(table.concat(out, "\n"))
 end, { desc = "LSP: work in flight now" })
 
 -- <leader>lP — the recorded transcript (every update since startup).
-nx.keymap.set("n", "<leader>lP", function()
+btv.keymap.set("n", "<leader>lP", function()
   if #transcript == 0 then
-    nx.notify("no LspProgress events recorded yet")
+    btv.notify("no LspProgress events recorded yet")
     return
   end
-  nx.notify(table.concat(transcript, "\n"))
+  btv.notify(table.concat(transcript, "\n"))
 end, { desc = "LSP: progress transcript" })
 
 -- <leader>ls — a split, for step 5.
-nx.keymap.set("n", "<leader>ls", "<C-w>v", { desc = "split" })
+btv.keymap.set("n", "<leader>ls", "<C-w>v", { desc = "split" })

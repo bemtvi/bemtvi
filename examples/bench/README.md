@@ -30,7 +30,7 @@ Edit `SCALE` at the top of `init.lua` to make every bench run longer/shorter
 ## 1) Baseline: PUC Lua 5.4 (the default build)
 
 ```sh
-NXVIM_CONFIG=examples/bench cargo run --release -p nxvim -- examples/bench/sample.txt
+BEMTVI_CONFIG=examples/bench cargo run --release -p bemtvi -- examples/bench/sample.txt
 ```
 
 In the editor: `:benchall`, then `:messages` to read the full table. The header
@@ -51,7 +51,7 @@ mlua = { version = "=0.11.6", features = ["vendored", "serde", "lua54"] }
 mlua = { version = "=0.11.6", features = ["vendored", "serde", "luau"] }
 ```
 
-**b. Add the stdlib shims** — in `crates/nxvim-lua/src/runtime.rs`, add the call
+**b. Add the stdlib shims** — in `crates/bemtvi-lua/src/runtime.rs`, add the call
 right after the VM is created in `LuaRuntime::new`:
 
 ```rust
@@ -63,7 +63,7 @@ right after the VM is created in `LuaRuntime::new`:
 `nil` hole, so the same source builds on both backends):
 
 ```rust
-/// Luau ships a deliberately sandboxed stdlib. nxvim owns Rust implementations of
+/// Luau ships a deliberately sandboxed stdlib. bemtvi owns Rust implementations of
 /// fs/system, so the missing surface is bridgeable; this fills the gaps the
 /// prelude needs to boot. No-op under the PUC `lua54` backend (every shim guards
 /// on nil). NOTE: `require`/`package.path` resolution is NOT wired here — Luau's
@@ -130,7 +130,7 @@ fn luau_stdlib_shims(lua: &Lua) -> mlua::Result<()> {
 Then rebuild and run the identical command:
 
 ```sh
-NXVIM_CONFIG=examples/bench cargo run --release -p nxvim -- examples/bench/sample.txt
+BEMTVI_CONFIG=examples/bench cargo run --release -p bemtvi -- examples/bench/sample.txt
 ```
 
 `:benchall` now reports `[Luau]`. Compare the two tables.

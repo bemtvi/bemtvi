@@ -1,6 +1,6 @@
 The quick brown fox jumps over the lazy dog.
 A second line with the word banana in it.
 Third line: apples, oranges, and bananas.
-fn main() { println!("hello nxvim"); }
-TODO: port the telescope config to nx.picker.
+fn main() { println!("hello bemtvi"); }
+TODO: port the telescope config to btv.picker.
 The end.

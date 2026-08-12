@@ -1,9 +1,9 @@
--- ~~~ nxvim statusline playground: a lualine-style 'statusline' from vim.fn ~~~
+-- ~~~ bemtvi statusline playground: a lualine-style 'statusline' from vim.fn ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/statusline \
---       cargo run -p nxvim -- examples/statusline/sample.txt
+--     BEMTVI_CONFIG=examples/statusline \
+--       cargo run -p bemtvi -- examples/statusline/sample.txt
 --
 -- The status line is driven by the 'statusline' option's %-format engine. This
 -- config sets `statusline = '%!v:lua.statusline()'`, so on EVERY redraw the engine
@@ -16,7 +16,7 @@
 -- expression with no Lua. `%{&fileencoding}` reads the buffer option directly, and
 -- `%{&bomb?"[bom]":""}` uses the ternary to tag a byte-order mark — exactly like
 -- neovim, which has no %-letter for the encoding. (Anything that isn't `v:lua.…`
--- runs through nxvim's pure expression evaluator: literals, &options, comparison,
+-- runs through bemtvi's pure expression evaluator: literals, &options, comparison,
 -- ternary. A bare variable or unknown option fails loud on the line, never silently.)
 --
 -- TRY IT interactively:
@@ -27,7 +27,7 @@
 --   :set bomb                     a "[bom]" tag appears via the %{&bomb?…} ternary
 --   :e examples/tabs/sample.txt   the file block follows the current buffer
 --   click the filename block       a `%@v:lua.…@…%X` click region echoes the path
---   :set statusline=              fall back to nxvim's built-in default look
+--   :set statusline=              fall back to bemtvi's built-in default look
 
 --------------------------------------------------------------------------------
 -- 1. Segment colours. `nvim_set_hl` defines the highlight groups that the

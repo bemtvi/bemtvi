@@ -1,12 +1,12 @@
--- ~~~ nx.diagnostic.config({ update_in_insert = … }) — diagnostics that hold
+-- ~~~ btv.diagnostic.config({ update_in_insert = … }) — diagnostics that hold
 -- ~~~ still while you type, then catch up ~~~
 --
--- A language server re-diagnoses after every `didChange`, and nxvim syncs a
+-- A language server re-diagnoses after every `didChange`, and bemtvi syncs a
 -- `didChange` per keystroke — so applied as they land, the squiggles, gutter signs
 -- and inline messages move under the cursor on every key, mostly complaining about
 -- a line you haven't finished writing.
 --
--- `update_in_insert` sets the timing. nxvim takes a NUMBER OF MILLISECONDS here as
+-- `update_in_insert` sets the timing. bemtvi takes a NUMBER OF MILLISECONDS here as
 -- well as neovim's two booleans:
 --
 --   update_in_insert = 3000   (default)  hold an update that lands while you type,
@@ -23,14 +23,14 @@
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/diagnostic-insert \
---       cargo run -p nxvim -- examples/diagnostic-insert/sample.txt
+--     BEMTVI_CONFIG=examples/diagnostic-insert \
+--       cargo run -p bemtvi -- examples/diagnostic-insert/sample.txt
 --
 --------------------------------------------------------------------------------
 -- 1. Make the diagnostics visible (all three surfaces), with a SHORT debounce so
 --    the demo doesn't keep you waiting — the shipped default is 3000.
 --------------------------------------------------------------------------------
-nx.diagnostic.config({
+btv.diagnostic.config({
   signs = true, -- the gutter letters (E / W / I / H)
   underline = true, -- squiggles under the flagged span
   virtual_text = true, -- the end-of-line message
@@ -47,12 +47,12 @@ nx.diagnostic.config({
 --    keys are coming; a second after you stop, the error appears — you are still
 --    in insert mode. Press `<Esc>` instead of waiting and it appears at once.
 --------------------------------------------------------------------------------
-local ns = nx.ns.create("diagnostic-insert-demo")
-local S = nx.diagnostic.severity
+local ns = btv.ns.create("diagnostic-insert-demo")
+local S = btv.diagnostic.severity
 
 local function lint(bufnr)
   local out = {}
-  for i, line in ipairs(nx.buf.lines(bufnr, 0, -1, false)) do
+  for i, line in ipairs(btv.buf.lines(bufnr, 0, -1, false)) do
     local at = line:lower():find("bug", 1, true)
     if at then
       out[#out + 1] = {
@@ -76,12 +76,12 @@ local function lint(bufnr)
       }
     end
   end
-  nx.diagnostic.set(ns, bufnr, out)
+  btv.diagnostic.set(ns, bufnr, out)
 end
 
 -- `TextChangedI` fires per keystroke in insert mode; `TextChanged` covers normal
 -- mode edits, and `BufEnter` seeds the buffer on open.
-nx.autocmd.create({ "BufEnter", "TextChanged", "TextChangedI" }, {
+btv.autocmd.create({ "BufEnter", "TextChanged", "TextChangedI" }, {
   pattern = "*sample.txt",
   callback = function(args)
     lint(args.buf)
@@ -97,17 +97,17 @@ nx.autocmd.create({ "BufEnter", "TextChanged", "TextChangedI" }, {
 --    happens until you press `<Esc>`, however long you pause. `:DiagDebounce` puts
 --    the demo back.
 --------------------------------------------------------------------------------
-nx.command("DiagLive", function()
-  nx.diagnostic.config({ update_in_insert = true })
-  nx.notify("diagnostics: updating on every keystroke (update_in_insert = true)")
+btv.command("DiagLive", function()
+  btv.diagnostic.config({ update_in_insert = true })
+  btv.notify("diagnostics: updating on every keystroke (update_in_insert = true)")
 end, { desc = "Update diagnostics on every keystroke" })
 
-nx.command("DiagHold", function()
-  nx.diagnostic.config({ update_in_insert = false })
-  nx.notify("diagnostics: held until InsertLeave (update_in_insert = false)")
+btv.command("DiagHold", function()
+  btv.diagnostic.config({ update_in_insert = false })
+  btv.notify("diagnostics: held until InsertLeave (update_in_insert = false)")
 end, { desc = "Hold diagnostic updates until leaving insert mode" })
 
-nx.command("DiagDebounce", function()
-  nx.diagnostic.config({ update_in_insert = 1000 })
-  nx.notify("diagnostics: debounced 1s after you stop typing")
+btv.command("DiagDebounce", function()
+  btv.diagnostic.config({ update_in_insert = 1000 })
+  btv.notify("diagnostics: debounced 1s after you stop typing")
 end, { desc = "Debounce diagnostic updates while typing" })

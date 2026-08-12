@@ -1,4 +1,4 @@
-nx.shada.plugin() — opt-in, isolated, per-plugin persistence
+btv.shada.plugin() — opt-in, isolated, per-plugin persistence
 ============================================================
 
 Open a few files this session, then quit (:qa) and relaunch with the SAME

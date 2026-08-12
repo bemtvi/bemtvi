@@ -22,14 +22,14 @@ that reflow the buffer are kept crisp — only genuine viewport jumps animate.
 | `'scrollanimduration'` | `160` | The longest a slide may last, in milliseconds. The per-scroll duration scales with the travel distance and is clamped to this ceiling; `0` disables animation entirely. |
 
 ```lua
-nx.o.scrollanim = true
-nx.o.scrollanimduration = 160   -- ms ceiling; raise for a slower, more visible slide
+btv.o.scrollanim = true
+btv.o.scrollanimduration = 160   -- ms ceiling; raise for a slower, more visible slide
 ```
 
-`'scrollanim'` is also a **window-local** option (`nx.wo.scrollanim`): `nil`
+`'scrollanim'` is also a **window-local** option (`btv.wo.scrollanim`): `nil`
 inherits the global value, `false` forces this window's scrolls to snap, and
 `true` forces the slide even when the global is off. A synced side-by-side diff
 sets it `false` on its panes so a mirrored scroll doesn't desync.
 
-See [`examples/smooth-scroll/`](https://github.com/davidrios/nxvim/tree/main/examples/smooth-scroll)
+See [`examples/smooth-scroll/`](https://github.com/davidrios/bemtvi/tree/main/examples/smooth-scroll)
 for a runnable demo.

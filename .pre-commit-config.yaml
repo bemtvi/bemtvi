@@ -1,4 +1,4 @@
-# Pre-commit hooks for nxvim.
+# Pre-commit hooks for bemtvi.
 #
 # Enable once per clone:  pre-commit install
 # Run manually on demand:  pre-commit run --all-files
@@ -10,7 +10,7 @@
 #     cargo install selene --features selene-lib/lua54
 # selene's default build (and the brew one) parses Lua 5.1 syntax only, and reports
 # every 5.4 bitwise operator in the prelude as `unexpected character &`; the feature
-# compiles in the 5.4 grammar `nxvim.yml` asks for.
+# compiles in the 5.4 grammar `bemtvi.yml` asks for.
 repos:
   - repo: local
     hooks:
@@ -35,17 +35,17 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      # --- First-party Lua (the nxvim prelude) -------------------------------
-      # Scoped to crates/nxvim-lua/src/prelude/ only: the vendored neovim copies
+      # --- First-party Lua (the bemtvi prelude) -------------------------------
+      # Scoped to crates/bemtvi-lua/src/prelude/ only: the vendored neovim copies
       # under src/vendor/nvim/ and the examples/ are intentionally left alone.
-      # Config: stylua.toml / selene.toml + the nxvim.yml selene std at the root.
+      # Config: stylua.toml / selene.toml + the bemtvi.yml selene std at the root.
       - id: stylua
         name: stylua
         description: Check Lua formatting (stylua)
         entry: stylua --check
         language: system
         types: [lua]
-        files: ^crates/nxvim-lua/src/prelude/.*\.lua$
+        files: ^crates/bemtvi-lua/src/prelude/.*\.lua$
 
       - id: selene
         name: selene
@@ -53,4 +53,4 @@ repos:
         entry: selene
         language: system
         types: [lua]
-        files: ^crates/nxvim-lua/src/prelude/.*\.lua$
+        files: ^crates/bemtvi-lua/src/prelude/.*\.lua$

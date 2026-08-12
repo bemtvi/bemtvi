@@ -1,12 +1,12 @@
--- ~~~ nxvim nx.picker playground: the fuzzy finder ~~~
+-- ~~~ bemtvi btv.picker playground: the fuzzy finder ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/ui-picker \
---       cargo run -p nxvim -- examples/ui-picker/sample.txt
+--     BEMTVI_CONFIG=examples/ui-picker \
+--       cargo run -p bemtvi -- examples/ui-picker/sample.txt
 --
--- `nx.picker` is the native fuzzy finder built on the unified float-list widget
--- (docs/specs/2026-06-14-nx-ui-float-widget.md). The SERVER owns it: a centered
+-- `btv.picker` is the native fuzzy finder built on the unified float-list widget
+-- (docs/specs/2026-06-14-btv-ui-float-widget.md). The SERVER owns it: a centered
 -- float with a PROMPT that grabs every key, a Rust fuzzy matcher that re-ranks as
 -- you type (matched chars are highlighted), and — for a dynamic source like live
 -- grep — a generation token so a response for a query you have already typed past
@@ -21,12 +21,12 @@
 --   <Esc>           cancel
 --
 -- Picker keys are ordinary `picker`-mode maps, so rebind any of them — e.g. the
--- default tab key is `nx.keymap.set("picker", "<C-t>", nx.picker.actions.confirm_tab)`.
+-- default tab key is `btv.keymap.set("picker", "<C-t>", btv.picker.actions.confirm_tab)`.
 --
 -- Sources are thin: they STREAM candidates via `ctx.push`, signal completion by
--- returning (an `nx.async` source returns its promise; nx is promise-only — no
+-- returning (an `btv.async` source returns its promise; btv is promise-only — no
 -- `done` callback), and handle `confirm(item)`.
--- The built-in `files` / `live_grep` / `buffers` ship with nxvim; this config maps
+-- The built-in `files` / `live_grep` / `buffers` ship with bemtvi; this config maps
 -- them and registers one custom source to show the shape.
 
 vim.g.mapleader = "\\"
@@ -41,32 +41,32 @@ vim.g.mapleader = "\\"
 --                    buffer's last cursor line — type-this: `:ls` and compare.
 --------------------------------------------------------------------------------
 -- Dynamic sources (live_grep) debounce: they re-run only after you stop typing for
--- `nx.picker.debounce` ms (default 250), the in-flight search is cancelled when you
+-- `btv.picker.debounce` ms (default 250), the in-flight search is cancelled when you
 -- type again, and the previous results stay on screen until the new ones arrive.
 -- Tune it globally, per source (`debounce = N`), or per open (below).
-nx.picker.debounce = 250
+btv.picker.debounce = 250
 
-nx.keymap.set("n", "<leader>ff", function()
-  nx.picker.open("files")
+btv.keymap.set("n", "<leader>ff", function()
+  btv.picker.open("files")
 end)
-nx.keymap.set("n", "<leader>fg", function()
-  nx.picker.open("live_grep")
+btv.keymap.set("n", "<leader>fg", function()
+  btv.picker.open("live_grep")
 end)
-nx.keymap.set("n", "<leader>fb", function()
-  nx.picker.open("buffers")
+btv.keymap.set("n", "<leader>fb", function()
+  btv.picker.open("buffers")
 end)
 -- A snappier live grep just for this map (override the debounce per open):
-nx.keymap.set("n", "<leader>fG", function()
-  nx.picker.open("live_grep", { debounce = 100 })
+btv.keymap.set("n", "<leader>fG", function()
+  btv.picker.open("live_grep", { debounce = 100 })
 end)
 
--- Where a confirmed pick LANDS is governed by 'switchbuf'. nxvim defaults it to
+-- Where a confirmed pick LANDS is governed by 'switchbuf'. bemtvi defaults it to
 -- `usetab`: picking (or any jump to) a buffer ALREADY shown in another tab focuses
 -- that tab instead of re-opening it in the current window. Try it: \fb a file, hit
 -- <C-t> to drop it in a new tab, switch back (`gT`), \fb that same file again with
 -- <CR> — focus jumps to the tab already showing it. Tune it like vim:
---   nx.o.switchbuf = "usetab"   -- the default; also "useopen" (current tab only)
---   nx.o.switchbuf = ""         -- classic: always open in the current window
+--   btv.o.switchbuf = "usetab"   -- the default; also "useopen" (current tab only)
+--   btv.o.switchbuf = ""         -- classic: always open in the current window
 -- (<C-t> always makes a NEW tab regardless — it is an explicit tab gesture.)
 
 --------------------------------------------------------------------------------
@@ -76,14 +76,14 @@ end)
 --    The picker is a FIXED box (never content-hugging — that looks ragged). Set
 --    the size per source with `width` / `height`: a cell count (e.g. 100) or a
 --    CSS-style viewport fraction string — "80vw" / "60vh" / "50%". Omit them for
---    the default (~80vw x 60vh). `nx.picker.open(name, { width=, height= })`
+--    the default (~80vw x 60vh). `btv.picker.open(name, { width=, height= })`
 --    overrides per-open.
 --
 --    `prompt_pos` chooses where the input box sits: "top" (the default) puts it
 --    above the results, "bottom" puts it below them (telescope-style). This source
 --    asks for the input BELOW the results.
 --------------------------------------------------------------------------------
-nx.picker.source({
+btv.picker.source({
   name = "colours",
   width = "50vw", -- half the editor width …
   height = "40vh", -- … and 40% of its height
@@ -103,15 +103,15 @@ nx.picker.source({
     end
   end,
   confirm = function(item)
-    nx.notify("you picked " .. item.text)
+    btv.notify("you picked " .. item.text)
   end,
 })
-nx.keymap.set("n", "<leader>fc", function()
-  nx.picker.open("colours")
+btv.keymap.set("n", "<leader>fc", function()
+  btv.picker.open("colours")
 end)
 -- … or override the size at open time (a compact 40x10 cell box):
-nx.keymap.set("n", "<leader>fC", function()
-  nx.picker.open("colours", { width = 40, height = 10 })
+btv.keymap.set("n", "<leader>fC", function()
+  btv.picker.open("colours", { width = 40, height = 10 })
 end)
 
 --------------------------------------------------------------------------------
@@ -120,7 +120,7 @@ end)
 --    reap the superseded job via `ctx.on_cancel`, as `live_grep` does).
 --    \fe  echo
 --------------------------------------------------------------------------------
-nx.picker.source({
+btv.picker.source({
   name = "echo",
   dynamic = true,
   items = function(ctx)
@@ -130,11 +130,11 @@ nx.picker.source({
     end
   end,
   confirm = function(item)
-    nx.notify("confirmed query: " .. (item.q or ""))
+    btv.notify("confirmed query: " .. (item.q or ""))
   end,
 })
-nx.keymap.set("n", "<leader>fe", function()
-  nx.picker.open("echo")
+btv.keymap.set("n", "<leader>fe", function()
+  btv.picker.open("echo")
 end)
 
 --------------------------------------------------------------------------------
@@ -151,9 +151,9 @@ end)
 --------------------------------------------------------------------------------
 -- This config's own directory, so the source can reference its sibling files
 -- regardless of how the config was loaded (`debug.getinfo` is how plugins locate
--- their install path; nxvim exposes the full `debug` library to user config).
+-- their install path; bemtvi exposes the full `debug` library to user config).
 local here = debug.getinfo(1, "S").source:sub(2):match("(.*)[/\\]") or "."
-nx.picker.source({
+btv.picker.source({
   name = "preview",
   preview = "file", -- the pane on the right shows the highlighted file's head
   items = function(ctx)
@@ -165,8 +165,8 @@ nx.picker.source({
     vim.cmd("edit " .. item.path)
   end,
 })
-nx.keymap.set("n", "<leader>fp", function()
-  nx.picker.open("preview")
+btv.keymap.set("n", "<leader>fp", function()
+  btv.picker.open("preview")
 end)
 
-nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t>/<C-x>/<C-v> in any picker)")
+btv.notify("btv.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t>/<C-x>/<C-v> in any picker)")

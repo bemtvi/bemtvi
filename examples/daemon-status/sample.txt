@@ -12,5 +12,5 @@ Things to try:
   - sleep the laptop / pull the network briefly            -> yellow -> green
     (the link auto-recovers with no command — your buffer and undo survive)
 
-In a LOCAL session (no :connect) the segment renders nothing — nx.daemon.status()
+In a LOCAL session (no :connect) the segment renders nothing — btv.daemon.status()
 returns nil, so the component hides itself.

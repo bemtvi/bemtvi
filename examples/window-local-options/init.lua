@@ -1,12 +1,12 @@
--- ~~~ nxvim window-local options: a per-window number gutter ~~~
+-- ~~~ bemtvi window-local options: a per-window number gutter ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/window-local-options \
---       cargo run -p nxvim -- examples/window-local-options/sample.txt
+--     BEMTVI_CONFIG=examples/window-local-options \
+--       cargo run -p bemtvi -- examples/window-local-options/sample.txt
 --
 -- `number` / `relativenumber` are window-local in vim: two windows onto the SAME
--- buffer can show different line-number gutters. nxvim stores them on each window
+-- buffer can show different line-number gutters. bemtvi stores them on each window
 -- (a split inherits them from the window it splits off), so `:set` / `:setlocal`
 -- and `vim.wo` target the focused window only — the sibling is untouched.
 --
@@ -26,7 +26,7 @@ vim.api.nvim_create_user_command("GutterDemo", function()
   local original = vim.api.nvim_get_current_win()
   vim.cmd("vsplit") -- queued: the new (focused) window exists on the NEXT tick
 
-  nx.on_next_tick(function()
+  btv.on_next_tick(function()
     local fresh = vim.api.nvim_get_current_win()
 
     -- Window-local writes via vim.wo: they change only the named window's gutter.

@@ -1,9 +1,9 @@
--- ~~~ nxvim image previews: open an image, see the picture ~~~
+-- ~~~ bemtvi image previews: open an image, see the picture ~~~
 --
 -- Run it (from the repo root) against the sample image:
 --
---     NXVIM_CONFIG=examples/image-preview \
---       cargo run -p nxvim -- examples/image-preview/sample.png
+--     BEMTVI_CONFIG=examples/image-preview \
+--       cargo run -p bemtvi -- examples/image-preview/sample.png
 --
 -- With `'imagepreview'` on, opening a file whose extension is a known image type
 -- (png/jpg/jpeg/gif/bmp/webp/tiff/ico/tga/qoi/pnm) shows the *picture* instead of
@@ -15,11 +15,11 @@
 -- supports none. So for a real picture (not a blocky approximation), run this in a
 -- graphics-capable terminal — e.g. Kitty, WezTerm, Ghostty, or iTerm2.
 --
--- The GUI client (`nxvim-gui`) renders the picture as a true GPU texture — always
+-- The GUI client (`bemtvi-gui`) renders the picture as a true GPU texture — always
 -- crisp, no terminal protocol involved:
 --
---     NXVIM_CONFIG=examples/image-preview \
---       cargo run -p nxvim-gui -- examples/image-preview/sample.png
+--     BEMTVI_CONFIG=examples/image-preview \
+--       cargo run -p bemtvi-gui -- examples/image-preview/sample.png
 --
 -- The picture is fit to the window (aspect-preserving, centered) and re-decoded
 -- when the file changes on disk, same as the TUI.
@@ -35,7 +35,7 @@
 -- files live on the remote host, so the native TUI/GUI can't open `sample.png` off
 -- their own disk. They fetch the bytes out-of-band over the editor RPC, exactly like
 -- the web client — the redraw marker flags the preview `remote` and the client
--- requests `nxvim_image_read`. So previewing a *remote* image works the same way,
+-- requests `bemtvi_image_read`. So previewing a *remote* image works the same way,
 -- with no config change; a brief "[image: loading …]" shows until the bytes arrive.
 --
 -- TRY IT:
@@ -44,11 +44,11 @@
 --   :e init.lua           a NON-image opens as ordinary text, unchanged
 --   :set noimagepreview   turn it off; now :e sample.png shows the raw bytes
 --
--- The option is a normal nx.* option, so `nx.o` / `vim.o` / `:set` all reach it.
+-- The option is a normal btv.* option, so `btv.o` / `vim.o` / `:set` all reach it.
 
--- Turn previews on (off by default). `nx.o` is the canonical surface; `vim.o`
+-- Turn previews on (off by default). `btv.o` is the canonical surface; `vim.o`
 -- and `:set imagepreview` are equivalent.
-nx.o.imagepreview = true
+btv.o.imagepreview = true
 
 -- Nothing else is needed — opening an image is all it takes. A line-number gutter
 -- is left off here so the picture fills the window body.

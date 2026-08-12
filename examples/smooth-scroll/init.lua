@@ -1,16 +1,16 @@
--- ~~~ nxvim smooth scrolling: the viewport slides, it doesn't teleport ~~~
+-- ~~~ bemtvi smooth scrolling: the viewport slides, it doesn't teleport ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/smooth-scroll \
---       cargo run -p nxvim -- examples/smooth-scroll/sample.txt
+--     BEMTVI_CONFIG=examples/smooth-scroll \
+--       cargo run -p bemtvi -- examples/smooth-scroll/sample.txt
 --
 -- The scroll commands (<C-d> / <C-u> half-page, <C-f> / <C-b> full-page, the
 -- mouse wheel, and off-screen jumps like `G`) ANIMATE: the editor applies the
 -- scroll instantly but hands the client a self-contained `scroll` descriptor, and
 -- the client slides the viewport to the destination over a short duration
 -- (neoscroll.nvim's feel, built in). Two global options tune it — both are real
--- nxvim options, settable from `:set`, `vim.o`, or `nx.o`:
+-- bemtvi options, settable from `:set`, `vim.o`, or `btv.o`:
 --
 --   scrollanim          (boolean, default on) — animate, or snap. `noscrollanim`
 --                       turns the slide off entirely; the viewport jumps as

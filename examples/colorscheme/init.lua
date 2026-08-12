@@ -1,17 +1,17 @@
--- ~~~ nxvim's built-in colorscheme: `:colorscheme nxvim` ~~~
+-- ~~~ bemtvi's built-in colorscheme: `:colorscheme bemtvi` ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/colorscheme \
---       cargo run -p nxvim -- examples/colorscheme/sample.rs
+--     BEMTVI_CONFIG=examples/colorscheme \
+--       cargo run -p bemtvi -- examples/colorscheme/sample.rs
 --
--- nxvim ships its own One Dark colorscheme — the truecolor sibling of the look
+-- bemtvi ships its own One Dark colorscheme — the truecolor sibling of the look
 -- the GUI and the browser edit-host paint by default — so a plain terminal can
 -- reach the same colors with no plugin, no download, and no config at all.
 --
 -- ON A TRUECOLOR TERMINAL IT LOADS AUTOMATICALLY. When the terminal advertises
 -- 24-bit color (via `COLORTERM=truecolor`/`24bit`, which every modern terminal
--- exports), nxvim defaults the `nxvim` scheme in at startup — you get real
+-- exports), bemtvi defaults the `bemtvi` scheme in at startup — you get real
 -- colors on a fresh install with an empty config. Your config still wins: set
 -- `vim.cmd.colorscheme('...')` in `init.lua` and that scheme is used instead,
 -- never overridden. A 256-color / legacy terminal keeps its own tuned palette
@@ -21,19 +21,19 @@
 -- (a) force the scheme on a terminal that doesn't set `COLORTERM`, or (b) show
 -- how you'd pin it explicitly. Comment it out and, on a truecolor terminal,
 -- you'll still see colors — that's the auto-default at work. To *suppress* the
--- auto-default (start with no styling), launch with `NXVIM_TRUECOLOR=0`.
+-- auto-default (start with no styling), launch with `BEMTVI_TRUECOLOR=0`.
 --
 -- It's bundled in the binary (not sourced off the runtimepath), so this works
--- on a fresh install. A user `colors/nxvim.lua` on the runtimepath still wins,
+-- on a fresh install. A user `colors/bemtvi.lua` on the runtimepath still wins,
 -- so you can fork the palette by dropping your own file there.
 --
 -- TRY IT interactively:
---   :colorscheme nxvim        load it live
+--   :colorscheme bemtvi        load it live
 --   :hi clear                 strip it back to the terminal's own colors
---   :colorscheme nxvim        bring it back
+--   :colorscheme bemtvi        bring it back
 --
 -- The scheme needs a treesitter grammar installed to light up syntax; install
 -- the Rust parser once with `:TSInstall rust` (see examples/ts-install) so the
 -- keywords/strings/types above get their colors.
 
-vim.cmd.colorscheme('nxvim')
+vim.cmd.colorscheme('bemtvi')

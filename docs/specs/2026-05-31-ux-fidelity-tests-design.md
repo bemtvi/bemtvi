@@ -2,17 +2,17 @@
 
 **Status:** approved design, pending implementation
 **Date:** 2026-05-31
-**Scope:** `nxvim-tui`, `nxvim` (bin) integration tests, `nxvim-core`/`nxvim-server` (`:sleep`), workspace dev-deps
+**Scope:** `bemtvi-tui`, `bemtvi` (bin) integration tests, `bemtvi-core`/`bemtvi-server` (`:sleep`), workspace dev-deps
 
 ## Problem
 
-Today's tests (`crates/nxvim-server/tests/editing.rs`) are good black-box
+Today's tests (`crates/bemtvi-server/tests/editing.rs`) are good black-box
 integration tests, but they stop at the **RPC + semantic `View`** boundary. They
 send `nvim_input` and assert on `nvim_buf_get_lines`, the cursor, and the
 `redraw` `View` map's fields (`lines`, `selection`, `mode_label`, …). They never
 exercise:
 
-1. **What's on screen.** The TUI client (`nxvim-tui`) is entirely untested — the
+1. **What's on screen.** The TUI client (`bemtvi-tui`) is entirely untested — the
    ratatui layout, the reserved chrome rows, status/command line content and
    styling, selection highlighting, and wide-char/tab alignment as actually
    *painted* into a cell grid. We assert the server *describes* the right screen,
@@ -28,7 +28,7 @@ exercise:
    is asserted nowhere.
 
 The architecture doc already names the gap: *"e2e tests (planned) will drive the
-actual `nxvim` binary through a PTY and assert on the terminal output a user
+actual `bemtvi` binary through a PTY and assert on the terminal output a user
 would really see."* This spec closes it.
 
 ## Goals
@@ -36,7 +36,7 @@ would really see."* This spec closes it.
 - Assert on the **actual painted cell grid** the user sees, not just the
   semantic `View`.
 - Exercise the **real crossterm → key-notation** translation.
-- Drive the **real `nxvim` binary through a PTY** and assert on the terminal
+- Drive the **real `bemtvi` binary through a PTY** and assert on the terminal
   output it produces.
 - Assert the **non-blocking** guarantee between the editor and the UI.
 - Keep the fast, deterministic tiers broad and the slow/flaky PTY tier thin, so
@@ -56,11 +56,11 @@ would really see."* This spec closes it.
 
 ## Architecture: three tiers, cheap → faithful
 
-### Tier 1 — `crates/nxvim-tui/tests/` — client paint + key translation
+### Tier 1 — `crates/bemtvi-tui/tests/` — client paint + key translation
 
 Pins the **client's rendering contract** with no process and no timing.
 Fast and fully deterministic. Requires a small, deliberate public surface on
-`nxvim-tui` (currently all private):
+`bemtvi-tui` (currently all private):
 
 - `pub fn encode_key(KeyEvent) -> Option<String>` — promote the existing fn.
 - `pub struct View` + `pub fn from_redraw(params: &[Value]) -> View` — expose
@@ -88,16 +88,16 @@ Representative tests:
   - a wide char (e.g. `日`) occupies two cells and the cursor screen-column
     lands correctly; a leading tab expands to the next tabstop.
 
-### Tier 2 — `crates/nxvim/tests/screen.rs` — full in-process stack → real paint
+### Tier 2 — `crates/bemtvi/tests/screen.rs` — full in-process stack → real paint
 
 The **workhorse** for "what the user sees", deterministic and PTY-free. The
-`nxvim` bin crate is the natural home: it already depends on both
-`nxvim-server` and `nxvim-tui`.
+`bemtvi` bin crate is the natural home: it already depends on both
+`bemtvi-server` and `bemtvi-tui`.
 
 Harness (mirrors `editing.rs`): start a real server over a `tokio::io::duplex`
 pipe, `nvim_ui_attach`, feed vim key-notation via `nvim_input`. Then capture the
-latest real `redraw` map and feed it through `nxvim_tui::View::from_redraw` +
-`nxvim_tui::paint`, and assert on the resulting cell grid. Determinism comes for
+latest real `redraw` map and feed it through `bemtvi_tui::View::from_redraw` +
+`bemtvi_tui::paint`, and assert on the resulting cell grid. Determinism comes for
 free from the existing `lines()`-as-barrier trick (awaiting a request guarantees
 all prior input was processed and its redraw emitted) — **no sleeps**.
 
@@ -114,22 +114,22 @@ thread, the editor keeps processing. After the burst, drain and assert the
 buffer reflects every keystroke — i.e. a UI that isn't keeping up never blocks
 the editor.
 
-### Tier 3 — `crates/nxvim/tests/e2e.rs` — thin PTY smoke of the real binary
+### Tier 3 — `crates/bemtvi/tests/e2e.rs` — thin PTY smoke of the real binary
 
 The only tier that proves the **real experience**: real crossterm decode, real
 terminal escape output, real process startup/args. Kept to a handful of tests
 because it is the slow/flaky surface.
 
 New pinned dev-dependencies (in root `Cargo.toml` `[workspace.dependencies]`,
-pulled into the `nxvim` crate as dev-deps):
+pulled into the `bemtvi` crate as dev-deps):
 
-- `portable-pty` — spawn the built `nxvim` binary in a fixed-size PTY.
+- `portable-pty` — spawn the built `bemtvi` binary in a fixed-size PTY.
 - `vt100` — parse the PTY output stream into an inspectable screen grid.
 
 Harness (all timing localized here):
 
 - `spawn(args: &[&str], cols: u16, rows: u16) -> Session` — launches the binary
-  (resolved via `CARGO_BIN_EXE_nxvim`) attached to a PTY parser.
+  (resolved via `CARGO_BIN_EXE_bemtvi`) attached to a PTY parser.
 - `Session::send(bytes: &[u8])` — writes raw bytes, including `\x1b` (Esc) and
   `\r` (Enter), exactly as a terminal would.
 - `Session::wait_until(pred: impl Fn(&vt100::Screen) -> bool, timeout) -> bool`
@@ -140,7 +140,7 @@ Harness (all timing localized here):
 
 Representative tests (small set):
 
-- **Startup:** `nxvim <file>` shows the file's contents and a status line.
+- **Startup:** `bemtvi <file>` shows the file's contents and a status line.
 - **Real keystroke round trip:** send `ihi\x1b`, `wait_until` the screen shows
   `hi` and the status flips `INSERT → NORMAL`.
 - **Wide-char alignment** on the real emulator.
@@ -158,8 +158,8 @@ Rather than a test-only RPC, implement the genuine vim/neovim ex-command
 `:sleep {N}` (seconds) / `:sleep {N}m` (milliseconds) in the editor. It doubles
 as the responsiveness test hook and is a real feature.
 
-- Parsing/dispatch lives where other ex-commands live (`nxvim-core` editor /
-  `nxvim-server` dispatch). The command yields a duration the server awaits
+- Parsing/dispatch lives where other ex-commands live (`bemtvi-core` editor /
+  `bemtvi-server` dispatch). The command yields a duration the server awaits
   (`tokio::time::sleep`), parking the dispatch loop for that span — exactly the
   "slow editor operation" the responsiveness test needs.
 - Minimal scope: a non-interruptible blocking sleep. Real vim's
@@ -176,7 +176,7 @@ tiers compile and pass and that `cargo test --workspace` stays green and fast
 - **PTY flakiness/slowness.** Mitigated by keeping Tier 3 thin, localizing all
   timing in `wait_until` (predicate-polling, not fixed sleeps), and putting the
   bulk of fidelity coverage in the deterministic Tiers 1–2.
-- **`nxvim-tui` public surface.** The promotions (`encode_key`, `View`,
+- **`bemtvi-tui` public surface.** The promotions (`encode_key`, `View`,
   `from_redraw`, `paint`) are a deliberate, minimal test surface; documented as
   such so they aren't mistaken for a general client API.
 - **`:sleep` parking the loop.** Acceptable and intended (models a slow op);

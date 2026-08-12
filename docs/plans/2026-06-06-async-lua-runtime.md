@@ -2,16 +2,16 @@
 
 ## Why this document exists
 
-Today **all Lua in nxvim runs synchronously on the input tick**. There is no
+Today **all Lua in bemtvi runs synchronously on the input tick**. There is no
 event loop, so the three primitives a real plugin (and a real `lsp/<server>.lua`
 config) reaches for are faked:
 
-| primitive | neovim semantics | nxvim today | where |
+| primitive | neovim semantics | bemtvi today | where |
 | --- | --- | --- | --- |
 | `vim.schedule(fn)` | run `fn` on a **later** main-loop turn | runs `fn` **inline**, nested in the caller | `prelude.lua` → `function vim.schedule(fn) fn() end` |
-| `vim.defer_fn(fn, ms)` | run `fn` after `ms` on the loop | **raises** `nx._notimpl` | `prelude.lua` → `vim.defer_fn` |
-| `vim.system(cmd, …)` | spawn async; `on_exit` fires off-tick | spawns and **blocks the server thread** until exit; `on_exit`/`:wait()` see an already-complete result | `prelude.lua` `vim.system` → Rust `nx._system` (`std::process::Command::output()`) |
-| `vim.uv`/`vim.loop` timers | libuv timer handles | **absent** (only `fs_stat`/`os_homedir`/`cwd`/`fs_realpath`/`os_uname` exist, all synchronous) | `nxvim-lua/src/lib.rs` `uv` table |
+| `vim.defer_fn(fn, ms)` | run `fn` after `ms` on the loop | **raises** `btv._notimpl` | `prelude.lua` → `vim.defer_fn` |
+| `vim.system(cmd, …)` | spawn async; `on_exit` fires off-tick | spawns and **blocks the server thread** until exit; `on_exit`/`:wait()` see an already-complete result | `prelude.lua` `vim.system` → Rust `btv._system` (`std::process::Command::output()`) |
+| `vim.uv`/`vim.loop` timers | libuv timer handles | **absent** (only `fs_stat`/`os_homedir`/`cwd`/`fs_realpath`/`os_uname` exist, all synchronous) | `bemtvi-lua/src/lib.rs` `uv` table |
 
 This is **foundational work**: it is Phase 4 of
 [`docs/plans/2026-06-05-lsp-completion.md`](2026-06-05-lsp-completion.md) and the pivot the back
@@ -23,7 +23,7 @@ runtime (event loop)"*).
 The plan is divided into self-contained phases. **Each is sized to be picked up
 and implemented in one focused session without the others loaded.** Phases list
 their dependencies; later phases assume earlier ones landed. After each phase the
-set of `nx._notimpl_hits` a real config triggers shrinks — that set is the
+set of `btv._notimpl_hits` a real config triggers shrinks — that set is the
 running scoreboard (the same one the LSP plan uses).
 
 ---
@@ -39,18 +39,18 @@ running scoreboard (the same one the LSP plan uses).
 | 3 | Async `vim.system` (off-tick `on_exit`, real `pid`, `kill`) | ✅ |
 | 4 | The async-request seam + robustness + scoreboard cleanup | ✅ |
 
-**Implementation note.** Phases 1–4 landed together (`crates/nxvim-server/src/evloop.rs`
-is the actor; `nxvim-lua`'s `LoopOp`/`CallbackArgs`/`run_callback`/`take_loop_ops`
-the bridge; the `nx._cb_fns` registry + `vim.schedule`/`defer_fn`/`vim.uv` timers
+**Implementation note.** Phases 1–4 landed together (`crates/bemtvi-server/src/evloop.rs`
+is the actor; `bemtvi-lua`'s `LoopOp`/`CallbackArgs`/`run_callback`/`take_loop_ops`
+the bridge; the `btv._cb_fns` registry + `vim.schedule`/`defer_fn`/`vim.uv` timers
 + async `vim.system` live in `prelude.lua`). The pid plumbing diverges from the
 plan's literal text: a synchronous blocking wait for the pid would **deadlock**
 the single-threaded (`new_current_thread`) runtime — the actor shares the server's
 thread — so the actor instead delivers the pid via `LoopEvent::ProcessSpawned`,
-which the server records into `nx._proc_pids[id]`; the `vim.system` handle's
+which the server records into `btv._proc_pids[id]`; the `vim.system` handle's
 `.pid` reads through that (nil until the spawn lands, microseconds later). The
 `:wait()`-on-an-async-handle case raises a clear error pointing at the synchronous
 (no-`on_exit`) form rather than double-spawning. Coverage:
-`crates/nxvim-server/tests/async_runtime.rs`.
+`crates/bemtvi-server/tests/async_runtime.rs`.
 
 ---
 
@@ -58,7 +58,7 @@ which the server records into `nx._proc_pids[id]`; the `vim.system` handle's
 
 **The editor core and the Lua VM are `!Send` and live on a single thread.** The
 server runs on a `tokio::runtime::Builder::new_current_thread()` runtime
-(`crates/nxvim/src/main.rs`), and processes **one message at a time** against
+(`crates/bemtvi/src/main.rs`), and processes **one message at a time** against
 that non-`Send` state (`architecture.md` → *Async design*). Concurrency comes
 from async **I/O**, never parallel mutation.
 
@@ -72,9 +72,9 @@ So the event loop is **not** "run Lua callbacks on background threads." It is:
 
 This is exactly the pattern already proven twice in the codebase:
 
-- **`SyntaxClient`** (`crates/nxvim-server/src/syntax.rs`) — the treesitter
+- **`SyntaxClient`** (`crates/bemtvi-server/src/syntax.rs`) — the treesitter
   worker actor; the main loop selects on its `SyntaxEvent` channel.
-- **`LspManager`** (`crates/nxvim-lsp/src/manager.rs`) — `LspManager::new()`
+- **`LspManager`** (`crates/bemtvi-lsp/src/manager.rs`) — `LspManager::new()`
   returns `(LspManager, UnboundedReceiver<LspEvent>)`; a lazily-`tokio::spawn`ed
   `run_supervisor` task owns the child language servers and ferries replies back
   over the `LspEvent` channel, correlated by an opaque `ReqToken`. Commands go
@@ -84,13 +84,13 @@ This is exactly the pattern already proven twice in the codebase:
 **The event loop is a third actor of the same shape.** Do not invent a new
 concurrency model — copy `LspManager`'s structure (lazy spawn, two unbounded
 channels, the event receiver added as a new `tokio::select!` arm in
-`nxvim-server::run`).
+`bemtvi-server::run`).
 
 ---
 
 ## The current main loop (what we are extending)
 
-`crates/nxvim-server/src/lib.rs` → `run()`:
+`crates/bemtvi-server/src/lib.rs` → `run()`:
 
 ```rust
 loop {
@@ -104,23 +104,23 @@ loop {
 
 Two mechanisms matter for this plan:
 
-1. **The effect queues (`Shared`, `crates/nxvim-lua/src/lib.rs`).** Lua never
+1. **The effect queues (`Shared`, `crates/bemtvi-lua/src/lib.rs`).** Lua never
    mutates the editor; it pushes onto `Shared` (`commands`, `output`,
    `highlights`, `panel_ops`, `lsp_ops`). After every Lua chunk the server calls
    `apply_lua_effects()` to drain them into the core. We add **one more queue**
    (`loop_ops`) here.
 
-2. **The convergence driver (`run_pending`, `crates/nxvim-server/src/lib.rs`).**
+2. **The convergence driver (`run_pending`, `crates/bemtvi-server/src/lib.rs`).**
    A fixpoint loop that drains `editor.lua_queue`, `editor.deferred_commands`,
    and `editor.panel_selects` until nothing new is queued, capped at
    `MAX_ROUNDS = 100` (the recursion guard). Lua-backed work re-enters here. We
    add the **scheduled-callback queue** as one more source inside this loop.
 
 3. **Rust→Lua calls (the bridge).** The server calls back *into* Lua by fetching
-   a `nx._*` function and invoking it: `run_keymap(id)` → `nx._run_keymap`,
+   a `btv._*` function and invoking it: `run_keymap(id)` → `btv._run_keymap`,
    `run_user_command(name, args)`, `run_panel_select(index, line)`,
    `run_lsp_on_init(id, result)`, `fire_autocmd_*`. Callbacks live in the Lua
-   registry keyed by id (e.g. `nx._keymap_fns[id]`). **The deferred-callback
+   registry keyed by id (e.g. `btv._keymap_fns[id]`). **The deferred-callback
    registry is one more of these**, and it is the spine of every phase.
 
 ---
@@ -133,7 +133,7 @@ Two mechanisms matter for this plan:
   RPC ─────▶│  handle()  ┐                                                                           │
             │            ├─▶ run Lua ─▶ apply_lua_effects() ─▶ drain Shared.loop_ops ──┐             │
   evloop ──▶│  on_loop_event(LoopEvent::{Timer,Process,…})                             │             │
-   events   │            └─▶ run nx._run_cb(id) ─▶ apply_lua_effects() ─▶ run_pending()│ ──▶ redraw  │
+   events   │            └─▶ run btv._run_cb(id) ─▶ apply_lua_effects() ─▶ run_pending()│ ──▶ redraw  │
             │                                                                          │             │
             │                                                LoopCommand  (fire-and-forget, !await)  │
             └────────────────────────────────────────────────────────┼───────────────────────────── ┘
@@ -147,7 +147,7 @@ Two mechanisms matter for this plan:
 **Four mechanisms, introduced across the phases:**
 
 - **A callback registry (Phase 1).** Lua stores deferred functions by integer id
-  in `nx._cb_fns[id]`; `nx._next_cb_id()` allocates, `nx._run_cb(id, …)`
+  in `btv._cb_fns[id]`; `btv._next_cb_id()` allocates, `btv._run_cb(id, …)`
   invokes (and drops one-shots). Rust side: `LuaRuntime::run_callback(id, args)`
   — the `run_keymap` analogue. This is reused by *every* later phase.
 
@@ -181,12 +181,12 @@ by id." Build and test that mechanism once, in isolation, with the simplest
 consumer (`schedule`).
 
 **Scope (files).**
-- `crates/nxvim-lua/src/prelude.lua` — `vim.schedule`, new `nx._cb_fns` /
-  `nx._next_cb_id` / `nx._run_cb`.
-- `crates/nxvim-lua/src/lib.rs` — `Shared.loop_ops`, `LoopOp` enum,
-  `take_loop_ops()`, `LuaRuntime::run_callback(id)`, the `nx._schedule(id)`
+- `crates/bemtvi-lua/src/prelude.lua` — `vim.schedule`, new `btv._cb_fns` /
+  `btv._next_cb_id` / `btv._run_cb`.
+- `crates/bemtvi-lua/src/lib.rs` — `Shared.loop_ops`, `LoopOp` enum,
+  `take_loop_ops()`, `LuaRuntime::run_callback(id)`, the `btv._schedule(id)`
   bridge fn.
-- `crates/nxvim-server/src/lib.rs` — a server-side `scheduled: VecDeque<u64>`,
+- `crates/bemtvi-server/src/lib.rs` — a server-side `scheduled: VecDeque<u64>`,
   drained inside `run_pending`; `apply_lua_effects` forwards `LoopOp::Schedule`
   into it.
 
@@ -194,22 +194,22 @@ consumer (`schedule`).
 
 1. **Registry (Lua).** In the prelude:
    ```lua
-   nx._cb_fns = nx._cb_fns or {}
-   nx._cb_seq = 0
-   function nx._next_cb_id() nx._cb_seq = nx._cb_seq + 1; return nx._cb_seq end
+   btv._cb_fns = btv._cb_fns or {}
+   btv._cb_seq = 0
+   function btv._next_cb_id() btv._cb_seq = btv._cb_seq + 1; return btv._cb_seq end
    -- run a registered callback by id; `keep` true for repeating timers.
-   function nx._run_cb(id, keep, ...)
-     local fn = nx._cb_fns[id]
-     if not keep then nx._cb_fns[id] = nil end   -- one-shot: drop so the registry can't leak
+   function btv._run_cb(id, keep, ...)
+     local fn = btv._cb_fns[id]
+     if not keep then btv._cb_fns[id] = nil end   -- one-shot: drop so the registry can't leak
      if fn then return fn(...) end
    end
    function vim.schedule(fn)
-     local id = nx._next_cb_id()
-     nx._cb_fns[id] = fn
-     nx._schedule(id)        -- Rust bridge: push LoopOp::Schedule{id} onto Shared.loop_ops
+     local id = btv._next_cb_id()
+     btv._cb_fns[id] = fn
+     btv._schedule(id)        -- Rust bridge: push LoopOp::Schedule{id} onto Shared.loop_ops
    end
    ```
-   Mirror `nx._keymap_fns`. **Drop one-shot callbacks after they run** (the
+   Mirror `btv._keymap_fns`. **Drop one-shot callbacks after they run** (the
    `keep == false` path) so the registry doesn't grow unbounded.
 
 2. **Bridge (Rust).** Add to `Shared`:
@@ -217,10 +217,10 @@ consumer (`schedule`).
    loop_ops: Vec<LoopOp>,
    ```
    and `pub enum LoopOp { Schedule { id: u64 }, /* Phase 2+: TimerStart/Stop, Spawn/Kill */ }`,
-   plus `pub fn take_loop_ops(&self) -> Vec<LoopOp>`. Register `nx._schedule`
+   plus `pub fn take_loop_ops(&self) -> Vec<LoopOp>`. Register `btv._schedule`
    (pushes `LoopOp::Schedule { id }`). Add
    `LuaRuntime::run_callback(&self, id: u64) -> mlua::Result<()>` calling
-   `nx._run_cb(id, false)` — the `run_keymap` twin.
+   `btv._run_cb(id, false)` — the `run_keymap` twin.
 
 3. **Drain + drive (server).** In `apply_lua_effects()`, after the `lsp_ops`
    drain, push every `LoopOp::Schedule { id }` onto `self.scheduled`. In
@@ -254,7 +254,7 @@ not a gap.
   or busy-loop: it lands in `self.scheduled` and is picked up by the next
   fixpoint iteration, capped by `MAX_ROUNDS` (echo `E132` on overflow, as today).
 
-**Tests** (`crates/nxvim-server/tests/editing.rs`, black-box per conventions).
+**Tests** (`crates/bemtvi-server/tests/editing.rs`, black-box per conventions).
 Because `vim.schedule` defers within the same handler, assert on **ordering**,
 not wall-clock:
 - A `:lua` chunk that does
@@ -268,7 +268,7 @@ not wall-clock:
   **not** prevent a second scheduled callback from running.
 
 **Done when.** `vim.schedule(fn)` runs `fn` after the current convergence rather
-than inline; the callback registry (`nx._cb_fns` / `_next_cb_id` / `_run_cb`),
+than inline; the callback registry (`btv._cb_fns` / `_next_cb_id` / `_run_cb`),
 `Shared.loop_ops` + `LoopOp::Schedule`, `LuaRuntime::run_callback`, and the
 `run_pending` drain all exist and are exercised by the ordering/error tests
 above. One-shot callbacks are dropped after firing (no registry leak).
@@ -290,16 +290,16 @@ raise that real configs use for deferred-retry patterns; timers are the most
 common `vim.uv` primitive plugins assume.
 
 **Scope (files).**
-- **New:** `crates/nxvim-server/src/evloop.rs` — the actor (`EventLoop` handle +
-  `run_evloop` task), modeled line-for-line on `crates/nxvim-lsp/src/manager.rs`
+- **New:** `crates/bemtvi-server/src/evloop.rs` — the actor (`EventLoop` handle +
+  `run_evloop` task), modeled line-for-line on `crates/bemtvi-lsp/src/manager.rs`
   (`LspManager`/`run_supervisor`).
-- `crates/nxvim-server/src/lib.rs` — construct it in `run()`
+- `crates/bemtvi-server/src/lib.rs` — construct it in `run()`
   (`let (evloop, mut loop_events) = EventLoop::new();`), add the
   `Some(event) = loop_events.recv()` arm, add `on_loop_event`, forward
   `LoopOp::TimerStart`/`TimerStop` from `apply_lua_effects`.
-- `crates/nxvim-lua/src/lib.rs` — `LoopOp::TimerStart { id, delay_ms, repeat_ms }`
-  / `TimerStop { id }`; bridge fns `nx._timer_start` / `nx._timer_stop`.
-- `crates/nxvim-lua/src/prelude.lua` — real `vim.defer_fn`; `vim.uv.new_timer`
+- `crates/bemtvi-lua/src/lib.rs` — `LoopOp::TimerStart { id, delay_ms, repeat_ms }`
+  / `TimerStop { id }`; bridge fns `btv._timer_start` / `btv._timer_stop`.
+- `crates/bemtvi-lua/src/prelude.lua` — real `vim.defer_fn`; `vim.uv.new_timer`
   (and `timer_start`/`timer_stop`) layered on the bridge; `vim.loop` already
   aliases `vim.uv`.
 
@@ -335,24 +335,24 @@ common `vim.uv` primitive plugins assume.
    ```
    `on_loop_event(LoopEvent::Timer{id, keep})` calls
    `self.lua.run_callback_keep(id, keep)` (a `run_callback` variant passing the
-   `keep` flag to `nx._run_cb`, so a repeating timer's fn is retained), then
+   `keep` flag to `btv._run_cb`, so a repeating timer's fn is retained), then
    `apply_lua_effects()`. Coalesce a burst into one repaint, exactly like the
    syntax/LSP arms.
 
 3. **`vim.defer_fn` (prelude).**
    ```lua
    function vim.defer_fn(fn, timeout)
-     local id = nx._next_cb_id(); nx._cb_fns[id] = fn
-     nx._timer_start(id, timeout, 0)         -- one-shot
+     local id = btv._next_cb_id(); btv._cb_fns[id] = fn
+     btv._timer_start(id, timeout, 0)         -- one-shot
      return vim.uv.new_timer_handle(id)       -- a handle with :stop()/:close()
    end
    ```
-   Replace the `nx._notimpl("vim.defer_fn")` raise.
+   Replace the `btv._notimpl("vim.defer_fn")` raise.
 
 4. **`vim.uv` timers (prelude).** `vim.uv.new_timer()` returns a handle table
    carrying a fresh `cb_id`; `handle:start(timeout, repeat, cb)` stores `cb` in
-   `nx._cb_fns[id]` and calls `nx._timer_start(id, timeout, repeat)`;
-   `handle:stop()` and `handle:close()` call `nx._timer_stop(id)` (and drop the
+   `btv._cb_fns[id]` and calls `btv._timer_start(id, timeout, repeat)`;
+   `handle:stop()` and `handle:close()` call `btv._timer_stop(id)` (and drop the
    fn). Repeat semantics: `keep = repeat > 0`, threaded through the actor.
 
 **Test-time observability.** The black-box harness is fully async
@@ -367,7 +367,7 @@ common `vim.uv` primitive plugins assume.
 
 Use a small, generous delay (tens of ms) and a longer wait to keep it
 non-flaky; mirror the timing tolerance of the existing `:sleep` responsiveness
-test in `crates/nxvim/tests/e2e.rs`.
+test in `crates/bemtvi/tests/e2e.rs`.
 
 **Tests.**
 - `vim.defer_fn(fn, ms)` runs `fn` after the delay, not before (the two-barrier
@@ -398,26 +398,26 @@ the architecture doc and the LSP plan both call out) and is the first non-timer
 consumer of the actor — the template the request seam (Phase 4) follows.
 
 **Scope (files).**
-- `crates/nxvim-server/src/evloop.rs` — extend with `LoopCommand::Spawn { id, argv,
+- `crates/bemtvi-server/src/evloop.rs` — extend with `LoopCommand::Spawn { id, argv,
   cwd, env }` / `Kill { id }` and `LoopEvent::ProcessExit { id, code, stdout, stderr }`;
   the task spawns via `tokio::process::Command`, awaits `output()`/`wait_with_output()`,
   sends the exit event. (`tokio` already has the `process` feature.)
-- `crates/nxvim-lua/src/lib.rs` — `LoopOp::Spawn`/`Kill`; a `nx._system_async(id,
+- `crates/bemtvi-lua/src/lib.rs` — `LoopOp::Spawn`/`Kill`; a `btv._system_async(id,
   cmd, cwd, env)` bridge that returns the child **pid** synchronously (so the
   handle is real) while the wait happens in the actor. Keep the existing blocking
-  `nx._system` for `:wait()`.
-- `crates/nxvim-lua/src/prelude.lua` — rework `vim.system` to register `on_exit`
+  `btv._system` for `:wait()`.
+- `crates/bemtvi-lua/src/prelude.lua` — rework `vim.system` to register `on_exit`
   under a `cb_id` and go async when an `on_exit` is supplied.
 
 **Approach & the `:wait()` decision.** neovim's `vim.system():wait()` pumps the
 event loop until the child exits; replicating that on a single thread is the
 sharp edge. Take the **pragmatic split** that keeps every current caller working:
 
-- **`on_exit` given** → async. Register `on_exit` in `nx._cb_fns[id]`, queue
+- **`on_exit` given** → async. Register `on_exit` in `btv._cb_fns[id]`, queue
   `LoopOp::Spawn{id,…}`; the actor runs the child and sends `ProcessExit`;
-  `on_loop_event` builds the result table and calls `nx._run_cb(id, false, result)`.
+  `on_loop_event` builds the result table and calls `btv._run_cb(id, false, result)`.
   Off-tick, non-blocking.
-- **`:wait()` called** → synchronous. Keep today's blocking `nx._system`
+- **`:wait()` called** → synchronous. Keep today's blocking `btv._system`
   (`std::process::Command::output()`), which is exactly what an `lsp/*.lua`
   `root_dir` needs (`cargo metadata`, `rustc --print sysroot`) and is short by
   construction. `:wait()` calls it and returns the complete result.
@@ -432,7 +432,7 @@ that keeps the config sweep green; the config path uses `:wait()` **without**
 `on_exit`, so the blocking branch covers it.
 
 - **`pid`/`kill`.** The async spawn returns the OS pid (the prelude currently
-  reads `result.pid`, which `nx._system` never sets — fix that too).
+  reads `result.pid`, which `btv._system` never sets — fix that too).
   `handle:kill(signal)` queues `LoopOp::Kill{id}`; the actor signals/aborts the
   child.
 
@@ -443,7 +443,7 @@ that keeps the config sweep green; the config path uses `:wait()` **without**
 - A `vim.system(...):wait()` with **no** `on_exit` still returns the complete
   `{code, stdout, stderr}` synchronously (the `root_dir` path — regression
   guard).
-- The existing `crates/nxvim-lua/tests/lspconfig_configs.rs` sweep stays green
+- The existing `crates/bemtvi-lua/tests/lspconfig_configs.rs` sweep stays green
   (the synchronous `:wait()` branch unchanged for config resolution).
 
 **Done when.** `vim.system` with `on_exit` runs the child asynchronously and
@@ -462,7 +462,7 @@ is retired (and the doc updated).
 **Goal.** Generalize the "issue async work → off-tick Lua callback" path into the
 reusable seam LSP **completion-plan Phase 5** (`client:request`) plugs into,
 harden the whole runtime against leaks/re-entrancy/ordering bugs, and tidy the
-`nx._notimpl` scoreboard.
+`btv._notimpl` scoreboard.
 
 **Why.** The loop's *point* is to let other subsystems hand work off and get a
 Lua callback back later. LSP `client:request(method, params, handler)` is the
@@ -471,9 +471,9 @@ round-trips). This phase makes that handoff a documented primitive rather than a
 per-consumer hack, and pays down the robustness items that are easy to get wrong
 under concurrency.
 
-**Scope (files).** `crates/nxvim-lua/src/lib.rs` (the seam API + `run_callback`
-variants), `crates/nxvim-server/src/lib.rs` (the central `settle()` helper),
-`crates/nxvim-lua/src/prelude.lua` (`vim.schedule_wrap`, any now-implementable
+**Scope (files).** `crates/bemtvi-lua/src/lib.rs` (the seam API + `run_callback`
+variants), `crates/bemtvi-server/src/lib.rs` (the central `settle()` helper),
+`crates/bemtvi-lua/src/prelude.lua` (`vim.schedule_wrap`, any now-implementable
 stubs), plus a short note in `docs/plans/2026-06-05-lsp-completion.md` Phase 5 pointing at
 the seam.
 
@@ -488,9 +488,9 @@ the seam.
      `lua.run_callback_with(id, payload_as_lua)`.
    For LSP specifically: `client:request` queues an `LspOp`-style request
    carrying a `cb_id`; the `LspManager` already correlates replies by `ReqToken`
-   (`crates/nxvim-lsp/src/manager.rs`) — thread the `cb_id` alongside the token so
+   (`crates/bemtvi-lsp/src/manager.rs`) — thread the `cb_id` alongside the token so
    `LspEvent::Reply` carries it back, and `on_lsp_event` runs
-   `nx._run_cb(cb_id, false, err, result)`. (The wiring lives in the LSP plan;
+   `btv._run_cb(cb_id, false, err, result)`. (The wiring lives in the LSP plan;
    **this** plan owns the callback-dispatch primitive it calls.)
 
 2. **`vim.schedule_wrap(fn)`** — returns a function that, when called, schedules
@@ -498,9 +498,9 @@ the seam.
 
 3. **Robustness pass (audit across all phases).**
    - **No registry leaks.** Every one-shot path (`schedule`, `defer_fn`,
-     `system` `on_exit`, a `request` handler) drops its `nx._cb_fns[id]` after
+     `system` `on_exit`, a `request` handler) drops its `btv._cb_fns[id]` after
      firing; repeating timers drop on `:stop()`/`:close()`. Add a test that a
-     long sequence of one-shots leaves `nx._cb_fns` empty.
+     long sequence of one-shots leaves `btv._cb_fns` empty.
    - **Ordering.** Two timers with the same deadline, and a `schedule` plus a
      `defer_fn(…, 0)`, fire in a defined, documented order (FIFO by enqueue).
    - **Re-entrancy & the `MAX_ROUNDS` cap.** A callback that re-arms itself every
@@ -522,10 +522,10 @@ the seam.
 **Tests.**
 - A Rust-registered callback fired from a simulated async completion runs on a
   later tick with its payload (drive through the mock in
-  `crates/nxvim-lsp/src/mock.rs` if wiring the LSP end, else a unit-style
+  `crates/bemtvi-lsp/src/mock.rs` if wiring the LSP end, else a unit-style
   black-box through `vim.system`).
 - `vim.schedule_wrap` defers correctly.
-- The leak test (`nx._cb_fns` empty after N one-shots) and the ordering test.
+- The leak test (`btv._cb_fns` empty after N one-shots) and the ordering test.
 
 **Done when.** There is a single documented callback-dispatch primitive both
 `vim.system`/timers and a Rust subsystem use; `vim.schedule_wrap` works; the
@@ -544,7 +544,7 @@ actual loop (actor + the wall-clock wake); Phase 3 proves the actor on a second
 consumer; Phase 4 generalizes the seam and hardens. After Phase 2, `vim.defer_fn`
 leaves the `_notimpl` scoreboard; after Phase 4, the LSP back half is unblocked.
 
-**The running scoreboard is `nx._notimpl_hits`** (introduced in LSP Phase 0).
+**The running scoreboard is `btv._notimpl_hits`** (introduced in LSP Phase 0).
 Re-run a real config after each phase; the set shrinks. This plan directly clears
 `vim.defer_fn`; it *unblocks* (for the LSP plan to clear) the deferred-callback
 surface — `client:request`, the `vim.lsp.util.*` round-trips, `vim.ui.*`.
@@ -555,7 +555,7 @@ surface — `client:request`, the `vim.lsp.util.*` round-trips, `vim.ui.*`.
 
 The conventions are unchanged (`architecture.md` → *Testing philosophy*): **no
 unit tests**; drive a real server over RPC and assert on observable state
-(`crates/nxvim-server/tests/editing.rs`, helpers `start`/`feed`/`lines`/`cursor`).
+(`crates/bemtvi-server/tests/editing.rs`, helpers `start`/`feed`/`lines`/`cursor`).
 Two patterns cover the async surface:
 
 1. **Deferred-within-a-tick (Phase 1, `vim.schedule`).** The effect lands in the
@@ -573,7 +573,7 @@ Two patterns cover the async surface:
    `lines(&rpc).await` is the barrier (the harness comment already notes it
    doubles as one). Keep delays generous (tens of ms set, ~2–3× wait) to stay off
    the flaky edge, matching the `:sleep` responsiveness test in
-   `crates/nxvim/tests/e2e.rs`.
+   `crates/bemtvi/tests/e2e.rs`.
 
 A guard worth adding once: a callback scheduled/deferred from a "fast" context
 must still be applied, and a UI that never drains redraws must not stall the

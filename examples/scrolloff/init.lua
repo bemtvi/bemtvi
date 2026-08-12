@@ -1,9 +1,9 @@
--- ~~~ nxvim 'scrolloff' (and 'wrap'): keep context around the cursor ~~~
+-- ~~~ bemtvi 'scrolloff' (and 'wrap'): keep context around the cursor ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/scrolloff \
---       cargo run -p nxvim -- examples/scrolloff/sample.txt
+--     BEMTVI_CONFIG=examples/scrolloff \
+--       cargo run -p bemtvi -- examples/scrolloff/sample.txt
 --
 -- 'scrolloff' is the VERTICAL scroll margin — the number of screen lines the
 -- editor keeps above AND below the cursor. With it set, the viewport scrolls
@@ -23,7 +23,7 @@
 -- window option.
 vim.opt.scrolloff = 8
 
--- 'wrap' is the other viewport option this demo shows. nxvim is `nowrap` by
+-- 'wrap' is the other viewport option this demo shows. bemtvi is `nowrap` by
 -- default (a long line is clipped and the viewport pans sideways — see
 -- `examples/horizontal-scroll/`). Turning 'wrap' ON lays a long line across
 -- several screen rows instead, so nothing scrolls off to the right. It, too, is a

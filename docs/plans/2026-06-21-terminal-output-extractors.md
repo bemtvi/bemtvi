@@ -17,10 +17,10 @@ stream of finalized terminal output.
 
 ## Guiding constraints
 
-- **Dogfood the `nx.*` plugin API.** Triggers, region semantics, ref-parsing and
+- **Dogfood the `btv.*` plugin API.** Triggers, region semantics, ref-parsing and
   loclist policy are *policy* — they belong in a Lua plugin, not calcified in
   Rust. Rust ships only a generic output stream that *any* terminal-scraping
-  plugin can build on. (See [[dogfood-nx-plugin-api]].)
+  plugin can build on. (See [[dogfood-btv-plugin-api]].)
 - **Reuse existing machinery.** The event registry, autocmd version-gating, and
   the loclist/quickfix write path already exist; this feature is mostly wiring.
   (See [[reuse-existing-apis-before-new-ones]].)
@@ -33,11 +33,11 @@ stream of finalized terminal output.
 
 Terminal output reaches the buffer by **splice**, not append:
 
-- `EditHost::terminal_feed()` (`crates/nxvim-server/src/terminal.rs:155`) pushes
+- `EditHost::terminal_feed()` (`crates/bemtvi-server/src/terminal.rs:155`) pushes
   raw PTY bytes through the vt100 parser.
 - `EditHost::terminal_project()` (`terminal.rs:326`) runs once per repaint and
   splices `history` + the live screen into the buffer via
-  `Editor::terminal_update()` (`crates/nxvim-core/src/editor/terminal.rs:176`).
+  `Editor::terminal_update()` (`crates/bemtvi-core/src/editor/terminal.rs:176`).
 
 So a buffer-attach `on_lines` observer is fragile for terminals: the **live
 screen region is constantly rewritten** (cursor moves, spinners, progress bars)
@@ -78,12 +78,12 @@ costs nothing unless something opts in.
 
 | Need | Existing machinery |
 |---|---|
-| Fire an event to Lua | `fire_autocmd_data(event, pattern, buf, file, …)` (`crates/nxvim-lua/src/runtime.rs:2065`) — already carries an `args.data` payload (LspAttach uses it) |
-| Dispatch to handlers | `nx._fire(event, pattern, buf, file, data)` (`prelude/autocmd.lua:285`) |
-| Register a handler | `nx.autocmd.create` / `nx.on` (`autocmd.lua:199`) |
-| Cost nothing when unobserved | `nx._au_version` gating — server only fires events Lua has registered for (`autocmd.lua:41`) |
+| Fire an event to Lua | `fire_autocmd_data(event, pattern, buf, file, …)` (`crates/bemtvi-lua/src/runtime.rs:2065`) — already carries an `args.data` payload (LspAttach uses it) |
+| Dispatch to handlers | `btv._fire(event, pattern, buf, file, data)` (`prelude/autocmd.lua:285`) |
+| Register a handler | `btv.autocmd.create` / `btv.on` (`autocmd.lua:199`) |
+| Cost nothing when unobserved | `btv._au_version` gating — server only fires events Lua has registered for (`autocmd.lua:41`) |
 | Finalized output rows | `TermEmu::history` growth; `read_scrollback_text()` (`terminal.rs:500`) |
-| Populate a loclist | `vim.fn.setloclist(win, items, action)`; or `nx._qf_populate(lines, efm, …)` (`install.rs:2492`) to parse raw lines through an errorformat |
+| Populate a loclist | `vim.fn.setloclist(win, items, action)`; or `btv._qf_populate(lines, efm, …)` (`install.rs:2492`) to parse raw lines through an errorformat |
 
 ## Seams (the only non-trivial parts)
 
@@ -98,7 +98,7 @@ costs nothing unless something opts in.
    existing `^C` flood-trim policy).
 
 2. **`history` is server-side; the event must fire from the projection tick.**
-   `terminal_project()` lives in `nxvim-server` and already holds `editor` +
+   `terminal_project()` lives in `bemtvi-server` and already holds `editor` +
    the Lua runtime handle at repaint. Fire `TermOutput` from there, after the
    splice, with `data = { lines = <delta> }` and the terminal `buf` as both the
    pattern target and `args.buf`. Version-gate: skip the delta bookkeeping
@@ -120,7 +120,7 @@ event).
 
 ```lua
 -- committed-only (default): settled output, append-only
-nx.autocmd.create("TermOutput", {
+btv.autocmd.create("TermOutput", {
   callback = function(ev)
     -- ev.buf        = terminal buffer
     -- ev.data.lines = { "finalized", "rows", ... }   -- append-only, immutable
@@ -128,7 +128,7 @@ nx.autocmd.create("TermOutput", {
 })
 
 -- live: also see the current screen tail as it's drawn
-nx.autocmd.create("TermOutput", {
+btv.autocmd.create("TermOutput", {
   pattern = "live",                                   -- opt into the live tail
   callback = function(ev)
     -- ev.data.lines       = rows for this frame
@@ -162,7 +162,7 @@ end
 
 The Claude-Code → loclist plugin is then just an `extractor` whose `process`
 pulls `path:line:col` refs out of the block and calls `vim.fn.setloclist` (or
-hands the raw lines to `nx._qf_populate` with an errorformat).
+hands the raw lines to `btv._qf_populate` with an errorformat).
 
 ## Phases (commit + pause for review between each — [[big-feature-workflow-cadence]])
 
@@ -193,7 +193,7 @@ hands the raw lines to `nx._qf_populate` with an errorformat).
 
 ### Phase 3 — Lua extractor helper + example plugin
 - Ship the `extractor` region-state-machine helper in the prelude (generally
-  useful for plugin authors — [[expose-general-helpers-in-nx]]).
+  useful for plugin authors — [[expose-general-helpers-in-btv]]).
 - Build a runnable `examples/terminal-loclist/` config: a Claude-Code file-ref
   extractor wired to `setloclist`, with a sample transcript fixture, verified
   end-to-end ([[example-config-for-testing]]).

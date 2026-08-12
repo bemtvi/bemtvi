@@ -1,0 +1,146 @@
+/// The editor's current input mode.
+///
+/// Mirrors vim's modes. The set is deliberately small and grows
+/// (operator-pending, select, etc.) as the editor matures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Insert,
+    Replace,
+    Visual,
+    VisualLine,
+    /// Command-line mode (`:` ex commands).
+    Command,
+    /// Multi-cursor *placement* mode (bemtvi-specific, entered with `<A-c>`).
+    /// Motions move only the active (primary) cursor so you can navigate and drop
+    /// cursors (`c` / `{count}c{motion}`); leaving with `<Esc>` keeps the placed
+    /// cursors and returns to Normal, where motions and edits act on them all.
+    MultiCursor,
+    /// Vim's *Select* mode (`v_CTRL-G`): a byte range is highlighted like a Visual
+    /// selection, but a printable / `<CR>` / `<BS>` **replaces** it — deleting the
+    /// range and entering Insert with that input — the type-over-default behavior a
+    /// snippet engine (or a rename/paired-edit widget) wants for a placeholder. Its
+    /// selection reuses the Visual anchor (`visual_anchor`/`cursor`, charwise) but
+    /// its keys route through a dedicated handler, not the Visual command grammar,
+    /// so it is *not* reported by [`Mode::is_visual`]. Entered over a range with
+    /// `btv.win.select_range` (there is no keystroke to enter it from Normal — it is a
+    /// primitive a plugin drives, not a muscle-memory mode).
+    Select,
+    /// Helix's selection-first *normal* mode (opt-in — see the helix editing model
+    /// plan). Every cursor is a persistent `anchor..head` range, not a point: a
+    /// motion *re-selects* (word/find motions set the anchor to the old head; plain
+    /// h/j/k/l motions collapse the range to a 1-wide block at the target).
+    /// Distinct from [`Mode::Normal`] because the same motion keys mean something
+    /// different here (noun→verb, no operator-pending wait). `v` toggles
+    /// [`Mode::HelixSelect`].
+    HelixNormal,
+    /// Helix's *select* (extend) mode — [`Mode::HelixNormal`] with every motion
+    /// growing the selection: only the `head` moves, the `anchor` stays put. `v`
+    /// enters it from Helix-normal, `<Esc>` returns.
+    HelixSelect,
+    /// Terminal-job mode: the current buffer hosts a live PTY child process and
+    /// keystrokes are forwarded to it as input bytes (vim/neovim's `t` mode).
+    /// `<C-\><C-n>` leaves to Normal, where the terminal buffer reads as ordinary
+    /// (read-only) text for scrolling / yanking.
+    Terminal,
+}
+
+/// Which key-handling context owns input right now — the buffer being edited, or a
+/// grabbing widget that routes keys through its **own** keymap bucket.
+///
+/// The keymap engine selects a trie by this rather than [`Mode`] alone: an
+/// `Editing` context uses the per-mode trie with the command-grammar disambiguation
+/// oracle and the literal-argument bypass; a widget context uses that widget's
+/// dedicated bucket (`vim.keymap.set('picker', …)`) with neither (a widget has no
+/// core command grammar). Each grabbing widget — picker, select — has its own
+/// context variant below; the cmdline routes through the `'c'` mode bucket instead.
+/// The explorer / `btv.view` / quickfix buffers, and the read-only scratch / loclist
+/// listings (`:messages` / `:ls` / `:marks` / …), are *not* widgets (they are ordinary
+/// `nomodifiable` buffers with buffer-local activation maps), so they stay `Editing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyContext {
+    /// The buffer — the normal/insert/visual/… per-mode trie applies.
+    Editing,
+    /// A prompted fuzzy picker (`btv.picker`) grabs input; its `picker` bucket applies.
+    Picker,
+    /// A promptless selectable list (`btv.ui.select`) grabs input; its `select`
+    /// bucket applies. No query — every key is a map (an unmapped key is inert).
+    Select,
+}
+
+impl Mode {
+    /// Short uppercase label shown in the status line, e.g. `NORMAL`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Replace => "REPLACE",
+            Mode::Visual => "VISUAL",
+            Mode::VisualLine => "V-LINE",
+            Mode::Command => "COMMAND",
+            Mode::MultiCursor => "MULTICURSOR",
+            Mode::Select => "SELECT",
+            Mode::HelixNormal => "HELIX",
+            Mode::HelixSelect => "HELIX-SEL",
+            Mode::Terminal => "TERMINAL",
+        }
+    }
+
+    /// The single-letter mode code used by vim's `mode()` builtin.
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Mode::Normal => "n",
+            Mode::Insert => "i",
+            Mode::Replace => "R",
+            Mode::Visual => "v",
+            Mode::VisualLine => "V",
+            Mode::Command => "c",
+            // bemtvi-specific placement mode — no vim equivalent. Reports its own code
+            // `m` (matching the `'m'` keymap trie) so a `mode()`-reading plugin (e.g.
+            // the statusline) can detect it and a Normal↔MultiCursor swap is a real
+            // `ModeChanged` (`n:m`). Editing behaviour is still normal-like (motions
+            // move the primary cursor); only the *reported* code differs.
+            Mode::MultiCursor => "m",
+            // Vim's Select-mode code. Reported so a `mode()`-reading plugin (the
+            // statusline, a snippet engine watching `ModeChanged`) can tell it apart
+            // from Visual (`v`), and so the keymap engine selects an `'s'` trie for it
+            // (see `bemtvi-server`'s `mode_key`) rather than leaking Visual (`v`) maps in.
+            Mode::Select => "s",
+            // bemtvi-specific Helix modes — no vim equivalent, so they report their
+            // own multi-char codes (`hn`/`hs`). Distinct from `n`/`v` so a
+            // Normal↔Helix swap is a real `ModeChanged` and a plugin can tell them
+            // apart; the keymap *bucket* is decided separately (see
+            // `keymap::mode_key`), so the reported code need not be a single char.
+            Mode::HelixNormal => "hn",
+            Mode::HelixSelect => "hs",
+            Mode::Terminal => "t",
+        }
+    }
+
+    /// Whether this is the bemtvi-specific multi-cursor *placement* mode.
+    pub fn is_multicursor(self) -> bool {
+        matches!(self, Mode::MultiCursor)
+    }
+
+    pub fn is_insert(self) -> bool {
+        matches!(self, Mode::Insert | Mode::Replace)
+    }
+
+    pub fn is_visual(self) -> bool {
+        matches!(self, Mode::Visual | Mode::VisualLine)
+    }
+
+    /// Whether this is one of the Helix selection-first modes (normal or select).
+    pub fn is_helix(self) -> bool {
+        matches!(self, Mode::HelixNormal | Mode::HelixSelect)
+    }
+
+    /// Whether a persistent selection highlight (anchor→head) should render in this
+    /// mode: vim's visual modes *and* the Helix modes, whose primary range lives in
+    /// `visual_anchor`/`cursor` exactly like a visual selection. The seam the
+    /// selection projection and the shared [`Range`](crate::editor) model consult
+    /// so Helix selections reuse the visual-selection rendering wholesale.
+    pub fn shows_selection(self) -> bool {
+        self.is_visual() || self.is_helix()
+    }
+}

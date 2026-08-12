@@ -1,6 +1,6 @@
--- ~~~ nxvim nx.decor playground: invalidating a provider when its DATA changes ~~~
+-- ~~~ bemtvi btv.decor playground: invalidating a provider when its DATA changes ~~~
 --
--- A `nx.decor` provider is woken by the VIEWPORT: scroll, resize, or an edit to the
+-- A `btv.decor` provider is woken by the VIEWPORT: scroll, resize, or an edit to the
 -- visible slice. That covers every decoration derived from the buffer text (see
 -- `examples/rainbow/` and `examples/decor-todo/`). It does NOT cover a decoration
 -- derived from something else — git blame that comes back off a promise, an LSP
@@ -9,18 +9,18 @@
 -- brackets, so nothing about the viewport moved, and without a signal the screen keeps
 -- showing the old colours until you happen to scroll or type.
 --
--- `nx.decor.invalidate` is that signal: "my data changed, run me again". It marks the
+-- `btv.decor.invalidate` is that signal: "my data changed, run me again". It marks the
 -- windows you scope it to, and the engine re-dispatches them (off the frame, with a
 -- fresh generation token) exactly as a scroll would.
 --
---     nx.decor.invalidate()                  -- every visible window
---     nx.decor.invalidate({ buf = 0 })       -- every window showing this buffer
---     nx.decor.invalidate({ win = 0 })       -- just this window
+--     btv.decor.invalidate()                  -- every visible window
+--     btv.decor.invalidate({ buf = 0 })       -- every window showing this buffer
+--     btv.decor.invalidate({ win = 0 })       -- just this window
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/decor-invalidate \
---       cargo run -p nxvim -- examples/decor-invalidate/sample.txt
+--     BEMTVI_CONFIG=examples/decor-invalidate \
+--       cargo run -p bemtvi -- examples/decor-invalidate/sample.txt
 --
 -- Two things to try, below.
 
@@ -29,11 +29,11 @@
 --    state, not buffer text, so the viewport signal knows nothing about it.
 --    Nothing here is special: an ordinary provider publishing hl-only marks.
 --------------------------------------------------------------------------------
-nx.hl.define(0, "TooLong", { fg = "#f38ba8", bold = true })
+btv.hl.define(0, "TooLong", { fg = "#f38ba8", bold = true })
 
 local state = { limit = nil } -- nil until the async "config" lands (section 2)
 
-nx.decor.provider({
+btv.decor.provider({
   name = "long-lines",
   on_range = function(ctx, publish)
     -- No data yet ⇒ publish nothing. A provider always publishes: an empty list is
@@ -59,13 +59,13 @@ nx.decor.provider({
 --    answer reach the screen.
 --
 --    SEE THAT: open the sample and sit still. The long lines stay plain for a beat,
---    then light up on their own. No key was pressed. Delete the `nx.decor.invalidate`
+--    then light up on their own. No key was pressed. Delete the `btv.decor.invalidate`
 --    line below and they never light up at all until you scroll or edit.
 --------------------------------------------------------------------------------
-nx.promise.delay(400):next(function()
+btv.promise.delay(400):next(function()
   state.limit = 48
-  nx.decor.invalidate({ buf = 0 })
-  print("nx.decor: limit arrived (48) — invalidate repainted with no input")
+  btv.decor.invalidate({ buf = 0 })
+  print("btv.decor: limit arrived (48) — invalidate repainted with no input")
 end)
 
 --------------------------------------------------------------------------------
@@ -81,13 +81,13 @@ end)
 --    and the scope wakes EVERY window showing it — try `:split` first and watch both
 --    halves repaint from the one call.
 --------------------------------------------------------------------------------
-nx.command("Limit", function(opts)
+btv.command("Limit", function(opts)
   local n = tonumber(opts.args)
   if not n then
-    return nx.notify("Limit: expects a number, e.g. :Limit 20", "error")
+    return btv.notify("Limit: expects a number, e.g. :Limit 20", "error")
   end
   state.limit = n
-  nx.decor.invalidate({ buf = 0 })
+  btv.decor.invalidate({ buf = 0 })
 end, { nargs = 1, desc = "set the long-line limit and repaint the decor provider" })
 
 --------------------------------------------------------------------------------
@@ -106,4 +106,4 @@ end, { nargs = 1, desc = "set the long-line limit and repaint the decor provider
 
 vim.o.number = true
 
-print("nx.decor.invalidate: wait ~400ms for the async limit, then try :Limit 20")
+print("btv.decor.invalidate: wait ~400ms for the async limit, then try :Limit 20")

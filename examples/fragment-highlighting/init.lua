@@ -2,8 +2,8 @@
 -- Fragment highlighting — colouring code that isn't a whole program.
 --
 -- Run:
---   NXVIM_CONFIG=examples/fragment-highlighting \
---     cargo run -p nxvim -- examples/fragment-highlighting/sample.txt
+--   BEMTVI_CONFIG=examples/fragment-highlighting \
+--     cargo run -p bemtvi -- examples/fragment-highlighting/sample.txt
 --
 -- Needs the `rust` and `python` grammars installed (`:TSInstall rust python`) —
 -- the doc blocks below are rust and python, and with no grammar for a block's
@@ -25,14 +25,14 @@
 --
 -- `field: Vec<String>` is not a rust program — parsed as one it lands in error
 -- recovery, which invents a construct and paints `Vec` as a @constructor. The
--- shipped framing for rust wraps it in `struct __nx { ... }`, which *is* a
+-- shipped framing for rust wraps it in `struct __btv { ... }`, which *is* a
 -- program, so the colours come from a real parse.
 --
 -- Type-this:  i f i e <C-n>
 -- See-that:   in the float, `Vec` and `String` are TYPE-coloured (the same colour
 --             a type has in a real .rs buffer), and `field` is a property.
 --------------------------------------------------------------------------------
-nx.complete.source({
+btv.complete.source({
   name = "hoverdemo",
   debounce = 0,
   complete = function(ctx)
@@ -64,7 +64,7 @@ nx.complete.source({
     end
   end,
 })
-nx.complete.setup({ sources = { { "hoverdemo" } } })
+btv.complete.setup({ sources = { { "hoverdemo" } } })
 
 --------------------------------------------------------------------------------
 -- 2. A DIALECT is left alone rather than guessed at.
@@ -127,20 +127,20 @@ nx.complete.setup({ sources = { { "hoverdemo" } } })
 -- Type-this:  (nothing — this runs at startup)
 -- See-that:   section 1 still works; the extra framing is simply tried in turn.
 --------------------------------------------------------------------------------
-nx.treesitter.fragment_context("rust", {
-  "struct __nx {\n%s\n}", -- fields
-  "fn __nx() {\n%s\n}", -- statements and expressions
-  "impl __nx {\n%s\n}", -- associated items
-  "trait __nx {\n%s\n}", -- bare signatures
+btv.treesitter.fragment_context("rust", {
+  "struct __btv {\n%s\n}", -- fields
+  "fn __btv() {\n%s\n}", -- statements and expressions
+  "impl __btv {\n%s\n}", -- associated items
+  "trait __btv {\n%s\n}", -- bare signatures
 })
 
 -- An INDENTING framing: the `%s` follows four spaces, so the whole fragment is
 -- placed inside the class body at that level, not just its first line.
-nx.treesitter.fragment_context("python", {
+btv.treesitter.fragment_context("python", {
   "%s:\n    pass\n", -- a header with no body: def / class / if / for / with
-  "class __nx:\n%s", -- a member block that already carries its indentation
-  "class __nx:\n    %s", -- a flush member block: indented line by line
-  "def __nx():\n    %s", -- a flush statement block, likewise
+  "class __btv:\n%s", -- a member block that already carries its indentation
+  "class __btv:\n    %s", -- a flush member block: indented line by line
+  "def __btv():\n    %s", -- a flush statement block, likewise
   "def %s:\n    pass\n", -- a BARE signature: the `def` a hover dropped
 })
 
@@ -155,12 +155,12 @@ nx.treesitter.fragment_context("python", {
 --             either: the highlighter would rather say nothing than guess.
 --             `:FragmentLadderOn` puts the framings back.
 --------------------------------------------------------------------------------
-nx.command("FragmentLadderOff", function()
-  nx.treesitter.fragment_context("rust", {})
-  nx.notify("rust fragment framings: off")
+btv.command("FragmentLadderOff", function()
+  btv.treesitter.fragment_context("rust", {})
+  btv.notify("rust fragment framings: off")
 end, {})
 
-nx.command("FragmentLadderOn", function()
-  nx.treesitter.fragment_context("rust", { "struct __nx {\n%s\n}", "fn __nx() {\n%s\n}" })
-  nx.notify("rust fragment framings: on")
+btv.command("FragmentLadderOn", function()
+  btv.treesitter.fragment_context("rust", { "struct __btv {\n%s\n}", "fn __btv() {\n%s\n}" })
+  btv.notify("rust fragment framings: on")
 end, {})

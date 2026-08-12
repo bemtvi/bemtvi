@@ -8,10 +8,10 @@ Two linked asks:
    GitHub repo, not only from nvim-treesitter's curated `parsers.lua` catalog.
 2. Grammars declare which file extensions they apply to (modern grammars ship a
    `tree-sitter.json` with `grammars[].file-types`, e.g. `tree-sitter-ruby →
-   ["rb"]`; older ones use a `tree-sitter` array in `package.json`). nxvim
+   ["rb"]`; older ones use a `tree-sitter` array in `package.json`). bemtvi
    currently ignores these — extension→language detection comes *only* from the
-   static `EXT_FILETYPE` const in `nxvim-core`. A grammar installed from an
-   arbitrary repo has no catalog entry and no `EXT_FILETYPE` row, so nxvim would
+   static `EXT_FILETYPE` const in `bemtvi-core`. A grammar installed from an
+   arbitrary repo has no catalog entry and no `EXT_FILETYPE` row, so bemtvi would
    compile it but never auto-detect the files it highlights.
 
 The canonical fix for (2) is what makes (1) actually useful: read the grammar's
@@ -42,11 +42,11 @@ of that type detects the filetype and highlights it.
 
 ### Phase 1 — repo install mechanics (native) + read declared file-types
 
-- Parse the spec in `nxvim_ts::install::install`: a token containing `/` is a
+- Parse the spec in `bemtvi_ts::install::install`: a token containing `/` is a
   repo spec (`owner/repo[@ref]`), else today's catalog language.
 - New `install_from_repo`:
   - Fetch `https://github.com/{o}/{r}/archive/{ref}.tar.gz` (ref default `HEAD`),
-    unpack, `single_subdir` (reuse existing helpers + `$NXVIM_TS_MIRROR` seam).
+    unpack, `single_subdir` (reuse existing helpers + `$BEMTVI_TS_MIRROR` seam).
   - Read grammar metadata: `tree-sitter.json` (`grammars[]`: `name`, `file-types`,
     `path`), falling back to `package.json`'s `tree-sitter` array. Derive the
     language from `name`, else the repo name minus a `tree-sitter-` prefix
@@ -60,7 +60,7 @@ of that type detects the filetype and highlights it.
 - `InstallReport` gains `file_types`; the catalog path sets it empty. The install
   echo reports the declared file-types.
 - wasm `:TSInstall` arm rejects a repo spec loudly.
-- Tests (hermetic, black-box via `$NXVIM_TS_MIRROR`): a fixture repo tarball
+- Tests (hermetic, black-box via `$BEMTVI_TS_MIRROR`): a fixture repo tarball
   (reusing tree-sitter-rust's `src/` for a real `parser.c`) plus a
   `tree-sitter.json` declaring `name`/`file-types`; assert the parser compiles,
   the grammar loads, and the report carries the declared file-types. A parse-shape
@@ -73,7 +73,7 @@ of that type detects the filetype and highlights it.
 
 - New per-data-dir manifest of ext→lang registrations harvested from installs
   (the `file_types` field). Loaded at boot, extended on each completed install.
-- `nxvim-core` `language_of_path` / `buffer_filetype` consult this dynamic layer
+- `bemtvi-core` `language_of_path` / `buffer_filetype` consult this dynamic layer
   *over* the static `EXT_FILETYPE` const (const remains the built-in base; the
   registry adds custom grammars). Single new read seam; no read-site rewrite
   beyond threading the registry into the core.
@@ -86,16 +86,16 @@ of that type detects the filetype and highlights it.
 ### Phase 3 — surfacing & polish
 
 - `:TSInstallInfo` lists custom grammars and their registered file-types.
-- Consider an explicit `nx.filetype.add` / `vim.filetype.add`-style API so config
+- Consider an explicit `btv.filetype.add` / `vim.filetype.add`-style API so config
   can register ext→lang without an install (the same registry, public surface).
-- Docs (the `nx` book page for treesitter) + an `examples/` walkthrough.
+- Docs (the `btv` book page for treesitter) + an `examples/` walkthrough.
 
 ## Key files
 
-- `crates/nxvim-ts/src/install.rs` — install pipeline; add `install_from_repo`,
+- `crates/bemtvi-ts/src/install.rs` — install pipeline; add `install_from_repo`,
   spec parsing, `tree-sitter.json`/`package.json` reader, `InstallReport.file_types`.
-- `crates/nxvim-server/src/excmd.rs` — `ts_install` arms; wasm repo-spec guard;
+- `crates/bemtvi-server/src/excmd.rs` — `ts_install` arms; wasm repo-spec guard;
   echo declared file-types; (Phase 2) register + persist in `on_install_done`.
-- `crates/nxvim-core/src/editor/mod.rs` — (Phase 2) dynamic ext→lang registry over
+- `crates/bemtvi-core/src/editor/mod.rs` — (Phase 2) dynamic ext→lang registry over
   `EXT_FILETYPE`, consulted by `language_of_path` / `buffer_filetype`.
-- `crates/nxvim/tests/ts_install.rs` — fixtures + black-box coverage.
+- `crates/bemtvi/tests/ts_install.rs` — fixtures + black-box coverage.

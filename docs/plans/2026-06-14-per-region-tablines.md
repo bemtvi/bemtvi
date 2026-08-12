@@ -7,7 +7,7 @@
 ## Context
 
 The permanent-docks feature (landed 2026-06-14, `docs/plans/2026-06-14-permanent-docked-panels.md`)
-gave nxvim VSCode-style edge regions: a *focused layer*'s `WindowTree` is always live on
+gave bemtvi VSCode-style edge regions: a *focused layer*'s `WindowTree` is always live on
 `Editor::windows`; non-focused layers park in `Editor::docks: [Option<WindowTree>; 4]` /
 `Editor::main_parked`. Layers: `Main`, `Dock(Left|Right|Top|Bottom)`.
 
@@ -85,8 +85,8 @@ byte-identical to today: docks stay single-tab, tabs stay main-only (tab ops kee
 
 Files: `editor/mod.rs`, `editor/dock.rs`, `editor/tabs.rs`, `editor/windows.rs`, and the
 `self.tabs`/`current_tab`/`main_parked`/`docks` read sites in `editor/{jumps,ex,mouse}.rs`,
-`view.rs`, plus the server mirrors in `nxvim-lua/{ops,install,runtime}.rs`,
-`nxvim-server/{dispatch,lifecycle,effects}.rs` (most go through existing helpers and need no
+`view.rs`, plus the server mirrors in `bemtvi-lua/{ops,install,runtime}.rs`,
+`bemtvi-server/{dispatch,lifecycle,effects}.rs` (most go through existing helpers and need no
 change once the helpers are rewritten).
 
 Steps:
@@ -129,7 +129,7 @@ Steps:
    call sites compile.
 4. Server: extend `View` (core `view.rs`) + the redraw map (`redraw.rs`) to carry per-region
    tablines + per-region current index, in addition to (for now) the legacy `tabline`/`current_tab`
-   so nothing breaks mid-migration. Add `nvim_*`/`nx` read surface as needed for tests.
+   so nothing breaks mid-migration. Add `nvim_*`/`btv` read surface as needed for tests.
 5. RPC niceties: `current_tab_id`/`tab_ids`/`tab_count` etc. gain a notion of *which layer* —
    default to focused layer to preserve `nvim_get_current_tabpage` semantics for main.
 
@@ -163,7 +163,7 @@ Steps:
 4. `View` (core `view.rs` `from_editor`): emit per-region `tabline_rows` alongside the per-region
    labels from Phase 2. Remove the legacy single `tabline`/`current_tab`/`tabline_segments` once
    all consumers move (Phase 4) — keep until then.
-5. `nxvim-view` (`view.rs`): add the per-region tabline fields + parsing; keep legacy fields until
+5. `bemtvi-view` (`view.rs`): add the per-region tabline fields + parsing; keep legacy fields until
    Phase 4 flips clients.
 
 **Verify:** core unit-of-behavior via the harness redraw map — open docks, assert each region's
@@ -183,14 +183,14 @@ emscripten wasm rebuild (`emcc` not installed) + Playwright — mirror the verif
 so plainly (`[[dont-conflate-loads-with-works]]`).
 
 Steps:
-1. **TUI** (`nxvim-tui/src/render.rs`): `DockLayout` already computes each region's rect; draw that
+1. **TUI** (`bemtvi-tui/src/render.rs`): `DockLayout` already computes each region's rect; draw that
    region's tabline into its first row, then the tree below. Generalize `render_tabline` to take a
    region's labels + active index + rect. Remove the standalone global tabline area.
-2. **GUI** (`nxvim-gui/src/render.rs`): same — `region_origin` already exists; paint each region's
+2. **GUI** (`bemtvi-gui/src/render.rs`): same — `region_origin` already exists; paint each region's
    tabline at its origin row using `build_tabline` per region.
-3. **Web** (`nxvim-edithost/web/index.html`): mirror in JS — `regionOrigin`/`dockGeo` already give
+3. **Web** (`bemtvi-edithost/web/index.html`): mirror in JS — `regionOrigin`/`dockGeo` already give
    per-region origins; render each region's tabline at its top row. (Verified-by-mirror only.)
-4. Delete the now-dead legacy global `tabline`/`current_tab` fields from core `View`, `nxvim-view`,
+4. Delete the now-dead legacy global `tabline`/`current_tab` fields from core `View`, `bemtvi-view`,
    and `redraw.rs` once all three clients consume the per-region fields.
 
 **Verify:** TUI `tests/paint.rs` — main 2 tabs + left dock 1 tab + bottom dock 3 tabs: assert each

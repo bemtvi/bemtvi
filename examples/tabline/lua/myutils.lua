@@ -1,8 +1,8 @@
 -- The tabline-relevant subset of a real ~/.config/nvim/lua/myutils.lua, trimmed
--- to what a custom 'tabline' needs so it runs under nxvim standalone (the full
+-- to what a custom 'tabline' needs so it runs under bemtvi standalone (the full
 -- file pulls in third-party helper libraries, none of which exist here). The
 -- functions below are copied verbatim from that config — this is the actual
--- tabline code, not a nxvim-specific rewrite.
+-- tabline code, not a bemtvi-specific rewrite.
 
 local M = {}
 

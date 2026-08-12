@@ -1,11 +1,11 @@
--- ~~~ nxvim registers: the Lua surface — setreg / getreg / getregtype + :put ~~~
+-- ~~~ bemtvi registers: the Lua surface — setreg / getreg / getregtype + :put ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/registers \
---       cargo run -p nxvim -- examples/registers/shopping.txt
+--     BEMTVI_CONFIG=examples/registers \
+--       cargo run -p bemtvi -- examples/registers/shopping.txt
 --
--- Phases 1–3 grew nxvim's one unnamed slot into vim's full register file
+-- Phases 1–3 grew bemtvi's one unnamed slot into vim's full register file
 -- (named "a–"z, the numbered delete ring "1–"9, the yank register "0, the
 -- small-delete "-, the read-only specials "% "/ ":, and :registers). Phase 4
 -- adds the *programmatic* surface — the same registers, reachable from Lua:
@@ -71,7 +71,7 @@ end, { desc = "put the seeded todo register" })
 --   "+p    paste FROM the system clipboard
 --   "+yiw  yank the word under the cursor to the clipboard
 --
--- When nxvim runs for real it wires a host clipboard tool (pbcopy/pbpaste on
+-- When bemtvi runs for real it wires a host clipboard tool (pbcopy/pbpaste on
 -- macOS, wl-copy/xclip on Linux). If none is found, `"+` errors loudly rather
 -- than silently falling back to the unnamed register. (In headless tests there
 -- is no provider, which is why this file does no `"+` work at startup.)

@@ -14,7 +14,7 @@ Two related editor gaps:
    another tab, jumping to it (picker, LSP go-to, quickfix, marks) should focus that tab
    instead of re-opening it in the current window. Vim models this with `'switchbuf'`
    (`useopen`/`usetab`). The option **exists but `useopen`/`usetab` are unimplemented**
-   (`crates/nxvim-core/src/options.rs:139-144` — "usetab is not yet acted on"). We implement
+   (`crates/bemtvi-core/src/options.rs:139-144` — "usetab is not yet acted on"). We implement
    them and **default `'switchbuf'` to `usetab`** so the behavior is on out of the box.
 
 Decisions (confirmed with the user):
@@ -32,7 +32,7 @@ to be `'switchbuf'`-gated and reachable from every jump.
 ## Conventions for this work
 
 - **TDD**: each phase writes black-box tests that **fail first** on current `main`, then
-  implements until green (`crates/nxvim-server/tests/{picker,tabs}.rs`, driven via
+  implements until green (`crates/bemtvi-server/tests/{picker,tabs}.rs`, driven via
   `feed`/`exec_lua`, asserting on `nvim_get_current_tabpage` / cursor / lines).
 - **Cadence**: implement one phase, run `cargo fmt --all` + `cargo clippy --all-targets -- -D
   warnings` + the phase's tests, **commit, and pause for review** before the next phase.
@@ -45,7 +45,7 @@ to be `'switchbuf'`-gated and reachable from every jump.
 **Goal:** `editor.jump_to` honors `useopen`/`usetab`; default is `usetab`. LSP/quickfix/marks
 jumps (which all funnel through `jump_to`) gain the behavior for free.
 
-**Changes (`nxvim-core`):**
+**Changes (`bemtvi-core`):**
 - `options.rs`: default `switchbuf: "usetab".to_string()` (~line 249); refresh docs at
   lines 139-144 and the catalog entry ~1265-1270 (drop "not yet acted on").
 - `windows.rs`: add `switchbuf_window(&self, buf) -> Option<(usize, WindowId)>` — wrap
@@ -61,14 +61,14 @@ jumps (which all funnel through `jump_to`) gain the behavior for free.
   `jump_to`. No functional change (default `usetab` performs no split, so no stray-split).
 
 **Tests (`tabs.rs`):**
-1. `usetab` (default): file A in tab 1, file B in current tab 2; `nx._jump_to(A,…)` →
+1. `usetab` (default): file A in tab 1, file B in current tab 2; `btv._jump_to(A,…)` →
    current tab becomes tab 1, no new window in tab 2.
-2. `useopen` (`nx.o.switchbuf="useopen"`): buffer only in another tab is NOT followed; one in
+2. `useopen` (`btv.o.switchbuf="useopen"`): buffer only in another tab is NOT followed; one in
    the current tab is reused.
-3. empty (`nx.o.switchbuf=""`): jump opens in the current window even when shown elsewhere.
-4. default reports `usetab` (`:set switchbuf?` / `nx.o.switchbuf`).
+3. empty (`btv.o.switchbuf=""`): jump opens in the current window even when shown elsewhere.
+4. default reports `usetab` (`:set switchbuf?` / `btv.o.switchbuf`).
 
-**Checkpoint:** fmt + clippy + `cargo test -p nxvim-server --test tabs`; commit; pause.
+**Checkpoint:** fmt + clippy + `cargo test -p bemtvi-server --test tabs`; commit; pause.
 
 ---
 
@@ -78,19 +78,19 @@ jumps (which all funnel through `jump_to`) gain the behavior for free.
 
 **Changes (bridges + Lua):**
 - `ops.rs`: add `WindowOp::OpenSwitchbuf { path }` and `WindowOp::BufSwitch { buf }`.
-- `install.rs` (~line 1340): register `nx._open(path)` and `nx._buf_switch(bufnr)`.
+- `install.rs` (~line 1340): register `btv._open(path)` and `btv._buf_switch(bufnr)`.
 - `effects.rs` (~line 1301): apply them → `editor.open_path_switchbuf` /
   `editor.switch_to_buffer_switchbuf` (new core method: `switchbuf_window` →
   `goto_tab_window`; else `switch_buffer`, no forced cursor).
 - `prelude/picker.lua`:
-  - `buffers` confirm (line 532): `nx._buf_switch(item.bufnr)` (was `vim.cmd("buffer "..)`).
-  - `nx.picker.edit` (line 439): located → `nx._jump_to(...)` (now switchbuf-aware);
-    location-less → `nx._open(item.path)` (was `vim.cmd("edit "..)`).
+  - `buffers` confirm (line 532): `btv._buf_switch(item.bufnr)` (was `vim.cmd("buffer "..)`).
+  - `btv.picker.edit` (line 439): located → `btv._jump_to(...)` (now switchbuf-aware);
+    location-less → `btv._open(item.path)` (was `vim.cmd("edit "..)`).
 
 **Tests (`picker.rs`):** buffers picker — buffer open in another tab → confirming switches to
 that tab; with `switchbuf=""` it opens in the current window (gating guard).
 
-**Checkpoint:** fmt + clippy + `cargo test -p nxvim-server --test picker`; commit; pause.
+**Checkpoint:** fmt + clippy + `cargo test -p bemtvi-server --test picker`; commit; pause.
 
 ---
 
@@ -107,23 +107,23 @@ that tab; with `switchbuf=""` it opens in the current window (gating guard).
 - `effects.rs` (~line 2712): `take()` the mode (default `Current`) and pass to
   `run_picker_result(result, mode)`.
 - `runtime.rs` `run_picker_result` (line 1557): add `mode: &str`, forwarded to
-  `nx._picker_result`.
+  `btv._picker_result`.
 - `buffers.rs`: add `jump_to_tab(path, line, col)` — clone window options, `open_buffer(path)`
   (find-or-load, off-tick aware, mirrors `ex_tabnew` `ex.rs:1919`), `new_tab`, then
   `land_cursor`. Always a new tab (ignores `'switchbuf'`).
-- Extend the `Jump` op + `nx._jump_to` bridge with an optional 4th `new_tab` arg
+- Extend the `Jump` op + `btv._jump_to` bridge with an optional 4th `new_tab` arg
   (`ops.rs`/`install.rs`/`effects.rs`); `new_tab` dispatches to `jump_to_tab` (core ordering is
   atomic — avoids a Lua tabedit-then-set_cursor race).
 - `prelude/picker.lua`: add `"confirm_tab"` to the actions loop (lines 37-54) and default
-  binding `{ "<C-t>", "confirm_tab", "Open in new tab" }` (lines 65-84); `nx._picker_result`
-  passes `mode` to `source.confirm(item, mode)`; `nx.picker.edit(item, mode)` handles
-  `mode=="tab"` (located → `nx._jump_to(path,row,col,"tab")`; else `vim.cmd("tabedit "..)`);
+  binding `{ "<C-t>", "confirm_tab", "Open in new tab" }` (lines 65-84); `btv._picker_result`
+  passes `mode` to `source.confirm(item, mode)`; `btv.picker.edit(item, mode)` handles
+  `mode=="tab"` (located → `btv._jump_to(path,row,col,"tab")`; else `vim.cmd("tabedit "..)`);
   buffers tab mode → `vim.cmd("tabnew")` then `vim.cmd("buffer "..bufnr)` (deferred FIFO order).
 
 **Tests (`picker.rs`):** `<C-t>` on `files` (location-less) and `live_grep`/buffers entries →
 tab count grows, new tab shows the entry (located: cursor at row/col); plain `<CR>` unaffected.
 
-**Checkpoint:** fmt + clippy + `cargo test -p nxvim-server --test picker`; commit; pause.
+**Checkpoint:** fmt + clippy + `cargo test -p bemtvi-server --test picker`; commit; pause.
 
 ---
 
@@ -134,7 +134,7 @@ tab count grows, new tab shows the entry (located: cursor at row/col); plain `<C
 - Add/extend a runnable `examples/` snippet (picker `<C-t>` + `switchbuf`), verified e2e per the
   example-config convention.
 - `cargo test --workspace` (no regressions); final fmt + clippy.
-- Manual smoke: `cargo run -p nxvim -- file.txt`; `<leader>fb` + `<C-t>` (new tab); open a file
+- Manual smoke: `cargo run -p bemtvi -- file.txt`; `<leader>fb` + `<C-t>` (new tab); open a file
   in two tabs and confirm picking/jumping focuses the existing tab.
 
 **Checkpoint:** commit; done.
@@ -150,7 +150,7 @@ Generalized the Phase 3 confirm mode to cover splits:
   `effects.rs` dispatches to `jump_to` / `jump_to_tab` / new `Editor::jump_to_split(.., vertical)`
   (split + `edit_in_current_window` + `land_cursor`, ignoring `'switchbuf'`).
 - `picker.lua`: `confirm_split`/`confirm_vsplit` actions + default `<C-x>`/`<C-v>` maps;
-  `nx.picker.edit` routes tab/split/vsplit through `nx._jump_to(.., mode)`; the buffers source
+  `btv.picker.edit` routes tab/split/vsplit through `btv._jump_to(.., mode)`; the buffers source
   opens the window (`:split`/`:vsplit`) then swaps the buffer in.
 - Tests: 3 new in `picker.rs` (buffers `<C-x>` horizontal, buffers `<C-v>` vertical, located
   `<C-x>` lands cursor). Docs + the ui-picker example updated.

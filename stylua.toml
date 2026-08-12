@@ -1,4 +1,4 @@
-# stylua formatting for nxvim's first-party Lua (crates/nxvim-lua/src/prelude/).
+# stylua formatting for bemtvi's first-party Lua (crates/bemtvi-lua/src/prelude/).
 # Matches the existing prelude style: 2-space indents, double-quote strings.
 # Scope is the prelude only — the pre-commit hook passes just those files, and
 # `.styluaignore` keeps a bare `stylua .` from touching the vendored neovim

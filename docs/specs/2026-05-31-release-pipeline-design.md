@@ -2,14 +2,14 @@
 
 **Date:** 2026-05-31
 **Status:** Approved (pending spec review)
-**Scope:** CI/CD that builds and publishes `nxvim` binaries for all major OSes, with a
+**Scope:** CI/CD that builds and publishes `bemtvi` binaries for all major OSes, with a
 rolling bleeding-edge channel, build provenance attestation, and a git-cliff changelog.
 
 ## Goal
 
 Stand up a hand-rolled GitHub Actions release pipeline that:
 
-1. Builds the `nxvim` binary for the five native targets below.
+1. Builds the `bemtvi` binary for the five native targets below.
 2. Publishes a **stable** GitHub Release via a review-gated flow: a maintainer-triggered
    release-prep PR (CHANGELOG + version bump) that, once merged, auto-tags `v<version>` and
    publishes. CI never pushes to `main`.
@@ -30,11 +30,11 @@ Every target builds on a runner of its own architecture so the vendored-Lua C to
 
 | Target triple                  | Runner            | Asset name                                |
 | ------------------------------ | ----------------- | ----------------------------------------- |
-| `x86_64-unknown-linux-musl`    | `ubuntu-latest`   | `nxvim-<ver>-x86_64-linux-musl.tar.gz`    |
-| `aarch64-unknown-linux-musl`   | `ubuntu-24.04-arm`| `nxvim-<ver>-aarch64-linux-musl.tar.gz`   |
-| `x86_64-apple-darwin`          | `macos-15-intel`  | `nxvim-<ver>-x86_64-macos.tar.gz`         |
-| `aarch64-apple-darwin`         | `macos-14`        | `nxvim-<ver>-aarch64-macos.tar.gz`        |
-| `x86_64-pc-windows-msvc`       | `windows-latest`  | `nxvim-<ver>-x86_64-windows.zip`          |
+| `x86_64-unknown-linux-musl`    | `ubuntu-latest`   | `bemtvi-<ver>-x86_64-linux-musl.tar.gz`    |
+| `aarch64-unknown-linux-musl`   | `ubuntu-24.04-arm`| `bemtvi-<ver>-aarch64-linux-musl.tar.gz`   |
+| `x86_64-apple-darwin`          | `macos-15-intel`  | `bemtvi-<ver>-x86_64-macos.tar.gz`         |
+| `aarch64-apple-darwin`         | `macos-14`        | `bemtvi-<ver>-aarch64-macos.tar.gz`        |
+| `x86_64-pc-windows-msvc`       | `windows-latest`  | `bemtvi-<ver>-x86_64-windows.zip`          |
 
 `<ver>` is the release version for stable (the tag minus the leading `v`, e.g. `0.2.0`) and
 the literal string `edge` for the edge channel.
@@ -96,8 +96,8 @@ The five-target matrix is defined **once**, in `build.yml`; the publishing workf
   2. Install the Rust toolchain (`dtolnay/rust-toolchain@stable`) with `targets: <target>`.
   3. Linux only: install `musl-tools`, export the `CC_*` / `*_LINKER` env vars.
   4. `Swatinem/rust-cache@v2` with `shared-key: <target>` (see Caching).
-  5. `cargo build --release -p nxvim --target <target>`.
-  6. Package: copy the binary (`nxvim` / `nxvim.exe`) into an archive — `.tar.gz` on
+  5. `cargo build --release -p bemtvi --target <target>`.
+  6. Package: copy the binary (`bemtvi` / `bemtvi.exe`) into an archive — `.tar.gz` on
      Unix, `.zip` on Windows — named per the table above. Binary is stripped (via Cargo
      profile, below).
   7. `actions/upload-artifact@v7` uploading the single archive, named by target so the
@@ -203,7 +203,7 @@ self-triggering CHANGELOG push for `edge.yml` to filter.
   `contents: write` to publish).
 - Free on public repositories; no PATs or external secrets — only the built-in
   `GITHUB_TOKEN`.
-- Consumers verify with: `gh attestation verify <asset> --repo davidrios/nxvim`.
+- Consumers verify with: `gh attestation verify <asset> --repo davidrios/bemtvi`.
 - A short note documents verification (in the release-notes footer and a brief `docs/` page).
 
 ## Cargo profile change
@@ -264,7 +264,7 @@ test harness:
    overwrite, stable URLs, edge notes, attestation.
 5. Verify caching: a second no-op `main` push completes substantially faster than the first
    (warm caches).
-6. `gh attestation verify <asset> --repo davidrios/nxvim` confirms provenance.
+6. `gh attestation verify <asset> --repo davidrios/bemtvi` confirms provenance.
 
 ## Implementation order (for the plan)
 

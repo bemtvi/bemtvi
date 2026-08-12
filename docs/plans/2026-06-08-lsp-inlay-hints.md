@@ -13,8 +13,8 @@
 ## Why this document exists
 
 `textDocument/inlayHint` is, today, only a relayable method string in the
-`dyn_requests!` table (`crates/nxvim-lsp/src/dispatch.rs`) — a config could
-`client:request` it, but nxvim has no *feature* behind it: no `LspReqKind`, no
+`dyn_requests!` table (`crates/bemtvi-lsp/src/dispatch.rs`) — a config could
+`client:request` it, but bemtvi has no *feature* behind it: no `LspReqKind`, no
 cache, no projection, no render surface, and `vim.lsp.inlay_hint` is a nil index.
 Inlay hints are the most-requested still-missing everyday LSP surface after
 diagnostics and semantic tokens: a real nvim 0.10+ setup shows `let x: i32 = …`
@@ -23,19 +23,19 @@ and `foo(count: 3)` the moment you call `vim.lsp.inlay_hint.enable(true)`.
 The fail-loud, no-silent-stub rule from the
 [LSP completion plan](2026-06-05-lsp-completion.md) applies: a part of the API we
 don't honor yet stays a documented approximation or raises through
-`nx._notimpl` — never a silent no-op.
+`btv._notimpl` — never a silent no-op.
 
 ## What's already in place (the seams these phases extend)
 
 - **The decoration projection.** `Server::diagnostics_virt_text_for`
-  (`crates/nxvim-server/src/lsp/diagnostics.rs`) already projects a per-row
+  (`crates/bemtvi-server/src/lsp/diagnostics.rs`) already projects a per-row
   inline decoration as `[text, …, style_id]` under a window key, and the
-  semantic-tokens path (`crates/nxvim-server/src/lsp/semantic.rs`) shows the
+  semantic-tokens path (`crates/bemtvi-server/src/lsp/semantic.rs`) shows the
   buffer-scoped request/decode/cache shape (request on open+change, stale-drop on
   `tick`, decode char→byte against the negotiated encoding, bucket by line).
   Inlay hints reuse both: the semantic request/cache shape and a *positioned*
   variant of the virt-text projection.
-- **Per-buffer LSP state.** `LspDocState` (`crates/nxvim-server/src/lsp/mod.rs`)
+- **Per-buffer LSP state.** `LspDocState` (`crates/bemtvi-server/src/lsp/mod.rs`)
   holds the `diagnostics` and `semantic` caches keyed by `BufferId`; the inlay
   cache is a new field beside them, with a per-buffer `inlay_enabled` flag
   (default **off** — unlike semantic tokens, neovim's inlay hints are opt-in via
@@ -44,13 +44,13 @@ don't honor yet stays a documented approximation or raises through
   `LspReply` variant, normalized in `dispatch.rs` — exactly the semantic-token
   shape, but the request carries a whole-buffer `range` (inlay hints are a
   range request; we send `0..line_count`).
-- **The render walk.** `highlight_line` (`crates/nxvim-tui/src/render.rs`) walks
+- **The render walk.** `highlight_line` (`crates/bemtvi-tui/src/render.rs`) walks
   each row's cells keyed on the **absolute** screen column, so the selection /
   search / highlight / diagnostic overlays all resolve per real glyph. Inserting
   an inline hint span into that stream keeps every overlay correct for free
   (styles travel with each glyph); the only coordinate that needs the inline
   shift is the **terminal cursor** (painted separately from `cursor_screen_col`).
-- **The scripted mock + redraw harness.** `nxvim-lsp/src/mock.rs` scripts replies
+- **The scripted mock + redraw harness.** `bemtvi-lsp/src/mock.rs` scripts replies
   per method; an `inlay_hints` script field + an `inlay_hints`-key redraw
   assertion is the test shape (mirroring `semantic_tokens`).
 
@@ -76,49 +76,49 @@ when the theme leaves it undefined). `is_enabled` reports the state.
 (Phase 2) only read or refine what Phase 1 paints.
 
 **Scope (files).**
-- `crates/nxvim-lsp/src/client.rs` — advertise
+- `crates/bemtvi-lsp/src/client.rs` — advertise
   `text_document.inlay_hint` (`InlayHintClientCapabilities`, `resolveSupport` for
   `label`/`tooltip`/… declared so the server offers lazy hints); add
   `ProviderCaps.inlay_hints` set by a `present("inlayHintProvider")` probe.
-- `crates/nxvim-lsp/src/protocol.rs` — `LspRequest::InlayHint { uri, range }`;
+- `crates/bemtvi-lsp/src/protocol.rs` — `LspRequest::InlayHint { uri, range }`;
   `LspReply::InlayHints(Vec<InlayHintData>)`; `InlayHintData { line, character,
   label, kind, padding_left, padding_right }` (position in the negotiated
   encoding, `label` the string form — label parts joined — `kind` 1=Type/2=Param/
   0=unset). `ProviderCaps.inlay_hints`.
-- `crates/nxvim-lsp/src/dispatch.rs` — issue `inlay_hint(params)` and normalize
+- `crates/bemtvi-lsp/src/dispatch.rs` — issue `inlay_hint(params)` and normalize
   the `InlayHint[]`/`null` reply to `Vec<InlayHintData>` (label-part fold,
   padding, kind); `describe_request` arm.
-- `crates/nxvim-server/src/lsp/mod.rs` — `LspReqKind::InlayHints`; an
+- `crates/bemtvi-server/src/lsp/mod.rs` — `LspReqKind::InlayHints`; an
   `InlayHintsCache` on `LspDocState` (per-line `Vec<InlayHintSpan { byte_col,
   text, kind }>`); a per-buffer `inlay_enabled: bool` (default off);
   `ProviderCaps.inlay_hints` → `provider_caps_to_lua`.
-- `crates/nxvim-server/src/lsp/inlay.rs` *(new)* — `request_inlay_hints(buffer)`
+- `crates/bemtvi-server/src/lsp/inlay.rs` *(new)* — `request_inlay_hints(buffer)`
   (gated on the buffer being enabled and its server advertising the provider;
   buffer-scoped, whole-buffer range, stale-dropped on `tick`),
   `on_inlay_hints_reply` (decode char→byte, build the per-line text, bucket),
   and `inlay_hints_for(buffer, numbers, styles)` → per-row
   `[[virtcol, text, style_id], …]` sorted by column (virtcol via the same
   tab/wide-char mapping the diagnostics underline uses).
-- `crates/nxvim-server/src/lsp/{request.rs,sync.rs}` — register/dispatch the
+- `crates/bemtvi-server/src/lsp/{request.rs,sync.rs}` — register/dispatch the
   request and reply (reuse the semantic stale-drop path); fire
   `request_inlay_hints` from `sync_lsp` on the same `content_synced` trigger as
   semantic tokens, and on the enable op.
-- `crates/nxvim-server/src/redraw.rs` — project under an `inlay_hints` window key.
-- `crates/nxvim-view/src/{parse.rs,view.rs}` — `InlayHint = (u16 col, String
+- `crates/bemtvi-server/src/redraw.rs` — project under an `inlay_hints` window key.
+- `crates/bemtvi-view/src/{parse.rs,view.rs}` — `InlayHint = (u16 col, String
   text, Option<usize> style_id)`; `WindowView.inlay_hints: Vec<Vec<InlayHint>>`;
   `parse_inlay_hints`.
-- `crates/nxvim-tui/src/render.rs` — thread the row's hints into
+- `crates/bemtvi-tui/src/render.rs` — thread the row's hints into
   `highlight_line`; insert each hint's span at its screen column (before the real
   glyph there, after `leftcol` clipping), advancing the painted-width counter so
   the trailing diagnostic virt-text still clears the text; compute the terminal
   cursor's inline shift (sum of hint widths at columns `≤ cursor_screen_col` on
   the cursor row) in `render_window`/`render`. `inlay_hint_style` (palette id or a
   dim fallback).
-- `crates/nxvim-lua/src/{ops.rs,install.rs}` + `prelude/lsp.lua` —
+- `crates/bemtvi-lua/src/{ops.rs,install.rs}` + `prelude/lsp.lua` —
   `vim.lsp.inlay_hint.enable(enable, filter)` / `is_enabled(filter)` →
-  `nx._lsp_inlay_hint_enable(bufnr, enabled)` → `LspOp::InlayHintEnable`, with a
-  Lua-side `nx._inlay_hint_enabled[bufnr]` mirror so `is_enabled` is pure Lua.
-- `crates/nxvim-lsp/src/mock.rs` — an `inlay_hints` script field (an
+  `btv._lsp_inlay_hint_enable(bufnr, enabled)` → `LspOp::InlayHintEnable`, with a
+  Lua-side `btv._inlay_hint_enabled[bufnr]` mirror so `is_enabled` is pure Lua.
+- `crates/bemtvi-lsp/src/mock.rs` — an `inlay_hints` script field (an
   `InlayHint[]`) returned for `textDocument/inlayHint`, and the
   `inlayHintProvider` capability when scripted.
 
@@ -138,8 +138,8 @@ when the theme leaves it undefined). `is_enabled` reports the state.
   cursor, painted from `cursor_screen_col`, is shifted right by the summed widths
   of hints at columns `≤ cursor_screen_col` on its row.
 
-**Tests** (`crates/nxvim/tests/lsp/` via the scripted mock + redraw, plus a
-Tier-2 paint test under `crates/nxvim-server/tests/`):
+**Tests** (`crates/bemtvi/tests/lsp/` via the scripted mock + redraw, plus a
+Tier-2 paint test under `crates/bemtvi-server/tests/`):
 - enabling inlay hints paints a scripted hint inline at its column in the
   `inlay_hints` redraw key (and on the rendered grid);
 - the default (not enabled) shows nothing there;
@@ -156,7 +156,7 @@ cursor right. The client capability is advertised in `client_capabilities()`;
 `ProviderCaps.inlay_hints` is captured onto `ServerRuntime.inlay_hints` at
 `Initialized`; the typed `LspRequest::InlayHint { uri, range }` /
 `LspReply::InlayHints(Vec<InlayHintData>)` are issued by `request_inlay_hints`
-(`crates/nxvim-server/src/lsp/inlay.rs`, gated on the per-buffer `inlay_enabled`
+(`crates/bemtvi-server/src/lsp/inlay.rs`, gated on the per-buffer `inlay_enabled`
 flag and the server's provider) on enable + after each `didChange`, normalized in
 `dispatch.rs` (label-part fold + padding + kind). The reply is stale-dropped on
 the issuing buffer's `tick`, decoded char→byte against the negotiated encoding
@@ -166,11 +166,11 @@ The TUI `highlight_line` splices each hint's span into the paint stream at its
 column (`emit_inlay_hint`), shifting the real glyphs right; `inlay_cursor_shift`
 moves the terminal cursor by the same width. The Lua surface
 `vim.lsp.inlay_hint.enable(enable, filter)` / `is_enabled(filter)` →
-`LspOp::InlayHintEnable` flips the per-buffer flag (with a `nx._inlay_hint_enabled`
+`LspOp::InlayHintEnable` flips the per-buffer flag (with a `btv._inlay_hint_enabled`
 Lua mirror for `is_enabled`). Verified by `inlay_hints_paint_when_enabled` /
 `inlay_hints_are_off_by_default` / `inlay_hint_columns_are_encoding_correct` /
 `editing_re_requests_inlay_hints` / `an_inlay_hint_shifts_the_text_right_on_the_grid`
-(`crates/nxvim/tests/lsp/inlay.rs`). Runnable demo: `examples/inlay-hints/`.
+(`crates/bemtvi/tests/lsp/inlay.rs`). Runnable demo: `examples/inlay-hints/`.
 
 *Known approximations:* off-by-default and per-buffer enable only (no per-client
 granularity); whole-document only (no `range`); the **string** label form (label
@@ -202,7 +202,7 @@ a server's lazy hints (an empty label + `data`) actually paint; the cap is what 
   `LspServerCapabilities.inlay_hints` → `set_lsp_client` as the
   `inlayHintProvider` key on `client.server_capabilities`, beside
   `semanticTokensProvider`.
-- **`get`.** A `nx._inlay_hints[bufnr]` mirror (the `nx._semantic_tokens`
+- **`get`.** A `btv._inlay_hints[bufnr]` mirror (the `btv._semantic_tokens`
   analogue) is pushed on every reply, after a resolve fills a label, and cleared
   on disable — built by `inlay_mirror` (`lsp/inlay.rs`) and set via
   `LuaRuntime::set_inlay_hints` (`InlayHintMirrorData`). `vim.lsp.inlay_hint.get`
@@ -222,14 +222,14 @@ a server's lazy hints (an empty label + `data`) actually paint; the cap is what 
   the buffer's `tick`. The projection + mirror both skip empty-`text` placeholders,
   so an unresolved hint paints nothing.
 
-**Tests** (`crates/nxvim/tests/lsp/inlay.rs`):
+**Tests** (`crates/bemtvi/tests/lsp/inlay.rs`):
 `inlay_hint_provider_capability_is_truthy` /
 `server_without_inlay_hints_reports_no_provider` (caps),
 `get_returns_cached_inlay_hints` (get + range filter + disabled→empty),
 `a_lazy_inlay_hint_label_resolves` (the placeholder paints nothing until the
 scripted `inlay_resolve` fills its label, then it paints and reads back via
 `get`). The shipped example is guarded by
-`crates/nxvim-lua/tests/inlay_example_load.rs`.
+`crates/bemtvi-lua/tests/inlay_example_load.rs`.
 
 **Done when.** ✅ The caps/`get`/resolve surface is live (above). Runnable demo:
 `examples/inlay-hints/` (the `on_attach` now gates on
@@ -240,13 +240,13 @@ hints back through `get`).
 
 The surface above is necessary but not sufficient for a *real* server — testing
 the example against `lua-language-server` surfaced two general LSP gaps that left
-hints "enabled but empty". Both are fixed (in `nxvim-lsp/src/client.rs` +
-`nxvim-server/src/lsp/sync.rs`), and are general — they also benefit semantic
+hints "enabled but empty". Both are fixed (in `bemtvi-lsp/src/client.rs` +
+`bemtvi-server/src/lsp/sync.rs`), and are general — they also benefit semantic
 tokens, diagnostics, and any settings-driven server (gopls, …):
 
 - **`workspace/configuration` (pull config).** lua_ls reads its `hint.enable`
   *only* by requesting `workspace/configuration` — it ignores the
-  `didChangeConfiguration` push for those options. nxvim now advertises
+  `didChangeConfiguration` push for those options. bemtvi now advertises
   `workspace.configuration` and answers each requested `section` with that dotted
   path into the config's `settings` (`configuration_reply` / `config_section`).
   Without it, lua_ls produced **zero** hints (verified directly against the real
@@ -254,7 +254,7 @@ tokens, diagnostics, and any settings-driven server (gopls, …):
   `attach::workspace_configuration_pull_is_answered_from_settings`.
 - **`workspace/{inlayHint,semanticTokens}/refresh`.** A server that computes
   decorations asynchronously returns nothing on the first request and signals
-  readiness with a refresh request. nxvim now advertises `refreshSupport` and, on
+  readiness with a refresh request. bemtvi now advertises `refreshSupport` and, on
   a refresh, re-issues the whole-buffer request for every buffer that server owns
   (`on_workspace_refresh`, via the new `LspEvent::WorkspaceRefresh`). Covered by
   `inlay::inlay_hints_appear_after_workspace_refresh`.
@@ -279,12 +279,12 @@ Phase-2 follow-up.
 
 ## Known approximations to expect
 
-- **Off by default, per-buffer.** Neovim's inlay hints are opt-in; nxvim matches
+- **Off by default, per-buffer.** Neovim's inlay hints are opt-in; bemtvi matches
   that, and `enable`/`is_enabled` are per-buffer (a `filter.bufnr`), no
   per-client split.
 - **String labels only.** Label *parts* are joined to their `value`s. Resolve
   (Phase 2) fills a lazy hint's **label**, but the per-part `location` (go-to on
-  click), `tooltip`, and `textEdits`-on-accept are still dropped — nxvim renders
+  click), `tooltip`, and `textEdits`-on-accept are still dropped — bemtvi renders
   label-only (no hover/click on a hint yet).
 - **One group, no kind split.** All hints paint `LspInlayHint`; neovim also has
   `LspInlayHintType`/`Parameter`. Theme-gated like the other decorations (a dim

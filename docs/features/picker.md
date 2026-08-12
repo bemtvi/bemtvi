@@ -1,6 +1,6 @@
 # Fuzzy picker
 
-`nx.picker` is nxvim's native fuzzy finder — a centered float with a prompt that
+`btv.picker` is bemtvi's native fuzzy finder — a centered float with a prompt that
 grabs every key, a Rust fuzzy matcher that re-ranks as you type, and an optional
 preview pane. The **server** owns the widget: the prompt, the matcher,
 navigation, and a generation token that drops a stale response for a query you've
@@ -37,10 +37,10 @@ The built-in sources are bound out of the box, plus a **resume** map:
 
 These are overridable defaults — your own map for the same key wins, and you can
 disable one by binding it to an empty function. To open any registered source
-from your own keymap, call `nx.picker.open`:
+from your own keymap, call `btv.picker.open`:
 
 ```lua
-nx.keymap.set("n", "<leader>o", function() nx.picker.open("files") end)
+btv.keymap.set("n", "<leader>o", function() btv.picker.open("files") end)
 ```
 
 ## Resume — `<leader>fr`
@@ -52,7 +52,7 @@ snapshot it captured at close, so a `live_grep` picker comes back with its
 *actual* previous results rather than a fresh, differently-ordered search;
 editing the query from there re-runs the source as usual. It's a no-op (with a
 gentle notice) before any picker has closed. Call it from your own map with
-`nx.picker.resume()`.
+`btv.picker.resume()`.
 
 Transient internal pickers (the command-line completion overlay, for instance)
 opt out by setting `resumable = false` on their source, so resume always points
@@ -78,7 +78,7 @@ In the open picker (all of these are rebindable — see [Keys](#keys)):
 ## Sending results to a list
 
 `<C-q>` sends the picker's **current results** to a **named list** keyed
-`<picker>:<query>` — nxvim's take on telescope's send-to-loclist, and a fast way to
+`<picker>:<query>` — bemtvi's take on telescope's send-to-loclist, and a fast way to
 turn a search into a working set you step through with `<CR>` in the list. Each
 distinct search is its own persistent dock tab (re-running the same search updates it
 in place); a named list never collides with the quickfix and survives closing the
@@ -92,15 +92,15 @@ window you sent it from. See [named lists](quickfix-dock-lists.md).
   mark order); with none marked it sends the whole filtered list.
 
 Where the list opens is governed by the `'qfdock'` option (**on by default**, the
-nxvim way): each send opens as a **tab in the bottom dock**, so several searches
+bemtvi way): each send opens as a **tab in the bottom dock**, so several searches
 sit side by side, and `<CR>` on an entry jumps into the main editing area. Set
 `:set noqfdock` for a bottom split instead. See [Quickfix & named dock
-lists](quickfix-dock-lists.md) for the full model and the `nx.qf.list` / `show` API
+lists](quickfix-dock-lists.md) for the full model and the `btv.qf.list` / `show` API
 the action builds on.
 
 ## Writing a source
 
-`nx.picker.source{...}` registers a source. The driver, `items(ctx)`, streams
+`btv.picker.source{...}` registers a source. The driver, `items(ctx)`, streams
 candidates by calling `ctx.push(item)` per result and signals completion by
 **returning**. An item is a table with a `text` display field plus whatever data
 `confirm` (or the preview) needs — e.g. `path` / `row` / `col`.
@@ -108,38 +108,38 @@ candidates by calling `ctx.push(item)` per result and signals completion by
 A **static** source pushes a fixed set, fuzzy-matched in Rust as you type:
 
 ```lua
-nx.picker.source({
+btv.picker.source({
   name = "colours",
   items = function(ctx)
     for _, c in ipairs({ "red", "green", "blue", "amber" }) do
       ctx.push({ text = c })
     end
   end,
-  confirm = function(item) nx.notify("picked " .. item.text) end,
+  confirm = function(item) btv.notify("picked " .. item.text) end,
 })
 ```
 
-A source can be **asynchronous** — wrap `items` in `nx.async` and stream from a
-subprocess. nxvim is promise-only, so an async source returns its promise and the
+A source can be **asynchronous** — wrap `items` in `btv.async` and stream from a
+subprocess. bemtvi is promise-only, so an async source returns its promise and the
 engine awaits it; there is no `done` callback. Reap any spawned job on close via
 `ctx.on_cancel`. This is essentially how the built-in `files` source works (the
-shipped one adds a fallback chain — `find`, then an `nx.fs` walk — for when `rg`
+shipped one adds a fallback chain — `find`, then an `btv.fs` walk — for when `rg`
 is missing):
 
 ```lua
-nx.picker.source({
+btv.picker.source({
   name = "files",
   preview = "file",
-  items = nx.async(function(ctx)
-    local stream = nx.run_stream({ cmd = "rg", args = { "--files" }, cwd = ctx.cwd })
+  items = btv.async(function(ctx)
+    local stream = btv.run_stream({ cmd = "rg", args = { "--files" }, cwd = ctx.cwd })
     ctx.on_cancel(function() stream:kill() end)
-    for batch in nx.await_each(stream) do
+    for batch in btv.await_each(stream) do
       for _, l in ipairs(batch) do
         if l ~= "" then ctx.push({ text = l, path = l }) end
       end
     end
   end),
-  confirm = function(item) nx.picker.edit(item) end,
+  confirm = function(item) btv.picker.edit(item) end,
 })
 ```
 
@@ -154,30 +154,30 @@ the difference between the results arriving and the cap filling with noise. The
 patterns themselves reach the source as `ctx.include` / `ctx.exclude`.
 
 ```lua
-items = nx.async(function(ctx)
+items = btv.async(function(ctx)
   local args = { "--files", "--color=never" }
   for _, a in ipairs(ctx.rg_globs) do args[#args + 1] = a end
-  local stream = nx.run_stream({ cmd = "rg", args = args, cwd = ctx.cwd })
+  local stream = btv.run_stream({ cmd = "rg", args = args, cwd = ctx.cwd })
   …
 end),
 ```
 
-`nx.picker.edit(item, mode)` is the common confirm action: it opens `item.path`
+`btv.picker.edit(item, mode)` is the common confirm action: it opens `item.path`
 and, if the item carries a 1-based `row` (and optional `col`), jumps the cursor
 there. The `mode` is the confirm gesture (the picker passes it to
 `confirm(item, mode)`): `"current"` opens in the focused window honoring
 [`'switchbuf'`](#switching-to-an-open-tab); `"tab"` / `"split"` / `"vsplit"` (the
 defaults `<C-t>` / `<C-x>` / `<C-v>`) open in a new tab / horizontal split /
 vertical split. Forward it from a custom source's `confirm` to support those keys:
-`confirm = function(item, mode) nx.picker.edit(item, mode) end`.
+`confirm = function(item, mode) btv.picker.edit(item, mode) end`.
 
 ### Switching to an open tab
 
 Where a confirmed pick (and every jump — LSP go-to, quickfix, marks) **lands** is
-governed by `'switchbuf'`. nxvim defaults it to `usetab`: opening a buffer already
+governed by `'switchbuf'`. bemtvi defaults it to `usetab`: opening a buffer already
 shown in another tab focuses that tab instead of re-opening it in the current
-window. Set it like vim — `nx.o.switchbuf = "useopen"` (reuse a window in the
-current tab only) or `nx.o.switchbuf = ""` (classic: always open in the current
+window. Set it like vim — `btv.o.switchbuf = "useopen"` (reuse a window in the
+current tab only) or `btv.o.switchbuf = ""` (classic: always open in the current
 window). `<C-t>` always makes a new tab regardless (an explicit tab gesture).
 
 The widget windows its rendering and matches incrementally, so a source can
@@ -190,20 +190,20 @@ Set `dynamic = true` and the source re-runs on **every prompt edit** with the
 local fuzzy matcher bypassed — the source itself does the filtering. It reads the
 live prompt from `ctx.query` and the working directory from `ctx.cwd`. This is
 essentially how live grep works (re-spawning `rg` per query; the shipped source
-falls back to `grep`, then an `nx.fs` match, when `rg` is missing):
+falls back to `grep`, then an `btv.fs` match, when `rg` is missing):
 
 ```lua
-nx.picker.source({
+btv.picker.source({
   name = "live_grep",
   dynamic = true,
   preview = "location",
-  items = nx.async(function(ctx)
+  items = btv.async(function(ctx)
     if ctx.query == "" then return end
-    local stream = nx.run_stream({
+    local stream = btv.run_stream({
       cmd = "rg", args = { "--vimgrep", "--", ctx.query }, cwd = ctx.cwd,
     })
     ctx.on_cancel(function() stream:kill() end)
-    for batch in nx.await_each(stream) do
+    for batch in btv.await_each(stream) do
       for _, l in ipairs(batch) do
         local file, lnum, col = l:match("^(.-):(%d+):(%d+):")
         if file then
@@ -212,7 +212,7 @@ nx.picker.source({
       end
     end
   end),
-  confirm = function(item) nx.picker.edit(item) end,
+  confirm = function(item) btv.picker.edit(item) end,
 })
 ```
 
@@ -221,7 +221,7 @@ schedules the search `debounce` ms later, so a fast typist spawns one process pe
 *pause*, not one per keystroke. While the new search runs the previous results
 stay on screen — the list never flashes empty; they swap out only when the first
 new result arrives (or clear if nothing matched). The delay defaults to
-`nx.picker.debounce` (250 ms), overridable per source (`debounce = N`) or per
+`btv.picker.debounce` (250 ms), overridable per source (`debounce = N`) or per
 open; `0` disables it.
 
 ## Preview pane
@@ -238,7 +238,7 @@ server, and works across the terminal, GUI, and web clients. Scroll it with the
 
 ## Open-time options
 
-`nx.picker.open(name, opts)` — each `opts` field overrides the matching field on
+`btv.picker.open(name, opts)` — each `opts` field overrides the matching field on
 the source, which in turn overrides the picker default:
 
 | Option | Meaning |
@@ -257,8 +257,8 @@ the source, which in turn overrides the picker default:
 
 ```lua
 -- a snappier live grep, just for this map:
-nx.keymap.set("n", "<leader>fG", function()
-  nx.picker.open("live_grep", { debounce = 100 })
+btv.keymap.set("n", "<leader>fG", function()
+  btv.picker.open("live_grep", { debounce = 100 })
 end)
 ```
 
@@ -270,11 +270,11 @@ confirm, cancel, preview-scroll, and query-editing are all rebindable like any
 other mode:
 
 ```lua
-nx.keymap.set("picker", "<C-j>", nx.picker.actions.next)
-nx.keymap.set("picker", "<C-k>", nx.picker.actions.prev)
-nx.keymap.set("picker", "<Tab>", nx.picker.actions.confirm)
+btv.keymap.set("picker", "<C-j>", btv.picker.actions.next)
+btv.keymap.set("picker", "<C-k>", btv.picker.actions.prev)
+btv.keymap.set("picker", "<Tab>", btv.picker.actions.confirm)
 -- disable a default binding by mapping it to an empty function:
-nx.keymap.set("picker", "<C-n>", function() end)
+btv.keymap.set("picker", "<C-n>", function() end)
 ```
 
 The actions are `next`, `prev`, `confirm`, `confirm_tab`, `confirm_split`,
@@ -310,11 +310,11 @@ never looks like one that isn't.
 
 ### Defaults
 
-`nx.picker.setup` sets the line every filterable picker opens with — the "stop
+`btv.picker.setup` sets the line every filterable picker opens with — the "stop
 showing me build output" knob:
 
 ```lua
-nx.picker.setup({
+btv.picker.setup({
   exclude = { "target/", "node_modules/", "*.min.js" },
   history = 20,  -- past lines kept per box for <C-Up>/<C-Down>; 0 disables
 })
@@ -323,7 +323,7 @@ nx.picker.setup({
 ### History — `<C-Up>` / `<C-Down>`
 
 Each box remembers the lines you have used, most recent first, and **persists them
-across restarts** (via `nx.shada.plugin`, on the ordinary shada cadence). With a box
+across restarts** (via `btv.shada.plugin`, on the ordinary shada cadence). With a box
 focused, `<C-Up>` walks back into older lines and `<C-Down>` forward again, returning
 to the line you were composing — cmdline history. The two boxes keep separate lists,
 so an include pattern never surfaces in the exclude box where it would mean the
@@ -333,12 +333,12 @@ A filterable picker opens pre-filled with the most recent line for each box, so 
 filter you worked out yesterday is already applied rather than retyped.
 
 ```lua
-nx.picker.history("exclude")   -- the stored lines, most recent first
-nx.picker.forget_history()     -- drop them all
+btv.picker.history("exclude")   -- the stored lines, most recent first
+btv.picker.forget_history()     -- drop them all
 ```
 
-Precedence, lowest to highest: the source's own default → `nx.picker.setup` → the
-most recent line used → an explicit `nx.picker.open{ include = … }`. History outranks
+Precedence, lowest to highest: the source's own default → `btv.picker.setup` → the
+most recent line used → an explicit `btv.picker.open{ include = … }`. History outranks
 the configured default because a line you actually typed is a stronger statement than
 one configured months ago; an explicit open option outranks everything, so a picker
 asked for a scope gets exactly that scope.
@@ -356,12 +356,12 @@ A picker can also open already scoped, which is what a dedicated map usually wan
 
 ```lua
 -- "find in sources"
-nx.keymap.set("n", "<leader>fs", function()
-  nx.picker.open("files", { include = { "src/**", "crates/**" } })
+btv.keymap.set("n", "<leader>fs", function()
+  btv.picker.open("files", { include = { "src/**", "crates/**" } })
 end)
 
 -- grep everything except the vendored trees, with the boxes already showing
-nx.picker.open("live_grep", { exclude = "vendor/, **/*.min.js", filters = "open" })
+btv.picker.open("live_grep", { exclude = "vendor/, **/*.min.js", filters = "open" })
 ```
 
 Any source whose items carry a `path` can have the boxes by declaring
@@ -370,21 +370,21 @@ it, `<C-g>` says so rather than presenting boxes that would filter nothing.
 
 ## Try it
 
-A runnable playground ships in [`examples/ui-picker`](https://github.com/davidrios/nxvim/tree/main/examples/ui-picker):
+A runnable playground ships in [`examples/ui-picker`](https://github.com/davidrios/bemtvi/tree/main/examples/ui-picker):
 
 ```sh
-NXVIM_CONFIG=examples/ui-picker cargo run -p nxvim -- examples/ui-picker/sample.txt
+BEMTVI_CONFIG=examples/ui-picker cargo run -p bemtvi -- examples/ui-picker/sample.txt
 ```
 
 It maps the three built-in sources, registers a custom static source, and shows
 the box-size, preview, and debounce overrides.
 
 For the filter boxes there is a second playground,
-[`examples/picker-filters`](https://github.com/davidrios/nxvim/tree/main/examples/picker-filters):
+[`examples/picker-filters`](https://github.com/davidrios/bemtvi/tree/main/examples/picker-filters):
 
 ```sh
-NXVIM_CONFIG=examples/picker-filters \
-  cargo run -p nxvim -- examples/picker-filters/sample.txt
+BEMTVI_CONFIG=examples/picker-filters \
+  cargo run -p bemtvi -- examples/picker-filters/sample.txt
 ```
 
 It ships the mess a real project has — a `target/` artifact, a `vendor/` lock file,
@@ -394,7 +394,7 @@ means, the `<C-Up>` history, pre-scoped pickers, and a custom filterable source.
 ## How it works (in brief)
 
 The full item tables stay Lua-side; only a display label and an integer key cross
-the bridge per result (exactly like `nx.ui.select`), so an item's arbitrary
+the bridge per result (exactly like `btv.ui.select`), so an item's arbitrary
 fields never need to serialize. Candidates are batched (~1000 per bridge call)
 rather than crossing one at a time, which is what makes streaming 100k results
 fast. A generation token stamps every run, so a push from a query you've typed
@@ -402,6 +402,6 @@ past — or from a picker that has since closed — is dropped.
 
 For the full design — the unified float-list widget, the Rust matcher, dynamic
 forwarding, and the preview cache — see the
-[fuzzy-finder plan](../plans/2026-06-14-nx-picker-fuzzy-finder.md), the
-[preview-pane plan](../plans/2026-06-14-nx-picker-preview-pane.md), and the
-[float-list widget spec](../specs/2026-06-14-nx-ui-float-widget.md).
+[fuzzy-finder plan](../plans/2026-06-14-btv-picker-fuzzy-finder.md), the
+[preview-pane plan](../plans/2026-06-14-btv-picker-preview-pane.md), and the
+[float-list widget spec](../specs/2026-06-14-btv-ui-float-widget.md).

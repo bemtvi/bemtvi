@@ -6,7 +6,7 @@ the markup is *rendered*, not shown verbatim.
 ## Inline styles
 
 You get **bold**, *italic*, ~~strikethrough~~, `inline code`, and
-[links](https://nxvim.example/docs) that keep their label and show the URL.
+[links](https://bemtvi.example/docs) that keep their label and show the URL.
 
 ## Lists
 
@@ -44,4 +44,4 @@ fn main() {
 
 ---
 
-Everything above is one call to `nx.markdown.render`.
+Everything above is one call to `btv.markdown.render`.

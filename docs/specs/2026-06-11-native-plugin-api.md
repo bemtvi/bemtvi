@@ -1,21 +1,21 @@
-# The native plugin API (`nx.*`) — design sketch
+# The native plugin API (`btv.*`) — design sketch
 
 > **Status: PARTIALLY IMPLEMENTED (proposed 2026-06-11).** The design for
-> nxvim's plugin system — the extensibility half of
+> bemtvi's plugin system — the extensibility half of
 > [ADR 0002](../decisions/0002-native-plugin-system.md): the server owns every
 > UI surface and the frame, plugins are async, declarative *providers*, and
-> the only `vim.*` surface nxvim ships is a closed whitelist of muscle-memory
-> aliases over `nx.*`.
+> the only `vim.*` surface bemtvi ships is a closed whitelist of muscle-memory
+> aliases over `btv.*`.
 >
 > **Landed (2026-06-12,
-> [foundation plan](../plans/2026-06-12-nx-foundation-and-treesitter.md)):** the
-> `nx.*` namespace as the canonical config surface with `vim.*` re-expressed as
-> the bounded alias whitelist — `nx.g`/`b`/`w`, `nx.o`/`opt`/`bo`/`wo`/`go`,
-> `nx.cmd`, `nx.keymap`, `nx.on`, `nx.command`, `nx.notify`/`schedule` — plus
-> `nx.treesitter` (highlight control as the `nx.bo.filetype` / `nx.bo.ts_highlight`
-> two nouns, and `nx.treesitter.set_query`). The UI-orchestration registries below
-> (`nx.complete` / `picker` / `statusline` / `snippet` / `tree`) and the async
-> primitives (`nx.run` / `nx.run_stream` / `timer` / `fs` / `ui`) remain proposed.
+> [foundation plan](../plans/2026-06-12-btv-foundation-and-treesitter.md)):** the
+> `btv.*` namespace as the canonical config surface with `vim.*` re-expressed as
+> the bounded alias whitelist — `btv.g`/`b`/`w`, `btv.o`/`opt`/`bo`/`wo`/`go`,
+> `btv.cmd`, `btv.keymap`, `btv.on`, `btv.command`, `btv.notify`/`schedule` — plus
+> `btv.treesitter` (highlight control as the `btv.bo.filetype` / `btv.bo.ts_highlight`
+> two nouns, and `btv.treesitter.set_query`). The UI-orchestration registries below
+> (`btv.complete` / `picker` / `statusline` / `snippet` / `tree`) and the async
+> primitives (`btv.run` / `btv.run_stream` / `timer` / `fs` / `ui`) remain proposed.
 
 ## Why not neovim's plugin model
 
@@ -23,7 +23,7 @@ neovim plugins are **imperative programs written against neovim's runtime
 model** — synchronous re-entrant editor access, blocking reads (`getcharstr`,
 `vim.wait`), libuv as a public API (`vim.uv` timers / check handles /
 processes), frame-time rendering hooks (decoration providers), and the
-unbounded `vim.fn` inventory. nxvim's model is snapshot reads + queued effects
+unbounded `vim.fn` inventory. bemtvi's model is snapshot reads + queued effects
 on a pure synchronous core, behind a client-server boundary. Hosting the
 former on the latter would mean reimplementing neovim's event loop and
 renderer contract underneath someone else's API — surrendering the properties
@@ -39,25 +39,25 @@ dictates the design.
 
 **The server owns every UI surface and the frame; plugins are async,
 declarative *providers* of data and behavior.** Where neovim says "here are
-buffer primitives and hooks, draw your own completion menu", nxvim says "here
+buffer primitives and hooks, draw your own completion menu", bemtvi says "here
 is a completion engine; give it items."
 
 Five rules — each one a property the architecture already enforces
 internally; the API makes them the documented contract:
 
-1. **Reads are snapshots.** `nx.buf.lines(b)` etc. read the state pushed at
+1. **Reads are snapshots.** `btv.buf.lines(b)` etc. read the state pushed at
    Lua entry. Documented, not disguised.
 2. **Writes are queued effects.** Applied at the settle point
    (`apply_lua_effects → run_pending → redraw`). Async writers guard with a
-   changedtick: `nx.buf.edit{tick = t, ...}` fails loud if stale.
+   changedtick: `btv.buf.edit{tick = t, ...}` fails loud if stale.
 3. **Nothing blocks, ever.** No wait-pumps, no blocking reads, no uv handles.
-   Anything that waits returns a **promise** (`nx.run`, `nx.fs.*`, `nx.timer`'s
-   `nx.promise.delay`) you `nx.await` inside `nx.async`, or — for multi-value
-   streaming — an async-iterator (`nx.run_stream` + `nx.await_each`); `nx` is
-   promise-only (no callback-shaped async). Event subscriptions (`nx.autocmd`,
-   keymap rhs) and emit sinks (a picker source's `ctx.push`, a `nx.decor` provider's
+   Anything that waits returns a **promise** (`btv.run`, `btv.fs.*`, `btv.timer`'s
+   `btv.promise.delay`) you `btv.await` inside `btv.async`, or — for multi-value
+   streaming — an async-iterator (`btv.run_stream` + `btv.await_each`); `btv` is
+   promise-only (no callback-shaped async). Event subscriptions (`btv.autocmd`,
+   keymap rhs) and emit sinks (a picker source's `ctx.push`, a `btv.decor` provider's
    `publish`) stay handler-based — they fire repeatedly, so a promise is the wrong
-   shape. (See [the promise-only migration](../plans/2026-06-16-nx-promise-only-async.md).)
+   shape. (See [the promise-only migration](../plans/2026-06-16-btv-promise-only-async.md).)
 4. **No frame-time Lua.** Plugins publish decorations / segments / items
    whenever they like; the server folds them into the next frame. A plugin
    cannot make redraw slow. (ADR 0001's bridge pattern, generalized into *the*
@@ -68,33 +68,33 @@ internally; the API makes them the documented contract:
    nothing for a synchronous provider). Stale responses are dropped by the engine.
 
 Because Lua influences the editor only through the same queues RPC clients
-use, every `nx.*` registration gets an RPC twin in principle
-(`nx_complete_register`, …) — out-of-process plugins in any language are the
+use, every `btv.*` registration gets an RPC twin in principle
+(`btv_complete_register`, …) — out-of-process plugins in any language are the
 same surface, later. The in-process Lua host is v1.
 
 ## The surface
 
 | Namespace | What it is | Backed by (exists today) |
 | --- | --- | --- |
-| `nx.buf` / `nx.win` / `nx.cursor` | snapshot reads, queued edits, `on_change` byte-delta subscription | mirrors + effect queues + the edit journal |
-| `nx.regex` / `nx.buf.search` | real-regex matching for Lua strings (a `string`-library-shaped object) / native buffer text search | the core regex engines — the Rust `regex` crate (`pcre`) + the vendored vim engine (`vim`) |
-| `nx.on(event, opts, fn)` | structured event subscriptions | the lifecycle/autocmd diff |
-| `nx.run` / `nx.run_stream` / `nx.timer` / `nx.fs.*` | async process (promise / async-iterator) / timer / fs | evloop actor + HostFs seams |
-| `nx.http.fetch` | async HTTP client, modeled on the browser's `fetch` (promise of a Response; any status resolves, only a transport failure rejects) | evloop actor (`ureq`, off-tick) / daemon `http_op` leg / browser `fetch()` |
-| `nx.hl.set(ns, buf, marks)` | batch-published decorations (known up front) | the extmark layer + priorities |
-| `nx.decor.provider` | viewport-scoped decoration publisher — lazy, recomputed on scroll, off the frame | the decoration-provider drive (`decor_on_win`), debounced off `redraw`; folds into the extmark layer |
-| `nx.keymap` / `nx.command` / `nx.cmd` | maps, user commands, ex dispatch | existing |
-| `nx.ui.input` / `select` / `confirm` / `float` | small async UI primitives (input/select/confirm are promise-only; float is fire-and-forget) | cmdline + floats + pmenu |
-| `nx.complete` | **native completion engine**; plugins = sources | pmenu + docs float, native LSP, evloop debounce; Rust fuzzy matcher (new) |
-| `nx.statusline` | segment registry + layout; event-keyed invalidation | server-side statusline render |
-| `nx.picker` | **native fuzzy picker** (prompt + list + preview); plugins = sources | floats + the panel's input-grab pattern; matcher shared with completion |
-| `nx.snippet` | **native snippet engine** (LSP grammar, tabstop mode, choices) | the existing LSP-snippet parse; tabstop session modeled like multi-cursor placement mode |
-| `nx.tree` | generic dock/tree views (file explorer, symbols, git) | the panel generalized to a persistent vertical dock |
-| `nx.shada.plugin()` | opt-in, **isolated** cross-session key/value storage; the namespace is assigned from the calling plugin's location, not chosen | a dedicated table in the shada store + the existing flush cadence |
+| `btv.buf` / `btv.win` / `btv.cursor` | snapshot reads, queued edits, `on_change` byte-delta subscription | mirrors + effect queues + the edit journal |
+| `btv.regex` / `btv.buf.search` | real-regex matching for Lua strings (a `string`-library-shaped object) / native buffer text search | the core regex engines — the Rust `regex` crate (`pcre`) + the vendored vim engine (`vim`) |
+| `btv.on(event, opts, fn)` | structured event subscriptions | the lifecycle/autocmd diff |
+| `btv.run` / `btv.run_stream` / `btv.timer` / `btv.fs.*` | async process (promise / async-iterator) / timer / fs | evloop actor + HostFs seams |
+| `btv.http.fetch` | async HTTP client, modeled on the browser's `fetch` (promise of a Response; any status resolves, only a transport failure rejects) | evloop actor (`ureq`, off-tick) / daemon `http_op` leg / browser `fetch()` |
+| `btv.hl.set(ns, buf, marks)` | batch-published decorations (known up front) | the extmark layer + priorities |
+| `btv.decor.provider` | viewport-scoped decoration publisher — lazy, recomputed on scroll, off the frame | the decoration-provider drive (`decor_on_win`), debounced off `redraw`; folds into the extmark layer |
+| `btv.keymap` / `btv.command` / `btv.cmd` | maps, user commands, ex dispatch | existing |
+| `btv.ui.input` / `select` / `confirm` / `float` | small async UI primitives (input/select/confirm are promise-only; float is fire-and-forget) | cmdline + floats + pmenu |
+| `btv.complete` | **native completion engine**; plugins = sources | pmenu + docs float, native LSP, evloop debounce; Rust fuzzy matcher (new) |
+| `btv.statusline` | segment registry + layout; event-keyed invalidation | server-side statusline render |
+| `btv.picker` | **native fuzzy picker** (prompt + list + preview); plugins = sources | floats + the panel's input-grab pattern; matcher shared with completion |
+| `btv.snippet` | **native snippet engine** (LSP grammar, tabstop mode, choices) | the existing LSP-snippet parse; tabstop session modeled like multi-cursor placement mode |
+| `btv.tree` | generic dock/tree views (file explorer, symbols, git) | the panel generalized to a persistent vertical dock |
+| `btv.shada.plugin()` | opt-in, **isolated** cross-session key/value storage; the namespace is assigned from the calling plugin's location, not chosen | a dedicated table in the shada store + the existing flush cadence |
 
-The same `nx.*` namespace is the **config** API: `init.lua` is written against
-it (`nx.o`/`nx.opt` for options, `nx.keymap`, `nx.on`, `nx.command`, `nx.lsp`
-for server setup, `nx.treesitter` for tree scripting). The only `vim.*` Lua is
+The same `btv.*` namespace is the **config** API: `init.lua` is written against
+it (`btv.o`/`btv.opt` for options, `btv.keymap`, `btv.on`, `btv.command`, `btv.lsp`
+for server setup, `btv.treesitter` for tree scripting). The only `vim.*` Lua is
 a closed set of muscle-memory aliases (see *The `vim.*` boundary* below).
 
 ### Plugins, manifests, and activation (why there is no plugin-manager plugin)
@@ -104,9 +104,9 @@ contribution hit (VS Code-style activation — the thing a plugin manager approx
 from the outside, because neovim plugins cannot *declare* their triggers):
 
 ```lua
--- ~/.config/nxvim/plugins/nx-files/plugin.lua  (data only; no requires)
+-- ~/.config/bemtvi/plugins/btv-files/plugin.lua  (data only; no requires)
 return {
-  name = "nx-files",
+  name = "btv-files",
   contributes = {
     picker  = { "files", "live_grep" },
     tree    = { "files" },
@@ -116,12 +116,12 @@ return {
 ```
 
 `init.lua` declares the set; the built-in manager syncs it over the async
-runtime (real `git clone` via `nx.run`):
+runtime (real `git clone` via `btv.run`):
 
 ```lua
-nx.plugins {
-  { "nxvim/nx-files" },
-  { "nxvim/nx-emoji" },
+btv.plugins {
+  { "bemtvi/btv-files" },
+  { "bemtvi/btv-emoji" },
 }
 -- :PluginSync clones/updates; :PluginList shows state
 ```
@@ -149,7 +149,7 @@ is plugin surface.
 
 ```lua
 -- init.lua — completion is built in; this is the whole setup
-nx.complete.setup {
+btv.complete.setup {
   sources = {
     { "lsp",      priority = 100 },              -- built-in (native LSP client)
     { "snippets", priority = 80  },              -- built-in (native snippet engine)
@@ -164,10 +164,10 @@ nx.complete.setup {
 A third-party source — this is the *entire* plugin:
 
 ```lua
--- plugins/nx-emoji/lua/nx-emoji/init.lua
-local emoji = require("nx-emoji.data")           -- { { ":smile:", "😄" }, ... }
+-- plugins/btv-emoji/lua/btv-emoji/init.lua
+local emoji = require("btv-emoji.data")           -- { { ":smile:", "😄" }, ... }
 
-nx.complete.source {
+btv.complete.source {
   name = "emoji",
   trigger = { chars = { ":" } },                 -- engine wakes us only after ':'
   complete = function(ctx, respond)
@@ -194,26 +194,26 @@ redraw" model is exactly what rule 4 forbids). The server caches each
 segment's resolved cells and paints natively.
 
 ```lua
-nx.statusline.setup {
+btv.statusline.setup {
   left  = { "mode", "git", "filename", "diagnostics" },   -- built-ins + plugin segments
   right = { "lsp_progress", "filetype", "location" },
 }
 
 -- a custom segment (the lualine "component"):
-nx.statusline.segment {
+btv.statusline.segment {
   name = "git",
   events = { "buf:enter", "dir:changed", "user:git" },    -- the invalidation set
   render = function(ctx)                                  -- ctx = { buf, win, focused, width }
-    local b = cached_branch[nx.buf.name(ctx.buf)]
+    local b = cached_branch[btv.buf.name(ctx.buf)]
     return b and { { text = " " .. b, hl = "StatusGit" } } or nil
   end,
 }
 
--- async data: recompute, then invalidate yourself (nx.run is a promise — await it)
-local refresh = nx.async(function()
-  local res = nx.await(nx.run { cmd = "git", args = { "branch", "--show-current" } })
+-- async data: recompute, then invalidate yourself (btv.run is a promise — await it)
+local refresh = btv.async(function()
+  local res = btv.await(btv.run { cmd = "git", args = { "branch", "--show-current" } })
   cached_branch[cwd] = res.stdout:gsub("%s+$", "")
-  nx.statusline.invalidate("git")
+  btv.statusline.invalidate("git")
 end)
 refresh()
 ```
@@ -227,38 +227,38 @@ callback re-sorting results on every keystroke; here Lua sees only "query
 changed" (dynamic sources) and "confirmed".
 
 ```lua
-nx.keymap.set("n", "<leader>ff", function() nx.picker.open("files") end)
+btv.keymap.set("n", "<leader>ff", function() btv.picker.open("files") end)
 
--- a static, streaming source: an nx.async iterator over nx.run_stream's batches.
+-- a static, streaming source: an btv.async iterator over btv.run_stream's batches.
 -- The source emits via ctx.push and completes by returning (no `done` callback).
-nx.picker.source {
+btv.picker.source {
   name = "files",
-  items = nx.async(function(ctx)               -- results stream in as found
-    for batch in nx.await_each(nx.run_stream { cmd = "rg", args = { "--files" }, cwd = ctx.cwd }) do
+  items = btv.async(function(ctx)               -- results stream in as found
+    for batch in btv.await_each(btv.run_stream { cmd = "rg", args = { "--files" }, cwd = ctx.cwd }) do
       for _, l in ipairs(batch) do ctx.push { text = l, path = l } end
     end
   end),
   preview = "file",                              -- declarative: server previews item.path
                                                  -- (rope + native treesitter, zero Lua)
-  confirm = function(item) nx.cmd("edit " .. nx.fnameescape(item.path)) end,
+  confirm = function(item) btv.cmd("edit " .. btv.fnameescape(item.path)) end,
 }
 
 -- a dynamic source (live grep): re-run per prompt edit, matcher bypassed
-nx.picker.source {
+btv.picker.source {
   name = "live_grep",
   dynamic = true,
-  items = nx.async(function(ctx)
+  items = btv.async(function(ctx)
     if ctx.query == "" then return end
-    local stream = nx.run_stream { cmd = "rg", args = { "--vimgrep", "--", ctx.query } }
+    local stream = btv.run_stream { cmd = "rg", args = { "--vimgrep", "--", ctx.query } }
     ctx.on_cancel(function() stream:kill() end)  -- superseded queries are reaped
-    for batch in nx.await_each(stream) do
+    for batch in btv.await_each(stream) do
       for _, l in ipairs(batch) do ctx.push(parse_vimgrep(l)) end
     end
   end),
   preview = "location",
   confirm = function(item)
-    nx.cmd("edit " .. nx.fnameescape(item.path))
-    nx.cursor.set(item.row, item.col)
+    btv.cmd("edit " .. btv.fnameescape(item.path))
+    btv.cursor.set(item.row, item.col)
   end,
 }
 ```
@@ -272,24 +272,24 @@ placeholders, and `${1|a,b|}` choices via the native pmenu. Plugins
 contribute snippet *data*, with functions for dynamic bodies:
 
 ```lua
-nx.snippet.setup { jump_next = "<C-j>", jump_prev = "<C-k>" }
+btv.snippet.setup { jump_next = "<C-j>", jump_prev = "<C-k>" }
 
-nx.snippet.add("rust", {
+btv.snippet.add("rust", {
   { trigger = "fn",   body = "fn ${1:name}(${2}) -> ${3:()} {\n\t$0\n}" },
   { trigger = "test", body = "#[test]\nfn ${1:it_works}() {\n\t${0:assert!(true);}\n}" },
   { trigger = "date", body = function(ctx) return os.date("%Y-%m-%d") end },
   { trigger = "mod",  body = function(ctx)            -- context-aware
-      return "mod ${1:" .. nx.fs.stem(nx.buf.name(ctx.buf)) .. "} {\n\t$0\n}"
+      return "mod ${1:" .. btv.fs.stem(btv.buf.name(ctx.buf)) .. "} {\n\t$0\n}"
     end },
 })
 ```
 
-A friendly-snippets loader is a ten-line plugin: `nx.fs.read` the VS Code
-JSON, `nx.snippet.add` per filetype. The completion engine's `snippets`
+A friendly-snippets loader is a ten-line plugin: `btv.fs.read` the VS Code
+JSON, `btv.snippet.add` per filetype. The completion engine's `snippets`
 source and LSP completions with snippet bodies expand through the same
 engine.
 
-### 5. File explorer (the nvim-tree shape) — `nx.tree` dock views
+### 5. File explorer (the nvim-tree shape) — `btv.tree` dock views
 
 Not a file-explorer built-in but a generic **tree view** surface (file
 explorer, symbol outline, git status are all instances). The server owns the
@@ -298,11 +298,11 @@ expand/collapse state, cursor movement, and key routing; the plugin supplies
 children and actions. No buffer puppeteering, no blocking prompts.
 
 ```lua
-local view = nx.tree.view {
+local view = btv.tree.view {
   name = "files", title = "Files", side = "left", width = 32,
-  root = function() return { path = nx.cwd(), dir = true } end,
+  root = function() return { path = btv.cwd(), dir = true } end,
   children = function(node, respond)
-    nx.fs.readdir(node.path, function(err, entries)
+    btv.fs.readdir(node.path, function(err, entries)
       if err then return respond(nil, err) end
       respond(map(entries, function(e)
         return { text = e.name, dir = e.dir, path = e.path,
@@ -312,26 +312,26 @@ local view = nx.tree.view {
   end,
   actions = {
     ["<CR>"] = function(node, t)
-      if node.dir then t:toggle(node) else nx.cmd("edit " .. nx.fnameescape(node.path)) end
+      if node.dir then t:toggle(node) else btv.cmd("edit " .. btv.fnameescape(node.path)) end
     end,
     ["a"] = function(node, t)
-      nx.ui.input({ prompt = "New file: " }):next(function(name)   -- promise, not blocking
+      btv.ui.input({ prompt = "New file: " }):next(function(name)   -- promise, not blocking
         if not name then return end
-        nx.fs.write(join(dir_of(node), name), "", function() t:refresh(node) end)
+        btv.fs.write(join(dir_of(node), name), "", function() t:refresh(node) end)
       end)
     end,
     ["d"] = function(node, t)
-      nx.ui.confirm("Delete " .. node.path .. "?"):next(function(yes)
-        if yes then nx.fs.remove(node.path, function() t:refresh(t:parent(node)) end) end
+      btv.ui.confirm("Delete " .. node.path .. "?"):next(function(yes)
+        if yes then btv.fs.remove(node.path, function() t:refresh(t:parent(node)) end) end
       end)
     end,
   },
 }
-nx.keymap.set("n", "<leader>e", function() view:toggle() end)
-nx.fs.watch(nx.cwd(), function() view:refresh() end)
+btv.keymap.set("n", "<leader>e", function() view:toggle() end)
+btv.fs.watch(btv.cwd(), function() view:refresh() end)
 ```
 
-### 6. Viewport decorations (the decoration-provider shape) — `nx.decor`
+### 6. Viewport decorations (the decoration-provider shape) — `btv.decor`
 
 Some decorations are expensive *and* depend on what's on screen: rainbow
 parens, indent guides, inline blame, semantic tokens on a huge file. neovim
@@ -340,7 +340,7 @@ renderer invokes per visible row, every frame. That is precisely the
 re-enter-Lua-every-redraw model rule 4 forbids: a slow provider stalls the
 frame, and the PUC 5.1 backend cannot host the per-row hot loop at all.
 
-`nx.decor` keeps the *useful kernel* — only decorate what is visible;
+`btv.decor` keeps the *useful kernel* — only decorate what is visible;
 recompute when the viewport moves — and drops the frame coupling. The engine
 wakes the provider **once per visible-range change** (scroll, resize, edit
 reflow), debounced off the frame path, hands it a snapshot of the visible
@@ -352,7 +352,7 @@ invalidates its generation.
 
 ```lua
 -- a rainbow-delimiters-shaped plugin — the whole thing
-nx.decor.provider {
+btv.decor.provider {
   name = "rainbow",
   bufs = { filetype = { "lua", "rust", "json" } },   -- engine skips non-matching windows
 
@@ -380,25 +380,25 @@ nx.decor.provider {
 }
 ```
 
-Marks are the **same shape as `nx.hl.set`** — decorations are one data type
+Marks are the **same shape as `btv.hl.set`** — decorations are one data type
 whether static or viewport-driven:
 `{ row, col, end_row?, end_col?, hl?, virt_text?, virt_lines?, sign?, conceal?, priority? }`.
-Async is fine: an indent-guide or blame provider can `nx.run`/`nx.lsp`
+Async is fine: an indent-guide or blame provider can `btv.run`/`btv.lsp`
 inside `on_range` and call `publish` from the callback — the generation token
 makes a late response safe to fold or safe to drop. A provider that errors is
 reported loud (`E5108`) and disabled after repeated failures, matching the
 "no silent stubs" convention and neovim's own `CB_MAX_ERROR`.
 
 Decorations you already know — diagnostics from an LSP response, signs from a
-diff — need no provider; they are a plain `nx.hl.set(ns, buf, marks)`. Reach
-for `nx.decor` only when the work is worth scoping to the viewport.
+diff — need no provider; they are a plain `btv.hl.set(ns, buf, marks)`. Reach
+for `btv.decor` only when the work is worth scoping to the viewport.
 
-## Plugin persistence — assigned, isolated namespaces (`nx.shada.plugin`)
+## Plugin persistence — assigned, isolated namespaces (`btv.shada.plugin`)
 
 A plugin that wants to remember something across sessions opts in:
 
 ```lua
-local store = nx.shada.plugin()           -- no argument
+local store = btv.shada.plugin()           -- no argument
 store:set("recent", { "a.txt", "b.txt" }) -- any JSON-able Lua value
 local recent = store:get("recent")        -- a fresh copy, or nil
 store:delete("recent"); store:keys(); store:clear()
@@ -411,12 +411,12 @@ the registers / marks / history (and persistence rides the ordinary debounced
 checkpoint + clean-exit flush; with shada off it is in-memory only, like
 registers).
 
-The point is the *namespace*. It is **assigned, not chosen**: `nx.shada.plugin()`
+The point is the *namespace*. It is **assigned, not chosen**: `btv.shada.plugin()`
 takes no name and derives one from where the calling code lives — it walks the
 stack to the caller's source file and attributes it to the runtimepath / plugin
 directory that contains it. The namespace is then, in order: the canonical **name
 the package manager registered** for that directory, when the plugin was loaded
-through `nx.plugins` (tightest identity — a `name = …` spec can differ from the
+through `btv.plugins` (tightest identity — a `name = …` spec can differ from the
 install dir's basename); the reserved `user` for the config root; otherwise the
 directory's **basename** (the fallback for a plugin loaded outside the manager,
 e.g. a `pack/*/start/*` directory). So a plugin gets its own slice and *cannot
@@ -435,9 +435,9 @@ plugin can't bloat the shared store and slow every launch's recency-merge. A
 is left intact), while a shrink is always allowed so a plugin can recover. It is
 for small structured state — settings, a recent list — not bulk data.
 
-The store is lifecycle-managed. `nx.shada.namespaces()` lists every namespace
+The store is lifecycle-managed. `btv.shada.namespaces()` lists every namespace
 currently stored (an audit of what plugins have stowed), and
-`nx.shada.forget(name)` prunes one. `:PluginClean` uses them: when it removes an
+`btv.shada.forget(name)` prunes one. `:PluginClean` uses them: when it removes an
 uninstalled plugin's directory it also forgets that plugin's namespace, so the
 data doesn't outlive the plugin.
 
@@ -452,10 +452,10 @@ rule of thumb: **prefer the noun.** neovim toggles treesitter highlighting
 with `vim.treesitter.start(buf, lang)` / `stop(buf)` — *commands*. A command
 leaves no readable state ("is TS on for this buffer?" has no answer you can
 point at), isn't idempotent, and doesn't survive a session/shada round-trip.
-`nx` models the same capability as **derived buffer state**, two declarative
+`btv` models the same capability as **derived buffer state**, two declarative
 nouns the engine reads:
 
-| `nx.bo` state | Default | Decides |
+| `btv.bo` state | Default | Decides |
 | --- | --- | --- |
 | `filetype` | from the path's extension | *which* language (`filetype` → lang) |
 | `ts_highlight` | on when a language resolves | *whether* the native engine highlights |
@@ -464,7 +464,7 @@ nouns the engine reads:
 Two nouns, not one, because "off" is orthogonal to "which": a giant `.rs`
 buffer can keep `filetype = "rust"` (so LSP, indent, and comments still key off
 it) with `ts_highlight = false`. Both are plain buffer options — set in
-`init.lua`, in a `nx.on("filetype", …)` handler, or by a plugin — and both
+`init.lua`, in a `btv.on("filetype", …)` handler, or by a plugin — and both
 write the per-buffer override the engine already derives its highlight language
 from (`Editor::ts_override`). Nothing new in the engine: the writer moves from
 a command to an option, and the state becomes introspectable and serializable.
@@ -479,16 +479,16 @@ onto — the noun is what makes the alias admissible.
 ## The `vim.*` boundary
 
 Per [ADR 0002](../decisions/0002-native-plugin-system.md) the break is clean:
-**every editor API lives in `nx.*`**, config included. The only `vim.*` Lua is
-a **closed whitelist of muscle-memory aliases** mapping 1:1 onto the `nx.*`
+**every editor API lives in `btv.*`**, config included. The only `vim.*` Lua is
+a **closed whitelist of muscle-memory aliases** mapping 1:1 onto the `btv.*`
 equivalents, so config can be written in familiar spellings. Colorschemes are
-nxvim's own: a colorscheme is Lua that fills the highlight registry through the
-`nx` highlight API (its `nvim_set_hl` alias), which is part of that whitelist —
+bemtvi's own: a colorscheme is Lua that fills the highlight registry through the
+`btv` highlight API (its `nvim_set_hl` alias), which is part of that whitelist —
 not a separate surface.
 
 The admission test for an alias: frequent in real
 configs, declarative or callback-shaped (never blocking, never frame-time),
-1:1 onto an `nx` primitive. The set (the canonical list lives in
+1:1 onto an `btv` primitive. The set (the canonical list lives in
 [ADR 0002](../decisions/0002-native-plugin-system.md)): variables / options /
 env (`vim.g`/`vim.b`/`vim.w`, `vim.o`/`vim.opt`/`vim.opt_local`/`vim.bo`/
 `vim.wo`, `vim.env`); `vim.cmd` and `vim.keymap.set`/`del`; the pure helpers
@@ -502,16 +502,16 @@ env (`vim.g`/`vim.b`/`vim.w`, `vim.o`/`vim.opt`/`vim.opt_local`/`vim.bo`/
 its callback form only — `:wait()` fails loud); and `vim.treesitter.start` /
 `stop`, the one carve-out from the no-`vim.treesitter`-surface rule, desugaring
 to the `filetype` / `ts_highlight` buffer-state writes above (*Treesitter
-highlighting is buffer state*). Aliases, not an API: the same objects, `nx`
+highlighting is buffer state*). Aliases, not an API: the same objects, `btv`
 semantics, no growth beyond the list.
 
 There is no `vim.treesitter` or `vim.lsp` *surface*: of that machinery, what
-serves nxvim's objectives is refactored into `nx.treesitter` / `nx.lsp` (the
+serves bemtvi's objectives is refactored into `btv.treesitter` / `btv.lsp` (the
 highlight toggle becomes buffer state, above), and the rest is deleted. The neovim runtime-model surfaces — wait-pumps, public uv
 handles, frame-time decoration providers, the `vim.fn` long tail,
 prompt-buffer emulation — exist on neither side of the API: plugins and config
-get `nx.run` / `nx.timer` / `nx.fs` / `nx.ui.*` and the off-frame
-`nx.decor` instead.
+get `btv.run` / `btv.timer` / `btv.fs` / `btv.ui.*` and the off-frame
+`btv.decor` instead.
 
 The native subsystems the surfaces above expose — LSP, treesitter, extmarks,
 the pmenu, floats, the panel, the evloop, the settle contract — are the
@@ -519,29 +519,29 @@ engines this API is a thin contract over.
 
 ## Suggested build order
 
-1. **`nx` core** (buf/win/options/event/spawn/fs/timer/keymap/command/ui.input
-   + `nx.lsp` setup — contracts over existing machinery; `init.lua` targets it
+1. **`btv` core** (buf/win/options/event/spawn/fs/timer/keymap/command/ui.input
+   + `btv.lsp` setup — contracts over existing machinery; `init.lua` targets it
    from day one) and the manifest loader + package manager. *(package manager
-   landed — `nx.plugins`: declarative specs, async `git` install/update over
-   `nx.run`, eager + lazy (`cmd`/`event`/`ft`/`keys`) loading, `:PluginSync` /
+   landed — `btv.plugins`: declarative specs, async `git` install/update over
+   `btv.run`, eager + lazy (`cmd`/`event`/`ft`/`keys`) loading, `:PluginSync` /
    `:PluginInstall` / `:PluginUpdate` / `:PluginClean` / `:PluginList`. A loaded
-   plugin is put on the live runtimepath via the `nx._add_rtp` bridge — so its
+   plugin is put on the live runtimepath via the `btv._add_rtp` bridge — so its
    modules `require` and its `colors/`/`queries/`/`lsp/` resolve without a
    restart — then its `plugin/` scripts source and its `config` runs. `config`/
    `init` accept a plain or async function. A built-in **first-run** flow
-   (`nx.plugins.recommend{…}` + the `VimEnter` autocmd) offers a curated set on a
+   (`btv.plugins.recommend{…}` + the `VimEnter` autocmd) offers a curated set on a
    fresh setup and, on accept, writes it to a managed `lua/plugins.lua` the user's
-   `init.lua` requires. See `crates/nxvim-lua/src/prelude/plugins.lua` and
+   `init.lua` requires. See `crates/bemtvi-lua/src/prelude/plugins.lua` and
    `examples/plugins/`.)*
 2. **Picker** — highest daily-driver value; exercises spawn / streaming /
    cancellation / floats / preview end to end.
 3. **Completion engine** — LSP + buffer + snippets sources built-in.
-4. **Statusline segments** *(landed — `nx.statusline`, the lualine-shaped
+4. **Statusline segments** *(landed — `btv.statusline`, the lualine-shaped
    registry: built-ins resolved natively, custom segments re-rendered on declared
    events / `invalidate`; see
-   [the plan](../plans/2026-06-15-nx-statusline-segments.md))*, **snippet engine**
+   [the plan](../plans/2026-06-15-btv-statusline-segments.md))*, **snippet engine**
    *(landed, shared with 3)*, **tree docks**.
-5. **`nx.decor`** — the decoration-provider drive already exists; the new
+5. **`btv.decor`** — the decoration-provider drive already exists; the new
    piece is the debounced viewport-changed signal off the scroll/resize path
    (not `redraw`) and the generation-keyed publish into the extmark layer.
    Lower daily-driver priority (rainbow / indent guides / inline blame are

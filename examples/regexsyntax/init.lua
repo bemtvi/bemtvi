@@ -1,11 +1,11 @@
--- ~~~ nxvim 'regexsyntax': pick the regex dialect for `/` search and `:substitute` ~~~
+-- ~~~ bemtvi 'regexsyntax': pick the regex dialect for `/` search and `:substitute` ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/regexsyntax \
---       cargo run -p nxvim -- examples/regexsyntax/sample.txt
+--     BEMTVI_CONFIG=examples/regexsyntax \
+--       cargo run -p bemtvi -- examples/regexsyntax/sample.txt
 --
--- nxvim's `/` search and `:s` substitute speak ONE of two regex dialects, chosen
+-- bemtvi's `/` search and `:s` substitute speak ONE of two regex dialects, chosen
 -- by the `regexsyntax` option:
 --
 --   * "pcre" (the DEFAULT) — canonical / perl-compatible regex (the Rust `regex`
@@ -13,7 +13,7 @@
 --     and a replacement uses `$1` / `${name}` capture refs. No back-references or
 --     look-around.
 --
---   * "vim" — the real vim "magic" dialect, matched by nxvim's embedded copy of
+--   * "vim" — the real vim "magic" dialect, matched by bemtvi's embedded copy of
 --     vim's own regexp engine. `\(\)` groups, `\1` / `&` back-refs, `\<`/`\>` word
 --     boundaries, the non-greedy `\{-}` family, `\zs`/`\ze`, look-around (`\@=`),
 --     and the `\u \U \l \L \e \E` replacement case modifiers — exactly as in vim.

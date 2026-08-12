@@ -1,7 +1,7 @@
--- ~~~ nxvim nx.decor playground: rainbow-delimiters as a viewport provider ~~~
+-- ~~~ bemtvi btv.decor playground: rainbow-delimiters as a viewport provider ~~~
 --
--- This is the flagship `nx.decor` example — a whole rainbow-parens plugin in one
--- provider. `nx.decor` is nxvim's answer to neovim's decoration provider: instead
+-- This is the flagship `btv.decor` example — a whole rainbow-parens plugin in one
+-- provider. `btv.decor` is bemtvi's answer to neovim's decoration provider: instead
 -- of an `on_win`/`on_line` callback the renderer fires per visible row *every
 -- frame* (which ADR 0002 rule 4 forbids and the Lua backend can't host), a
 -- provider is woken **once per visible-range change** — scroll, resize, edit
@@ -11,20 +11,20 @@
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/rainbow \
---       cargo run -p nxvim -- examples/rainbow/sample.lua
+--     BEMTVI_CONFIG=examples/rainbow \
+--       cargo run -p bemtvi -- examples/rainbow/sample.lua
 --
 -- The brackets colour by nesting depth the instant the file opens; scroll with
 -- <C-e>/<C-d> or `G` and the newly-revealed lines colour as they come into view.
 
 --------------------------------------------------------------------------------
--- The six depth colours the marks reference. nx.hl.define is the canonical
+-- The six depth colours the marks reference. btv.hl.define is the canonical
 -- highlight setter (vim.api.nvim_set_hl is its alias); ns 0 is the global table.
 --------------------------------------------------------------------------------
 local RAINBOW = { "Rainbow1", "Rainbow2", "Rainbow3", "Rainbow4", "Rainbow5", "Rainbow6" }
 local COLORS = { "#f38ba8", "#fab387", "#f9e2af", "#a6e3a1", "#89b4fa", "#cba6f7" }
 for i, group in ipairs(RAINBOW) do
-  nx.hl.define(0, group, { fg = COLORS[i], bold = true })
+  btv.hl.define(0, group, { fg = COLORS[i], bold = true })
 end
 
 --------------------------------------------------------------------------------
@@ -36,7 +36,7 @@ end
 -- mark is extmark-shaped: `{ row, col, end_col = col+1, hl = group }` with `row`
 -- in absolute (buffer) coordinates.
 --------------------------------------------------------------------------------
-nx.decor.provider {
+btv.decor.provider {
   name = "rainbow",
   bufs = { filetype = { "lua", "rust", "json", "javascript", "c" } },
   on_range = function(ctx, publish)
@@ -60,4 +60,4 @@ nx.decor.provider {
 
 vim.o.number = true
 
-print("nx.decor rainbow: brackets colour by nesting depth — scroll to see new lines colour in")
+print("btv.decor rainbow: brackets colour by nesting depth — scroll to see new lines colour in")

@@ -1,9 +1,9 @@
--- ~~~ nxvim dock winhighlight: paint a dock like a VSCode sidebar ~~~
+-- ~~~ bemtvi dock winhighlight: paint a dock like a VSCode sidebar ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/dock-winhighlight \
---       cargo run -p nxvim -- examples/dock-winhighlight/sample.txt
+--     BEMTVI_CONFIG=examples/dock-winhighlight \
+--       cargo run -p bemtvi -- examples/dock-winhighlight/sample.txt
 --
 -- `'winhighlight'` is vim's per-window highlight-group REMAP: while a window is
 -- rendered, every group on the left of a `from:to` pair resolves to the group on
@@ -11,7 +11,7 @@
 -- the mechanism behind the "dimmer sidebar" look: a file-tree panel painted on a
 -- slightly different background from the code you are editing.
 --
--- nxvim exposes it on the dock scope: `nx.dock.opt(side).winhighlight = "..."`
+-- bemtvi exposes it on the dock scope: `btv.dock.opt(side).winhighlight = "..."`
 -- applies the remap to every window in that dock. The value is a comma-separated
 -- list of `FromGroup:ToGroup` pairs.
 --
@@ -31,16 +31,16 @@
 --    the example works with no colorscheme loaded). A real config would let its
 --    theme define `NormalSB` etc., or link them to theme groups.
 --------------------------------------------------------------------------------
-nx.hl.define(0, "NormalSB", { bg = "#181825", fg = "#cdd6f4" }) -- the sidebar body
-nx.hl.define(0, "SidebarEob", { fg = "#313244" }) -- dim the trailing ~ fillers
-nx.hl.define(0, "SidebarLineNr", { fg = "#45475a" }) -- a quieter number gutter
+btv.hl.define(0, "NormalSB", { bg = "#181825", fg = "#cdd6f4" }) -- the sidebar body
+btv.hl.define(0, "SidebarEob", { fg = "#313244" }) -- dim the trailing ~ fillers
+btv.hl.define(0, "SidebarLineNr", { fg = "#45475a" }) -- a quieter number gutter
 
 --------------------------------------------------------------------------------
 -- 2. Open a left dock and a titled, always-on strip — the file-tree panel stand-in.
 --------------------------------------------------------------------------------
-nx.dock.open({ side = "left", size = 30 })
-nx.dock.opt("left").title = "EXPLORER"
-nx.dock.opt("left").showtabline = 2
+btv.dock.open({ side = "left", size = 30 })
+btv.dock.opt("left").title = "EXPLORER"
+btv.dock.opt("left").showtabline = 2
 
 --------------------------------------------------------------------------------
 -- 3. The star of the example: remap the dock's chrome so it reads as a sidebar.
@@ -48,13 +48,13 @@ nx.dock.opt("left").showtabline = 2
 --    `EndOfBuffer:SidebarEob` → the ~ fillers below the content fade out
 --    `LineNr:SidebarLineNr`   → a quieter line-number gutter inside the dock
 --
---    Equivalent inline form: `nx.dock.open{ side = "left", size = 30,
+--    Equivalent inline form: `btv.dock.open{ side = "left", size = 30,
 --      winhighlight = "Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr" }`.
 --------------------------------------------------------------------------------
-nx.dock.opt("left").winhighlight = "Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr"
+btv.dock.opt("left").winhighlight = "Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr"
 
 -- Give the sidebar some content so the background is obvious (its own scratch
--- buffer is focused right after `nx.dock.open`, before focus returns to main).
+-- buffer is focused right after `btv.dock.open`, before focus returns to main).
 local sidebar = vim.api.nvim_get_current_buf()
 vim.api.nvim_buf_set_lines(sidebar, 0, -1, false, {
   "  src/",
@@ -64,6 +64,6 @@ vim.api.nvim_buf_set_lines(sidebar, 0, -1, false, {
   "  README.md",
 })
 
--- winhighlight is per-WINDOW, not per-buffer: it is also exposed on `nx.wo`, so a
+-- winhighlight is per-WINDOW, not per-buffer: it is also exposed on `btv.wo`, so a
 -- single window (not in any dock) can remap its own groups the same way. Docks are
 -- just the most common use.

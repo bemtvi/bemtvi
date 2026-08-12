@@ -37,7 +37,7 @@ single global list and can also be a dock tab.
 | Add another list tab | `focus_dock(Bottom)` + `new_tab(buf, opts)` (`tabs.rs:290`) |
 | Cross out of the dock on jump | `switch_layer(Layer::Main)` (`dock.rs`) |
 | Tab label | `QfList.title` → `region_tablines()` |
-| Picker's current result set | `nx._picker.items` (Lua-side full item tables) |
+| Picker's current result set | `btv._picker.items` (Lua-side full item tables) |
 
 ## Seams (the only non-trivial parts)
 
@@ -59,7 +59,7 @@ single global list and can also be a dock tab.
 ### Phase 1 — Jump routing crosses to the main layer — DONE (no code needed)
 - Test: `enter_in_dock_hosted_qf_jumps_into_the_main_layer` (`tests/quickfix.rs`).
   Hosts a qf display as a bottom-dock tab via existing APIs (`:copen` → grab buf →
-  `:cclose` → `nx.dock.open{buf=…}`), then `<CR>` from the dock.
+  `:cclose` → `btv.dock.open{buf=…}`), then `<CR>` from the dock.
 - **Finding:** seam 1 needs no change. `qf_focus_target_window` already resolves
   the target to a main-layer window (`qf_prev_win` / the loclist owner), and
   `set_current_window` (`windows.rs:1131`) already crosses layers (`switch_layer`
@@ -85,13 +85,13 @@ single global list and can also be a dock tab.
 - Tests (`tests/quickfix.rs`): `copen_hosts_the_list_in_the_bottom_dock_by_default`,
   `cclose_closes_the_dock_hosted_list`, `noqfdock_opens_the_classic_bottom_split`.
   The split-mechanics tests (`copen_opens_a_small_window_at_the_bottom`, the
-  cclose/owner-close/`nx.qf` wrappers) now `:set noqfdock` — they guard the split
+  cclose/owner-close/`btv.qf` wrappers) now `:set noqfdock` — they guard the split
   mode, which is the opt-out. Full quickfix (38) + dock (54) suites green.
 - Original Phase 2 plan text follows.
 
 ### Phase 2 — Host the qf/loc display in the bottom dock (option-gated)
 - **User-facing option** selecting list-display style — **dock (default, the
-  nxvim way)** vs **split (the telescope/vim way: a bottom split of the current
+  bemtvi way)** vs **split (the telescope/vim way: a bottom split of the current
   window, the single global qf list / per-window loclist, replace-in-place).** The
   option governs where `:copen`/`:lopen` and the send-action place the display, so
   one switch flips the whole behavior. Default = dock.
@@ -112,10 +112,10 @@ single global list and can also be a dock tab.
   whose window both owns and displays its own location list (reuses
   `qf_place_in_dock` + `qf_set_items`); returns the owning window. Each call adds an
   independent list. `Editor::loclist_send(items, title)` wraps it and honors
-  `'qfdock'`: dock tab (nxvim) vs current-window loclist replace + split (vim).
-- Bridge: a `send: bool` flag on `QfSetOp`; `nx._loclist_send(items, title)` queues
+  `'qfdock'`: dock tab (bemtvi) vs current-window loclist replace + split (vim).
+- Bridge: a `send: bool` flag on `QfSetOp`; `btv._loclist_send(items, title)` queues
   it; `effects.rs` routes `op.send` to `loclist_send`. Lua API
-  `nx.qf.send_to_loclist(list, { title })` (alias `nx.send_to_loclist`) — the
+  `btv.qf.send_to_loclist(list, { title })` (alias `btv.send_to_loclist`) — the
   telescope port. Reuses the whole `setloclist` item-marshalling path.
 - Tests (`tests/quickfix.rs`): `send_to_loclist_saves_each_search_as_its_own_dock_tab`
   (two sends → two independent dock tabs, each with its own list, `<CR>` jumps to
@@ -130,9 +130,9 @@ single global list and can also be a dock tab.
   server-side from the menu (`apply_picker_action` → new `Editor::picker_sends`
   channel), so a fuzzy-narrowed `files` picker sends only the visible rows, not
   every candidate — then closes the picker and hands the keys to Lua.
-- `nx._picker_send(keys)` (via `run_picker_send`) maps the keys back to the source
-  item tables, keeps those with a `path`, and `nx.schedule`s
-  `nx.qf.send_to_loclist` (Phase 3) so the float has closed and focus is back in
+- `btv._picker_send(keys)` (via `run_picker_send`) maps the keys back to the source
+  item tables, keeps those with a `path`, and `btv.schedule`s
+  `btv.qf.send_to_loclist` (Phase 3) so the float has closed and focus is back in
   main before the dock list opens. `<C-q>` registered as a default `picker`-mode map
   (overridable).
 - Test (`tests/picker.rs`): `ctrl_q_sends_filtered_results_to_a_dock_loclist` — a
@@ -142,8 +142,8 @@ single global list and can also be a dock tab.
 
 ### Phase 5 — DONE (all three parts)
 - **Part 2 — `send_to_qflist` + `add_*` variants.** Generalized the send into
-  `Editor::list_send(items, title, action, to_qf)`; Lua `nx.qf.{send,add}_to_{loc,qf}list`
-  (+ bare aliases) via `nx._list_send`. quickfix list = one reused dock tab; loclist
+  `Editor::list_send(items, title, action, to_qf)`; Lua `btv.qf.{send,add}_to_{loc,qf}list`
+  (+ bare aliases) via `btv._list_send`. quickfix list = one reused dock tab; loclist
   *send* = new tab, *add* = append to the focused tab. Honors `'qfdock'`.
 - **Part 1 — picker multi-select.** `marked: Vec<usize>` on `Menu`;
   `toggle_select`/`clear_select` actions bound to `<Tab>`/`<S-Tab>`; `<C-q>` sends
@@ -153,9 +153,9 @@ single global list and can also be a dock tab.
 - **Part 3 — examples + docs.** `examples/picker-to-loclist/` (init.lua + sample +
   notes), smoke-tested to load end-to-end. Docs: `docs/features/quickfix-dock-lists.md`
   + `docs/features/picker.md` updates + the `features.md` index. Exposed `'qfdock'`
-  through the `nx.o` mirror (name map + default + `GoMirror` + `set_global_option_bool`)
-  so `nx.o.qfdock` reads/writes (the example's toggle).
-- Tests: send/add_to_qflist + add_to_loclist, multi-select send-marked, `nx.o.qfdock`
+  through the `btv.o` mirror (name map + default + `GoMirror` + `set_global_option_bool`)
+  so `btv.o.qfdock` reads/writes (the example's toggle).
+- Tests: send/add_to_qflist + add_to_loclist, multi-select send-marked, `btv.o.qfdock`
   round-trip, example-config load. quickfix (43) + picker (38) green, clippy clean.
 
 ## Status: COMPLETE — all phases landed.

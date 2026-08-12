@@ -8,10 +8,10 @@
 
 ## Why this document exists
 
-nxvim **already has a working insert-mode completion menu.** `<C-Space>` in
+bemtvi **already has a working insert-mode completion menu.** `<C-Space>` in
 insert mode fires a real `textDocument/completion`
-(`crates/nxvim-server/src/lib.rs` binds it to `LspReqKind::Completion`); the
-reply opens a server-owned `CompletionMenu` (`crates/nxvim-server/src/lsp.rs`)
+(`crates/bemtvi-server/src/lib.rs` binds it to `LspReqKind::Completion`); the
+reply opens a server-owned `CompletionMenu` (`crates/bemtvi-server/src/lsp.rs`)
 that filters/ranks in place as you type, navigates with `<C-n>`/`<C-p>`, and
 accepts the selected item — honoring its `textEdit` range and
 `additionalTextEdits` (auto-imports) as one undo step. The e2e suite drives it
@@ -23,13 +23,13 @@ block a server attaches to a candidate (function docs, parameter help). When the
 plan was written it was missing for two concrete reasons, both now resolved:
 
 1. **`documentation` was dropped at distillation.** `completion_item()`
-   (`crates/nxvim-lsp/src/manager.rs`) reduces the protocol `CompletionItem` to
+   (`crates/bemtvi-lsp/src/manager.rs`) reduces the protocol `CompletionItem` to
    `CompletionItemData`; it previously kept `label / kind / detail / filter_text /
    sort_text / insert_text / text_edit / additional_text_edits` — but **not**
    `documentation`, and not the opaque `data` blob a server needs to resolve it.
    Phase 1 added both (`documentation` + `resolve_data`).
 2. **No `completionItem/resolve`, and no completion client capability at all.**
-   nxvim advertised no `completion` block under `text_document` in
+   bemtvi advertised no `completion` block under `text_document` in
    `client_capabilities()`, so it never declared `documentationFormat` or
    `resolveSupport`. This matters because most servers — **notably
    rust_analyzer** — send completion lists *without* documentation (often
@@ -48,7 +48,7 @@ resolve, or a malformed reply, is logged — never faked into an empty doc that
 looks like "no documentation."
 
 > **Not in scope: `vim.lsp.omnifunc`.** That stub
-> (`crates/nxvim-lua/src/prelude.lua`) raises `not implemented`, but it is the
+> (`crates/bemtvi-lua/src/prelude.lua`) raises `not implemented`, but it is the
 > *legacy `i_CTRL-X_CTRL-O` Vimscript omni-completion* entry point — a separate,
 > Vimscript-era path. The native menu above does **not** route through it. Do
 > not read the omnifunc raise as "completion is missing"; it isn't.
@@ -74,8 +74,8 @@ resolve possible at all (rust_analyzer rejects a resolve whose `data` it didn't
 issue). Advertising the capability is also what some servers gate doc-sending
 on.
 
-**Scope.** `crates/nxvim-lsp/src/manager.rs` (`CompletionItemData`,
-`completion_item()`, `client_capabilities()`), `crates/nxvim-server/src/lsp.rs`
+**Scope.** `crates/bemtvi-lsp/src/manager.rs` (`CompletionItemData`,
+`completion_item()`, `client_capabilities()`), `crates/bemtvi-server/src/lsp.rs`
 (`CompletionMenu` carries the field forward — already `raw`-backed).
 
 **Approach.**
@@ -94,7 +94,7 @@ on.
   "detail"]), data_support? ... }), .. })` block, alongside the existing
   `code_action` `resolve_support`/`data_support` pattern.
 
-**Tests.** In `crates/nxvim/tests/lsp.rs` (scripted mock): a `completion` result
+**Tests.** In `crates/bemtvi/tests/lsp.rs` (scripted mock): a `completion` result
 whose item carries inline `documentation` surfaces on the menu item — assert it
 rides the reply into `CompletionMenu.raw` (a new redraw assertion or a Lua-side
 probe, consistent with how the menu is otherwise observed).
@@ -109,7 +109,7 @@ construction. Verified by `completion_capability_advertises_documentation_and_re
 (asserts the advertised capability on the recorded `initialize`) and
 `a_documented_completion_item_opens_the_menu` (a `MarkupContent`-documented,
 `data`-bearing item distills cleanly and reaches the menu) in
-`crates/nxvim/tests/lsp.rs`.
+`crates/bemtvi/tests/lsp.rs`.
 
 **Depends on.** Nothing (the menu already exists).
 
@@ -127,9 +127,9 @@ them. (The raw wire method already exists in the `dyn_requests!` table in
 `manager.rs` — but only reachable via the generic Lua `client:request`, not from
 the native menu.)
 
-**Scope.** `crates/nxvim-lsp/src/manager.rs` (a typed `LspRequest::ResolveCompletion`
+**Scope.** `crates/bemtvi-lsp/src/manager.rs` (a typed `LspRequest::ResolveCompletion`
 / `LspReply::ResolvedCompletion`, modeled on `ResolveCodeAction` /
-`ResolvedCodeAction`), `crates/nxvim-server/src/lsp.rs` (`LspReqKind::CompletionResolve`,
+`ResolvedCodeAction`), `crates/bemtvi-server/src/lsp.rs` (`LspReqKind::CompletionResolve`,
 issue on selection-settle, route reply → merge into the open menu).
 
 **Approach.**
@@ -145,7 +145,7 @@ issue on selection-settle, route reply → merge into the open menu).
 - On reply, merge `documentation`/`detail` into the matching `raw` entry and
   mark it resolved; `lsp_dirty = true` so the preview repaints.
 
-**Tests.** In `crates/nxvim/tests/lsp.rs`: extend the scripted mock with a
+**Tests.** In `crates/bemtvi/tests/lsp.rs`: extend the scripted mock with a
 `completion_resolve` reply; assert that selecting an item with no inline docs
 issues `completionItem/resolve` with the original item's `data`, and the
 resolved documentation lands on the menu item off-tick. A resolve failure logs
@@ -161,9 +161,9 @@ target on the menu), and a failed/malformed resolve is logged and leaves the
 item docless. Typed `LspRequest::ResolveCompletion` / `LspReply::ResolvedCompletion`
 in `manager.rs`; `LspReqKind::CompletionResolve` fired from `lsp_menu_move` via
 `maybe_resolve_selected`, merged by `merge_resolved_completion`, in
-`nxvim-server/src/lsp.rs`. Verified by
+`bemtvi-server/src/lsp.rs`. Verified by
 `selecting_a_docless_item_resolves_it_and_merges_the_result` and
-`a_completion_resolve_failure_leaves_the_item_docless` in `crates/nxvim/tests/lsp.rs`
+`a_completion_resolve_failure_leaves_the_item_docless` in `crates/bemtvi/tests/lsp.rs`
 (the mock gained a `completion_resolve` script field).
 
 **Depends on.** Phase 1 (the field + `data` + advertised capability).
@@ -177,7 +177,7 @@ completion popup (vim's "preview window"/`completeopt=popup` shape).
 
 **Why.** The visible payoff — Phases 1–2 make the data exist; this shows it.
 
-**Scope.** `crates/nxvim-server/src/lsp.rs` (`pmenu_value` projects the selected
+**Scope.** `crates/bemtvi-server/src/lsp.rs` (`pmenu_value` projects the selected
 item's doc lines), the `pmenu` redraw key (a new `doc` field), and the client's
 pmenu overlay renderer (a side box; falls back to below/above like the popup's
 own placement logic).
@@ -190,7 +190,7 @@ own placement logic).
 - Render it client-side next to the popup; prefer the side with room, mirroring
   `pmenu_value`'s existing fit logic.
 
-**Tests.** In `crates/nxvim-server/tests/editing.rs` (or `lsp.rs` for the
+**Tests.** In `crates/bemtvi-server/tests/editing.rs` (or `lsp.rs` for the
 mock-fed case): after opening the menu and selecting a documented item, the
 `pmenu` redraw value carries the doc lines — asserted on the redraw view
 (take-latest helper), the project's standard surface for UI state.
@@ -205,7 +205,7 @@ scrollable**: the client tracks a `doc_scroll` offset (a pure UI gesture — onl
 the client knows the box height), the wheel hit-tests the box via the shared
 `pmenu_doc_geometry` and clamps to its `max_scroll`, and the offset resets when
 the previewed docs change. Verified by `selecting_a_documented_item_shows_a_doc_preview`
-and `the_doc_preview_scrolls_with_the_mouse_wheel` in `crates/nxvim/tests/lsp.rs`
+and `the_doc_preview_scrolls_with_the_mouse_wheel` in `crates/bemtvi/tests/lsp.rs`
 (the latter asserts the box shows the top unscrolled and the matching later line
 scrolled to the bottom).
 
@@ -214,8 +214,8 @@ hit-test lets the wheel over the popup move the selection one item per notch
 (non-wrapping, so the list scrolls to the ends like a scrollbar) and a left-click
 on a row select it — clicking the already-selected row accepts it, the
 `<C-n>`/`<C-y>` equivalents. Unlike the doc-box offset, selection is server
-state, so the client just sends `nxvim_complete_select(index)` /
-`nxvim_complete_accept` (the index clamped server-side) and the menu repaints on
+state, so the client just sends `bemtvi_complete_select(index)` /
+`bemtvi_complete_accept` (the index clamped server-side) and the menu repaints on
 the reply. Verified by `a_click_selects_then_accepts_a_completion_item` and
 `the_completion_popup_scrolls_with_the_mouse_wheel`.
 

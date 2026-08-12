@@ -2,7 +2,7 @@ unified window geometry — viewport-relative size · alignment · margin
 
 One vocabulary, four surfaces:
 
-  • floats / nx.view   — width/height as cells or "50vw"/"30vh"/"50%",
+  • floats / btv.view   — width/height as cells or "50vw"/"30vh"/"50%",
                          align = "top-right"/"center"/…, margin = a gap
   • pickers            — same align + margin (no longer centered-only)
   • the bottom panel   — fractional height + a margin from the edges

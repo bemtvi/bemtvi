@@ -1,16 +1,16 @@
-# Serves the browser (wasm) build of nxvim as static files.
+# Serves the browser (wasm) build of bemtvi as static files.
 #
 # The browser client is arch-independent wasm, deployed as a static bundle (the same
 # way it ships to a CDN) — so this image does NOT compile anything; it serves a bundle
 # you build once on the host. Build that bundle first:
 #
-#     crates/nxvim-edithost/build.sh        # produces dist/ + web/vendor/ (needs emcc + node)
+#     crates/bemtvi-edithost/build.sh        # produces dist/ + web/vendor/ (needs emcc + node)
 #
 # Then build + run this image. The build context is the edit-host crate dir, so build
 # from the REPO ROOT with an explicit context:
 #
-#     podman build -f examples/docker-daemon/Containerfile.web -t nxvim-web crates/nxvim-edithost
-#     podman run --rm -p 127.0.0.1:8088:8088 --name nxvim-web nxvim-web
+#     podman build -f examples/docker-daemon/Containerfile.web -t bemtvi-web crates/bemtvi-edithost
+#     podman run --rm -p 127.0.0.1:8088:8088 --name bemtvi-web bemtvi-web
 #
 # The page is then at http://localhost:8088/web/ . It is a *static* host: the actual
 # WebTransport connection to the daemon is made by YOUR browser (on the host), not by

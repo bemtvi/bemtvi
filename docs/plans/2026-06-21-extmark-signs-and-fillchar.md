@@ -1,7 +1,7 @@
 # Extmark gutter signs + line-fill (fillchar) — core capabilities
 
-Two render-only extmark decorations nxvim accepts-but-doesn't-paint today (see
-`EXTMARK_OPT_DECORATION` in `prelude/api.lua`), needed so the **nxvim-diff** plugin can
+Two render-only extmark decorations bemtvi accepts-but-doesn't-paint today (see
+`EXTMARK_OPT_DECORATION` in `prelude/api.lua`), needed so the **bemtvi-diff** plugin can
 honor its deferred `signs` and `fillchar` options — but both are general-purpose (gutter
 signs back any gitsigns/marks/dap-breakpoint plugin; line-fill backs any "blank this row
 with a glyph" need).
@@ -40,7 +40,7 @@ with a glyph" need).
 
 1. **Core** (`extmark.rs`): add `line_fill: Option<VirtChunk>` to `VirtDecor` — fill the
    anchored line's text area with `text` (repeated to the window text width) in `hl_group`.
-2. **Lua bridge**: accept an `nx`-native key (e.g. `line_fill = { text, hl_group }`) on
+2. **Lua bridge**: accept an `btv`-native key (e.g. `line_fill = { text, hl_group }`) on
    `set_extmark` and lower it.
 3. **Projection**: in `window_value`, where the window text width is known, expand a
    `line_fill` mark on its row into an `Overlay` `virt_text` placement sized to the
@@ -49,7 +49,7 @@ with a glyph" need).
 4. **Test**: a core redraw test — a blank line with a `line_fill` mark renders the char
    across the row.
 
-## Phase C — nxvim-diff (the plugin repo)
+## Phase C — bemtvi-diff (the plugin repo)
 
 Flip `signs` / `fillchar` from deferred to working: place `+`/`~`/`-` hunk signs and paint
 the `fillchar` on filler rows; update `decor_spec`, the plan, and the README.

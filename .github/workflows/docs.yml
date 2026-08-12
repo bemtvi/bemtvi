@@ -1,7 +1,7 @@
-# Build "The nxvim Book" and deploy it to GitHub Pages.
+# Build "The bemtvi Book" and deploy it to GitHub Pages.
 #
 # The book is GENERATED FROM SOURCE: book/gen/generate.py imports the curated
-# docs/*.md (rewriting links) and extracts the nx.* API reference from the Lua
+# docs/*.md (rewriting links) and extracts the btv.* API reference from the Lua
 # prelude, then renders src/SUMMARY.md. Generated files are git-ignored, so this
 # workflow regenerates them before every build — the prelude is the source of
 # truth and the published site cannot drift from the code.
@@ -18,7 +18,7 @@ on:
     paths:
       - "book/**"
       - "docs/**"
-      - "crates/nxvim-lua/src/prelude/**"
+      - "crates/bemtvi-lua/src/prelude/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 

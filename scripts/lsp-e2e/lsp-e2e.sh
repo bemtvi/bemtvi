@@ -2,7 +2,7 @@
 #
 # lsp-e2e.sh — install the pinned language servers the LSP end-to-end suite drives.
 #
-# The suite (crates/nxvim/tests/lsp_e2e.rs) is gated behind NXVIM_LSP_E2E=1 and runs
+# The suite (crates/bemtvi/tests/lsp_e2e.rs) is gated behind BEMTVI_LSP_E2E=1 and runs
 # the *real* server binaries, configured through the vendored nvim-lspconfig. This
 # script downloads exactly the versions pinned in manifest.json, verifies their
 # hashes, and installs them into a local, git-ignored prefix.
@@ -22,8 +22,8 @@
 #   scripts/lsp-e2e/lsp-e2e.sh print-bin   # print the install bin dir (for $PATH / the test)
 #
 # The install prefix defaults to <repo>/.lsp-e2e and can be overridden with
-# NXVIM_LSP_E2E_DIR. The test reads the same default, so `install` then
-# `NXVIM_LSP_E2E=1 cargo test -p nxvim --test lsp_e2e` just works.
+# BEMTVI_LSP_E2E_DIR. The test reads the same default, so `install` then
+# `BEMTVI_LSP_E2E=1 cargo test -p bemtvi --test lsp_e2e` just works.
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MANIFEST="$SCRIPT_DIR/manifest.json"
 NPM_DIR="$SCRIPT_DIR/npm"
 
-PREFIX="${NXVIM_LSP_E2E_DIR:-$REPO_ROOT/.lsp-e2e}"
+PREFIX="${BEMTVI_LSP_E2E_DIR:-$REPO_ROOT/.lsp-e2e}"
 BIN_DIR="$PREFIX/bin"
 PKG_DIR="$PREFIX/pkg"
 
@@ -238,7 +238,7 @@ cmd_install() {
 
   echo
   log "done. Add to PATH for the suite:  export PATH=\"$BIN_DIR:\$PATH\""
-  log "then:  NXVIM_LSP_E2E=1 cargo test -p nxvim --test lsp_e2e -- --nocapture"
+  log "then:  BEMTVI_LSP_E2E=1 cargo test -p bemtvi --test lsp_e2e -- --nocapture"
 }
 
 cmd_doctor() {

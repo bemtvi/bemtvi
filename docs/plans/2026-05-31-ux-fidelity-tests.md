@@ -2,7 +2,7 @@
 
 **Goal:** Add three tiers of tests that exercise what a user actually experiences — the painted terminal grid, real key translation, the real binary through a PTY, and the editor/UI non-blocking guarantee — on top of the existing RPC/`View`-level suite.
 
-**Architecture:** Tier 1 promotes a tiny public surface on `nxvim-tui` (`encode_key`, `View::from_redraw`, `paint`) and tests key translation + cell-grid painting from synthetic views. Tier 2 (`crates/nxvim/tests/screen.rs`) runs the real server in-process, captures the real `redraw`, paints it via `nxvim_tui::paint`, and asserts on cells — plus a deterministic "stalled UI never blocks the editor" test. Tier 3 (`crates/nxvim/tests/e2e.rs`) drives the real `nxvim` binary in a PTY with `portable-pty` + `vt100`. A real `:sleep {N}[m]` ex-command serves as the slow-op hook for the responsiveness tests.
+**Architecture:** Tier 1 promotes a tiny public surface on `bemtvi-tui` (`encode_key`, `View::from_redraw`, `paint`) and tests key translation + cell-grid painting from synthetic views. Tier 2 (`crates/bemtvi/tests/screen.rs`) runs the real server in-process, captures the real `redraw`, paints it via `bemtvi_tui::paint`, and asserts on cells — plus a deterministic "stalled UI never blocks the editor" test. Tier 3 (`crates/bemtvi/tests/e2e.rs`) drives the real `bemtvi` binary in a PTY with `portable-pty` + `vt100`. A real `:sleep {N}[m]` ex-command serves as the slow-op hook for the responsiveness tests.
 
 **Tech Stack:** Rust, tokio, ratatui (`TestBackend`), crossterm, rmpv, `portable-pty`, `vt100`.
 
@@ -10,35 +10,35 @@
 
 ## File structure
 
-- `crates/nxvim-tui/src/lib.rs` — *modify*: make `encode_key` public; make `View` public; add `View::from_redraw` and `paint`.
-- `crates/nxvim-tui/tests/keys.rs` — *create*: Tier 1 key-translation tests.
-- `crates/nxvim-tui/tests/paint.rs` — *create*: Tier 1 cell-grid paint tests.
-- `crates/nxvim-core/src/editor.rs` — *modify*: `pending_sleep` field + `take_sleep()` + `:sleep` parsing.
-- `crates/nxvim-server/src/lib.rs` — *modify*: make `handle` async and await any pending sleep.
-- `crates/nxvim-server/tests/editing.rs` — *modify*: add the `:sleep` timing test.
-- `crates/nxvim/Cargo.toml` — *modify*: add dev-dependencies.
+- `crates/bemtvi-tui/src/lib.rs` — *modify*: make `encode_key` public; make `View` public; add `View::from_redraw` and `paint`.
+- `crates/bemtvi-tui/tests/keys.rs` — *create*: Tier 1 key-translation tests.
+- `crates/bemtvi-tui/tests/paint.rs` — *create*: Tier 1 cell-grid paint tests.
+- `crates/bemtvi-core/src/editor.rs` — *modify*: `pending_sleep` field + `take_sleep()` + `:sleep` parsing.
+- `crates/bemtvi-server/src/lib.rs` — *modify*: make `handle` async and await any pending sleep.
+- `crates/bemtvi-server/tests/editing.rs` — *modify*: add the `:sleep` timing test.
+- `crates/bemtvi/Cargo.toml` — *modify*: add dev-dependencies.
 - `Cargo.toml` — *modify*: pin `portable-pty` and `vt100` in `[workspace.dependencies]`.
-- `crates/nxvim/tests/screen.rs` — *create*: Tier 2 full-stack screen tests + responsiveness A.
-- `crates/nxvim/tests/e2e.rs` — *create*: Tier 3 PTY smoke + responsiveness B.
+- `crates/bemtvi/tests/screen.rs` — *create*: Tier 2 full-stack screen tests + responsiveness A.
+- `crates/bemtvi/tests/e2e.rs` — *create*: Tier 3 PTY smoke + responsiveness B.
 
 ---
 
 ## Task 1: Tier 1 — key-translation tests + public `encode_key`
 
 **Files:**
-- Create: `crates/nxvim-tui/tests/keys.rs`
-- Modify: `crates/nxvim-tui/src/lib.rs:328` (the `fn encode_key` declaration)
+- Create: `crates/bemtvi-tui/tests/keys.rs`
+- Modify: `crates/bemtvi-tui/src/lib.rs:328` (the `fn encode_key` declaration)
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/nxvim-tui/tests/keys.rs`:
+Create `crates/bemtvi-tui/tests/keys.rs`:
 
 ```rust
 //! Tier 1: the crossterm `KeyEvent` -> vim key-notation translation, tested as
 //! the public function the client uses. Black-box, no process, no timing.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nxvim_tui::encode_key;
+use bemtvi_tui::encode_key;
 
 fn note(code: KeyCode, mods: KeyModifiers) -> Option<String> {
     encode_key(KeyEvent::new(code, mods))
@@ -71,12 +71,12 @@ fn literal_less_than_is_escaped() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p nxvim-tui --test keys`
-Expected: compile error — `encode_key` is private / unresolved import `nxvim_tui::encode_key`.
+Run: `cargo test -p bemtvi-tui --test keys`
+Expected: compile error — `encode_key` is private / unresolved import `bemtvi_tui::encode_key`.
 
 - [ ] **Step 3: Make `encode_key` public**
 
-In `crates/nxvim-tui/src/lib.rs`, change the declaration at line 328 from:
+In `crates/bemtvi-tui/src/lib.rs`, change the declaration at line 328 from:
 
 ```rust
 /// Translate a crossterm key event into vim key-notation.
@@ -94,13 +94,13 @@ pub fn encode_key(ev: KeyEvent) -> Option<String> {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p nxvim-tui --test keys`
+Run: `cargo test -p bemtvi-tui --test keys`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/nxvim-tui/tests/keys.rs crates/nxvim-tui/src/lib.rs
+git add crates/bemtvi-tui/tests/keys.rs crates/bemtvi-tui/src/lib.rs
 git commit -m "test(tui): cover crossterm->key-notation translation"
 ```
 
@@ -109,19 +109,19 @@ git commit -m "test(tui): cover crossterm->key-notation translation"
 ## Task 2: Tier 1 — cell-grid paint tests + public `View`/`from_redraw`/`paint`
 
 **Files:**
-- Create: `crates/nxvim-tui/tests/paint.rs`
-- Modify: `crates/nxvim-tui/src/lib.rs` (make `View` public; add `from_redraw` and `paint`)
+- Create: `crates/bemtvi-tui/tests/paint.rs`
+- Modify: `crates/bemtvi-tui/src/lib.rs` (make `View` public; add `from_redraw` and `paint`)
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/nxvim-tui/tests/paint.rs`:
+Create `crates/bemtvi-tui/tests/paint.rs`:
 
 ```rust
 //! Tier 1: render a known `View` into a cell grid via ratatui's test backend
 //! and assert on exactly what a user would see. Synthetic views are the right
 //! input here — this pins the *client's painting contract*, not server logic.
 
-use nxvim_tui::{paint, View};
+use bemtvi_tui::{paint, View};
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use rmpv::Value;
@@ -230,14 +230,14 @@ fn command_mode_renders_the_colon_line() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p nxvim-tui --test paint`
+Run: `cargo test -p bemtvi-tui --test paint`
 Expected: compile error — `View`, `View::from_redraw`, and `paint` are not public / do not exist.
 
 (If it instead fails on `cell(...)`/`style()` not existing, the installed ratatui differs; confirm the current cell/style accessors with the find-docs skill for ratatui 0.30 and adjust `row_text`/`reversed` accordingly. This is the only API-shape risk in the task.)
 
 - [ ] **Step 3: Make `View` public and add `from_redraw` + `paint`**
 
-In `crates/nxvim-tui/src/lib.rs`, change the struct declaration (line 112) from:
+In `crates/bemtvi-tui/src/lib.rs`, change the struct declaration (line 112) from:
 
 ```rust
 /// The server's view, mirrored client-side for rendering.
@@ -280,13 +280,13 @@ pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p nxvim-tui --test paint`
+Run: `cargo test -p bemtvi-tui --test paint`
 Expected: PASS (6 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/nxvim-tui/tests/paint.rs crates/nxvim-tui/src/lib.rs
+git add crates/bemtvi-tui/tests/paint.rs crates/bemtvi-tui/src/lib.rs
 git commit -m "test(tui): assert on the painted cell grid via TestBackend"
 ```
 
@@ -295,13 +295,13 @@ git commit -m "test(tui): assert on the painted cell grid via TestBackend"
 ## Task 3: `:sleep` ex-command + async server await (the slow-op hook)
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs` (struct field, constructor, `take_sleep`, `:sleep` parse, `parse_sleep` helper)
-- Modify: `crates/nxvim-server/src/lib.rs` (async `handle`, await pending sleep)
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs` (struct field, constructor, `take_sleep`, `:sleep` parse, `parse_sleep` helper)
+- Modify: `crates/bemtvi-server/src/lib.rs` (async `handle`, await pending sleep)
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/nxvim-server/tests/editing.rs`:
+Append to `crates/bemtvi-server/tests/editing.rs`:
 
 ```rust
 #[tokio::test]
@@ -325,12 +325,12 @@ async fn sleep_blocks_the_editor_for_the_requested_duration() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p nxvim-server --test editing sleep_blocks`
+Run: `cargo test -p bemtvi-server --test editing sleep_blocks`
 Expected: FAIL — `:sleep` is unrecognized (no delay), `begin.elapsed()` is ~0ms, assertion fails.
 
 - [ ] **Step 3a: Add the `pending_sleep` field and `take_sleep` to the editor**
 
-In `crates/nxvim-core/src/editor.rs`, in the `Editor` struct, change (line 123-124):
+In `crates/bemtvi-core/src/editor.rs`, in the `Editor` struct, change (line 123-124):
 
 ```rust
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
@@ -379,7 +379,7 @@ In the `// ----- public API used by the server -----` region (just after the `re
 
 - [ ] **Step 3b: Parse `:sleep` in `execute_ex`**
 
-In `crates/nxvim-core/src/editor.rs`, in the `execute_ex` match (line 1187-1190), change:
+In `crates/bemtvi-core/src/editor.rs`, in the `execute_ex` match (line 1187-1190), change:
 
 ```rust
             "lua" => self.lua_queue.push(args.to_string()),
@@ -415,13 +415,13 @@ fn parse_sleep(args: &str) -> u64 {
 
 - [ ] **Step 3c: Make the server await the pending sleep**
 
-In `crates/nxvim-server/src/lib.rs`, change the run loop (line 54-60) from:
+In `crates/bemtvi-server/src/lib.rs`, change the run loop (line 54-60) from:
 
 ```rust
     while let Some(message) = incoming.recv().await {
         server.handle(message);
         if server.editor.should_quit {
-            server.rpc.notify("nxvim_exit", vec![]);
+            server.rpc.notify("bemtvi_exit", vec![]);
             break;
         }
     }
@@ -433,7 +433,7 @@ to:
     while let Some(message) = incoming.recv().await {
         server.handle(message).await;
         if server.editor.should_quit {
-            server.rpc.notify("nxvim_exit", vec![]);
+            server.rpc.notify("bemtvi_exit", vec![]);
             break;
         }
     }
@@ -487,17 +487,17 @@ to:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p nxvim-server --test editing sleep_blocks`
+Run: `cargo test -p bemtvi-server --test editing sleep_blocks`
 Expected: PASS.
 
 Also run the full server suite to confirm the async-`handle` change broke nothing:
-Run: `cargo test -p nxvim-server`
+Run: `cargo test -p bemtvi-server`
 Expected: PASS (all existing tests + the new one).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-server/src/lib.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-server/src/lib.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "feat: :sleep ex-command, awaited by the server"
 ```
 
@@ -506,25 +506,25 @@ git commit -m "feat: :sleep ex-command, awaited by the server"
 ## Task 4: Tier 2 — full-stack screen tests + responsiveness A
 
 **Files:**
-- Modify: `crates/nxvim/Cargo.toml` (add `[dev-dependencies]`)
-- Create: `crates/nxvim/tests/screen.rs`
+- Modify: `crates/bemtvi/Cargo.toml` (add `[dev-dependencies]`)
+- Create: `crates/bemtvi/tests/screen.rs`
 
-- [ ] **Step 1: Add dev-dependencies to the `nxvim` crate**
+- [ ] **Step 1: Add dev-dependencies to the `bemtvi` crate**
 
-In `crates/nxvim/Cargo.toml`, after the `[dependencies]` block (line 15-19), add:
+In `crates/bemtvi/Cargo.toml`, after the `[dependencies]` block (line 15-19), add:
 
 ```toml
 [dev-dependencies]
-nxvim-rpc.workspace = true
+bemtvi-rpc.workspace = true
 rmpv.workspace = true
 ratatui.workspace = true
 ```
 
-(`nxvim-server`, `nxvim-tui`, and `tokio` are already normal dependencies and are usable from integration tests; only `nxvim-rpc`, `rmpv`, and `ratatui` need adding.)
+(`bemtvi-server`, `bemtvi-tui`, and `tokio` are already normal dependencies and are usable from integration tests; only `bemtvi-rpc`, `rmpv`, and `ratatui` need adding.)
 
 - [ ] **Step 2: Write the failing test**
 
-Create `crates/nxvim/tests/screen.rs`:
+Create `crates/bemtvi/tests/screen.rs`:
 
 ```rust
 //! Tier 2: the full in-process stack — real server -> real `View` -> real
@@ -532,9 +532,9 @@ Create `crates/nxvim/tests/screen.rs`:
 //! `barrier`/`lines` request guarantees all prior input was processed and its
 //! redraw emitted before we read the screen. No sleeps.
 
-use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_server::{run as run_server, ServerInit};
-use nxvim_tui::{paint, View};
+use bemtvi_rpc::{connect, Incoming, Rpc};
+use bemtvi_server::{run as run_server, ServerInit};
+use bemtvi_tui::{paint, View};
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use rmpv::Value;
@@ -685,19 +685,19 @@ async fn editor_keeps_processing_when_the_ui_never_drains_redraws() {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `cargo test -p nxvim --test screen`
+Run: `cargo test -p bemtvi --test screen`
 Expected: first run fails to compile until the dev-deps from Step 1 are in place; once compiling, all four tests should pass (this task is mostly test-only — the production code it exercises already exists after Tasks 1–3). If any assertion fails, treat it as a real defect surfaced by the new tier and debug it systematically.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p nxvim --test screen`
+Run: `cargo test -p bemtvi --test screen`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/nxvim/Cargo.toml crates/nxvim/tests/screen.rs
-git commit -m "test(nxvim): full-stack screen paint + stalled-UI responsiveness"
+git add crates/bemtvi/Cargo.toml crates/bemtvi/tests/screen.rs
+git commit -m "test(bemtvi): full-stack screen paint + stalled-UI responsiveness"
 ```
 
 ---
@@ -706,16 +706,16 @@ git commit -m "test(nxvim): full-stack screen paint + stalled-UI responsiveness"
 
 **Files:**
 - Modify: `Cargo.toml` (pin `portable-pty`, `vt100` in `[workspace.dependencies]`)
-- Modify: `crates/nxvim/Cargo.toml` (add the two as dev-deps)
-- Create: `crates/nxvim/tests/e2e.rs`
+- Modify: `crates/bemtvi/Cargo.toml` (add the two as dev-deps)
+- Create: `crates/bemtvi/tests/e2e.rs`
 
 - [ ] **Step 1: Add and pin the PTY dev-dependencies**
 
-Add the crates to the `nxvim` package (this resolves the latest stable versions):
+Add the crates to the `bemtvi` package (this resolves the latest stable versions):
 
-Run: `cargo add -p nxvim --dev portable-pty vt100`
+Run: `cargo add -p bemtvi --dev portable-pty vt100`
 
-Then enforce the project's exact-pin convention. Note the two versions `cargo add` wrote into `crates/nxvim/Cargo.toml` (e.g. `portable-pty = "0.X.Y"`, `vt100 = "0.A.B"`). Move them to the root `Cargo.toml` `[workspace.dependencies]` block (after `unicode-segmentation` on line 39), pinned with `=`:
+Then enforce the project's exact-pin convention. Note the two versions `cargo add` wrote into `crates/bemtvi/Cargo.toml` (e.g. `portable-pty = "0.X.Y"`, `vt100 = "0.A.B"`). Move them to the root `Cargo.toml` `[workspace.dependencies]` block (after `unicode-segmentation` on line 39), pinned with `=`:
 
 ```toml
 portable-pty = "=0.X.Y"
@@ -724,7 +724,7 @@ vt100 = "=0.A.B"
 
 (Replace `0.X.Y` / `0.A.B` with the exact versions `cargo add` resolved.)
 
-Then in `crates/nxvim/Cargo.toml`, change the two lines `cargo add` inserted under `[dev-dependencies]` to use the workspace versions:
+Then in `crates/bemtvi/Cargo.toml`, change the two lines `cargo add` inserted under `[dev-dependencies]` to use the workspace versions:
 
 ```toml
 portable-pty.workspace = true
@@ -735,21 +735,21 @@ The `[dev-dependencies]` block should now read:
 
 ```toml
 [dev-dependencies]
-nxvim-rpc.workspace = true
+bemtvi-rpc.workspace = true
 rmpv.workspace = true
 ratatui.workspace = true
 portable-pty.workspace = true
 vt100.workspace = true
 ```
 
-Verify it resolves: Run `cargo build -p nxvim --tests` — Expected: builds.
+Verify it resolves: Run `cargo build -p bemtvi --tests` — Expected: builds.
 
 - [ ] **Step 2: Write the failing test**
 
-Create `crates/nxvim/tests/e2e.rs`:
+Create `crates/bemtvi/tests/e2e.rs`:
 
 ```rust
-//! Tier 3: drive the real `nxvim` binary in a pseudo-terminal and assert on the
+//! Tier 3: drive the real `bemtvi` binary in a pseudo-terminal and assert on the
 //! terminal output a user would actually see. This is the only tier that proves
 //! real crossterm decode, real terminal escapes, and process startup/args. Kept
 //! thin: it is the slow/flaky surface, so the bulk of coverage lives in Tiers 1–2.
@@ -760,7 +760,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-/// A spawned `nxvim` process attached to a PTY, with a background thread feeding
+/// A spawned `bemtvi` process attached to a PTY, with a background thread feeding
 /// all output into a `vt100` parser.
 struct Session {
     writer: Box<dyn Write + Send>,
@@ -775,11 +775,11 @@ impl Session {
         let pair = pty
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .expect("openpty");
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nxvim"));
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_bemtvi"));
         for a in args {
             cmd.arg(a);
         }
-        let child = pair.slave.spawn_command(cmd).expect("spawn nxvim");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bemtvi");
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let writer = pair.master.take_writer().expect("writer");
 
@@ -830,7 +830,7 @@ impl Session {
 
 #[test]
 fn startup_shows_the_file_contents() {
-    let path = std::env::temp_dir().join(format!("nxvim_e2e_startup_{}.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("bemtvi_e2e_startup_{}.txt", std::process::id()));
     std::fs::write(&path, "alpha\nbeta\n").unwrap();
 
     let mut s = Session::spawn(&[path.to_str().unwrap()], 80, 24);
@@ -894,19 +894,19 @@ fn client_stays_responsive_while_the_editor_sleeps() {
 
 - [ ] **Step 3: Run test to verify it fails (then passes)**
 
-Run: `cargo test -p nxvim --test e2e`
+Run: `cargo test -p bemtvi --test e2e`
 Expected: with the production code from Tasks 1–3 in place, the tests should PASS. If the harness mis-compiles against the resolved `portable-pty`/`vt100` API (method names like `openpty`, `try_clone_reader`, `take_writer`, `spawn_command`, `vt100::Parser::new`, `Screen::contents`), confirm the current signatures with the find-docs skill for those crates and adjust the harness. This is the task's only API-shape risk.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p nxvim --test e2e`
+Run: `cargo test -p bemtvi --test e2e`
 Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.toml crates/nxvim/Cargo.toml crates/nxvim/tests/e2e.rs
-git commit -m "test(nxvim): PTY smoke of the real binary + sleep responsiveness"
+git add Cargo.toml crates/bemtvi/Cargo.toml crates/bemtvi/tests/e2e.rs
+git commit -m "test(bemtvi): PTY smoke of the real binary + sleep responsiveness"
 ```
 
 ---
@@ -932,7 +932,7 @@ Expected: no warnings. Fix any that appear (the new test files and the async-`ha
 
 - [ ] **Step 4: Update the architecture doc's testing section**
 
-In `docs/architecture.md`, the *Testing philosophy* section lists e2e PTY tests as "(planned)" and the roadmap lists "PTY-driven e2e tests of the binary". Update both: describe the now-implemented three tiers (Tier 1 client paint/key tests in `nxvim-tui/tests/`, Tier 2 full-stack screen tests in `nxvim/tests/screen.rs`, Tier 3 PTY smoke in `nxvim/tests/e2e.rs`) and remove the PTY item from the "Not yet implemented" roadmap list. Keep it to a short, accurate paragraph.
+In `docs/architecture.md`, the *Testing philosophy* section lists e2e PTY tests as "(planned)" and the roadmap lists "PTY-driven e2e tests of the binary". Update both: describe the now-implemented three tiers (Tier 1 client paint/key tests in `bemtvi-tui/tests/`, Tier 2 full-stack screen tests in `bemtvi/tests/screen.rs`, Tier 3 PTY smoke in `bemtvi/tests/e2e.rs`) and remove the PTY item from the "Not yet implemented" roadmap list. Keep it to a short, accurate paragraph.
 
 - [ ] **Step 5: Commit**
 

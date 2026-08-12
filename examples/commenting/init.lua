@@ -1,23 +1,23 @@
--- ~~~ nxvim commenting: the gc / gcc operator and 'commentstring' ~~~
+-- ~~~ bemtvi commenting: the gc / gcc operator and 'commentstring' ~~~
 --
 -- Run it (from the repo root) against the sample Rust buffer:
 --
---     NXVIM_CONFIG=examples/commenting \
---       cargo run -p nxvim -- examples/commenting/sample.rs
+--     BEMTVI_CONFIG=examples/commenting \
+--       cargo run -p bemtvi -- examples/commenting/sample.rs
 --
 -- `gc` is the comment operator and `gcc` toggles the current line — both are
 -- built in, no plugin needed. The comment template comes from 'commentstring',
--- which nxvim sets per buffer from the filetype: `// %s` for rust/c/js/go/…,
+-- which bemtvi sets per buffer from the filetype: `// %s` for rust/c/js/go/…,
 -- `# %s` for python/shell/yaml/…, `-- %s` for lua/sql, `/* %s */` for css, and so
 -- on for the ~20 most common languages. So `gcc` Just Works on a known file.
 --
 -- This config doesn't need to set anything for the defaults to work; it only
 -- shows the two ways to customize.
 
--- 1. Override 'commentstring' for a filetype. nxvim already defaults shell to
+-- 1. Override 'commentstring' for a filetype. bemtvi already defaults shell to
 --    "# %s"; suppose you prefer two spaces after the marker for shell scripts —
 --    a FileType autocmd is the idiomatic place (it targets the buffer that
---    loaded). nxvim's filetype for a `.sh` file is `bash`.
+--    loaded). bemtvi's filetype for a `.sh` file is `bash`.
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "bash",
   callback = function(args)

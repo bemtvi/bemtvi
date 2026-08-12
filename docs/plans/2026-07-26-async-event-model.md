@@ -24,7 +24,7 @@ and the plugins that should configure the restored buffers never run for them.**
 
 ### D1 — The read lifecycle only fires for the *current* buffer
 
-`emit_lifecycle_events` (`crates/nxvim-server/src/lifecycle.rs:336`) is a
+`emit_lifecycle_events` (`crates/bemtvi-server/src/lifecycle.rs:336`) is a
 current-buffer diff: it takes `buf = self.editor.current_buffer_id()`
 (`lifecycle.rs:353`) and the `BufReadPost`/`BufNewFile`/`FileType` block
 (`lifecycle.rs:628`) is gated on that single buffer's `announced` state. Only
@@ -72,7 +72,7 @@ reaches a window stays unloaded and fires no `FileType`.
 
 ### D2 — `ft` / `event` lazy triggers never re-fire
 
-`arm_lazy` (`crates/nxvim-lua/src/prelude/plugins.lua:472-482`) arms the `event`
+`arm_lazy` (`crates/bemtvi-lua/src/prelude/plugins.lua:472-482`) arms the `event`
 and `ft` triggers as bare `load_reporting(name)` calls. The `cmd` trigger
 re-dispatches the original invocation (`plugins.lua:458`) and `keys` feeds the
 key back through the typeahead (`plugins.lua:490`), but `ft`/`event` do neither.
@@ -95,7 +95,7 @@ nothing.
 
 ### D3 — Async `config` makes a naive re-fire insufficient
 
-nxvim plugin `config` may be async (`M.load` awaits a promise). By the time an
+bemtvi plugin `config` may be async (`M.load` awaits a promise). By the time an
 async config registers its `FileType` autocmd, the event is long gone — and
 unlike lazy.nvim we cannot re-fire synchronously right after `load()` returns,
 because `load()` returns a *promise*, not a loaded plugin.
@@ -103,7 +103,7 @@ because `load()` returns a *promise*, not a loaded plugin.
 More generally: **a handler registered while event E was still in its async tail
 never sees E.** That is the defect in its general form, and it is not specific
 to the plugin manager — a user's `init.lua` that awaits something and then calls
-`nx.on("FileType", ...)` has it too.
+`btv.on("FileType", ...)` has it too.
 
 ---
 
@@ -111,11 +111,11 @@ to the plugin manager — a user's `init.lua` that awaits something and then cal
 
 Exactly one settle-aware path exists:
 
-- `nx._fire` (`crates/nxvim-lua/src/prelude/autocmd.lua:441`) — fire-and-forget.
+- `btv._fire` (`crates/bemtvi-lua/src/prelude/autocmd.lua:441`) — fire-and-forget.
   A handler's promise is `:catch`ed for error reporting only
   (`track_au_promise`, `autocmd.lua:427`); the editor never waits.
-- `nx._fire_gated` (`autocmd.lua:475`) — the only awaited path:
-  `gate_id` → `nx._au_gate_done` → server-side `drain_au_gate_done`
+- `btv._fire_gated` (`autocmd.lua:475`) — the only awaited path:
+  `gate_id` → `btv._au_gate_done` → server-side `drain_au_gate_done`
   (`lifecycle.rs:1495`).
 
 The gate primitive already has two users — `BufWritePre`
@@ -211,7 +211,7 @@ instead of buffer.
 
 The budget applies to the **wait**, not to the handler — a Lua promise cannot be
 cancelled. Implemented as
-`nx.promise.race({ all_settled(promises), nx.timer(budget) })`.
+`btv.promise.race({ all_settled(promises), btv.timer(budget) })`.
 
 Once the chain gates, the budget stops being purely diagnostic: **a hung
 `BufReadPost` handler must not prevent `FileType`/`BufEnter` from ever firing**,
@@ -226,13 +226,13 @@ advances regardless.
 - **Warn on eventual settle**: "handler X settled after {n}s". If `autocmd_seq`
   advanced past the watermark in the meantime, run a second replay.
 - **Never settles**: remains visible in the expiry warning, plus an
-  `nx.autocmd.pending()` introspection listing so a hung handler is inspectable
+  `btv.autocmd.pending()` introspection listing so a hung handler is inspectable
   rather than inferred.
 - **Budget**: global default **500 ms** overridable per-autocmd via
   `{ timeout = ... }`, so a legitimately slow one-time handler (a first LSP
   spawn) does not warn on every open.
 - **Warnings must be retrievable, not just displayed.** *(Settled in Phase 3:
-  no special routing is needed — Lua `print` / `nx.notify` already reach
+  no special routing is needed — Lua `print` / `btv.notify` already reach
   `Editor::echo`, which calls `record_message`, so every warning is in
   `:messages` already. The plan's original `:echomsg` note was unnecessary.)*
 
@@ -270,7 +270,7 @@ resolves name and filetype from `buf` itself.
 - **Steady-state cost must be zero on the hot path.** The classification check
   is a table lookup; hot-path events allocate no watermark, track no promises,
   and never enter the state machine.
-- **`nxvim-core` stays pure and synchronous.** The core records intent; the
+- **`bemtvi-core` stays pure and synchronous.** The core records intent; the
   server owns firing and awaiting; Lua owns dispatch and classification.
 - **Tier-1 remote.** Restored buffers in a daemon/wasm session take the off-tick
   load path, so the read lifecycle must fire when the bytes *land*
@@ -288,16 +288,16 @@ hot-path handler a loud error.
 **Why first.** Self-contained, and every later phase's cost argument depends on
 hot-path events being unable to park anything.
 
-**Scope.** `crates/nxvim-lua/src/prelude/autocmd.lua`.
+**Scope.** `crates/bemtvi-lua/src/prelude/autocmd.lua`.
 
 **Approach.**
-- Add `nx._hot_events` — a set of the hot-path event names listed in Design A.
-- In `nx._fire`, if the event is hot and a handler returns a promise, raise
+- Add `btv._hot_events` — a set of the hot-path event names listed in Design A.
+- In `btv._fire`, if the event is hot and a handler returns a promise, raise
   instead of calling `track_au_promise`. The message must carry the escape
   hatch, or it is just an obstacle:
 
   > `CursorMoved` handlers must be synchronous (registered at `init.lua:47`).
-  > Start async work with `nx.schedule` / `nx.on_next_tick` and return nothing.
+  > Start async work with `btv.schedule` / `btv.on_next_tick` and return nothing.
 
   (The registration site arrives in Phase 2; until then the message names the
   event and the autocmd id.)
@@ -307,7 +307,7 @@ hot-path events being unable to park anything.
   for hot-path handlers that return a promise and drop the `return` — the async
   work still runs, fire-and-forget. Update that comment.
 
-**Tests** (`crates/nxvim-server/tests/autocmds.rs`).
+**Tests** (`crates/bemtvi-server/tests/autocmds.rs`).
 - A `CursorMoved` handler returning a promise raises, and the message names the
   event.
 - A `CursorMoved` handler that starts async work without returning it is fine
@@ -327,26 +327,26 @@ registered.
 **Why.** Every warning in Phases 3 and 5 depends on it. Highest
 value-per-line in the feature.
 
-**Scope.** `crates/nxvim-lua/src/prelude/autocmd.lua`.
+**Scope.** `crates/bemtvi-lua/src/prelude/autocmd.lua`.
 
 **Approach.**
-- In `nx.autocmd.create` (`autocmd.lua:292`; the record is built at
+- In `btv.autocmd.create` (`autocmd.lua:292`; the record is built at
   `autocmd.lua:302`), stash `debug.getinfo(2, "Sl")` →
   `{ src = short_src, line = currentline }` on the record. The idiom already
-  exists in the tree at `crates/nxvim-lua/src/prelude/utils.lua:136`.
+  exists in the tree at `crates/bemtvi-lua/src/prelude/utils.lua:136`.
 - Cost is once per **registration**, never per fire.
-- Expose it: `nx.autocmd.get` (`autocmd.lua:629`) includes the site, and the
+- Expose it: `btv.autocmd.get` (`autocmd.lua:629`) includes the site, and the
   existing autocmd listing surfaces it.
 
 **Tests.** An autocmd registered at a known line reports that file and line
-through `nx.autocmd.get()`.
+through `btv.autocmd.get()`.
 
 **Done when.** Sites are captured, exposed, and hot-path errors from Phase 1
 name them.
 
 **Follow-ups.** Two, both found re-reviewing the phase:
 
-- **The `nx.autocmd.create` book page went blank.** The site-capture helpers were
+- **The `btv.autocmd.create` book page went blank.** The site-capture helpers were
   inserted *between* the function's docstring and the function, and
   `book/gen/generate.py`'s `doc_above` takes the `--` block **immediately above**
   the definition — so the whole (long) doc for the primary autocmd API silently
@@ -367,18 +367,18 @@ sequencing yet.
 **Value on its own.** This alone fixes D2/D3 for ordinary opens: an `ft`-lazy
 plugin with an async `config` starts working without any chain changes.
 
-**Scope.** `crates/nxvim-lua/src/prelude/autocmd.lua`, plus
-`crates/nxvim-lua/src/prelude/promise.lua` only if a combinator is missing
+**Scope.** `crates/bemtvi-lua/src/prelude/autocmd.lua`, plus
+`crates/bemtvi-lua/src/prelude/promise.lua` only if a combinator is missing
 (`all_settled` at `promise.lua:315` and `race` at `promise.lua:343` both exist).
 
 **Approach.**
-- `nx._fire` for a non-hot-path event captures the pre-dispatch `autocmd_seq`
+- `btv._fire` for a non-hot-path event captures the pre-dispatch `autocmd_seq`
   watermark and collects handler promises (in addition to the existing
   `:catch`).
 - If no handler returned a pending promise, return exactly as today — no
   behavior change, no extra tick, for the overwhelmingly common case.
 - Otherwise arm the settle continuation:
-  `race(all_settled(promises), nx.timer(budget))` → replay
+  `race(all_settled(promises), btv.timer(budget))` → replay
   `(E, pattern, buf)` against handlers with `au.id > watermark` only.
 - Fixpoint loop with an iteration cap (proposed 8); exceeding it warns and
   stops, naming the event — an unbounded registration loop must fail loud rather
@@ -386,9 +386,9 @@ plugin with an async `config` starts working without any chain changes.
 - Budget default 500 ms, per-autocmd override via `opts.timeout`.
 - Warnings per Design D, through `:echomsg`, each naming event, buffer and
   registration site.
-- `nx.autocmd.pending()` lists in-flight handler promises past their budget.
+- `btv.autocmd.pending()` lists in-flight handler promises past their budget.
 
-**Tests** (`crates/nxvim-server/tests/autocmds.rs`).
+**Tests** (`crates/bemtvi-server/tests/autocmds.rs`).
 - A `FileType` handler that asynchronously registers a *second* `FileType`
   handler: the second one runs for the same buffer, exactly once.
 - No double-fire: a handler present at first dispatch does not run again on
@@ -436,7 +436,7 @@ background buffer needs replay to deliver its own handler).
 machine is per-buffer state written once, rather than a current-buffer machine
 later generalized to N concurrent chains.
 
-**Scope.** `crates/nxvim-server/src/lifecycle.rs`, and whatever `lib.rs` startup
+**Scope.** `crates/bemtvi-server/src/lifecycle.rs`, and whatever `lib.rs` startup
 ordering the restore requires.
 
 **Approach.**
@@ -452,9 +452,9 @@ ordering the restore requires.
   `:badd`-style listed-but-unloaded buffer does not.
 - Keep `BufEnter` on the current buffer only (it is hot-path and per-entry).
 
-**Tests** (`crates/nxvim-server/tests/session.rs`, plus `autocmds.rs`).
+**Tests** (`crates/bemtvi-server/tests/session.rs`, plus `autocmds.rs`).
 - Restore a 3-window session; assert `BufReadPost` + `FileType` fire for **all
-  three** restored files, in per-buffer order — i.e. the nxvim log matches the
+  three** restored files, in per-buffer order — i.e. the bemtvi log matches the
   neovim log captured in *Problem*.
 - End-to-end: a lazy plugin with `ft = "python"` and an **async** `config` that
   registers a `FileType python` handler — after restore, that handler has run
@@ -504,8 +504,8 @@ settle+replay → `BufEnter`, per buffer.
 
 **Depends on.** Phases 3 and 4.
 
-**Scope.** `crates/nxvim-server/src/lifecycle.rs`, `crates/nxvim-lua/src/ops.rs`
-(if the gate op needs a new variant), `crates/nxvim-lua/src/prelude/autocmd.lua`.
+**Scope.** `crates/bemtvi-server/src/lifecycle.rs`, `crates/bemtvi-lua/src/ops.rs`
+(if the gate op needs a new variant), `crates/bemtvi-lua/src/prelude/autocmd.lua`.
 
 **Approach.**
 - Reuse the existing gate primitive — this is its third user after `BufWritePre`
@@ -524,7 +524,7 @@ settle+replay → `BufEnter`, per buffer.
 - Budget expiry advances the stage anyway (Design D liveness), with the warning.
 - Abandon the chain if the buffer is deleted mid-flight; drop its state.
 
-**Tests** (`crates/nxvim-server/tests/autocmds.rs`).
+**Tests** (`crates/bemtvi-server/tests/autocmds.rs`).
 - An async `BufReadPost` handler that sets `vim.bo.filetype`: `FileType` fires
   **once**, with the handler's filetype, and not with a stale pre-callback one.
 - Ordering: an async `BufReadPost` handler completes before any `FileType`
@@ -545,7 +545,7 @@ buffer, `chain_gates` mapping gate id → buffer), driven by `drive_read_chain`
 with `fire_buf_lifecycle_gated` as the per-stage fire. `drain_au_gate_done`
 grew a chain branch ahead of the write/exit ones.
 
-`nx._fire_gated` was folded onto the Phase-3 settle protocol rather than kept
+`btv._fire_gated` was folded onto the Phase-3 settle protocol rather than kept
 separate, so a gated fire also replays to late subscribers and signals its gate
 only once that whole fixpoint converges. That is what makes the ordering claim
 true: when `FileType` fires, an async `BufReadPost` handler has finished *and*
@@ -592,15 +592,15 @@ Two more, from a review after Phase 6 landed:
   it again). Both halves are covered by
   `re_reading_a_file_mid_chain_abandons_the_previous_chain`; without the carry-over
   the log ends at `ft`, with no `enter,winenter` at all.
-- **The gated path swallowed handler rejections.** `nx._fire` attaches
+- **The gated path swallowed handler rejections.** `btv._fire` attaches
   `track_au_promise` to every non-hot handler promise, so a rejection surfaces named
-  for its event; `nx._fire_gated` never did. That was tolerable while the only gated
+  for its event; `btv._fire_gated` never did. That was tolerable while the only gated
   events were `BufWritePre` and the exit chain, but folding the read chain onto the
   gated path (this phase) silently moved `BufReadPost`/`BufNewFile`/`FileType` from
   the reporting path to the quiet one — and `all_settled` subscribes with a rejection
   handler of its own, marking the promise handled, so not even the generic
   unhandled-rejection reporter fired. A failing async read handler produced *no
-  output at all*. `nx._fire_gated` now tracks like `nx._fire`; the liveness rule is
+  output at all*. `btv._fire_gated` now tracks like `btv._fire`; the liveness rule is
   unchanged (a rejection still never blocks the gated action). Covered by
   `a_rejecting_async_read_handler_surfaces_its_rejection`.
 
@@ -610,7 +610,7 @@ Two more, from a review after Phase 6 landed:
 
 **Goal.** Remove what replay makes redundant and document the model.
 
-**Scope.** `crates/nxvim-lua/src/prelude/plugins.lua`, book docs,
+**Scope.** `crates/bemtvi-lua/src/prelude/plugins.lua`, book docs,
 `examples/async-events/`.
 
 **Approach.**
@@ -625,7 +625,7 @@ Two more, from a review after Phase 6 landed:
 - Leave `PluginsLoaded` (`plugins.lua:512`) as-is — it is a useful public
   "everything is ready" hook, not a mechanism this design depends on.
 - Book: document the two event classes (which events are hot, why hot handlers
-  must be synchronous, the `nx.schedule` escape hatch), the chain's ordering
+  must be synchronous, the `btv.schedule` escape hatch), the chain's ordering
   guarantee, the replay guarantee, the budget and its warnings, and
   `opts.timeout`. Follow the prelude docstring markdown rules in `CLAUDE.md`.
 - `examples/async-events/` — `init.lua` with numbered *type-this / see-that*
@@ -687,7 +687,7 @@ asserted in `a_handler_that_settles_late_warns_with_its_elapsed_time`.
   `BufEnter` does (`ReadChain::deferred_win_enter`) and fires last, matching vim.
   It is deliberately **not** a gated stage: nothing follows it, so gating would
   buy only replay-to-late-subscribers, which every non-hot event already gets
-  from `nx._fire`'s settle protocol. Covered by
+  from `btv._fire`'s settle protocol. Covered by
   `bufwinenter_is_sequenced_after_the_chains_gates_too`.
-- `nx.autocmd.pending()` may want to be folded into a future `:checkhealth`
+- `btv.autocmd.pending()` may want to be folded into a future `:checkhealth`
   rather than standing alone.

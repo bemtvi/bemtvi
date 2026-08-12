@@ -1,6 +1,6 @@
--- ~~~ nxvim nx.decor playground: TODO-keyword highlighting, debounced ~~~
+-- ~~~ bemtvi btv.decor playground: TODO-keyword highlighting, debounced ~~~
 --
--- A second `nx.decor` example (the flagship is `examples/rainbow/`). It shows two
+-- A second `btv.decor` example (the flagship is `examples/rainbow/`). It shows two
 -- Phase-4 conveniences:
 --
 --   * `debounce = <ms>` — coalesce a fast continuous scroll into ONE provider run.
@@ -15,14 +15,14 @@
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/decor-todo \
---       cargo run -p nxvim -- examples/decor-todo/sample.lua
+--     BEMTVI_CONFIG=examples/decor-todo \
+--       cargo run -p bemtvi -- examples/decor-todo/sample.lua
 --
 -- The keywords colour the instant the file opens; scroll and the newly-revealed
 -- lines colour once the scroll settles (the debounce).
 
 --------------------------------------------------------------------------------
--- The keyword → highlight-group map. nx.hl.define is the canonical highlight
+-- The keyword → highlight-group map. btv.hl.define is the canonical highlight
 -- setter (vim.api.nvim_set_hl is its alias); ns 0 is the global table.
 --------------------------------------------------------------------------------
 local KEYWORDS = {
@@ -32,10 +32,10 @@ local KEYWORDS = {
   XXX = "HackKeyword",
   NOTE = "NoteKeyword",
 }
-nx.hl.define(0, "TodoKeyword", { fg = "#89b4fa", bold = true })
-nx.hl.define(0, "FixmeKeyword", { fg = "#f38ba8", bold = true })
-nx.hl.define(0, "HackKeyword", { fg = "#fab387", bold = true })
-nx.hl.define(0, "NoteKeyword", { fg = "#a6e3a1", bold = true })
+btv.hl.define(0, "TodoKeyword", { fg = "#89b4fa", bold = true })
+btv.hl.define(0, "FixmeKeyword", { fg = "#f38ba8", bold = true })
+btv.hl.define(0, "HackKeyword", { fg = "#fab387", bold = true })
+btv.hl.define(0, "NoteKeyword", { fg = "#a6e3a1", bold = true })
 
 --------------------------------------------------------------------------------
 -- The provider. `on_range(ctx, publish)` runs off the frame, once per visible-
@@ -45,7 +45,7 @@ nx.hl.define(0, "NoteKeyword", { fg = "#a6e3a1", bold = true })
 -- It walks only `ctx.lines` (the visible slice), finds each keyword, and publishes
 -- one `hl`-only mark per occurrence (extmark-shaped, absolute buffer coordinates).
 --------------------------------------------------------------------------------
-nx.decor.provider({
+btv.decor.provider({
   name = "todo-keywords",
   debounce = 60,
   on_range = function(ctx, publish)
@@ -72,4 +72,4 @@ nx.decor.provider({
 
 vim.o.number = true
 
-print("nx.decor todo-keywords: TODO/FIXME/HACK/XXX/NOTE colour by kind (debounced on scroll)")
+print("btv.decor todo-keywords: TODO/FIXME/HACK/XXX/NOTE colour by kind (debounced on scroll)")

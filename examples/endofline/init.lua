@@ -1,13 +1,13 @@
--- ~~~ nxvim trailing newlines: 'endofline' / 'fixendofline' ~~~
+-- ~~~ bemtvi trailing newlines: 'endofline' / 'fixendofline' ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/endofline \
---       cargo run -p nxvim -- examples/endofline/sample.txt
+--     BEMTVI_CONFIG=examples/endofline \
+--       cargo run -p bemtvi -- examples/endofline/sample.txt
 --
 -- `sample.txt` is deliberately stored WITHOUT a trailing newline.
 --
--- Internally nxvim's text rope always ends in a `\n` — that phantom newline is
+-- Internally bemtvi's text rope always ends in a `\n` — that phantom newline is
 -- what vim's line model calls the implicit terminator after the last line, and
 -- every byte offset, mark and tree-sitter point in the editor relies on it. So
 -- the rope alone cannot say whether the file on disk really ended with one. Two
@@ -86,11 +86,11 @@ vim.api.nvim_create_autocmd("BufReadPost", {
 --      SEE:   every earlier line is still terminated; only "new last line" is not
 --
 -- 5. AN EMPTY FILE STAYS EMPTY. A 0-byte file has no final newline either, so
---    nxvim writes it back at 0 bytes rather than growing it to one:
---      TYPE:  :e /tmp/nxvim-empty-demo<CR>:w<CR>:!wc -c /tmp/nxvim-empty-demo<CR>
+--    bemtvi writes it back at 0 bytes rather than growing it to one:
+--      TYPE:  :e /tmp/bemtvi-empty-demo<CR>:w<CR>:!wc -c /tmp/bemtvi-empty-demo<CR>
 --      SEE:   0 bytes
 --
 -- 6. LANGUAGE SERVERS SEE THE DOCUMENT, NOT THE ROPE. With an LSP attached, the
---    text nxvim sends is the document — no phantom newline — so a formatter that
+--    text bemtvi sends is the document — no phantom newline — so a formatter that
 --    adds or removes a trailing newline actually changes `:set endofline?`.
 --------------------------------------------------------------------------------

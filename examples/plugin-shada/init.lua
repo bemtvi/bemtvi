@@ -1,8 +1,8 @@
--- ~~~ nxvim nx.shada.plugin: opt-in, ISOLATED per-plugin persistence ~~~
+-- ~~~ bemtvi btv.shada.plugin: opt-in, ISOLATED per-plugin persistence ~~~
 --
 -- A plugin can opt into shada and keep its own cross-session key/value data with
 --
---     local store = nx.shada.plugin()
+--     local store = btv.shada.plugin()
 --     store:set(key, value)   -- value: any JSON-able Lua value
 --     local v = store:get(key)
 --     store:delete(key); store:keys(); store:clear()
@@ -23,22 +23,22 @@
 -- touched. From the repo root:
 --
 --     # First session — bumps the launch counter, remembers sample.txt, then :qa
---     XDG_STATE_HOME=/tmp/nxvim-plugin-shada NXVIM_CONFIG=examples/plugin-shada \
---       cargo run -p nxvim -- examples/plugin-shada/sample.txt
+--     XDG_STATE_HOME=/tmp/bemtvi-plugin-shada BEMTVI_CONFIG=examples/plugin-shada \
+--       cargo run -p bemtvi -- examples/plugin-shada/sample.txt
 --
 --     # Second session — the counter and the recent-files list are restored
---     XDG_STATE_HOME=/tmp/nxvim-plugin-shada NXVIM_CONFIG=examples/plugin-shada \
---       cargo run -p nxvim -- examples/plugin-shada/sample.txt
+--     XDG_STATE_HOME=/tmp/bemtvi-plugin-shada BEMTVI_CONFIG=examples/plugin-shada \
+--       cargo run -p bemtvi -- examples/plugin-shada/sample.txt
 --
--- (Delete /tmp/nxvim-plugin-shada to start fresh.)
+-- (Delete /tmp/bemtvi-plugin-shada to start fresh.)
 --
 -- Try in the SECOND session:
 --   :Launches      how many times this config has been launched
 --   :RecentFiles   the files the bundled plugin remembers (its own namespace)
 
--- Opt in. From init.lua, `nx.shada.plugin()` attributes to the config root, which
+-- Opt in. From init.lua, `btv.shada.plugin()` attributes to the config root, which
 -- maps to the reserved "user" namespace.
-local store = nx.shada.plugin()
+local store = btv.shada.plugin()
 
 -- A trivial cross-session counter: read last session's value, bump, persist.
 local launches = (store:get("launches") or 0) + 1

@@ -1,9 +1,9 @@
--- ~~~ nxvim option scopes: :set vs :setlocal vs :setglobal ~~~
+-- ~~~ bemtvi option scopes: :set vs :setlocal vs :setglobal ~~~
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/global-local-options \
---       cargo run -p nxvim -- examples/global-local-options/sample.txt
+--     BEMTVI_CONFIG=examples/global-local-options \
+--       cargo run -p bemtvi -- examples/global-local-options/sample.txt
 --
 -- A buffer-local or window-local option has TWO values: the local one on each
 -- buffer/window, and the GLOBAL one a newly created buffer is born from. Which one
@@ -43,7 +43,7 @@ vim.opt.showbreak = "↪ "
 --      * `commentstring` / `foldexpr` / `foldmarker` live in a per-buffer map that
 --        already spells "unset" as absence, so the tier is a read-time FALLBACK:
 --        every buffer with no value of its own follows it, including open ones.
---        (nxvim deviates from vim here, deliberately — see
+--        (bemtvi deviates from vim here, deliberately — see
 --        docs/plans/2026-08-01-global-local-options.md.)
 --    Either way a buffer's OWN value, set with `:setlocal`, still wins.
 vim.opt_global.commentstring = "## %s"
@@ -51,7 +51,7 @@ vim.opt_global.commentstring = "## %s"
 --------------------------------------------------------------------------------
 -- 4. `vim.opt_local` — the ftplugin case: one filetype's indent must not become
 --    everyone's default, so it writes the buffer and stops there.
-nx.on("FileType", { pattern = "lua", callback = function()
+btv.on("FileType", { pattern = "lua", callback = function()
   vim.opt_local.tabstop = 2
 end })
 
@@ -86,9 +86,9 @@ end })
 --      TYPE:  u | gcc                -> ";; " in THIS buffer, "## " everywhere else
 --
 -- 4. `vim.go` reads the global value, `vim.o` the local one:
---      TYPE:  :lua nx.notify(vim.o.tabstop .. " vs " .. vim.go.tabstop)<CR>
+--      TYPE:  :lua btv.notify(vim.o.tabstop .. " vs " .. vim.go.tabstop)<CR>
 --
 -- 5. Some buffer options have NO global value, because the read decides them.
---    nxvim says so out loud instead of storing something nothing reads:
+--    bemtvi says so out loud instead of storing something nothing reads:
 --      TYPE:  :setglobal fileencoding=latin1<CR>
 --        -> E5100: fileencoding has no global value (the read decides it per buffer)

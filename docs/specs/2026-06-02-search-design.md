@@ -5,7 +5,7 @@
 
 ## Goal
 
-Add vim's **search** to nxvim: the `/` and `?` command-line searches, `n`/`N`
+Add vim's **search** to bemtvi: the `/` and `?` command-line searches, `n`/`N`
 repeat, match highlighting (`hlsearch`/`incsearch`), the search options
 (`ignorecase`/`smartcase`/`wrapscan`), and real pattern matching. This is the
 last big editing primitive on the roadmap's short list (architecture.md →
@@ -22,18 +22,18 @@ feature; Phase 5 is optional polish.
 
 ## Where it slots into the architecture
 
-Search is a **core** (`nxvim-core`) concern: the core owns the buffer text, the
+Search is a **core** (`bemtvi-core`) concern: the core owns the buffer text, the
 cursor, the modes, and the command line, so it owns *finding* the match and
 *moving* the cursor. The server and TUI only gain a little plumbing:
 
-- **`nxvim-core`** — a search command-line (reusing `Mode::Command`), the match
+- **`bemtvi-core`** — a search command-line (reusing `Mode::Command`), the match
   engine, `last_search` state for `n`/`N`, the options, and the match spans
   projected into the `View` (the way `selection` already is).
-- **`nxvim-server`** — projects the new `View` fields into the `redraw` map and
+- **`bemtvi-server`** — projects the new `View` fields into the `redraw` map and
   resolves the `Search`/`IncSearch` highlight groups to styles (the same path
   `chrome_styles` uses today). `:nohlsearch` already exists as a no-op stub
   (`editor.rs`, the `"noh" | "nohlsearch"` arm) and gets wired up.
-- **`nxvim-tui`** — renders the `/`/`?` prompt char (today the command line is
+- **`bemtvi-tui`** — renders the `/`/`?` prompt char (today the command line is
   hard-coded to `:`), and paints the search-match spans.
 
 Key existing seams we lean on:
@@ -49,9 +49,9 @@ Key existing seams we lean on:
   groups (`Visual`, `StatusLine`, …) to palette ids; `Search` and `IncSearch`
   join that list. catppuccin already defines both via `nvim_set_hl`, so they
   light up for free once resolved.
-- **Black-box tests.** All coverage goes in `crates/nxvim-server/tests/editing.rs`
+- **Black-box tests.** All coverage goes in `crates/bemtvi-server/tests/editing.rs`
   (cursor/lines/redraw assertions) and the screen tiers
-  (`crates/nxvim/tests/screen.rs`, `crates/nxvim-tui/tests/`) for the painted
+  (`crates/bemtvi/tests/screen.rs`, `crates/bemtvi-tui/tests/`) for the painted
   highlight — no unit tests (architecture.md → *Testing philosophy*).
 
 ---
@@ -189,7 +189,7 @@ leading `\` escapes them to a literal (the inverse of vim, where `\+` is the
 operator and bare `+` is literal). Per-pattern case is the standard inline
 `(?i)`/`(?-i)` flag rather than vim's `\c`/`\C`.
 
-> **Divergence note.** This is the one place nxvim intentionally does *not* clone
+> **Divergence note.** This is the one place bemtvi intentionally does *not* clone
 > vim. The Rust `regex` engine's syntax is exposed directly because it is the
 > familiar everyday regex flavor; users coming from vim must write `\+` for a
 > literal plus and `(?i)` instead of `\c`. Recorded here so it isn't mistaken for
@@ -197,7 +197,7 @@ operator and bare `+` is literal). Per-pattern case is the standard inline
 
 As shipped:
 
-- **`search.rs` module** in `nxvim-core` (pure/sync — `regex` is a pure
+- **`search.rs` module** in `bemtvi-core` (pure/sync — `regex` is a pure
   dependency, no I/O): a thin `SearchRegex` wrapper that compiles the pattern
   *directly* with `RegexBuilder` (no vim→regex translation layer). The `regex`
   crate is exact-pinned (`=1.12.3`) in `[workspace.dependencies]`. It is not full

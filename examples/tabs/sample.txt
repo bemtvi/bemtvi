@@ -1,4 +1,4 @@
-nxvim tab pages — a quick tour
+bemtvi tab pages — a quick tour
 ==============================
 
 A tab page is its own window layout. Open a few and switch between them:

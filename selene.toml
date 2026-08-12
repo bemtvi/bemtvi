@@ -1,13 +1,13 @@
-# selene linting for nxvim's first-party Lua (crates/nxvim-lua/src/prelude/).
+# selene linting for bemtvi's first-party Lua (crates/bemtvi-lua/src/prelude/).
 #
-# std = base Lua 5.1 GLOBALS + nxvim's own (incl. the 5.2+ stdlib bits PUC 5.4 adds),
-# parsed with the Lua 5.4 GRAMMAR — see nxvim.yml, which sets both and explains why
+# std = base Lua 5.1 GLOBALS + bemtvi's own (incl. the 5.2+ stdlib bits PUC 5.4 adds),
+# parsed with the Lua 5.4 GRAMMAR — see bemtvi.yml, which sets both and explains why
 # they differ. The 5.4 grammar needs a selene built with it:
 #
 #     cargo install selene --features selene-lib/lua54
 #
 # The default build reports `unexpected character &` on 5.4 bitwise operators.
-std = "lua51+nxvim"
+std = "lua51+bemtvi"
 
 [rules]
 # stylua deliberately collapses simple statements onto one line (the prelude's

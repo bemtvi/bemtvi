@@ -2,26 +2,26 @@
 
 **Goal:** Make cursor movement step by grapheme cluster and make cursor display/`j`/`k` honor wide characters and tabs, so non-ASCII text in the buffer behaves correctly.
 
-**Architecture:** `cursor.col` stays a byte offset within its line (the rope's metric and what `nvim_win_get_cursor` returns). A new pure `nxvim-core::unicode` module converts between byte offset, grapheme boundary, and virtual (screen) column over a line `&str`. Motions step by grapheme; vertical motion and `$` remember a virtual column; the `View` gains `cursor_screen_col` (cells) for terminal placement while `cursor_col` stays the byte column for the ruler/API. The TUI expands tabs when painting so its widths match core's.
+**Architecture:** `cursor.col` stays a byte offset within its line (the rope's metric and what `nvim_win_get_cursor` returns). A new pure `bemtvi-core::unicode` module converts between byte offset, grapheme boundary, and virtual (screen) column over a line `&str`. Motions step by grapheme; vertical motion and `$` remember a virtual column; the `View` gains `cursor_screen_col` (cells) for terminal placement while `cursor_col` stays the byte column for the ruler/API. The TUI expands tabs when painting so its widths match core's.
 
 **Tech Stack:** Rust, `ropey` 2.0, `unicode-segmentation`, `unicode-width`, ratatui, msgpack-RPC.
 
-**Testing note (project convention overrides default TDD):** Per `CLAUDE.md` and `docs/architecture.md`, this repo has **no unit tests** — behavior is verified end-to-end through black-box integration tests in `crates/nxvim-server/tests/editing.rs` (`start`/`feed`/`lines`/`cursor`, plus the `latest_view` redraw helper). Behavioral tasks below follow TDD at that integration level (failing test → implement → pass). Two foundation tasks (the `unicode` module and the internal grapheme helpers) have no direct behavioral surface; they are verified by `cargo build` **and** by the existing ASCII integration suite staying green (a real regression gate, since grapheme/virtual math is a no-op for ASCII).
+**Testing note (project convention overrides default TDD):** Per `CLAUDE.md` and `docs/architecture.md`, this repo has **no unit tests** — behavior is verified end-to-end through black-box integration tests in `crates/bemtvi-server/tests/editing.rs` (`start`/`feed`/`lines`/`cursor`, plus the `latest_view` redraw helper). Behavioral tasks below follow TDD at that integration level (failing test → implement → pass). Two foundation tasks (the `unicode` module and the internal grapheme helpers) have no direct behavioral surface; they are verified by `cargo build` **and** by the existing ASCII integration suite staying green (a real regression gate, since grapheme/virtual math is a no-op for ASCII).
 
 ---
 
 ## File structure
 
 - `Cargo.toml` — pin `unicode-width`, `unicode-segmentation` in `[workspace.dependencies]`.
-- `crates/nxvim-core/Cargo.toml` — pull both deps into the core crate.
-- `crates/nxvim-core/src/unicode.rs` — **new** pure column-math helpers.
-- `crates/nxvim-core/src/lib.rs` — declare `pub mod unicode;`.
-- `crates/nxvim-core/src/editor.rs` — grapheme helpers, grapheme motion, virtual desired column, word motion, snapping.
-- `crates/nxvim-core/src/view.rs` — add `cursor_screen_col`.
-- `crates/nxvim-server/src/lib.rs` — plumb `cursor_screen_col` into the redraw map.
-- `crates/nxvim-tui/Cargo.toml` — add `unicode-width`.
-- `crates/nxvim-tui/src/lib.rs` — place cursor at `cursor_screen_col`, expand tabs when rendering.
-- `crates/nxvim-server/tests/editing.rs` — new tests + a `view_u64` helper.
+- `crates/bemtvi-core/Cargo.toml` — pull both deps into the core crate.
+- `crates/bemtvi-core/src/unicode.rs` — **new** pure column-math helpers.
+- `crates/bemtvi-core/src/lib.rs` — declare `pub mod unicode;`.
+- `crates/bemtvi-core/src/editor.rs` — grapheme helpers, grapheme motion, virtual desired column, word motion, snapping.
+- `crates/bemtvi-core/src/view.rs` — add `cursor_screen_col`.
+- `crates/bemtvi-server/src/lib.rs` — plumb `cursor_screen_col` into the redraw map.
+- `crates/bemtvi-tui/Cargo.toml` — add `unicode-width`.
+- `crates/bemtvi-tui/src/lib.rs` — place cursor at `cursor_screen_col`, expand tabs when rendering.
+- `crates/bemtvi-server/tests/editing.rs` — new tests + a `view_u64` helper.
 - `docs/architecture.md` — drop the "one cell per byte" caveat once done.
 
 ---
@@ -30,9 +30,9 @@
 
 **Files:**
 - Modify: `Cargo.toml` (`[workspace.dependencies]`)
-- Modify: `crates/nxvim-core/Cargo.toml`
-- Create: `crates/nxvim-core/src/unicode.rs`
-- Modify: `crates/nxvim-core/src/lib.rs`
+- Modify: `crates/bemtvi-core/Cargo.toml`
+- Create: `crates/bemtvi-core/src/unicode.rs`
+- Modify: `crates/bemtvi-core/src/lib.rs`
 
 - [ ] **Step 1: Pin the two crates in the workspace manifest**
 
@@ -47,7 +47,7 @@ unicode-segmentation = "=1.13.2"
 
 - [ ] **Step 2: Add the deps to the core crate**
 
-In `crates/nxvim-core/Cargo.toml`, under `[dependencies]` (after `ropey.workspace = true`), add:
+In `crates/bemtvi-core/Cargo.toml`, under `[dependencies]` (after `ropey.workspace = true`), add:
 
 ```toml
 unicode-width.workspace = true
@@ -56,7 +56,7 @@ unicode-segmentation.workspace = true
 
 - [ ] **Step 3: Create the `unicode` module**
 
-Create `crates/nxvim-core/src/unicode.rs` with exactly:
+Create `crates/bemtvi-core/src/unicode.rs` with exactly:
 
 ```rust
 //! Unicode-aware column math over a single line of text.
@@ -148,7 +148,7 @@ fn grapheme_width(g: &str, col: usize, tabstop: usize) -> usize {
 
 - [ ] **Step 4: Declare the module**
 
-In `crates/nxvim-core/src/lib.rs`, add `pub mod unicode;` to the module list (after `pub mod mode;`):
+In `crates/bemtvi-core/src/lib.rs`, add `pub mod unicode;` to the module list (after `pub mod mode;`):
 
 ```rust
 pub mod buffer;
@@ -161,13 +161,13 @@ pub mod view;
 
 - [ ] **Step 5: Build**
 
-Run: `cargo build -p nxvim-core`
+Run: `cargo build -p bemtvi-core`
 Expected: compiles cleanly (no warnings).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml crates/nxvim-core/Cargo.toml crates/nxvim-core/src/unicode.rs crates/nxvim-core/src/lib.rs
+git add Cargo.toml crates/bemtvi-core/Cargo.toml crates/bemtvi-core/src/unicode.rs crates/bemtvi-core/src/lib.rs
 git commit -m "$(printf 'feat(core): add unicode column-math helpers\n\nGrapheme boundaries and virtual (screen) columns over a line, tab- and\nwide-char aware. Pure; used by editor motion and view next.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -178,11 +178,11 @@ git commit -m "$(printf 'feat(core): add unicode column-math helpers\n\nGrapheme
 Adds buffer-wide grapheme stepping/snapping and routes the existing snap points through it. For ASCII every byte is a grapheme boundary, so behavior is unchanged — the existing integration suite is the regression gate.
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
 
 - [ ] **Step 1: Import the module**
 
-At the top of `crates/nxvim-core/src/editor.rs`, add to the `use crate::...` block:
+At the top of `crates/bemtvi-core/src/editor.rs`, add to the `use crate::...` block:
 
 ```rust
 use crate::unicode;
@@ -318,16 +318,16 @@ fn first_non_blank(&self, line: usize) -> usize {
 
 - [ ] **Step 7: Build, then run the existing suite as a regression gate**
 
-Run: `cargo build -p nxvim-core`
+Run: `cargo build -p bemtvi-core`
 Expected: compiles cleanly.
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: all existing tests PASS (ASCII behavior unchanged).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs
+git add crates/bemtvi-core/src/editor.rs
 git commit -m "$(printf 'refactor(core): grapheme-aware cursor snapping helpers\n\nAdd buffer-wide grapheme step/floor/ceil helpers and route snap_cursor,\nset_cursor_char(_insert), and snap_range through them. No behavior change\nfor ASCII; foundation for grapheme motion.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -338,13 +338,13 @@ git commit -m "$(printf 'refactor(core): grapheme-aware cursor snapping helpers\
 Carry the cursor's screen-cell column so clients can place the terminal cursor correctly. `cursor_col` keeps its byte meaning.
 
 **Files:**
-- Modify: `crates/nxvim-core/src/view.rs`
-- Modify: `crates/nxvim-server/src/lib.rs`
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/view.rs`
+- Modify: `crates/bemtvi-server/src/lib.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Add a `view_u64` test helper**
 
-In `crates/nxvim-server/tests/editing.rs`, right after the existing `view_str` function, add:
+In `crates/bemtvi-server/tests/editing.rs`, right after the existing `view_str` function, add:
 
 ```rust
 fn view_u64(view: &[(Value, Value)], key: &str) -> u64 {
@@ -354,7 +354,7 @@ fn view_u64(view: &[(Value, Value)], key: &str) -> u64 {
 
 - [ ] **Step 2: Write the failing tests**
 
-In `crates/nxvim-server/tests/editing.rs`, add:
+In `crates/bemtvi-server/tests/editing.rs`, add:
 
 ```rust
 #[tokio::test]
@@ -382,12 +382,12 @@ async fn screen_column_expands_tabs_to_the_next_tabstop() {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p nxvim-server --test editing screen_column`
+Run: `cargo test -p bemtvi-server --test editing screen_column`
 Expected: both FAIL — `cursor_screen_col` is absent, so `view_u64` returns 0 (2 ≠ 0, 8 ≠ 0).
 
 - [ ] **Step 4: Add the field to the core `View`**
 
-In `crates/nxvim-core/src/view.rs`, add the field to the struct (after `pub cursor_col: usize,`):
+In `crates/bemtvi-core/src/view.rs`, add the field to the struct (after `pub cursor_col: usize,`):
 
 ```rust
     pub cursor_col: usize,
@@ -407,7 +407,7 @@ Then update the module-doc line that currently says "One display cell per byte f
 
 - [ ] **Step 5: Populate the field in `from_editor`**
 
-In `crates/nxvim-core/src/view.rs`, inside `from_editor`, compute the screen column before the `View { ... }` literal:
+In `crates/bemtvi-core/src/view.rs`, inside `from_editor`, compute the screen column before the `View { ... }` literal:
 
 ```rust
         let cursor_screen_col = {
@@ -425,7 +425,7 @@ and add `cursor_screen_col,` to the `View { ... }` literal, right after `cursor_
 
 - [ ] **Step 6: Plumb it through the redraw map**
 
-In `crates/nxvim-server/src/lib.rs`, in `redraw()`, add an entry to the `map` vector right after the `cursor_col` entry:
+In `crates/bemtvi-server/src/lib.rs`, in `redraw()`, add an entry to the `map` vector right after the `cursor_col` entry:
 
 ```rust
             (
@@ -440,13 +440,13 @@ In `crates/nxvim-server/src/lib.rs`, in `redraw()`, add an entry to the `map` ve
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `cargo test -p nxvim-server --test editing screen_column`
+Run: `cargo test -p bemtvi-server --test editing screen_column`
 Expected: both PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/nxvim-core/src/view.rs crates/nxvim-server/src/lib.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/view.rs crates/bemtvi-server/src/lib.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "$(printf 'feat(core): carry cursor screen column in the View\n\nAdd cursor_screen_col (wide-char/tab-aware cells) alongside the byte\ncursor_col, and plumb it through the redraw map. Verified by wide-char\nand tab integration tests.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -455,12 +455,12 @@ git commit -m "$(printf 'feat(core): carry cursor screen column in the View\n\nA
 ## Task 4: Horizontal motion by grapheme (`h`, `l`, `$`)
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs`
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/nxvim-server/tests/editing.rs`, add:
+In `crates/bemtvi-server/tests/editing.rs`, add:
 
 ```rust
 #[tokio::test]
@@ -484,12 +484,12 @@ async fn horizontal_motion_steps_over_multibyte_chars() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p nxvim-server --test editing horizontal_motion_steps_over_multibyte_chars`
+Run: `cargo test -p bemtvi-server --test editing horizontal_motion_steps_over_multibyte_chars`
 Expected: FAIL — after the first `l` the cursor sticks at column 1 (cannot pass `é`).
 
 - [ ] **Step 3: Implement grapheme stepping for `h`, `l`, `$`**
 
-In `crates/nxvim-core/src/editor.rs`, inside `resolve_motion`, replace the three relevant arms of the `match (kc, ch)`.
+In `crates/bemtvi-core/src/editor.rs`, inside `resolve_motion`, replace the three relevant arms of the `match (kc, ch)`.
 
 Replace the `h` / Left / Backspace arm with:
 
@@ -542,18 +542,18 @@ Replace the `$` / End arm with:
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p nxvim-server --test editing horizontal_motion_steps_over_multibyte_chars`
+Run: `cargo test -p bemtvi-server --test editing horizontal_motion_steps_over_multibyte_chars`
 Expected: PASS.
 
 - [ ] **Step 5: Run the whole editing suite (regression)**
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: all PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "$(printf 'fix(core): h/l/$ step by grapheme cluster\n\nHorizontal motions advance to the next/previous grapheme boundary instead\nof by one byte, so the cursor no longer sticks on multibyte characters.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -562,12 +562,12 @@ git commit -m "$(printf 'fix(core): h/l/$ step by grapheme cluster\n\nHorizontal
 ## Task 5: `x` and `r` operate on whole graphemes
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs`
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/nxvim-server/tests/editing.rs`, add:
+In `crates/bemtvi-server/tests/editing.rs`, add:
 
 ```rust
 #[tokio::test]
@@ -590,12 +590,12 @@ async fn x_deletes_a_wide_char_and_leaves_the_rest() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p nxvim-server --test editing x_deletes`
+Run: `cargo test -p bemtvi-server --test editing x_deletes`
 Expected: FAIL — `x` deletes one byte, leaving a broken/partial character (the assertion on the resulting line mismatches).
 
 - [ ] **Step 3: Rename `advance_chars` to `advance_graphemes` and step by grapheme**
 
-In `crates/nxvim-core/src/editor.rs`, replace the whole `advance_chars` method with:
+In `crates/bemtvi-core/src/editor.rs`, replace the whole `advance_chars` method with:
 
 ```rust
 /// Advance `count` grapheme clusters forward from byte offset `from`, never
@@ -642,18 +642,18 @@ to:
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p nxvim-server --test editing x_deletes`
+Run: `cargo test -p bemtvi-server --test editing x_deletes`
 Expected: both PASS.
 
 - [ ] **Step 6: Run the whole editing suite (regression)**
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: all PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "$(printf 'fix(core): x and r act on whole grapheme clusters\n\nadvance_chars becomes advance_graphemes (steps by grapheme), so x/r cover\nbase+combining and wide characters as one unit.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -664,12 +664,12 @@ git commit -m "$(printf 'fix(core): x and r act on whole grapheme clusters\n\nad
 Backspace/Delete/Replace/Left/Right/Esc step by grapheme rather than by byte.
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs`
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/nxvim-server/tests/editing.rs`, add:
+In `crates/bemtvi-server/tests/editing.rs`, add:
 
 ```rust
 #[tokio::test]
@@ -685,12 +685,12 @@ async fn insert_backspace_deletes_a_whole_grapheme() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p nxvim-server --test editing insert_backspace_deletes_a_whole_grapheme`
+Run: `cargo test -p bemtvi-server --test editing insert_backspace_deletes_a_whole_grapheme`
 Expected: PASS or FAIL depending on byte split — run it and observe. (Backspace currently floors to a *char* boundary; for a precomposed `é` that already deletes the whole 2-byte char, so this specific case may pass. Keep the test: it locks the behavior, and the implementation below also fixes base+combining clusters which a char-floor would split.) If it passes already, still apply Step 3 to cover combining clusters, then re-run.
 
 - [ ] **Step 3: Make insert-mode edits grapheme-aware**
 
-In `crates/nxvim-core/src/editor.rs`, in `handle_insert`, replace these arms.
+In `crates/bemtvi-core/src/editor.rs`, in `handle_insert`, replace these arms.
 
 `Esc` arm — step back one grapheme instead of one byte (snap already protected it, but make it explicit), and drop the now-redundant `desired_col` line (it is recomputed in `input()`):
 
@@ -781,18 +781,18 @@ fn insert_backspace(&mut self) {
 
 - [ ] **Step 5: Run the test to verify it passes**
 
-Run: `cargo test -p nxvim-server --test editing insert_backspace_deletes_a_whole_grapheme`
+Run: `cargo test -p bemtvi-server --test editing insert_backspace_deletes_a_whole_grapheme`
 Expected: PASS.
 
 - [ ] **Step 6: Run the whole editing suite (regression)**
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: all PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "$(printf 'fix(core): insert-mode editing steps by grapheme\n\nBackspace/Delete/Left/Right/Replace and the Esc back-step move by whole\ngrapheme clusters instead of bytes.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -801,12 +801,12 @@ git commit -m "$(printf 'fix(core): insert-mode editing steps by grapheme\n\nBac
 ## Task 7: Word motions classify by base character over graphemes
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs`
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/nxvim-server/tests/editing.rs`, add:
+In `crates/bemtvi-server/tests/editing.rs`, add:
 
 ```rust
 #[tokio::test]
@@ -820,12 +820,12 @@ async fn dw_deletes_a_multibyte_word() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p nxvim-server --test editing dw_deletes_a_multibyte_word`
+Run: `cargo test -p bemtvi-server --test editing dw_deletes_a_multibyte_word`
 Expected: FAIL — `word_forward` walks byte-by-byte and misreads `é`/`ö` continuation bytes as blanks, so the deleted range is wrong.
 
 - [ ] **Step 3: Rewrite the three word-motion helpers to step by grapheme**
 
-In `crates/nxvim-core/src/editor.rs`, replace the whole `word_forward`, `word_backward`, and `word_end` methods with:
+In `crates/bemtvi-core/src/editor.rs`, replace the whole `word_forward`, `word_backward`, and `word_end` methods with:
 
 ```rust
 fn word_forward(&self, mut idx: usize) -> usize {
@@ -892,18 +892,18 @@ fn word_end(&self, mut idx: usize) -> usize {
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p nxvim-server --test editing dw_deletes_a_multibyte_word`
+Run: `cargo test -p bemtvi-server --test editing dw_deletes_a_multibyte_word`
 Expected: PASS.
 
 - [ ] **Step 5: Run the whole editing suite (regression)**
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: all PASS (existing `cw_changes_a_word` etc. still green).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "$(printf 'fix(core): word motions step by grapheme cluster\n\nw/b/e iterate grapheme clusters and classify by base character, so word\nboundaries are correct inside multibyte words.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -914,12 +914,12 @@ git commit -m "$(printf 'fix(core): word motions step by grapheme cluster\n\nw/b
 Make vertical motion remember a *screen* column and land on the nearest grapheme.
 
 **Files:**
-- Modify: `crates/nxvim-core/src/editor.rs`
-- Test: `crates/nxvim-server/tests/editing.rs`
+- Modify: `crates/bemtvi-core/src/editor.rs`
+- Test: `crates/bemtvi-server/tests/editing.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/nxvim-server/tests/editing.rs`, add:
+In `crates/bemtvi-server/tests/editing.rs`, add:
 
 ```rust
 #[tokio::test]
@@ -939,12 +939,12 @@ async fn vertical_motion_keeps_screen_column_across_wide_chars() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p nxvim-server --test editing vertical_motion_keeps_screen_column_across_wide_chars`
+Run: `cargo test -p bemtvi-server --test editing vertical_motion_keeps_screen_column_across_wide_chars`
 Expected: FAIL — `desired_col` is a byte column, so `j` lands on byte 2 of line 1 region math incorrectly / the wrong cell mapping.
 
 - [ ] **Step 3: Make `desired_col` a virtual column where it is set**
 
-In `crates/nxvim-core/src/editor.rs`, in `input()`, replace:
+In `crates/bemtvi-core/src/editor.rs`, in `input()`, replace:
 
 ```rust
         if !self.preserve_desired {
@@ -1031,18 +1031,18 @@ fn toggle_case(&mut self, count: usize) {
 
 - [ ] **Step 6: Run the test to verify it passes**
 
-Run: `cargo test -p nxvim-server --test editing vertical_motion_keeps_screen_column_across_wide_chars`
+Run: `cargo test -p bemtvi-server --test editing vertical_motion_keeps_screen_column_across_wide_chars`
 Expected: PASS.
 
 - [ ] **Step 7: Run the whole editing suite (regression)**
 
-Run: `cargo test -p nxvim-server --test editing`
+Run: `cargo test -p bemtvi-server --test editing`
 Expected: all PASS (including `vertical_motion_preserves_desired_column` and `dollar_sticks_to_end_of_line_through_j`, which are ASCII and unaffected).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/nxvim-core/src/editor.rs crates/nxvim-server/tests/editing.rs
+git add crates/bemtvi-core/src/editor.rs crates/bemtvi-server/tests/editing.rs
 git commit -m "$(printf 'fix(core): j/k/$ remember a virtual (screen) column\n\ndesired_col becomes a virtual column; settle_desired_col maps it back to\nthe nearest grapheme, so vertical motion is stable across wide/tab text.\n~ advances by grapheme.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
@@ -1053,12 +1053,12 @@ git commit -m "$(printf 'fix(core): j/k/$ remember a virtual (screen) column\n\n
 The text already renders width-correctly via ratatui; place the terminal cursor at `cursor_screen_col` and expand tabs so painted widths match core's virtual columns. (No PTY/e2e harness exists yet, so this task is verified by build + the existing core-level screen-column tests from Task 3; the change is mechanical.)
 
 **Files:**
-- Modify: `crates/nxvim-tui/Cargo.toml`
-- Modify: `crates/nxvim-tui/src/lib.rs`
+- Modify: `crates/bemtvi-tui/Cargo.toml`
+- Modify: `crates/bemtvi-tui/src/lib.rs`
 
 - [ ] **Step 1: Add `unicode-width` to the TUI crate**
 
-In `crates/nxvim-tui/Cargo.toml`, under `[dependencies]` (after `ratatui.workspace = true`), add:
+In `crates/bemtvi-tui/Cargo.toml`, under `[dependencies]` (after `ratatui.workspace = true`), add:
 
 ```toml
 unicode-width.workspace = true
@@ -1066,7 +1066,7 @@ unicode-width.workspace = true
 
 - [ ] **Step 2: Import the trait and define the tab stop**
 
-In `crates/nxvim-tui/src/lib.rs`, add to the imports near the top:
+In `crates/bemtvi-tui/src/lib.rs`, add to the imports near the top:
 
 ```rust
 use unicode_width::UnicodeWidthChar;
@@ -1075,7 +1075,7 @@ use unicode_width::UnicodeWidthChar;
 and add a constant next to `CHROME_ROWS`:
 
 ```rust
-/// Tab stop width in cells. Must match `nxvim_core::unicode::TABSTOP` so the
+/// Tab stop width in cells. Must match `bemtvi_core::unicode::TABSTOP` so the
 /// painted text lines up with the server's reported screen columns.
 const TABSTOP: usize = 8;
 ```
@@ -1158,7 +1158,7 @@ Expected: compiles cleanly.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/nxvim-tui/Cargo.toml crates/nxvim-tui/src/lib.rs
+git add crates/bemtvi-tui/Cargo.toml crates/bemtvi-tui/src/lib.rs
 git commit -m "$(printf 'feat(tui): place cursor at screen column and expand tabs\n\nUse cursor_screen_col for terminal cursor placement and expand tabs to\nspaces at tabstop 8 so painted widths match the server.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 

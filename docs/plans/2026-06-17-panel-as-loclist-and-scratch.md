@@ -11,7 +11,7 @@ Status: **DONE** — 2026-06-17 (all 5 phases landed; workspace green default +
 (`2026-06-16-unify-special-buffer-kinds.md`): the bottom **panel** — the last grabbing,
 bespoke-rendered "non-ordinary buffer" mechanism — is **deleted entirely**. No `panel`
 concept survives. Every listing it served moves to one of the two general mechanisms
-nxvim already has:
+bemtvi already has:
 
 - **Location-bearing lists** (`:marks`, `:jumps`, `:changes`, LSP references /
   definitions / diagnostics-with-targets) → real **location lists** (`filetype=qf`,
@@ -25,13 +25,13 @@ Two listings are *select-with-callback*, not jumps, so they get explicit homes:
 
 - **`:ls`** (switch to the picked buffer) → a read-only scratch buffer whose
   buffer-local `<CR>` parses the buffer number off the cursor line and switches to it.
-- **LSP code actions** (apply the picked action) → **`nx.ui.select`** (the select
+- **LSP code actions** (apply the picked action) → **`btv.ui.select`** (the select
   menu) — exactly where neovim puts them (`vim.ui.select`), retiring the
   `CODE_ACTION_PANEL_TITLE` routing hack.
 
-The public **`vim.panel.*` Lua API and `nxvim_panel_*` RPC are retired** (breaking;
-they were nxvim-only and never a neovim concept). Scripts that want a custom bottom-dock
-list use `nx.view`, the documented generalization.
+The public **`vim.panel.*` Lua API and `bemtvi_panel_*` RPC are retired** (breaking;
+they were bemtvi-only and never a neovim concept). Scripts that want a custom bottom-dock
+list use `btv.view`, the documented generalization.
 
 ## Why
 
@@ -52,7 +52,7 @@ to be read-only without being a `BufferKind`. Add the honest vim mechanism:
 
 - `BufferOptions.modifiable: bool` (default `true`).
 - `modifiable()` gains `&& self.buffer().options.modifiable`.
-- `:setlocal [no]modifiable` / `:set [no]ma` and `nx.bo.modifiable` set it.
+- `:setlocal [no]modifiable` / `:set [no]ma` and `btv.bo.modifiable` set it.
 
 This generalizes beyond the listings (any plugin/buffer can be `nomodifiable`) and is a
 real latent gap, not panel-specific scaffolding.
@@ -79,8 +79,8 @@ real latent gap, not panel-specific scaffolding.
 ### Phase 3 — the two select-with-callback listings
 - `:ls` (`ex_buffers`): scratch listing + a `FileType` autocmd installing a buffer-local
   `<CR>` → a prelude helper that parses the leading bufnr off the cursor line and
-  `:b <n>`. Replaces the `vim.panel.on_select(nx._panel_select_buffer)` wiring.
-- LSP code actions (`edit.rs`): present via `nx.ui.select`; apply the chosen action on
+  `:b <n>`. Replaces the `vim.panel.on_select(btv._panel_select_buffer)` wiring.
+- LSP code actions (`edit.rs`): present via `btv.ui.select`; apply the chosen action on
   confirm. Remove `CODE_ACTION_PANEL_TITLE` + its `effects.rs` routing.
 
 ### Phase 4 — delete the panel apparatus
@@ -90,11 +90,11 @@ real latent gap, not panel-specific scaffolding.
   (`ex.rs`), `panel_rows` + its removal from the layout/mouse chrome math
   (`windows.rs`, `mouse.rs`), the mouse panel-click path.
 - Server: the `'L'` bucket in `widget_bucket`/`mode_buckets`/`mode_code` (`keymap.rs`),
-  `nxvim_panel_*` dispatch (`dispatch.rs`), `take_panel_ops` drain (`input.rs`,
+  `bemtvi_panel_*` dispatch (`dispatch.rs`), `take_panel_ops` drain (`input.rs`,
   `effects.rs`).
 - Lua: `vim.panel.*` (`install.rs`), `PanelOp`/`panel_ops`/`take_panel_ops`
   (`ops.rs`, `runtime.rs`), `PANEL_ON_SELECT` / `store_panel_callback` /
-  `nx._panel_select_buffer` / `nx._panel_action`.
+  `btv._panel_select_buffer` / `btv._panel_action`.
 
 ### Phase 5 — tests + docs
 - Re-home the panel tests: `:messages`/`:registers` assert a `nomodifiable` bottom
@@ -112,11 +112,11 @@ real latent gap, not panel-specific scaffolding.
   conversion is a scratch listing (Phase 1's `open_scratch_listing`), which also keeps
   their tabular format. Only the genuinely-navigable **LSP** lists (references,
   diagnostics-with-targets) became loclists, via the new
-  [`Editor::open_location_list`](../../crates/nxvim-core/src/editor/quickfix.rs).
-- **`:ls` rides its own `bufferlist_bufnr`** (filetype `nxbuffers`), separate from the
+  [`Editor::open_location_list`](../../crates/bemtvi-core/src/editor/quickfix.rs).
+- **`:ls` rides its own `bufferlist_bufnr`** (filetype `btvbuffers`), separate from the
   shared `scratch_bufnr`, so its `<CR>`-switch buffer-local map can't bleed onto the
   plain text listings.
-- **Code actions → `nx.ui.select`** via a `pending_code_action` flag routed in the
+- **Code actions → `btv.ui.select`** via a `pending_code_action` flag routed in the
   `menu_results` drain (no existing test covers code actions — they need a mock LSP
   server — so this path is converted but, like before, untested).
 - **Client panel-rendering code (tui/gui/web) was left in place**: it reads the now-absent
@@ -124,7 +124,7 @@ real latent gap, not panel-specific scaffolding.
 
 ## Out of scope
 - Word-wrap (deliberately dropped; buffer-wide feature, separate effort).
-- `nx.view` itself (unchanged; it's the scripting replacement for `vim.panel`).
+- `btv.view` itself (unchanged; it's the scripting replacement for `vim.panel`).
 - The terminal mode, floats, picker, select — they keep their mechanisms (see the
   [picker/floats analysis](2026-06-16-unify-special-buffer-kinds.md): a prompt or a
   non-window overlay genuinely justifies a widget; the panel had neither).

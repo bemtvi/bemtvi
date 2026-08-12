@@ -6,13 +6,13 @@ the plan, and why, are recorded inline under each phase.
 
 ## Problem
 
-Two defects, one report. nxvim fires `BufWinEnter` on every tab switch (neovim never
+Two defects, one report. bemtvi fires `BufWinEnter` on every tab switch (neovim never
 does), and its underlying model — "a buffer's window-visibility went 0 → ≥1" — is not
 neovim's, so it also misses fires neovim makes.
 
-### Measured (nvim 0.12.2 headless vs. nxvim through the harness)
+### Measured (nvim 0.12.2 headless vs. bemtvi through the harness)
 
-| action | neovim | nxvim (today) |
+| action | neovim | bemtvi (today) |
 | --- | --- | --- |
 | `:tabnext` / `:tabprevious` | no fire | **fires every switch** |
 | `:tabclose` returning to another tab | no fire | **fires** |
@@ -27,14 +27,14 @@ sees only the active tab, so one `:tabnext` fires four spurious events:
 
 ```
 neovim :  WinEnter TabEnter BufEnter
-nxvim  :  WinNew WinClosed BufEnter WinEnter BufWinEnter WinResized TabEnter
+bemtvi  :  WinNew WinClosed BufEnter WinEnter BufWinEnter WinResized TabEnter
           ^^^^^^ ^^^^^^^^^                  ^^^^^^^^^^^ ^^^^^^^^^^ spurious
 ```
 
 ### Root causes
 
 1. **Active-tab-only enumeration.** `EditHost::emit_lifecycle_events` builds its window
-   set from `Editor::window_ids()` (`crates/nxvim-core/src/editor/windows.rs:1254`),
+   set from `Editor::window_ids()` (`crates/bemtvi-core/src/editor/windows.rs:1254`),
    which walks `layer_tree(layer)` — the **active tab** of each layer
    (`editor/dock.rs:127`). Windows parked in background tabs are invisible, so leaving a
    tab reads as "those windows closed" and returning as "these windows are new".
@@ -57,7 +57,7 @@ Swap the lifecycle diff's enumeration from `window_ids()` (active tab of each la
 `all_window_ids()` (every tab of every open layer). Windows in background tabs then stay
 continuously known, so a tab switch transitions nothing.
 
-Touchpoints, all in `crates/nxvim-server`:
+Touchpoints, all in `crates/bemtvi-server`:
 
 - `lifecycle.rs::emit_lifecycle_events` — the `wins` vec feeding `new_wins` /
   `closed_wins` (`WinNew` / `WinClosed`), `bufwin_changed`, and `known_windows`.
@@ -76,7 +76,7 @@ restored into background *tabs* now get their `BufReadPost` → `FileType` annou
 background *windows* already do — matching neovim, which loads every restored tab's
 buffers.
 
-Tests (`crates/nxvim-server/tests/autocmds.rs`), written failing first:
+Tests (`crates/bemtvi-server/tests/autocmds.rs`), written failing first:
 
 - `tab_switch_fires_no_window_lifecycle_events` — with two tabs, `:tabnext` fires exactly
   neovim's `WinEnter` / `TabEnter` / `BufEnter` and none of `WinNew` / `WinClosed` /
@@ -122,7 +122,7 @@ Rule 2 needs one canonical core signal — which new windows inherited. A heuris
 displayed must fire. So the split path records the fact, mirroring the
 `loaded_in_place` precedent:
 
-- `crates/nxvim-core/src/editor/mod.rs` — `inherited_windows: Vec<(WindowId, BufferId)>`.
+- `crates/bemtvi-core/src/editor/mod.rs` — `inherited_windows: Vec<(WindowId, BufferId)>`.
 - `editor/windows.rs::split` (`:split` / `:vsplit`, the only pure-inherit creation path;
   `open_split_window` takes an explicit buffer and is an assignment) pushes
   `(new_id, buffer)`.
@@ -146,16 +146,16 @@ the assignment model.
 
 **Landed as designed.** Three findings changed the edges:
 
-- **`<C-w>x`** fires nothing, matching nvim. **`:bdelete`** fires in nxvim and not in
+- **`<C-w>x`** fires nothing, matching nvim. **`:bdelete`** fires in bemtvi and not in
   nvim, but the two aren't comparable: nvim *closes* the window showing the deleted
-  buffer (2 windows → 1, `BufEnter` only), while nxvim keeps it and rebinds it to a
+  buffer (2 windows → 1, `BufEnter` only), while bemtvi keeps it and rebinds it to a
   survivor — a window genuinely displaying something new, which under this model fires.
   A suppression was written and reverted: it would only have covered *background*
   windows, leaving the current window (which moves via the ordinary switch path) firing
-  on the same command. nxvim's `:bdelete` keeping the window open is a real divergence
+  on the same command. bemtvi's `:bdelete` keeping the window open is a real divergence
   from vim, and its own question.
 - **`:b <name>`** routes focus to a window already showing that buffer instead of
-  switching in place (nxvim's `:drop`-like behavior, a divergence from vim's `:b`), so
+  switching in place (bemtvi's `:drop`-like behavior, a divergence from vim's `:b`), so
   it changes no window's buffer and correctly fires nothing. The switch test therefore
   drives one window with `:edit` / `:b` on buffers displayed nowhere else.
 - **Bare `:e` / `:e!` did not reload at all** — only `:e ++enc=…` fell back to the
@@ -197,7 +197,7 @@ fixed: a *diff* cannot see an event whose cause moved nothing.
   example turned this up: `:split file` is a split *then* `:edit file`, and with no
   argument-vs-inherit distinction the `:edit` took its "re-edit the current file" branch.
   vim takes `do_ecmd`'s old-buffer path — the window already shows it, so nothing is read
-  — and nxvim's reload cost two things a request for a second view has no business
+  — and bemtvi's reload cost two things a request for a second view has no business
   costing: on a modified buffer the reload's `E37` guard *refused the split*, and on a
   clean one the fresh read re-rooted the undo tree, so every undo step taken before the
   split was gone. `ex_edit_file` now consumes the window's inherit record instead, which
@@ -209,7 +209,7 @@ fixed: a *diff* cannot see an event whose cause moved nothing.
   the *current* file, so the `BufWinEnter` it saw came from the reload's `loaded_in_place`
   path, not from the window diff the phase existed to build.
 
-With those in, nxvim's log is identical to nvim's on every one of the twelve commands
+With those in, bemtvi's log is identical to nvim's on every one of the twelve commands
 (`:tabnew`, `:tabnext`, `:tabclose`, `:vsplit <shown file>`, `:quit`, `:split`,
 `<C-w>w`, `:e!`, `:tabnew <shown file>`, `:enew`, `:b <name>`, `<C-w>x`).
 

@@ -4,7 +4,7 @@ winhighlight — per-window highlight remap
 This file is open in the MAIN editor area, painted with the global `Normal`
 background. To its left is a dock styled with:
 
-    nx.dock.opt("left").winhighlight =
+    btv.dock.opt("left").winhighlight =
       "Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr"
 
 The dock renders on the `NormalSB` background — a dimmer sidebar — while this

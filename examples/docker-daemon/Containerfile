@@ -1,13 +1,13 @@
-# nxvim remote daemon, containerized — native (QUIC) transport.
+# bemtvi remote daemon, containerized — native (QUIC) transport.
 #
 # Build from the REPO ROOT (the whole workspace is the build context):
 #
-#     podman build -f examples/docker-daemon/Containerfile -t nxvim-daemon .
-#     # or: docker build -f examples/docker-daemon/Containerfile -t nxvim-daemon .
+#     podman build -f examples/docker-daemon/Containerfile -t bemtvi-daemon .
+#     # or: docker build -f examples/docker-daemon/Containerfile -t bemtvi-daemon .
 #
 # Run it (QUIC is UDP — note the /udp, and publish on loopback only):
 #
-#     podman run --rm -p 127.0.0.1:8765:8765/udp --name nxvim-daemon nxvim-daemon
+#     podman run --rm -p 127.0.0.1:8765:8765/udp --name bemtvi-daemon bemtvi-daemon
 #
 # Then connect from the host with examples/docker-daemon/connect.sh.
 
@@ -23,7 +23,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 # Only the binary crate is needed for the daemon role.
-RUN cargo build --release -p nxvim
+RUN cargo build --release -p bemtvi
 
 # ---- runtime stage: just the binary + the daemon's config & workspace ------
 FROM docker.io/library/debian:bookworm-slim
@@ -32,12 +32,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /src/target/release/nxvim /usr/local/bin/nxvim
+COPY --from=build /src/target/release/bemtvi /usr/local/bin/bemtvi
 
 # The daemon serves THIS config over the wire (see daemon/init.lua). It is resolved
-# exactly like a local config would be: $NXVIM_CONFIG first.
-COPY examples/docker-daemon/daemon /etc/nxvim
-ENV NXVIM_CONFIG=/etc/nxvim
+# exactly like a local config would be: $BEMTVI_CONFIG first.
+COPY examples/docker-daemon/daemon /etc/bemtvi
+ENV BEMTVI_CONFIG=/etc/bemtvi
 
 # The files you actually edit live on the daemon's filesystem (the container).
 COPY examples/docker-daemon/workspace /work
@@ -46,4 +46,4 @@ WORKDIR /work
 # QUIC listener. 0.0.0.0 so it's reachable from outside the container; the bearer
 # token + TOFU cert (printed on stdout at startup) are the auth gate.
 EXPOSE 8765/udp
-CMD ["nxvim", "--daemon", "--listen", "0.0.0.0:8765"]
+CMD ["bemtvi", "--daemon", "--listen", "0.0.0.0:8765"]

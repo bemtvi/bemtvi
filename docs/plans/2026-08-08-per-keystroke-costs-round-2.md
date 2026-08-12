@@ -160,7 +160,7 @@ still matters.
 
 ## Phase 4 — the tree-sitter injection layers
 
-`Engine::edit` (`nxvim-ts/engine.rs:800`) calls `update_injection_layers` on every
+`Engine::edit` (`bemtvi-ts/engine.rs:800`) calls `update_injection_layers` on every
 edit, which runs the host grammar's injection query over the **entire tree** via
 `collect_injection_regions` (`engine.rs:2363`) — a `QueryCursor` with no
 `set_byte_range`, unlike `extract_spans` (`engine.rs:2166`), which correctly clips

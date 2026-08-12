@@ -1,9 +1,9 @@
--- ~~~ nxvim gutter options: 'numberwidth' + 'signcolumn' ~~~
+-- ~~~ bemtvi gutter options: 'numberwidth' + 'signcolumn' ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/gutter-options \
---       cargo run -p nxvim -- examples/gutter-options/sample.txt
+--     BEMTVI_CONFIG=examples/gutter-options \
+--       cargo run -p bemtvi -- examples/gutter-options/sample.txt
 --
 -- Two neovim-compatible window-local options shape the left gutter:
 --

@@ -1,3 +1,3 @@
-module example.com/nxvim/multiserver
+module example.com/bemtvi/multiserver
 
 go 1.21

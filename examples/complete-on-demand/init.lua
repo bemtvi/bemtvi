@@ -1,9 +1,9 @@
--- ~~~ nxvim on-demand completion: the manual trigger is a SESSION ~~~
+-- ~~~ bemtvi on-demand completion: the manual trigger is a SESSION ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/complete-on-demand \
---       cargo run -p nxvim -- examples/complete-on-demand/sample.txt
+--     BEMTVI_CONFIG=examples/complete-on-demand \
+--       cargo run -p bemtvi -- examples/complete-on-demand/sample.txt
 --
 -- The companion to `examples/ui-complete` (which shows the full engine with
 -- `auto = true`). Here the popup NEVER opens on its own — `auto = false` — so the
@@ -29,7 +29,7 @@
 -- to make the bypass visible: auto-completion would need four characters, but the
 -- manual session happily completes a one-character prefix.
 --------------------------------------------------------------------------------
-nx.complete.setup {
+btv.complete.setup {
   sources = { { "buffer" } },
   auto = false,
   min_chars = 4,
@@ -45,10 +45,10 @@ nx.complete.setup {
 --------------------------------------------------------------------------------
 -- 2. The same trigger as a Lua API, on a second key.
 --
--- `nx.complete.trigger()` is the API half of the trigger key — map it wherever
+-- `btv.complete.trigger()` is the API half of the trigger key — map it wherever
 -- you like. It starts an identical session.
 --------------------------------------------------------------------------------
-nx.keymap.set("i", "<C-j>", nx.complete.trigger, { desc = "completion: open on demand" })
+btv.keymap.set("i", "<C-j>", btv.complete.trigger, { desc = "completion: open on demand" })
 
 --------------------------------------------------------------------------------
 -- TYPE THIS / SEE THAT

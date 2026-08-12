@@ -1,7 +1,7 @@
 # Keep `stylua .` confined to first-party prelude Lua.
 # Vendored neovim copies — never reformat (diverges from upstream).
-crates/nxvim-lua/src/vendor/
+crates/bemtvi-lua/src/vendor/
 # Out of the pre-commit's chosen scope (prelude only).
 examples/
-crates/nxvim/tests/
+crates/bemtvi/tests/
 vendor/

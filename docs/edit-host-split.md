@@ -6,26 +6,26 @@ moves. That lag is structural, not tunable: the editing state machine lives on t
 far side of the wire.
 
 The **edit-host split** moves the network boundary *below* the editor instead. The
-editor and Lua run **locally**; only an **`nxvim --daemon`** serving the filesystem,
+editor and Lua run **locally**; only an **`bemtvi --daemon`** serving the filesystem,
 processes, and file-watching runs on the remote. So typing, motions, operators, and
 undo are all local — **zero round-trips** — and only fs / process / watch / LSP
 traffic crosses the wire, the work that was always going to feel like a spinner
 anyway. It's the direction VS Code Remote takes: the text model is local, the heavy
 I/O is remote.
 
-The same `nxvim --daemon` serves the [Browser editor](browser-editor.md) too — one
+The same `bemtvi --daemon` serves the [Browser editor](browser-editor.md) too — one
 remote, reached natively here or from a browser tab over WebTransport.
 
 ## The two halves
 
 ```
-editor + Lua  (LOCAL, your machine)  ──network──▶  nxvim --daemon = fs + processes + watch  (REMOTE)
+editor + Lua  (LOCAL, your machine)  ──network──▶  bemtvi --daemon = fs + processes + watch  (REMOTE)
 ```
 
-- **The local half** is the same embedded editor as a normal `nxvim`, with its host
+- **The local half** is the same embedded editor as a normal `bemtvi`, with its host
   seams — `HostFs`, `HostProc`, the async `HostFsAsync`, the LSP transport, and the
   Lua-facing `LuaFs` — pointed at the daemon instead of the local disk.
-- **The remote half** is `nxvim --daemon`: it reads and writes the remote machine's
+- **The remote half** is `bemtvi --daemon`: it reads and writes the remote machine's
   files, spawns its processes, and watches its files. Nothing about editing lives
   there.
 
@@ -39,15 +39,15 @@ same transport the browser uses).
 Point a local editor at a daemon spawned over ssh:
 
 ```sh
-NXVIM_DAEMON_CMD="ssh user@host nxvim --daemon" nxvim --connect-daemon path/to/file
+BEMTVI_DAEMON_CMD="ssh user@host bemtvi --daemon" bemtvi --connect-daemon path/to/file
 ```
 
-`NXVIM_DAEMON_CMD` is run through `sh -c`, so any command line ending in
-`nxvim --daemon` over stdio works. Left unset, `--connect-daemon` spawns this same
-binary locally (`nxvim --daemon`) — a two-process local split, handy for testing.
+`BEMTVI_DAEMON_CMD` is run through `sh -c`, so any command line ending in
+`bemtvi --daemon` over stdio works. Left unset, `--connect-daemon` spawns this same
+binary locally (`bemtvi --daemon`) — a two-process local split, handy for testing.
 
 In the **GUI**, do it at runtime with `:connect [user@]host[:port][/file]` — it spawns
-`ssh … nxvim --daemon` and routes any password / passphrase prompt to a native dialog
+`ssh … bemtvi --daemon` and routes any password / passphrase prompt to a native dialog
 via `SSH_ASKPASS`, so it works from a windowed launch with no tty.
 
 ### Over QUIC / WebTransport
@@ -56,25 +56,25 @@ Run a standalone listener on the remote — the same `wtransport`-on-`quinn` sta
 browser dials:
 
 ```sh
-nxvim --daemon --listen                 # binds 127.0.0.1:8765, prints a connect URI
-nxvim --daemon --listen 0.0.0.0:9000    # accept off-host connections
+bemtvi --daemon --listen                 # binds 127.0.0.1:8765, prints a connect URI
+bemtvi --daemon --listen 0.0.0.0:9000    # accept off-host connections
 ```
 
-It prints a connect URI — `nxvim://HOST:PORT/TOKEN?cert=HASH`. Dial it from a local
-editor (the `nxvim://…` scheme selects the QUIC path; `--connect-daemon` is optional):
+It prints a connect URI — `bemtvi://HOST:PORT/TOKEN?cert=HASH`. Dial it from a local
+editor (the `bemtvi://…` scheme selects the QUIC path; `--connect-daemon` is optional):
 
 ```sh
-nxvim nxvim://HOST:PORT/TOKEN?cert=HASH path/to/file
+bemtvi bemtvi://HOST:PORT/TOKEN?cert=HASH path/to/file
 ```
 
-In the **GUI**, `:connect nxvim://…` does the same at runtime.
+In the **GUI**, `:connect bemtvi://…` does the same at runtime.
 
 ## What crosses the wire (and what doesn't)
 
 | Stays **local** (zero round-trips) | Goes **remote** (over the wire) |
 | --- | --- |
 | Every keystroke, motion, operator, undo | Opening / saving files and the file explorer |
-| The Lua VM and the redraw | Processes — `nx.run` / `nx.run_stream` / `nx.process` / `:terminal` |
+| The Lua VM and the redraw | Processes — `btv.run` / `btv.run_stream` / `btv.process` / `:terminal` |
 | Your config + shada *(default; see below)* | File-watching — `:checktime` / `'autoread'` / `FileChangedShell` |
 | | LSP requests |
 
@@ -93,20 +93,20 @@ so it is **always** remote-config. See [`examples/remote-config`](../examples/re
 
 ### The split-brain filesystem (for Lua)
 
-One subtlety the split forces: *which* filesystem does Lua see? nxvim splits it on
-purpose. **Project-facing** fs APIs route to the daemon — the async `nx.fs` surface
-(`nx.fs.read` / `nx.fs.readdir` / `nx.fs.stat` / `nx.fs.watch` / …), root detection,
+One subtlety the split forces: *which* filesystem does Lua see? bemtvi splits it on
+purpose. **Project-facing** fs APIs route to the daemon — the async `btv.fs` surface
+(`btv.fs.read` / `btv.fs.readdir` / `btv.fs.stat` / `btv.fs.watch` / …), root detection,
 a picker's previewer, a
 VCS-status provider — so they see the **project** on the remote. Config and shada stay
 **local** by default, or move to the daemon with `--remote-config` (see above). (This
 is the `LuaFs` seam.)
 
-**Plugin management is always local.** The `nx.plugins` manager clones, discovers, and
+**Plugin management is always local.** The `btv.plugins` manager clones, discovers, and
 sources plugins on the **local disk** in every session — even a daemon / `--remote-config`
 one — because a plugin loads into the *local* Lua VM (its dir is added to the local
 runtimepath and `require`d). So `:PluginSync` downloads into the local
 `stdpath('data')/plugins`, and a `dir=` plugin is read locally; a git clone runs the local
-`git`, never the daemon's. (A loaded plugin's *own* runtime `nx.fs` / `nx.run` still route
+`git`, never the daemon's. (A loaded plugin's *own* runtime `btv.fs` / `btv.run` still route
 to the daemon — it edits the remote's files.) This is separate from the `pack/*/start`
 plugins a `--remote-config` session fetches in the `config_bundle`: those come *from* the
 daemon and are materialized into the local cache alongside the config. Either way, plugin
@@ -126,7 +126,7 @@ untouched, and the transport beneath them reconnects. While the link is down, re
   link parks **disconnected** and tells you to run `:reconnect`.
 - **`:reconnect`** re-dials now (and resets the retry budget); **`:disconnect`** drops the
   link on demand. Both are server-side ex-commands, so they work on the TUI too.
-- **Status** is a first-class API: `nx.daemon.status()` returns `"connected"` /
+- **Status** is a first-class API: `btv.daemon.status()` returns `"connected"` /
   `"reconnecting"` / `"disconnected"` (or `nil` for a local session), and a
   `User DaemonStatusChanged` autocmd fires on every change — so a statusline component can
   render it (green / yellow / red). See [`examples/daemon-status`](../examples/daemon-status).
@@ -166,7 +166,7 @@ its job.
   a process flood (a fuzzy-finder's `rg`, an `npm install`) can head-of-line-block a
   file save queued behind it. QUIC gives each traffic class its own stream, removing
   that coupling at the protocol level: the legs ride four independently flow-controlled
-  bidi streams by latency class — Control (`fs` / `config` / `nx.fs`), Proc, Lsp, Term —
+  bidi streams by latency class — Control (`fs` / `config` / `btv.fs`), Proc, Lsp, Term —
   each prefixed with a one-byte group tag the daemon dispatches on. Because it's the same
   `wtransport`/`quinn` stack the browser's WebTransport uses, native and browser **unify
   on one daemon** (the browser opens the same four streams). See

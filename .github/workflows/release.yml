@@ -70,7 +70,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: nxvim-*
+          pattern: bemtvi-*
           path: dist
           merge-multiple: true
 
@@ -78,12 +78,12 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum nxvim-* > SHA256SUMS
+          sha256sum bemtvi-* > SHA256SUMS
 
       - name: Attest provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: "dist/nxvim-*"
+          subject-path: "dist/bemtvi-*"
 
       - name: Build release notes
         shell: bash
@@ -94,7 +94,7 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/nxvim"
+            echo "gh attestation verify <file> --repo davidrios/bemtvi"
             echo '```'
           } > RELEASE_NOTES.md
 

@@ -1,7 +1,7 @@
 Silent-commands demo buffer.
 
 The mappings below all run ex-commands under the `:silent[!]` modifier — from
-Lua, via `nx.cmd(cmd, opts)` and the `vim.cmd` aliases.
+Lua, via `btv.cmd(cmd, opts)` and the `vim.cmd` aliases.
 
   <Space>w   save this file with no "…written" message
   <Space>o   run an optional (nonexistent) command — silent!, so nothing reports

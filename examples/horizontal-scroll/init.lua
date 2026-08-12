@@ -1,9 +1,9 @@
--- ~~~ nxvim horizontal scrolling: long lines scroll, they don't clip ~~~
+-- ~~~ bemtvi horizontal scrolling: long lines scroll, they don't clip ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/horizontal-scroll \
---       cargo run -p nxvim -- examples/horizontal-scroll/sample.txt
+--     BEMTVI_CONFIG=examples/horizontal-scroll \
+--       cargo run -p bemtvi -- examples/horizontal-scroll/sample.txt
 --
 -- This is the `nowrap` half of the pair (see `examples/word-wrap/` for `:set
 -- wrap`): a line wider than the window is shown clipped, and the viewport scrolls

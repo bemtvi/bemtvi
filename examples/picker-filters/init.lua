@@ -1,14 +1,14 @@
--- nx.picker include / exclude filters — a runnable playground.
+-- btv.picker include / exclude filters — a runnable playground.
 --
---   NXVIM_CONFIG=examples/picker-filters \
---     cargo run -p nxvim -- examples/picker-filters/sample.txt
+--   BEMTVI_CONFIG=examples/picker-filters \
+--     cargo run -p bemtvi -- examples/picker-filters/sample.txt
 --
 -- This directory deliberately contains the mess a real project has: a `target/`
 -- build artifact, a `vendor/` lock file, and a dotfile — the things `files` and
 -- `live_grep` list by default (they search unrestricted, so nothing is ever
 -- unfindable) and that the filter boxes are for hiding when you don't want them.
 
--- Space as the leader, so the maps below read as `<Space>ff`. (nxvim's default is
+-- Space as the leader, so the maps below read as `<Space>ff`. (bemtvi's default is
 -- vim's `\`; the shipped picker maps are registered against whatever this is set to.)
 vim.g.mapleader = " "
 
@@ -23,7 +23,7 @@ vim.g.mapleader = " "
 --    Then TYPE  <C-g>
 --    SEE   the include / exclude rows appear, the exclude one already holding
 --          `target/, vendor/`, and the badge gone (the rows say it now).
-nx.picker.setup({
+btv.picker.setup({
   exclude = { "target/", "vendor/" },
   history = 20, -- past lines kept per box for <C-Up> / <C-Down> (0 disables)
 })
@@ -67,7 +67,7 @@ nx.picker.setup({
 --    where it would mean the opposite) and persists across restarts: quit with
 --    `:qa`, start the example again, and <C-Up> still has your lines.
 --
---    `nx.picker.history("exclude")` reads the list; `nx.picker.forget_history()`
+--    `btv.picker.history("exclude")` reads the list; `btv.picker.forget_history()`
 --    clears it.
 
 -- 5. Opening a picker already scoped, from a keymap.
@@ -77,8 +77,8 @@ nx.picker.setup({
 --          (`filters = "open"`) so the scope it was given is visible rather than
 --          hidden behind a badge. The seed is a seed — clear the box and the rest
 --          of the tree comes back.
-nx.keymap.set("n", "<leader>fs", function()
-  nx.picker.open("files", { include = "src/**", filters = "open" })
+btv.keymap.set("n", "<leader>fs", function()
+  btv.picker.open("files", { include = "src/**", filters = "open" })
 end, { desc = "Find files in src/" })
 
 -- 6. The same for grep.
@@ -86,13 +86,13 @@ end, { desc = "Find files in src/" })
 --    TYPE  <leader>fS  then type  needle
 --    SEE   only the hits under `src/`. Compare with <leader>fg (plain live grep),
 --          which also matches the vendored copy.
-nx.keymap.set("n", "<leader>fS", function()
-  nx.picker.open("live_grep", { include = "src/**", filters = "open" })
+btv.keymap.set("n", "<leader>fS", function()
+  btv.picker.open("live_grep", { include = "src/**", filters = "open" })
 end, { desc = "Live grep in src/" })
 
 -- 7. Your own source can have the boxes.
 --
---    TYPE  :lua nx.picker.open("mine")<CR>  then  <C-g>
+--    TYPE  :lua btv.picker.open("mine")<CR>  then  <C-g>
 --    NOTE  the include box may already hold a line — if you tried <leader>fs above,
 --          `src/**` is the most recent include you used, and every filterable
 --          picker opens from that. Clear it with <BS> first, then type  src
@@ -102,7 +102,7 @@ end, { desc = "Live grep in src/" })
 --          (A source that shells out to ripgrep should also splice `ctx.rg_globs`
 --          into its argv, so the tool prunes the tree instead of streaming paths
 --          that are about to be dropped.)
-nx.picker.source({
+btv.picker.source({
   name = "mine",
   title = "A source of my own",
   filter = true,
@@ -119,7 +119,7 @@ nx.picker.source({
     end
   end,
   confirm = function(item, mode, layer)
-    nx.picker.edit(item, mode, layer)
+    btv.picker.edit(item, mode, layer)
   end,
 })
 

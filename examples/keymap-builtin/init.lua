@@ -1,13 +1,13 @@
--- ~~~ nxvim keymap playground: instant built-ins under a colliding map ~~~
+-- ~~~ bemtvi keymap playground: instant built-ins under a colliding map ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/keymap-builtin \
---       cargo run -p nxvim -- examples/keymap-builtin/sample.txt
+--     BEMTVI_CONFIG=examples/keymap-builtin \
+--       cargo run -p bemtvi -- examples/keymap-builtin/sample.txt
 --
--- The point of this playground is the ABSENCE of a pause. nxvim's matcher
+-- The point of this playground is the ABSENCE of a pause. bemtvi's matcher
 -- consults the editor's *own* command grammar (a shared, pure classifier,
--- `nxvim_core::command_status`). So when a user map shares a built-in's prefix
+-- `bemtvi_core::command_status`). So when a user map shares a built-in's prefix
 -- (here `gh`, `dh`, `fh`, `rx` all collide with built-ins), the built-in still
 -- fires the INSTANT its sequence completes — no idle flush, no following key.
 --

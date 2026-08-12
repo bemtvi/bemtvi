@@ -1,6 +1,6 @@
 -- Live `:substitute` diff preview (inccommand-style).
 --
--- While you type a `:[range]s/pat/rep/` command line, nxvim previews the change
+-- While you type a `:[range]s/pat/rep/` command line, bemtvi previews the change
 -- right in the buffer: every match of `pat` is struck through as the REMOVED text
 -- and `rep` is spliced in inline just after it as the ADDED text — so you see the
 -- edit before pressing <CR>. This is built in and needs no config; it is on
@@ -26,15 +26,15 @@
 -- recolour them — a colorscheme that sets them wins too. The block below tints the
 -- removed side with a red background and the added side with a green one, closer
 -- to a diff view. Comment it out to see the plain built-in look.
-vim.api.nvim_set_hl(0, "NxSubstituteDelete", {
+vim.api.nvim_set_hl(0, "BtvSubstituteDelete", {
   fg = "#f38ba8",
   bg = "#45252a",
   strikethrough = true,
 })
-vim.api.nvim_set_hl(0, "NxSubstituteAdd", {
+vim.api.nvim_set_hl(0, "BtvSubstituteAdd", {
   fg = "#a6e3a1",
   bg = "#24402b",
 })
 
---   Run:  NXVIM_CONFIG=examples/substitute-preview \
---           cargo run -p nxvim -- examples/substitute-preview/sample.txt
+--   Run:  BEMTVI_CONFIG=examples/substitute-preview \
+--           cargo run -p bemtvi -- examples/substitute-preview/sample.txt

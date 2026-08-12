@@ -14,28 +14,28 @@
 #
 # Env:
 #     CONTAINER_CLI    podman (default) or docker
-#     NXVIM_CONTAINER  daemon container name (default: nxvim-daemon)
-#     NXVIM_HOST       reachable daemon host (default: 127.0.0.1)
-#     NXVIM_PORT       published daemon UDP port (default: 8765)
+#     BEMTVI_CONTAINER  daemon container name (default: bemtvi-daemon)
+#     BEMTVI_HOST       reachable daemon host (default: 127.0.0.1)
+#     BEMTVI_PORT       published daemon UDP port (default: 8765)
 #     WEB_HOST         web host (default: localhost — keep it localhost: a secure context)
 #     WEB_PORT         published web port (default: 8088)
 set -euo pipefail
 
 CLI="${CONTAINER_CLI:-podman}"
-NAME="${NXVIM_CONTAINER:-nxvim-daemon}"
-DHOST="${NXVIM_HOST:-127.0.0.1}"
-DPORT="${NXVIM_PORT:-8765}"
+NAME="${BEMTVI_CONTAINER:-bemtvi-daemon}"
+DHOST="${BEMTVI_HOST:-127.0.0.1}"
+DPORT="${BEMTVI_PORT:-8765}"
 WHOST="${WEB_HOST:-localhost}"
 WPORT="${WEB_PORT:-8088}"
 
-uri="$("$CLI" logs "$NAME" 2>&1 | grep -oE "nxvim://[^']+" | head -n1 || true)"
+uri="$("$CLI" logs "$NAME" 2>&1 | grep -oE "bemtvi://[^']+" | head -n1 || true)"
 if [ -z "$uri" ]; then
-  echo "connect-web.sh: no nxvim:// URI in '$NAME' logs — is the daemon running?" >&2
+  echo "connect-web.sh: no bemtvi:// URI in '$NAME' logs — is the daemon running?" >&2
   exit 1
 fi
 
 # Point the browser at the host-published daemon address.
-uri="$(printf '%s' "$uri" | sed -E "s#nxvim://[^/]+#nxvim://${DHOST}:${DPORT}#")"
+uri="$(printf '%s' "$uri" | sed -E "s#bemtvi://[^/]+#bemtvi://${DHOST}:${DPORT}#")"
 # URL-encode the whole URI so it survives as a single query value (node is the web
 # bundle's own toolchain, so it's a safe dependency to assume here).
 enc="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$uri")"

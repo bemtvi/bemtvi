@@ -14,10 +14,10 @@ to manage that list. Splits, the window layout tree, and a tabline remain future
 work.
 
 Read [`docs/architecture.md`](../architecture.md) first. The relevant code is
-`crates/nxvim-core/src/editor.rs` (the state machine and the single embedded
-`Buffer`), `crates/nxvim-core/src/buffer.rs` (the rope text type + edit
-journal), `crates/nxvim-core/src/view.rs` (the renderable `View`), and
-`crates/nxvim-server/src/lib.rs` (the RPC surface + the syntax integration,
+`crates/bemtvi-core/src/editor.rs` (the state machine and the single embedded
+`Buffer`), `crates/bemtvi-core/src/buffer.rs` (the rope text type + edit
+journal), `crates/bemtvi-core/src/view.rs` (the renderable `View`), and
+`crates/bemtvi-server/src/lib.rs` (the RPC surface + the syntax integration,
 which currently hardcodes `BUFFER_ID = 0`).
 
 ---
@@ -56,7 +56,7 @@ Key decisions, each with a rationale a future maintainer can check against vim:
 - **There is always ≥ 1 buffer.** Deleting the last buffer leaves a fresh
   `[No Name]` buffer (vim does this), so `current` is always valid.
 - **`Buffer` (buffer.rs) stays the pure text type.** Undo and saved window
-  position live in a new `OpenBuffer` wrapper in `editor.rs`, so `nxvim-core`'s
+  position live in a new `OpenBuffer` wrapper in `editor.rs`, so `bemtvi-core`'s
   text model stays unchanged and `buffer.rs` keeps its single mutation/journal
   responsibility.
 - **`self.buffer` field → `self.buffer()` / `self.buffer_mut()` accessors** that
@@ -82,7 +82,7 @@ Key decisions, each with a rationale a future maintainer can check against vim:
 buffer. Pure refactor — every existing test passes unchanged, no new user-facing
 behavior.
 
-**Changes (`crates/nxvim-core/src/editor.rs`):**
+**Changes (`crates/bemtvi-core/src/editor.rs`):**
 
 - Add `BufferId(u64)` (public; the RPC layer and tests will name buffers by it).
 - Add `OpenBuffer { buffer: Buffer, undo_stack, redo_stack, saved_cursor,
@@ -153,7 +153,7 @@ the server only ever drives the *current* buffer through its single
 `SyntaxState`, highlighting stays correct across switches (it re-parses on each
 switch). Phase 4 optimizes this.
 
-**Tests** (`crates/nxvim-server/tests/buffers.rs`, new file; mirror `editing.rs`
+**Tests** (`crates/bemtvi-server/tests/buffers.rs`, new file; mirror `editing.rs`
 helpers):
 
 - `:e a.txt`, edit, `:e b.txt`, `:e a.txt` → buffer A's text and **cursor
@@ -253,7 +253,7 @@ change.
   actually changed out of band.
 
 **Tests:** mostly covered by existing screen/highlight tests staying green across
-a buffer switch. Add (Tier 2, `crates/nxvim/tests/screen.rs`) a switch-and-back
+a buffer switch. Add (Tier 2, `crates/bemtvi/tests/screen.rs`) a switch-and-back
 that asserts highlighted cells reappear without an intervening blank frame, and a
 debug-only `__crash`-language test that a crash in one buffer's parse doesn't
 corrupt another buffer's cached spans.

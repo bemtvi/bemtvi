@@ -1,9 +1,9 @@
--- ~~~ nxvim keymap Phase 3 playground ~~~
+-- ~~~ bemtvi keymap Phase 3 playground ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/phase3-config \
---       cargo run -p nxvim -- examples/phase3-config/sample.txt
+--     BEMTVI_CONFIG=examples/phase3-config \
+--       cargo run -p bemtvi -- examples/phase3-config/sample.txt
 --
 -- Each section says what to TYPE and what you should SEE. Phase 3 adds: insert &
 -- command-mode maps, buffer-local maps (opts.buffer), vim.keymap.del, and the

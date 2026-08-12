@@ -2,8 +2,8 @@
 
 > **Update (2026-06-11): classic remote removed.** The "whole editor runs remote,
 > thin client local" topology this plan was written *against* has since been deleted
-> outright — `nxvim --server`, the `nxvim-gui` SSH client (`:connect`, askpass), and
-> the Socket.IO web bridge (`nxvim-web-bridge` + the wasm `RemoteClient`) are all
+> outright — `bemtvi --server`, the `bemtvi-gui` SSH client (`:connect`, askpass), and
+> the Socket.IO web bridge (`bemtvi-web-bridge` + the wasm `RemoteClient`) are all
 > gone. The browser is **serverless only**. References below to `--server` as
 > "today's topology," and to the `RemoteClient`/Socket.IO path "retiring" into the
 > edit-host (Open Decision #3), are therefore historical: those pieces no longer
@@ -13,7 +13,7 @@
 
 ## Why this document exists
 
-Remote nxvim is **laggy**, and the lag is structural, not tunable. Today's
+Remote bemtvi is **laggy**, and the lag is structural, not tunable. Today's
 client–server split (`docs/architecture.md` → *Embedded vs. remote*) puts the
 **whole editor on the far side of the wire**:
 
@@ -29,7 +29,7 @@ This plan moves the network boundary **below** the editing engine instead of
 above it — the same direction VS Code Remote takes (the Monaco editor and its
 text model are local; fs, LSP, terminals are remote). One honest divergence from
 that precedent, owned rather than glossed: VS Code runs its *extension host* on
-the **remote**, while nxvim keeps the plugin runtime (Lua) **local** —
+the **remote**, while bemtvi keeps the plugin runtime (Lua) **local** —
 deliberately, because plugins are latency-sensitive UI (statusline per
 keystroke, key-hint popups, fuzzy-finder sorters) and running them remote would
 reintroduce the very lag this plan removes. The cost is that the Lua VM's
@@ -48,7 +48,7 @@ going to feel like a spinner.
 The **same edit-host concept** then unlocks a long-standing goal: **running the
 real editor — Lua plugins and all — entirely in the browser**. The browser is
 just the edit-host compiled to wasm in a Web Worker, with the daemon either
-absent (serverless) or reached over WebSocket. `nxvim-web` today is core+view
+absent (serverless) or reached over WebSocket. `bemtvi-web` today is core+view
 only (no Lua); this plan brings the Lua-bearing edit-host to wasm.
 
 ### What this changes about the thesis
@@ -56,7 +56,7 @@ only (no Lua); this plan brings the Lua-bearing edit-host to wasm.
 Principle #3 ("Client-server, always; thin clients, headless server") bends — but
 only in *topology*, not semantics:
 
-- **"Identical editing behavior everywhere"** — *kept*. `nxvim-core` is unchanged
+- **"Identical editing behavior everywhere"** — *kept*. `bemtvi-core` is unchanged
   in its editing logic; we only swap its I/O dependency.
 - **"Thin clients, headless server"** — becomes **"thin daemon, thick clients."**
   The laptop/browser runs the full edit-host; the remote runs only fs + process +
@@ -94,7 +94,7 @@ Everything past the spikes is **engineering with known shapes**, not feasibility
 
 ## The one constraint that shapes everything
 
-**`nxvim-core` and the Lua VM are `!Send` and live on a single thread** (same as
+**`bemtvi-core` and the Lua VM are `!Send` and live on a single thread** (same as
 neovim; concurrency comes from async I/O, not parallel mutation —
 `docs/architecture.md` → *Async design*). The plan never violates this:
 
@@ -119,9 +119,9 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 0 | Feasibility spikes (compile / interop / input wait) | — | ✅ |
 | 1 | The `HostFs` I/O seam in core (dependency inversion) | 0 | ✅ |
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
-| 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
-| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | ✅ (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`nx.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; **6e the LSP leg** is **done** (browser `vim.lsp.start`/diagnostics/hover over a real `--daemon --listen` via the in-Worker `SyncLspClient` ↔ the daemon's `lsp_spawn`/`lsp_stdin`/`lsp_kill` wire — Stages A–F below); the **sys_run** leg is MOOT — the blocking `nx._system` vertical was **removed** entirely under "no blocking IO at all" (commit `474813f`, [[no-blocking-io-fs-async-only]]), so there is no browser sys_run leg to build. Browser edit-host fs/process/LSP/terminal are feature-complete.) |
+| 4 | wasm edit-host: compile (gate `bemtvi-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
+| 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__bemtvi` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | ✅ (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`btv.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-btv-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; **6e the LSP leg** is **done** (browser `vim.lsp.start`/diagnostics/hover over a real `--daemon --listen` via the in-Worker `SyncLspClient` ↔ the daemon's `lsp_spawn`/`lsp_stdin`/`lsp_kill` wire — Stages A–F below); the **sys_run** leg is MOOT — the blocking `btv._system` vertical was **removed** entirely under "no blocking IO at all" (commit `474813f`, [[no-blocking-io-fs-async-only]]), so there is no browser sys_run leg to build. Browser edit-host fs/process/LSP/terminal are feature-complete.) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -132,7 +132,7 @@ its dependencies loaded.
 
 ## The keystone: the `HostFs` seam (Phase 1) — ✅ DONE
 
-Every later phase pivots on **dependency-inverting `nxvim-core`'s I/O**. Core
+Every later phase pivots on **dependency-inverting `bemtvi-core`'s I/O**. Core
 defines the interface it needs; the default implementation wraps the local disk,
 and Phase 3 swaps in a daemon-backed one — the editing logic never knows which.
 
@@ -144,7 +144,7 @@ value). Guessing that shape ahead of the daemon invites rework, so it moves to
 **Phase 3**. The high-value, core-touching half — the part that made the "pure
 core" thesis real — is the fs seam, and it landed here.
 
-Shipped (`crates/nxvim-core/src/host.rs`), a **synchronous** trait + a real-disk
+Shipped (`crates/bemtvi-core/src/host.rs`), a **synchronous** trait + a real-disk
 default:
 
 ```rust
@@ -164,7 +164,7 @@ calling `std::fs`. `Editor` holds an `Rc<dyn HostFs>` (Rc so a `&mut`-borrowing
 buffer write can still lend it without aliasing `self`; core is single-threaded)
 with `set_host_fs` for Phase 3's remote injection.
 
-Two points that keep this honest against `nxvim-core stays pure and synchronous`:
+Two points that keep this honest against `bemtvi-core stays pure and synchronous`:
 
 1. **Core stays sync.** The methods are called at *buffer open* / *save*, never on
    the keystroke path. When Phase 3 needs the actual wait-on-the-network to be
@@ -206,15 +206,15 @@ Shipped:
   unsize coercion). `None` = today's local disk. The startup open lifts to *after*
   injection, exactly as the Phase-3 note prescribed.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/host_fs.rs`: an in-memory fake
+**Exit criteria — met.** `crates/bemtvi-server/tests/host_fs.rs`: an in-memory fake
 `HostFs` (shared `Arc<Mutex<…>>` the test inspects) both **serves** the initial
 buffer (a `/virtual/...` path that never touches disk) and **captures** `:w` — and
 a bare-session `:write <path>` also lands in the fake. Faithful, not a no-op: the
 fake genuinely round-trips bytes the editor read and wrote. Regression-clean —
-`editing` (536), `buffers` (27), `nxvim` crate, fmt + clippy all green; the local
-binaries (`nxvim`, `nxvim-gui`) pass `host_fs: None` and are unchanged.
+`editing` (536), `buffers` (27), `bemtvi` crate, fmt + clippy all green; the local
+binaries (`bemtvi`, `bemtvi-gui`) pass `host_fs: None` and are unchanged.
 
-**Still to do in Phase 3:** the daemon wire protocol + `nxvim --daemon`, the local
+**Still to do in Phase 3:** the daemon wire protocol + `bemtvi --daemon`, the local
 edit-host as a `HostServices` client over ssh stdio, and the buffer-replica /
 `FileChangedShell` / remote-path / clipboard semantics. The remote `HostFs` impl is
 *not* a drop-in here — core's `HostFs` is **sync** — and it had two candidate
@@ -228,7 +228,7 @@ the editor thread live, but re-plumbs each fs-touching call site individually).
 (the `HostFsAsync` seam); see Open Decision #5 for the trade and the residual
 blocking-bridge need on *sync* surfaces. Two corollaries that still stand
 regardless of shape: a blocking bridge, wherever one is later needed (sync
-`nx._system`, sync Lua fs calls), requires the daemon link's RPC tasks to live
+`btv._system`, sync Lua fs calls), requires the daemon link's RPC tasks to live
 on their **own** thread/runtime, *not* the server's single-threaded one — a
 blocked editor thread would otherwise starve the very reader task carrying its
 reply (deadlock); and **don't stat-poll over the wire** — `disk_changed`
@@ -245,11 +245,11 @@ Of the three spawn sites the full-split note lists, only the event loop's
 `run_process` (the async, one-shot `vim.system` / `jobstart` / `:!` path) is
 run-to-completion with pid + exit reported as loop events; the **clipboard** is a
 *synchronous* `Clipboard` provider returning a value, and the **LSP** servers are
-long-lived bidirectional raw-pipe transports living in `nxvim-lsp` — both diverge
+long-lived bidirectional raw-pipe transports living in `bemtvi-lsp` — both diverge
 from the sketch, so folding them in is a later slice matched to the wire rather
 than guessed now. (Scope confirmed with the requester, 2026-06-10.)
 
-Shipped (`crates/nxvim-server/src/host.rs` — server-side, **not** core, because the
+Shipped (`crates/bemtvi-server/src/host.rs` — server-side, **not** core, because the
 trait is async + event-routing and is consumed by the async server, never by the
 pure-sync core):
 - **`trait HostProc { fn run(&self, spec, kill, events) -> Pin<Box<dyn Future + Send>> }`**
@@ -267,16 +267,16 @@ pure-sync core):
   `Arc<dyn HostProc>` the `EventLoop` actor holds (`Arc::from` → drop `Send` by
   unsize coercion, mirroring the `host_fs` rebuild). `None` = real local processes.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/host_proc.rs`: an in-memory fake
+**Exit criteria — met.** `crates/bemtvi-server/tests/host_proc.rs`: an in-memory fake
 `HostProc` (shared `Arc<Mutex<…>>`) both **records** the argv it is asked to run and
 **serves** a result the editor's `on_exit` observes. Faithful, not a no-op — the
 fake echoes the *actual* argv back as stdout for a program on no PATH, so the
 observed `code = 0` + echoed argv proves the injected host intercepted the spawn (a
 real spawn would be `code = -1`); a second test proves each `vim.system` reaches the
 host with its own argv (reacts to input, not a canned constant). Regression-clean —
-full `nxvim-server` suite (17 binaries incl. `editing` 536, `uv_process`,
-`async_runtime`, `blockers` 34), `nxvim` crate, fmt + clippy all green; the local
-binaries (`nxvim`, `nxvim-gui`) pass `host_proc: None` and are unchanged.
+full `bemtvi-server` suite (17 binaries incl. `editing` 536, `uv_process`,
+`async_runtime`, `blockers` 34), `bemtvi` crate, fmt + clippy all green; the local
+binaries (`bemtvi`, `bemtvi-gui`) pass `host_proc: None` and are unchanged.
 
 ### Phase 3c — the daemon wire protocol (process half) — ✅ DONE (2026-06-10)
 
@@ -288,14 +288,14 @@ not a return value), so it maps onto a wire with **no impedance mismatch**. Core
 (buffer-as-replica), which is a later slice deliberately not guessed here. (Next-slice
 direction confirmed with the requester, 2026-06-10.)
 
-Shipped (`crates/nxvim-server/src/daemon.rs`, re-exported from the crate root):
-- **The wire** — four `nxvim-rpc` (msgpack) **notifications** correlated by a
+Shipped (`crates/bemtvi-server/src/daemon.rs`, re-exported from the crate root):
+- **The wire** — four `bemtvi-rpc` (msgpack) **notifications** correlated by a
   per-spawn `id`: edit-host → daemon `proc_spawn [id, argv, cwd?, env, stdin]` /
   `proc_kill [id]`; daemon → edit-host `proc_spawned [id, pid?]` / `proc_exited [id,
   code, stdout, stderr]`. Notifications (not request/response) because a child's life
   is two events at different times, which a single reply can't model. Transport is any
   `AsyncRead`/`AsyncWrite` pair — an in-process `tokio::io::duplex` today, ssh stdio to
-  `nxvim --daemon` in the full split.
+  `bemtvi --daemon` in the full split.
 - **`RemoteHostProc` (edit-host side, a `HostProc`)** — `connect(reader, writer)` wires
   the RPC link and a **demux task** that fans the daemon's replies out to per-spawn
   channels (an `Inflight` map, `id` → sender). Each `run` mints a wire `id`, registers
@@ -310,7 +310,7 @@ Shipped (`crates/nxvim-server/src/daemon.rs`, re-exported from the crate root):
   straight onto the wire, so a process behaves identically remote and local. Holds a
   per-child kill map mirroring the event-loop actor's `procs`.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_proc.rs` drives a real
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_proc.rs` drives a real
 editor whose `host_proc` is a `RemoteHostProc` talking to a `serve_daemon` over an
 in-process duplex (the ssh-stdio stand-in): an async `vim.system` runs a **real** `sh`
 on the daemon and `on_exit` sees its *actual* stdout (`hello-from-daemon`) — output a
@@ -318,7 +318,7 @@ stub can't invent; two concurrent spawns each see their own result (`AAA`/`BBB` 
 proving the per-`id` demux, not a shared constant); a non-zero `exit 7` round-trips
 faithfully; and `handle:kill()` on a `sleep 30` child fires `on_exit` with `code = -1`
 in well under a second (proving `proc_kill` crosses the wire and terminates the child,
-not that the sleep elapsed). Regression-clean — full `nxvim-server` suite (now 18
+not that the sleep elapsed). Regression-clean — full `bemtvi-server` suite (now 18
 binaries incl. `editing` 536, `async_runtime`, `uv_process`, `host_proc`, `blockers`
 34), fmt + clippy `-D warnings` all green; the duplex+daemon and the remote host's RPC
 tasks live on the test runtime while the server keeps its own thread, exactly the split
@@ -326,13 +326,13 @@ the harness already makes for its client connection.
 
 **Still to do in the full split:** `lsp/manager.rs` (long-lived bidirectional
 raw-pipe transport: needs the `write_stdin` + stdout-as-events shape, not
-run-to-completion); ~~the **blocking spawn path `nx._system`**~~ ✅ DONE — Phase 3n
+run-to-completion); ~~the **blocking spawn path `btv._system`**~~ ✅ DONE — Phase 3n
 below (the *fourth* spawn site the original three-site list missed; it now routes to
 the daemon over the `sys_run` wire and blocks on the round-trip via the blocking
 bridge, because a `root_dir` shell-out like `cargo metadata` must run *where the
 project files are*);
 `HostWatch` (the daemon side of `FsEventStart`, today local-only via `notify` —
-`serve_daemon` currently drops `LoopEvent::FsEvent` on the floor); the `nxvim
+`serve_daemon` currently drops `LoopEvent::FsEvent` on the floor); the `bemtvi
 --daemon` binary; and the local edit-host as a client over ssh stdio. (The
 `HostFs` half landed next — Phase 3d, via the async `HostFsAsync` seam.)
 **`clipboard.rs` is struck from this list** — slating it for daemon-folding
@@ -358,12 +358,12 @@ the network — so the remote fs is **not** a `HostFs` impl. It is a new *async*
 disk). A file read is also naturally request/response (one reply, not a two-event
 lifecycle), so unlike the process leg it needs no `id`/demux.
 
-Shipped (alongside 3c in `crates/nxvim-server/src/daemon.rs`; the module now carries
+Shipped (alongside 3c in `crates/bemtvi-server/src/daemon.rs`; the module now carries
 *both* legs):
-- **The wire** — one `nxvim-rpc` **request**: `fs_read [path]` → `["file", bytes]`,
+- **The wire** — one `bemtvi-rpc` **request**: `fs_read [path]` → `["file", bytes]`,
   `["new"]` (path doesn't exist → a new-file buffer), or a loud RPC **error** (a
   directory — remote explorer is a later slice — or a transport/permission failure;
-  never a silent empty buffer). `nxvim_rpc::request` routes the reply by msgid, so the
+  never a silent empty buffer). `bemtvi_rpc::request` routes the reply by msgid, so the
   edit-host side has no demux.
 - **`HostFsAsync` (server-side async seam)** + **`RemoteHostFs`** (its over-the-wire
   impl: `read` issues `fs_read` and awaits the reply). `ServerInit::host_fs_async:
@@ -385,7 +385,7 @@ Shipped (alongside 3c in `crates/nxvim-server/src/daemon.rs`; the module now car
   `announced` to let the now-named buffer's `BufReadPost`/`FileType` fire as a fresh
   read (`FileType` drives syntax + LSP), then refreshes the Lua snapshot/mirror.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_fs.rs`: an editor whose
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_fs.rs`: an editor whose
 `host_fs_async` is a `RemoteHostFs` talking to a `serve_fs_daemon` over an in-process
 duplex opens a `/virtual/...` path — one the edit-host's *local* disk cannot read — and
 its bytes (`fetched / over / the / wire`) appear in the first buffer, named for the
@@ -393,8 +393,8 @@ path; the content can only have crossed the wire (the same faithfulness argument
 `host_fs.rs` makes for the sync seam). A second test proves a not-yet-existing path
 opens as an empty **new-file** buffer (not an error) with its name bound for a later
 `:w`. The `attach` handshake completes before the file loads — evidence the fetch did
-not block startup. Regression-clean — full `nxvim-server` suite (now 19 binaries),
-`nxvim`/`nxvim-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
+not block startup. Regression-clean — full `bemtvi-server` suite (now 19 binaries),
+`bemtvi`/`bemtvi-gui` (which pass `host_fs_async: None`, unchanged), fmt + clippy
 `-D warnings` all green.
 
 **Still to do on the fs leg (after 3e/3f/3g/3h):** `FileChangedShell` from a daemon
@@ -402,7 +402,7 @@ not block startup. Regression-clean — full `nxvim-server` suite (now 19 binari
 async seam + replica pattern these slices established is what it extends. (The **save**
 path landed in Phase 3e, `:edit` in Phase 3f, the **remote explorer** — `read_dir` over
 the wire — in Phase 3g, and **`:tabnew` / LSP go-to** in Phase 3h, all below. `:read`/`:r`
-is *not implemented* in nxvim at all, so there is nothing to route over the wire — it
+is *not implemented* in bemtvi at all, so there is nothing to route over the wire — it
 would be a new feature, not a wire slice.)
 
 ### Phase 3i — the watch leg, local behavior (`:checktime` / `'autoread'`) — ✅ DONE (2026-06-10)
@@ -412,7 +412,7 @@ behavior in 3a → remote async in 3d): before the daemon can *push* "a remote f
 changed under you," the editor has to know what to *do* when a file changes. That
 behavior didn't exist — the only external-change detection was the `:w` clobber guard.
 
-Shipped (all in `nxvim-core`, with the `vim.o` mirror plumbing):
+Shipped (all in `bemtvi-core`, with the `vim.o` mirror plumbing):
 - **`Buffer::disk_change` → `DiskChange { Unchanged, Changed, Vanished }`** — the richer
   form of `disk_changed` that distinguishes a modified file from a deleted one, by
   comparing a fresh stat against the read/write snapshot (the same mtime+size snapshot
@@ -423,7 +423,7 @@ Shipped (all in `nxvim-core`, with the `vim.o` mirror plumbing):
 - **`Editor::checktime(target)`** (`:checkt[ime]`) — re-stats every loaded file-backed
   buffer (or one resolved buffer) and reconciles it the way neovim does: an
   externally-changed but *unmodified* buffer is silently reloaded when `'autoread'` is on
-  (**W11** warning + no reload when off); a buffer changed on disk **and** in nxvim is a
+  (**W11** warning + no reload when off); a buffer changed on disk **and** in bemtvi is a
   **W12** conflict (never clobbered); a vanished file is **E211**.
 - **`Editor::reload_buffer(id)`** — the in-place disk re-read `:checktime`'s autoread path
   uses (generalizing `load_into_current` to any buffer): replaces the rope, re-roots the
@@ -431,7 +431,7 @@ Shipped (all in `nxvim-core`, with the `vim.o` mirror plumbing):
   `:checktime` is quiet), and clamps the cursor (live for the current buffer, saved
   otherwise) into the new extent.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/editing/core_editing.rs`: four
+**Exit criteria — met.** `crates/bemtvi-server/tests/editing/core_editing.rs`: four
 black-box tests drive `:checktime` after an external `std::fs::write`/`remove_file` and
 assert each branch — autoreload picks up the new content, a modified buffer warns W12
 without losing the in-buffer edit, `:set noautoread` warns W11 without reloading, and a
@@ -481,7 +481,7 @@ construction).
 **Exit criteria — met.** `core_editing.rs`'s `an_external_change_autoreloads_via_the_buffer_watch`
 opens a file, makes an external in-place change with **no `:checktime`**, and polls until the
 buffer autoreloads — proving the watch fired and reconciled on its own. Full suite green
-(`nxvim-server` 559 in `editing`, all binaries; `nxvim`); fmt + clippy clean.
+(`bemtvi-server` 559 in `editing`, all binaries; `bemtvi`); fmt + clippy clean.
 
 **Test-determinism note (recorded so it isn't rediscovered):** an always-on watch fires
 `checktime` *asynchronously* around the test's own actions, so three existing disk-change
@@ -514,7 +514,7 @@ while detection/reload stayed in core — mirroring neovim's `buf_check_timestam
   `Editor::warn_file_change` echoes the default W11/W12/E211; `reload_buffer` is now `pub`.
 - **The server owns the round-trip.** `Server::reconcile_file_change` (drained in
   `run_pending`'s fixpoint) fires `FileChangedShell` with `v:fcs_reason` set and
-  `v:fcs_choice` reset (the new `LuaRuntime::fire_file_changed` / `fcs_choice`; `nx._fire`
+  `v:fcs_choice` reset (the new `LuaRuntime::fire_file_changed` / `fcs_choice`; `btv._fire`
   now returns whether any handler ran), then dispatches: `"reload"`/`"edit"` →
   `reload_buffer` (`"reload"` refused for a deleted file), `"ask"` → the default warning,
   an empty choice → the handler took over (neovim's `return 2`: no post). Every handled
@@ -591,13 +591,13 @@ exactly the frozen-screen-on-`:w` failure this plan exists to kill). So the writ
 those bytes over the wire, finalizing the buffer's saved-state only on the daemon's ack.
 
 Shipped:
-- **The wire** — one `nxvim-rpc` **request** added alongside 3c/3d in `daemon.rs`:
+- **The wire** — one `bemtvi-rpc` **request** added alongside 3c/3d in `daemon.rs`:
   `fs_write [path, bytes]` → `["ok", stat?]` (the post-write [`FileStat`] the edit-host
   stamps as its `disk` baseline — no remote stat round-trip) or a loud RPC **error** (a
   permission/transport failure; never a silent success). `serve_fs_daemon` does the
   atomic write through the *same* sync [`HostFs`] the local server uses, so a fake and
   the real disk behave identically.
-- **The off-tick save seam in core** (`nxvim-core`): an opt-in `host_save_offtick` flag
+- **The off-tick save seam in core** (`bemtvi-core`): an opt-in `host_save_offtick` flag
   (the server sets it whenever a daemon fs is present), a `PendingSave` queue the server
   drains with `take_pending_saves`, and `finalize_save(buffer, path, stat)` — the
   deferred half of a synchronous `:w` (bind name, stamp `disk`, clear `[+]`, bump
@@ -624,11 +624,11 @@ Shipped:
 `:wall` / `:wqa` / `:xa` echoed `E5555: :wall over the daemon is not supported yet` in
 off-tick mode rather than silently writing every modified buffer to the *local* disk
 (the wrong machine). `BufWritePre`/`BufWritePost`
-autocmds aren't emitted anywhere in nxvim yet (the contract's snapshot-after-`BufWritePre`
+autocmds aren't emitted anywhere in bemtvi yet (the contract's snapshot-after-`BufWritePre`
 point is moot until they exist); the observable saved-state is `modified` / `save_tick` /
 the `written` echo, all ack-gated here.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_save.rs`: an editor whose
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_save.rs`: an editor whose
 `host_fs_async` is a `RemoteHostFs` talking to a `serve_fs_daemon` over an in-process
 duplex edits a `/virtual/...` buffer (a path its *local* disk can't hold) and `:w`s it —
 the **edited** bytes appear in the daemon fake, so they can only have crossed the wire
@@ -639,7 +639,7 @@ bytes already on the daemon. A third proves a **failing** daemon write *cancels*
 and surfaces the failure **loudly** on the message line — proving the quit is gated on a
 *successful* ack, not fired optimistically. Regression-clean — full `cargo test
 --workspace` green (now 20 server test binaries), fmt + clippy `-D warnings` clean; the
-local binaries (`nxvim`, `nxvim-gui`) leave off-tick mode off and write synchronously
+local binaries (`bemtvi`, `bemtvi-gui`) leave off-tick mode off and write synchronously
 through the sync `host_fs`, unchanged.
 
 ### Phase 3f — the daemon wire protocol (filesystem half, `:edit` over the wire) — ✅ DONE (2026-06-10)
@@ -659,7 +659,7 @@ serving the (briefly empty) buffer the whole time — a slow remote `:e` never f
 typing, the exact failure mode Open Decision #5 ruled out for buffer opens.
 
 Shipped:
-- **Core** (`nxvim-core`): the off-tick flag generalized `host_save_offtick` →
+- **Core** (`bemtvi-core`): the off-tick flag generalized `host_save_offtick` →
   `host_fs_offtick` (it now gates reads *and* writes). A `PendingOpen { buffer, path }`
   queue drained with `take_pending_opens`, `enqueue_open`, and **`load_str_into(buffer,
   name, contents)`** — the buffer-*targeted* form of `load_str` (replaces the named
@@ -679,10 +679,10 @@ Shipped:
   cross the wire too. **Still sync (documented):** `:tabnew {file}` (its own
   `from_file`), LSP go-to / `jump_to`, and the explorer — later micro-slices on the same
   pattern.
-- **`:read`/`:r` is *not implemented* in nxvim** (confirmed: no dispatch arm), so there
+- **`:read`/`:r` is *not implemented* in bemtvi** (confirmed: no dispatch arm), so there
   was nothing to route — it would be a new feature, out of this slice.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_edit.rs`: `:edit
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_edit.rs`: `:edit
 /virtual/other.txt` fills a new buffer with a *second* file's bytes fetched over the wire
 (a `/virtual/...` path the local disk can't hold — the 3d/3e faithfulness argument);
 `:edit` of a not-yet-existing path opens an empty new-file buffer named for it; and `:e!`
@@ -696,7 +696,7 @@ off and open synchronously, unchanged.
 ### Phase 3g — the daemon wire protocol (filesystem half, the remote explorer) — ✅ DONE (2026-06-10)
 
 The listing companion to 3d/3f's file open: where those fetch a *file's bytes*, this
-fetches a *directory's entries* over the wire so nxvim's in-window file explorer (vim's
+fetches a *directory's entries* over the wire so bemtvi's in-window file explorer (vim's
 netrw) shows the **remote** project tree instead of the edit-host's local disk. Until
 this slice a remote directory came back as a loud `fs_read` error ("remote directory open
 not yet supported", the placeholder 3d left); now it lists, navigates, and opens entries.
@@ -718,8 +718,8 @@ Shipped:
   `FsRead::Dir { path, entries }` for a readable directory (canonicalizing the path so the
   edit-host's `../`/descend navigation is unambiguous) instead of the old loud error; the
   entries ride raw and **unsorted** — the edit-host sorts/renders them, keeping the netrw
-  sort in one place. (`crates/nxvim-server/src/daemon.rs`.)
-- **Core, off-tick directory listing** (`nxvim-core`): `Buffer::from_dir_entries(dir,
+  sort in one place. (`crates/bemtvi-server/src/daemon.rs`.)
+- **Core, off-tick directory listing** (`bemtvi-core`): `Buffer::from_dir_entries(dir,
   entries)` factors the [`HostFs`]-free sort-and-render core out of `Buffer::from_dir`
   (which now just `read_dir`s then calls it), and `Editor::load_dir_into(buffer, dir,
   entries)` is the directory analogue of `load_str_into` — it builds the listing into an
@@ -735,16 +735,16 @@ Shipped:
   directory sibling of `load_replica` — `load_dir_into` + clear `announced` (so the
   now-named buffer's `BufReadPost` fires) + refresh the Lua snapshot/mirror + drive the
   queued autocmds. A directory has no filetype, so no `FileType`/LSP work.
-- **Rides for free:** the startup `nxvim <remote-dir>` open (the deferred startup fetch
+- **Rides for free:** the startup `bemtvi <remote-dir>` open (the deferred startup fetch
   hits the same `apply_open`) and `:split`/`:vsplit <remote-dir>` (delegate to `ex_edit`).
   **Still sync (documented):** `:tabnew {file}`; and remote directory **canonicalization**
   beyond what the daemon resolves on the open is not re-statted per navigation (the
   listing's trailing-slash and the daemon's canonical path carry it).
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_explorer.rs`: a server whose
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_explorer.rs`: a server whose
 `host_fs_async` is a `RemoteHostFs` over an in-process duplex, backed by a daemon-side
 fake that models *directories* (a `read_dir` that succeeds only for registered dirs).
-`nxvim /virtual/proj` (startup) and `:edit /virtual/proj` both list the remote dir's
+`bemtvi /virtual/proj` (startup) and `:edit /virtual/proj` both list the remote dir's
 entries — dirs-first, then files by name — a `/virtual/...` tree the edit-host's local
 disk can't hold, so the listing crossed the wire (the 3d/3f faithfulness argument);
 `<CR>` on `src/` descends into the remote sub-directory and `-` lists the remote parent
@@ -760,7 +760,7 @@ The remaining sync `from_file` sites. 3a/3d/3f/3g routed `:edit`, the startup op
 explorer onto the off-tick wire, but **`:tabnew {file}`** and **`jump_to`** (LSP go-to /
 diagnostics / the location-list panel) still read the edit-host's *local* disk — so in a
 daemon session they'd open the wrong machine's files. The reason they lagged is structural,
-and worth recording: nxvim had **four near-identical file-open paths** (`ex_edit`,
+and worth recording: bemtvi had **four near-identical file-open paths** (`ex_edit`,
 `ex_tabnew`, `jump_to`, `explorer_open_file`), each inlining its own
 `find_buffer_by_path` → `Buffer::from_file` because the *load* step was never separated from
 the *placement* policy (current window in place / a new tab / cursor jump / wipe the
@@ -769,7 +769,7 @@ stayed sync.
 
 So this slice **extracts the shared kernel** rather than bolting a fourth and fifth copy of
 the off-tick enqueue on:
-- **`Editor::load_new_buffer(path) -> Option<BufferId>`** (`nxvim-core`) — the load atom: off-tick
+- **`Editor::load_new_buffer(path) -> Option<BufferId>`** (`bemtvi-core`) — the load atom: off-tick
   it creates an empty named buffer and enqueues a `PendingOpen` the server fills over the
   wire; locally it reads `Buffer::from_file`. No find, no placement. `None` = a *synchronous*
   load failed (echoed); off-tick never fails here (errors surface later in `apply_open`).
@@ -794,7 +794,7 @@ explorer in a new tab (the unified kernel composes with 3g's `FsRead::Dir`); `:s
 synchronous `:tabnew <dir>` fallback (a local dir errors → empty buffer, unchanged — only
 the off-tick path gets the listing).
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_edit.rs` gains
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_edit.rs` gains
 `tabnew_fetches_a_file_over_the_wire`: `:tabnew /virtual/other.txt` fills the *new tab's*
 buffer with a `/virtual/...` file the edit-host's local disk can't hold (so it crossed the
 wire — the 3d/3f faithfulness argument), and `nvim_list_tabpages` confirms a *second* tab
@@ -810,7 +810,7 @@ run. Regression-clean: the four-way unification left every local suite green —
 `editing::explorer` (10), `tabs` (35), `buffers` (27), `host_fs` (3), and the marks/panel/
 LSP suites that exercise `jump_to`; the lib/server/core run is 1040 green; fmt + clippy
 `-D warnings` clean. (The only red anywhere is pre-existing and environmental — the
-`nxvim-web-bridge` relay test times out identically on a clean tree, and the `nxvim` e2e PTY
+`bemtvi-web-bridge` relay test times out identically on a clean tree, and the `bemtvi` e2e PTY
 tests flake under the full-`--workspace` parallel storm but pass in isolation.)
 
 ### Phase 3m — the daemon wire protocol (filesystem half, multi-buffer `:wall` / `:wqa` / `:xa`) — ✅ DONE (2026-06-10)
@@ -846,7 +846,7 @@ modified *no-name* buffer still makes the replayed `:qa` report `E37` (the gate 
 write for it), matching vim.
 
 Shipped:
-- **Core** (`nxvim-core`): `enqueue_save_of(buffer, …)` (the buffer-targeted form of
+- **Core** (`bemtvi-core`): `enqueue_save_of(buffer, …)` (the buffer-targeted form of
   `enqueue_save`, returning the minted seq); `ex_write_all` grew an off-tick branch that
   enqueues each modified file-backed buffer and returns the seqs; `ex_write_quit_all` (the
   new `:wqa` / `:xa` entry) sets `pending_quit_all` from those seqs off-tick (or quits inline
@@ -860,11 +860,11 @@ Shipped:
 **Scoped out (unchanged, fail loud where relevant):** the local-disk `:wall` keeps its
 disk-change conflict guard + `"{n} buffer(s) written"` summary (off-tick can't stat the
 remote on-tick, so it skips the guard and emits the per-ack echoes instead, consistent with
-`:w`). `BufWritePre`/`BufWritePost` still aren't emitted anywhere in nxvim yet, so the
+`:w`). `BufWritePre`/`BufWritePost` still aren't emitted anywhere in bemtvi yet, so the
 snapshot-after-`BufWritePre` point stays moot; the observable saved-state is `modified` /
 the `written` echo, ack-gated per buffer.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_save.rs` gains three tests over an
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_save.rs` gains three tests over an
 in-process duplex daemon (a `RemoteHostFs` ↔ `serve_fs_daemon`): two `/virtual/...` buffers
 edited then `:wall`ed both land their *distinct* edited bodies on the daemon (content a stub
 couldn't invent and the local disk can't hold — the 3d/3e faithfulness argument) and both read
@@ -880,10 +880,10 @@ mode off and `:wall` / `:wqa` write synchronously, unchanged.
 ### Phase 3n — the blocking `vim.system` shell-out over the wire (`sys_run`, the blocking bridge) — ✅ DONE (2026-06-10), then **REMOVED (2026-06-17, commit `474813f`)**
 
 > **This whole leg was later deleted** under "no blocking IO at all"
-> ([[no-blocking-io-fs-async-only]]): the `BlockingSystem` trait, `nx._system`, the
+> ([[no-blocking-io-fs-async-only]]): the `BlockingSystem` trait, `btv._system`, the
 > `Std`/`Wasm`/`RemoteBlockingSystem` impls, and the `sys_run` daemon wire are gone. It had
-> zero production callers — `vim.system`/`nx.run`/`:make` ride the async
-> `nx._system_async` path, and `vim.fn.system` as a sync function was never wired. The
+> zero production callers — `vim.system`/`btv.run`/`:make` ride the async
+> `btv._system_async` path, and `vim.fn.system` as a sync function was never wired. The
 > section below is kept for history; the blocking bridge it describes no longer exists.
 
 The *fourth* spawn site the original three-site list missed (called out under Phase 3c's
@@ -903,16 +903,16 @@ already rides the Phase 3c `HostProc` wire off-tick — unchanged; only the bloc
 
 The shape, kept to the one spawn site whose contract matches (the same "don't guess ahead
 of need" discipline as 3b/3c):
-- **The seam, in `nxvim-lua`** (`system.rs`): a synchronous `trait BlockingSystem { fn
+- **The seam, in `bemtvi-lua`** (`system.rs`): a synchronous `trait BlockingSystem { fn
   run(&self, SystemSpec) -> SystemOutput }` with `SystemSpec` (argv / cwd / env) and
   `SystemOutput` (code / stdout / stderr / pid). `StdBlockingSystem` is today's
-  `nx._system` spawn-and-wait logic **factored verbatim** behind the seam — the
-  editor-side default (no daemon) *and* the daemon-side backend in the real `nxvim
-  --daemon`, where "local" *is* where the project files live. `nx._system` now builds a
+  `btv._system` spawn-and-wait logic **factored verbatim** behind the seam — the
+  editor-side default (no daemon) *and* the daemon-side backend in the real `bemtvi
+  --daemon`, where "local" *is* where the project files live. `btv._system` now builds a
   `SystemSpec` and runs it through `Shared::blocking_system` (an `Option<Rc<dyn
   BlockingSystem>>`, `None` = the `StdBlockingSystem` default — a bare/local session is
   byte-for-byte unchanged); `LuaRuntime::set_blocking_system` injects the daemon bridge.
-- **The wire** (`daemon.rs`, alongside the fs/process legs): one `nxvim-rpc` **request**
+- **The wire** (`daemon.rs`, alongside the fs/process legs): one `bemtvi-rpc` **request**
   `sys_run [argv, cwd?, env]` → `[code, stdout, stderr, pid?]` (stdout/stderr as binary so
   non-UTF-8 output survives), or a loud RPC error. Request/response, like the fs read — no
   `id`/demux.
@@ -920,7 +920,7 @@ of need" discipline as 3b/3c):
   writer)` spawns a **dedicated link thread** that owns its *own* current-thread runtime
   and the RPC link; `run` hands the spec to that thread over a plain `std::sync::mpsc`
   channel and **parks the calling (Lua) thread** on a `std` reply channel. Parking with a
-  `std` recv — not a tokio primitive — is deliberate: `nx._system` runs *inside* the
+  `std` recv — not a tokio primitive — is deliberate: `btv._system` runs *inside* the
   server's tokio runtime, where a tokio `blocking_recv` would panic; a `std` recv just
   parks the OS thread, and the link thread (a different thread) is free to drive the wire
   that delivers the reply. `Send` (it holds only the channel sender) so it rides
@@ -932,7 +932,7 @@ of need" discipline as 3b/3c):
   wire. `ServerInit::blocking_system: Option<Box<dyn BlockingSystem + Send>>` is the
   injection point; `None` = today's local spawn.
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_system.rs`: an editor whose
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_system.rs`: an editor whose
 `blocking_system` is a `RemoteBlockingSystem` talking to a `serve_sys_daemon` over an
 in-process duplex runs `vim.system({...}):wait()` and sees the daemon's result inline — a
 tool name **not on the edit-host's `PATH`** comes back `code = 0` with the daemon fake's
@@ -945,10 +945,10 @@ the local `StdBlockingSystem` runs — flips the first test to `code = -1` (the 
 confirming it genuinely depends on the wire. Regression-clean — full `cargo test
 --workspace` green (the two `mouse` flakes are the documented test-shuffle race and pass in
 isolation), the `daemon_system` suite is 3, fmt + clippy `-D warnings` clean; the local
-binaries (`nxvim`, `nxvim-gui`) leave `blocking_system: None` and spawn locally, unchanged.
+binaries (`bemtvi`, `bemtvi-gui`) leave `blocking_system: None` and spawn locally, unchanged.
 
 **Still to do on the process side of the full split:** ~~`lsp/manager.rs` (the long-lived
-bidirectional raw-pipe transport)~~ ✅ DONE — Phase 3o below. The `nxvim --daemon` binary and
+bidirectional raw-pipe transport)~~ ✅ DONE — Phase 3o below. The `bemtvi --daemon` binary and
 the ssh-stdio transport tie all the legs together remain. (`clipboard.rs` stays
 local-by-topology, struck from this list under 3c.)
 
@@ -963,9 +963,9 @@ original sketch guessed (`HostProc`'s `run`-to-`exited(stdout)` contract can't m
 it gets its own seam matched to that shape, the same "don't fold a mismatched shape in" discipline
 that kept the clipboard local and gave the blocking `vim.system` its own bridge (3n).
 
-The seam is **in `nxvim-lsp`** (where the spawn lived), not the server, because the
+The seam is **in `bemtvi-lsp`** (where the spawn lived), not the server, because the
 [`LspManager`] is what spawns servers. Shipped:
-- **`trait LspTransport`** (`crates/nxvim-lsp/src/transport.rs`): `spawn(spec, root) ->
+- **`trait LspTransport`** (`crates/bemtvi-lsp/src/transport.rs`): `spawn(spec, root) ->
   io::Result<LspChannel>`, where an [`LspChannel`] hands back the server's `stdout`/`stdin`
   (boxed `AsyncRead`/`AsyncWrite`), its `stderr`, and an [`LspProcess`] (`start_kill` + `wait
   -> (code, signal)`). The manager drives its `async-lsp` `run_buffered` loop over whichever
@@ -973,7 +973,7 @@ The seam is **in `nxvim-lsp`** (where the spawn lived), not the server, because 
   default — today's `tokio::process` spawn lifted verbatim behind the seam (the inline
   `Command`/pipe-take/stderr-drain `run_server_once` did is now its `spawn`). `LspManager::new`
   uses it; `with_transport` injects another. **Zero behavior change** on the local path.
-- **The wire** (`crates/nxvim-server/src/daemon.rs`, a fifth leg): six notifications correlated
+- **The wire** (`crates/bemtvi-server/src/daemon.rs`, a fifth leg): six notifications correlated
   by a per-spawn `id` — edit-host → daemon `lsp_spawn [id, program, args, cwd]` / `lsp_stdin
   [id, bytes]` / `lsp_kill [id]`; daemon → edit-host `lsp_stdout [id, bytes]` / `lsp_stderr [id,
   bytes]` / `lsp_exited [id, code?, signal?]`. It streams the *pipe itself* (raw chunks), not a
@@ -990,7 +990,7 @@ The seam is **in `nxvim-lsp`** (where the spawn lived), not the server, because 
 - **`ServerInit::lsp_transport`** rides onto the server thread and is rebuilt into the
   `Arc<dyn LspTransport>` the manager holds (mirroring `host_proc`); `None` = local children.
 
-**Exit criteria — met.** `crates/nxvim/tests/lsp/daemon.rs` drives the **real** `nxvim
+**Exit criteria — met.** `crates/bemtvi/tests/lsp/daemon.rs` drives the **real** `bemtvi
 --__lsp-mock` server through a `RemoteLspTransport` ↔ `serve_lsp_daemon` over an in-process
 duplex (the ssh-stdio stand-in): a scripted `publishDiagnostics` renders in the editor —
 proving the `didOpen` crossed as `lsp_stdin` to the child *and* its reply crossed back as
@@ -999,15 +999,15 @@ proving the `didOpen` crossed as `lsp_stdin` to the child *and* its reply crosse
 mock that exits after `initialize` makes the tunneled child die, `lsp_exited` round-trips, the
 breaker respawns, and the editor stays fully responsive throughout. Regression-clean — the full
 114-test local LSP suite passes unchanged (the `LocalLspTransport` lift didn't regress it), full
-`cargo test --workspace` green, fmt + clippy `-D warnings` clean; the local binaries (`nxvim`,
-`nxvim-gui`) leave `lsp_transport: None` and spawn servers locally, unchanged. (`clipboard.rs`
+`cargo test --workspace` green, fmt + clippy `-D warnings` clean; the local binaries (`bemtvi`,
+`bemtvi-gui`) leave `lsp_transport: None` and spawn servers locally, unchanged. (`clipboard.rs`
 stays local-by-topology, struck under 3c.)
 
 ### Phase 3p — the Lua-visible filesystem seam (`LuaFs`, the project-facing fs surface) — ✅ DONE (2026-06-11)
 
 The cross-cutting semantic the *Lua-visible filesystem semantics* bullet below named "the
 hardest one": plugins read the *project* through `vim.uv.fs_*` and a handful of `vim.fn` fs
-builtins, which bound **directly** to `std::fs` (~22 sites in `nxvim-lua/uvfs.rs`, plus
+builtins, which bound **directly** to `std::fs` (~22 sites in `bemtvi-lua/uvfs.rs`, plus
 `install.rs`/`host.rs`). In a daemon session that silently hits the *local* machine — the
 wrong filesystem — so file-picker previewers, LSP `root_dir` detection, and VCS-status providers would
 see the wrong tree. This slice routes that surface through a synchronous **`LuaFs` seam**
@@ -1017,13 +1017,13 @@ plugin-by-plugin** (the bullet's demand).
 
 **The rule (now in `architecture.md` and the `luafs.rs` header):** vim-level *project-facing*
 fs APIs route through `LuaFs`; raw Lua `io.*`/`os.*`, `require`/`package.path`,
-`nvim_get_runtime_file` (runtimepath = local plugins), `nx._read_file` (sources an
+`nvim_get_runtime_file` (runtimepath = local plugins), `btv._read_file` (sources an
 `lsp/<name>.lua` *config*), `vim.fn.mkdir` (overwhelmingly a `stdpath`-rooted local data/state
 dir), and `stdpath` all stay **local** — plugins and their caches live on the local machine
 by design (the divergence from VS Code's remote-extension-host topology).
 
 Shipped:
-- **The seam** (`nxvim-lua/src/luafs.rs`): a synchronous object-safe `trait LuaFs` covering the
+- **The seam** (`bemtvi-lua/src/luafs.rs`): a synchronous object-safe `trait LuaFs` covering the
   whole surface — fd-level `open`/`read`/`write`/`close`/`fstat` (open files are opaque `i64`
   **fd tokens** the impl mints and owns, so the *daemon* holds the real `File`), `stat`/`lstat`/
   `scandir` (materialized in one call — the libuv iterator handle is reconstructed locally over
@@ -1037,7 +1037,7 @@ Shipped:
   `LuaRuntime::set_lua_fs`, `ServerInit::lua_fs: Option<Box<dyn LuaFs + Send>>` rebuilt `Box → Rc`
   on the server thread. `uvfs.rs` / `install.rs` / `host.rs` route their project-facing closures
   through it.
-- **The wire** (`nxvim-server/daemon.rs`, alongside the sys leg): one `luafs` request carrying
+- **The wire** (`bemtvi-server/daemon.rs`, alongside the sys leg): one `luafs` request carrying
   `["op", args…]` → `["ok", payload] | ["err", msg]`, with `RemoteLuaFs` (the edit-host side, a
   `LuaFs`) the blocking bridge — a dedicated link thread owns the wire + its own runtime, each
   call parks the Lua thread on the reply (`std` channel, so the park can't starve the reader) —
@@ -1045,12 +1045,12 @@ Shipped:
   (it owns the fd table the tokens index).
 
 **Scoped out (next slices, not silent gaps):** the short-TTL stat/exists cache the bullet pairs
-with the routing (deferred — correctness first); the `nxvim --daemon` binary + WebTransport/QUIC
+with the routing (deferred — correctness first); the `bemtvi --daemon` binary + WebTransport/QUIC
 listener transport that ties every leg together (ssh dropped — Open Decision #2); and the
 *paths-are-remote-paths* concern (`getcwd` stays the local cwd —
 the path-space split is its own bullet).
 
-**Exit criteria — met.** `crates/nxvim-server/tests/daemon_luafs.rs`: an editor whose `lua_fs` is a
+**Exit criteria — met.** `crates/bemtvi-server/tests/daemon_luafs.rs`: an editor whose `lua_fs` is a
 `RemoteLuaFs` talking to a `serve_luafs_daemon` over an in-process duplex, backed by a virtual
 in-memory fs serving `/virtual/...` content that exists on no real disk. `vim.uv.fs_stat` returns
 the daemon's size + sentinel mtime (a local stat would be nil); `fs_open`+`fs_read`+`fs_close`
@@ -1063,7 +1063,7 @@ a real temp dir (the refactor is behavior-preserving). Regression-clean — full
 --workspace` green, fmt +
 clippy `-D warnings` clean; local binaries leave `lua_fs: None` and hit the disk directly, unchanged.
 
-### Phase 3q — the `nxvim --daemon` binary + the six-leg multiplexer (one stream) — ✅ DONE — both multiplexers *and* the QUIC listener shipped (2026-06-11)
+### Phase 3q — the `bemtvi --daemon` binary + the six-leg multiplexer (one stream) — ✅ DONE — both multiplexers *and* the QUIC listener shipped (2026-06-11)
 
 **Status (2026-06-11): the daemon half, the edit-host multiplexer (`connect_daemon`),
 *and* the WebTransport/QUIC listener transport are all shipped — the native full split
@@ -1085,7 +1085,7 @@ transport-agnostic stand-in the listener slice will swap for QUIC. What shipped 
   the legs down and reaps children.
 - **`--daemon`** in `main.rs` → `run_daemon()` (a current-thread runtime over
   stdin/stdout, no `ServerInit`, no config), checked before `--server`.
-- **`crates/nxvim/tests/daemon_stdio.rs`** drives the **real** `nxvim --daemon` binary,
+- **`crates/bemtvi/tests/daemon_stdio.rs`** drives the **real** `bemtvi --daemon` binary,
   exercising three namespaces over one connection (an `fs_read`/`fs_write` round-trip
   issued *while a `proc_spawn` is in flight*, plus a `luafs read_file`) — proving the
   classes coexist demuxed without cross-talk, with byte/stdout round-trips a stub
@@ -1111,7 +1111,7 @@ What shipped in the **edit-host multiplexer** (`connect_daemon`, 2026-06-11):
   into the matching `ServerInit` slots — one connection populates every seam. The async legs hold
   clones of the shared `Rpc` and issue from the server runtime; only wire I/O touches the link
   thread. Re-exported from the crate root.
-- **`crates/nxvim/tests/daemon_stdio.rs`** gained `edit_host_drives_a_real_daemon_over_one_stream`:
+- **`crates/bemtvi/tests/daemon_stdio.rs`** gained `edit_host_drives_a_real_daemon_over_one_stream`:
   it wraps the real `--daemon` child in `connect_daemon` and hands the five seams to a real
   in-process edit-host `Server`, then exercises four classes through the running editor over the
   **one** stdio stream — the off-tick **fs read** (startup open) and **write** (`:w`, with
@@ -1122,13 +1122,13 @@ What shipped in the **edit-host multiplexer** (`connect_daemon`, 2026-06-11):
   identically and covered by the daemon-side test above. Full `cargo test --workspace` green
   (0 failed); fmt + clippy `-D warnings` clean; local binaries (`ServerInit::default()` =
   every seam `None`) unchanged.
-- **`nxvim --connect-daemon [file]`** (`main.rs`) — the manual driver / local edit-host role,
+- **`bemtvi --connect-daemon [file]`** (`main.rs`) — the manual driver / local edit-host role,
   so the split is runnable for real, not just in tests. It is the default editor+TUI role plus
   the daemon seams: it spawns the daemon child (this binary's `--daemon` by default, or whatever
-  `NXVIM_DAEMON_CMD` names — e.g. `ssh host nxvim --daemon` — run through `sh -c`), wraps the
+  `BEMTVI_DAEMON_CMD` names — e.g. `ssh host bemtvi --daemon` — run through `sh -c`), wraps the
   child's stdio in `connect_daemon`, and injects the five seams into `ServerInit`; config /
   runtimepath / clipboard stay **local** (the thesis), only I/O crosses the wire. The daemon's
-  stderr is redirected to `$TMPDIR/nxvim-daemon.log` so it can't corrupt the TUI. **Verified by
+  stderr is redirected to `$TMPDIR/bemtvi-daemon.log` so it can't corrupt the TUI. **Verified by
   hand over a PTY:** the startup buffer renders `[No Name]` then fills from the daemon (off-tick
   `fs_read`) with its name bound, and an in-editor edit + `:w` lands the bytes on disk through the
   daemon's off-tick `fs_write`. (This subsumes the listener slice's "drives a local edit-host
@@ -1136,16 +1136,16 @@ What shipped in the **edit-host multiplexer** (`connect_daemon`, 2026-06-11):
 
 The **listener slice landed as Phase 3r below** (2026-06-11): the non-ssh
 WebTransport/QUIC listener (`wtransport` on `quinn`), the launch-minted bearer token, the
-self-signed cert pinned TOFU, the `--daemon --listen` role and the `nxvim://…`
+self-signed cert pinned TOFU, the `--daemon --listen` role and the `bemtvi://…`
 `--connect-daemon` target. `connect_daemon`/`run_daemon_io` were ready for it exactly as
 predicted — they take any `AsyncRead`/`AsyncWrite`, so the listener just feeds them a QUIC
 bidi stream's halves and the stdio proof carried over verbatim (zero changes to the legs).
 
 The slice that **ties every leg together**. Phases 3c–3p each built a wire leg and
 proved it over its *own* `tokio::io::duplex`; this one stands up the actual
-`nxvim --daemon` process and carries **all six legs over one ordered stdio stream** —
-the transport `ssh host nxvim --daemon` execs. It is the daemon counterpart to
-`--server` (`crates/nxvim/src/main.rs`), but inverted: `--server` runs the *whole
+`bemtvi --daemon` process and carries **all six legs over one ordered stdio stream** —
+the transport `ssh host bemtvi --daemon` execs. It is the daemon counterpart to
+`--server` (`crates/bemtvi/src/main.rs`), but inverted: `--server` runs the *whole
 editor* remotely (one round-trip per keystroke — the lag this plan exists to kill);
 `--daemon` runs *only* fs + process + watch + `sys_run` + LSP + `luafs` remotely while
 the editor stays local. No `Editor`, no `LuaRuntime`, no UI, and — unlike `--server` —
@@ -1154,7 +1154,7 @@ local edit-host; the daemon is pure I/O).
 
 **The one genuinely new mechanism: a multiplexer, needed symmetrically on both ends.**
 Every `serve_*` (daemon side) *and* every `Remote*::connect` (edit-host side) currently
-calls `nxvim_rpc::connect(reader, writer)` itself and **assumes it owns the whole
+calls `bemtvi_rpc::connect(reader, writer)` itself and **assumes it owns the whole
 transport** — which is why the per-leg tests each hand it a private duplex. A real
 daemon has *one* ssh stdio stream for all six classes, so the legs must share a single
 connection. Two properties (verified in the code) make that a clean *router*, not a
@@ -1164,7 +1164,7 @@ rework:
   `luafs` (and the `proc_`/`lsp_` daemon→edit-host pushes) — so an inbound stream
   demuxes unambiguously on the method string.
 - **Request replies are routed by msgid *inside* `Rpc`, not by an embedded responder.**
-  `Incoming::Request` carries only `{id, method, params}` (`nxvim-rpc/src/lib.rs`); a
+  `Incoming::Request` carries only `{id, method, params}` (`bemtvi-rpc/src/lib.rs`); a
   handler replies via `rpc.respond(id, …)` on any clone of the shared `Rpc`, and
   request *responses* (`fs_read`/`fs_write`/`sys_run`/`luafs` results) are matched by the
   `pending` map and never surface as `Incoming` at all. **So forwarding an `Incoming`
@@ -1176,7 +1176,7 @@ rework:
 **Plan.**
 
 1. **Split each `serve_*` into `connect()` + a connection-agnostic core**
-   (`crates/nxvim-server/src/daemon.rs`). Each grows a `serve_*_on(rpc: Rpc, incoming:
+   (`crates/bemtvi-server/src/daemon.rs`). Each grows a `serve_*_on(rpc: Rpc, incoming:
    UnboundedReceiver<Incoming>, deps…)` that is its existing loop *minus* the leading
    `let (rpc, incoming) = connect(...)`. The current `serve_*(reader, writer, deps…)`
    stay as thin wrappers (`let (rpc, incoming) = connect(reader, writer);
@@ -1188,13 +1188,13 @@ rework:
    shared one.
 
 2. **The daemon-side multiplexer + the binary role.** A new
-   `nxvim_server::run_daemon_io(stdin, stdout)`: `connect` once, mint a per-leg
+   `bemtvi_server::run_daemon_io(stdin, stdout)`: `connect` once, mint a per-leg
    `unbounded_channel`, `tokio::spawn` each `serve_*_on(rpc.clone(), leg_rx, deps)` —
    `StdHostFs` for `fs_*`, `StdHostProc` (internal to the proc leg), `StdBlockingSystem`
    for `sys_run`, `LocalLspTransport` (internal to the lsp leg), `StdLuaFs` for `luafs`
    — then a demux loop reading `incoming` and routing each message by method prefix
    (`fs_` / `proc_` / `sys_run` / `lsp_` / `luafs`) to the matching `leg_tx`; unknown
-   methods drop (the peer is the same build). Then in `crates/nxvim/src/main.rs`, a
+   methods drop (the peer is the same build). Then in `crates/bemtvi/src/main.rs`, a
    `const DAEMON_FLAG = "--daemon"` early branch → a `run_daemon()` mirroring
    `run_headless` (a `current_thread` runtime, `enable_io().enable_time()`,
    `block_on(run_daemon_io(tokio::io::stdin(), tokio::io::stdout()))`) but with **no
@@ -1225,8 +1225,8 @@ closing the window tears the remote down. (Abrupt parent-loss reaping of grandch
 ssh `-tt` / process-group behavior — is the clean path tested and the abrupt path
 eyeballed.)
 
-**Testing (mirror `crates/nxvim/tests/stdio_server.rs`).** A new
-`crates/nxvim/tests/daemon_stdio.rs` spawns the **real** `CARGO_BIN_EXE_nxvim --daemon`
+**Testing (mirror `crates/bemtvi/tests/stdio_server.rs`).** A new
+`crates/bemtvi/tests/daemon_stdio.rs` spawns the **real** `CARGO_BIN_EXE_bemtvi --daemon`
 with piped stdio, wraps the child in `connect_daemon`, hands those `Remote*` seams to a
 real in-process edit-host `Server`, and asserts a faithful round-trip over the *one*
 stream: a temp file the **daemon** holds (a path the edit-host's own disk can't serve)
@@ -1240,7 +1240,7 @@ stdio stream without cross-talk or head-of-line deadlock.**
 **Exit criteria.** `daemon_stdio.rs` green against the real `--daemon` binary; the six
 per-leg suites still green (the `connect` → `*_on` extraction was pure inversion); full
 `cargo test --workspace` green; fmt + clippy `-D warnings` clean; the local binaries
-(`nxvim`/`nxvim-gui`, no `--daemon`) byte-for-byte unchanged (all `Remote*`/`serve_*`
+(`bemtvi`/`bemtvi-gui`, no `--daemon`) byte-for-byte unchanged (all `Remote*`/`serve_*`
 wrappers retained). This is the concrete slice that fulfils *The full split*'s first two
 exit-criteria sentences below.
 
@@ -1248,10 +1248,10 @@ exit-criteria sentences below.
 - ~~**The real listener hop / CLI / `:connect`**~~ ✅ DONE — **Phase 3r above** wired
   `connect_quic`/`serve_quic` onto a **WebTransport/QUIC** connection (`wtransport` on
   `quinn`, launch-minted bearer token, TOFU cert pin — Open Decision #2), the
-  `--daemon --listen` role, and the `nxvim://…` `--connect-daemon` target. (An in-editor
+  `--daemon --listen` role, and the `bemtvi://…` `--connect-daemon` target. (An in-editor
   `:connect` ex-command — live seam re-pointing — is the one piece deferred from that
   slice; the launch-time target shipped.) **(ssh is dropped — the earlier
-  `ssh … nxvim --daemon` + askpass + `NXVIM_REMOTE_CMD` plan no longer applies.)**
+  `ssh … bemtvi --daemon` + askpass + `BEMTVI_REMOTE_CMD` plan no longer applies.)**
 - **Path-space** (`getcwd` / buffer names / statusline in the remote's path-space) and
   the **short-TTL stat/exists cache** for `luafs` — both already deferred by Phase 3p.
 - **Transport HOL mitigation beyond app-level framing** — Phase 3r ships the QUIC listener
@@ -1264,7 +1264,7 @@ exit-criteria sentences below.
 
 **Scoping question — RESOLVED (2026-06-11): daemon side first, then the edit-host
 multiplexer as its own stdio slice.** The daemon demux was tested faithfully without the
-edit-host multiplexer — a raw `nxvim_rpc` client over one stream drives three namespaces
+edit-host multiplexer — a raw `bemtvi_rpc` client over one stream drives three namespaces
 (request/response replies are msgid-routed inside `Rpc`, proc notifications arrive on
 `incoming`) — which is what `daemon_stdio.rs`'s first test does against the real binary.
 The edit-host-side multiplexer (`connect_daemon`) then landed as a **second focused slice
@@ -1286,7 +1286,7 @@ that, so the listener is pure transport wiring around the unchanged `run_daemon_
 browser daemon transports unify on one stack — `wtransport` on `quinn`, default features
 (`ring` crypto, no aws-lc-rs/cmake; `self-signed`/`rcgen` for the dev cert).
 
-Shipped (`crates/nxvim-server/src/quic.rs`, re-exported from the crate root):
+Shipped (`crates/bemtvi-server/src/quic.rs`, re-exported from the crate root):
 - **The seam reuse** — `connect_daemon`'s link-thread body was extracted into a
   `pub(crate) serve_daemon_link(rpc, incoming, client_tx)` (pure inversion; `connect_daemon`
   now calls `connect(reader, writer)` then it). `connect_quic` reuses that body verbatim,
@@ -1308,15 +1308,15 @@ Shipped (`crates/nxvim-server/src/quic.rs`, re-exported from the crate root):
   cert's SHA-256 hash, the edit-host pins it (`with_server_certificate_hashes`), the
   known-hosts model, no CA. (The hash, not mTLS, because the browser passes the same hash
   to its `WebTransport` constructor — native/browser auth stays unified.)
-- **The CLI** (`crates/nxvim/src/main.rs`) — `--daemon --listen [addr]` binds the listener
+- **The CLI** (`crates/bemtvi/src/main.rs`) — `--daemon --listen [addr]` binds the listener
   (default `127.0.0.1:8765`, loopback-only as defense-in-depth; pass `0.0.0.0:PORT` to
-  accept off-host) and prints the exact `nxvim --connect-daemon 'nxvim://HOST:PORT/TOKEN?cert=HASH'`
-  command. A `nxvim://…` argument selects the QUIC connect path (`connect_quic` → the same
+  accept off-host) and prints the exact `bemtvi --connect-daemon 'bemtvi://HOST:PORT/TOKEN?cert=HASH'`
+  command. A `bemtvi://…` argument selects the QUIC connect path (`connect_quic` → the same
   five seams `connect_daemon` returns over stdio) over the default stdio-child split; the
   stdio and QUIC edit-host roles now share one `run_edit_host_session` helper, so they can't
   drift. Config / runtimepath / clipboard stay **local** (the thesis); only I/O crosses.
 
-**Exit criteria — met.** `crates/nxvim/tests/daemon_quic.rs`: a real in-process edit-host
+**Exit criteria — met.** `crates/bemtvi/tests/daemon_quic.rs`: a real in-process edit-host
 `Server` drives a QUIC daemon (an in-process listener on its own thread+runtime — a
 faithful stand-in for the separate daemon *process*, reached only over a loopback QUIC
 socket) over **one real QUIC connection**, exercising four wire classes through the running
@@ -1330,8 +1330,8 @@ the right one connects. The six per-leg suites + `daemon_stdio.rs` stay green (t
 `serve_daemon_link` extraction was pure inversion); full `cargo test --workspace` green
 (one unrelated, load-only `mouse` redraw-race flake that passes standalone — the documented
 `drain_to_latest_redraw` timing issue, not this slice); fmt + clippy `-D warnings` clean.
-**Verified end-to-end as two real processes**: `nxvim --daemon --listen 127.0.0.1:0` +
-`nxvim --connect-daemon 'nxvim://…'` driven through a PTY — the file opens off-tick over the
+**Verified end-to-end as two real processes**: `bemtvi --daemon --listen 127.0.0.1:0` +
+`bemtvi --connect-daemon 'bemtvi://…'` driven through a PTY — the file opens off-tick over the
 wire, an edit + `:wq` lands the edited bytes on the daemon's disk over real QUIC.
 
 **Deferred (explicitly, not stubbed):** the per-`HostServices`-class QUIC stream split (the
@@ -1344,22 +1344,22 @@ the short-TTL `luafs` stat/exists cache (both already deferred by Phase 3p).
 
 ### The full split
 
-The native latency payoff. Carve today's `nxvim-server` into two roles connected
+The native latency payoff. Carve today's `bemtvi-server` into two roles connected
 by `HostServices` (Phase 1) over RPC:
 
-- **Edit host** (runs *locally* in the remote case): `nxvim-core` + `nxvim-lua` +
-  `nxvim-ts` + redraw projection + the input/keymap/excmd/evloop machinery.
+- **Edit host** (runs *locally* in the remote case): `bemtvi-core` + `bemtvi-lua` +
+  `bemtvi-ts` + redraw projection + the input/keymap/excmd/evloop machinery.
   Everything in `dispatch.rs` / `redraw.rs` / `input.rs` / `keymap.rs` /
   `excmd.rs` / `evloop.rs` / `lsp/` stays here.
 - **Daemon** (runs *remotely*): fs + process + watch only — the `HostFs`/`HostProc`
   server half. Tiny.
 
-The network boundary moves from *above* the editor (the former `nxvim --server` over
+The network boundary moves from *above* the editor (the former `bemtvi --server` over
 ssh stdio, since removed) to *below* it: the GUI/TUI
-client and edit-host are co-located and local; `ssh … nxvim --daemon` runs just
+client and edit-host are co-located and local; `ssh … bemtvi --daemon` runs just
 the fs/process daemon on the remote, and the local edit-host is a `HostServices`
-client over the ssh stdio transport (reusing the `nxvim-rpc` plumbing and the
-hardened ssh connector from `crates/nxvim-gui/src/remote.rs`).
+client over the ssh stdio transport (reusing the `bemtvi-rpc` plumbing and the
+hardened ssh connector from `crates/bemtvi-gui/src/remote.rs`).
 
 **The `HostProc` seam (folded in from Phase 1).** Phase 3b **landed the trait and
 its in-process default** for the one-shot spawn path (see above) — async +
@@ -1382,9 +1382,9 @@ trait HostProc {
 seemed to fit. **In practice it did not fold into `HostProc`** (resolved in Phase 3o):
 a language server's pipe stays open for its whole life with stdout consumed
 incrementally, which `HostProc`'s run-to-`exited(stdout)` contract cannot model. So
-LSP **landed in Phase 3o** with its own `LspTransport` seam (in `nxvim-lsp`, where the
+LSP **landed in Phase 3o** with its own `LspTransport` seam (in `bemtvi-lsp`, where the
 spawn lives) + the `lsp_*` wire that streams the raw bidirectional pipe — *not*
-`HostProc`. The blocking `nx._system` **landed in Phase 3n** — its own
+`HostProc`. The blocking `btv._system` **landed in Phase 3n** — its own
 `BlockingSystem` seam + `sys_run` request/response wire (a blocking bridge, *not*
 `HostProc`: it's synchronous, the caller parks on the reply rather than routing
 pid/exit as loop events). `clipboard.rs` stays **local-by-topology** and is *not*
@@ -1404,7 +1404,7 @@ all three.
   listing in Phase 3g, **`:tabnew` / LSP go-to** in Phase 3h, and the multi-buffer
   **`:wall` / `:wqa` / `:xa`** in Phase 3m — every buffer-open path *and* every write path
   is now off-tick, behind one shared kernel. **The fs leg, the watch leg (3i–3l), the
-  blocking `nx._system` (Phase 3n), the LSP leg (Phase 3o), and the Lua-visible fs surface
+  blocking `btv._system` (Phase 3n), the LSP leg (Phase 3o), and the Lua-visible fs surface
   (Phase 3p) are all complete**; what remains for the full split is the daemon binary / ssh
   transport and the path-space + cache follow-ups noted below.)
 - **Lua-visible filesystem semantics — the hardest one. ✅ DONE — Phase 3p above** (the
@@ -1413,7 +1413,7 @@ all three.
   (the thesis), but plugins read the *project* through it, and today the bridge
   reaches the disk directly: `vim.uv.fs_*` (`uvfs.rs`, ~22 raw `std::fs` call
   sites), `vim.fn.readfile` / `readdir` / `glob` / `filereadable` /
-  `executable` (`install.rs` / `host.rs` in `nxvim-lua`), and the blocking
+  `executable` (`install.rs` / `host.rs` in `bemtvi-lua`), and the blocking
   `vim.fn.system`. The proposed split-brain rule: **vim-level fs/process APIs
   route through the host seams** (`HostFsAsync` / the blocking bridge /
   `HostProc` — Open Decision #5's residual note) — so file-picker previewers, root
@@ -1423,7 +1423,7 @@ all three.
   caches/state files are local. This is exactly the consequence of diverging
   from VS Code's remote-extension-host topology; it must be decided and
   documented up front, not discovered plugin-by-plugin. Two corollaries: (1)
-  it's an implementation lift — `nxvim-lua` has no `HostFs` handle today and
+  it's an implementation lift — `bemtvi-lua` has no `HostFs` handle today and
   needs one threaded in; (2) per-call round-trips amplify (a root detector
   stats a dozen ancestors), so pair the routing with a short-TTL stat/exists
   cache invalidated by `HostWatch`.
@@ -1436,8 +1436,8 @@ all three.
 - **Clipboard** — supersedes the remote-ssh v1 limitation: with the edit-host
   local, `"+`/`"*` can target the *local* OS clipboard directly.
 
-**Exit criteria.** `nxvim --daemon` over stdio passes a black-box suite mirroring
-`crates/nxvim/tests/stdio_server.rs` but for the `HostServices` protocol; an
+**Exit criteria.** `bemtvi --daemon` over stdio passes a black-box suite mirroring
+`crates/bemtvi/tests/stdio_server.rs` but for the `HostServices` protocol; an
 end-to-end test drives a local edit-host against a daemon over an in-process
 duplex and asserts edit/save/reload round-trips. Manually: typing over a real ssh
 hop has **no per-keystroke latency** (the whole point — verify, don't assume).
@@ -1450,32 +1450,32 @@ Bring the Lua-bearing edit-host to `wasm32-unknown-emscripten` (Phase 0 proved t
 VM compiles; this compiles the *real* stack).
 
 **Scope (per Open Decision #3, resolved): one web build.** This emscripten edit-host
-*replaces* the `wasm32-unknown-unknown` `nxvim-web` — the serverless `WebEditor` and
+*replaces* the `wasm32-unknown-unknown` `bemtvi-web` — the serverless `WebEditor` and
 the `RemoteClient`/Socket.IO bridge both retire into it (see Open Decision #3). The
-gating below is the first slice: make `nxvim-lua` (the C-heavy VM, the real risk)
-compile under emscripten with `nxvim-ts`/`libloading` and the process/fs hatches gated
+gating below is the first slice: make `bemtvi-lua` (the C-heavy VM, the real risk)
+compile under emscripten with `bemtvi-ts`/`libloading` and the process/fs hatches gated
 on `target_arch = "wasm32"`. **Prerequisite:** the emsdk toolchain (`emcc`) must be
 installed and sourced — the Rust `wasm32-unknown-emscripten` *target* alone can't build
 the vendored Lua/regex C.
 
-- **Gate out `nxvim-ts` + `libloading`.** Dynamic library loading doesn't exist in
-  wasm. `nxvim-lua` pulls `nxvim-ts` (tree-sitter + `libloading`) for the
+- **Gate out `bemtvi-ts` + `libloading`.** Dynamic library loading doesn't exist in
+  wasm. `bemtvi-lua` pulls `bemtvi-ts` (tree-sitter + `libloading`) for the
   `vim.treesitter` binding; feature-gate that binding **out** of the wasm build.
   The browser already does highlighting in JS via web-tree-sitter (project memory
   `web-treesitter-highlighting`, `docs/architecture.md` → *The web build*), so no
   capability is lost — the redraw just omits server-side highlight spans and the
-  JS layer paints them, as `nxvim-web` does today.
-- **Gate the process/fs escape hatches.** `nxvim-lua` reaches `std::process`
-  directly (the blocking `nx._system`) and `std::fs` directly (`uvfs.rs`,
+  JS layer paints them, as `bemtvi-web` does today.
+- **Gate the process/fs escape hatches.** `bemtvi-lua` reaches `std::process`
+  directly (the blocking `btv._system`) and `std::fs` directly (`uvfs.rs`,
   `vim.fn.readfile`/`readdir`/`glob`): there are no subprocesses in a browser,
   and the Worker's "local fs" is meaningless. Per *No silent stubs or skips*
   these must **fail loud** on wasm (until Phase 6 routes them to the daemon /
   OPFS) — not link against emscripten's stubs and quietly return junk. The
   clipboard likewise: `navigator.clipboard` via JS interop, not a shell-out.
 - **Emscripten toolchain in the build.** The web build moves from
-  `wasm32-unknown-unknown` (`crates/nxvim-web`, wasm-bindgen, `build.sh`) to
+  `wasm32-unknown-unknown` (`crates/bemtvi-web`, wasm-bindgen, `build.sh`) to
   `wasm32-unknown-emscripten`. Wire `EMCC_CFLAGS=-fwasm-exceptions` and the
-  emsdk-sourced `emcc` into the build script. `nxvim-core` is pure Rust and
+  emsdk-sourced `emcc` into the build script. `bemtvi-core` is pure Rust and
   compiles to the new target unchanged.
 - **Backend = `lua51`** (LuaJIT excluded from wasm). The browser inherits the
   PUC 5.1 dialect ceiling — a config relying on LuaJIT-only `ffi`/`bit` won't run
@@ -1489,27 +1489,27 @@ editor runs in wasm, proven by behavior, not just a clean link (cf. project memo
 **Progress (2026-06-10) — concept VALIDATED via a throwaway demo.** The
 risky-unknown half of Phase 4 is green, proven by behavior in a real wasm engine:
 
-1. **`nxvim-lua` compiles to `wasm32-unknown-emscripten` (`lua51`).** Gated
-   `nxvim-ts`/`libloading` off wasm (a `cfg(not(wasm32))` dependency + three gated
+1. **`bemtvi-lua` compiles to `wasm32-unknown-emscripten` (`lua51`).** Gated
+   `bemtvi-ts`/`libloading` off wasm (a `cfg(not(wasm32))` dependency + three gated
    call sites in `runtime.rs`; the browser highlights in JS). Hit and fixed a
    portability bug the plan hadn't called out: **`mlua::Integer` is `i32` on wasm32**
    (`lua_Integer` = `ptrdiff_t`), not `i64` — 11 type errors fixed with the
    `lua_int`/`lua_i64` helpers in `convert.rs` (identity on native, so host
-   `clippy -D warnings` + the full `nxvim-server` suite stay green). Project memory:
+   `clippy -D warnings` + the full `bemtvi-server` suite stay green). Project memory:
    `wasm32-mlua-integer-is-i32`.
 2. **core + Lua run *together* in one wasm module.** A throwaway demo crate —
-   `crates/nxvim-edithost-demo/` (workspace-excluded, **marked TEMPORARY/DELETE-ME**
-   in every file) — wires `nxvim_core::Editor` + `nxvim_lua::LuaRuntime` with the
+   `crates/bemtvi-edithost-demo/` (workspace-excluded, **marked TEMPORARY/DELETE-ME**
+   in every file) — wires `bemtvi_core::Editor` + `bemtvi_lua::LuaRuntime` with the
    crudest sync tick (`editor.input` + `lua.eval` + drain `take_commands` →
    `editor.command`, mirroring `effects.rs`), links via `emcc` (staticlib + the
-   `mlua-sys`/`nxvim-regex` C archives) into an ES module, and a node harness asserts:
+   `mlua-sys`/`bemtvi-regex` C archives) into an ES module, and a node harness asserts:
    vim-key insert → buffer; `return 1+41` → `42`; `#vim.split("a,b,c",",")` → `3`
    (the `vim.*` prelude runs in wasm); `vim.cmd("%s/hello/LUA/")` mutates the buffer
    (Lua → editor). All pass. (It also confirmed the **fail-loud** convention survives
    wasm — an unimplemented `vim.fn.abs` raised loudly rather than returning junk.)
 
 **Still to do for Phase 4 proper** (the demo deliberately skips these — it is *not*
-the edit-host): the real edit-host reuses `nxvim-server`'s synchronous tick
+the edit-host): the real edit-host reuses `bemtvi-server`'s synchronous tick
 (`apply_lua_effects` + the buffer/option/register **mirrors** that let Lua *read*
 editor state, autocmds, redraw projection) behind an async-effect seam — which is the
 larger "extract the sync edit-host" refactor (Open Decision #6 below). The throwaway
@@ -1525,7 +1525,7 @@ pull the synchronous tick out of `impl Server` into a reusable `EditHost` whose
 `Server` becomes the trait's implementor (today's tokio/RPC/LSP machinery, verbatim);
 the wasm Worker (Phase 5) supplies a JS-interop + daemon-link implementor. The
 empirical anchor (Open Decision #6): the wasm blocker is the **dependency tree**, not
-`nxvim-server`'s own source — so the work is *moving the I/O behind a seam*, not
+`bemtvi-server`'s own source — so the work is *moving the I/O behind a seam*, not
 rewriting the editor.
 
 **The seam, sliced from the small side.** `self.editor` / `self.lua` are touched at
@@ -1543,7 +1543,7 @@ and feed editor-tick methods — that *inbound* seam is its own later slice.
 
 #### Phase 4a — the `HostEffects` seam: wire + event-loop commands — ✅ DONE (2026-06-11)
 
-The first brick: define `trait HostEffects` (`crates/nxvim-server/src/edithost.rs`) and
+The first brick: define `trait HostEffects` (`crates/bemtvi-server/src/edithost.rs`) and
 route the two cleanest, fully self-contained **outbound** effects through it — the
 client wire (`notify` / `respond`) and the event-loop command sink (`loop_command`).
 `Server` no longer holds `rpc: Rpc` or `evloop: EventLoop`; it holds
@@ -1556,10 +1556,10 @@ and untouched.
 
 **Exit criteria — met.** Pure indirection, zero behavior change, guarded by the existing
 suite: `cargo build` + `fmt --check` + `clippy -D warnings` clean; the full
-`nxvim-server` + `nxvim` suites (41 binaries, **1179 tests**) green, including `editing`
+`bemtvi-server` + `bemtvi` suites (41 binaries, **1179 tests**) green, including `editing`
 (570 — the redraw/respond wire path), `uv_process` (the evloop timer/process command
 path), and `daemon_proc` / `daemon_watch` (the proc/watch command path) — exactly the
-seam this slice routes; `nxvim-gui` (the other `run_io` consumer) builds. The
+seam this slice routes; `bemtvi-gui` (the other `run_io` consumer) builds. The
 `HostEffects` surface grows in the next slices (off-tick fs, LSP, TSInstall) before the
 sync tick is hoisted off `Server` onto `EditHost` proper.
 
@@ -1580,7 +1580,7 @@ the *inbound* deliveries (the `open_rx` / `save_done_rx` / `watch_rx` arms that 
 buffer, finalize the save, and reconcile a remote change) stay owned by the run loop's
 `select!` for the 4d inbound slice.
 
-Shipped (`crates/nxvim-server/src/edithost.rs`):
+Shipped (`crates/bemtvi-server/src/edithost.rs`):
 - **Five new `HostEffects` methods.** `fs_fetch(buffer, path)` (spawn an `fs_read`,
   deliver `(buffer, path, result)` to the open arm), `fs_save(PendingSave)` (take the
   command-time snapshot's bytes, spawn an `fs_write`, deliver the ack-gated [`SaveDone`]
@@ -1616,7 +1616,7 @@ whole field moves behind the trait with no read-path entanglement. Same discipli
 (`lsp_events`, the diagnostics/reply arm) stays owned by the run loop's `select!` for the
 4d inbound slice.
 
-Shipped (`crates/nxvim-server/src/edithost.rs`):
+Shipped (`crates/bemtvi-server/src/edithost.rs`):
 - **Three new `HostEffects` methods** — `lsp_ensure(key, spawn)`, `lsp_notify(key, note)`,
   `lsp_request(key, token, req)` — one per `LspManager` method the tick actually fires
   (the fourth, `shutdown`, isn't called from the tick, so it stays off the trait per
@@ -1629,7 +1629,7 @@ Shipped (`crates/nxvim-server/src/edithost.rs`):
 **Exit criteria — met.** Pure delegation, zero behavior change: `cargo build` +
 `fmt --check` + `clippy -D warnings` clean; the **full workspace** (`cargo test
 --workspace`, 1341 tests / 78 binaries) green, and — the faithful proof this reroutes a
-*live* path, not just compiles — the **114-test `nxvim` LSP suite** (`crates/nxvim/tests/
+*live* path, not just compiles — the **114-test `bemtvi` LSP suite** (`crates/bemtvi/tests/
 lsp/`) passes unchanged: it drives a real `--__lsp-mock` server through the whole
 `ensure → didOpen → request → reply` exchange (and the daemon `RemoteLspTransport` leg),
 exactly the `lsp_ensure` / `lsp_notify` / `lsp_request` methods this slice introduces. Four of
@@ -1653,7 +1653,7 @@ own coalesce-drain + `settle_events` + (for the two quit-capable arms) a direct 
 That direct reach into tick internals is exactly what the `EditHost` hoist (4e) can't have
 in the loop.
 
-Shipped (`crates/nxvim-server/src/inbound.rs`, a new module — the inbound counterpart to
+Shipped (`crates/bemtvi-server/src/inbound.rs`, a new module — the inbound counterpart to
 `edithost.rs`):
 - **One translator method per arm** — `on_client_message` (→ `handle`, returns whether to
   quit), `on_lsp_events`, `on_loop_events`, `on_opens`, `on_installs`, `on_save_dones`
@@ -1662,7 +1662,7 @@ Shipped (`crates/nxvim-server/src/inbound.rs`, a new module — the inbound coun
   handler (`on_lsp_event` / `on_loop_event` / `apply_open` / `on_install_done` /
   `apply_save_done` / `on_remote_file_changed`), and settles — the LSP one keeping its
   `lsp_dirty`-gated settle, verbatim.
-- **`quitting()` — the single quit funnel.** The `should_quit` check + the `nxvim_exit`
+- **`quitting()` — the single quit funnel.** The `should_quit` check + the `bemtvi_exit`
   client notification, previously duplicated in the input and save arms, now live in one
   private method both quit-capable handlers call. The loop no longer reads `editor` or `fx`.
 - **The loop body is now one line per arm.** `Some(event) = lsp_events.recv() =>
@@ -1676,7 +1676,7 @@ logic is byte-for-byte the same, just moved off the loop): `cargo build` + `fmt 
 78 binaries) green — and since the run loop is the one path *all* behavior flows through,
 that sweep is the proof: the quit path (`:q` / `:wq` ack-gated quit), the LSP
 `lsp_dirty`-coalesced settle, the daemon open/save/watch arms, and the timer/process arm
-are each exercised by their existing suites (`editing`, the 114-test `nxvim` LSP suite,
+are each exercised by their existing suites (`editing`, the 114-test `bemtvi` LSP suite,
 `daemon_*`, `uv_process`). Only **4e** remains in Phase 4-proper: hoist the sync state +
 tick methods off `Server` onto a standalone `EditHost` holding `&mut dyn HostEffects` (and
 fold in the one trailing TSInstall outbound site).
@@ -1710,16 +1710,16 @@ Shipped:
   own loop, reusing this exact tick.
 
 **Exit criteria — met.** Pure relocation, zero behavior change: `cargo build` +
-`fmt --check` + `clippy -D warnings` clean across the workspace (incl. `nxvim` + `nxvim-gui`,
+`fmt --check` + `clippy -D warnings` clean across the workspace (incl. `bemtvi` + `bemtvi-gui`,
 the `run`/`run_io` consumers); the **full workspace** (`cargo test --workspace`, 1351 tests
 / 78 binaries) green. The rename is exercised by *every* test (all drive the renamed
 `EditHost` through the loop); the TSInstall fold is proven *live* — not merely compiled — by
-the hermetic `nxvim` `ts_install` suite, which drives `:TSInstall` end to end through a local
+the hermetic `bemtvi` `ts_install` suite, which drives `:TSInstall` end to end through a local
 HTTPS mirror (real gunzip → untar → C compile → `dlopen`) and asserts the freshly-installed
 parser highlights/indents — exactly the `fx.ts_install` → `spawn_blocking` → install arm →
 `on_install_done` → reload path this slice reroutes. Phase 4-proper is complete: the
 reusable sync `EditHost` exists, coupled to the outside world only through `HostEffects`.
-The throwaway `nxvim-edithost-demo` was replaced by Phase 5's wasm cdylib (`nxvim-edithost`) and deleted in slice 5e.
+The throwaway `bemtvi-edithost-demo` was replaced by Phase 5's wasm cdylib (`bemtvi-edithost`) and deleted in slice 5e.
 
 ---
 
@@ -1740,7 +1740,7 @@ integrates them).
 - **Input over SAB.** The Worker's run loop parks on `Atomics.wait` against a
   `SharedArrayBuffer` keyboard channel the UI fills — no Asyncify. It wakes on a
   keystroke, runs the tick, and posts the redraw back.
-- **Timers in the Worker.** Native `vim.defer_fn` / `nx.timer` timers ride
+- **Timers in the Worker.** Native `vim.defer_fn` / `btv.timer` timers ride
   `evloop.rs` (tokio), which doesn't exist in the wasm edit-host — the plan
   needs a Worker-side analog of `LoopEvent::Timer`. The SAB park *is* the event
   loop: `Atomics.wait` takes a timeout, so set it to the next-due timer's
@@ -1751,7 +1751,7 @@ integrates them).
   (`Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
   require-corp`). Add to the dev server + ship docs.
 
-**Exit criteria.** Driveable via Playwright through the `window.__nxvim` hook
+**Exit criteria.** Driveable via Playwright through the `window.__bemtvi` hook
 (project memory `web-client-driveable-via-playwright`): type vim commands, assert
 buffer/cursor/redraw, and prove the SAB input/timer loop works end-to-end in a
 real browser — keystrokes drive the tick and a timer fires a deferred callback.
@@ -1767,16 +1767,16 @@ treesitter) must fail *loud* at runtime, not stub a success.
 **Binding decisions (set here so the slices don't re-litigate them):**
 - **Target `wasm32-unknown-emscripten`, not `wasm32-unknown-unknown`.** Forced, not
   chosen: the edit-host contains Lua (PUC 5.1, C), and only the emscripten target links
-  the vendored C cleanly — exactly what `nxvim-edithost-demo` proved (Phase 0 spike #1,
+  the vendored C cleanly — exactly what `bemtvi-edithost-demo` proved (Phase 0 spike #1,
   the `-fwasm-exceptions` EH gotcha). The interop is therefore emscripten `ccall`/`cwrap`
   (JS→Rust) + `EM_JS` (Rust→JS), **not** wasm-bindgen. This is a *separate* build from
-  today's `nxvim-web` (which is `unknown-unknown` + wasm-bindgen, **core only, no Lua**);
-  converging the two web builds is an explicit non-goal for now — `nxvim-web` stays the
+  today's `bemtvi-web` (which is `unknown-unknown` + wasm-bindgen, **core only, no Lua**);
+  converging the two web builds is an explicit non-goal for now — `bemtvi-web` stays the
   lean serverless core editor, the Phase 5 build is the full Lua edit-host.
-- **A `native` feature on `nxvim-server` (default-on) is the wasm seam.** The blocker is
+- **A `native` feature on `bemtvi-server` (default-on) is the wasm seam.** The blocker is
   the *dependency tree*, not the tick's source (Open Decision #6): `EditHost`'s crate
   hard-pulls `tokio`, `wtransport` (QUIC), `notify`, `redb`, `getrandom`, `rmp-serde`,
-  plus `nxvim-lsp` (process spawn) and `nxvim-ts` (C/`dlopen`) — none of which target
+  plus `bemtvi-lsp` (process spawn) and `bemtvi-ts` (C/`dlopen`) — none of which target
   emscripten. `--no-default-features` (the wasm profile, `+ lua51`) must compile the tick
   subset alone. So `native` gates: `lib.rs`'s `run`/`run_io`/`run_daemon_io`, `daemon.rs`,
   `quic.rs`, `evloop.rs`, `inbound.rs`, `host.rs`, the `NativeEffects` impl in
@@ -1786,7 +1786,7 @@ treesitter) must fail *loud* at runtime, not stub a success.
   `decoration` / `extmarks` / `keymap` / `save` (snapshot side).
 - **v1 excludes LSP and native treesitter.** No language servers in a serverless browser
   (that needs the Phase 6 daemon), and treesitter highlighting is already done JS-side in
-  `nxvim-web` (`web/highlight.js`). The catch the code map surfaced: LSP/TS coupling is
+  `bemtvi-web` (`web/highlight.js`). The catch the code map surfaced: LSP/TS coupling is
   **threaded through `input.rs` / `excmd.rs` / `dispatch.rs`** (the `gd`/`K` keymap
   actions, the `Lsp*` + `TSInstall` ex-commands, the `nvim_*` LSP API), not isolated to
   `lsp/` + `treesitter.rs`. So gating them out is **per-arm `#[cfg(feature = "native")]`**
@@ -1799,19 +1799,19 @@ treesitter) must fail *loud* at runtime, not stub a success.
 #### Slice 5a — the `native` feature seam (the dependency-tree cut) — ✅ DONE (2026-06-11)
 
 Introduced `feature = "native"` (in `default`) and moved the whole async/transport surface
-+ the LSP/TS coupling behind it, so `nxvim-server` compiles with `--no-default-features
++ the LSP/TS coupling behind it, so `bemtvi-server` compiles with `--no-default-features
 --features lua51`. The largest slice; pure feature-gating, no logic change.
 
 Shipped:
 - **The deps split** (`Cargo.toml`): `tokio` / `wtransport` / `getrandom` / `redb` /
-  `rmp-serde` / `serde` / `notify` / `nxvim-rpc` / `nxvim-lsp` / `nxvim-ts` are now
+  `rmp-serde` / `serde` / `notify` / `bemtvi-rpc` / `bemtvi-lsp` / `bemtvi-ts` are now
   `optional`, pulled in only by `native`. The wasm tree keeps `anyhow` / `rmpv` /
-  `nxvim-core` (with `vim-regex` — the C compiles under emscripten) / `nxvim-lua`.
+  `bemtvi-core` (with `vim-regex` — the C compiles under emscripten) / `bemtvi-lua`.
 - **Whole native modules gated:** `daemon` / `quic` / `evloop` / `inbound` / `host` /
-  `shada` / `dispatch` (the `nxvim_rpc::Incoming` router — wasm feeds input via FFI, not
+  `shada` / `dispatch` (the `bemtvi_rpc::Incoming` router — wasm feeds input via FFI, not
   RPC) / `clipboard` / `lsp/` / `treesitter`, plus `NativeEffects` (the trait stays).
 - **Per-arm gating in the wasm-eligible tick:** the `HostEffects` `loop_command` + `lsp_*`
-  methods (`LoopCommand` / `nxvim_lsp` typed); the LSP `EditHost` struct fields + their
+  methods (`LoopCommand` / `bemtvi_lsp` typed); the LSP `EditHost` struct fields + their
   `redraw` projections (empty-array fallbacks keep the wire shape stable); the `Lsp*` /
   `TSInstallInfo` ex-command arms; the LSP keymap defaults (`BuiltinAction` / `NativeDefault`
   / `MappingRhs::Native`); the completion-popup key routing; the off-tick `apply_open` /
@@ -1824,27 +1824,27 @@ Shipped:
 - **Native unchanged:** `cargo build` + `clippy -D warnings` clean; `cargo test --workspace`
   green (**1360 tests / 79 binaries**) — the gating is `#[cfg]` only, `native` is default, so
   every native path is byte-identical.
-- **Wasm-eligibility (host target):** `cargo build -p nxvim-server --no-default-features
+- **Wasm-eligibility (host target):** `cargo build -p bemtvi-server --no-default-features
   --features lua51` compiles **warning-free** — the un-gated tick subset references no gated
   symbol.
 - **Wasm (emscripten):** with `emsdk` provisioned, `EMCC_CFLAGS=-fwasm-exceptions cargo
-  build -p nxvim-server --no-default-features --features lua51 --target
+  build -p bemtvi-server --no-default-features --features lua51 --target
   wasm32-unknown-emscripten` compiles **warning-free** — the dependency-tree blocker
   (Open Decision #6) is cut: the reusable sync `EditHost` (core + Lua + the full tick)
   now builds for the browser. The actual emcc *link* of a wasm module is slice 5b.
 
-#### Slice 5b — the wasm `HostEffects` + the `nxvim-edithost` cdylib — ✅ DONE (2026-06-11)
+#### Slice 5b — the wasm `HostEffects` + the `bemtvi-edithost` cdylib — ✅ DONE (2026-06-11)
 
-New emscripten crate `nxvim-edithost` (the demo's successor), depending on `nxvim-server`
+New emscripten crate `bemtvi-edithost` (the demo's successor), depending on `bemtvi-server`
 (`default-features = false, features = ["lua51"]`). A `WasmEffects: HostEffects` that
 captures `notify` redraw frames into a buffer the UI drains, answers `respond` likewise,
 and queues `loop_command` timers for 5d (the off-tick fs / LSP / TSInstall methods
 `fail!`-loud — serverless v1). `extern "C"` exports mirror the demo but drive the **real**
 `EditHost` tick: construct, feed vim-notation input (→ `EditHost::input` → settle), drain
-the latest redraw as msgpack/JSON. Reuse `nxvim-edithost-demo/build.sh`'s emcc shape.
+the latest redraw as msgpack/JSON. Reuse `bemtvi-edithost-demo/build.sh`'s emcc shape.
 
 Shipped:
-- **`EditHost` made publicly constructable + drivable** (`nxvim-server`): `EditHost` and
+- **`EditHost` made publicly constructable + drivable** (`bemtvi-server`): `EditHost` and
   `EditHost::new(editor, lua, fx)` are now `pub` — the **one** construction site, shared by
   the native `run_io` (refactored onto it; it then seeds `shada` / `mouse_clock`) and the
   out-of-crate cdylib. The wasm drive surface is a small `#[cfg(not(feature = "native"))]`
@@ -1856,9 +1856,9 @@ Shipped:
   `apply_lua_effects` + `run_pending` — not the demo's hand-drained `take_commands`), and
   `lines`. The native API surface is unchanged (the block is wasm-only); `HostEffects` is
   now `pub use`-exported so the cdylib can implement it.
-- **`WasmEffects` + the FFI** (`crates/nxvim-edithost`, workspace-excluded like the demo /
-  `nxvim-web`): `notify` captures the latest `redraw` params and queues the rest
-  (`nxvim_exit` / scripted selects) for 5c; every **off-tick** effect is genuinely
+- **`WasmEffects` + the FFI** (`crates/bemtvi-edithost`, workspace-excluded like the demo /
+  `bemtvi-web`): `notify` captures the latest `redraw` params and queues the rest
+  (`bemtvi_exit` / scripted selects) for 5c; every **off-tick** effect is genuinely
   unreachable in serverless v1 (`has_remote_fs() == false` gates the fs legs; `respond`
   needs the gated RPC router) and so `unreachable!`-loud, not a silent no-op. `extern "C"`
   exports (`eh_new` / `eh_input` / `eh_exec_lua` / `eh_redraw_json` / `eh_lines` /
@@ -1884,17 +1884,17 @@ Shipped:
   test since `run_io` now builds the host via `EditHost::new`), `clippy -D
   warnings` clean on **both** the native default and the `--no-default-features --features
   lua51` wasm subset, fmt clean (incl. the excluded crate). The throwaway
-  `nxvim-edithost-demo` was deleted in slice 5e once this crate fully superseded it.
+  `bemtvi-edithost-demo` was deleted in slice 5e once this crate fully superseded it.
 
-#### Slice 5c — the Web Worker + redraw transport + `window.__nxvim` — ✅ DONE (2026-06-13)
+#### Slice 5c — the Web Worker + redraw transport + `window.__bemtvi` — ✅ DONE (2026-06-13)
 
 The edit-host now runs in a **Web Worker** — the single `!Send` thread owning core + Lua,
-mapping nxvim's threading model onto the browser exactly as the native edit-host owns its
+mapping bemtvi's threading model onto the browser exactly as the native edit-host owns its
 own OS thread. The UI thread holds **no** editor/Lua state: it ferries input and renders
 the redraw. Transport is `postMessage` request/response (correlated by `id`); slice 5d
 swaps the UI→worker input leg for the SAB park (so the same wait fires Worker-side timers).
 
-Shipped (`crates/nxvim-edithost/`):
+Shipped (`crates/bemtvi-edithost/`):
 - **`eh_attach` FFI export** (`src/lib.rs`) — the resize path; re-attaches the UI at a new
   `cols`×`rows` and repaints (the JS side fires it on window resize, the plan's "resize via
   a re-attach" note). `build.sh` exports it and adds the `worker` emscripten environment.
@@ -1906,7 +1906,7 @@ Shipped (`crates/nxvim-edithost/`):
 - **`web/index.html`** — the UI: a renderer that composes the **server** `redraw` frame
   (the same projection the native TUI consumes — windows by rect offset past the tabline,
   gutters, statuslines, cmdline/message, cursor placement) into a character grid + a cursor
-  overlay; a keystroke→vim-notation translator; and the `window.__nxvim` hook (`feed` /
+  overlay; a keystroke→vim-notation translator; and the `window.__bemtvi` hook (`feed` /
   `execLua` / `attach` / `lines` / `frame` / `cursor` / `cursorCell` / `mode` / `cmdline` /
   `message`, plus a `ready` promise) for automation.
 - **`web/serve.mjs`** — a cross-origin-isolated dev/CI server (COOP `same-origin` + COEP
@@ -1917,7 +1917,7 @@ Shipped (`crates/nxvim-edithost/`):
   form of the exit criteria) and its `playwright` devDependency.
 
 **Exit criteria — met.** `web/verify.mjs` drives the **real** wasm edit-host in a real
-headless Chromium through `window.__nxvim` and asserts, all PASS: the page is
+headless Chromium through `window.__bemtvi` and asserts, all PASS: the page is
 cross-origin isolated; `ihello world<Esc>` inserts the line (the production tick runs in
 the browser); the cursor settles on the last char (col 10) where vim leaves it after
 `<Esc>`; the **rendered DOM grid** (not just the FFI return — proving the Worker +
@@ -1926,7 +1926,7 @@ the browser); the cursor settles on the last char (col 10) where vim leaves it a
 command-line mode renders the `:` prompt + text on the bottom row. The node smoke test
 (`harness.mjs`) and the `--no-default-features --features lua51` clippy (host + wasm
 target) stay green; no workspace crate changed (the FFI lives in the workspace-excluded
-`nxvim-edithost`), so the native suite is untouched.
+`bemtvi-edithost`), so the native suite is untouched.
 
 > **Verifier note (env-specific).** `verify.mjs` prefers an explicitly-installed Chromium
 > (`PW_CHROMIUM`, else the newest `~/.cache/ms-playwright/chromium-*/chrome`) so the run
@@ -1942,17 +1942,17 @@ deadline**, so one mechanism is both the input wait and the `LoopEvent::Timer` w
 due timers, runs the tick, and posts the redraw back.
 
 Shipped:
-- **The Worker-side timer wheel** (`nxvim-server`, all `#[cfg(not(feature = "native"))]` —
+- **The Worker-side timer wheel** (`bemtvi-server`, all `#[cfg(not(feature = "native"))]` —
   the native build is byte-identical). [`EditHost`] gains a `WasmTimer { id, due_ms,
   repeat_ms }` list + a JS clock, with `set_clock` / `next_timer_deadline` /
   `fire_due_timers` and `arm_wasm_timer` / `stop_wasm_timer`. `fire_due_timers` runs each
   due timer's Lua callback through the **real** effects path and repaints once; only timers
   due *at entry* fire per pass (so a 0-delay self-re-arming timer can't spin the wheel), and
   a repeating timer re-arms to `now + repeat_ms` *before* its callback runs.
-  `apply_loop_op`'s wasm branch now **arms/stops** these from `vim.defer_fn` / `nx.timer`
+  `apply_loop_op`'s wasm branch now **arms/stops** these from `vim.defer_fn` / `btv.timer`
   (the `LoopOp::TimerStart` / `TimerStop` it used to echo "not available" for); processes /
   fs-watch (`vim.system` / `jobstart` / `vim.uv.spawn`) still echo loud (Phase 6 daemon).
-- **The cdylib FFI** (`nxvim-edithost`): `eh_set_clock` / `eh_next_deadline` /
+- **The cdylib FFI** (`bemtvi-edithost`): `eh_set_clock` / `eh_next_deadline` /
   `eh_tick_timers` (build.sh exports them).
 - **The Worker SAB loop** (`web/worker.mjs`): when the page is cross-origin isolated it
   enters a blocking loop draining a framed byte ring (`[type:u8][reqId:u32][len:u32][payload]`;
@@ -1963,10 +1963,10 @@ Shipped:
 - **The UI transport** (`web/index.html`): picks SAB vs. postMessage by capability
   (`crossOriginIsolated && SharedArrayBuffer`), writes framed input into the ring +
   `Atomics.notify`, and resolves the `feed` / `execLua` / `attach` promises by `reqId`
-  carried back in the redraw's `acks` / `results`. `window.__nxvim.sab` reports the mode.
+  carried back in the redraw's `acks` / `results`. `window.__bemtvi.sab` reports the mode.
 
 **Exit criteria — met.** `web/verify.mjs` (real headless Chromium): all 5c checks still
-pass; the SAB input/timer loop is active (`__nxvim.sab === true`, cross-origin isolated); a
+pass; the SAB input/timer loop is active (`__bemtvi.sab === true`, cross-origin isolated); a
 one-shot `vim.defer_fn` rewrites the buffer **on its own** ~150 ms later with **no further
 input** (only the Worker's park timeout could have fired it); and a self-rescheduling
 `defer_fn` chain fires ≥5 times unattended. Native `cargo test --workspace` green (the lone
@@ -1979,27 +1979,27 @@ native binary is unchanged); clippy clean on native + the `--no-default-features
 > design and project-wide** (native *and* wasm load the same `prelude/api.lua`, whose
 > header declares the mutating entity surface — `nvim_buf_set_lines`/`set_text`/`set_name`,
 > `nvim_open_win`, `nvim_win_set_*`, `nvim_create_buf`, `nvim_feedkeys`, `nvim_buf_attach`
-> — *intentionally absent*: nxvim's config API is autocmds / diagnostics / keymaps /
+> — *intentionally absent*: bemtvi's config API is autocmds / diagnostics / keymaps /
 > options, not entity mutation). The *read* getters + extmarks exist. So the 5d test
 > mutates via `vim.cmd` / keystrokes, which is the supported path — there is nothing to
 > "wire in." (An earlier draft of this note mis-filed it as a wasm follow-up; corrected.)
 
-#### Slice 5e — COOP/COEP serving + docs; delete `nxvim-edithost-demo` — ✅ DONE (2026-06-13)
+#### Slice 5e — COOP/COEP serving + docs; delete `bemtvi-edithost-demo` — ✅ DONE (2026-06-13)
 
 The cross-origin-isolation serving requirement (SAB → `crossOriginIsolated`) is now
 documented for production, and the throwaway demo is gone.
 
 Shipped:
-- **Production serving docs + a ready `_headers`** (`crates/nxvim-edithost/web/`):
+- **Production serving docs + a ready `_headers`** (`crates/bemtvi-edithost/web/`):
   `web/_headers` sets `Cross-Origin-Opener-Policy: same-origin` +
   `Cross-Origin-Embedder-Policy: require-corp` + `Cross-Origin-Resource-Policy:
   same-origin` for `/*` (Netlify / Cloudflare Pages format). The README's *Serving in
   production* section explains the requirement (without the headers the page degrades to
-  the slow `postMessage` transport and timers never fire — `window.__nxvim.sab` reports
+  the slow `postMessage` transport and timers never fire — `window.__bemtvi.sab` reports
   which mode is live) and gives nginx / Apache / generic recipes plus the `application/wasm`
   mime note. The dev/CI server `web/serve.mjs` already sets the same three (slice 5c).
-- **`nxvim-edithost-demo` deleted** — the Phase 4 throwaway that only proved core+Lua
-  *compile and run* in wasm. `nxvim-edithost` (the real `nxvim-server` tick in a Worker)
+- **`bemtvi-edithost-demo` deleted** — the Phase 4 throwaway that only proved core+Lua
+  *compile and run* in wasm. `bemtvi-edithost` (the real `bemtvi-server` tick in a Worker)
   has fully superseded it, so the crate dir is removed, dropped from the workspace
   `exclude` list, and every "supersedes the demo / deleted in 5e" reference scrubbed to
   past tense across `Cargo.toml` / the crate README / `src/lib.rs`.
@@ -2007,13 +2007,13 @@ Shipped:
 **Exit criteria — met.** `web/serve.mjs` + `web/_headers` make `crossOriginIsolated ===
 true` (the `verify.mjs` run asserts it, and the SAB timer path depends on it — both green);
 the build + serving + production-headers docs ship in the crate README; `git ls-files`
-shows no `nxvim-edithost-demo`, and `grep -r nxvim-edithost-demo` over the tree returns only
+shows no `bemtvi-edithost-demo`, and `grep -r bemtvi-edithost-demo` over the tree returns only
 this plan's historical narrative. **Phase 5 is complete** — the full Lua edit-host runs in
 the browser (core + Lua + autocmds + redraw + Worker-side timers), driven over SAB, served
 cross-origin-isolated; what remains browser-side is Phase 6 (the daemon over WebTransport
 for real files/processes/LSP) and the v1 feature gaps that are genuinely *gated out* of the
 wasm build (LSP + native treesitter). (The `vim.api.nvim_buf_*` *write* surface being `nil`
-is **not** one of these — it is intentionally absent in every build by the nx.* config-API
+is **not** one of these — it is intentionally absent in every build by the btv.* config-API
 design; see the slice-5d clarification above.)
 
 > **Toolchain prerequisite (now provisioned).** Slices 5b–5e — and the wasm half of 5a —
@@ -2056,7 +2056,7 @@ transport is OPFS instead of the QUIC wire. No new core seam; the daemon path an
 serverless path are now the *same* off-tick design with two transports.
 
 Shipped:
-- **Core/server (the wasm-eligible tick, `nxvim-server`):** three public methods on the
+- **Core/server (the wasm-eligible tick, `bemtvi-server`):** three public methods on the
   `#[cfg(not(feature = "native"))]` `EditHost` drive surface — `enable_offtick_fs()` (turns
   on `Editor::set_host_fs_offtick`), `complete_fs_read(buffer, path, kind, contents)` (the
   read applier: kind file/new/dir/err — reuses the *ungated* subset of the native
@@ -2067,13 +2067,13 @@ Shipped:
   clear, `FileStat` baseline, deferred-`:wq` replay, and per-buffer/`:wqa` serialization
   behave **identically** to the daemon save path). The native binary is byte-identical —
   every line is inside the existing wasm-only `impl` block.
-- **The cdylib (`nxvim-edithost`):** `WasmEffects::has_remote_fs() → true`; `fs_fetch` /
+- **The cdylib (`bemtvi-edithost`):** `WasmEffects::has_remote_fs() → true`; `fs_fetch` /
   `fs_save` record the request into the `Sink` (a read list; a write queue + a
   seq→`PendingSave` map holding the snapshot bytes) instead of `unreachable!`. New FFI:
   `eh_take_fs_requests` (drains the queued reads/writes as JSON), `eh_save_bytes` /
   `eh_save_len` (hand a write's snapshot bytes to JS), `eh_fs_read_complete` /
   `eh_fs_write_complete` (land the OPFS result back through the two appliers). `eh_new`
-  also injects a **`WasmBlockingSystem`**: `nx._system` (the blocking shell-out behind
+  also injects a **`WasmBlockingSystem`**: `btv._system` (the blocking shell-out behind
   `vim.fn.system`) now fails *loud* with a named "processes are not available in the
   browser build yet" rather than `StdBlockingSystem`'s cryptic emscripten spawn errno —
   the serverless "fail loud, name what's missing" for the process half.
@@ -2088,12 +2088,12 @@ Shipped:
   fine: the `await` fully settles before the park.
 
 **Exit criteria — met.** `web/verify.mjs` (real headless Chromium, the same harness as
-5c/5d) adds, all PASS alongside the existing 11 checks: `:w /nxvim-verify/rt.txt` saves a
+5c/5d) adds, all PASS alongside the existing 11 checks: `:w /bemtvi-verify/rt.txt` saves a
 buffer to OPFS and `vim.bo.modified` clears **only after** the write acks; the saved bytes
 are read back through the **raw OPFS API** (`navigator.storage` — a path the editor never
 touches), proving they truly landed in storage; `:e!` reloads the file from OPFS,
 discarding an unsaved in-memory edit (so the reloaded content can only have come from
-storage — the read leg); and `nx._system({...})` returns a clear `code = -1` + a "not
+storage — the read leg); and `btv._system({...})` returns a clear `code = -1` + a "not
 available in the browser build" message (the process half fails loud). Native
 `cargo test --workspace` regression-clean (my Rust is all `cfg(not(native))`, so every
 native binary is byte-identical — the lone load-sensitive `mouse` flake passes in
@@ -2126,7 +2126,7 @@ path landed next — Phase 6b below.**
 
 The remote half of Phase 6, sliced first to the **fs read + write leg** on the same
 "simplest path first / prove the transport" discipline 6a used for OPFS. The browser
-edit-host is now a `HostFs` client of a real `nxvim --daemon --listen` over **WebTransport
+edit-host is now a `HostFs` client of a real `bemtvi --daemon --listen` over **WebTransport
 (HTTP/3 / QUIC)** — the browser twin of the native `connect_quic` fs leg (Phase 3d/3e), and
 the *inverse* of the deleted Socket.IO whole-editor-remote topology. Editing stays in the
 Worker (zero per-keystroke round-trips); only `:e`/`:w`/`:e <dir>` cross the wire.
@@ -2140,13 +2140,13 @@ native binary and the whole `cargo test --workspace` are byte-identical; zero `.
 the appliers 6a proved are reused verbatim.
 
 **The one genuinely new piece is browser-side: a JS msgpack-RPC client** (`web/rpc.mjs`), the
-JS twin of `nxvim-rpc`'s `Rpc` + reader task (the Worker has no tokio — the point of
+JS twin of `bemtvi-rpc`'s `Rpc` + reader task (the Worker has no tokio — the point of
 `EditHost`). It wraps one WebTransport bidi stream: a msgid counter + pending-reply map, a
 `for await (const frame of decodeMultiStream(readable))` reader loop that resolves responses
 (`[1,msgid,err,result]` — reject on a non-nil `err`, fail loud) and surfaces notifications
 (`[2,method,params]` via `onNotify`, unused by the fs leg, ready for the next), and
 `encode([0,msgid,method,params])` writes. `dialDaemon(uri)` parses the launch-printed
-`nxvim://HOST:PORT/TOKEN?cert=HASH`, builds `https://HOST:PORT/TOKEN` (token on the CONNECT
+`bemtvi://HOST:PORT/TOKEN?cert=HASH`, builds `https://HOST:PORT/TOKEN` (token on the CONNECT
 path, the daemon reads `request.path()`) + `serverCertificateHashes` (dotted-hex →
 `Uint8Array(32)`, TOFU), awaits `.ready`, opens the bidi stream. **msgpack is a real vendored
 library** — `@msgpack/msgpack`, staged into `web/vendor/msgpack/` by `build.sh` from the
@@ -2185,7 +2185,7 @@ the daemon's disk in Node** (proving the write truly landed remotely, not in-mem
 serverless mode (no `?daemon=`) is untouched.
 
 **Deferred to later Phase 6 slices (not stubbed):** the other five wire legs over
-WebTransport — **proc** (`HostProc`), **sys_run** (the blocking `nx._system` — today the
+WebTransport — **proc** (`HostProc`), **sys_run** (the blocking `btv._system` — today the
 browser fails it loud), **lsp**, **watch** (`fs_changed` push → the `onNotify` hook this
 slice's `RpcClient` already exposes), and **luafs** (`vim.uv.fs_stat`/`filereadable`) — each
 reuses the same `RpcClient`, the process legs adding the daemon→browser notification routing;
@@ -2218,7 +2218,7 @@ already; the wasm build just never reached it (`on_remote_file_changed` and the 
 was `unreachable!()`). So the Rust change is a small de-gating, not new policy.
 
 Shipped:
-- **Shared reconcile body** (`nxvim-server` `lifecycle.rs`) — `on_remote_file_changed`'s body
+- **Shared reconcile body** (`bemtvi-server` `lifecycle.rs`) — `on_remote_file_changed`'s body
   lifted into an un-gated `reconcile_remote_change(path, stat)`; the native run-loop wrapper
   (`on_remote_file_changed(WatchEvent)`) and a new wasm `EditHost::remote_file_changed`
   (decomposed `(path, has_stat, size, mtime_ms)` — the daemon wire types are native-only)
@@ -2229,7 +2229,7 @@ Shipped:
   no-op became the **remote branch** (the native build's `has_remote_fs()` path verbatim,
   paths-only): every file-backed buffer arms one watch through `HostEffects::fs_watch`. The
   wasm `WasmEffects::fs_watch` / `fs_unwatch` enqueue into the `Sink` instead of `unreachable!`.
-- **Two new FFI exports** (`nxvim-edithost` cdylib) — `eh_take_watch_requests` (drains the
+- **Two new FFI exports** (`bemtvi-edithost` cdylib) — `eh_take_watch_requests` (drains the
   arm/disarm queue as `{"arm":[…],"disarm":[…]}` for the Worker to forward) and
   `eh_remote_file_changed(path, has_stat, size, mtime_ms)` (the Worker calls it from
   `RpcClient.onNotify`; it builds the `FileStat`, runs `reconcile_remote_change`, and settles —
@@ -2262,7 +2262,7 @@ no-ops without a daemon, and the park is unchanged when no watch is armed).
 **Deferred to later Phase 6 slices (not stubbed):** the remaining four wire legs over
 WebTransport — **proc** (`HostProc`; the process legs add the daemon→browser
 `proc_spawned`/`proc_exited` notification routing this slice's push plumbing now proves),
-**sys_run** (blocking `nx._system` — still fails loud in the browser), **lsp**, and **luafs**
+**sys_run** (blocking `btv._system` — still fails loud in the browser), **lsp**, and **luafs**
 (`vim.uv.fs_stat` / `filereadable`); the per-`HostServices`-class **QUIC stream split** (one
 bidi stream still); and an **event-driven push wakeup** to replace the async-park cap — a
 second worker (or the UI thread) owning the connection and poking the edit-host Worker's SAB,
@@ -2292,7 +2292,7 @@ work — and the child's pid/exit land back through new inbound `EditHost` metho
 (`proc_spawned` / `proc_exited`), the wasm twins of the native `on_loop_event` arms.
 
 Shipped:
-- **The wasm proc seam** (`nxvim-server` `edithost.rs` + `effects.rs`) — `HostEffects` grew
+- **The wasm proc seam** (`bemtvi-server` `edithost.rs` + `effects.rs`) — `HostEffects` grew
   three `#[cfg(not(feature = "native"))]` methods: `proc_spawn(id, cmd, cwd, env, stdin)`,
   `proc_kill(id)`, and `has_remote_proc()`. `apply_loop_op`'s wasm `LoopOp::Spawn`/`Kill`
   branch — which used to fail loud unconditionally ("not available in the browser build yet")
@@ -2306,7 +2306,7 @@ Shipped:
   table, drains its effects, and `settle_events` + repaints (native's `ProcessExit` arm plus the
   run loop's trailing settle) — a chained spawn / off-tick `:edit` the callback queues drains in
   the same convergence, exactly as `remote_file_changed` does for a watch reconcile.
-- **The cdylib FFI** (`nxvim-edithost`) — `Sink` gained `proc_spawns` / `proc_kills` /
+- **The cdylib FFI** (`bemtvi-edithost`) — `Sink` gained `proc_spawns` / `proc_kills` /
   `daemon_connected`; `WasmEffects` implements the three seam methods over them. Four exports:
   `eh_set_daemon_connected` (the Worker flips it on `:connect` / `?daemon=` / disconnect),
   `eh_take_proc_requests` (drains the spawn/kill queue as JSON for the Worker to forward),
@@ -2321,16 +2321,16 @@ Shipped:
   reader stays live to receive the unsolicited `proc_exited` push, exactly as 6c does for watch
   pushes. `eh_set_daemon_connected` is flipped on every connect/disconnect path.
 
-**The async-spawn *public* Lua surface (`nx.spawn`, ADR 0002) is still the proposed primitive —
+**The async-spawn *public* Lua surface (`btv.spawn`, ADR 0002) is still the proposed primitive —
 this slice carries the leg, not the wrapper.** When the neovim-plugin-compat runtime was ripped
 out (`300cdb0` / `e9bb90c`), the public `vim.system` wrapper went with it, leaving the **funnel**
-(`nx._system_async` / `nx._system_kill` / `nx._set_proc_pid` / `nx._proc_pids`) and the native
+(`btv._system_async` / `btv._system_kill` / `btv._set_proc_pid` / `btv._proc_pids`) and the native
 event-loop handling in place. The native proc leg is in the same funnel-only state, so 6d brings
 the browser to **parity** (transport + funnel, no public wrapper yet) rather than inventing the
-`nx.spawn` API — that public surface is a separate, still-proposed slice. The leg is ready for it.
+`btv.spawn` API — that public surface is a separate, still-proposed slice. The leg is ready for it.
 
 **Exit criteria — met.** `web/verify-proc.mjs` (real headless Chromium + a real `--daemon
---listen`, the browser twin of the native daemon proc test): driving the genuine `nx._system_async`
+--listen`, the browser twin of the native daemon proc test): driving the genuine `btv._system_async`
 funnel (the exact funnel any public wrapper calls — not a mock), (1) a `sh -c 'printf …'` child's
 **stdout round-trips** to the `on_exit` callback over WebTransport with exit code 0; (2) a child
 writes a **marker file on the daemon's disk** (a path the browser origin can't touch) that Node
@@ -2338,16 +2338,16 @@ reads back — proving the process truly executed on the daemon, not faked; and 
 child is **killed from the browser** and its `on_exit` fires with a `-1` (killed) code in well
 under a second — proving `proc_kill` crossed the wire and terminated the child, not that the sleep
 elapsed. Native `cargo test --workspace` green (61 suites, zero failures — the wasm-gated changes
-don't touch the native build), fmt + clippy `-D warnings` clean on `nxvim-server` (native) and
-`nxvim-edithost` (wasm); the existing browser suites stay green — serverless OPFS (`verify.mjs`)
+don't touch the native build), fmt + clippy `-D warnings` clean on `bemtvi-server` (native) and
+`bemtvi-edithost` (wasm); the existing browser suites stay green — serverless OPFS (`verify.mjs`)
 and the 6b fs leg (`verify-daemon.mjs`) are untouched (proc requests no-op without a daemon, and
 the park is unchanged when no child is in flight). (A pre-existing, platform-specific clippy error
-in the unrelated `nxvim-gui/src/remote.rs` — `anyhow::Context` unused on Linux, used only in the
+in the unrelated `bemtvi-gui/src/remote.rs` — `anyhow::Context` unused on Linux, used only in the
 macOS/Windows SSH-dialog `cfg` blocks — is present on clean `HEAD` and out of this slice's scope.)
 
 **Deferred to later Phase 6 slices (not stubbed):** the remaining three wire legs over
-WebTransport — **sys_run** (blocking `nx._system` — still fails loud in the browser), **lsp**, and
-**luafs** (`vim.uv.fs_stat` / `filereadable`); the public **`nx.spawn`** async surface over the
+WebTransport — **sys_run** (blocking `btv._system` — still fails loud in the browser), **lsp**, and
+**luafs** (`vim.uv.fs_stat` / `filereadable`); the public **`btv.spawn`** async surface over the
 funnel this leg carries (a shared native+browser slice, per ADR 0002); the per-`HostServices`-class
 **QUIC stream split** (one bidi stream still — a `proc_*` flood can still HOL-block an `fs_*` save);
 a **connection-drop sweep** that fails every in-flight child's `on_exit` with `code -1` (the native
@@ -2358,9 +2358,9 @@ dangling for now); and an **event-driven push wakeup** to replace the async-park
 
 Since 6d, two more legs landed browser-side under their **own** plans (they extend
 this Worker / `RpcClient`, so they belong on this map even though they were sliced
-elsewhere): the **luafs legs** — `nx.fs`'s off-tick `luafs_op` and the streaming
-`luafs_watch`/`luafs_unwatch` (`docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`,
-project memory `nx-fs-must-route-to-daemon-in-browser`) — and the **terminal leg**,
+elsewhere): the **luafs legs** — `btv.fs`'s off-tick `luafs_op` and the streaming
+`luafs_watch`/`luafs_unwatch` (`docs/plans/2026-06-16-btv-fs-off-tick-daemon-leg.md`,
+project memory `btv-fs-must-route-to-daemon-in-browser`) — and the **terminal leg**,
 the web `:terminal` PTY over `term_open`/`term_write`/`term_resize`/`term_kill` +
 `term_data`/`term_exit` pushes (Phase 7). So the browser Worker now consumes **fs,
 watch, proc, luafs (op + watch), and terminal**; the daemon (`run_daemon_io`) serves
@@ -2369,17 +2369,17 @@ watch, proc, luafs (op + watch), and terminal**; the daemon (`run_daemon_io`) se
 `RemoteBlockingSystem`/`RemoteLspTransport`/`RemoteLuaFs`). The only legs the **browser**
 still lacks are **LSP** and **sys_run** — and LSP is the substantial one (it is not a
 pure Worker-forwarding slice like the others, because the LSP *client* itself —
-`nxvim-lsp` on tokio + `async-lsp` — was native-gated and had to be brought to wasm).
+`bemtvi-lsp` on tokio + `async-lsp` — was native-gated and had to be brought to wasm).
 **Phase 6e** below is that LSP leg.
 
 > **Phase 6e — DONE (2026-06-17).** The browser edit-host runs language servers on a
-> real `nxvim --daemon --listen` over WebTransport, verified end-to-end
+> real `bemtvi --daemon --listen` over WebTransport, verified end-to-end
 > (`web/verify-lsp.mjs`): server-pushed diagnostics (`didOpen` → `publishDiagnostics`
-> land in `nx.diagnostic.get()`) and a hover request/reply (`nx.lsp.hover()` opens the
+> land in `btv.diagnostic.get()`) and a hover request/reply (`btv.lsp.hover()` opens the
 > content float with the server's markup), both against the scripted mock
-> (`nxvim --__lsp-mock`) the daemon spawns. The slices:
-> - **Stage A** — the synchronous `SyncLspClient` (`nxvim-lsp/src/sync_client.rs`):
->   `nxvim-lsp` feature-gated (`native` default) so the async manager/transport tree
+> (`bemtvi --__lsp-mock`) the daemon spawns. The slices:
+> - **Stage A** — the synchronous `SyncLspClient` (`bemtvi-lsp/src/sync_client.rs`):
+>   `bemtvi-lsp` feature-gated (`native` default) so the async manager/transport tree
 >   drops on wasm; the protocol/convert/caps transforms stay always-on and are shared
 >   verbatim with the async path. (commit 27ae327)
 > - **Stage B** — server integration: the `lsp/` consumer de-gated for wasm, the
@@ -2387,7 +2387,7 @@ pure Worker-forwarding slice like the others, because the LSP *client* itself �
 >   `lsp_stdout`/`lsp_stderr`/`lsp_exited`/`lsp_take_events`/`has_remote_lsp`), and the
 >   `EditHost` wasm inbound (`lsp_stdout` feed → `drain_lsp_events` → `on_lsp_event`).
 >   (commit 2efb06e)
-> - **Stage C** — the `nxvim-edithost` cdylib: `WasmEffects` holds the `SyncLspClient`
+> - **Stage C** — the `bemtvi-edithost` cdylib: `WasmEffects` holds the `SyncLspClient`
 >   and implements the seam (each call flushes the client's `WireOp`s into the `Sink`;
 >   inbound feeds the client and drains events); FFI `eh_take_lsp_requests` /
 >   `eh_lsp_stdout` / `eh_lsp_stderr` / `eh_lsp_exited`.
@@ -2404,7 +2404,7 @@ pure Worker-forwarding slice like the others, because the LSP *client* itself �
 >   `Initialized` never fired — diagnostics never flowed. Un-gating it (it runs on both
 >   builds now) is what makes server pushes work.
 >
-> The remaining browser leg is **sys_run** (blocking `nx._system` over the wire), per
+> The remaining browser leg is **sys_run** (blocking `btv._system` over the wire), per
 > the residual note in Open Decision #5.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
@@ -2459,7 +2459,7 @@ This is the *application-layer* case for splitting `HostServices` into
 `HostFs`/`HostProc`/`HostWatch` (Open Decision #1): distinct traits → distinct
 logical channels → distinct streams.
 
-**One nxvim-specific correction to the usual "remote editor" framing:** because the
+**One bemtvi-specific correction to the usual "remote editor" framing:** because the
 edit-host moved the editor *local* (the whole thesis), the latency-critical
 keystroke → core → redraw path **never crosses the wire**. So HOL blocking here can
 delay *completion results*, *saves*, and *diagnostics* — all already-async,
@@ -2475,7 +2475,7 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
   single WebSocket above.
 - **Native (Phase 3):** the native transport is the **same WebTransport/QUIC listener**
   (Open Decision #2, RESOLVED 2026-06-11) — **ssh is dropped**, not kept as a fallback.
-  An earlier draft carried the daemon over `ssh … nxvim --daemon` (a single ordered
+  An earlier draft carried the daemon over `ssh … bemtvi --daemon` (a single ordered
   stdio stream), but QUIC can't go under ssh's one TCP connection, so its HOL blocking
   is intrinsic and app-level framing can't escape it. Rather than ship a second,
   weaker native transport, native and browser unify on the QUIC listener — one stream
@@ -2522,7 +2522,7 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    TCP connection), so keeping it would mean shipping a second, strictly-weaker native
    transport and splitting auth (ssh's vs the listener's). Instead there is one native
    transport, the QUIC listener, and ssh's free conveniences (auth, identity, launch)
-   move into it explicitly below. The Phase 3 deferred ssh slice (the `ssh … nxvim
+   move into it explicitly below. The Phase 3 deferred ssh slice (the `ssh … bemtvi
    --daemon` connector, `:connect`, askpass) is therefore **dropped**, not deferred.
 
    **Forced sub-decisions (ssh gave these for free; the listener must provide them):**
@@ -2542,18 +2542,18 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
      hosts model) and warns on change. No CA infrastructure.
 3. **One web build or two** (Phase 4) — **RESOLVED (2026-06-10): one build,
    emscripten only.** The emscripten edit-host *replaces* today's
-   `wasm32-unknown-unknown` `nxvim-web` outright — no second no-Lua core-only demo
+   `wasm32-unknown-unknown` `bemtvi-web` outright — no second no-Lua core-only demo
    build. **Both** of today's web clients fold into the single edit-host:
-   - the **serverless `WebEditor`** (`crates/nxvim-web/src/lib.rs`, core-only, no
+   - the **serverless `WebEditor`** (`crates/bemtvi-web/src/lib.rs`, core-only, no
      Lua) and its bespoke *local* paint path in `index.html` (the
      `serverStyled === false` branches) are deleted — the edit-host *is* the local
      editor now, with Lua;
-   - the **`RemoteClient` + Socket.IO bridge** (`remote.rs` + `nxvim-web-bridge`)
+   - the **`RemoteClient` + Socket.IO bridge** (`remote.rs` + `bemtvi-web-bridge`)
      is superseded too: it is the whole-editor-*remote* topology this plan exists
      to kill (one round-trip per keystroke). The editor moves *into* the browser
      Worker; only fs/process stay remote, behind the daemon (Phase 6). `remote.rs`'s
      *synchronous* msgpack framing is reusable for the new browser↔daemon link, but
-     the boundary flips, and `nxvim-web-bridge`'s per-connection `nxvim --server`
+     the boundary flips, and `bemtvi-web-bridge`'s per-connection `bemtvi --server`
      relay retires with the Socket.IO client.
 
    The trade: we give up the smallest-possible no-Lua demo for **one** web client
@@ -2578,7 +2578,7 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    accepted cost: each remaining fs-touching call site (`:edit`/`:read`, save,
    explorer `read_dir` — Phase 3d's *Still to do on the fs leg*) is re-plumbed
    onto the async seam individually rather than swapped behind the Phase-1
-   trait. **Residual:** the *synchronous* surfaces — blocking `nx._system`,
+   trait. **Residual:** the *synchronous* surfaces — blocking `btv._system`,
    and any Lua-visible sync fs calls routed remote (`vim.uv.fs_stat`,
    `vim.fn.filereadable`, …) — cannot use an off-tick shape (the caller needs
    the value *now*) and need the **blocking bridge**: a request over
@@ -2587,7 +2587,7 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    starve the reader carrying its reply (the deadlock trap — see *Still to do
    in Phase 3* under Phase 3a), plus the short-TTL stat/exists cache to damp
    per-call round-trips. **The bridge is now built and proven — Phase 3n shipped it
-   for the blocking `nx._system`** (the `BlockingSystem` seam + `sys_run` wire +
+   for the blocking `btv._system`** (the `BlockingSystem` seam + `sys_run` wire +
    dedicated-link-thread park, exactly this mechanism); the Lua-visible sync fs
    calls reuse the same bridge when the Lua-visible fs-semantics slice lands.
 6. **How the wasm edit-host gets the editor+Lua sync tick** (Phase 4/5) —
@@ -2595,18 +2595,18 @@ typing lag (unlike the Monaco-remote topology, where the editor itself round-tri
    async effects behind a `HostEffects` trait.** The tick (`dispatch` →
    `run_pending` → `apply_lua_effects` + the mirrors) is synchronous but lived in
    `impl Server`, entangled with the async fields (`tokio` net→`mio`, `notify`,
-   `nxvim-lsp` subprocess, `nxvim-ts`). Three shapes were on the table:
+   `bemtvi-lsp` subprocess, `bemtvi-ts`). Three shapes were on the table:
    **(a) extract a reusable sync `EditHost`** from `Server` with async effects
    behind a trait — the blessed architecture (it *is* the "full split" seam, serving
    both native latency in Phase 3 and wasm here), the largest refactor but the only
    one with **no tokio in the Worker** and **one sync core for native + wasm**;
-   **(b) gate `nxvim-server` itself to wasm** (target-off `net`/`process`, native
+   **(b) gate `bemtvi-server` itself to wasm** (target-off `net`/`process`, native
    deps non-wasm, current-thread tokio in the Worker) — reuses all glue but keeps
    tokio in the Worker, against this plan's grain; **(c) a minimal fresh cdylib**
-   reimplementing a crude tick (the throwaway `crates/nxvim-edithost-demo`, which
+   reimplementing a crude tick (the throwaway `crates/bemtvi-edithost-demo`, which
    proved core+Lua-in-wasm by behavior — the *interim* 2026-06-10 de-risking step,
    now superseded). The empirical finding that makes (a) tractable: the wasm blocker
-   is the **dependency tree** (`mio`/net, `notify`, lsp, ts), not `nxvim-server`'s own
+   is the **dependency tree** (`mio`/net, `notify`, lsp, ts), not `bemtvi-server`'s own
    source, which produced *zero* errors before the build died at `mio`. **(a) chosen**
    — the slice plan is *Phase 4-proper* below. The throwaway demo gets deleted when the
    real `EditHost` lands.

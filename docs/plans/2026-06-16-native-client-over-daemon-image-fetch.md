@@ -9,8 +9,8 @@
 bytes (the never-freeze invariant). Each native client (TUI/GUI) reads and decodes the
 file itself from the path, via `ImageReader::open(path)`:
 
-- TUI: `crates/nxvim-tui/src/images.rs::decode`
-- GUI: `crates/nxvim-gui/src/images.rs::decode`
+- TUI: `crates/bemtvi-tui/src/images.rs::decode`
+- GUI: `crates/bemtvi-gui/src/images.rs::decode`
 
 This assumes the client shares the filesystem with the buffer. In a **daemon
 (`:connect` / edit-host split) session** that assumption is false: the editor (and so
@@ -38,11 +38,11 @@ async round-trip when the file is actually remote.
 
 1. **Server stamps `remote` on the marker.** `redraw.rs` already projects `win.image`
    into the redraw map. Add `remote = self.host_fs_async.is_some()`. The wire type
-   `nxvim_view::ImageData` gains a `remote: bool` parsed in `from_redraw`/`update`.
+   `bemtvi_view::ImageData` gains a `remote: bool` parsed in `from_redraw`/`update`.
    (Core's `ImageView` stays unchanged — core knows nothing of the daemon; `remote` is
    purely a redraw-projection concern.)
 
-2. **New RPC `nxvim_image_read [path] -> bin`.** Reads the file through the server's
+2. **New RPC `bemtvi_image_read [path] -> bin`.** Reads the file through the server's
    `host_fs_async` (daemon) — or local disk when `None` — and responds with the raw
    bytes (`Value::Binary`) or a loud error string. It is **async with a deferred
    response**: `dispatch` is synchronous, so `handle` intercepts this method, clones the
@@ -51,7 +51,7 @@ async round-trip when the file is actually remote.
    `Err` (the client shows its `[image: …]` placeholder).
 
 3. **Native clients fetch when `remote`.** When `image.remote` is true, the client does
-   not `ImageReader::open(path)`; instead it requests `nxvim_image_read` over the editor
+   not `ImageReader::open(path)`; instead it requests `bemtvi_image_read` over the editor
    RPC, decodes the returned bytes from memory (`ImageReader::new(Cursor::new(bytes))`),
    and feeds them into its existing path-keyed cache. While the fetch is in flight it
    paints the `[image: …]` placeholder, and on arrival it requests a repaint — exactly
@@ -61,8 +61,8 @@ async round-trip when the file is actually remote.
 ## Phases
 
 - **Phase 1 — server (this commit).** `remote` bit on `ImageData` + redraw projection;
-  `nxvim_image_read` RPC reading via `host_fs_async`. Tests (headless, via the daemon-fs
-  harness): a daemon session marks `remote = true` and `nxvim_image_read` returns the
+  `bemtvi_image_read` RPC reading via `host_fs_async`. Tests (headless, via the daemon-fs
+  harness): a daemon session marks `remote = true` and `bemtvi_image_read` returns the
   daemon's bytes; a local session marks `remote = false` and the RPC reads local disk.
 
 - **Phase 2 — GUI.** Async fetch pipeline feeding the wgpu texture cache: a render-thread
@@ -80,7 +80,7 @@ async round-trip when the file is actually remote.
 
 ## Test seams
 
-- Daemon-fs harness: `crates/nxvim-server/tests/daemon_fs.rs` shows
+- Daemon-fs harness: `crates/bemtvi-server/tests/daemon_fs.rs` shows
   `spawn_with_daemon_fs` (a `RemoteHostFs` over a `serve_fs_daemon`/`DaemonFs` duplex).
   Phase 1's image test reuses this shape.
 - Redraw marker assertions: `window0_field(m, "image")` + `map_get` (see

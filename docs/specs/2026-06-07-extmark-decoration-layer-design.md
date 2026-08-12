@@ -9,15 +9,15 @@ honest `_notimpl` (see *Non-goals*). This doc unblocks LSP semantic tokens and
 plugin-driven highlights; it does not build them.
 
 Builds directly on the projection pattern already shipped twice — treesitter
-highlights ([`treesitter.rs::highlights_for`](../../crates/nxvim-server/src/treesitter.rs))
-and LSP diagnostics ([`lsp/diagnostics.rs::diagnostics_for`](../../crates/nxvim-server/src/lsp/diagnostics.rs)).
+highlights ([`treesitter.rs::highlights_for`](../../crates/bemtvi-server/src/treesitter.rs))
+and LSP diagnostics ([`lsp/diagnostics.rs::diagnostics_for`](../../crates/bemtvi-server/src/lsp/diagnostics.rs)).
 An extmark layer is the *generalization* of those: a third highlight source that
 rides the same `*_for(buffer, numbers, styles)` → `window_value` seam.
 
 ## Why extmarks, and why first
 
 From the treesitter-Lua-platform design's non-goals: real
-`vim.treesitter.start` "needs an extmark/decoration layer nxvim doesn't have,"
+`vim.treesitter.start` "needs an extmark/decoration layer bemtvi doesn't have,"
 and LSP semantic tokens "share only the future highlight-layering primitive."
 That primitive is the **extmark**: a buffer-anchored position (or range) that
 shifts with edits and can carry a highlight group. Almost every plugin highlight
@@ -39,7 +39,7 @@ An extmark is identified by `(buffer, namespace, id)` and anchored to a byte
 range in the buffer's rope. v1 carries only what the highlight layer needs:
 
 ```rust
-// nxvim-core
+// bemtvi-core
 pub struct Extmark {
     pub id: u64,
     pub start: usize,           // byte offset, anchored, shifts with edits
@@ -49,7 +49,7 @@ pub struct Extmark {
 }
 ```
 
-Anchoring is **byte-offset based**, consistent with the rest of nxvim's text
+Anchoring is **byte-offset based**, consistent with the rest of bemtvi's text
 model (architecture.md → *Text model*). neovim stores `(row, col)`; we store a
 single byte offset and derive `(row, col)`/screen columns at projection time
 exactly as `highlights_for`/`diagnostics_for` already do via
@@ -67,7 +67,7 @@ stubs*).
 ## Storage
 
 Authoritative state lives in **core**, owned per buffer, so every front end
-shares identical behavior and `nxvim-core` stays pure/synchronous:
+shares identical behavior and `bemtvi-core` stays pure/synchronous:
 
 ```rust
 // per Buffer (or an editor-side side table keyed by BufferId — see "Open question")
@@ -85,7 +85,7 @@ the editor (not per buffer): the same namespace id addresses marks across all
 buffers.
 
 This also retires the known incomplete in
-[`install.rs`](../../crates/nxvim-lua/src/install.rs) (the `nvim_set_hl` note
+[`install.rs`](../../crates/bemtvi-lua/src/install.rs) (the `nvim_set_hl` note
 that "a non-zero `ns` is silently folded into the global namespace"): once
 namespaces are real, `HlSet` can be keyed by ns. (Per-window/`nvim_set_hl`
 namespacing is **not** in this doc's scope — we only make the namespace *ids*
@@ -94,7 +94,7 @@ real; folding `nvim_set_hl` onto them is a follow-up that this unblocks.)
 ## Anchor shifting (the load-bearing correctness piece)
 
 Every buffer mutation already funnels through two choke points in
-[`buffer.rs`](../../crates/nxvim-core/src/buffer.rs):
+[`buffer.rs`](../../crates/bemtvi-core/src/buffer.rs):
 
 - `Buffer::record(edit)` — runs after every `insert`/`remove`, carrying a
   `BufferEdit { start_byte, old_end_byte, new_end_byte, .. }`. This is the
@@ -170,9 +170,9 @@ a mark (the fast path is byte-identical to the pre-extmark projection).
 ## Lua API surface
 
 Mutations ride the existing **effect-queue** (`Shared` → drained in
-[`effects.rs`](../../crates/nxvim-server/src/effects.rs)); reads come from a
-**snapshot mirror** refreshed before each Lua run (like `nx._bufs`). New
-functions in [`install.rs`](../../crates/nxvim-lua/src/install.rs):
+[`effects.rs`](../../crates/bemtvi-server/src/effects.rs)); reads come from a
+**snapshot mirror** refreshed before each Lua run (like `btv._bufs`). New
+functions in [`install.rs`](../../crates/bemtvi-lua/src/install.rs):
 
 - `nvim_create_namespace(name) -> integer` — create-or-get; empty name ⇒ fresh
   anonymous ns. Resolved synchronously against the mirrored registry (and queued

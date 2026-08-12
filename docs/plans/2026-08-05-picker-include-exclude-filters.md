@@ -22,15 +22,15 @@ time I want to include the vendored tree I normally hide.
 ## The shape
 
 VSCode's search panel: alongside the query, a **files to include** and a **files
-to exclude** glob box. Ported to nxvim's picker, per the answers given:
+to exclude** glob box. Ported to bemtvi's picker, per the answers given:
 
 - **Hidden by default.** The picker looks exactly as it does today. `<C-g>`
   reveals the two rows and cycles focus through query → include → exclude. When
   the rows are collapsed but patterns are active, a compact badge on the prompt
   row keeps you from filtering blindly.
-- **Config defaults.** `nx.picker.setup{ exclude = { "**/target/**", … } }`
+- **Config defaults.** `btv.picker.setup{ exclude = { "**/target/**", … } }`
   pre-fills the boxes for every filterable picker.
-- **Persisted across restarts**, via the existing `nx.shada.plugin` store.
+- **Persisted across restarts**, via the existing `btv.shada.plugin` store.
 
 ```
 ┌─ Find Files ─────────────────────┐      ┌─ Find Files ─────────────────────┐
@@ -47,8 +47,8 @@ to exclude** glob box. Ported to nxvim's picker, per the answers given:
 ### 1. Patterns are normalized once, then handed to *both* engines
 
 The filter has to hold on every leg of both fallback chains: `rg` → `find` →
-`nx.fs.walk`, and `rg` → `grep` → `nx.fs.grep`. Only `rg` takes globs (`-g`), so
-the naive split — globs to `rg`, `nx.glob` for the other legs — puts two matchers
+`btv.fs.walk`, and `rg` → `grep` → `btv.fs.grep`. Only `rg` takes globs (`-g`), so
+the naive split — globs to `rg`, `btv.glob` for the other legs — puts two matchers
 in play and the legs stop enumerating the same set, which is exactly the property
 a1f84bc0 was careful to establish.
 
@@ -57,10 +57,10 @@ and burning the item cap on paths we are about to throw away. Pruning at the too
 is not a nicety here; it is what keeps the cap meaningful.
 
 So: do both, and remove the divergence at its root. Both engines are globset —
-`nx.glob` compiles through `globset` (`crates/nxvim-core/src/glob.rs`) and so does
+`btv.glob` compiles through `globset` (`crates/bemtvi-core/src/glob.rs`) and so does
 ripgrep — and they differ on exactly one thing that matters: a pattern with no
 `/`. `rg -g '!*.lock'` matches `a/b/c.lock` (gitignore's basename rule);
-`nx.glob.match("*.lock", "a/b/c.lock")` is `false`, because `*` stops at `/`.
+`btv.glob.match("*.lock", "a/b/c.lock")` is `false`, because `*` stops at `/`.
 
 One normalization pass, applied before either engine sees a pattern, closes it:
 
@@ -72,14 +72,14 @@ One normalization pass, applied before either engine sees a pattern, closes it:
 | `src/**`     | `src/**`        | already anchored, untouched
 
 Normalized patterns mean the same set to both engines, so `rg`'s pruning can only
-remove what `nx.glob` would have removed anyway. `nx.glob` stays authoritative —
+remove what `btv.glob` would have removed anyway. `btv.glob` stays authoritative —
 every leg's output, `rg`'s included, is tested by it in `push` — and `rg` becomes
 a pure optimization that cannot change the answer. One semantics, documented once.
 
 ### 2. The filter lives in `push`, not in each source
 
 `ctx.push` (`picker.lua:404-446`) is the single point every candidate crosses. A
-`nx.glob.set` pair compiled once per run and tested there gives include/exclude to
+`btv.glob.set` pair compiled once per run and tested there gives include/exclude to
 **every** source that yields paths — shipped or user-registered — for free, rather
 than asking each to re-implement it. Items with no `path` are passed through
 untouched.
@@ -120,7 +120,7 @@ struct PromptSet {
   `focused_mut()`, so typing edits whichever field has focus.
 - Two new picker actions in `apply_picker_action` (`menu.rs:1404`):
   `toggle_filters` (expand + focus `include`; collapse restores focus to `query`)
-  and `next_field`. Bound in `nx.picker.actions` (`picker.lua:37-58`) with a
+  and `next_field`. Bound in `btv.picker.actions` (`picker.lua:37-58`) with a
   default `<C-g>`; `<Tab>` is already `toggle_select` and stays.
 - Geometry: `chrome = prompt_rows * 2` (`menu.rs:1836`) becomes
   `prompt_rows + filter_rows + separator`. It is recomputed identically in
@@ -130,7 +130,7 @@ struct PromptSet {
   Option<String>` on `MenuView`, so the clients right-align a string instead of
   three copies of the counting logic.
 - Wire: `MenuView` (`core/view.rs:236`) → `redraw.rs:1951-1968` → `MenuData`
-  (`nxvim-view/src/view.rs:603`) → TUI `render.rs:2604`, GUI `render.rs:2706`,
+  (`bemtvi-view/src/view.rs:603`) → TUI `render.rs:2604`, GUI `render.rs:2706`,
   web `edithost/web/index.html`.
 
 Tests: prompt editing and caret per field, collapse/expand geometry, the badge,
@@ -145,12 +145,12 @@ unchanged.
   changes — `files` must re-run `rg` with new `-g` args, where a query edit only
   re-ranks locally.
 - `picker_query_changes` `(gen, query)` → plus the two pattern lists;
-  `run_picker_run` (`nxvim-lua/src/runtime.rs:2155`) and `nx._picker_run`
+  `run_picker_run` (`bemtvi-lua/src/runtime.rs:2155`) and `btv._picker_run`
   (`picker.lua:344`) grow them, surfacing as `ctx.include` / `ctx.exclude`.
-- `nx.picker._normalize(patterns)` implements the table above; `push` compiles the
-  two `nx.glob.set`s once per run and filters on `item.path`.
+- `btv.picker._normalize(patterns)` implements the table above; `push` compiles the
+  two `btv.glob.set`s once per run and filters on `item.path`.
 - `files` / `live_grep` splice `-g <pat>` / `-g !<pat>` into their `rg` argv next
-  to the existing `-g !.git`. The `find` / `grep` / `nx.fs` legs need no change —
+  to the existing `-g !.git`. The `find` / `grep` / `btv.fs` legs need no change —
   `push` covers them.
 - Pattern edits are debounced on the same 250 ms path as a dynamic query — for a
   **static** source too. Its re-run is a full tree walk, so undebounced, typing
@@ -160,7 +160,7 @@ unchanged.
 
 Tests: a temp tree with `src/a.rs`, `target/junk.rs`, `vendor/b.lock`; assert each
 of include-only, exclude-only, and both, over `files` and `live_grep`; assert the
-`find`/`nx.fs` legs filter identically — covered by testing BOTH a pure-Lua source
+`find`/`btv.fs` legs filter identically — covered by testing BOTH a pure-Lua source
 that spawns nothing (so only the sink can be filtering) and the shipped `rg`-backed
 ones; assert a bare
 `*.lock` catches `vendor/b.lock` (the normalization) and that removing the
@@ -175,26 +175,26 @@ picker opens already narrowed:
 ```lua
 -- a "find in sources" map: same picker, pre-scoped
 vim.keymap.set("n", "<leader>fs", function()
-  nx.picker.open("files", { include = { "src/**", "crates/**" } })
+  btv.picker.open("files", { include = { "src/**", "crates/**" } })
 end)
 
 -- grep everything except the vendored trees, boxes already showing
-nx.picker.open("live_grep", {
+btv.picker.open("live_grep", {
   exclude = { "vendor/", "**/*.min.js" },
   filters = "open",          -- reveal the rows instead of the collapsed badge
 })
 ```
 
-`include` / `exclude` take a list or a single string (the `nx.glob.any` idiom, so
+`include` / `exclude` take a list or a single string (the `btv.glob.any` idiom, so
 a caller taking "a glob or a list of globs" from its own config need not branch),
 and are normalized by the same pass as a typed pattern. They **seed** the boxes —
 the user can still edit or clear them for that session; they are not a lock.
 `filters` (`"open"` | `"collapsed"`, default `"collapsed"`) chooses whether the
 rows start revealed, since a caller that pre-filters usually wants that visible.
 
-- `nx.picker.setup{ include = {…}, exclude = {…}, history = N }` supplies the global
+- `btv.picker.setup{ include = {…}, exclude = {…}, history = N }` supplies the global
   defaults. Precedence, low → high: source spec → `setup` → the most recent line
-  used → `nx.picker.open` opts. The per-open opts sit at the top so a programmatic
+  used → `btv.picker.open` opts. The per-open opts sit at the top so a programmatic
   picker gets exactly the scope it asked for and is never surprised by a stale box;
   a picker opened *without* pattern opts restores yours.
 
@@ -212,7 +212,7 @@ the last-value behavior for free, so the simpler model is a strict subset.
 - The lines are recorded from the core's **capture at close**, not from the last
   source run — a dynamic source's re-run is debounced, so the run can lag the final
   keystroke by a pattern or two.
-- Storage is `nx.shada.plugin("picker")` — already isolated, capped and riding the
+- Storage is `btv.shada.plugin("picker")` — already isolated, capped and riding the
   ordinary shada cadence in whichever store the session uses. This needs **no**
   native/web cfg-split work, which the CLAUDE.md persist convention would otherwise
   demand.
@@ -231,14 +231,14 @@ recalled line actually re-running the source; per-box separation; `history = 0` 
 
 ## Notes
 
-- **`nx.picker.setup` and the "no parallel config table" non-goal.** The
+- **`btv.picker.setup` and the "no parallel config table" non-goal.** The
   configurable-widget-keys plan (`2026-06-16`, *Non-goals*) rules out
-  `nx.picker.setup{ mappings = … }` on the grounds that the keymap engine *is* the
+  `btv.picker.setup{ mappings = … }` on the grounds that the keymap engine *is* the
   configuration surface for keys. That reasoning is specific to mappings and is
   not weakened here: glob defaults are plain data with no engine of their own, and
   `setup` never grows a `mappings` key.
 - **`'wildignore'` is not a candidate.** It exists only as an accepted-but-unmodeled
-  name in the `nx._o_store` catch-all (`state.lua:551`) — nothing reads it — and it
+  name in the `btv._o_store` catch-all (`state.lua:551`) — nothing reads it — and it
   covers neither an include side nor per-search editing.
 - **`.git` stays hardcoded.** It is excluded because its object store is not
   source, which is not a user preference; it remains outside the box so an empty

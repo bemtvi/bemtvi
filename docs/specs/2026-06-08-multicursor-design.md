@@ -3,7 +3,7 @@
 **Status:** implemented. Scope is **single-buffer multi-editing** with a dedicated
 placement mode: drop N cursors, then have motions, operators, **visual mode**, and
 all the insert-entry / open-line / paste keys act on every cursor at once. This is
-a Helix/kakoune/Sublime-style multi-cursor built on top of nxvim's existing vim
+a Helix/kakoune/Sublime-style multi-cursor built on top of bemtvi's existing vim
 grammar, not a selection-first rewrite.
 
 The editing surface is now essentially complete: motions, the `d`/`y`/`c`/`=`
@@ -14,7 +14,7 @@ deliberate non-goal that remains is the `self.cursor` → cursor-set refactor, w
 is **explicitly not planned** — see *Non-goals* for why the replay model makes it
 unnecessary.
 
-The load-bearing claim, validated: **nxvim already had the hard part.** Keeping N
+The load-bearing claim, validated: **bemtvi already had the hard part.** Keeping N
 cursor positions correct as an edit at one of them shifts the bytes under the
 others is the classic multi-cursor nightmare — and it is exactly what the
 [extmark layer](2026-06-07-extmark-decoration-layer-design.md) already solves.
@@ -59,7 +59,7 @@ Normal ──<A-c>──▶ MultiCursor ──<Esc>──▶ Normal (cursors liv
 ## Why cursors are extmarks
 
 A secondary cursor is a **point extmark** in a reserved namespace,
-[`extmark::CURSOR_NS`](../../crates/nxvim-core/src/extmark.rs) (`u32::MAX`, far
+[`extmark::CURSOR_NS`](../../crates/bemtvi-core/src/extmark.rs) (`u32::MAX`, far
 above any `nvim_create_namespace` id). It carries no `hl_group`/`end`, so it
 renders nothing through the highlight layer and is filtered out of the
 user-facing `nvim_buf_get_extmarks` mirror.
@@ -67,14 +67,14 @@ user-facing `nvim_buf_get_extmarks` mirror.
 Storing them this way buys, for free:
 
 - **Edit-shift.** Every insert/remove funnels through
-  [`Buffer::record`](../../crates/nxvim-core/src/buffer.rs), which calls
+  [`Buffer::record`](../../crates/bemtvi-core/src/buffer.rs), which calls
   `ExtmarkStore::shift`. So an edit at any cursor keeps all the others' anchors
   correct, across every edit path, with no bespoke fix-up code.
 - **Undo/redo carry.** Extmarks ride the per-node undo snapshot, so cursors come
   back on undo (with one wrinkle the undo section resolves).
 
 Per-cursor **visual mode** adds a second reserved namespace,
-[`extmark::ANCHOR_NS`](../../crates/nxvim-core/src/extmark.rs) (`u32::MAX - 1`):
+[`extmark::ANCHOR_NS`](../../crates/bemtvi-core/src/extmark.rs) (`u32::MAX - 1`):
 each secondary cursor's visual anchor is a point extmark there, paired to its
 `CURSOR_NS` head **by the same id**, so the two are looked up and shifted together.
 Like cursors, anchors ride the edit choke point and render nothing through the
@@ -87,9 +87,9 @@ deliberately did *not* refactor that away; secondary cursors are an additive lay
 
 ## Mode
 
-[`Mode::MultiCursor`](../../crates/nxvim-core/src/mode.rs) is a placement mode.
+[`Mode::MultiCursor`](../../crates/bemtvi-core/src/mode.rs) is a placement mode.
 Its `label()` is `"MULTICURSOR"` (drives the status line and the client's
-`View::is_multicursor()`); its `short_code()` is `"m"` — a distinct nxvim-specific
+`View::is_multicursor()`); its `short_code()` is `"m"` — a distinct bemtvi-specific
 code (no vim equivalent) so a `mode()`-reading plugin (e.g. the status line) can
 detect placement mode and a Normal↔MultiCursor swap is a real `ModeChanged`
 (`n:m` / `m:n`). It matches the `'m'` keymap trie. It is not visual and not insert,
@@ -99,7 +99,7 @@ normal grammar, with the differences below.
 ### Mode-specific keymaps
 
 Placement mode has its **own** keymap bucket so a map can fire *only while
-placing*. In [`keymap.rs`](../../crates/nxvim-server/src/keymap.rs),
+placing*. In [`keymap.rs`](../../crates/bemtvi-server/src/keymap.rs),
 `mode_key(MultiCursor)` returns `'m'` (diverging from `short_code`'s `"n"`), so
 the matcher selects a dedicated `'m'` trie rather than the normal one. A user
 declares one with the `'m'` mode code:
@@ -126,8 +126,8 @@ is plain `Mode::Normal`, so normal maps already apply there and propagate throug
 the replay sweep; the **placement** phase now gets its own addressable mode.
 
 A runnable playground lives in
-[`examples/multicursor`](../../examples/multicursor) (`NXVIM_CONFIG=examples/multicursor
-cargo run -p nxvim -- examples/multicursor/sample.txt`): the same key mapped in
+[`examples/multicursor`](../../examples/multicursor) (`BEMTVI_CONFIG=examples/multicursor
+cargo run -p bemtvi -- examples/multicursor/sample.txt`): the same key mapped in
 both `'n'` and `'m'`, a placement string-RHS map (`<Tab>` → `wc`), an `''`
 all-mode map, and a normal-only map shown inert while placing.
 
@@ -157,7 +157,7 @@ motion. `cc` is the doubled-operator (linewise) form. All three funnel through
 
 The editing phase replays an ordinary single-cursor command at each cursor. Two
 primitives in
-[`editor/multicursor.rs`](../../crates/nxvim-core/src/editor/multicursor.rs):
+[`editor/multicursor.rs`](../../crates/bemtvi-core/src/editor/multicursor.rs):
 
 - **`for_each_cursor(f)`** — runs `f` once at the primary and once per secondary,
   parking `self.cursor` at each in turn so the normal effect helpers operate
@@ -174,7 +174,7 @@ common no-cursor case pay nothing.
 
 Crucially, a **motion is re-resolved at each cursor**: `w` lands at a different
 byte for each. So the Motion / TextObject / doubled-operator arms in
-[`command.rs`](../../crates/nxvim-core/src/editor/command.rs) call per-cursor
+[`command.rs`](../../crates/bemtvi-core/src/editor/command.rs) call per-cursor
 helpers (`apply_motion_once`, `apply_text_object_once`,
 `apply_doubled_operator_once`) that re-resolve and apply without resetting the
 pending state until the sweep is done. Wired:
@@ -210,7 +210,7 @@ where the edit shifted them. Two subtleties make the naïve approach wrong:
    cursors.
 2. That node's `snap.cursor` (the primary) is stale for the same reason.
 
-Fix, in [`undo.rs`](../../crates/nxvim-core/src/editor/undo.rs): at edit-start,
+Fix, in [`undo.rs`](../../crates/bemtvi-core/src/editor/undo.rs): at edit-start,
 `push_undo` → `refresh_undo_cursor_marks` **bakes the live cursor positions**
 (primary `snap.cursor` + the `CURSOR_NS` marks) into the snapshot of the node
 we'll undo back to (`UndoTree::set_cur_snapshot_cursors`). A normal restore then
@@ -236,7 +236,7 @@ selection. (The visual flag is captured up front, because an editing `f` like
 visual `c` flips the mode to Insert mid-sweep.)
 
 Operators on a multi-cursor selection route through
-[`operators.rs`](../../crates/nxvim-core/src/editor/operators.rs):
+[`operators.rs`](../../crates/bemtvi-core/src/editor/operators.rs):
 `visual_operate` → `visual_operate_multi` → `edit_each_cursor(|e|
 e.visual_operate_once(op, linewise))`, one undo group, each cursor bracketing its
 own `anchor..head` range.
@@ -278,7 +278,7 @@ A committed search — `/`, `?`, `n`, `N`, `*`, `#` — in **Normal** mode is tr
 as navigating away, which abandons the multi-cursor session and collapses to the
 primary. In **placement** mode the same search instead *navigates to* a match so
 you can drop a cursor there, so cursors are kept. One guard at the top of
-`run_search` ([`search.rs`](../../crates/nxvim-core/src/editor/search.rs)):
+`run_search` ([`search.rs`](../../crates/bemtvi-core/src/editor/search.rs)):
 
 ```rust
 if self.mode != Mode::MultiCursor {
@@ -296,11 +296,11 @@ so the extras are painted as cells.
 
 - The server projects each focused-window secondary cursor into the redraw as a
   `cursors` array of `[row, screen_col]` pairs
-  ([`view.rs`](../../crates/nxvim-core/src/view.rs) →
-  [`redraw.rs`](../../crates/nxvim-server/src/redraw.rs)); the client parses it
+  ([`view.rs`](../../crates/bemtvi-core/src/view.rs) →
+  [`redraw.rs`](../../crates/bemtvi-server/src/redraw.rs)); the client parses it
   into `WindowView.secondary_cursors`
-  ([`nxvim-view`](../../crates/nxvim-view/src/view.rs)).
-- [`render_secondary_cursors`](../../crates/nxvim-tui/src/render.rs) paints each
+  ([`bemtvi-view`](../../crates/bemtvi-view/src/view.rs)).
+- [`render_secondary_cursors`](../../crates/bemtvi-tui/src/render.rs) paints each
   placed cursor as a **reverse-video** cell — and tracks the mode-driven cursor
   *shape*: insert/replace → underline (a bar can't be drawn in one cell),
   everything else → reverse-video, so a mode change propagates to every cursor.
@@ -310,44 +310,44 @@ so the extras are painted as cells.
 - In visual mode each secondary cursor's **selection** is projected too:
   `WindowView.secondary_selection` (a per-row multi-span list, mirroring `search`)
   built by `secondary_selection_spans`, sent as `secondary_selection` in the
-  redraw, parsed in nxvim-view, and painted with the same `Visual` style as the
+  redraw, parsed in bemtvi-view, and painted with the same `Visual` style as the
   primary's selection. The primary's selection stays in `selection`.
 - Both are skipped mid-scroll-animation (like search/diagnostics), where
   interpolated positions wouldn't line up.
 
 ## Key files
 
-- [`crates/nxvim-core/src/editor/multicursor.rs`](../../crates/nxvim-core/src/editor/multicursor.rs)
+- [`crates/bemtvi-core/src/editor/multicursor.rs`](../../crates/bemtvi-core/src/editor/multicursor.rs)
   — `add_cursor`/`place_cursor_here`/`finish_multicursor`,
   `for_each_cursor`/`edit_each_cursor` (incl. the per-cursor register collector),
   `merge_overlapping_cursors`, `clear_secondary_cursors`, and the visual helpers
   `begin_visual_anchors`/`clear_anchor_marks`/`visual_swap_ends`/
   `secondary_selections`.
-- [`command.rs`](../../crates/nxvim-core/src/editor/command.rs) — the grammar (the
+- [`command.rs`](../../crates/bemtvi-core/src/editor/command.rs) — the grammar (the
   `<A-c>` and `c` arms, the per-cursor replay helpers, propagation guards, the
   visual-mode `o`/`O`→`VisualSwapEnds` routing, the `<Esc>` finish-vs-collapse
   logic).
-- [`insert.rs`](../../crates/nxvim-core/src/editor/insert.rs) —
+- [`insert.rs`](../../crates/bemtvi-core/src/editor/insert.rs) —
   `enter_insert_each` (per-cursor `a`/`A`/`i`/`I`), `insert_newline` (per-cursor
   `Enter`), the per-cursor `<Esc>` backstep.
-- [`operators.rs`](../../crates/nxvim-core/src/editor/operators.rs) —
+- [`operators.rs`](../../crates/bemtvi-core/src/editor/operators.rs) —
   `visual_operate_multi`/`visual_operate_once`, `paste_multi`/`paste_text`, and
   the `collect_cursor_register` hook in `yank_range`/`delete_yank_range`.
-- [`mode.rs`](../../crates/nxvim-core/src/mode.rs) — `Mode::MultiCursor`.
-- [`cmdline.rs`](../../crates/nxvim-core/src/editor/cmdline.rs) —
+- [`mode.rs`](../../crates/bemtvi-core/src/mode.rs) — `Mode::MultiCursor`.
+- [`cmdline.rs`](../../crates/bemtvi-core/src/editor/cmdline.rs) —
   `cmdline_return_mode`, so `/`-search and `:` return to placement mode.
-- [`undo.rs`](../../crates/nxvim-core/src/editor/undo.rs) — pre-edit cursor baking.
-- [`extmark.rs`](../../crates/nxvim-core/src/extmark.rs) — `CURSOR_NS` (heads),
+- [`undo.rs`](../../crates/bemtvi-core/src/editor/undo.rs) — pre-edit cursor baking.
+- [`extmark.rs`](../../crates/bemtvi-core/src/extmark.rs) — `CURSOR_NS` (heads),
   `ANCHOR_NS` (per-cursor visual anchors).
-- Rendering: [`view.rs`](../../crates/nxvim-core/src/view.rs),
-  [`redraw.rs`](../../crates/nxvim-server/src/redraw.rs),
-  [`nxvim-view`](../../crates/nxvim-view/src/view.rs),
-  [`render.rs`](../../crates/nxvim-tui/src/render.rs).
+- Rendering: [`view.rs`](../../crates/bemtvi-core/src/view.rs),
+  [`redraw.rs`](../../crates/bemtvi-server/src/redraw.rs),
+  [`bemtvi-view`](../../crates/bemtvi-view/src/view.rs),
+  [`render.rs`](../../crates/bemtvi-tui/src/render.rs).
 
 ## Testing
 
 Black-box, per the project convention.
-[`tests/editing/multicursor.rs`](../../crates/nxvim-server/tests/editing/multicursor.rs)
+[`tests/editing/multicursor.rs`](../../crates/bemtvi-server/tests/editing/multicursor.rs)
 drives `nvim_input` and asserts on `nvim_buf_get_lines` and the redraw `cursors`
 array. Coverage includes:
 
@@ -363,9 +363,9 @@ array. Coverage includes:
   `<Esc>`-keeps-cursors, and `o` swaps ends at every cursor.
 
 Single-cursor visual `o` is pinned in
-[`tests/editing/core_editing.rs`](../../crates/nxvim-server/tests/editing/core_editing.rs).
+[`tests/editing/core_editing.rs`](../../crates/bemtvi-server/tests/editing/core_editing.rs).
 Rendering is pinned in
-[`nxvim-tui/tests/paint.rs`](../../crates/nxvim-tui/tests/paint.rs): placed-cursor
+[`bemtvi-tui/tests/paint.rs`](../../crates/bemtvi-tui/tests/paint.rs): placed-cursor
 reverse-video, shape-follows-mode, and the active-cursor recolor.
 
 ## Done since the first slice

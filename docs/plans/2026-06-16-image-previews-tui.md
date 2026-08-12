@@ -6,7 +6,7 @@ review between phases.
 
 ## Goal & UX
 
-- `nx.o.imagepreview = true` (off by default) turns the feature on.
+- `btv.o.imagepreview = true` (off by default) turns the feature on.
 - With it on, `:e photo.png` (and the CLI arg, eventually) opens the file as an
   **inert preview buffer** — the picture is rendered; the bytes are *not* loaded
   as text. This is the "open = preview" model (cf. vim/image.nvim), confirmed with
@@ -16,7 +16,7 @@ review between phases.
 
 ## The architectural problem
 
-nxvim is a headless server + thin text-grid clients. The whole pipeline is cells:
+bemtvi is a headless server + thin text-grid clients. The whole pipeline is cells:
 buffers are ropes, the `View` projects to cell-coordinate spans, the redraw
 notification is msgpack text+spans, and every client (ratatui TUI, wgpu GUI,
 canvas web) paints a monospace grid. Nothing carries or draws a raster. So "show
@@ -28,7 +28,7 @@ Two invariants this must respect:
   never the image bytes. Base64-ing a multi-MB image into every redraw frame is
   the per-event-work-scales-with-output anti-pattern. Bytes are read/decoded once,
   client-side, and cached.
-- **Dogfood the nx API** — the policy/gating is the `nx.o.imagepreview` option;
+- **Dogfood the btv API** — the policy/gating is the `btv.o.imagepreview` option;
   the protocol + per-client rendering are legitimately Rust frame work (Lua can't
   blit pixels).
 
@@ -48,12 +48,12 @@ Two invariants this must respect:
 
 A window's image is a *reference*, carried per-window:
 
-- core `nxvim_core::view::WindowView` gains `image: Option<ImageView>` where
+- core `bemtvi_core::view::WindowView` gains `image: Option<ImageView>` where
   `ImageView { path: String }` (Phase 1). Phase 2 may add `size`/`mtime_ms` for a
   precise client cache key if statting client-side proves insufficient.
 - `redraw.rs` emits it as a per-window sub-map `{"image": {"path": …}}` (or `Nil`
   when absent — older/none clients ignore it).
-- wire `nxvim_view::WindowView` gains the mirror `image: Option<ImageData>`.
+- wire `bemtvi_view::WindowView` gains the mirror `image: Option<ImageData>`.
 
 The buffer marks itself: `Buffer::image: bool`, set by `Buffer::from_image_file`
 (stats the file for its disk snapshot but does **not** read the bytes — the rope
@@ -68,10 +68,10 @@ The whole bool-option surface for `imagepreview`:
 - `options.rs`: `Options.imagepreview` field + default `false`; `:set` name table
   entry `"imagepreview" => Bool`.
 - `editor/options.rs`: `apply_set_bool` arm.
-- `editor/windows.rs`: `set_global_option_bool` arm (the `vim.o`/`nx.o` write seam).
-- `nxvim-lua/runtime.rs`: `GoMirror.imagepreview` field.
-- `nxvim-server/effects.rs`: `GoMirror { … imagepreview: go.imagepreview }`.
-- `nxvim-lua/prelude/state.lua`: option name-map + defaults entries.
+- `editor/windows.rs`: `set_global_option_bool` arm (the `vim.o`/`btv.o` write seam).
+- `bemtvi-lua/runtime.rs`: `GoMirror.imagepreview` field.
+- `bemtvi-server/effects.rs`: `GoMirror { … imagepreview: go.imagepreview }`.
+- `bemtvi-lua/prelude/state.lua`: option name-map + defaults entries.
 
 Image policy + plumbing:
 - `editor/mod.rs`: `is_image_path(path) -> bool` (extension table, sibling of
@@ -84,7 +84,7 @@ Image policy + plumbing:
   CLI-at-construction opens don't preview yet — Phase 3.)
 - `view.rs`: `ImageView` + `WindowView.image`, projected in `window_view()`.
 - `redraw.rs`: emit the `image` sub-map.
-- `nxvim-view/view.rs`: `ImageData` + parse.
+- `bemtvi-view/view.rs`: `ImageData` + parse.
 - Bump ratatui to `=0.30.1`.
 
 Test (black-box harness): with `imagepreview` on, `:e <tmp>.png` yields a redraw
@@ -95,7 +95,7 @@ Commit, pause for review.
 
 ### Phase 2 — TUI rendering
 
-- Add `ratatui-image` to `nxvim-tui`.
+- Add `ratatui-image` to `bemtvi-tui`.
 - Build a `Picker` once at startup (after alt-screen) — detects protocol + cell
   pixel size. Hold a path-keyed cache of `(DynamicImage, StatefulProtocol)`;
   decode-from-disk once, re-encode only on rect change.
@@ -110,7 +110,7 @@ Commit, pause for review.
 
 - Graphics-protocol redraw artifacts (clear/repaint on scroll), large-image
   downscale-on-decode, `ThreadProtocol` if synchronous re-encode stutters.
-- CLI-open ordering so `nxvim photo.png` previews when config set the option
+- CLI-open ordering so `bemtvi photo.png` previews when config set the option
   (today the CLI buffer is built at `Editor` construction, before user config
   runs).
 - Later/optional: GUI (wgpu texture) and web (`<img>`/canvas + out-of-band byte

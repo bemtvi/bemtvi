@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the nxvim book's source from the repository.
+"""Generate the bemtvi book's source from the repository.
 
 Two pipelines feed the book, both run here so the published site cannot drift
 from the code:
@@ -8,24 +8,24 @@ from the code:
      repo-relative links to absolute GitHub URLs (so a single edit to the
      canonical doc updates the book).
 
-  2. nx.* API reference — extracts every PUBLIC declaration from the Lua prelude
+  2. btv.* API reference — extracts every PUBLIC declaration from the Lua prelude
      together with the doc-comment block above it, one page per top-level
-     namespace (nx._private excluded). The prelude declares its public surface in
+     namespace (btv._private excluded). The prelude declares its public surface in
      six shapes, one collector each:
-       * `function nx.NS.name(args)` / `nx.NS.name = function(args)` /
-         `nx.NS.name = nx.async(function(args)` — a promise-returning verb, which
+       * `function btv.NS.name(args)` / `btv.NS.name = function(args)` /
+         `btv.NS.name = btv.async(function(args)` — a promise-returning verb, which
          is a plain public shape here, not an implementation detail    (DECL_RE)
-       * `nx.NS = { name = function(args) … }` table literals   (collect_table_literals)
+       * `btv.NS = { name = function(args) … }` table literals   (collect_table_literals)
        * a factory installing one verb table onto twin surfaces  (collect_surface_factories)
-         — `nx.git` / `nx.git_local`
-       * a module-local alias, `local M = nx.NS` + `function M.name()`
+         — `btv.git` / `btv.git_local`
+       * a module-local alias, `local M = btv.NS` + `function M.name()`
                                                           (collect_module_aliases)
-       * a HANDLE's methods — `function View:mount(opts)` on an object an `nx.*`
+       * a HANDLE's methods — `function View:mount(opts)` on an object an `btv.*`
          function hands back                              (collect_handle_methods)
-       * a documented public VALUE — `nx.json.null = …`         (collect_values)
+       * a documented public VALUE — `btv.json.null = …`         (collect_values)
      A COVERAGE GUARD then fails the build if any namespace the prelude creates
      produced no page, so a seventh shape cannot silently drop a whole module the
-     way the alias shape hid `nx.plugins` and `nx.editorconfig`; an unmapped handle
+     way the alias shape hid `btv.plugins` and `btv.editorconfig`; an unmapped handle
      table fails the same way (HANDLE_SURFACES).
 
 Finally it renders src/SUMMARY.md from src/SUMMARY.template.md, replacing the
@@ -46,10 +46,10 @@ GEN_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOK_DIR = os.path.dirname(GEN_DIR)
 REPO_ROOT = os.path.dirname(BOOK_DIR)
 SRC_DIR = os.path.join(BOOK_DIR, "src")
-PRELUDE_DIR = os.path.join(REPO_ROOT, "crates", "nxvim-lua", "src", "prelude")
+PRELUDE_DIR = os.path.join(REPO_ROOT, "crates", "bemtvi-lua", "src", "prelude")
 
-GH_BLOB = "https://github.com/davidrios/nxvim/blob/main"
-GH_RAW = "https://raw.githubusercontent.com/davidrios/nxvim/main"
+GH_BLOB = "https://github.com/davidrios/bemtvi/blob/main"
+GH_RAW = "https://raw.githubusercontent.com/davidrios/bemtvi/main"
 
 
 def die(msg):
@@ -82,7 +82,7 @@ IMPORTS = [
     ("docs/edit-host-split.md", "features/edit-host-split.md"),
     ("docs/architecture.md", "architecture/overview.md"),
     ("docs/recommended-plugins.md", "guide/recommended-plugins.md"),
-    ("docs/nx-model.md", "plugins/nx-model.md"),
+    ("docs/btv-model.md", "plugins/btv-model.md"),
     ("docs/first-party-plugins.md", "plugins/first-party.md"),
     ("docs/plugin-authoring.md", "plugins/authoring.md"),
     ("docs/async.md", "plugins/async.md"),
@@ -181,39 +181,39 @@ def import_docs():
 
 
 # ---------------------------------------------------------------------------
-# 2. nx.* API reference extraction
+# 2. btv.* API reference extraction
 # ---------------------------------------------------------------------------
 DECL_RE = re.compile(
-    r"^\s*(?:function\s+(nx\.[A-Za-z0-9_.]+)\s*\(([^)]*)\)"
-    r"|(nx\.[A-Za-z0-9_.]+)\s*=\s*(?:nx\.async\s*\(\s*)?function\s*\(([^)]*)\))"
+    r"^\s*(?:function\s+(btv\.[A-Za-z0-9_.]+)\s*\(([^)]*)\)"
+    r"|(btv\.[A-Za-z0-9_.]+)\s*=\s*(?:btv\.async\s*\(\s*)?function\s*\(([^)]*)\))"
 )
-# `nx.NS = {` opening a namespace table literal whose fields are the public
-# functions (e.g. `nx.fs_local = { exists = function(path) … }` in localseam.lua).
-TABLE_OPEN_RE = re.compile(r"^\s*(nx\.[A-Za-z0-9_.]+)\s*=\s*\{\s*$")
+# `btv.NS = {` opening a namespace table literal whose fields are the public
+# functions (e.g. `btv.fs_local = { exists = function(path) … }` in localseam.lua).
+TABLE_OPEN_RE = re.compile(r"^\s*(btv\.[A-Za-z0-9_.]+)\s*=\s*\{\s*$")
 FIELD_FN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function\s*\(([^)]*)\)")
-# A factory that installs the SAME verb table onto several `nx.*` surfaces via a
+# A factory that installs the SAME verb table onto several `btv.*` surfaces via a
 # local parameter (e.g. `local function define(surface, bridge)` in git.lua, with
-# `function surface.head(path)` methods, invoked as `define(nx.git, …)` /
-# `define(nx.git_local, …)`). One verb table, two surfaces, no drift.
+# `function surface.head(path)` methods, invoked as `define(btv.git, …)` /
+# `define(btv.git_local, …)`). One verb table, two surfaces, no drift.
 LOCAL_FACTORY_RE = re.compile(r"^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)")
 SURFACE_METHOD_RE = re.compile(
     r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]+)\s*\(([^)]*)\)"
 )
-# A module-local ALIAS for a namespace: `local M = nx.plugins` at the top level, after
-# which the file writes `function M.lock()` instead of `function nx.plugins.lock()`.
+# A module-local ALIAS for a namespace: `local M = btv.plugins` at the top level, after
+# which the file writes `function M.lock()` instead of `function btv.plugins.lock()`.
 # Purely a spelling choice, but it hides the whole module from `DECL_RE` — which is how
-# `nx.plugins` (28 public fns) and `nx.editorconfig` went undocumented for their entire
-# existence. Only a bare `nx.<NS>` right-hand side counts (`local M = {}` is a plain
+# `btv.plugins` (28 public fns) and `btv.editorconfig` went undocumented for their entire
+# existence. Only a bare `btv.<NS>` right-hand side counts (`local M = {}` is a plain
 # table, not a namespace).
-MODULE_ALIAS_RE = re.compile(r"^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(nx\.[A-Za-z0-9_]+)\s*$")
+MODULE_ALIAS_RE = re.compile(r"^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(btv\.[A-Za-z0-9_]+)\s*$")
 ALIAS_ASSIGN_RE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]+)\s*=\s*function\s*\(([^)]*)\)"
 )
-# A method on a HANDLE — an object an `nx.*` function hands back, whose methods are
+# A method on a HANDLE — an object an `btv.*` function hands back, whose methods are
 # called with `:` (`function View:mount(opts)`, `function client_handle:exec_cmd(…)`).
-# These are public API the same way a namespace function is, but they name no `nx.`
+# These are public API the same way a namespace function is, but they name no `btv.`
 # holder, so every one of them was invisible here: 76 methods across 15 handles,
-# including the whole of `nx.view`'s View, `Promise`, and the LSP client handle.
+# including the whole of `btv.view`'s View, `Promise`, and the LSP client handle.
 HANDLE_METHOD_RE = re.compile(
     r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*):([A-Za-z0-9_]+)\s*\(([^)]*)\)"
 )
@@ -222,44 +222,44 @@ HANDLE_METHOD_RE = re.compile(
 # receiver is what the docs call it (`view:mount(opts)`, not `View:mount(opts)`), so an
 # entry reads as the call site would spell it.
 HANDLE_SURFACES = {
-    "client_handle": ("lsp", "client"),  # nx.lsp.clients() / client_by_id()
-    "Ctx": ("test", "ctx"),  # the `nx.test` spec context
-    "debounced": ("utils", "debounced"),  # nx.utils.debounce / throttle
-    "defer_handle": ("nx", "timer"),  # nx.timer
-    "float_handle": ("ui", "float"),  # nx.ui.float
-    "Iter": ("nx", "iter"),  # nx.iter
-    "Mount": ("http", "mount"),  # nx.http.mount
-    "Option": ("opt", "opt"),  # nx.opt.<name>
-    "Process": ("process", "process"),  # nx.process.open
-    "Promise": ("nx", "promise"),  # nx.async / nx.await / nx.run / nx.promise.*
-    "Response": ("http", "response"),  # nx.http.fetch
-    "Socket": ("socket", "socket"),  # nx.socket.connect
-    "Stream": ("nx", "stream"),  # nx.run_stream
-    "View": ("view", "view"),  # nx.view.create
-    "Watch": ("fs", "watch"),  # nx.fs.watch
+    "client_handle": ("lsp", "client"),  # btv.lsp.clients() / client_by_id()
+    "Ctx": ("test", "ctx"),  # the `btv.test` spec context
+    "debounced": ("utils", "debounced"),  # btv.utils.debounce / throttle
+    "defer_handle": ("btv", "timer"),  # btv.timer
+    "float_handle": ("ui", "float"),  # btv.ui.float
+    "Iter": ("btv", "iter"),  # btv.iter
+    "Mount": ("http", "mount"),  # btv.http.mount
+    "Option": ("opt", "opt"),  # btv.opt.<name>
+    "Process": ("process", "process"),  # btv.process.open
+    "Promise": ("btv", "promise"),  # btv.async / btv.await / btv.run / btv.promise.*
+    "Response": ("http", "response"),  # btv.http.fetch
+    "Socket": ("socket", "socket"),  # btv.socket.connect
+    "Stream": ("btv", "stream"),  # btv.run_stream
+    "View": ("view", "view"),  # btv.view.create
+    "Watch": ("fs", "watch"),  # btv.fs.watch
 }
-# Handle tables that are genuinely internal — no `nx.*` function hands one to a caller,
-# so there is nothing for a reader to call these on. Both are `nx.component` internals:
+# Handle tables that are genuinely internal — no `btv.*` function hands one to a caller,
+# so there is nothing for a reader to call these on. Both are `btv.component` internals:
 # `inst` is the component instance the framework owns, `proxy` the reactive-state
 # wrapper a component sees only as a plain table.
 PRIVATE_HANDLES = {"inst", "proxy"}
-# A documented public VALUE (`nx.json.null = setmetatable(…)`) — not every public name is
+# A documented public VALUE (`btv.json.null = setmetatable(…)`) — not every public name is
 # a function, and the collectors above only look for functions, so a value's doc-comment
 # was extracted nowhere. Anchored at column 0 (a top-level assignment, never one inside a
 # function body) and paired with the docstring convention below, which is what keeps
 # aliases and internal assignments out.
-VALUE_ASSIGN_RE = re.compile(r"^(nx\.[A-Za-z0-9_.]+)\s*=\s*(?!function\b|nx\.async\b)\S")
-# `nx.X = nx.X or {}` — the namespace-creation idiom, not a value. Its doc block is the
+VALUE_ASSIGN_RE = re.compile(r"^(btv\.[A-Za-z0-9_.]+)\s*=\s*(?!function\b|btv\.async\b)\S")
+# `btv.X = btv.X or {}` — the namespace-creation idiom, not a value. Its doc block is the
 # namespace's blurb, which opens by naming the namespace and so otherwise reads as a
 # documented value and renders as an entry on its own page.
-NAMESPACE_IDIOM_RE = re.compile(r"^nx\.([A-Za-z0-9_]+)\s*=\s*nx\.\1\s+or\s+\{\}\s*$")
+NAMESPACE_IDIOM_RE = re.compile(r"^btv\.([A-Za-z0-9_]+)\s*=\s*btv\.\1\s+or\s+\{\}\s*$")
 # Namespaces the prelude creates that legitimately expose NO functions, so the
 # "every namespace is documented" guard below must not flag them. Keep this list tiny and
 # justified — an entry here is a claim that the namespace is pure data.
 NO_PUBLIC_API = {
-    # `nx.g` is the global-variable table (the `vim.g` alias) — values, not functions.
+    # `btv.g` is the global-variable table (the `vim.g` alias) — values, not functions.
     "g",
-    # `nx.cmdline` holds only `nx.cmdline.actions[name] = fn`, a registry written by
+    # `btv.cmdline` holds only `btv.cmdline.actions[name] = fn`, a registry written by
     # callers (keymap.lua); it declares no functions of its own.
     "cmdline",
 }
@@ -285,15 +285,15 @@ def escape_angles_outside_code(text):
 
 
 def is_private(dotted):
-    return "._" in dotted or dotted.startswith("nx._")
+    return "._" in dotted or dotted.startswith("btv._")
 
 
 def ns_title(ns):
-    return "nx" if ns == "nx" else "nx.%s" % ns
+    return "btv" if ns == "btv" else "btv.%s" % ns
 
 
 def ns_page(ns):
-    return "nx.md" if ns == "nx" else "nx.%s.md" % ns
+    return "btv.md" if ns == "btv" else "btv.%s.md" % ns
 
 
 def doc_above(lines, idx):
@@ -332,7 +332,7 @@ def _brace_delta(line):
 
 
 def collect_table_literals(lines):
-    """Yield (name, args, decl_idx) for `nx.NS = { field = function(args) }` decls.
+    """Yield (name, args, decl_idx) for `btv.NS = { field = function(args) }` decls.
 
     Only fields at the table's top level (brace depth 1) count, so nested tables
     and inline `{ … }` values inside a field body are never mistaken for methods.
@@ -356,8 +356,8 @@ def collect_surface_factories(lines):
     """Yield (name, args, decl_idx) for the twin-surface factory pattern.
 
     A `local function F(p1, …)` whose body adds `function p1.method(args)` and is
-    later called as `F(nx.git, …)` / `F(nx.git_local, …)` installs one verb table
-    onto every `nx.*` surface passed at p1's argument position. We emit each method
+    later called as `F(btv.git, …)` / `F(btv.git_local, …)` installs one verb table
+    onto every `btv.*` surface passed at p1's argument position. We emit each method
     under every such surface, so both twins are documented from the single source.
     """
     # param name -> (factory F, 0-based position of that param)
@@ -370,8 +370,8 @@ def collect_surface_factories(lines):
         for pos, pname in enumerate(params):
             surface_params[pname] = (f.group(1), pos)
 
-    # For each factory, the `nx.*` surfaces bound to each param position across all
-    # of its call sites: factory F -> { pos -> [nx.NS, …] }.
+    # For each factory, the `btv.*` surfaces bound to each param position across all
+    # of its call sites: factory F -> { pos -> [btv.NS, …] }.
     factory_surfaces = {}
     for line in lines:
         for pname, (factory, pos) in surface_params.items():
@@ -379,7 +379,7 @@ def collect_surface_factories(lines):
             if not call:
                 continue
             argv = [a.strip() for a in call.group(1).split(",")]
-            if pos < len(argv) and re.match(r"^nx\.[A-Za-z0-9_]+$", argv[pos]):
+            if pos < len(argv) and re.match(r"^btv\.[A-Za-z0-9_]+$", argv[pos]):
                 factory_surfaces.setdefault(factory, {}).setdefault(pos, []).append(argv[pos])
 
     for i, line in enumerate(lines):
@@ -398,9 +398,9 @@ def collect_surface_factories(lines):
 def collect_module_aliases(lines):
     """Yield (name, args, decl_idx) for functions written through a module-local alias.
 
-    A file may alias its namespace once (`local M = nx.plugins`) and then declare every
+    A file may alias its namespace once (`local M = btv.plugins`) and then declare every
     public function as `function M.lock()`. That is invisible to `DECL_RE`, which only
-    matches a literal `nx.`-prefixed holder — so the whole module silently produces no
+    matches a literal `btv.`-prefixed holder — so the whole module silently produces no
     page. Resolve the alias and emit under the real namespace.
     """
     aliases = {}
@@ -423,7 +423,7 @@ def collect_handle_methods(lines, fname):
     """Yield (ns, display, args, decl_idx) for `function Handle:method(args)` decls.
 
     A handle's methods are public API — `view:mount{}`, `promise:next(fn)`,
-    `client:exec_cmd(cmd)` — but they carry no `nx.` holder, so no other collector sees
+    `client:exec_cmd(cmd)` — but they carry no `btv.` holder, so no other collector sees
     them. Every handle must be mapped in HANDLE_SURFACES or declared internal in
     PRIVATE_HANDLES: an unmapped one is a new public object silently producing no docs,
     which is exactly the failure mode the namespace coverage guard exists to prevent.
@@ -439,19 +439,19 @@ def collect_handle_methods(lines, fname):
         if not surface:
             die(
                 "unmapped handle table `%s` (%s:%d declares `%s:%s`).\n"
-                "       Add it to HANDLE_SURFACES with the nx.* page a reader would look\n"
+                "       Add it to HANDLE_SURFACES with the btv.* page a reader would look\n"
                 "       on and the receiver name callers write, or to PRIVATE_HANDLES if\n"
-                "       no nx.* function ever hands one out." % (holder, fname, i + 1, holder, method)
+                "       no btv.* function ever hands one out." % (holder, fname, i + 1, holder, method)
             )
         ns, receiver = surface
         yield (ns, "%s:%s" % (receiver, method), args, i)
 
 
 def collect_values(lines):
-    """Yield (name, decl_idx) for documented public `nx.NAME = <value>` declarations.
+    """Yield (name, decl_idx) for documented public `btv.NAME = <value>` declarations.
 
     Only a top-level assignment whose doc block OPENS by naming it (the prelude's
-    ``-- `nx.json.null`: …`` convention) counts. That one rule is what separates a
+    ``-- `btv.json.null`: …`` convention) counts. That one rule is what separates a
     documented value from the aliases and internal wiring assigned all over the prelude
     — those either carry no doc block or document something else.
     """
@@ -466,14 +466,14 @@ def collect_values(lines):
 
 
 def collect_created_namespaces(lines):
-    """The `nx.<NS>` namespaces a file creates via the `nx.X = nx.X or {}` idiom.
+    """The `btv.<NS>` namespaces a file creates via the `btv.X = btv.X or {}` idiom.
 
     Backs the coverage guard: a namespace that exists at runtime but produces no page is
     either undocumented or (rarely) data-only, and the two must be told apart explicitly.
     """
     out = set()
     for line in lines:
-        m = re.match(r"^nx\.([A-Za-z0-9_]+)\s*=\s*nx\.\1\s+or\s+\{\}\s*$", line)
+        m = re.match(r"^btv\.([A-Za-z0-9_]+)\s*=\s*btv\.\1\s+or\s+\{\}\s*$", line)
         if m:
             out.add(m.group(1))
     return out
@@ -485,13 +485,13 @@ def extract_api():
     # namespace -> list of (name, args, doc); insertion order preserved.
     namespaces = {}
     seen = set()
-    created = set()  # every `nx.X = nx.X or {}` namespace, for the coverage guard
+    created = set()  # every `btv.X = btv.X or {}` namespace, for the coverage guard
     files = sorted(f for f in os.listdir(PRELUDE_DIR) if f.endswith(".lua"))
     for fname in files:
         with open(os.path.join(PRELUDE_DIR, fname), encoding="utf-8") as f:
             lines = f.read().split("\n")
         # Gather every public declaration from the three real prelude shapes:
-        # direct `function nx.NS.name` / `nx.NS.name = function`, namespace table
+        # direct `function btv.NS.name` / `btv.NS.name = function`, namespace table
         # literals, and twin-surface factories. Sort by source line so a page's
         # entries stay in file order regardless of which collector found them.
         # Each entry is (line, name, args, ns_override): `ns_override` is set only for
@@ -525,20 +525,20 @@ def extract_api():
             if ns_override:
                 ns = ns_override
             else:
-                parts = name[len("nx.") :].split(".")
-                ns = "nx" if len(parts) == 1 else parts[0]
+                parts = name[len("btv.") :].split(".")
+                ns = "btv" if len(parts) == 1 else parts[0]
             doc = doc_above(lines, i)
             namespaces.setdefault(ns, []).append(
                 (name, None if args is None else args.strip(), doc, fname)
             )
 
     if not namespaces:
-        die("extracted zero nx.* declarations — extraction is broken")
+        die("extracted zero btv.* declarations — extraction is broken")
 
     # COVERAGE GUARD. The check above only catches total failure; it cannot notice a single
-    # module going missing, which is exactly what happened — `nx.plugins` (28 public
-    # functions) and `nx.editorconfig` were absent for their whole existence because they
-    # alias their namespace (`local M = nx.plugins`) and no collector resolved that. A
+    # module going missing, which is exactly what happened — `btv.plugins` (28 public
+    # functions) and `btv.editorconfig` were absent for their whole existence because they
+    # alias their namespace (`local M = btv.plugins`) and no collector resolved that. A
     # namespace that exists at runtime must either produce a page or be declared data-only,
     # so the next module written in an unrecognized style fails the build instead of
     # quietly vanishing.
@@ -547,27 +547,27 @@ def extract_api():
     )
     if undocumented:
         die(
-            "these nx.* namespaces exist in the prelude but produced no API page: %s\n"
+            "these btv.* namespaces exist in the prelude but produced no API page: %s\n"
             "       Either their functions are declared in a form no collector in this file\n"
             "       recognizes (add a collector), or they are genuinely data-only (add them\n"
             "       to NO_PUBLIC_API with a comment saying why)." % ", ".join(undocumented)
         )
 
     total = sum(len(v) for v in namespaces.values())
-    # Order: the top-level `nx` page first, then namespaces alphabetically.
-    ordered = sorted(namespaces.keys(), key=lambda n: (n != "nx", n))
+    # Order: the top-level `btv` page first, then namespaces alphabetically.
+    ordered = sorted(namespaces.keys(), key=lambda n: (n != "btv", n))
 
     for ns in ordered:
         entries = namespaces[ns]
         out = ["# `%s`\n" % ns_title(ns)]
-        if ns == "nx":
+        if ns == "btv":
             out.append(
-                "Top-level `nx.*` functions (those without a sub-namespace), plus the\n"
+                "Top-level `btv.*` functions (those without a sub-namespace), plus the\n"
                 "methods of the handles they hand back (`promise:`, `iter:`, `stream:`,\n"
                 "`timer:`).\n"
             )
         out.append(
-            "<!-- GENERATED from crates/nxvim-lua/src/prelude/ by"
+            "<!-- GENERATED from crates/bemtvi-lua/src/prelude/ by"
             " book/gen/generate.py. Do not edit. -->\n"
         )
         for name, args, doc, fname in entries:
@@ -578,19 +578,19 @@ def extract_api():
             else:
                 out.append("_No documentation comment in the prelude._\n")
             out.append(
-                "<sub>Defined in [`%s`](%s/crates/nxvim-lua/src/prelude/%s).</sub>\n"
+                "<sub>Defined in [`%s`](%s/crates/bemtvi-lua/src/prelude/%s).</sub>\n"
                 % (fname, GH_BLOB, fname)
             )
         write(os.path.join(SRC_DIR, "api", ns_page(ns)), "\n".join(out))
 
     # Reference index page.
     idx = [
-        "# nx.* API Reference\n",
-        "The public `nx.*` Lua API, **extracted directly from the prelude**",
-        "(`crates/nxvim-lua/src/prelude/*.lua`) by `book/gen/generate.py`. Every",
+        "# btv.* API Reference\n",
+        "The public `btv.*` Lua API, **extracted directly from the prelude**",
+        "(`crates/bemtvi-lua/src/prelude/*.lua`) by `book/gen/generate.py`. Every",
         "entry is a public declaration — a function, a handle method",
-        "(`view:mount(opts)`), or a value (`nx.json.null`) — plus its doc-comment;",
-        "private `nx._*` internals are excluded. This is the canonical surface per",
+        "(`view:mount(opts)`), or a value (`btv.json.null`) — plus its doc-comment;",
+        "private `btv._*` internals are excluded. This is the canonical surface per",
         "[ADR 0002](%s/docs/decisions/0002-native-plugin-system.md).\n" % GH_BLOB,
         "| Namespace | Entries |",
         "| --------- | --------- |",
@@ -603,7 +603,7 @@ def extract_api():
     write(os.path.join(SRC_DIR, "api", "index.md"), "\n".join(idx) + "\n")
 
     print(
-        "  extracted %d nx.* entries across %d namespaces"
+        "  extracted %d btv.* entries across %d namespaces"
         % (total, len(ordered))
     )
     return ordered
@@ -629,10 +629,10 @@ def render_summary(namespaces):
 
 
 def main():
-    print("Generating the nxvim book from source...")
+    print("Generating the bemtvi book from source...")
     print("Importing curated docs:")
     import_docs()
-    print("Extracting nx.* API reference:")
+    print("Extracting btv.* API reference:")
     namespaces = extract_api()
     print("Rendering table of contents:")
     render_summary(namespaces)

@@ -13,7 +13,7 @@ A few specifics differ from the sketch below; the shape is the same:
   removes the siblings it absorbed — so the dir is bounded by live sessions, not
   launches (verified by `remote_shada_compacts_and_merges_across_sessions`). The
   dir is a *sibling* of the daemon's native `shada_dir()` and `read_dir` is
-  non-recursive, so a daemon that also runs nxvim natively never globs these as
+  non-recursive, so a daemon that also runs bemtvi natively never globs these as
   its own store (no extension trick needed — Phase 2's `.shada` rename is gone).
   Two concurrent remote sessions merge by recency; cross-machine liveness can't
   be detected, so a live sibling may be transiently removed and re-uploaded
@@ -64,7 +64,7 @@ session runs the **daemon's** config or the **local** config — and make shada
 
 ## Current behavior (baseline)
 
-- `crates/nxvim/src/main.rs`: connecting (`--connect-daemon`, or a `nxvim://`
+- `crates/bemtvi/src/main.rs`: connecting (`--connect-daemon`, or a `bemtvi://`
   URI) routes through `run_with_daemon` / `run_with_daemon_quic` →
   `run_edit_host_session`, which **always** does
   `client.config.fetch().await` → `materialize_remote_config(bundle)` and points
@@ -82,8 +82,8 @@ session runs the **daemon's** config or the **local** config — and make shada
 Ship the config-source switch first; shada follows in Phase 2.
 
 1. **CLI flag.** Add `--remote-config` (bool) to `Cli`
-   (`crates/nxvim/src/main.rs`). Only meaningful with a connect target; fail
-   loud (`bail!`) if given without `--connect-daemon`/`nxvim://`. Define a small
+   (`crates/bemtvi/src/main.rs`). Only meaningful with a connect target; fail
+   loud (`bail!`) if given without `--connect-daemon`/`bemtvi://`. Define a small
    `enum ConfigSource { Local, Remote }` and thread it through
    `run_with_daemon` / `run_with_daemon_quic` → `run_edit_host_session`.
 
@@ -107,7 +107,7 @@ Ship the config-source switch first; shada follows in Phase 2.
      the daemon's disk — buffers/fs are still remote) and `ts_autoinstall`.
    - Shada stays `shada.store()` (local) in both branches this phase.
 
-4. **Tests** (`nxvim-server` edit-host suite): connect with and without
+4. **Tests** (`bemtvi-server` edit-host suite): connect with and without
    `--remote-config`; assert the loaded config differs (e.g. a sentinel option
    the daemon's `init.lua` sets vs the local one). Reuse the per-leg
    `RemoteConfig::connect` test seam.
@@ -122,7 +122,7 @@ Ship the config-source switch first; shada follows in Phase 2.
 2. **Download at connect** (before building the editor, alongside the config
    fetch in `run_edit_host_session`): `client.host_fs.read(remote_file)`. If
    `["file", bytes]` → write to a local **staging dir** (per-pid, under
-   `$XDG_CACHE_HOME/nxvim/remote-shada/<pid>`); if `["new"]` → start empty.
+   `$XDG_CACHE_HOME/bemtvi/remote-shada/<pid>`); if `["new"]` → start empty.
    Construct `RedbFileStore::new(staging)` (unchanged) as `ServerInit::shada`.
    The staged file is merged as a sibling into our fresh instance file exactly
    like the local model.

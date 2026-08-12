@@ -8,7 +8,7 @@ foldmethod, and docs + example config (+ the `vim.bo`/`vim.wo` fold-option wirin
 are done; `foldtext` customization and the `syntax`/`diff` foldmethods remain
 deferred.
 
-Implements code folding in nxvim. Scope (decided): full fold parity — a generic
+Implements code folding in bemtvi. Scope (decided): full fold parity — a generic
 fold model with **manual**, **indent**, **expr / tree-sitter**, and **LSP
 foldingRange** sources, rendered with both the collapsed placeholder line *and* a
 `foldcolumn` gutter. Tree-sitter is the headline source; the model, commands,
@@ -23,19 +23,19 @@ explicitly lists *folds* as pending), and it reuses that machinery wholesale.
 There is **no** fold implementation today, but the groundwork is unusually
 favorable — three independent explorations confirmed:
 
-- **Tree-sitter engine runs synchronous queries.** `nxvim-ts` (`engine.rs`,
+- **Tree-sitter engine runs synchronous queries.** `bemtvi-ts` (`engine.rs`,
   `loader.rs`) already loads/compiles `highlights` + `indents` + `injections`
   per language and runs them in-process on the keypress tick via the
-  `SyntaxEngine` trait (`crates/nxvim-core/src/syntax.rs`). Adding `folds` is the
+  `SyntaxEngine` trait (`crates/bemtvi-core/src/syntax.rs`). Adding `folds` is the
   same shape as `indents`: a new `Option<Query>` on `Grammar`, a new
   `is_engine_query()` arm, and a new trait method. The `folds` query file is
   *already fetched and cached* during grammar install
-  (`nxvim-ts/src/install.rs:42` lists `"folds"`; web `grammars.js` `QUERY_KINDS`
+  (`bemtvi-ts/src/install.rs:42` lists `"folds"`; web `grammars.js` `QUERY_KINDS`
   too) — it is simply never consumed.
 - **The view model anticipated folds.** `RowKind` in
-  `crates/nxvim-core/src/view.rs:68` (`Line` / `VirtLine` / `Filler`) carries the
+  `crates/bemtvi-core/src/view.rs:68` (`Line` / `VirtLine` / `Filler`) carries the
   comment that a fold/diff-filler row "is just another arm here". The redraw
-  projection (`crates/nxvim-server/src/redraw.rs`) emits **one entry per visible
+  projection (`crates/bemtvi-server/src/redraw.rs`) emits **one entry per visible
   screen row** as parallel arrays (`lines` / `numbers` / `continuation` / signs /
   highlights …); hidden lines are simply *absent* from the row vector, which is
   exactly the collapsed-fold shape.
@@ -45,10 +45,10 @@ favorable — three independent explorations confirmed:
   new continuations on the same stage. The continuation table even labels the `z`
   stage "Scroll / fold" (`command.rs:1493`).
 - **A viewport-change signal exists.** `DecorViewport`
-  (`crates/nxvim-core/src/editor/decor.rs:28`, drained via `take_decor_dirty()`)
+  (`crates/bemtvi-core/src/editor/decor.rs:28`, drained via `take_decor_dirty()`)
   already fires `{win, buf, top, bot, generation}` on scroll/resize/edit — the
   natural trigger to (re)compute folds for the visible range.
-- **LSP foldingRange is a stubbed placeholder.** `nxvim-lsp/src/dispatch.rs:609`
+- **LSP foldingRange is a stubbed placeholder.** `bemtvi-lsp/src/dispatch.rs:609`
   routes `"textDocument/foldingRange"` to a `req_textDocument_foldingRange` that
   does not exist yet.
 
@@ -56,19 +56,19 @@ favorable — three independent explorations confirmed:
 
 | Concern | File | Anchor |
 | --- | --- | --- |
-| `RowKind` / `RenderRow` / `WindowView` | `nxvim-core/src/view.rs` | `:68`, `:91`, `:347` |
-| Redraw row projection / unbundle | `nxvim-server/src/redraw.rs` | `window_value` `:358`, `unbundle_rows` `:1594` |
-| Protocol parse (clients) | `nxvim-view/src/view.rs` | `parse_window` `:975` |
-| `z`-prefix dispatch | `nxvim-core/src/editor/command.rs` | `:190`, `:1076`, `:1493` |
-| Cursor screen-row / scroll math | `nxvim-core/src/editor/cursor.rs` | `cursor_screen_row` `:406`, `line_text_rows` `:364`, `scroll_top_for_bottom` `:428` |
-| Motions (j/k/gj/gk/G/gg) | `nxvim-core/src/editor/motions.rs` | `resolve_motion` `:134`, `display_motion` `:294` |
-| Options struct | `nxvim-core/src/options.rs` | global `:11`, window `WindowOptions` |
-| Window state (per-window) | `nxvim-core/src/editor/windows.rs` | `Window` `:356` |
-| Syntax engine trait | `nxvim-core/src/syntax.rs` | trait `:57` |
-| TS engine / grammar | `nxvim-ts/src/engine.rs`, `loader.rs` | `is_engine_query` `engine.rs:1532`, `Grammar` `loader.rs:47` |
-| Viewport signal | `nxvim-core/src/editor/decor.rs` | `DecorViewport` `:28` |
-| LSP folding stub | `nxvim-lsp/src/dispatch.rs` | `:609` |
-| TUI / GUI gutter render | `nxvim-tui/src/render.rs`, `nxvim-gui/src/render.rs` | `render_gutter` `tui:1185`, gutter layout `gui:998` |
+| `RowKind` / `RenderRow` / `WindowView` | `bemtvi-core/src/view.rs` | `:68`, `:91`, `:347` |
+| Redraw row projection / unbundle | `bemtvi-server/src/redraw.rs` | `window_value` `:358`, `unbundle_rows` `:1594` |
+| Protocol parse (clients) | `bemtvi-view/src/view.rs` | `parse_window` `:975` |
+| `z`-prefix dispatch | `bemtvi-core/src/editor/command.rs` | `:190`, `:1076`, `:1493` |
+| Cursor screen-row / scroll math | `bemtvi-core/src/editor/cursor.rs` | `cursor_screen_row` `:406`, `line_text_rows` `:364`, `scroll_top_for_bottom` `:428` |
+| Motions (j/k/gj/gk/G/gg) | `bemtvi-core/src/editor/motions.rs` | `resolve_motion` `:134`, `display_motion` `:294` |
+| Options struct | `bemtvi-core/src/options.rs` | global `:11`, window `WindowOptions` |
+| Window state (per-window) | `bemtvi-core/src/editor/windows.rs` | `Window` `:356` |
+| Syntax engine trait | `bemtvi-core/src/syntax.rs` | trait `:57` |
+| TS engine / grammar | `bemtvi-ts/src/engine.rs`, `loader.rs` | `is_engine_query` `engine.rs:1532`, `Grammar` `loader.rs:47` |
+| Viewport signal | `bemtvi-core/src/editor/decor.rs` | `DecorViewport` `:28` |
+| LSP folding stub | `bemtvi-lsp/src/dispatch.rs` | `:609` |
+| TUI / GUI gutter render | `bemtvi-tui/src/render.rs`, `bemtvi-gui/src/render.rs` | `render_gutter` `tui:1185`, gutter layout `gui:998` |
 
 ## Design
 
@@ -112,12 +112,12 @@ defer syntax), `foldexpr` (fde), `foldmarker` (fmr), `foldnestmax` (fdn),
 `SyntaxEngine::folds(buf, first, last) -> Vec<FoldRegion>` runs the compiled
 `folds.scm` (`@fold` captures), mirroring `extract_spans`. `@fold` node ranges →
 per-line levels by containment depth. Built-in `foldmethod=expr` with the
-canonical `nx.treesitter.foldexpr` short-circuits to this native call (fast
+canonical `btv.treesitter.foldexpr` short-circuits to this native call (fast
 path); an arbitrary Lua `foldexpr` is evaluated per line (vim-compatible, slower).
 Recompute is driven by `DecorViewport` + `changedtick`, reusing the incremental
 tree — no reparse.
 
-**Web/wasm caveat:** the web build has no `nxvim-ts`; tree-sitter runs in JS
+**Web/wasm caveat:** the web build has no `bemtvi-ts`; tree-sitter runs in JS
 (`highlight.js`). Manual + indent folds are pure-core and work on web unchanged.
 Tree-sitter folds on web need a JS `folds.scm` runner feeding ranges into the
 core fold store across the edit-host seam (mirrors how `ts-indent.js` reimplements
@@ -142,7 +142,7 @@ spine end-to-end first.
   `zR`/`zM` (all), `zv` (view cursor), `zn`/`zN`/`zi` (fold-enable toggles).
 - Redraw projection: new `RowKind::Fold { line, count }`, hidden lines dropped
   from the row vector, `foldtext` rendered into the placeholder row. Protocol
-  carries it via the existing parallel-array shape (`nxvim-view` parse updated).
+  carries it via the existing parallel-array shape (`bemtvi-view` parse updated).
 - **Tests:** create a manual fold, close it, assert hidden lines absent from
   redraw rows + placeholder text present; `zo` restores them; `zR`/`zM`;
   `foldlevel`/`foldenable` interplay.
@@ -200,7 +200,7 @@ shows up.
 ### Phase 4 — Tree-sitter folds (the headline)
 
 **4a — native. ✅ done**
-- `nxvim-ts`: `folds: Option<Query>` on `Grammar` (`loader.rs`), `"folds"` arm in
+- `bemtvi-ts`: `folds: Option<Query>` on `Grammar` (`loader.rs`), `"folds"` arm in
   `is_engine_query` + `recompile_query` (`engine.rs`), load/compile `folds.scm`.
 - `SyntaxEngine::folds()` / `folds_available()` (trait + impl) extracting `@fold`
   node ranges; `Engine::folds` runs the query and trims a node ending at column 0
@@ -208,15 +208,15 @@ shows up.
 - `foldmethod=expr` (`FoldMethod::Expr` + a per-buffer `'foldexpr'` string, stored
   beside `commentstring` since it's not `Copy`). A `FoldSource` resolver classifies
   `expr` into `Treesitter` (the canonical foldexpr — recognized by
-  `is_treesitter_foldexpr`, the `v:lua.`/`nx.`/`vim.` spellings) vs `GenericExpr`
+  `is_treesitter_foldexpr`, the `v:lua.`/`btv.`/`vim.` spellings) vs `GenericExpr`
   (Phase 5; produces no folds, warns at set-time — not a silent no-op).
   `compute_treesitter_folds` turns the engine's `@fold` ranges into per-line levels
   **by containment depth** (capped at `foldnestmax`), then reuses
   `ranges_from_levels` — the same Phase-3 spine. Cache key (`FoldKey`) now keys on
   the `FoldSource`. Recompute is `changedtick`-driven through the input loop;
   `DecorViewport`-scoped recompute is a deferred perf follow-up.
-- `nx.treesitter.foldexpr` Lua surface (+ the `vim.treesitter.foldexpr` alias),
-  authored in `prelude/nx.lua`. It is a **native marker** (the string reference the
+- `btv.treesitter.foldexpr` Lua surface (+ the `vim.treesitter.foldexpr` alias),
+  authored in `prelude/btv.lua`. It is a **native marker** (the string reference the
   fold engine recognizes), so calling it directly fails loud (per-line Lua foldexpr
   eval is Phase 5).
 - **Tests:** hermetic dispatch tests in `tests/editing/folds.rs` (expr accepted,
@@ -246,7 +246,7 @@ per edit rather than scoping to the `DecorViewport` + reusing the incremental tr
 
 ### Phase 5 — Generic `foldexpr` + LSP foldingRange ✅ done
 
-Both halves are **server-pushed external fold sources**: nxvim-core can't run Lua
+Both halves are **server-pushed external fold sources**: bemtvi-core can't run Lua
 or talk to a language server, so the server computes the structure out-of-band and
 pushes it into a new per-buffer `external_folds` store on the `Editor` (tagged with
 the `changedtick` it was computed for); `refresh_folds`' `GenericExpr`/`Lsp` arms
@@ -262,9 +262,9 @@ A stale push (for a since-edited buffer) is ignored until the server re-pushes.
   `ranges_from_levels`. Cached by `changedtick`; a broken foldexpr fails loud on
   the message line once per edit. The tree-sitter foldexpr stays the native
   short-circuit. (Native only — the browser edit-host folds JS-side.)
-- **LSP `foldingRange`** (`fold.rs` `Lsp`): a new `nx.lsp.foldexpr` marker (+
+- **LSP `foldingRange`** (`fold.rs` `Lsp`): a new `btv.lsp.foldexpr` marker (+
   `vim.lsp.foldexpr` alias, fail-loud on direct call) selects the source.
-  `nxvim-lsp` gained the typed `LspRequest::FoldingRange`/`LspReply::Folds`, the
+  `bemtvi-lsp` gained the typed `LspRequest::FoldingRange`/`LspReply::Folds`, the
   `folding_range` client+provider capability, and the `dispatch`/`sync_client`
   legs (so it works on native **and** the wasm daemon path). The server requests
   ranges from `redraw` (`maybe_request_folding_range`, after `sync_lsp` flushes
@@ -273,11 +273,11 @@ A stale push (for a since-edited buffer) is ignored until the server re-pushes.
   source, retrying until the server initializes; the reply is stale-dropped on a
   tick change and pushed via `Editor::set_lsp_folds` (containment depth → levels,
   the same `ranges_from_containment` helper tree-sitter uses). The mock LSP
-  (`nxvim-lsp/src/mock.rs`) scripts `folding_ranges` + advertises the provider.
+  (`bemtvi-lsp/src/mock.rs`) scripts `folding_ranges` + advertises the provider.
 - **Tests:** generic foldexpr folds returned levels, reflows on a content-driven
   edit, and fails loud on a bad expr (`tests/editing/folds.rs`); the LSP markers
   alias + fail loud on call; an end-to-end mock-LSP `foldingRange` collapses the
-  buffer (`crates/nxvim/tests/lsp_features.rs`).
+  buffer (`crates/bemtvi/tests/lsp_features.rs`).
 
 Knowingly deferred (shared with the earlier phases): recompute is focused-window-
 only and whole-buffer (no `DecorViewport` scoping / incremental reuse); generic
@@ -290,7 +290,7 @@ foldexpr supports the `v:lua.` Lua spelling, not arbitrary vimscript exprs; the
 `d{motion}`) or a linewise-visual selection over a *closed* fold acts on the whole
 fold range, via the existing `fold_line_start`/`fold_line_end` helpers in
 `apply_operator`'s `Linewise` arm and `visual_range_lw`. (`>>`/`<<` shift operators
-aren't implemented in nxvim at all — a separate gap, not a fold one.) Tests:
+aren't implemented in bemtvi at all — a separate gap, not a fold one.) Tests:
 dd / yy / dj / linewise-visual over a closed fold each take the full range.
 
 **6b — manual-fold shada persistence. ✅ done.** A file's **manual** folds (each
@@ -325,12 +325,12 @@ end-marker line stays inside its fold), feeding the same `ranges_from_levels` sp
 as indent/expr. `'foldmarker'` is a per-buffer `(start, end)` string pair stored
 beside `'foldexpr'` (not a `Copy` `BufferOptions` slot); wired through `:set
 foldmarker=…` (E474 on anything but a distinct non-empty `start,end` pair) and the
-`vim.bo`/`nx.bo` bridge (`set_buffer_option_str` + the `BUF_OPT_CANON`/`fmr`
+`vim.bo`/`btv.bo` bridge (`set_buffer_option_str` + the `BUF_OPT_CANON`/`fmr`
 whitelist). Changing the markers busts the structure cache (they don't enter the
 `FoldKey`). Being pure-core, it works on the web/wasm edit-host unchanged. Tests
 (`tests/editing/folds.rs`): a marked block folds, nested markers nest, a numbered
 marker sets an absolute level, a custom `'foldmarker'` changes the delimiters,
-editing reflows the fold, an invalid `'foldmarker'` fails loud, and the `nx.bo`
+editing reflows the fold, an invalid `'foldmarker'` fails loud, and the `btv.bo`
 write reaches the live engine.
 
 **Deferred (not done):**
@@ -361,7 +361,7 @@ write reaches the live engine.
 
 ## Test surface summary
 
-All black-box via `nxvim-test-harness`: manual create/close/open and redraw-row
+All black-box via `bemtvi-test-harness`: manual create/close/open and redraw-row
 assertions (P1), motion/scroll/fold-column (P2), indent nesting (P3), hermetic
 grammar fold fixtures + Playwright web (P4), mock-LSP folding + custom foldexpr
 (P5), shada round-trip + operator-over-fold (P6).

@@ -2,7 +2,7 @@
 
 **Status:** plan / not started · **Date:** 2026-06-01
 
-Goal: stand up nxvim's colorscheme runtime — a colorscheme is a pure-Lua module
+Goal: stand up bemtvi's colorscheme runtime — a colorscheme is a pure-Lua module
 that fills the highlight registry — and have it actually recolor the editor:
 text (treesitter groups), the line-number gutter, the visual selection, and the
 status/command lines. The worked example here is the pure-Lua
@@ -42,7 +42,7 @@ Traced from the plugin source (`init.lua`, `colors/catppuccin.lua`,
    `Visual`, `StatusLine`, …), and treesitter groups (`@comment`, `@string`,
    `@keyword`, `@function.call`, …), many defined as **links** to others.
 
-So "make catppuccin work" decomposes into four capabilities nxvim lacks today:
+So "make catppuccin work" decomposes into four capabilities bemtvi lacks today:
 
 - **A plugin runtime**: `require` resolving modules off a runtimepath, a place
   to drop the plugin, and an `init.lua` sourced at startup.
@@ -51,7 +51,7 @@ So "make catppuccin work" decomposes into four capabilities nxvim lacks today:
 - **A highlight-group registry**: `nvim_set_hl` storing fg/bg/sp/attrs/links, a
   `:colorscheme` command that sources `colors/<name>.lua`, and link resolution.
 - **A theme→screen pipeline**: today the **client** owns colors
-  (`nxvim-tui::group_style` hardcodes ANSI per treesitter family). catppuccin
+  (`bemtvi-tui::group_style` hardcodes ANSI per treesitter family). catppuccin
   moves color ownership to the plugin, so the **server** must resolve each
   capture/region to a concrete (truecolor) style and the client must render it.
 
@@ -94,8 +94,8 @@ each later phase is testable only because the earlier one landed.
 ### Phase 1 — Plugin runtime: `require`, runtimepath, and `init.lua` ✅ DONE (2026-06-01)
 
 **Landed:** `ServerInit` gained `config_dir` + `runtimepath`;
-`nxvim_server::default_runtime()` resolves them from `$NXVIM_CONFIG` /
-`$XDG_CONFIG_HOME` / `$HOME` + `$NXVIM_RUNTIMEPATH` + `pack/*/start/*` discovery
+`bemtvi_server::default_runtime()` resolves them from `$BEMTVI_CONFIG` /
+`$XDG_CONFIG_HOME` / `$HOME` + `$BEMTVI_RUNTIMEPATH` + `pack/*/start/*` discovery
 (binary calls it; tests pass explicit paths to avoid env races).
 `LuaRuntime::new(runtimepath)` seeds `package.path` (`<rt>/lua/?.lua`,
 `<rt>/lua/?/init.lua`) and exposes `runtimepath()` for Phase 3's `colors/` search.
@@ -112,26 +112,26 @@ all work — so Phase 4 can pursue strategy A (run catppuccin's real compiler).
 **Why first:** nothing about catppuccin can run until `require("catppuccin")`
 resolves a file on disk. `Lua::new()` already loads the safe stdlib (so
 `package`/`require`/`io`/`os` exist), but `package.path` points nowhere useful
-and nxvim has no concept of a runtimepath, a plugin directory, or a startup
+and bemtvi has no concept of a runtimepath, a plugin directory, or a startup
 script.
 
 **Scope**
-- Define nxvim's runtimepath and config story (smallest thing that works):
-  - A config dir (XDG: `$XDG_CONFIG_HOME/nxvim` → `~/.config/nxvim`, override
-    with `$NXVIM_CONFIG`) containing `init.lua`.
+- Define bemtvi's runtimepath and config story (smallest thing that works):
+  - A config dir (XDG: `$XDG_CONFIG_HOME/bemtvi` → `~/.config/bemtvi`, override
+    with `$BEMTVI_CONFIG`) containing `init.lua`.
   - A pack/plugin dir for installed plugins (e.g. `<config>/pack/*/start/*` or a
     flat `<config>/plugins/*`), each plugin contributing its `lua/` to the
     module search path and its root to the runtimepath (so `colors/*.lua` is
     findable). Use a conventional pack/runtimepath layout so a pure-Lua
     colorscheme checkout is drop-in.
-  - Allow `$NXVIM_RUNTIMEPATH` (a list) so tests can point at a fixture/checkout
+  - Allow `$BEMTVI_RUNTIMEPATH` (a list) so tests can point at a fixture/checkout
     without touching the user's home.
-- In `nxvim-lua`: on `LuaRuntime::new`, seed `package.path` from the runtimepath
+- In `bemtvi-lua`: on `LuaRuntime::new`, seed `package.path` from the runtimepath
   (`<rt>/lua/?.lua;<rt>/lua/?/init.lua;…`) and record the runtimepath so later
   phases can search `colors/`, `after/`, etc. Decide modules-via-`package.path`
   vs. a custom `package.loaders` searcher; `package.path` is enough for
   catppuccin and simpler.
-- In `nxvim-server`/`nxvim`: at startup, after the Lua runtime is built, source
+- In `bemtvi-server`/`bemtvi`: at startup, after the Lua runtime is built, source
   `init.lua` if present (run it through the same `drain_lua` path so its queued
   commands apply). Thread the runtimepath from the binary into the server init
   (extend `ServerInit`).
@@ -145,13 +145,13 @@ script.
   status message asserted via the `redraw` view, or writes via an `nvim_command`
   that the test reads back).
 - `init.lua` in the config dir runs at server startup.
-- A test points `$NXVIM_RUNTIMEPATH` at a temp dir and proves both the module
+- A test points `$BEMTVI_RUNTIMEPATH` at a temp dir and proves both the module
   search and the `init.lua` sourcing.
 
 **Handoff notes**
-- Touch points: `crates/nxvim-lua/src/lib.rs` (package.path + runtimepath
-  storage), `crates/nxvim-server/src/lib.rs` (`ServerInit`, startup sourcing),
-  `crates/nxvim/src/main.rs` (resolve config/runtimepath, pass down).
+- Touch points: `crates/bemtvi-lua/src/lib.rs` (package.path + runtimepath
+  storage), `crates/bemtvi-server/src/lib.rs` (`ServerInit`, startup sourcing),
+  `crates/bemtvi/src/main.rs` (resolve config/runtimepath, pass down).
 - Don't expand `vim.*` here — that's Phase 2. Just get files loading.
 - Keep the runtimepath as data on `LuaRuntime` (Phase 3 reads it to find
   `colors/<name>.lua`).
@@ -160,7 +160,7 @@ script.
 
 ### Phase 2 — Broaden the `vim.*` surface (no highlights yet) ✅ DONE (2026-06-01)
 
-**Landed:** a bundled Lua prelude (`crates/nxvim-lua/src/prelude.lua`,
+**Landed:** a bundled Lua prelude (`crates/bemtvi-lua/src/prelude.lua`,
 `include_str!`-loaded at VM init) provides the pure-Lua surface —
 `tbl_deep_extend`/`tbl_extend`/`tbl_filter`/`tbl_keys`/`tbl_values`/`tbl_map`/
 `tbl_contains`/`tbl_isempty`, `deepcopy`, `list_extend`, `split`, `startswith`/
@@ -169,7 +169,7 @@ script.
 (plain store), `vim.o` (`background`/`termguicolors`/`winblend`/`pumblend`
 defaults), `vim.opt` (scalar proxy over `vim.o`), `vim.env` (read-through to
 `os.getenv`), and the registration APIs `nvim_create_user_command` /
-`nvim_create_augroup` / `nvim_create_autocmd` (stored in `nx._user_commands` /
+`nvim_create_augroup` / `nvim_create_autocmd` (stored in `btv._user_commands` /
 `_augroups` / `_autocmds`) plus a no-op `nvim_set_hl` stub. `vim.cmd` became
 callable **and** indexable (`vim.cmd.set("number")` → `:set number`). Rust-backed
 `vim.fn` (`stdpath`, `getftime`, `isdirectory`, `mkdir`, `has`) covers what needs
@@ -190,7 +190,7 @@ plugin's `setup()` — the mini-plugin proves the surface shape instead.
 **Why:** `setup()` and the load path call a wide but shallow set of helpers. Get
 them all present so catppuccin's Lua *executes* to completion (highlights still
 no-op until Phase 3). Most are pure Lua — ship them as a **Lua prelude** loaded
-at runtime init (the nxvim analogue of neovim's `runtime/lua/vim/shared.lua`),
+at runtime init (the bemtvi analogue of neovim's `runtime/lua/vim/shared.lua`),
 not as Rust, so they stay faithful and cheap to maintain.
 
 **Scope** — provide at least what the traced load path uses:
@@ -229,13 +229,13 @@ not as Rust, so they stay faithful and cheap to maintain.
   command registered via `nvim_create_user_command` then invoked as `:Catppuccin`.
 
 **Handoff notes**
-- Touch points: `crates/nxvim-lua/src/lib.rs` + a new bundled prelude `.lua`
-  (embed with `include_str!`, run at init). `crates/nxvim-core/src/editor.rs` and
+- Touch points: `crates/bemtvi-lua/src/lib.rs` + a new bundled prelude `.lua`
+  (embed with `include_str!`, run at init). `crates/bemtvi-core/src/editor.rs` and
   `options.rs` for `background`/`termguicolors` options + user-command dispatch
   from `execute_ex`.
 - Anything editor-affecting must round-trip through the existing
   `lua_queue`/`drain_lua` mechanism — don't let Lua mutate the editor directly
-  (keeps `nxvim-core` pure).
+  (keeps `bemtvi-core` pure).
 - Leave `nvim_set_hl` a no-op stub that *accepts* the full arg shape
   (`(ns, name, { fg, bg, sp, bold, italic, underline, undercurl, reverse,
   link, … })`) so Phase 3 only has to add storage.
@@ -244,22 +244,22 @@ not as Rust, so they stay faithful and cheap to maintain.
 
 ### Phase 3 — Highlight-group registry + `:colorscheme` + link resolution ✅ DONE (2026-06-01)
 
-**Landed:** a pure `Highlights` registry (`crates/nxvim-core/src/highlight.rs`)
+**Landed:** a pure `Highlights` registry (`crates/bemtvi-core/src/highlight.rs`)
 on `Editor` — `HlDef` (fg/bg/sp as 24-bit `Rgb` + the six boolean attrs +
 `link`), `set`/`clear`/`get`, a cycle-guarded `resolve(group) -> Style` that
 follows link chains, and `resolve_capture(capture)` that walks the standard
 fallback chain (`function.call` → `@function.call` → `@function` → `Function`,
-then a legacy-group map for the captures nxvim-ts emits). `parse_color` handles
+then a legacy-group map for the captures bemtvi-ts emits). `parse_color` handles
 `#rrggbb`, a small named-color set, and `NONE`. `nvim_set_hl` is now Rust-backed
-in `nxvim-lua` (captures the opts shape — incl. integer→`#rrggbb` colors — into
+in `bemtvi-lua` (captures the opts shape — incl. integer→`#rrggbb` colors — into
 `Shared.highlights`, exposed via `take_highlights()`/the new `HlSet`); the
 server folds them into the registry through the existing `apply_lua_effects`
 drain, so the core stays the sole mutator. `:colorscheme <name>` sources
 `colors/<name>.lua` off the runtimepath, records `g:colors_name`, and fires the
-`ColorScheme` autocmd (new prelude `nx._fire` + `LuaRuntime::fire_autocmd`);
+`ColorScheme` autocmd (new prelude `btv._fire` + `LuaRuntime::fire_autocmd`);
 missing → `E185`. `:hi clear` empties the registry. New RPCs: `nvim_get_hl(0,
 {name})` (link-resolved style as RGB ints + attr flags) and the
-`nxvim_resolve_capture` debug hook. Tests in `editing.rs`:
+`bemtvi_resolve_capture` debug hook. Tests in `editing.rs`:
 `nvim_set_hl_stores_resolved_colors_and_attrs`,
 `nvim_get_hl_follows_links_to_the_target_color`,
 `capture_resolves_through_the_group_fallback_chain`,
@@ -275,7 +275,7 @@ phase the full catppuccin highlight table lives in the server, queryable, with
 links resolved — even though nothing is repainted yet (Phase 5).
 
 **Scope**
-- A `Highlights` registry (new module in `nxvim-core`, kept pure — it's just a
+- A `Highlights` registry (new module in `bemtvi-core`, kept pure — it's just a
   map + resolver, no I/O). Stores per-group attrs: `fg`/`bg`/`sp` as 24-bit RGB
   (parse `"#rrggbb"` and the small set of named colors catppuccin uses),
   booleans (`bold`, `italic`, `underline`, `undercurl`, `strikethrough`,
@@ -286,7 +286,7 @@ links resolved — even though nothing is repainted yet (Phase 5).
   the registry back to the built-in defaults.
 - Link resolution: `resolve(group) -> ResolvedStyle` follows `link` chains
   (cycle-guarded) to a concrete style; unresolved/empty → none.
-- Treesitter capture → highlight group mapping. nxvim-ts emits capture names
+- Treesitter capture → highlight group mapping. bemtvi-ts emits capture names
   like `keyword`, `string`, `function.call`. Map to neovim's `@`-group
   convention (`@keyword`, `@string`, `@function.call`) and walk the standard
   fallback chain (`@function.call` → `@function` → `Function`) so a theme that
@@ -309,11 +309,11 @@ links resolved — even though nothing is repainted yet (Phase 5).
 - `:hi clear` empties back to defaults.
 
 **Handoff notes**
-- Touch points: new `crates/nxvim-core/src/highlight.rs` (registry + resolver +
+- Touch points: new `crates/bemtvi-core/src/highlight.rs` (registry + resolver +
   capture map), `editor.rs` (`:colorscheme`, `:hi clear`, owns the registry),
-  `nxvim-lua` (`nvim_set_hl` → queued registry op; `nvim_get_hl` read path),
-  `nxvim-server` (`nvim_get_hl` RPC, `:colorscheme` sourcing via runtimepath).
-- Keep the registry in `nxvim-core` and mutate it only via the drain path, so
+  `bemtvi-lua` (`nvim_set_hl` → queued registry op; `nvim_get_hl` read path),
+  `bemtvi-server` (`nvim_get_hl` RPC, `:colorscheme` sourcing via runtimepath).
+- Keep the registry in `bemtvi-core` and mutate it only via the drain path, so
   core stays pure and synchronous.
 - This phase deliberately does **not** touch the `View`/redraw or the TUI — the
   theme is fully resolvable but not yet painted. That keeps the diff reviewable
@@ -324,7 +324,7 @@ links resolved — even though nothing is repainted yet (Phase 5).
 ### Phase 4 — catppuccin's compile step (run it, or bypass it) ✅ DONE (2026-06-01, strategy A)
 
 **Landed:** strategy A confirmed — catppuccin's real compile mechanics work
-under nxvim's vendored Lua 5.1 with **zero new Rust** (the Phase 1/2 surface
+under bemtvi's vendored Lua 5.1 with **zero new Rust** (the Phase 1/2 surface
 already sufficed). Verified by fetching the actual plugin and reading its real
 load path: `lib/compiler.lua` serializes the highlight table to Lua source,
 `loadstring`s it, `string.dump(fn, true)`s the result to bytecode, and
@@ -366,7 +366,7 @@ vendored Lua 5.1. Keeping it as its own phase means a fresh context can make
   `require("catppuccin.lib.mapper").apply(flavour)` directly to get the highlight
   table and feed it through `nvim_set_hl`, skipping `compile()`/`loadstring`.
   This still runs the *real* plugin logic (palette, integrations, groups) — only
-  the serialize-to-disk optimization is replaced. Implement as a thin nxvim-side
+  the serialize-to-disk optimization is replaced. Implement as a thin bemtvi-side
   shim, not a patch to the vendored plugin.
 
 **Done when**
@@ -396,7 +396,7 @@ truecolor renderer. The server now resolves every highlight span's capture
 through the Phase-3 registry and the chrome groups (`Normal`, `LineNr`,
 `CursorLineNr`, `Visual`, `StatusLine`, `EndOfBuffer`) to concrete styles,
 deduping them into a per-frame `styles` palette (a new `StyleTable` in
-`nxvim-server`); the redraw map gained a `styles` array, a `chrome` map of
+`bemtvi-server`); the redraw map gained a `styles` array, a `chrome` map of
 `name -> style_id`, and each `highlights` span grew a 4th element (a palette id,
 `Nil` when unresolved). Core `Rgb`/`Style` gained `Eq`/`Hash` for the dedup. The
 TUI parses the palette into `ratatui::Style`s, paints the `Normal` background as
@@ -406,12 +406,12 @@ themes the gutter via `LineNr`/`CursorLineNr`, the selection via `Visual`
 via `EndOfBuffer`; the scroll-animation band shares the same palette. The
 client's `group_style` stays the **fallback theme** used per-span when no
 resolved style is sent, so default startup is byte-for-byte unchanged. Tests:
-Tier-1 `crates/nxvim-tui/tests/paint.rs`
+Tier-1 `crates/bemtvi-tui/tests/paint.rs`
 (`a_resolved_style_paints_its_truecolor_foreground`,
 `the_normal_background_fills_the_text_area`,
 `the_visual_style_replaces_reverse_video_when_themed`,
 `no_colorscheme_falls_back_to_the_builtin_theme`) and Tier-2
-`crates/nxvim/tests/syntax.rs`
+`crates/bemtvi/tests/syntax.rs`
 (`a_loaded_colorscheme_paints_resolved_styles_truecolor` — sources a
 catppuccin-shaped `colors/` fixture via `:colorscheme` and asserts keyword
 mauve, string green, `Normal` background, `CursorLineNr` gutter, and a `Visual`
@@ -441,7 +441,7 @@ client to render 24-bit color, gutter, selection, and status with the theme.
   fg/bg — the big visible win), `LineNr` + `CursorLineNr` (gutter), `Visual`
   (selection — replace the hardcoded reverse-video), `StatusLine`, and the
   `~` end-of-buffer (`EndOfBuffer`/`NonText`). Carry these on the `View`/redraw.
-- **TUI render.** In `nxvim-tui`: render truecolor (`ratatui::style::Color::Rgb`)
+- **TUI render.** In `bemtvi-tui`: render truecolor (`ratatui::style::Color::Rgb`)
   from the sent styles; apply `Normal` bg to the whole text area, theme the
   gutter via `LineNr`/`CursorLineNr` (replacing the `DIM` modifier), the
   selection via `Visual`, and the status line via `StatusLine`. Keep
@@ -453,21 +453,21 @@ client to render 24-bit color, gutter, selection, and status with the theme.
   smooth-scroll stays colored.
 
 **Done when**
-- A Tier-2 full-stack screen test (`crates/nxvim/tests/screen.rs`): open a
+- A Tier-2 full-stack screen test (`crates/bemtvi/tests/screen.rs`): open a
   small source file, `:colorscheme catppuccin`, drive a real `redraw`, paint
   with the real client into a `TestBackend`, and assert specific cells carry
   catppuccin RGB — a keyword cell is mauve, a string cell green, the text-area
   background is base, the cursor-line gutter is the `CursorLineNr` color, a
   visual selection uses `Visual`.
-- A Tier-1 paint test (`crates/nxvim-tui/tests/paint.rs`) feeding a known
+- A Tier-1 paint test (`crates/bemtvi-tui/tests/paint.rs`) feeding a known
   styled `View` asserts the RGB mapping and the no-colorscheme fallback.
 - Default startup (no colorscheme) still renders exactly as before.
 
 **Handoff notes**
-- Touch points: `crates/nxvim-core/src/view.rs` (carry chrome styles + per-span
-  style ids), `crates/nxvim-server/src/lib.rs` (`highlights_for` resolves to
+- Touch points: `crates/bemtvi-core/src/view.rs` (carry chrome styles + per-span
+  style ids), `crates/bemtvi-server/src/lib.rs` (`highlights_for` resolves to
   styles; build the per-frame `styles` table; add chrome groups), all of
-  `nxvim-tui/src/lib.rs`'s render path (`render`, `render_text`,
+  `bemtvi-tui/src/lib.rs`'s render path (`render`, `render_text`,
   `highlight_line`, `cell_style`, `render_gutter`, `render_status`, `group_style`
   fallback), and the `View`/redraw parse on both sides.
 - This is the largest single diff. Land the payload/protocol change and the TUI
@@ -492,21 +492,21 @@ With those, `setup({flavour="mocha"})` compiles the highlight table to Lua
 bytecode under `stdpath("cache")` and `:colorscheme catppuccin` populates the
 registry with the exact mocha palette (Normal `#cdd6f4`/`#1e1e2e`, Keyword mauve,
 Function blue, Comment overlay+italic). Catppuccin is installed the user-config
-way — cloned into `~/.config/nxvim/pack/plugins/start/catppuccin` (no vendoring) —
+way — cloned into `~/.config/bemtvi/pack/plugins/start/catppuccin` (no vendoring) —
 and a user `init.lua` loads it; since init.lua is sourced before the first frame,
 the editor is themed from the moment it opens. Docs: `docs/architecture.md`
 updated (View protocol → server-resolved styles + `styles`/`chrome` payload; Lua
 section grown to runtimepath/`require`/`init.lua`/`nvim_set_hl`/`:colorscheme`
 + stdlib notes; roadmap line for the remaining `vim.*` gaps), and a new
 `docs/getting-started.md` documents the repeatable setup. Tests: Tier-3
-`crates/nxvim/tests/e2e.rs::catppuccin_repaints_the_editor_in_truecolor` drives
+`crates/bemtvi/tests/e2e.rs::catppuccin_repaints_the_editor_in_truecolor` drives
 the real binary in a PTY and asserts catppuccin's truecolor reaches the `vt100`
 screen (skips cleanly when no checkout is present, since we don't vendor it);
 Tier-2 `editing.rs::init_lua_colorscheme_themes_the_first_frame` proves the
 startup frame's `chrome` is already resolved.
 **Decisions:** per the owner's call, catppuccin is **not vendored** — it's cloned
 into the real user-config plugin path so it loads like any user plugin; the e2e
-test reuses that checkout (or `$NXVIM_CATPPUCCIN`) and skips when absent.
+test reuses that checkout (or `$BEMTVI_CATPPUCCIN`) and skips when absent.
 
 **Why:** make it usable and keep the design docs honest.
 
@@ -523,7 +523,7 @@ test reuses that checkout (or `$NXVIM_CATPPUCCIN`) and skips when absent.
   shift from *Architecture note* above), and the *Lua* section grows from "narrow
   bridge" to "runtimepath + `require` + `nvim_set_hl` + colorscheme." Add a
   roadmap line for remaining plugin-API gaps.
-- A Tier-3 PTY smoke test (`crates/nxvim/tests/e2e.rs`): launch the binary with a
+- A Tier-3 PTY smoke test (`crates/bemtvi/tests/e2e.rs`): launch the binary with a
   config that loads catppuccin and assert the parsed `vt100` screen shows the
   expected foreground/background colors (proves real crossterm truecolor escapes
   end to end).

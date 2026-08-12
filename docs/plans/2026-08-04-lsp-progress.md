@@ -6,11 +6,11 @@ Author-date: 2026-08-04.
 **Post-ship review.** A read-back of the shipped chain found three more gaps, each now
 test-first:
 
-- **`nx.lsp.progress()` had no stable order.** The mirror is a client-id-keyed table and
+- **`btv.lsp.progress()` had no stable order.** The mirror is a client-id-keyed table and
   the read walked it with `pairs`, which is unordered — and *observably* reversed once
   the ids sit in the table's hash part (any session where client 1 has stopped): with
   ids 3 and 2 pushed highest-first, `pairs` yields 3 then 2. The docstring promised
-  "newest task last" and nxvim-line renders `tasks[1]` plus `(+N)`, so the bar could
+  "newest task last" and bemtvi-line renders `tasks[1]` plus `(+N)`, so the bar could
   pick a different server's task from one update to the next. The read now walks the ids
   sorted, and the guarantee (ascending client id; within a client, begin order) is
   documented rather than accidental.
@@ -41,17 +41,17 @@ the browser leg is clean too. So the `lsp_progress.remove` above is defence in d
 branch that doesn't currently arise, and there was never a client-handle leak to fix.
 
 What the exercise *did* produce is the coverage that was missing: a reconnect had never
-been driven with a language server attached on either leg. `crates/nxvim/tests/daemon_lsp.rs`
+been driven with a language server attached on either leg. `crates/bemtvi/tests/daemon_lsp.rs`
 now covers the native one and `web/verify-lsp-reconnect.mjs` the browser one, both
 asserting that a dropped link leaves exactly one live client and no stranded task.
 Mutation-tested — deleting the Worker's synthetic `lsp_exited` reproduces precisely the
-failure originally hypothesized (`nx.lsp.clients()` listing `1,2`, and `Indexing` spinning
+failure originally hypothesized (`btv.lsp.clients()` listing `1,2`, and `Indexing` spinning
 under the dead client id), so the guard is real even though the bug was not.
 
 **What the plan missed, and the build found.** Decoding `$/progress` was necessary but
 not sufficient: a conforming server sends **nothing** unless the client both
 *advertises* `window.workDoneProgress` at `initialize` **and** *acks*
-`window/workDoneProgress/create`. nxvim did neither on the native leg — async-lsp's
+`window/workDoneProgress/create`. bemtvi did neither on the native leg — async-lsp's
 method-not-found default answered the `create` with an error, and gopls concluded the
 client cannot do progress and stayed silent. The wasm `SyncLspClient` already acked
 every unmodelled request with `null`, so the two legs had **silently drifted**: the
@@ -66,18 +66,18 @@ while real gopls sent nothing.
 ## Goal
 
 A language server reports long-running work (indexing, loading a workspace, building a
-crate graph) over `$/progress` with a `WorkDoneProgress` payload. nxvim currently
+crate graph) over `$/progress` with a `WorkDoneProgress` payload. bemtvi currently
 **drops it on the floor at every layer**:
 
-- `crates/nxvim-lsp/src/client.rs:274` — the native client's
+- `crates/bemtvi-lsp/src/client.rs:274` — the native client's
   `router.unhandled_notification` swallows it (the comment even names "progress").
-- `crates/nxvim-lsp/src/sync_client.rs:660` — the wasm client's
+- `crates/bemtvi-lsp/src/sync_client.rs:660` — the wasm client's
   `on_server_notification` has no `"$/progress"` arm.
 - There is no `LspEvent` variant for it, no store on `EditHost`, no Lua mirror, and no
   `LspProgress` autocmd event.
 
 So a plugin cannot tell "lua_ls is indexing, 43%" from "lua_ls is idle", and
-nxvim-line's `lsp` component can only ever render attached client *names*. The ask is
+bemtvi-line's `lsp` component can only ever render attached client *names*. The ask is
 lualine's `lsp_status`: the attached servers **plus** what they are busy doing.
 
 Close the gap at every layer, ending with the bundled statusline rendering it.
@@ -124,7 +124,7 @@ the note at the top.
 
 ### Phase 1 — capture it in both clients, carry it as an `LspEvent`
 
-`crates/nxvim-lsp/src/protocol.rs`:
+`crates/bemtvi-lsp/src/protocol.rs`:
 
 - `ProgressKind { Begin, Report, End }` and
 
@@ -165,7 +165,7 @@ user-visible yet), so the mock lands here and is asserted next phase.
 
 ### Phase 2 — the store, the Lua mirror, and the `LspProgress` event
 
-`EditHost` (`crates/nxvim-server/src/lsp/`): a per-server ordered store
+`EditHost` (`crates/bemtvi-server/src/lsp/`): a per-server ordered store
 
 ```rust
 lsp_progress: HashMap<ServerKey, Vec<ProgressEntry>>   // ordered by first sighting
@@ -175,14 +175,14 @@ lsp_progress: HashMap<ServerKey, Vec<ProgressEntry>>   // ordered by first sight
 (begin inserts/replaces, report patches only the fields it carried, end removes the
 token), then:
 
-1. **Mirrors** the server's whole active list into `nx.lsp._progress[client_id]` (a new
+1. **Mirrors** the server's whole active list into `btv.lsp._progress[client_id]` (a new
    `LuaRuntime::set_lsp_progress`), the same push-a-mirror shape `set_diagnostics` /
    `set_lsp_client` use — Lua never reads live Rust state.
 2. **Fires `LspProgress`** with `pattern = kind` (`"begin"` / `"report"` / `"end"`) and
    `data = { client_id, token, kind, title, message, percentage, cancellable }`.
    Neovim's `LspProgress` uses the kind as the pattern exactly this way, so
-   `nx.autocmd.create("LspProgress", { pattern = "end", … })` works as a config author
-   expects, and `nx.statusline`'s two-word `"LspProgress end"` event spelling narrows a
+   `btv.autocmd.create("LspProgress", { pattern = "end", … })` works as a config author
+   expects, and `btv.statusline`'s two-word `"LspProgress end"` event spelling narrows a
    segment to it.
 
    `fire_autocmd_data` only carries a `client_id`, so this needs a richer sibling
@@ -195,55 +195,55 @@ forever.
 Public Lua API in `prelude/lsp.lua`:
 
 ```lua
-nx.lsp.progress()                        -- every client's active work, newest client last
-nx.lsp.progress({ client_id = id })      -- just that client's
-nx.lsp.progress({ bufnr = 0 })           -- just the clients attached to that buffer
+btv.lsp.progress()                        -- every client's active work, newest client last
+btv.lsp.progress({ client_id = id })      -- just that client's
+btv.lsp.progress({ bufnr = 0 })           -- just the clients attached to that buffer
 ```
 
-(Shipped as a **filter table**, matching `nx.lsp.clients(filter)`, rather than the bare
+(Shipped as a **filter table**, matching `btv.lsp.clients(filter)`, rather than the bare
 `client_id` sketched here.) "Newest client last" is a real guarantee, not an artifact of
 iteration order — see the post-ship review at the top.
 
 each item `{ client_id, client_name, token, title, message, percentage, cancellable }`.
 Docstring written to the book's markdown rules (backticked tokens, fenced example).
 
-**Tests** (`crates/nxvim/tests/`, black-box through the harness against the mock):
+**Tests** (`crates/bemtvi/tests/`, black-box through the harness against the mock):
 
-- a scripted `begin → report → end` leaves `nx.lsp.progress()` non-empty mid-sequence
+- a scripted `begin → report → end` leaves `btv.lsp.progress()` non-empty mid-sequence
   with the right title/percentage, and **empty** after the `end`;
 - a `report` carrying only a `percentage` **keeps** the `begin`'s title and message
   (the "absent means unchanged" rule — the assertion that fails if the store is a
   naive overwrite);
 - two concurrent tokens are both listed, and ending one leaves the other;
 - `LspProgress` fires with `pattern = kind` and a `data.client_id` resolving through
-  `nx.lsp.clients()`;
+  `btv.lsp.clients()`;
 - a server exit clears its progress.
 
-### Phase 3 — nxvim-line renders it
+### Phase 3 — bemtvi-line renders it
 
 The `lsp` component (already in the default `lualine_x` as of `f6646e8`) grows the
 progress half, which is what lualine's `lsp_status` actually shows: the client names,
 and for each client with active work a spinner frame plus `title`/`message`/`percentage`.
 
 - `opts.progress = false` opts back out to names-only.
-- The spinner is a frame index advanced by an `nx.timer` that **only runs while some
+- The spinner is a frame index advanced by an `btv.timer` that **only runs while some
   progress is active** — armed on `LspProgress begin`, disarmed when the last token
   ends. An always-on animation timer would violate the never-freeze/never-busy spirit
   of the per-event rule for a bar that is idle 99% of the time.
 - Component `events = { "LspProgress", "LspAttach", "LspDetach", "BufEnter" }`.
 
-Tests in the plugin's `test/components_spec.lua` drive `nx.lsp._progress` and assert the
+Tests in the plugin's `test/components_spec.lua` drive `btv.lsp._progress` and assert the
 rendered bar (the same style as the existing `lsp` / `diagnostics` component tests).
 
 ### Phase 4 — example + docs
 
 `examples/lsp-progress/` in the core repo: an `init.lua` with numbered
 *type-this / see-that* sections (an `LspProgress` autocmd echoing each phase, a
-`nx.lsp.progress()` readout on a key, the statusline showing it live) plus a sample
+`btv.lsp.progress()` readout on a key, the statusline showing it live) plus a sample
 file. Verified end-to-end, throwaway harness test deleted before commit per the
 examples rule.
 
-Book pages regenerate from the `nx.lsp.progress` docstring; the plugin's vimdoc
+Book pages regenerate from the `btv.lsp.progress` docstring; the plugin's vimdoc
 regenerates via `scripts/gen-vimdoc.sh`.
 
 ## Verification matrix (tier-1 remote)
@@ -257,5 +257,5 @@ regenerates via `scripts/gen-vimdoc.sh`.
 Verified against **real gopls** through the example config, not only the mock — the
 step that surfaced Phase 0. The check was a throwaway test (deleted before commit, per
 the examples rule); its transcript was `begin Setting up workspace | end -`, with
-`nx.lsp.progress()` non-empty mid-run and empty after, and the `end` carrying no title
+`btv.lsp.progress()` non-empty mid-run and empty after, and the `end` carrying no title
 — rule 1 observed on the wire.

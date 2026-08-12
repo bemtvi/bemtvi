@@ -1,4 +1,4 @@
-nx.ui.select — the floating selectable-list widget
+btv.ui.select — the floating selectable-list widget
 ===================================================
 
 Put the cursor anywhere and try the leader maps (leader is "\"):

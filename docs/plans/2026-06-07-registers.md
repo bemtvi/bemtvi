@@ -1,7 +1,7 @@
 # Registers — named, numbered, and special registers
 
-Today nxvim has exactly **one** register: a single unnamed `Register { text,
-linewise }` (`crates/nxvim-core/src/editor/mod.rs:117`) that every yank/delete
+Today bemtvi has exactly **one** register: a single unnamed `Register { text,
+linewise }` (`crates/bemtvi-core/src/editor/mod.rs:117`) that every yank/delete
 overwrites and every paste reads. This plan grows that one slot into vim's full
 register file: named `"a`–`"z` (with append `"A`–`"Z`), the numbered yank/delete
 ring `"0`–`"9`, the small-delete `"-`, the black-hole `"_`, the read-only
@@ -16,14 +16,14 @@ and the `setreg`/`getreg` Lua surface.
 Verified in the current tree before planning:
 
 - **There is exactly one register read site and one write site.** Yank writes
-  the register in `yank_range` (`crates/nxvim-core/src/editor/operators.rs:193`);
+  the register in `yank_range` (`crates/bemtvi-core/src/editor/operators.rs:193`);
   paste reads it in `paste` (`operators.rs:359`). Every operator
   (`apply_operator_to_range`, the visual operators, `delete_under_cursor`,
   `delete_to_eol`, …) routes through `yank_range` before deleting. So
   redirecting yank/paste to a *selected* register is a change at two chokepoints,
   not a scatter-gun edit. (Confirmed: no other `self.register` references exist.)
 - **The command grammar already has clean argument-stage machinery.** `parse_step`
-  (`crates/nxvim-core/src/editor/command.rs:372`) threads partial state through a
+  (`crates/bemtvi-core/src/editor/command.rs:372`) threads partial state through a
   `PendingCommand { count, op_count, operator, stage }` with a `Stage` enum for
   "the next key is data" sub-states (`FindPending`, `ReplacePending`,
   `TextObjectPending`, …). Adding `"` as a new `Stage::RegisterPending` + a
@@ -33,14 +33,14 @@ Verified in the current tree before planning:
   disambiguation for free.
 - **Core already does dependency injection for impure providers.** The treesitter
   engine is injected as `Option<Box<dyn SyntaxEngine>>`
-  (`crates/nxvim-core/src/editor/mod.rs:484`, `syntax.rs:49`), keeping
-  `nxvim-core` pure while the server supplies the real implementation. The system
+  (`crates/bemtvi-core/src/editor/mod.rs:484`, `syntax.rs:49`), keeping
+  `bemtvi-core` pure while the server supplies the real implementation. The system
   clipboard (`"+`/`"*`) reuses this exact pattern: core holds an injected
   `Option<Box<dyn Clipboard>>`, the server wires the OS clipboard. No purity
   violation.
 - **The Lua compat shims already exist as loud stubs.** `vim.fn.setreg` is a
-  `nx._notimpl("vim.fn.setreg")` placeholder
-  (`crates/nxvim-lua/src/prelude/fs.lua:275`) — there's a defined seam to fill,
+  `btv._notimpl("vim.fn.setreg")` placeholder
+  (`crates/bemtvi-lua/src/prelude/fs.lua:275`) — there's a defined seam to fill,
   not a new surface to invent.
 
 ## Architecture
@@ -48,7 +48,7 @@ Verified in the current tree before planning:
 ### The register file lives in core, keyed by char
 
 Replace the single `register: Register` field with a `registers: Registers`
-store (new `crates/nxvim-core/src/editor/registers.rs`):
+store (new `crates/bemtvi-core/src/editor/registers.rs`):
 
 ```rust
 struct RegisterCell { text: String, kind: RegKind }   // kind: Char | Line  (Block later)
@@ -115,7 +115,7 @@ of the auto-populated registers once Phase 2 lands. So Phase 1 ships *with*
 Phase 2's selection to be end-to-end testable; they are split here only for
 review clarity.
 
-- New `crates/nxvim-core/src/editor/registers.rs`: `RegKind`, `RegisterCell`,
+- New `crates/bemtvi-core/src/editor/registers.rs`: `RegKind`, `RegisterCell`,
   `Registers` with `record_yank` / `record_delete` / `get`. The numbered-ring
   shift and small-delete-vs-`"1` decision live here.
 - `yank_range` (`operators.rs:193`) → `self.registers.record_yank(reg, text,
@@ -143,7 +143,7 @@ Wire the prefix end-to-end so the auto-population from Phase 1 becomes reachable
 ### Phase 3 — `:registers` display + read-only specials
 
 - `:reg[isters]` / `:di[splay]` ex command (dispatch in
-  `crates/nxvim-core/src/editor/ex.rs:233`): renders the populated registers as a
+  `crates/bemtvi-core/src/editor/ex.rs:233`): renders the populated registers as a
   message-area table (`""`, `"0`–`"9`, `"-`, named, then specials), with `^J` for
   newlines as vim does. Optional `:reg ab0` argument filters to listed registers.
 - Read-only specials in `Registers::get`: `"%` (buffer name), `"/` (last search
@@ -169,7 +169,7 @@ Wire the prefix end-to-end so the auto-population from Phase 1 becomes reachable
 ### Phase 5 — System clipboard (`"+` / `"*`) — DONE
 
 - A `trait Clipboard { fn get(&self) -> Option<(String, bool)>; fn set(&self,
-  text: &str, linewise: bool); }` (`crates/nxvim-core/src/clipboard.rs`),
+  text: &str, linewise: bool); }` (`crates/bemtvi-core/src/clipboard.rs`),
   injected as `Option<Box<dyn Clipboard>>` into the `Editor` exactly like
   `SyntaxEngine`. The boundary uses `bool` linewise (not `RegKind`, which stays
   crate-private) to match the existing public register surface
@@ -181,7 +181,7 @@ Wire the prefix end-to-end so the auto-population from Phase 1 becomes reachable
   rather than silently using the unnamed register — the operator/visual/paste
   paths all guard on it.
 - Server supplies a real provider via **platform shell-out**
-  (`crates/nxvim-server/src/clipboard.rs`: `pbcopy`/`pbpaste` on macOS,
+  (`crates/bemtvi-server/src/clipboard.rs`: `pbcopy`/`pbpaste` on macOS,
   `wl-copy`/`xclip` on Linux), chosen over `arboard` to add no dependency and
   stay lazy (the tool runs only on a `"+` operation). Wired in `run()` next to
   the syntax engine via `ServerInit.clipboard: ClipboardProvider`
@@ -202,7 +202,7 @@ Wire the prefix end-to-end so the auto-population from Phase 1 becomes reachable
   existing synchronous Lua eval used by the statusline plan,
   `eval_to_value_pumped`), and pastes the result. Read-only, eval-on-read.
 - **Blockwise registers (`RegKind::Block`)** — requires visual-block mode
-  (`<C-v>`), which nxvim does not have yet (`Mode` has only `Visual` /
+  (`<C-v>`), which bemtvi does not have yet (`Mode` has only `Visual` /
   `VisualLine`, `mode.rs`). Land with visual-block.
 - **Macros `q{reg}` / `@{reg}`** — recording keystrokes into a register and
   replaying them. Reuses the named-register store from Phases 1–2 (a macro is

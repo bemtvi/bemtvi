@@ -4,9 +4,9 @@ Status: **in progress** — Phases 1–5 **done** 2026-06-16; Phase 6 mostly don
 2026-06-16 (GUI/web paint parity, `hl_mode`, wasm parity landed; `virt_lines_leftcol`
 and scroll-band virtual rows remain as documented refinements).
 
-**Client coverage note:** rendering is implemented in the **TUI** (`nxvim-tui`,
+**Client coverage note:** rendering is implemented in the **TUI** (`bemtvi-tui`,
 the agent-verifiable reference client) for every phase. As of Phase 6 the **GUI**
-(`nxvim-gui`) and **web** (`nxvim-edithost`) clients also paint `virt_text` and
+(`bemtvi-gui`) and **web** (`bemtvi-edithost`) clients also paint `virt_text` and
 `virt_lines`, **including chunk backgrounds** (a chunk whose hl group sets a `bg`
 reads as a filled badge, not dark-on-dark) — see Phase 6 for the exact per-client
 coverage (the GUI paints the chunk `bg` as a quad behind the glyph; the web's
@@ -18,11 +18,11 @@ crate; the visual output of the GUI/web paint is **not** yet eyeballed.
 ## Problem
 
 Extmark virtual-text fields (`virt_text`, `virt_text_pos`, `virt_lines`, `hl_mode`,
-…) are **accepted and stored Lua-side** (`nx._extmarks[b][ns][id].decoration`) so
+…) are **accepted and stored Lua-side** (`btv._extmarks[b][ns][id].decoration`) so
 `nvim_buf_get_extmarks(…, {details=true})` can return them, but they **never reach
 Rust** and are **not rendered**. The core `Extmark` struct
-(`crates/nxvim-core/src/extmark.rs:77`) carries only `hl_group`; the
-`nx._extmark_set` effect (`install.rs:691`, `ExtmarkOp::Set` in `ops.rs:360`)
+(`crates/bemtvi-core/src/extmark.rs:77`) carries only `hl_group`; the
+`btv._extmark_set` effect (`install.rs:691`, `ExtmarkOp::Set` in `ops.rs:360`)
 forwards only position + `hl_group` + `priority`.
 
 Goal: render the full virtual-text surface — all `virt_text` positions
@@ -36,15 +36,15 @@ Out of scope (remain accepted-but-unrendered, separate follow-ups): `sign_text`,
 ## What already exists (reuse)
 
 - **eol virtual text**: `diagnostics_virt_text_for()`
-  (`crates/nxvim-server/src/lsp/diagnostics.rs:140`) projects one decoration per
+  (`crates/bemtvi-server/src/lsp/diagnostics.rs:140`) projects one decoration per
   visible row → `diagnostics_virt` wire key; TUI renders it after a one-cell gap
-  past EOL (`crates/nxvim-tui/src/render.rs:1271`). The extmark eol path mirrors
+  past EOL (`crates/bemtvi-tui/src/render.rs:1271`). The extmark eol path mirrors
   this, but per-mark / multi-chunk.
 - **inline splicing**: `inlay_hints` already splice text into a row at an anchor
   column, pushing real text right (same `render.rs` `highlight_line`). Inline
   `virt_text` reuses this.
 - **hl_group → style_id palette**: `merge_intervals` / the frame `StyleTable`
-  (`crates/nxvim-server/src/extmarks.rs`, `redraw.rs`) resolve groups to deduped
+  (`crates/bemtvi-server/src/extmarks.rs`, `redraw.rs`) resolve groups to deduped
   per-frame style ids. virt chunks resolve the same way.
 - **per-window parallel-to-row arrays**: `lines` / `numbers` / `highlights` /
   `diagnostics_virt` are screen-row-indexed (`redraw.rs` `window_value`). New
@@ -53,10 +53,10 @@ Out of scope (remain accepted-but-unrendered, separate follow-ups): `sign_text`,
 
 ## Data model (Phase 1)
 
-New pure types in `nxvim-core` (no mlua, no async — core stays pure):
+New pure types in `bemtvi-core` (no mlua, no async — core stays pure):
 
 ```rust
-// crates/nxvim-core/src/extmark.rs
+// crates/bemtvi-core/src/extmark.rs
 pub struct VirtChunk { pub text: String, pub hl_group: Option<String> }
 
 pub enum VirtTextPos { Eol, Inline, Overlay, RightAlign, WinCol(u16) }
@@ -86,8 +86,8 @@ pub struct Extmark {
 
 ## Threading (Phase 1)
 
-1. `api.lua` `nx.buf.set_extmark` already collects the `decoration` table — forward
-   it as a 10th arg to `nx._extmark_set`.
+1. `api.lua` `btv.buf.set_extmark` already collects the `decoration` table — forward
+   it as a 10th arg to `btv._extmark_set`.
 2. `install.rs` `_extmark_set` bridge: convert the `Option<Table>` → core
    `VirtDecor` via a new `virt_decor_from_table` helper (this is where mlua →
    core conversion happens; `ops.rs` stays mlua-free). Add `decor` to
@@ -100,13 +100,13 @@ tests per project convention).
 ## Phases
 
 - **Phase 1 — Core data model + threading. ✅ DONE.** Added `VirtChunk` /
-  `VirtTextPos` / `HlMode` / `VirtDecor` to `nxvim-core` (`extmark.rs`), a boxed
+  `VirtTextPos` / `HlMode` / `VirtDecor` to `bemtvi-core` (`extmark.rs`), a boxed
   `decor` field on `Extmark`, and the `decor` param on `ExtmarkStore::set`.
   Threaded the payload: `api.lua` forwards the `decoration` table → `install.rs`
   `virt_decor_from_table` lowers it into the new `VirtDecorData` (mlua-free) on
   `ExtmarkOp::Set` (validating `virt_text_pos`/`hl_mode` loud) → `effects.rs`
   `virt_decor_to_core` resolves it into the typed core `VirtDecor` and stores it.
-  `nx.decor` provider marks pass `decor: None` (hl-only; wiring virt onto provider
+  `btv.decor` provider marks pass `decor: None` (hl-only; wiring virt onto provider
   marks is a later follow-up). All 8 `extmarks.rs` tests pass; clippy/fmt clean.
 
 - **Phase 2 — `eol` virt_text. ✅ DONE.** Server `virt_text_for()` in
@@ -115,8 +115,8 @@ tests per project convention).
   — **Phase 2 emits only `pos==0` (eol)**; the shape is final so later positions
   are server-emit + client-render only, no re-parse. Wired into `redraw.rs`
   `window_value` as the new `virt_text` key (native; empty array on wasm). Client:
-  `nxvim-view` `parse_virt_text` + `VirtPlacement`/`VirtChunk` types + `WindowView`
-  field; `nxvim-tui` `highlight_line` paints eol placements after EOL (one-cell
+  `bemtvi-view` `parse_virt_text` + `VirtPlacement`/`VirtChunk` types + `WindowView`
+  field; `bemtvi-tui` `highlight_line` paints eol placements after EOL (one-cell
   gap, per-chunk style via `virt_chunk_style`, truncated to viewport). Unknown/
   absent `hl_group` → `Nil` style_id → normal color (same graceful fallback as the
   hl span path). Test `eol_virt_text_paints_after_the_line` asserts the chunk text
@@ -169,13 +169,13 @@ tests per project convention).
     arrays onto the expanded rows. The server adds the `virt_lines` wire key
     (`extmarks.rs::virt_lines_value` — shares `virt_chunks_value` with `virt_text`);
     native-only, empty on wasm like the other extmark projections.
-  - 5c (clients): `nxvim-view` `parse_virt_lines` + `WindowView.virt_lines`; **TUI**
+  - 5c (clients): `bemtvi-view` `parse_virt_lines` + `WindowView.virt_lines`; **TUI**
     `render_text` paints a virtual row via `virt_line` (chunk text in its resolved
     style, no gutter number, no cursor, no `~`) — the agent-verifiable reference. GUI +
     web paint parity is batched into Phase 6 (the wire data already reaches them).
     `virt_lines_leftcol` / horizontal scroll of virtual rows is a Phase-6 refinement
     (today they start at the text body's left edge).
-  - Tests (`crates/nxvim/tests/extmarks.rs`):
+  - Tests (`crates/bemtvi/tests/extmarks.rs`):
     `virt_lines_interleave_above_and_below_their_line` (above/below placement +
     surrounding line order/numbers) and
     `scroll_accounts_for_virt_lines_to_keep_the_cursor_visible` (fills the buffer to
@@ -210,11 +210,11 @@ tests per project convention).
     underlying bg to merge with); **web** fg + chunk bg, with `blend` averaging hex fg
     (`blendHex`). Documented at `apply_hl_mode` / `virt_overlay_fg` / `blendHex`.
   - ✅ **GUI + web client paint parity** for `virt_text` positions and `virt_lines`.
-    **GUI** (`nxvim-gui/render.rs`): eol, inline, overlay, win_col, right_align, and
+    **GUI** (`bemtvi-gui/render.rs`): eol, inline, overlay, win_col, right_align, and
     `virt_lines` rows all paint — inline/overlay via segment transforms (`apply_row_virt`
     + `splice_insertions`, merged with the inlay splice), eol/right_align as positioned
     text items, the cursor shift extended by `virt_inline_shift`. **web**
-    (`nxvim-edithost/web/index.html`): `virt_lines` rows, eol, inline, overlay/win_col
+    (`bemtvi-edithost/web/index.html`): `virt_lines` rows, eol, inline, overlay/win_col
     (in-place cell overwrite), and right_align all paint on the JS-highlight `renderLine`
     path. Inline rides DOM flow — emitting the chunk span before its anchor cell shifts
     the following glyphs / cursor / selection right with no painted-column math (unlike
@@ -236,7 +236,7 @@ tests per project convention).
     clients. Until then virtual lines start at the text body's left edge. Documented in
     `api.lua`'s `EXTMARK_OPT_DECORATION` note.
   - ✅ **`virt_text_repeat_linebreak`** — a no-op **by design**: it only repeats the
-    virt text at a soft-wrap boundary, and nxvim has no `'wrap'` option, so there's no
+    virt text at a soft-wrap boundary, and bemtvi has no `'wrap'` option, so there's no
     wrap point. Accepted + stored Lua-side; documented as a deliberate no-op in `api.lua`.
   - ✅ **`virt_text` placements on the scroll-animation band** — eol / inline / overlay /
     win_col / right_align text now rides the slide instead of flashing out and back when
@@ -262,7 +262,7 @@ tests per project convention).
     `virt_text` position, `virt_lines` (above / below), and a `virt_text_hide` mark.
     Its code paths are covered by the black-box tests; the example itself hasn't been
     launched interactively (the TUI isn't agent-verifiable). Eyeball it with
-    `NXVIM_CONFIG=examples/virt-text cargo run -p nxvim -- examples/virt-text/sample.txt`.
+    `BEMTVI_CONFIG=examples/virt-text cargo run -p bemtvi -- examples/virt-text/sample.txt`.
 
 ## Risks / open questions
 
@@ -271,7 +271,7 @@ tests per project convention).
   visibility, `<C-e>`/`<C-y>`, `zz`, and page motions. Keep 5a isolated and test
   scrolling hard.
 - **Wire churn**: adding a row-kind flag changes the per-window payload; all three
-  clients (`nxvim-tui`, `nxvim-gui`, `nxvim-web`) and `nxvim-view` parsing must be
+  clients (`bemtvi-tui`, `bemtvi-gui`, `bemtvi-web`) and `bemtvi-view` parsing must be
   updated together (Phase 5c).
 - **Styles**: virt chunks with an unknown `hl_group` must fail loud at resolution
   (no silent skip), matching the extmark hl path.

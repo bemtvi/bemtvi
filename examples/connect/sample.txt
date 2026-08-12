@@ -1,12 +1,12 @@
-nx.connect demo — a connector for the :connect command.
+btv.connect demo — a connector for the :connect command.
 
-Open this in nxvim with the example config, then run:
+Open this in bemtvi with the example config, then run:
 
     :connect demo://here
 
-The window reloads onto a local `nxvim --daemon` (a daemon-backed session),
+The window reloads onto a local `bemtvi --daemon` (a daemon-backed session),
 proving the connect → resolve → session-swap loop. Confirm with:
 
-    :lua print(nx.daemon.status())   -- "connected"
+    :lua print(btv.daemon.status())   -- "connected"
 
 See init.lua for the resolver and the full API notes.

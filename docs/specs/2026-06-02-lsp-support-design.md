@@ -3,7 +3,7 @@
 **Date:** 2026-06-02
 **Status:** **Phases 1–7 complete** (lifecycle + document sync; diagnostics; go-to definition & references; hover & signature help; completion — the popup menu, ordered & live-refreshing; edits — formatting, rename across open buffers, code actions; **7a — the `vim.lsp.config`/`vim.lsp.enable` config framework + FileType attach lifecycle, replacing the built-in server table: a server starts only via user Lua**; **7b — the `vim.*` Lua surface: Slice 1 `vim.lsp.buf.*` routes through the existing native paths; Slice 2 `vim.diagnostic.*` — `get`/`goto_next`/`goto_prev`/`setloclist`/`config` — plus a value-returning `nvim_exec_lua`; Slice 3 `LspAttach`/`on_attach`/`server_capabilities` — a per-server client mirrored into `vim.lsp._clients`, a default `LspAttach` autocmd running the config's `on_attach`, and `LspDetach` on `didClose`/server-exit, which closes the phase**). 7a built on the [autocmd lifecycle foundation](2026-06-04-autocmd-lifecycle-design.md), and is verified end-to-end against the vendored nvim-lspconfig (`lspconfig.rs`), now including a user-style `on_attach` keymap setup driving go-to + hover off the real config.
 
-This document is both the design for LSP support in nxvim **and** a phase-by-phase
+This document is both the design for LSP support in bemtvi **and** a phase-by-phase
 implementation plan. Each phase below is written to be **handed off to a fresh
 context window**: it states its prerequisites, the exact files it touches, the
 protocol surface it adds, the tests that prove it, and a hard "done when" gate.
@@ -14,23 +14,23 @@ The closest existing subsystem, and the template for most of this work, is the
 **treesitter syntax worker** ([syntax-highlighting design](2026-06-01-syntax-highlighting-design.md)):
 an out-of-editor capability that is *advisory*, *fully async*, and *can never
 stall the editor*. LSP reuses that shape — with one deliberate divergence (it is
-**in-process**, not a separate nxvim worker — see [Decision 1](#decision-1-in-process-client-crate-not-a-worker-process)).
+**in-process**, not a separate bemtvi worker — see [Decision 1](#decision-1-in-process-client-crate-not-a-worker-process)).
 
 ---
 
 ## Goal
 
-Make nxvim a usable LSP client: connect to real language servers
+Make bemtvi a usable LSP client: connect to real language servers
 (rust-analyzer, pyright, gopls, lua-language-server, …) and surface their
 intelligence — **diagnostics, go-to-definition, hover, completion, rename,
-formatting, code actions** — while preserving nxvim's two non-negotiables:
+formatting, code actions** — while preserving bemtvi's two non-negotiables:
 
 1. **The editor never blocks on a language server.** A slow or hung server can
    never freeze keystroke→buffer→redraw. Every LSP request is fired and
    forgotten; its reply arrives later as an event that triggers a redraw or a UI
    update, exactly like `ts_highlights`.
-2. **`nxvim-core` stays pure and synchronous.** No LSP types, no JSON, no async,
-   no I/O leak into core. LSP lives in a new crate and in `nxvim-server`; core
+2. **`bemtvi-core` stays pure and synchronous.** No LSP types, no JSON, no async,
+   no I/O leak into core. LSP lives in a new crate and in `bemtvi-server`; core
    gains only small, pure helpers (position-encoding math) and a cursor-jump API.
 
 Compatibility target, per [architecture.md](../architecture.md) guiding
@@ -48,7 +48,7 @@ API exists.
   projected to the TUI through the existing `redraw` map and (new) request/reply
   notifications. The TUI stays a dumb renderer.
 - **The `View` is core-owned and pure.** Like treesitter highlights, LSP overlays
-  (diagnostics, hover, the completion menu) are **not** added to `nxvim-core`'s
+  (diagnostics, hover, the completion menu) are **not** added to `bemtvi-core`'s
   `View`. The server merges them into the `redraw` map it already builds by hand.
   Core's only `View`-adjacent change is exposing a cursor-jump for go-to.
 - **Effects flow through queues / events.** Server→language-server commands are
@@ -69,32 +69,32 @@ API exists.
 The treesitter worker is a separate OS process for one reason only: **grammars
 are compiled C and can segfault the host**, which no in-process guard survives.
 That rationale **does not apply to LSP**. Language servers are *already* separate
-OS processes; nxvim talks to them over pipes. A crashing rust-analyzer just
-closes a pipe — it cannot segfault nxvim. The LSP *client* code (JSON-RPC
+OS processes; bemtvi talks to them over pipes. A crashing rust-analyzer just
+closes a pipe — it cannot segfault bemtvi. The LSP *client* code (JSON-RPC
 framing, `lsp-types`, request correlation) is pure safe Rust and cannot crash the
 editor.
 
 Therefore the LSP client runs **inside the server's runtime** (as spawned async
 tasks), and spawns language servers as its **direct children**. This matches
 neovim (its LSP client is in-process) and avoids a pointless double translation
-(an `nxvim --__lsp-worker` would only re-encode msgpack↔JSON for no isolation
+(an `bemtvi --__lsp-worker` would only re-encode msgpack↔JSON for no isolation
 benefit).
 
 To keep the heavy protocol machinery out of the server crate proper, it lives in
-a **new `nxvim-lsp` crate** that `nxvim-server` depends on as a normal crate edge
-(unlike `nxvim-ts`, which is a *process* edge). `serde_json` and `lsp-types` are
-reached only through `nxvim-lsp`.
+a **new `bemtvi-lsp` crate** that `bemtvi-server` depends on as a normal crate edge
+(unlike `bemtvi-ts`, which is a *process* edge). `serde_json` and `lsp-types` are
+reached only through `bemtvi-lsp`.
 
-> **Rejected alternative:** an `nxvim --__lsp-worker` process mirroring the
+> **Rejected alternative:** an `bemtvi --__lsp-worker` process mirroring the
 > treesitter worker. Rejected because LSP servers are already isolated, so the
 > extra process buys nothing and adds a latency hop and a second protocol
-> translation. Noted here because the symmetry with `nxvim-ts` is tempting and a
+> translation. Noted here because the symmetry with `bemtvi-ts` is tempting and a
 > future contributor will ask.
 
 ### Decision 2: `async-lsp` drives the JSON-RPC layer, inside the manager
 
 LSP is JSON-RPC 2.0 with `Content-Length:` headers over the server's
-stdin/stdout. `nxvim-lsp` uses [`async-lsp`](https://docs.rs/async-lsp) to own
+stdin/stdout. `bemtvi-lsp` uses [`async-lsp`](https://docs.rs/async-lsp) to own
 that layer — framing, request/response **id correlation**, `$/cancelRequest`,
 concurrency, and backpressure — with `lsp-types` for the message *types* (which
 `async-lsp` re-exports). We do **not** hand-roll the transport.
@@ -129,25 +129,25 @@ Why default to it rather than hand-roll:
    codec.
 
 > **The hand-rolled alternative** — a ~100–150-line `Content-Length` + JSON-RPC
-> layer over the child's stdio (in the spirit of `nxvim-rpc`), adding only
+> layer over the child's stdio (in the spirit of `bemtvi-rpc`), adding only
 > `serde_json` instead of tower — stays the **sanctioned fallback** if
 > `async-lsp`'s tower/`Service` programming model proves an awkward fit or its
 > dependency surface becomes a problem. The editor-facing design
 > (`LspCommand`/`LspEvent`) is identical either way, so this choice is internal to
-> `nxvim-lsp` and reversible without touching `nxvim-server`. *(Note the precedent
-> cuts the other way and is deliberately not invoked here: nxvim hand-rolls
-> `nxvim-rpc` because msgpack values are self-delimiting — the framing is
+> `bemtvi-lsp` and reversible without touching `bemtvi-server`. *(Note the precedent
+> cuts the other way and is deliberately not invoked here: bemtvi hand-rolls
+> `bemtvi-rpc` because msgpack values are self-delimiting — the framing is
 > near-trivial — and the protocol is bespoke with no off-the-shelf fit. LSP is the
 > opposite on both counts: real `Content-Length` framing, and a maintained client
 > framework that fits.)*
 
 ### Decision 3: requests never block — reply-as-event with a generation token
 
-`nxvim-server` processes one message at a time against `!Send` editor state. It
+`bemtvi-server` processes one message at a time against `!Send` editor state. It
 **cannot** hold a `oneshot` across the main loop awaiting an LSP reply without
 freezing the editor. So LSP requests follow the `SyntaxEvent` model:
 
-- The server sends a *command* to the `nxvim-lsp` manager (e.g.
+- The server sends a *command* to the `bemtvi-lsp` manager (e.g.
   `LspCommand::Hover { buffer, position, token }`), then returns to the loop.
 - The manager's per-server `async-lsp` `MainLoop` task `await`s the reply (id↔
   reply correlation is async-lsp's job). When it lands, the manager emits an
@@ -163,13 +163,13 @@ This is the exact role `tick` plays for `ts_highlights`.
 
 ### Decision 4: position encoding negotiated to UTF-8, with a UTF-16 fallback
 
-nxvim columns are **byte offsets**; LSP `Position.character` is, by default,
+bemtvi columns are **byte offsets**; LSP `Position.character` is, by default,
 **UTF-16 code units**. Modern servers honor the client's
 `general.positionEncodings` capability; we advertise `["utf-8", "utf-16"]`
 (preferring `utf-8`, which makes the conversion a no-op for ASCII and a cheap
 byte count otherwise) and store the **negotiated encoding per server** from the
 `initialize` result. All byte↔character conversion is **pure column math** and
-lives in `nxvim-core::unicode` (alongside `virtcol`) as encoding-agnostic helpers
+lives in `bemtvi-core::unicode` (alongside `virtcol`) as encoding-agnostic helpers
 (`byte_to_utf16` / `utf16_to_byte`, with UTF-8 being identity). The server picks
 which to apply per the negotiated encoding. Core gains *no* LSP concepts — just
 two more unicode helpers.
@@ -209,9 +209,9 @@ Auto-start servers from a small built-in **filetype→command** table (e.g.
 the `filetype_of` pattern and lets every feature phase land before the large
 `vim.lsp.*` Lua surface (Phase 7).
 
-### Decision 7: UI strategy given nxvim has no floats, pmenu, or sign column yet
+### Decision 7: UI strategy given bemtvi has no floats, pmenu, or sign column yet
 
-nxvim today has **no floating windows, no popup menu, no sign column, no virtual
+bemtvi today has **no floating windows, no popup menu, no sign column, no virtual
 text**. LSP results must land somewhere that exists. The plan threads features by
 what they need:
 
@@ -235,12 +235,12 @@ for location lists and hover text without inventing float layout.
 ## Architecture
 
 ```
-                        crate edge (nxvim-server depends on nxvim-lsp)
+                        crate edge (bemtvi-server depends on bemtvi-lsp)
 ┌────────────┐  redraw (+diag/hover/pmenu)  ┌──────────────┐    LspCommand     ┌───────────────┐
-│ nxvim-tui  │ ◀─────────────────────────── │ nxvim-server │ ───────────────▶  │  LspManager   │
-│ (client)   │  ──────── nvim_input ──────▶ │  (editor)    │ ◀── LspEvent ──── │  (nxvim-lsp)  │
+│ bemtvi-tui  │ ◀─────────────────────────── │ bemtvi-server │ ───────────────▶  │  LspManager   │
+│ (client)   │  ──────── nvim_input ──────▶ │  (editor)    │ ◀── LspEvent ──── │  (bemtvi-lsp)  │
 └────────────┘                              └──────────────┘   mpsc channels   └───────┬───────┘
-   main thread          nxvim-rpc            its own thread                            │ spawns children,
+   main thread          bemtvi-rpc            its own thread                            │ spawns children,
                                                                                        │ JSON-RPC / stdio
                                                                             ┌──────────┴──────────┐
                                                                             ▼          ▼          ▼
@@ -260,20 +260,20 @@ editor thread sees.
 
 | crate            | new? | role                                                                                                   |
 | ---------------- | ---- | ------------------------------------------------------------------------------------------------------ |
-| `nxvim-lsp`      | new  | The LSP client: `LspManager` (spawn/supervise/route N language servers via per-server `async-lsp` `MainLoop`s), the `LspCommand`/`LspEvent` bridge, server lifecycle. Heavy deps (`async-lsp`, `lsp-types`, `serde_json`) live **here only**. |
-| `nxvim-server`   | —    | Gains an `LspManager` field + a third `select!` arm for `LspEvent`s. Owns: filetype→server config, per-buffer document-sync bookkeeping (reusing the edit journal), byte↔LSP position conversion (via core), diagnostics cache → redraw, request tokens, and the per-feature UI wiring. **Depends on `nxvim-lsp`.** |
-| `nxvim-core`     | —    | Two additive, pure changes: UTF-16/UTF-8 column helpers in `unicode.rs`, and a cursor-jump (`Editor::jump_to(path, line, col)` reusing the existing buffer-open path). Stays pure & synchronous. |
-| `nxvim-tui`      | —    | Renders the new redraw payloads: diagnostic underlines (already has underline/undercurl styles), the diagnostics/hover/symbols panel (already exists), and — in Phase 5 — the **completion popup menu** widget. |
-| `nxvim` (bin)    | —    | No worker re-invoke needed (LSP is in-process). In test/debug builds, a hidden `--__lsp-mock` mode provides the mock language server fixture (see *Testing*). |
+| `bemtvi-lsp`      | new  | The LSP client: `LspManager` (spawn/supervise/route N language servers via per-server `async-lsp` `MainLoop`s), the `LspCommand`/`LspEvent` bridge, server lifecycle. Heavy deps (`async-lsp`, `lsp-types`, `serde_json`) live **here only**. |
+| `bemtvi-server`   | —    | Gains an `LspManager` field + a third `select!` arm for `LspEvent`s. Owns: filetype→server config, per-buffer document-sync bookkeeping (reusing the edit journal), byte↔LSP position conversion (via core), diagnostics cache → redraw, request tokens, and the per-feature UI wiring. **Depends on `bemtvi-lsp`.** |
+| `bemtvi-core`     | —    | Two additive, pure changes: UTF-16/UTF-8 column helpers in `unicode.rs`, and a cursor-jump (`Editor::jump_to(path, line, col)` reusing the existing buffer-open path). Stays pure & synchronous. |
+| `bemtvi-tui`      | —    | Renders the new redraw payloads: diagnostic underlines (already has underline/undercurl styles), the diagnostics/hover/symbols panel (already exists), and — in Phase 5 — the **completion popup menu** widget. |
+| `bemtvi` (bin)    | —    | No worker re-invoke needed (LSP is in-process). In test/debug builds, a hidden `--__lsp-mock` mode provides the mock language server fixture (see *Testing*). |
 
-Dependency direction stays one-way and acyclic: `nxvim-server → nxvim-lsp` is a
+Dependency direction stays one-way and acyclic: `bemtvi-server → bemtvi-lsp` is a
 new edge; nothing depends back on the server.
 
 ---
 
 ## Protocol & module surface
 
-### `nxvim-lsp` public surface (sketch)
+### `bemtvi-lsp` public surface (sketch)
 
 ```rust
 /// Handle the server holds; cheap, drives all language servers.
@@ -313,7 +313,7 @@ pub enum LspEvent {
   correlation, and `$/cancelRequest` are owned by `async-lsp` within the manager;
   the server sees only the distilled events above.
 
-### Server-side per-buffer state (in `nxvim-server`)
+### Server-side per-buffer state (in `bemtvi-server`)
 
 Mirrors `SyntaxState`, keyed by `BufferId`:
 
@@ -334,12 +334,12 @@ key. The byte ranges are converted to screen columns with `unicode::virtcol`
 
 ### Core changes (pure, additive)
 
-1. `nxvim-core/src/unicode.rs`:
+1. `bemtvi-core/src/unicode.rs`:
    - `byte_to_utf16(line: &str, byte: usize) -> usize`
    - `utf16_to_byte(line: &str, u16_units: usize) -> usize`
    (UTF-8 is the identity on byte offsets; UTF-32 = char count, add if a server
    ever needs it.) Pure, table-free, fuzz-friendly.
-2. `nxvim-core/src/editor.rs`:
+2. `bemtvi-core/src/editor.rs`:
    - `Editor::jump_to(path: &str, line: usize, col: usize)` — open-or-switch to
      the buffer for `path` (reuse the `:e` path used by `open_or_named`), set the
      cursor, record the jump in the alternate/jumplist as `:e` already does. Used
@@ -356,22 +356,22 @@ Everything is exercised through the running server over RPC, against a **mock
 language server**. The mock is the LSP analogue of the syntax tests' fixture
 grammar:
 
-- **Mock server fixture.** The `nxvim` binary, in debug builds, supports a hidden
+- **Mock server fixture.** The `bemtvi` binary, in debug builds, supports a hidden
   `--__lsp-mock <script>` mode: it speaks real LSP (Content-Length + JSON-RPC 2.0)
   over stdio and returns **scripted, deterministic** responses — a fixed
   capability set, canned diagnostics, a canned hover/definition/completion — and
   **records every notification it received** to a file the test can read back.
   The server's filetype→command table is overridden in tests via an env var
-  (`NXVIM_LSP_CMD` / a per-language override) to launch this mock instead of a
+  (`BEMTVI_LSP_CMD` / a per-language override) to launch this mock instead of a
   real server. This keeps tests hermetic and network-free, exactly like
-  `NXVIM_TS_WORKER` / `NXVIM_DATA_DIR`.
+  `BEMTVI_TS_WORKER` / `BEMTVI_DATA_DIR`.
 - **Async polling.** LSP replies are asynchronous, so redraw/state assertions
   **poll** (bounded wait) until the expected payload arrives (diagnostics in a
   redraw, the hover panel opening, the cursor having jumped) — never a single
   barrier. This is the pattern the syntax tests already use.
 - **Tiers:** RPC/`View` integration tests in a new
-  `crates/nxvim-server/tests/lsp.rs` (the bulk); a Tier-2 screen test in
-  `crates/nxvim/tests/` for the painted result of diagnostics underlines and the
+  `crates/bemtvi-server/tests/lsp.rs` (the bulk); a Tier-2 screen test in
+  `crates/bemtvi/tests/` for the painted result of diagnostics underlines and the
   completion pmenu; the position-encoding helpers are covered indirectly through
   a non-ASCII-line test that asserts a diagnostic/hover lands on the right cells.
 - **Resilience test:** a mock that exits/hangs on a request; assert the editor
@@ -385,7 +385,7 @@ coverage boundary the syntax and smooth-scrolling designs set.
 
 ## Dependencies (pinned `=x.y.z`, latest stable; pin exactly at implementation)
 
-Added under `[workspace.dependencies]`, reached **only** through `nxvim-lsp`
+Added under `[workspace.dependencies]`, reached **only** through `bemtvi-lsp`
 (plus `tokio`'s `process` feature, already enabled for the syntax worker):
 
 - `async-lsp = "=0.2.4"` (features: `tokio`; `client-monitor` for child-exit
@@ -402,8 +402,8 @@ Added under `[workspace.dependencies]`, reached **only** through `nxvim-lsp`
 We do **not** add `tower-lsp` (server-only — see Decision 2). The hand-rolled
 `Content-Length` + JSON-RPC layer (~100–150 lines, adding only `serde_json` in
 place of `async-lsp`) remains the sanctioned fallback if `async-lsp`'s tower model
-or dependency surface proves an awkward fit; it is internal to `nxvim-lsp` and
-swappable without touching `nxvim-server`.
+or dependency surface proves an awkward fit; it is internal to `bemtvi-lsp` and
+swappable without touching `bemtvi-server`.
 
 Verify the exact latest patch versions with `cargo search` at implementation
 time and pin them, as the rest of the workspace does.
@@ -419,7 +419,7 @@ one focused context window.
 
 ---
 
-### Phase 1 — `nxvim-lsp` crate: lifecycle + document sync (foundation) — ✅ DONE
+### Phase 1 — `bemtvi-lsp` crate: lifecycle + document sync (foundation) — ✅ DONE
 
 **Goal / value.** Stand up the whole LSP plumbing with **no user-visible feature
 yet**: a buffer of a configured filetype auto-starts its language server, the
@@ -449,11 +449,11 @@ Proven entirely against the mock server, which records what it received.
 >   the-saved-state (which clears `modified` without a `:w`) is never mistaken for
 >   a save. This is a small, pure, editor-domain core addition (no I/O, no LSP
 >   concepts), and a future `BufWritePost` autocmd can read the same signal.
-> - **Tests live in `crates/nxvim/tests/lsp.rs`** (not `nxvim-server/tests/`):
->   spawning the `nxvim --__lsp-mock` binary needs `CARGO_BIN_EXE_nxvim`, which is
->   only set for the `nxvim` crate's integration tests — exactly where the syntax
+> - **Tests live in `crates/bemtvi/tests/lsp.rs`** (not `bemtvi-server/tests/`):
+>   spawning the `bemtvi --__lsp-mock` binary needs `CARGO_BIN_EXE_bemtvi`, which is
+>   only set for the `bemtvi` crate's integration tests — exactly where the syntax
 >   worker tests live, for the same reason.
-> - **Workspace root** (refined during Phase 6): `$NXVIM_LSP_ROOT` overrides it
+> - **Workspace root** (refined during Phase 6): `$BEMTVI_LSP_ROOT` overrides it
 >   explicitly; otherwise the nearest ancestor holding a language root marker
 >   (`Cargo.toml` for rust, `go.mod` for go, `pyproject.toml`/… for python, …)
 >   then any `.git` ancestor, falling back to the file's parent directory. The
@@ -463,18 +463,18 @@ Proven entirely against the mock server, which records what it received.
 >   exists):** an `:LspInfo` ex-command opens the panel with the current buffer's
 >   server / encoding / sync-kind / version / cached-diagnostics count plus the
 >   list of running servers; and an append-only LSP log at
->   `$XDG_STATE_HOME/nxvim/lsp.log` (else `~/.local/state/nxvim/lsp.log`) in the
+>   `$XDG_STATE_HOME/bemtvi/lsp.log` (else `~/.local/state/bemtvi/lsp.log`) in the
 >   `[LEVEL][UTC ts] server\tmessage` shape, capturing lifecycle, server
 >   `window/logMessage`+`showMessage` at their mapped severity, captured server
 >   **stderr**, and (at DEBUG) outgoing `did*` sync traffic. Level is set by
->   `$NXVIM_LSP_LOG_LEVEL` (`off`/`error`/`warn`/`info`/`debug`/`trace`, default
->   `warn`); `$NXVIM_LSP_LOG_FILE` overrides the path. `window/logMessage` goes to
+>   `$BEMTVI_LSP_LOG_LEVEL` (`off`/`error`/`warn`/`info`/`debug`/`trace`, default
+>   `warn`); `$BEMTVI_LSP_LOG_FILE` overrides the path. `window/logMessage` goes to
 >   the log only; `window/showMessage` (user-facing) also reaches `:messages`.
 
 **Prerequisites.** None.
 
 **Scope (in):**
-- New `nxvim-lsp` crate: wire `async-lsp`'s client `MainLoop` over a spawned
+- New `bemtvi-lsp` crate: wire `async-lsp`'s client `MainLoop` over a spawned
   child's stdio (one `MainLoop` task per server), and the `LspManager` that
   spawns/supervises/respawns them + bridges to a single event channel (model the
   supervision/backoff/circuit-breaker on `SyntaxClient`'s
@@ -487,31 +487,31 @@ Proven entirely against the mock server, which records what it received.
   close and server teardown.
 - The `LspCommand`/`LspEvent` enums (Decision 3), `ServerKey`,
   `PositionEncoding`.
-- `nxvim-core`: the two `unicode.rs` position helpers (Decision 4). Cover them
+- `bemtvi-core`: the two `unicode.rs` position helpers (Decision 4). Cover them
   via the integration tests below (non-ASCII line).
-- `nxvim-server`: the filetype→command built-in table + `NXVIM_LSP_CMD` test
+- `bemtvi-server`: the filetype→command built-in table + `BEMTVI_LSP_CMD` test
   override; `LspDocState` per buffer; the third `select!` arm draining
   `LspEvent`s (initially handling only `Initialized`/`ServerExited`/`Log`);
   document sync driven from `redraw()`/the input path, reusing `take_edits()` and
   `changedtick` (full sync vs incremental per the server's reported
   `TextDocumentSyncKind`; `resync` → re-`didOpen` with full text + bumped
   version); `didClose` on `:bdelete` (reuse the `reap_closed_buffers` hook).
-- The mock server fixture (`nxvim --__lsp-mock`) + the test harness override.
+- The mock server fixture (`bemtvi --__lsp-mock`) + the test harness override.
 
 **Scope (out → later phases):** diagnostics rendering (Phase 2) — but if the
 mock sends `publishDiagnostics`, just cache them; any language *feature* request;
 all UI.
 
 **Files.**
-- `crates/nxvim-lsp/{Cargo.toml, src/lib.rs, src/manager.rs}` (new; the
+- `crates/bemtvi-lsp/{Cargo.toml, src/lib.rs, src/manager.rs}` (new; the
   `MainLoop` wiring + `LspCommand`/`LspEvent` bridge. The fallback hand-rolled
   transport, if ever needed, would add `src/codec.rs`/`src/jsonrpc.rs` here.)
-- `crates/nxvim-core/src/unicode.rs` (add helpers)
-- `crates/nxvim-server/src/lsp.rs` (new: config table, `LspDocState`, sync logic, event handling — the `syntax.rs` analogue)
-- `crates/nxvim-server/src/lib.rs` (wire the manager field, the `select!` arm, drain hooks)
-- `crates/nxvim/src/main.rs` (+ `--__lsp-mock` debug mode), `crates/nxvim/Cargo.toml`
+- `crates/bemtvi-core/src/unicode.rs` (add helpers)
+- `crates/bemtvi-server/src/lsp.rs` (new: config table, `LspDocState`, sync logic, event handling — the `syntax.rs` analogue)
+- `crates/bemtvi-server/src/lib.rs` (wire the manager field, the `select!` arm, drain hooks)
+- `crates/bemtvi/src/main.rs` (+ `--__lsp-mock` debug mode), `crates/bemtvi/Cargo.toml`
 - `Cargo.toml` (workspace member + deps)
-- `crates/nxvim-server/tests/lsp.rs` (new)
+- `crates/bemtvi-server/tests/lsp.rs` (new)
 
 **Tests (black-box).**
 - Open a `.rs` buffer (mock launched via override); poll until the mock's record
@@ -529,7 +529,7 @@ all UI.
   still edits and the manager records the exit (and respawns per backoff, or
   gives up cleanly past the breaker).
 
-**Done when.** All of the above pass; `nxvim-core` still has no async/LSP/JSON
+**Done when.** All of the above pass; `bemtvi-core` still has no async/LSP/JSON
 deps; the three workspace gates are green.
 
 ---
@@ -539,7 +539,7 @@ deps; the three workspace gates are green.
 > **Implementation notes (as built).** Faithful to the plan, with a few choices
 > worth recording:
 > - **`Editor::jump_to(path, line, col)` was pulled forward** (as the plan
->   permits) and lives in `nxvim-core::editor` — a pure composition of the
+>   permits) and lives in `bemtvi-core::editor` — a pure composition of the
 >   existing `:e` open-or-switch path and the search-landing cursor-set, taking a
 >   **byte** column (the server converts the LSP encoding first). It records the
 >   alternate `#` like `:e` and never reloads-in-place / guards `modified` (a jump
@@ -570,7 +570,7 @@ deps; the three workspace gates are green.
 >   `:panelopen` snapshot and can't drift from the panel they belong to.)*
 > - **Mock** gained a `diagnostics` script field; it pushes
 >   `textDocument/publishDiagnostics` for a document the instant it sees that
->   document's `didOpen`. Tests (in `crates/nxvim/tests/lsp.rs`, reusing the
+>   document's `didOpen`. Tests (in `crates/bemtvi/tests/lsp.rs`, reusing the
 >   Phase-1 mock harness) cover screen-column conversion (leading tab + 2-byte
 >   `é`), the under-cursor message line on/off, the panel list + `<CR>` jump, and
 >   a Tier-2 paint asserting an underlined error cell with the red `sp` color.
@@ -605,9 +605,9 @@ cursor** on the message line, and a **diagnostics list** in the bottom panel.
 underline + message line + panel cover the MVP); `vim.diagnostic.*` Lua API
 (Phase 7).
 
-**Files.** `crates/nxvim-server/src/lsp.rs`, `crates/nxvim-server/src/lib.rs`
-(redraw key + projection, mirroring `highlights_for`), `crates/nxvim-tui/src/render.rs`,
-`crates/nxvim-server/tests/lsp.rs`, a Tier-2 screen test in `crates/nxvim/tests/`.
+**Files.** `crates/bemtvi-server/src/lsp.rs`, `crates/bemtvi-server/src/lib.rs`
+(redraw key + projection, mirroring `highlights_for`), `crates/bemtvi-tui/src/render.rs`,
+`crates/bemtvi-server/tests/lsp.rs`, a Tier-2 screen test in `crates/bemtvi/tests/`.
 
 **Tests.**
 - Mock pushes diagnostics for known ranges; poll a redraw until `diagnostics`
@@ -626,7 +626,7 @@ underline + message line + panel cover the MVP); `vim.diagnostic.*` Lua API
 
 > **Implementation notes (as built).** Faithful to the plan; choices worth
 > recording:
-> - **Request/reply plumbing lives in `nxvim-lsp`** as the design sketched:
+> - **Request/reply plumbing lives in `bemtvi-lsp`** as the design sketched:
 >   `LspRequest` (definition/declaration/typeDefinition/implementation/
 >   references, already in LSP coordinates), `ReqToken { kind: u16, generation:
 >   u64 }` (the manager never interprets it — it only echoes it back), and
@@ -676,7 +676,7 @@ underline + message line + panel cover the MVP); `vim.diagnostic.*` Lua API
 >   so a references list dismissed by a `<CR>` jump still navigates when reopened.
 > - **Mock** gained `definition`/`declaration`/`type_definition`/`implementation`/
 >   `references` script fields (returned verbatim for the matching request).
->   Tests (in `crates/nxvim/tests/lsp.rs`) cover the same-file `gd` jump (asserting
+>   Tests (in `crates/bemtvi/tests/lsp.rs`) cover the same-file `gd` jump (asserting
 >   the request was actually sent), a utf-16 cross-file `gd`, the `gr` references
 >   panel + `<CR>` jump, the empty-reply message, and the cursor-moved stale drop
 >   (`gdj` issues at (0,0) then moves before the reply, which must not jump).
@@ -702,9 +702,9 @@ fills the panel as a jump list. Cheapest high-value features — no new UI.
 **Scope (out):** the jumplist UI beyond what `jump_to` records; workspace symbol
 search (a later/optional add).
 
-**Files.** `crates/nxvim-server/src/lsp.rs`, `crates/nxvim-server/src/lib.rs`
+**Files.** `crates/bemtvi-server/src/lsp.rs`, `crates/bemtvi-server/src/lib.rs`
 (command routing, token generations, keymap/ex-command wiring),
-`crates/nxvim-server/tests/lsp.rs`.
+`crates/bemtvi-server/tests/lsp.rs`.
 
 **Tests.**
 - Mock returns a definition `Location` in the same and in a *different* file;
@@ -731,7 +731,7 @@ search (a later/optional add).
 >   `MarkedString`, an array joined by blank lines, or a `MarkupContent.value`,
 >   with trailing blanks trimmed) and `SignatureHelp { signature, active_parameter
 >   }` (the active signature's label + its active parameter's text). Every protocol
->   response shape collapses inside `nxvim-lsp` before it reaches the editor, the
+>   response shape collapses inside `bemtvi-lsp` before it reaches the editor, the
 >   way goto responses already normalize to a flat `Vec<Location>`. The editor
 >   does **no** markup parsing.
 > - **Hover → the panel; signature help → the message line.** Hover docs can be
@@ -754,7 +754,7 @@ search (a later/optional add).
 >   auto-trigger on `(`/`,` is deferred to keep insert mode untouched until
 >   completion (Phase 5), as the plan directs.
 > - **Mock** gained `hover` and `signature_help` script fields (returned verbatim
->   for the matching request). Tests (in `crates/nxvim/tests/lsp.rs`) cover the `K`
+>   for the matching request). Tests (in `crates/bemtvi/tests/lsp.rs`) cover the `K`
 >   hover panel (markdown → plain lines, trailing blank trimmed, request actually
 >   sent), the empty-hover message (no panel), and the `<C-k>` signature line with
 >   the active parameter bracketed (asserting no literal `k` was inserted).
@@ -777,8 +777,8 @@ search (a later/optional add).
 **Scope (out):** floating windows (the natural home — a follow-up once floats
 exist); markdown styling beyond plain text.
 
-**Files.** `crates/nxvim-server/src/lsp.rs`, `crates/nxvim-server/src/lib.rs`,
-`crates/nxvim-server/tests/lsp.rs`.
+**Files.** `crates/bemtvi-server/src/lsp.rs`, `crates/bemtvi-server/src/lib.rs`,
+`crates/bemtvi-server/tests/lsp.rs`.
 
 **Tests.**
 - Mock returns hover markup; `K` opens the panel with the expected lines.
@@ -845,7 +845,7 @@ exist); markdown styling beyond plain text.
 >   its normal effect (so `<C-k>` signature help still fires after closing).
 > - **Mock** gained `completion` (one scripted response for every request) and
 >   `completion_sequence` (one response **per request**, for the re-request path).
->   Tests (in `crates/nxvim/tests/lsp.rs`) cover the headline ordering (`use nv` →
+>   Tests (in `crates/bemtvi/tests/lsp.rs`) cover the headline ordering (`use nv` →
 >   `nva`,`nvb`, one request), `sortText`-over-label ranking with a subsequence
 >   tail, the `isIncomplete` live re-request (menu stays open, second request,
 >   narrowed items), accept replacing the prefix + applying an `additionalTextEdit`
@@ -968,7 +968,7 @@ wrong:
   the server's document version stays consistent. This is the same applier
   Phase 6 generalizes to multi-file `WorkspaceEdit`s. (Setting the cursor and
   grouping the undo are editor-domain, not LSP — any small core helper added here
-  takes no LSP types, keeping `nxvim-core` LSP-free.)
+  takes no LSP types, keeping `bemtvi-core` LSP-free.)
 
 **Scope (out):**
 - **Snippets** (`InsertTextFormat.Snippet` placeholder/tab-stop expansion) —
@@ -980,14 +980,14 @@ wrong:
 - **Float chrome** — the pmenu is a minimal overlay until real float layout exists
   (cross-phase note); no documentation popup beside the menu yet.
 
-**Files.** `crates/nxvim-lsp/src/manager.rs` (the `Completion` request + the
-`CompletionList`/item distillation) and `crates/nxvim-lsp/src/mock.rs` (the
-`completion` + `completion_sequence` script fields, below); `crates/nxvim-server/src/lsp.rs`
-(prefix, ranking, menu model, accept applier); `crates/nxvim-server/src/lib.rs`
+**Files.** `crates/bemtvi-lsp/src/manager.rs` (the `Completion` request + the
+`CompletionList`/item distillation) and `crates/bemtvi-lsp/src/mock.rs` (the
+`completion` + `completion_sequence` script fields, below); `crates/bemtvi-server/src/lsp.rs`
+(prefix, ranking, menu model, accept applier); `crates/bemtvi-server/src/lib.rs`
 (the `pmenu` redraw key + the insert-mode menu state machine + key interception);
-`crates/nxvim-tui/src/{view.rs, render.rs}` (the `pmenu` `View` field + the overlay
-widget); `crates/nxvim/tests/lsp.rs`, plus a Tier-2 screen test in
-`crates/nxvim/tests/`. **No core change** is anticipated (the anchor reuses
+`crates/bemtvi-tui/src/{view.rs, render.rs}` (the `pmenu` `View` field + the overlay
+widget); `crates/bemtvi/tests/lsp.rs`, plus a Tier-2 screen test in
+`crates/bemtvi/tests/`. **No core change** is anticipated (the anchor reuses
 `cursor_screen_col`; ranking/menu live in the server) beyond, at most, a tiny
 LSP-free cursor-set / undo-group helper for accept.
 
@@ -1047,7 +1047,7 @@ poller mirrors `wait_for_panel`. Then:
   the menu was dismissed) leaves the editor fully editable and inserts nothing; a
   stale reply (generation superseded by the re-request) is dropped.
 
-**Done when.** All of the above pass; `nxvim-core` still carries no LSP/async/JSON
+**Done when.** All of the above pass; `bemtvi-core` still carries no LSP/async/JSON
 deps; the three workspace gates are green. *(Largest phase: if it overflows a
 context, split at the pmenu-widget boundary — 5a = surface + widget + manual
 navigation against static mock items, **including the ordering/ranking and the
@@ -1076,7 +1076,7 @@ land in 5a so 5b is purely behavior.)*
 >   `take_lsp_edits_of(id)` (drain a non-current buffer's LSP journal) — plus
 >   `panel_title()` (so the server recognizes the code-action panel). Core gains
 >   **no** LSP types.
-> - **`WorkspaceEdit` normalization lives in `nxvim-lsp`** (the goto/hover
+> - **`WorkspaceEdit` normalization lives in `bemtvi-lsp`** (the goto/hover
 >   pattern): `changes` and the versioned `documentChanges` (collapsing
 >   `OneOf<TextEdit, AnnotatedTextEdit>`, dropping file create/rename/delete
 >   resource ops) both reduce to a flat `WorkspaceEditData = Vec<(Url,
@@ -1135,7 +1135,7 @@ land in 5a so 5b is purely behavior.)*
 >   core-owned, synchronous `:w` and needs a deferred-write pre-write hook).
 > - **Mock** gained `formatting` / `rename` / `code_action` / `code_action_resolve`
 >   script fields (via the existing `reply_scripted` path) plus `reply_delay_ms`.
->   Tests (in `crates/nxvim/tests/lsp.rs`) cover `:LspFormat` rewrite + idempotent
+>   Tests (in `crates/bemtvi/tests/lsp.rs`) cover `:LspFormat` rewrite + idempotent
 >   re-run, the content-version drop, a **two-file** rename across open buffers
 >   (each independently undoable, cursor survives, sibling read by handle), the
 >   code-action panel + `<CR>` apply, a **lazy action resolved before applying**, a
@@ -1201,14 +1201,14 @@ per-document `apply_edits` this phase lifts into a multi-buffer applier.
   `textDocument.codeAction.codeActionLiteralSupport` (else `Command[]`, see
   above), and `workspace.workspaceEdit { documentChanges: true }` (resource ops
   stay out — Scope out).
-- **A shared `WorkspaceEdit` applier (the keystone).** In `nxvim-lsp`, normalize a
+- **A shared `WorkspaceEdit` applier (the keystone).** In `bemtvi-lsp`, normalize a
   `WorkspaceEdit` — 0.95.1 carries it as **either** `changes: {Url → TextEdit[]}`
   **or** `document_changes` (`Edits(TextDocumentEdit[])`, whose edits are
   `OneOf<TextEdit, AnnotatedTextEdit>`, or `Operations` that also mix in file
   create/rename/delete) — into a flat `Url → Vec<TextEdit>` (collapse the
   `OneOf`/annotation; **drop resource ops**, the scoped-out unopened-file case),
   ranges left in the negotiated encoding (the goto/hover normalization pattern).
-  In `nxvim-server`, for each URI that maps to an **open** buffer: convert ranges →
+  In `bemtvi-server`, for each URI that maps to an **open** buffer: convert ranges →
   bytes through *that* document's server encoding + line text, apply via the new
   per-`BufferId` core entry (reverse order within a document so earlier offsets
   stay valid; one undo step per buffer), then `sync_lsp_buffer(id)` so its
@@ -1217,7 +1217,7 @@ per-document `apply_edits` this phase lifts into a multi-buffer applier.
   work is reaching the *other* buffers.)
 - **`:LspFormat`** → `textDocument/formatting` (send `FormattingOptions` with a
   fixed default — `tabSize: 8` to match the `TABSTOP` constant, `insertSpaces:
-  true` — since nxvim has no `:set shiftwidth`/`expandtab` yet; real options are a
+  true` — since bemtvi has no `:set shiftwidth`/`expandtab` yet; real options are a
   follow-up when `:set` lands) → on reply, apply the `TextEdit[]` to the current
   buffer **iff it hasn't changed since the request** (the version guard above);
   re-running on already-formatted text is a no-op.
@@ -1244,19 +1244,19 @@ per-document `apply_edits` this phase lifts into a multi-buffer applier.
 - **Range / on-type formatting.**
 
 **Files.**
-- `crates/nxvim-lsp/src/manager.rs` — the new `Formatting`/`Rename`/`CodeAction`
+- `crates/bemtvi-lsp/src/manager.rs` — the new `Formatting`/`Rename`/`CodeAction`
   requests and the `WorkspaceEdit` / `TextEdit[]` / `CodeAction[]` distillation —
-  and `crates/nxvim-lsp/src/mock.rs` — the `formatting`/`rename`/`code_action`
+  and `crates/bemtvi-lsp/src/mock.rs` — the `formatting`/`rename`/`code_action`
   script fields (below). *(Both omitted from the original Files list; every prior
   feature phase touched them.)*
-- `crates/nxvim-core/src/editor.rs` — the per-`BufferId` edit applier (LSP-free,
+- `crates/bemtvi-core/src/editor.rs` — the per-`BufferId` edit applier (LSP-free,
   the multi-buffer sibling of Phase 5's `apply_edits`).
-- `crates/nxvim-server/src/lsp.rs` — the WorkspaceEdit→buffers apply driver, the
+- `crates/bemtvi-server/src/lsp.rs` — the WorkspaceEdit→buffers apply driver, the
   per-buffer sync, the version-guarded reply handling, the three issue functions.
-- `crates/nxvim-server/src/lib.rs` — the `:LspFormat`/`:LspRename`/`:LspCodeAction`
+- `crates/bemtvi-server/src/lib.rs` — the `:LspFormat`/`:LspRename`/`:LspCodeAction`
   ex-commands and the code-action panel-select→apply wiring.
-- `crates/nxvim/tests/lsp.rs` — **not** `crates/nxvim-server/tests/` (the mock
-  binary needs `CARGO_BIN_EXE_nxvim`, as Phases 1–5 record) — plus a Tier-2 screen
+- `crates/bemtvi/tests/lsp.rs` — **not** `crates/bemtvi-server/tests/` (the mock
+  binary needs `CARGO_BIN_EXE_bemtvi`, as Phases 1–5 record) — plus a Tier-2 screen
   test if the code-action panel warrants one.
 
 > **Code-action panel payload.** The panel carries two payloads today: jump
@@ -1276,7 +1276,7 @@ three script fields answered by the existing `reply_scripted` path:
 - `code_action`: the `(CodeAction | Command)[]` for `textDocument/codeAction`
   (tests script `CodeAction`s carrying an eager `edit`).
 
-**Tests** (in `crates/nxvim/tests/lsp.rs`).
+**Tests** (in `crates/bemtvi/tests/lsp.rs`).
 - Mock returns formatting `TextEdit`s; `:LspFormat` rewrites the buffer to the
   expected lines; idempotent on re-run; **a reply that lands after an intervening
   edit is dropped** (version guard) and the buffer is left intact.
@@ -1290,7 +1290,7 @@ three script fields answered by the existing `reply_scripted` path:
 - Resilience: a format/rename request whose reply never arrives leaves the editor
   fully editable and the buffers unchanged.
 
-**Done when.** The above pass; `nxvim-core` still carries no LSP/async/JSON deps;
+**Done when.** The above pass; `bemtvi-core` still carries no LSP/async/JSON deps;
 the three gates are green. *(Sized like Phase 5 — if it overflows a context, split
 at the feature boundary: **6a** = capability advertisement + WorkspaceEdit
 normalization + the multi-buffer applier + per-buffer sync + version guard, proven
@@ -1305,7 +1305,7 @@ mock fields land in 6a so 6b is purely the code-action surface.)*
 **Goal / value.** Make it plugin-compatible: drive LSP entirely from the Lua
 surface real configs use, so a user's `init.lua` — running the **real
 nvim-lspconfig** — starts and configures servers. This is what turns the machinery
-from "nxvim-native LSP" into "runs the ecosystem's LSP config."
+from "bemtvi-native LSP" into "runs the ecosystem's LSP config."
 
 **Key framing — nvim-lspconfig is data-only (Neovim 0.11+).** The modern plugin no
 longer ships a `require'lspconfig'.xxx.setup{}` framework; it ships
@@ -1338,8 +1338,8 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 > **Implementation notes (as built).** Faithful to the plan; choices worth
 > recording:
 > - **`LspOp::Start` is the new queue**, the LSP analogue of `PanelOp`: a
->   `vim.lsp.start` (Rust `nx._lsp_start`) pushes `{name, cmd, root, filetype,
->   bufnr}` into `nxvim-lua`'s `Shared`; the server drains it in `apply_lua_effects`
+>   `vim.lsp.start` (Rust `btv._lsp_start`) pushes `{name, cmd, root, filetype,
+>   bufnr}` into `bemtvi-lua`'s `Shared`; the server drains it in `apply_lua_effects`
 >   (right after panel ops) into `Server::apply_lsp_op`, which ensures the
 >   `(name, root)` client and binds the buffer. The whole start path is one more
 >   effect on the existing "Lua queues, server applies" flow.
@@ -1347,8 +1347,8 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   `vim.lsp.start` already bound (`state.server`), sending `didOpen`/`didChange`/
 >   `didSave` exactly as before. The built-in `filetype→cmd` table,
 >   `workspace_root`/`find_root_marker`/`lsp_root_for`, the `lsp_roots` cache, and
->   the redraw-loop auto-spawn are **gone**. `$NXVIM_LSP_CMD` (override the argv —
->   the mock hook) and `$NXVIM_LSP_ROOT` (override the resolved root) survive as the
+>   the redraw-loop auto-spawn are **gone**. `$BEMTVI_LSP_CMD` (override the argv —
+>   the mock hook) and `$BEMTVI_LSP_ROOT` (override the resolved root) survive as the
 >   only env hooks, applied in `apply_lsp_op`.
 > - **The `languageId` is carried, not re-derived.** `LspDocState` gained a
 >   `language_id` (the buffer's filetype, set when the dispatcher binds the buffer)
@@ -1362,21 +1362,21 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   `root_markers` from the buffer's directory; a `function(bufnr, on_dir)`
 >   root_dir drives the start through its `on_dir` callback (so it can decline). The
 >   server takes the resolved string as-is (falling back to the file's directory, or
->   `$NXVIM_LSP_ROOT`).
+>   `$BEMTVI_LSP_ROOT`).
 > - **Supporting `vim.*` surface** (prelude, pure Lua over Rust primitives):
 >   `vim.fs.root/find/dirname/basename/parents/joinpath/normalize`, `vim.uri_from_fname/
 >   uri_to_fname/uri_from_bufnr`, `vim.fn.getcwd/bufname/fnamemodify`,
 >   `vim.lsp.protocol.make_client_capabilities` (stub — caps stay Rust-owned),
 >   `vim.validate`/`vim.deprecate` (no-ops). Rust-backed: `nvim_get_runtime_file`
->   (runtimepath `lsp/` discovery, single-`*` glob), `nx._read_file`/`nx._readdir`.
+>   (runtimepath `lsp/` discovery, single-`*` glob), `btv._read_file`/`btv._readdir`.
 > - **`vim.lsp.config` is a `setmetatable` table:** `__call` merges a user override,
 >   `__index` returns the resolved chain (`'*'` ← `lsp/<name>.lua` runtimepath base
 >   ← user override, via `tbl_deep_extend('force', …)`), `__newindex` redefines
 >   (replaces the override and drops the base). `vim.lsp.enable` installs **one**
->   shared `FileType` autocmd (augroup `nxvim.lsp.enable`) that, per opened buffer,
+>   shared `FileType` autocmd (augroup `bemtvi.lsp.enable`) that, per opened buffer,
 >   starts every enabled config whose resolved `filetypes` matches. It **also**
 >   processes the already-open current buffer on the spot (via `_on_filetype` over
->   the `nx._cur_buf` snapshot, which now carries the buffer's `filetype`) — so an
+>   the `btv._cur_buf` snapshot, which now carries the buffer's `filetype`) — so an
 >   interactive `:lua vim.lsp.enable(…)` after a file is already open starts the
 >   server immediately, matching neovim's "process loaded buffers" behavior instead
 >   of silently arming only future `FileType` events. The retroactive start is
@@ -1386,10 +1386,10 @@ Phase 2 (`FileType`/`BufReadPost`/`BufEnter` + buffer snapshot) is in place.
 >   per-test change beyond the harness: the `start` helper now sources a temp
 >   `init.lua` (`vim.lsp.config('mock', {cmd=…, filetypes={'rust',…}})` +
 >   `vim.lsp.enable('mock')`); the mock command is still injected via
->   `$NXVIM_LSP_CMD`. Because auto-spawn is gone, every passing `didOpen`/feature
+>   `$BEMTVI_LSP_CMD`. Because auto-spawn is gone, every passing `didOpen`/feature
 >   assertion now *proves* the framework drove the start. The `:LspInfo` server name
 >   is the config name (`mock`) rather than the filetype. A new
->   `crates/nxvim/tests/lspconfig.rs` runs the **real** vendored
+>   `crates/bemtvi/tests/lspconfig.rs` runs the **real** vendored
 >   `lsp/lua_ls.lua` (pure `root_markers`, no `vim.system`/`cargo metadata`): it
 >   enables `lua_ls`, opens a `.lua` file under a temp project with a `.luarc.json`
 >   marker one dir up, and asserts `initialize` (with the **real** resolved root) →
@@ -1422,7 +1422,7 @@ working through the new start path.
   and calls `vim.lsp.start`.
 - **`vim.lsp.start(config)`** — queues an `LspOp::Start { name, cmd, root, filetype,
   bufnr }` (root already resolved in Lua; Rust never re-resolves), drained on the
-  existing `nxvim-lua` effect pattern into `LspManager::ensure_server`.
+  existing `bemtvi-lua` effect pattern into `LspManager::ensure_server`.
 - **Supporting `vim.*` surface** real config files call: `vim.fs.root/find/dirname/
   parents/joinpath`, `vim.uri_from_fname/uri_to_fname/uri_from_bufnr`,
   `vim.fn.getcwd/expand/fnamemodify/bufname`, Lua-exposed `vim.api.nvim_buf_get_name`,
@@ -1434,16 +1434,16 @@ working through the new start path.
   client when `vim.lsp.start` drains. `reuse_client` = the existing `lsp_ensured`
   dedup on `(name, root)`.
 
-**Files.** `crates/nxvim-lua/src/{lib.rs,prelude.lua}` (the `vim.lsp.config`
+**Files.** `crates/bemtvi-lua/src/{lib.rs,prelude.lua}` (the `vim.lsp.config`
 metatable, `enable` dispatcher, `LspOp` queue, `vim.fs`/`vim.uri`/`vim.fn` shims,
-`nvim_get_runtime_file`); `crates/nxvim-server/src/{lsp.rs,lib.rs}` (drain `LspOp`s
+`nvim_get_runtime_file`); `crates/bemtvi-server/src/{lsp.rs,lib.rs}` (drain `LspOp`s
 into `ensure_server`, bind buffer→client, rewrite `sync_lsp`, remove the built-in
-table); `crates/nxvim-lsp/src/manager.rs` (`ServerKey.name`); `vendor/nvim-lspconfig`
-(submodule); `crates/nxvim/tests/{lsp.rs,lspconfig.rs}`.
+table); `crates/bemtvi-lsp/src/manager.rs` (`ServerKey.name`); `vendor/nvim-lspconfig`
+(submodule); `crates/bemtvi/tests/{lsp.rs,lspconfig.rs}`.
 
 **Tests.**
 - Migrate the Phase 1–6 tests: a temp `init.lua` does `vim.lsp.config('mock', …)` +
-  `vim.lsp.enable('mock')` (mock cmd still injected via `NXVIM_LSP_CMD`); features
+  `vim.lsp.enable('mock')` (mock cmd still injected via `BEMTVI_LSP_CMD`); features
   prove out through the Lua start path, not auto-spawn.
 - New `lspconfig.rs`: runtimepath points at vendored nvim-lspconfig; override one
   server's `cmd` to the mock; `vim.lsp.enable`; open a matching file under a temp
@@ -1453,7 +1453,7 @@ table); `crates/nxvim-lsp/src/manager.rs` (`ServerKey.name`); `vendor/nvim-lspco
 
 **Done when.** A server starts only via user Lua; the real vendored
 rust_analyzer/gopls/pyright/lua_ls configs load and start the mock; all migrated
-Phase 1–6 features pass; `nxvim-core` still carries no LSP/async/JSON deps; gates green.
+Phase 1–6 features pass; `bemtvi-core` still carries no LSP/async/JSON deps; gates green.
 
 ---
 
@@ -1481,15 +1481,15 @@ only as plugins demand it." Legacy Vimscript configs are a non-goal.
 
 1. **Action queue (Lua → Rust)** for anything that mutates editor state.
    `vim.lsp.start` pushes an `LspOp` onto `shared.lsp_ops`; the server drains it in
-   `apply_lua_effects()` via `take_lsp_ops()` (`nxvim-server/src/lib.rs:888`), which
+   `apply_lua_effects()` via `take_lsp_ops()` (`bemtvi-server/src/lib.rs:888`), which
    runs right after `run_keymap(id)` (`lib.rs:735,739`). A Lua keymap RHS that calls
    `vim.lsp.buf.definition()` therefore enqueues an op the server applies on the same
-   input tick. **Extend the `LspOp` enum** (`nxvim-lua/src/lib.rs`, currently just
+   input tick. **Extend the `LspOp` enum** (`bemtvi-lua/src/lib.rs`, currently just
    `Start`) — do not invent a new channel.
 2. **State mirror (Rust → Lua)** for the one synchronous getter (`vim.diagnostic.get`).
    Lua closures can't reach the live `Server`, so mirror the cache into a Lua table
-   the way `nx._set_cur_buf` mirrors the current buffer (`prelude.lua:289`): on every
-   `publishDiagnostics` the server calls a new `nx._set_diagnostics(bufnr, list)`,
+   the way `btv._set_cur_buf` mirrors the current buffer (`prelude.lua:289`): on every
+   `publishDiagnostics` the server calls a new `btv._set_diagnostics(bufnr, list)`,
    and `vim.diagnostic.get` reads that table in pure Lua.
 
 The native entry points already exist and are what the ops route into:
@@ -1507,14 +1507,14 @@ The thin-routing slice: each function enqueues an op; the server calls the exist
 > **Implementation notes (as built).** Faithful to the plan; the two `Ask first`
 > questions were settled with the listed defaults (require the `rename` arg;
 > **keep** the native `gd`/`gD`/`gr`/`K` defaults).
-> - **`LspOp` gained four variants** (`nxvim-lua/src/lib.rs`): `BufRequest { kind:
+> - **`LspOp` gained four variants** (`bemtvi-lua/src/lib.rs`): `BufRequest { kind:
 >   u16 }` (the position family — definition/declaration/typeDefinition/
 >   implementation/references/hover/signatureHelp, `kind` = `LspReqKind::as_u16`),
 >   `Format`, `Rename { new_name }`, `CodeAction`. Four Rust closures
->   (`nx._lsp_buf`, `nx._lsp_buf_format`, `nx._lsp_buf_code_action`,
->   `nx._lsp_buf_rename`) sit next to `_lsp_start` and just push the op — no new
+>   (`btv._lsp_buf`, `btv._lsp_buf_format`, `btv._lsp_buf_code_action`,
+>   `btv._lsp_buf_rename`) sit next to `_lsp_start` and just push the op — no new
 >   channel.
-> - **`apply_lsp_op` routes them** (`nxvim-server/src/lsp.rs`): it now matches the
+> - **`apply_lsp_op` routes them** (`bemtvi-server/src/lsp.rs`): it now matches the
 >   op, sending `BufRequest`→`request_lsp(from_u16(kind))`, `Format`→
 >   `request_lsp_format`, `Rename`→`request_lsp_rename`, `CodeAction`→
 >   `request_lsp_code_action`, and falls through to the existing `Start` body
@@ -1523,13 +1523,13 @@ The thin-routing slice: each function enqueues an op; the server calls the exist
 >   `run_keymap` in `apply_lua_effects`).
 > - **`vim.lsp.buf` is bare functions** (`prelude.lua`): `definition`/`declaration`/
 >   `type_definition`/`implementation`/`references`/`hover`/`signature_help` each
->   call `nx._lsp_buf(<kind>)`; `format`/`code_action` accept and ignore their
+>   call `btv._lsp_buf(<kind>)`; `format`/`code_action` accept and ignore their
 >   neovim options table (no behavior yet); `rename(name)` requires a non-empty
 >   string and echoes `E471` otherwise (no prompt UI). Being bare means
 >   `vim.keymap.set('n','gd',vim.lsp.buf.definition)` works — the RHS is the
 >   function itself. Completion stays out of `vim.lsp.buf` (it is `vim.lsp.completion`
 >   in neovim; not needed here).
-> - **Tests** (`crates/nxvim/tests/lsp.rs`, +4): definition (jump), references
+> - **Tests** (`crates/bemtvi/tests/lsp.rs`, +4): definition (jump), references
 >   (panel + `<CR>`), hover (panel text), and rename (cross-buffer edit) each driven
 >   through a *Lua-set* keymap on a non-default key (`<Space>d/r/h`) or `:lua`, so
 >   the trigger is unambiguously `vim.lsp.buf.*` rather than the native default. Each
@@ -1537,18 +1537,18 @@ The thin-routing slice: each function enqueues an op; the server calls the exist
 
 > **❓ Ask first (before coding Slice 1):**
 > - **`vim.lsp.buf.rename()` with no argument.** Neovim prompts for the new name;
->   nxvim has no prompt UI. Require the arg (`rename(name)`) and echo `E471` when nil
+>   bemtvi has no prompt UI. Require the arg (`rename(name)`) and echo `E471` when nil
 >   (same as `:LspRename`), deferring a prompt to a later phase? *(default: yes,
 >   require the arg)*
 > - **Keep the native `gd`/`gD`/`gr`/`K` defaults** (`lib.rs:243`) now that Lua can
 >   set them? They are `default=true` lowest-precedence, so an `on_attach` user map
->   shadows them; real neovim ships no defaults, but nxvim's "native-first" principle
+>   shadows them; real neovim ships no defaults, but bemtvi's "native-first" principle
 >   wants a working no-config baseline. *(default: keep them)*
 
-**Rust — `nxvim-lua/src/lib.rs`:** extend `LspOp` with
+**Rust — `bemtvi-lua/src/lib.rs`:** extend `LspOp` with
 `BufRequest { kind: u16 }`, `Format`, `Rename { new_name: String }`, `CodeAction`
 (`kind` reuses `LspReqKind::as_u16`/`from_u16`, `lsp.rs:88`, so the wire stays one
-int). Register a `nx._lsp_buf(kind_u16)` / `nx._lsp_buf_rename(name)` Rust closure
+int). Register a `btv._lsp_buf(kind_u16)` / `btv._lsp_buf_rename(name)` Rust closure
 next to `_lsp_start` (`lib.rs:701`) that pushes the matching op.
 
 **Rust — `apply_lsp_op` (`lsp.rs:216`):** add arms routing `BufRequest`→`request_lsp`,
@@ -1558,9 +1558,9 @@ next to `_lsp_start` (`lib.rs:701`) that pushes the matching op.
 
 **Lua — `prelude.lua` (new `vim.lsp.buf` table near `:972`):** one bare function per
 feature (so `vim.keymap.set('n','gd',vim.lsp.buf.definition)` works), each calling
-`nx._lsp_buf(<kind>)`; `rename` → `nx._lsp_buf_rename`.
+`btv._lsp_buf(<kind>)`; `rename` → `btv._lsp_buf_rename`.
 
-**Tests (`crates/nxvim/tests/lsp.rs`).** Cover the distinct reply shapes through the
+**Tests (`crates/bemtvi/tests/lsp.rs`).** Cover the distinct reply shapes through the
 Lua path: definition (jump via a Lua-set `gd`), references (panel), hover (panel
 text), rename (cross-buffer edit). One-per-kind is overkill.
 
@@ -1573,19 +1573,19 @@ the existing jump/panel logic.
 
 > **Implementation notes (as built).** Faithful to the plan; the two `Ask first`
 > questions were settled as: **honor what's possible** (wire `config({underline=…})`
-> to the one diagnostic surface nxvim has — the underline spans — and store the rest)
+> to the one diagnostic surface bemtvi has — the underline spans — and store the rest)
 > and **match neovim** field indexing.
 > - **Rust→Lua mirror.** A new `LuaRuntime::set_diagnostics(bufnr, &[DiagnosticData])`
->   writes `nx._diagnostics[bufnr]` (via a prelude `nx._set_diagnostics`); the
+>   writes `btv._diagnostics[bufnr]` (via a prelude `btv._set_diagnostics`); the
 >   server calls it from the `LspEvent::Diagnostics` handler on **every**
 >   `publishDiagnostics` (the same spot it caches `state.diagnostics`). Keyed by
 >   `bufnr`, the mirror never goes stale on a buffer switch — `get(0)` resolves
->   `0` → current via `nx._cur_buf`, which `BufEnter` already refreshes — so the
+>   `0` → current via `btv._cur_buf`, which `BufEnter` already refreshes — so the
 >   plan's extra "push on buffer switch" is unnecessary in this design (noted as a
 >   deliberate, documented deviation). `DiagnosticData` is a new public
->   `nxvim-lua` struct with neovim's shape: 0-based `lnum`/`col`/`end_lnum`/`end_col`,
+>   `bemtvi-lua` struct with neovim's shape: 0-based `lnum`/`col`/`end_lnum`/`end_col`,
 >   `severity` 1=ERROR…4=HINT, `message`, optional `source`. `col`/`end_col` are the
->   raw LSP character offsets — byte columns under the UTF-8 nxvim advertises first
+>   raw LSP character offsets — byte columns under the UTF-8 bemtvi advertises first
 >   (the negotiated default), correct for the common case; a utf-16-only server would
 >   diverge past non-ASCII (documented, not yet converted — would need the target
 >   buffer's line text).
@@ -1596,7 +1596,7 @@ the existing jump/panel logic.
 >   (sequence-table → array, other table → map, scalars as-is; functions/userdata →
 >   nil). `args` is accepted but not yet threaded in. Effects the chunk queued drain
 >   afterward (`apply_lua_effects` + `run_pending`), exactly like `:lua`. This pulled
->   `rmpv` into `nxvim-lua` as a dep (it already underlies the RPC layer).
+>   `rmpv` into `bemtvi-lua` as a dep (it already underlies the RPC layer).
 > - **Actions on the existing queue.** Three new `LspOp`s —
 >   `DiagnosticGoto { forward, severity }`, `DiagnosticSetloclist`,
 >   `DiagnosticConfig { underline }` — ride the Slice-1 op queue.
@@ -1613,10 +1613,10 @@ the existing jump/panel logic.
 >   (with the number→name reverse map), `get(bufnr, opts)` reading the mirror
 >   (`nil` → all buffers, `0` → current, `opts.severity` number filter, entries
 >   copied out with their `bufnr`), `goto_next`/`goto_prev`/`setloclist` →
->   `nx._diagnostic_*`, and `config(opts)` merging into a stored table and pushing
+>   `btv._diagnostic_*`, and `config(opts)` merging into a stored table and pushing
 >   the resolved `underline` bool (an explicit `false` disables; a table/true
 >   enables).
-> - **Tests** (`crates/nxvim/tests/lsp.rs`, +4): `get(0)` field shape + severity
+> - **Tests** (`crates/bemtvi/tests/lsp.rs`, +4): `get(0)` field shape + severity
 >   filter (through `nvim_exec_lua`), `goto_next`/`goto_prev` across two diagnostics
 >   with forward/backward **wrap**, `setloclist` opening the navigable panel (+`<CR>`
 >   jump), and `config({underline=false})` draining the underline spans out of the
@@ -1632,9 +1632,9 @@ the existing jump/panel logic.
 
 **Rust — mirror push.** In the `publishDiagnostics` handler (`lsp.rs:416–428`, where
 `state.diagnostics` is set) *and* on buffer switch, call a new
-`Lua::set_diagnostics(bufnr, &[Diagnostic])` writing `nx._diagnostics[bufnr]` as
+`Lua::set_diagnostics(bufnr, &[Diagnostic])` writing `btv._diagnostics[bufnr]` as
 `{lnum,col,end_lnum,end_col,severity,message,source}`. Push on **every**
-`publishDiagnostics` and on buffer switch or the getter goes stale (the `nx._cur_buf`
+`publishDiagnostics` and on buffer switch or the getter goes stale (the `btv._cur_buf`
 refresh is the model).
 
 **Rust — actions.** Add `LspOp::DiagnosticGoto { forward, severity }` and
@@ -1647,9 +1647,9 @@ duplicate the byte↔char conversion (reuse the encoding on `LspDocState`).
 panel like `:LspDiagnostics` (`lib.rs:980`).
 
 **Lua — `prelude.lua` (new `vim.diagnostic` table):** `severity` constants;
-`nx._diagnostics` table; `get(bufnr,opts)` reading the mirror (0/`nil` bufnr →
+`btv._diagnostics` table; `get(bufnr,opts)` reading the mirror (0/`nil` bufnr →
 current, `opts.severity` filter, deepcopy out); `goto_next`/`goto_prev` →
-`nx._diagnostic_goto`; `setloclist` → `nx._diagnostic_setloclist`; `config` per the
+`btv._diagnostic_goto`; `setloclist` → `btv._diagnostic_setloclist`; `config` per the
 answer above.
 
 **Tests.** Seed canned diagnostics via the mock; assert `get(0)` returns them with
@@ -1664,7 +1664,7 @@ The slice that makes real nvim-lspconfig setups work and closes the gate.
 
 > **Resolved (requester answers):**
 > - **`server_capabilities` shape** — the **full feature-mirroring set**: one bool per
->   feature nxvim implements (`definitionProvider`, `declarationProvider`,
+>   feature bemtvi implements (`definitionProvider`, `declarationProvider`,
 >   `typeDefinitionProvider`, `implementationProvider`, `referencesProvider`,
 >   `hoverProvider`, `signatureHelpProvider`, `completionProvider`,
 >   `documentFormattingProvider`, `renameProvider`, `codeActionProvider`). Distilled
@@ -1689,7 +1689,7 @@ re-fire), through the new `fire_autocmd_data` which threads `data = { client_id 
 (which also drops the runtime and `remove_lsp_client`s it).
 
 **Lua — invoke `on_attach` (done).** A default `LspAttach` autocmd in the
-`nxvim.lsp.enable` augroup resolves the client via `vim.lsp.get_client_by_id(
+`bemtvi.lsp.enable` augroup resolves the client via `vim.lsp.get_client_by_id(
 args.data.client_id)` and calls `cfg.on_attach(client, args.buf)` (where `cfg =
 vim.lsp.config[client.name]`) — the call site that lets `on_attach` set buffer-local
 maps (`vim.keymap.set('n','gd',vim.lsp.buf.definition,{buffer=args.buf})`).
@@ -1707,8 +1707,8 @@ maps (`vim.keymap.set('n','gd',vim.lsp.buf.definition,{buffer=args.buf})`).
   identical attach→keymap path and keep their dedicated mock coverage in `lsp.rs`.)
 
 **Conventions reminder (CLAUDE.md).** No unit tests — all coverage is black-box in
-`crates/nxvim/tests/lsp.rs` / `lspconfig.rs` against the mock (or real lspconfig for
-the gate). `nxvim-core` stays LSP-free.
+`crates/bemtvi/tests/lsp.rs` / `lspconfig.rs` against the mock (or real lspconfig for
+the gate). `bemtvi-core` stays LSP-free.
 
 ---
 
@@ -1726,11 +1726,11 @@ the gate). `nxvim-core` stays LSP-free.
 - **Workspace features** — `workspace/symbol`, `workspace/executeCommand` beyond
   single-reply actions: add as needed. (`workspace/didChangeWatchedFiles` **is**
   implemented: the client advertises `dynamicRegistration`, answers
-  `client/registerCapability`, and `nx.lsp._register_capability` turns each
-  registered glob into an `nx.fs.watch` subscription that reports Created/Changed/
+  `client/registerCapability`, and `btv.lsp._register_capability` turns each
+  registered glob into an `btv.fs.watch` subscription that reports Created/Changed/
   Deleted back to the server. The workspace root also goes out as `workspaceFolders`
   — pyright/basedpyright ignore the deprecated `rootUri` and analyse nothing without
-  it. See `crates/nxvim/tests/lsp_watchfiles.rs`.)
+  it. See `crates/bemtvi/tests/lsp_watchfiles.rs`.)
 - **Pull diagnostics** (`textDocument/diagnostic`) — the plan uses push
   (`publishDiagnostics`); add the pull model if a target server requires it.
 - **Format-on-save** (descoped from Phase 6) — must invert the `:w` flow: `:w` is
@@ -1750,12 +1750,12 @@ the gate). `nxvim-core` stays LSP-free.
   manager with reply-as-event correlation instead of Lua coroutines, because the
   server loop is single-message-at-a-time and must never block (Decision 3).
 - **Reuses the treesitter edit journal** for `didChange` — neovim tracks LSP
-  document changes separately; nxvim already has the deltas.
-- **Panel-first UI** — neovim leans on floats from day one; nxvim defers floats
+  document changes separately; bemtvi already has the deltas.
+- **Panel-first UI** — neovim leans on floats from day one; bemtvi defers floats
   and routes hover/symbols/lists through its existing message panel until a float
   surface exists.
 - **`vim.lsp.*` last** — the machinery is native first (built-in config), the Lua
-  surface is layered on top, matching how nxvim grew `nvim_set_hl`/`:colorscheme`
+  surface is layered on top, matching how bemtvi grew `nvim_set_hl`/`:colorscheme`
   before a broad `vim.*`.
 </content>
 </invoke>

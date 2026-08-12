@@ -1,18 +1,18 @@
--- ~~~ nxvim nx.complete: the `lsp` source + the docs sidebar (Phase 4-D) ~~~
+-- ~~~ bemtvi btv.complete: the `lsp` source + the docs sidebar (Phase 4-D) ~~~
 --
 -- Run it (from the repo root) — needs `lua-language-server` on your PATH:
 --
---     NXVIM_CONFIG=examples/ui-complete-lsp \
---       cargo run -p nxvim -- examples/ui-complete-lsp/sample.lua
+--     BEMTVI_CONFIG=examples/ui-complete-lsp \
+--       cargo run -p bemtvi -- examples/ui-complete-lsp/sample.lua
 --
--- This is the completion engine (docs/specs/2026-06-14-nx-ui-float-widget.md,
+-- This is the completion engine (docs/specs/2026-06-14-btv-ui-float-widget.md,
 -- Phase 4) driving the built-in **`lsp`** source, with the **docs float** beside the
 -- popup — a real, non-focusable float window (the same model LSP hover uses), so the
 -- docs are syntax-highlighted (the signature is fenced in the buffer's language) and
 -- scroll with the mouse wheel. As you navigate the list, the float to the right
 -- (flipping left when there's no room) shows the selected item's signature (`detail`)
 -- and documentation. Many servers — lua_ls and rust_analyzer especially — send docs
--- only on demand, so nxvim issues `completionItem/resolve` for the highlighted row
+-- only on demand, so bemtvi issues `completionItem/resolve` for the highlighted row
 -- and renders the reply **server-side** (no Lua at frame time, ADR 0002 rule 4).
 --
 -- In insert mode:
@@ -35,7 +35,7 @@ vim.g.mapleader = "\\"
 -- the docs float only renders for `lsp` rows that carry documentation, so a buffer
 -- word simply shows none. Set `docs = false` to turn it off. `docs_wrap` (default
 -- true) wraps a long doc line within the float instead of truncating it.
-nx.complete.setup {
+btv.complete.setup {
   sources = { { "lsp" }, { "buffer", min_chars = 2 } },
   min_chars = 1,
   -- docs = false,       -- uncomment to hide the docs float
@@ -43,37 +43,37 @@ nx.complete.setup {
 }
 
 --------------------------------------------------------------------------------
--- Attach lua-language-server to `lua` buffers via the declarative nx.lsp control
--- surface: nx.lsp.config registers the server, nx.lsp.enable activates it, and the
+-- Attach lua-language-server to `lua` buffers via the declarative btv.lsp control
+-- surface: btv.lsp.config registers the server, btv.lsp.enable activates it, and the
 -- engine starts it on the first `lua` buffer (resolving the root upward from the
 -- file through root_markers). on_attach runs once the server has bound the buffer —
 -- the place to set buffer-local LSP keymaps.
-nx.lsp.config("lua_ls", {
+btv.lsp.config("lua_ls", {
   cmd = { "lua-language-server" },
   filetypes = { "lua" },
   root_markers = { ".luarc.json", ".luarc.jsonc", ".git" },
   on_attach = function(_client, bufnr)
-    local function map(lhs, fn) nx.keymap.set("n", lhs, fn, { buffer = bufnr }) end
-    -- Go-to / references / symbols all open in nx.picker (with the "location"
+    local function map(lhs, fn) btv.keymap.set("n", lhs, fn, { buffer = bufnr }) end
+    -- Go-to / references / symbols all open in btv.picker (with the "location"
     -- preview) when there's more than one hit; a single definition jumps straight.
-    map("gd", nx.lsp.definition)
-    map("gr", nx.lsp.references)
-    map("gO", nx.lsp.document_symbol) -- this file's symbols, in the picker
-    map("<leader>ws", nx.lsp.workspace_symbol) -- prompt → workspace/symbol picker
-    map("K", nx.lsp.hover)
-    map("<leader>rn", nx.lsp.rename)
-    map("<leader>ca", nx.lsp.code_action)
+    map("gd", btv.lsp.definition)
+    map("gr", btv.lsp.references)
+    map("gO", btv.lsp.document_symbol) -- this file's symbols, in the picker
+    map("<leader>ws", btv.lsp.workspace_symbol) -- prompt → workspace/symbol picker
+    map("K", btv.lsp.hover)
+    map("<leader>rn", btv.lsp.rename)
+    map("<leader>ca", btv.lsp.code_action)
     -- Signature help in INSERT mode: type a call like `print(` and press <C-k> to
     -- float the parameter hints (the active parameter is shown in brackets). This
     -- matches the built-in default; setting it here keeps the example self-contained.
-    nx.keymap.set("i", "<C-k>", nx.lsp.signature_help, { buffer = bufnr })
+    btv.keymap.set("i", "<C-k>", btv.lsp.signature_help, { buffer = bufnr })
     -- Inlay hints are off by default — turn them on for this buffer (the engine
     -- requests them and paints the type/parameter annotations inline).
-    nx.lsp.inlay_hint.enable(true, { bufnr = bufnr })
+    btv.lsp.inlay_hint.enable(true, { bufnr = bufnr })
     -- Toggle them with <leader>ih.
     map("<leader>ih", function()
-      nx.lsp.inlay_hint.enable(not nx.lsp.inlay_hint.is_enabled({ bufnr = bufnr }), { bufnr = bufnr })
+      btv.lsp.inlay_hint.enable(not btv.lsp.inlay_hint.is_enabled({ bufnr = bufnr }), { bufnr = bufnr })
     end)
   end,
 })
-nx.lsp.enable("lua_ls")
+btv.lsp.enable("lua_ls")

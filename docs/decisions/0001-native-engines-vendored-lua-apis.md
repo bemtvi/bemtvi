@@ -3,15 +3,15 @@
 **Status:** superseded by [ADR 0002](0002-native-plugin-system.md). The
 native-engine half carries forward (engines drive editor behavior; script
 results project through the extmark layer — the bridge pattern). The
-vendored-API half does not: nxvim's scripting surface is its own `nx.*`
+vendored-API half does not: bemtvi's scripting surface is its own `btv.*`
 namespace — there is no `vim.treesitter` / `vim.lsp` surface; that machinery
-is refactored into the `nx` API where useful and deleted where not, and the
-only `vim.*` Lua is a closed whitelist of muscle-memory aliases over `nx.*`.
+is refactored into the `btv` API where useful and deleted where not, and the
+only `vim.*` Lua is a closed whitelist of muscle-memory aliases over `btv.*`.
 Kept as the dated record of the
 engine/API split and the bridge pattern. *(Original status: accepted
 2026-06-08.)* Records a cross-cutting boundary that several
 feature designs already assume but none states in one place: who owns the
-treesitter / LSP *engine* (nxvim, natively) versus who owns the `vim.treesitter`
+treesitter / LSP *engine* (bemtvi, natively) versus who owns the `vim.treesitter`
 / `vim.lsp` *API surface* (vendored neovim Lua), and where the two are wired
 together. This is an ADR — the *why* of a standing decision — not a build plan;
 the feature specs it references say *how*.
@@ -20,14 +20,14 @@ the feature specs it references say *how*.
 
 Two constraints pull in opposite directions:
 
-- **nxvim-core is pure and synchronous** — no async, no Lua, no I/O beyond
+- **bemtvi-core is pure and synchronous** — no async, no Lua, no I/O beyond
   `Buffer` read/write (CLAUDE.md; [`architecture.md`](../architecture.md)). Every
   front end shares identical editing behavior because the editing state machine
   takes no detour through a scripting runtime. So anything that drives a
   *synchronous editing decision* — the highlight floor, indentation, folding, the
   `=` family — must run in-core, in Rust, with no Lua and no socket.
 
-- **The plugin ecosystem is the product.** nxvim's value is running unmodified
+- **The plugin ecosystem is the product.** bemtvi's value is running unmodified
   neovim plugins, and the corpus already in the repo proves the target:
   a colorscheme, an LSP config layer, a filesystem/async helper library, a
   keymap-hint popup, treesitter highlighting and textobjects, a fuzzy finder,
@@ -45,15 +45,15 @@ asynchronously, after the fact.
 ## Decision
 
 **Ship native engines and vendor the neovim Lua APIs on top of them. The engine
-is what nxvim needs; the API is what the ecosystem needs. Bridges wire a vendored
+is what bemtvi needs; the API is what the ecosystem needs. Bridges wire a vendored
 API to the native engine underneath.**
 
-|                | Native engine (nxvim's)                              | Lua API surface (vendored neovim)                      |
+|                | Native engine (bemtvi's)                              | Lua API surface (vendored neovim)                      |
 | -------------- | ---------------------------------------------------- | ------------------------------------------------------ |
-| Treesitter     | [`nxvim-ts`](../../crates/nxvim-ts) — sync, in-core; drives highlight floor, indent, fold, `=` | [`vim.treesitter.*`](../../crates/nxvim-lua/src/prelude/treesitter.lua) — snapshot, for plugin queries |
-| LSP            | [`nxvim-lsp`](../../crates/nxvim-lsp) + [`server/src/lsp/`](../../crates/nxvim-server/src/lsp) — async, server-side | [`vim.lsp.*`](../../crates/nxvim-lua/src/prelude/lsp.lua) — for lspconfig/mason/cmp |
+| Treesitter     | [`bemtvi-ts`](../../crates/bemtvi-ts) — sync, in-core; drives highlight floor, indent, fold, `=` | [`vim.treesitter.*`](../../crates/bemtvi-lua/src/prelude/treesitter.lua) — snapshot, for plugin queries |
+| LSP            | [`bemtvi-lsp`](../../crates/bemtvi-lsp) + [`server/src/lsp/`](../../crates/bemtvi-server/src/lsp) — async, server-side | [`vim.lsp.*`](../../crates/bemtvi-lua/src/prelude/lsp.lua) — for lspconfig/mason/cmp |
 
-The vendored Lua does **not** exist to serve nxvim — nxvim's editor behavior runs
+The vendored Lua does **not** exist to serve bemtvi — bemtvi's editor behavior runs
 on the native engine. It exists to serve *plugins*, a customer the native engine
 cannot serve: plugins call Lua by name and depend on its exact semantics. That is
 why both can run over one buffer (the "double parse"): **native engine for the
@@ -69,15 +69,15 @@ plugins on exactly those edges (see
 [the vim.treesitter Lua platform spec](../specs/2026-06-07-vim-treesitter-lua-platform.md)).
 Vendoring buys the long tail for free, and a neovim update is a *re-vendor*, not a
 re-derivation. The same logic drives the `vim.lsp` surface: faithfully implement
-the API so lspconfig/mason/cmp run, backed by nxvim's own async server.
+the API so lspconfig/mason/cmp run, backed by bemtvi's own async server.
 
 ### The bridge pattern — three instances of one shape
 
-Where a vendored API must affect what nxvim actually paints or edits, the result
-is **projected into nxvim's own highlight layer at the right priority**, never
+Where a vendored API must affect what bemtvi actually paints or edits, the result
+is **projected into bemtvi's own highlight layer at the right priority**, never
 allowed into core's sync path. The
 [extmark / decoration layer](../specs/2026-06-07-extmark-decoration-layer-design.md)
-is the shared substrate ([`extmark.rs`](../../crates/nxvim-core/src/extmark.rs):
+is the shared substrate ([`extmark.rs`](../../crates/bemtvi-core/src/extmark.rs):
 `TS_HL_PRIORITY = 100` < `DEFAULT_PRIORITY = 4096`), so an async/plugin mark rides
 *over* the synchronous treesitter floor:
 
@@ -96,13 +96,13 @@ is the shared substrate ([`extmark.rs`](../../crates/nxvim-core/src/extmark.rs):
    `initialize`, and requests the whole-buffer token set on open and after each
    change; the reply is decoded against the legend + negotiated encoding and
    projected as highlight intervals at
-   [`SEMANTIC_HL_PRIORITY`](../../crates/nxvim-core/src/extmark.rs) (125) — *above*
+   [`SEMANTIC_HL_PRIORITY`](../../crates/bemtvi-core/src/extmark.rs) (125) — *above*
    the treesitter floor (100), *below* user extmarks — folded into the same
    `highlights_for` merge the other sources ride. A token whose `@lsp.*` group is
    undefined in the active theme is dropped, so the syntactic floor shows through
    rather than blanking. The decode + projection live in
-   [`server/src/lsp/semantic.rs`](../../crates/nxvim-server/src/lsp/semantic.rs);
-   the request plumbing is in [`nxvim-lsp`](../../crates/nxvim-lsp/src/dispatch.rs).
+   [`server/src/lsp/semantic.rs`](../../crates/bemtvi-server/src/lsp/semantic.rs);
+   the request plumbing is in [`bemtvi-lsp`](../../crates/bemtvi-lsp/src/dispatch.rs).
    Delta refresh (`full/delta`) and the `vim.lsp.semantic_tokens` Lua control
    surface remain (Phases 2–3 of
    [the semantic-tokens plan](../plans/2026-06-08-lsp-semantic-tokens.md)).
@@ -139,7 +139,7 @@ so a missing or slow server degrades to "syntactic but correct," never to blank.
   and absent precisely because the sync treesitter floor covers the gap.
 - Plugins get bug-for-bug `vim.treesitter` / `vim.lsp`, updated by re-vendoring.
 - One projection seam (`*_for(buffer, numbers, styles)` →
-  [`window_value`](../../crates/nxvim-server/src/redraw.rs)) absorbs every
+  [`window_value`](../../crates/bemtvi-server/src/redraw.rs)) absorbs every
   highlight source — treesitter, extmarks, diagnostics — arbitrated by priority.
 
 **Costs (accepted).**

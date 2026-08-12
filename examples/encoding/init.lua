@@ -1,14 +1,14 @@
--- ~~~ nxvim file encodings: read latin1 / utf-16 / invalid-UTF-8, round-trip on save ~~~
+-- ~~~ bemtvi file encodings: read latin1 / utf-16 / invalid-UTF-8, round-trip on save ~~~
 --
--- nxvim's internal text model is ALWAYS UTF-8 (the rope). `'fileencoding'` names
+-- bemtvi's internal text model is ALWAYS UTF-8 (the rope). `'fileencoding'` names
 -- the charset of the bytes *on disk*; the read/write seam transcodes between the
 -- two. Try it against the two sample files (from the repo root):
 --
---     NXVIM_CONFIG=examples/encoding \
---       cargo run -p nxvim -- examples/encoding/latin1.txt
+--     BEMTVI_CONFIG=examples/encoding \
+--       cargo run -p bemtvi -- examples/encoding/latin1.txt
 --
---     NXVIM_CONFIG=examples/encoding \
---       cargo run -p nxvim -- examples/encoding/invalid-utf8.txt
+--     BEMTVI_CONFIG=examples/encoding \
+--       cargo run -p bemtvi -- examples/encoding/invalid-utf8.txt
 --
 -- What to look for:
 --
@@ -42,7 +42,7 @@
 -- Converting on save: open `latin1.txt`, then `:set fenc=utf-8` and `:w` — the file
 -- is rewritten as UTF-8 (each accented byte becomes its multi-byte utf-8 form).
 --
--- Fail-loud on save: nxvim never silently corrupts a file. Writing a character the
+-- Fail-loud on save: bemtvi never silently corrupts a file. Writing a character the
 -- target encoding can't represent (e.g. a CJK char like 中 into a latin1 buffer)
 -- aborts the write with `E513` and leaves the file untouched — rather than emitting
 -- the HTML numeric character references encoding libraries fall back to.
@@ -83,6 +83,6 @@ vim.api.nvim_create_autocmd("BufReadPost", {
   callback = function(args)
     local enc = vim.bo[args.buf].fileencoding
     local bomb = vim.bo[args.buf].bomb and " (+BOM)" or ""
-    vim.notify(("nxvim: opened with fileencoding=%s%s"):format(enc, bomb))
+    vim.notify(("bemtvi: opened with fileencoding=%s%s"):format(enc, bomb))
   end,
 })

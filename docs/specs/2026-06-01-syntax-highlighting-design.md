@@ -1,7 +1,7 @@
 # Treesitter syntax highlighting — design
 
 **Date:** 2026-06-01
-**Status:** Implemented (crate `nxvim-ts`; tests in `crates/nxvim/tests/syntax.rs`).
+**Status:** Implemented (crate `bemtvi-ts`; tests in `crates/bemtvi/tests/syntax.rs`).
 **Process-isolation architecture superseded** by
 [`2026-06-06-in-process-treesitter-and-indentation-design.md`](2026-06-06-in-process-treesitter-and-indentation-design.md),
 which moves the parser in-process to enable synchronous treesitter indentation.
@@ -10,7 +10,7 @@ still hold; only the separate worker process is replaced.
 
 ## Goal
 
-Add **syntax highlighting** to nxvim. nxvim is **treesitter-native only** — there
+Add **syntax highlighting** to bemtvi. bemtvi is **treesitter-native only** — there
 is no regex/`syntax.vim` highlighter and there never will be. Highlighting is
 driven entirely by [tree-sitter](https://tree-sitter.github.io) grammars and
 their `highlights.scm` queries.
@@ -25,7 +25,7 @@ Two decisions shape the whole design (both chosen deliberately):
    editor.**
 2. **Installable grammars, not bundled.** Grammars are
    **installed at runtime** into a data directory as compiled parser libraries
-   plus `.scm` query files, and loaded dynamically by filetype. nxvim ships
+   plus `.scm` query files, and loaded dynamically by filetype. bemtvi ships
    **zero** grammars linked into the binary. The on-disk layout follows
    tree-sitter's standard `parser/` + `queries/` convention, so any standard
    tree-sitter grammar + query set is drop-in usable.
@@ -60,10 +60,10 @@ toggle / per-buffer enable; configurable filetype and colorscheme.
 
 ```
 ┌────────────┐  redraw (+highlights)   ┌──────────────┐  ts_highlight (text)   ┌────────────────────┐
-│ nxvim-tui  │ ◀────────────────────── │ nxvim-server │ ─────────────────────▶ │ syntax worker      │
-│ (client)   │  ──── nvim_input ─────▶ │ (editor)     │ ◀── ts_highlights ──── │ (nxvim --__ts)     │
+│ bemtvi-tui  │ ◀────────────────────── │ bemtvi-server │ ─────────────────────▶ │ syntax worker      │
+│ (client)   │  ──── nvim_input ─────▶ │ (editor)     │ ◀── ts_highlights ──── │ (bemtvi --__ts)     │
 └────────────┘                         └──────────────┘   msgpack over pipe    │ tree-sitter +      │
-   main thread        nxvim-rpc          its own thread       nxvim-rpc         │ libloading         │
+   main thread        bemtvi-rpc          its own thread       bemtvi-rpc         │ libloading         │
                                               │ spawns/supervises               └────────────────────┘
                                               │                                    │ dlopen by filetype
                                               ▼                                    ▼
@@ -71,15 +71,15 @@ toggle / per-buffer enable; configurable filetype and colorscheme.
                                                                          <data>/queries/<lang>/highlights.scm
 ```
 
-The syntax worker is **another nxvim-rpc peer**. We reuse the exact msgpack-RPC
-framing the client↔server link already uses (`nxvim-rpc`), so there is no second
+The syntax worker is **another bemtvi-rpc peer**. We reuse the exact msgpack-RPC
+framing the client↔server link already uses (`bemtvi-rpc`), so there is no second
 protocol stack — just a new set of methods. The **server is the client** of the
 worker.
 
 ### One binary, worker mode
 
-The worker is not a second executable. The `nxvim` binary, when invoked with an
-internal flag (`nxvim --__ts-worker`, hidden from `--help`), runs the worker main
+The worker is not a second executable. The `bemtvi` binary, when invoked with an
+internal flag (`bemtvi --__ts-worker`, hidden from `--help`), runs the worker main
 loop and never starts an editor. The server spawns it via
 `std::env::current_exe()`, so there is nothing extra to install or find on
 `$PATH`, and the worker is always version-matched to the server. The tree-sitter
@@ -87,17 +87,17 @@ and `libloading` dependencies are reached **only** in worker mode.
 
 ### Crate layout
 
-One new crate, `nxvim-ts`, holds everything tree-sitter:
+One new crate, `bemtvi-ts`, holds everything tree-sitter:
 
 | crate            | new? | role                                                                                 |
 | ---------------- | ---- | ------------------------------------------------------------------------------------ |
-| `nxvim-ts`       | new  | The worker: `run_worker(stdin, stdout)`, the dynamic grammar loader, the parse/query engine, the data-dir resolver. Heavy C deps (`tree-sitter`, `tree-sitter-highlight`, `libloading`) live **here only**. |
-| `nxvim-server`   | —    | Gains a `SyntaxClient`: spawns + supervises the worker subprocess, speaks the highlight protocol over its pipes (`nxvim-rpc` + `tokio::process`), caches spans, drives respawn. **Does not depend on `nxvim-ts`** — it only spawns a subprocess and speaks msgpack, so tree-sitter stays out of the server's build graph. |
-| `nxvim` (bin)    | —    | Routes `--__ts-worker` to `nxvim_ts::run_worker`; otherwise starts normally. This is the *only* crate that depends on `nxvim-ts`. |
-| `nxvim-core`     | —    | One additive change: a `changedtick` on `Buffer` (below). No tree-sitter, no highlight logic — stays pure & synchronous. |
-| `nxvim-tui`      | —    | Maps highlight-group **names** → colors and paints them. Stays a thin client; learns nothing about tree-sitter. |
+| `bemtvi-ts`       | new  | The worker: `run_worker(stdin, stdout)`, the dynamic grammar loader, the parse/query engine, the data-dir resolver. Heavy C deps (`tree-sitter`, `tree-sitter-highlight`, `libloading`) live **here only**. |
+| `bemtvi-server`   | —    | Gains a `SyntaxClient`: spawns + supervises the worker subprocess, speaks the highlight protocol over its pipes (`bemtvi-rpc` + `tokio::process`), caches spans, drives respawn. **Does not depend on `bemtvi-ts`** — it only spawns a subprocess and speaks msgpack, so tree-sitter stays out of the server's build graph. |
+| `bemtvi` (bin)    | —    | Routes `--__ts-worker` to `bemtvi_ts::run_worker`; otherwise starts normally. This is the *only* crate that depends on `bemtvi-ts`. |
+| `bemtvi-core`     | —    | One additive change: a `changedtick` on `Buffer` (below). No tree-sitter, no highlight logic — stays pure & synchronous. |
+| `bemtvi-tui`      | —    | Maps highlight-group **names** → colors and paints them. Stays a thin client; learns nothing about tree-sitter. |
 
-Dependency direction stays one-way. `nxvim-server` → (spawns) → `nxvim` worker
+Dependency direction stays one-way. `bemtvi-server` → (spawns) → `bemtvi` worker
 mode is a *process* edge, not a crate edge, so there is no cycle.
 
 ---
@@ -168,11 +168,11 @@ worker except to hand it text and receive spans, both asynchronously.
 
 ### Data directory
 
-Resolved once at startup, overridable by `$NXVIM_DATA_DIR` (essential for tests):
+Resolved once at startup, overridable by `$BEMTVI_DATA_DIR` (essential for tests):
 
-- Linux/BSD: `$XDG_DATA_HOME/nxvim` else `$HOME/.local/share/nxvim`
+- Linux/BSD: `$XDG_DATA_HOME/bemtvi` else `$HOME/.local/share/bemtvi`
 - macOS: same XDG rule (kept simple; not `~/Library/Application Support`)
-- Windows: `%LOCALAPPDATA%\nxvim`
+- Windows: `%LOCALAPPDATA%\bemtvi`
 
 No new dependency — a tiny env-based resolver. Layout (tree-sitter's standard
 `parser/`/`queries/` convention):
@@ -229,7 +229,7 @@ highlights — plain text, today's behavior. (`:set filetype=` override: future.
 
 ## Protocol
 
-### Worker RPC (server → worker), reusing `nxvim-rpc` framing
+### Worker RPC (server → worker), reusing `bemtvi-rpc` framing
 
 - **`ts_open`** (notification, server→worker):
   `{ buffer: u64, tick: u64, language: str, text: str, first_line, last_line }`
@@ -275,12 +275,12 @@ array (aligned with `lines`), each element an array of
 aware, like `selection`), or `Nil`/empty for an unhighlighted row.
 
 The server converts the worker's *byte* columns to *screen* columns with
-`nxvim_core::unicode::virtcol` (the exact function `selection_spans` already uses)
+`bemtvi_core::unicode::virtcol` (the exact function `selection_spans` already uses)
 against the current visible line text — so highlight spans line up with painted
 glyphs the same way the selection does. **This conversion is the server's job**,
 keeping the TUI screen-column-only and gutter-agnostic.
 
-> Design choice: highlights are **not** added to `nxvim-core`'s `View`. They are
+> Design choice: highlights are **not** added to `bemtvi-core`'s `View`. They are
 > produced by the out-of-core worker and merged into the redraw map by the server
 > (which already builds that map by hand). Core stays pure; the only core change
 > is `changedtick`.
@@ -416,10 +416,10 @@ is asynchronous, so screen/redraw assertions **poll redraws until one carries
 A test **fixture grammar** makes this hermetic without a network: a test helper
 (or `build.rs`) compiles a known grammar's bundled C sources into a
 `parser/<lang>.{so,dylib}` and writes its `highlights.scm` into a temp
-`queries/<lang>/`, then points the server at it via `NXVIM_DATA_DIR`. Rust is the
+`queries/<lang>/`, then points the server at it via `BEMTVI_DATA_DIR`. Rust is the
 natural fixture (dogfoods the repo).
 
-- **RPC/`View` tier** (`nxvim-server/tests`): open a `.rs` buffer with known
+- **RPC/`View` tier** (`bemtvi-server/tests`): open a `.rs` buffer with known
   content; wait for a redraw with `highlights`; assert the `fn`/`let` keyword
   ranges, a string literal, and a comment carry the expected group names, in
   correct screen columns (including a line with a leading tab to prove
@@ -428,7 +428,7 @@ natural fixture (dogfoods the repo).
   worker handler calls `std::process::abort()`. Request it, then assert the
   editor **still edits** (`i...<Esc>` changes the buffer) and that highlighting
   for a *good* language recovers afterward — proving isolation and respawn.
-- **Tier 2 screen test** (`nxvim/tests/screen.rs`): open a `.rs` buffer, wait for
+- **Tier 2 screen test** (`bemtvi/tests/screen.rs`): open a `.rs` buffer, wait for
   the highlighted redraw, assert a keyword cell carries the theme's keyword
   `fg` color in the painted ratatui buffer, and that a selected keyword cell is
   both colored and `REVERSED`.
@@ -450,7 +450,7 @@ coverage boundary the smooth-scrolling design set.
 
 ## Dependencies (pinned `=x.y.z`, latest stable)
 
-Added under `nxvim-ts` only (plus `tokio` `process` feature for the server):
+Added under `bemtvi-ts` only (plus `tokio` `process` feature for the server):
 
 - `tree-sitter = "=0.26.9"` — core parser; `Tree::edit`, `parse_with`, `Query`,
   `QueryCursor::set_byte_range`. The **low-level** API (not `tree-sitter-highlight`)
@@ -478,8 +478,8 @@ installable-grammar decision.
    `insert_char` tracked methods, `take_edits()`, `resync`; route `editor.rs`'s
    mutations (and `normalize`, undo/redo, `:e`) through them. Existing editing
    tests stay green — this is a pure refactor of mutation plumbing.
-2. **`nxvim-ts` worker skeleton + protocol:** `run_worker`, data-dir resolver,
-   `ts_open`/`ts_edit`/`ts_view`/`ts_highlights`/`ts_error` over `nxvim-rpc`;
+2. **`bemtvi-ts` worker skeleton + protocol:** `run_worker`, data-dir resolver,
+   `ts_open`/`ts_edit`/`ts_view`/`ts_highlights`/`ts_error` over `bemtvi-rpc`;
    per-buffer shadow `Rope`; stub that echoes no spans. Binary routes
    `--__ts-worker`.
 3. **Dynamic loader + incremental engine:** `libloading` grammar load, query

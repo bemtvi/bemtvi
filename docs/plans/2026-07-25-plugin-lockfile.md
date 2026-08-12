@@ -1,10 +1,10 @@
-# Plugin lockfile for `nx.plugins`
+# Plugin lockfile for `btv.plugins`
 
 **Status:** COMPLETE (2026-07-25) — phases 1, 2, 4 then 3.
 
 ## Problem
 
-`nx.plugins` supports pinning — `commit` / `tag` / `version`, `commit` wins
+`btv.plugins` supports pinning — `commit` / `tag` / `version`, `commit` wins
 (`prelude/plugins.lua`, `normalize`) — and `_update` correctly refuses to move a pinned
 plugin. But nothing *records* what an unpinned plugin resolved to, so:
 
@@ -16,11 +16,11 @@ plugin. But nothing *records* what an unpinned plugin resolved to, so:
 * **There is no way back.** An update that breaks a plugin cannot be undone — the previous
   SHA was never written down anywhere.
 * **The built-in recommended set is entirely unpinned.** All 7 entries of
-  `M._default_recommended` are bare `"nxvim/<repo>"` + hooks. The set a real user installs
+  `M._default_recommended` are bare `"bemtvi/<repo>"` + hooks. The set a real user installs
   on first run is not reproducible.
 
 This is inconsistent with how the *same* plugins are treated elsewhere in the repo:
-`crates/nxvim-edithost/build-plugins.sh` pins every bundled plugin to an exact SHA. The
+`crates/bemtvi-edithost/build-plugins.sh` pins every bundled plugin to an exact SHA. The
 wasm/bundled build is reproducible; the user-facing install is not.
 
 Pinning the recommended set to fixed SHAs was the alternative considered. Rejected: it
@@ -39,20 +39,20 @@ the plugins a user declares themselves. A lockfile solves the general case.
 
 ### Format — JSON, generated, sorted
 
-`<config>/nxvim-lock.json`, a flat map keyed by plugin name:
+`<config>/bemtvi-lock.json`, a flat map keyed by plugin name:
 
 ```json
 {
   "catppuccin": { "branch": "main", "commit": "0b0a9a1..." },
-  "nxvim-line": { "commit": "ada94b5..." }
+  "bemtvi-line": { "commit": "ada94b5..." }
 }
 ```
 
 * **JSON, not Lua.** A lockfile is data-only by definition, and it is meant to be
   committed to the user's config repo — the same reasoning that makes project-local
-  config (`.nxvim/workspace.json`) plain JSON rather than embedded Lua: no code-exec
+  config (`.bemtvi/workspace.json`) plain JSON rather than embedded Lua: no code-exec
   vector in a file that travels between machines.
-* **`nx.json` already exists** (`prelude/stdlib.lua`) and `encode(t, { pretty = true })`
+* **`btv.json` already exists** (`prelude/stdlib.lua`) and `encode(t, { pretty = true })`
   emits a 2-space-indented document with **sorted object keys** — `serde_json` is built
   without `preserve_order`, so its `Map` is a `BTreeMap`. Deterministic, diff-friendly
   output with no hand-rolled serializer and no key-order churn. Verified empirically.
@@ -71,7 +71,7 @@ hermetic.
 
 ### Local-always, like the rest of the manager
 
-Read and written through `lfs` (`nx.fs_local`), never the session-routed `nx.fs`. Plugin
+Read and written through `lfs` (`btv.fs_local`), never the session-routed `btv.fs`. Plugin
 management is a local concern even in a daemon / wasm session — plugins load into *this*
 Lua VM via the local runtimepath — so the lockfile lives on the client disk beside the
 clones it describes. This is the tier-1 rule applied: the feature works identically over a
@@ -93,7 +93,7 @@ and neither is a plugin whose clone is missing.
 
 ### The one real obstacle: shallow clones
 
-An unpinned install is `depth = 1`, and there is **no `fetch` verb** — `nxvim-git`'s job
+An unpinned install is `depth = 1`, and there is **no `fetch` verb** — `bemtvi-git`'s job
 surface is `Discover / Head / Show / DiffFile / Status / Clone / Checkout / Pull /
 SubmoduleUpdate` (`run_git_job`). So an arbitrary locked SHA may simply not be present in
 an existing shallow checkout, and there is no way to deepen it.
@@ -108,7 +108,7 @@ Consequences, and how each phase handles it:
   never a silent no-op that leaves the user believing they rolled back. An explicit
   `:PluginRestore!` re-clones those (destructive, so opt-in, never automatic).
 
-The clean fix is a `fetch` / unshallow verb in `nxvim-git`, which would make restore always
+The clean fix is a `fetch` / unshallow verb in `bemtvi-git`, which would make restore always
 work in place. That is a real gix addition, so it is **deferred to Phase 4 and left as a
 decision** rather than bundled in — Phases 1–3 are useful without it.
 
@@ -118,7 +118,7 @@ decision** rather than bundled in — Phases 1–3 are useful without it.
 
 Landed as described below. Notes from the implementation:
 
-* `nx.json.encode(t, { pretty = true })` sorting object keys was confirmed empirically, not
+* `btv.json.encode(t, { pretty = true })` sorting object keys was confirmed empirically, not
   assumed — `serde_json` is pinned `=1.0.150` with no `preserve_order`, so its `Map` is a
   `BTreeMap`. If that dependency ever gains `preserve_order`, the lockfile's diff-stability
   regresses silently; `the_lockfile_is_pretty_printed_with_sorted_keys` is the guard.
@@ -130,14 +130,14 @@ Landed as described below. Notes from the implementation:
 * Rejecting with a `{ code, message }` table needs the prelude's
   `local e = {…}; error(e, 0)` idiom — selene types `error`'s argument as a string and
   flags the inline literal (same as `test.lua`'s `fail`).
-* **Discovered, not fixed:** the book's API extractor never picks up `nx.plugins.*` at all.
-  `book/gen/generate.py` matches `function nx.NS.name`, and plugins.lua declares
-  `function M.lock()` over `local M = nx.plugins` — so the whole manager API (~30
+* **Discovered, not fixed:** the book's API extractor never picks up `btv.plugins.*` at all.
+  `book/gen/generate.py` matches `function btv.NS.name`, and plugins.lua declares
+  `function M.lock()` over `local M = btv.plugins` — so the whole manager API (~30
   functions) is missing from the generated reference. Out of scope here (it is an extractor
   change affecting one whole module), documented in the hand-written guide instead.
 
 * `setup_manager{ lockfile = }`; `lockfile_path()` defaulting to
-  `config_dir() .. "/nxvim-lock.json"`.
+  `config_dir() .. "/bemtvi-lock.json"`.
 * `M._read_lock()` → promise of the decoded table (`{}` when absent). A malformed
   lockfile fails loud rather than being silently treated as empty — a corrupt lock must
   not look like "nothing pinned".
@@ -168,7 +168,7 @@ Notes from the implementation:
   plugin. `_update` now reports `"detached"` and leaves such a plugin alone.
 * That leaves a real hole: there is no in-editor way to move a lock-installed plugin
   *forward*. Re-attaching to a branch would need `checkout(detach = false)`, which
-  `nxvim-git` explicitly refuses (`"checkout without detach is not implemented"`), and
+  `bemtvi-git` explicitly refuses (`"checkout without detach is not implemented"`), and
   there is no fetch/unshallow verb either. The documented escape hatch is to drop the
   entry from the lockfile and re-sync. This makes the Phase 4 case concrete: **without a
   git-layer addition the lockfile can reproduce but not un-reproduce.**
@@ -215,9 +215,9 @@ Pulled forward, because Phase 2 hit the wall first and Phase 3 could not have be
 honestly without it: a `restore` verb on the old surface would have failed on exactly the
 case people reach for it.
 
-Two additions to `nxvim-git`, each crossing all five touchpoints (`GitJob` in
-`nxvim-lua/ops.rs` → the gix impl → the Lua job parser in `install.rs` → the **daemon wire**
-codec in `gitwire.rs` → the `nx.git` surface in `prelude/git.lua`):
+Two additions to `bemtvi-git`, each crossing all five touchpoints (`GitJob` in
+`bemtvi-lua/ops.rs` → the gix impl → the Lua job parser in `install.rs` → the **daemon wire**
+codec in `gitwire.rs` → the `btv.git` surface in `prelude/git.lua`):
 
 * **`checkout` gained its ATTACH mode.** It previously returned
   `EGIT "checkout without detach is not implemented"`. Now `detach = false` means `rev`
@@ -230,7 +230,7 @@ codec in `gitwire.rs` → the `nx.git` surface in `prelude/git.lua`):
   history a `depth = 1` clone omitted becomes reachable.
 
 Verified over the **daemon wire** too, not just locally
-(`daemon_git.rs::nx_git_fetch_and_attach_checkout_run_on_the_daemon_over_the_wire`) — a new
+(`daemon_git.rs::btv_git_fetch_and_attach_checkout_run_on_the_daemon_over_the_wire`) — a new
 git verb that worked locally and silently not over a remote session would violate the
 tier-1 rule.
 

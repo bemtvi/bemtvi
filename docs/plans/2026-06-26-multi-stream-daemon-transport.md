@@ -4,7 +4,7 @@
 
 The native QUIC connector and the browser WebTransport connector both carry every
 daemon leg over **one** shared bidi stream, demuxed by method namespace. The
-`nxvim-rpc` writer prioritises control over bulk, but both lanes still serialise onto
+`bemtvi-rpc` writer prioritises control over bulk, but both lanes still serialise onto
 that one stream, so a `proc`/`term`/`lsp` flood (a fuzzy-finder's `rg`, an
 `npm install`, an LSP `semanticTokens` dump) can head-of-line-block an `fs_write` save
 queued behind it **at the QUIC layer** — app-level framing can't escape bytes already
@@ -27,7 +27,7 @@ the group because it opened the stream, so the daemon→client direction needs n
 
 | tag | group | legs | why grouped |
 | --- | --- | --- | --- |
-| `0` | **Control** | `fs_*`, `config_*`, `luafs_op`, `luafs_watch` | latency-critical saves/reads + one-shot config + low-volume `nx.fs` ops/pushes |
+| `0` | **Control** | `fs_*`, `config_*`, `luafs_op`, `luafs_watch` | latency-critical saves/reads + one-shot config + low-volume `btv.fs` ops/pushes |
 | `1` | **Proc** | `proc_*` | run-to-completion floods (`rg`, `npm install`) |
 | `2` | **Lsp** | `lsp_*` | long-lived bidi pipe, bursty (`didChange`, large responses) |
 | `3` | **Term** | `term_*` | continuous high-volume PTY output (browser-only sender) |
@@ -41,7 +41,7 @@ error (no silent stub), not a dropped stream.
 
 ## What stays single-stream (unchanged)
 
-The **ssh/stdio** daemon (`nxvim --daemon` over `NXVIM_DAEMON_CMD`) and every in-process
+The **ssh/stdio** daemon (`bemtvi --daemon` over `BEMTVI_DAEMON_CMD`) and every in-process
 `tokio::io::duplex` **test** have exactly one ordered byte pipe — there is no second
 stream to open. They keep today's single-stream multiplexer verbatim
 (`run_daemon_io` server-side, `serve_daemon_link` client-side). Multi-stream is a
@@ -96,7 +96,7 @@ demux uses, partitioned by group.
   - `host_fs` / `fs_jobs` / `config` → Control `Rpc`; `run_fs_jobs` over Control.
   - `host_proc` → Proc `Rpc`.
   - `lsp_transport` → Lsp `Rpc`.
-  - `fs_watch` (the streaming `nx.fs.watch` seam, `RemoteFsWatch`) → Control `Rpc`; its
+  - `fs_watch` (the streaming `btv.fs.watch` seam, `RemoteFsWatch`) → Control `Rpc`; its
     `luafs_change`/`luafs_watch_err` pushes land in the Control demux. (Browser-only when
     this was written; the native client took the leg later, so a daemon session watches the
     daemon's disk rather than its own.)
@@ -107,7 +107,7 @@ demux uses, partitioned by group.
   shared `incoming` into the per-group demuxes by `LegGroup::owns`, so both transports run
   the *same* per-group demux code.
 
-### Browser side (`crates/nxvim-edithost/web/`)
+### Browser side (`crates/bemtvi-edithost/web/`)
 
 - `rpc.mjs`: today's `RpcClient` opens one bidi (`createBidirectionalStream()`, L136) and
   decodes with `decodeMultiStream`. Generalise to open the four group streams, write each
@@ -149,5 +149,5 @@ demux uses, partitioned by group.
   no idle PTY stream to pay for.
 - **Auth is per-connection** (bearer token at session accept), so all four streams inherit
   it; no per-stream auth.
-- **`nxvim-rpc` priority lanes still apply per stream** — control-vs-bulk prioritisation
+- **`bemtvi-rpc` priority lanes still apply per stream** — control-vs-bulk prioritisation
   now matters mainly *within* a group (e.g. Lsp stdin vs a stdout flood).

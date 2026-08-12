@@ -1,89 +1,89 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nxvim",
-    "crates/nxvim-core",
-    "crates/nxvim-rpc",
-    "crates/nxvim-server",
-    "crates/nxvim-lua",
-    "crates/nxvim-tui",
-    "crates/nxvim-gui",
-    "crates/nxvim-ts",
-    "crates/nxvim-git",
-    "crates/nxvim-lsp",
-    "crates/nxvim-view",
-    "crates/nxvim-regex",
-    "crates/nxvim-test-harness",
+    "crates/bemtvi",
+    "crates/bemtvi-core",
+    "crates/bemtvi-rpc",
+    "crates/bemtvi-server",
+    "crates/bemtvi-lua",
+    "crates/bemtvi-tui",
+    "crates/bemtvi-gui",
+    "crates/bemtvi-ts",
+    "crates/bemtvi-git",
+    "crates/bemtvi-lsp",
+    "crates/bemtvi-view",
+    "crates/bemtvi-regex",
+    "crates/bemtvi-test-harness",
 ]
-# nxvim-edithost is the real wasm edit-host: the reusable synchronous `EditHost` tick
+# bemtvi-edithost is the real wasm edit-host: the reusable synchronous `EditHost` tick
 # (core + Lua) compiled to `wasm32-unknown-emscripten` behind a wasm `HostEffects`, run
 # in a Web Worker (Phase 5), built via its own build.sh. It is NOT a workspace member:
 # excluding it keeps it out of the host `cargo build/test/clippy --workspace` flow,
 # which can't meaningfully compile or link a wasm + C-deps artifact; being excluded, it
 # pins its own dependencies rather than inheriting the workspace's. (It superseded the
-# throwaway nxvim-edithost-demo, deleted in slice 5e.)
-exclude = ["crates/nxvim-edithost"]
+# throwaway bemtvi-edithost-demo, deleted in slice 5e.)
+exclude = ["crates/bemtvi-edithost"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["David Rios <david.rios.gomes@gmail.com>"]
-repository = "https://github.com/davidrios/nxvim"
+repository = "https://github.com/davidrios/bemtvi"
 rust-version = "1.85"
 
 [workspace.dependencies]
-nxvim-core = { path = "crates/nxvim-core" }
-nxvim-rpc = { path = "crates/nxvim-rpc" }
-# nxvim-server is `default-features = false` so the `native` feature is off by
+bemtvi-core = { path = "crates/bemtvi-core" }
+bemtvi-rpc = { path = "crates/bemtvi-rpc" }
+# bemtvi-server is `default-features = false` so the `native` feature is off by
 # default (the wasm edit-host builds without it); native binaries re-enable it
 # via `features = ["native"]`. (There is no Lua-backend toggle to thread — see
 # the mlua note below; PUC lua54 is baked into the shared mlua dep.)
-nxvim-server = { path = "crates/nxvim-server", default-features = false }
-nxvim-lua = { path = "crates/nxvim-lua" }
-nxvim-git = { path = "crates/nxvim-git" }
-nxvim-tui = { path = "crates/nxvim-tui" }
-nxvim-gui = { path = "crates/nxvim-gui" }
-nxvim-ts = { path = "crates/nxvim-ts" }
-# `default-features = false` so the wasm build (`nxvim-server --no-default-features`)
-# drops nxvim-lsp's `native` (tokio + async-lsp); native consumers turn it back on
-# via `nxvim-server`'s `native` feature → `nxvim-lsp/native` (feature unification).
-nxvim-lsp = { path = "crates/nxvim-lsp", default-features = false }
-nxvim-view = { path = "crates/nxvim-view" }
-nxvim-regex = { path = "crates/nxvim-regex" }
+bemtvi-server = { path = "crates/bemtvi-server", default-features = false }
+bemtvi-lua = { path = "crates/bemtvi-lua" }
+bemtvi-git = { path = "crates/bemtvi-git" }
+bemtvi-tui = { path = "crates/bemtvi-tui" }
+bemtvi-gui = { path = "crates/bemtvi-gui" }
+bemtvi-ts = { path = "crates/bemtvi-ts" }
+# `default-features = false` so the wasm build (`bemtvi-server --no-default-features`)
+# drops bemtvi-lsp's `native` (tokio + async-lsp); native consumers turn it back on
+# via `bemtvi-server`'s `native` feature → `bemtvi-lsp/native` (feature unification).
+bemtvi-lsp = { path = "crates/bemtvi-lsp", default-features = false }
+bemtvi-view = { path = "crates/bemtvi-view" }
+bemtvi-regex = { path = "crates/bemtvi-regex" }
 # Test-only harness (a single Lua backend, PUC lua54, baked in via mlua).
-nxvim-test-harness = { path = "crates/nxvim-test-harness" }
+bemtvi-test-harness = { path = "crates/bemtvi-test-harness" }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
 # builds. Stable releases are preferred; a pre-release line is pinned only where
 # there is no stable equivalent yet (e.g. ropey, still on 2.0.0-beta).
 #
 # Lua backend: vendored PUC Lua 5.4, the single backend (LuaJIT was dropped —
-# nxvim is PUC-Lua-only, matching the wasm build, which never supported LuaJIT).
+# bemtvi is PUC-Lua-only, matching the wasm build, which never supported LuaJIT).
 # 5.4 brings real 64-bit integers, native bitwise operators, the `utf8` library,
 # yieldable `pcall`, and a generational GC over the old 5.1 baseline. `lua54` is
 # selected here so every crate that links mlua shares it; there is no backend
 # toggle to thread anymore.
 anyhow = "=1.0.103"
-# CLI argument parsing for the `nxvim` binary (the only consumer): the `derive`
+# CLI argument parsing for the `bemtvi` binary (the only consumer): the `derive`
 # feature gives a struct-driven parser that validates flags, errors on unknown
 # options, and auto-generates `--help`/`--version`.
 clap = { version = "=4.6.1", features = ["derive"] }
 ropey = "=2.0.0-beta.1"
 # Fuzzy matcher (nucleo-class) shared by every static-source widget consumer —
-# completion, `nx.ui.select`, and static pickers. The matcher-only sub-crate:
-# pure Rust, no async/IO, so it lives inside the synchronous `nxvim-core`. Pure
+# completion, `btv.ui.select`, and static pickers. The matcher-only sub-crate:
+# pure Rust, no async/IO, so it lives inside the synchronous `bemtvi-core`. Pure
 # Rust ⇒ compiles under emscripten for the wasm edit-host too.
 nucleo-matcher = "=0.3.1"
 # Charset transcoding (the WHATWG Encoding Standard, Firefox's library) backing
 # per-buffer `'fileencoding'` and the convert-on-read/write seam. Pure Rust, no
-# C, no async/IO ⇒ lives inside the synchronous `nxvim-core` and compiles under
+# C, no async/IO ⇒ lives inside the synchronous `bemtvi-core` and compiles under
 # emscripten for the wasm edit-host. `simd-accel` is left OFF (it needs nightly);
 # the default `alloc` build is stable and portable. See
 # docs/plans/2026-06-14-encoding-and-invalid-utf8.md.
 encoding_rs = "=0.8.35"
-# URL query-string + component percent-encoding for `nx.http` (the `query`/`form` opts
-# and `nx.http.encode_query` / `encode_uri_component`). The canonical `rust-url`
+# URL query-string + component percent-encoding for `btv.http` (the `query`/`form` opts
+# and `btv.http.encode_query` / `encode_uri_component`). The canonical `rust-url`
 # (servo) crates — pure Rust, wasm-safe, and already in the tree via `url`/`ureq`, so
 # no bespoke encoder. `form_urlencoded` builds `application/x-www-form-urlencoded`
 # query/body strings; `percent-encoding` does single-component `encodeURIComponent`.
@@ -91,9 +91,9 @@ form_urlencoded = "=1.2.2"
 percent-encoding = "=2.3.2"
 # CommonMark + GFM parser backing the markdown renderer for read-only doc popups
 # (LSP hover / completion docs / picker preview): a pull parser that emits an event
-# stream `nxvim_core::markdown` walks into stripped display lines + highlight spans.
+# stream `bemtvi_core::markdown` walks into stripped display lines + highlight spans.
 # `default-features = false` drops its `html`/`getopts` bits — we only want the
-# parser. Pure Rust, no C, no async/IO ⇒ lives inside the synchronous `nxvim-core`
+# parser. Pure Rust, no C, no async/IO ⇒ lives inside the synchronous `bemtvi-core`
 # and compiles under emscripten for the wasm edit-host.
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
@@ -113,14 +113,14 @@ ratatui-image = { version = "=11.0.6", default-features = false, features = [
 ] }
 image = "=0.25.10"
 # Raw `poll(2)` for the TUI's does-this-terminal-answer-queries probe (see
-# `nxvim-tui/src/images.rs::terminal_answers_status_query`): it must wait for a
+# `bemtvi-tui/src/images.rs::terminal_answers_status_query`): it must wait for a
 # reply *without consuming stdin*, which `std::io` can't express. Already in the
 # tree transitively; pinned to the resolved version.
 libc = "=0.2.186"
-# OSC 52 clipboard payloads (`crates/nxvim-server/src/clipboard.rs`) — the escape
+# OSC 52 clipboard payloads (`crates/bemtvi-server/src/clipboard.rs`) — the escape
 # carries its text base64-encoded.
 base64 = "=0.22.1"
-# Native GUI client stack (`nxvim-gui`). winit owns the window + input event loop,
+# Native GUI client stack (`bemtvi-gui`). winit owns the window + input event loop,
 # wgpu the GPU surface, and glyphon the text rendering (it re-exports cosmic-text,
 # so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through `glyphon::`). glyphon
 # 0.11 builds against wgpu 29 — bump the two together (glyphon 0.12 wants wgpu 30
@@ -150,11 +150,11 @@ rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"]
 # dependency. Text only — no image support.
 arboard = { version = "=3.6.1", default-features = false }
 # Build-dependency (Windows host only): embeds the app icon + version info into
-# the nxvim-gui.exe via the Windows SDK's rc.exe. See crates/nxvim-gui/build.rs.
+# the bemtvi-gui.exe via the Windows SDK's rc.exe. See crates/bemtvi-gui/build.rs.
 winresource = "=0.1.31"
-# Build-dependency of nxvim-regex: compiles the vendored vim/neovim regexp
+# Build-dependency of bemtvi-regex: compiles the vendored vim/neovim regexp
 # engine (csrc/) into the crate. Plain C99; also builds for
-# wasm32-unknown-emscripten (the nxvim-edithost target).
+# wasm32-unknown-emscripten (the bemtvi-edithost target).
 cc = "=1.2.66"
 tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
 # Cross-platform filesystem notification backing `vim.uv.fs_event` in the server's
@@ -163,7 +163,7 @@ tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", 
 # can block for seconds before it returns, which — on the server's single-threaded
 # runtime — would freeze the editor every time a watch is armed; kqueue arms with a
 # plain syscall (sub-ms) and needs no daemon. Linux still uses inotify, Windows
-# ReadDirectoryChangesW (both already non-blocking). nxvim watches only a handful of
+# ReadDirectoryChangesW (both already non-blocking). bemtvi watches only a handful of
 # paths (e.g. lualine's `.git/HEAD`), so kqueue's one-fd-per-watch cost is moot.
 notify = { version = "=8.2.0", features = ["macos_kqueue"] }
 futures = "=0.3.32"
@@ -183,7 +183,7 @@ unicode-segmentation = "=1.13.3"
 # Pinned to the version cosmic-text resolves so the trait's `Script` type unifies.
 unicode-script = "=0.5.8"
 regex = "=1.12.4"
-# The glob parser behind `nxvim_core::glob` (and so `nx.glob`). Used purely as the
+# The glob parser behind `bemtvi_core::glob` (and so `btv.glob`). Used purely as the
 # glob->regex TRANSLATOR — `Glob::regex()` hands back regex source that we compile
 # and match ourselves with the `regex` crate above, rather than going through
 # globset's own `GlobMatcher`. That matters: `GlobMatcher` normalizes path
@@ -197,10 +197,10 @@ vt100 = "=0.16.2"
 tree-sitter = "=0.26.10"
 streaming-iterator = "=0.1.9"
 libloading = "=0.9.0"
-# In-process git (nxvim-git, native-only). Feature set is chosen per crate;
+# In-process git (bemtvi-git, native-only). Feature set is chosen per crate;
 # default-features off keeps the network/tls tree opt-in.
 gix = { version = "=0.86.0", default-features = false }
-# Sub-crates of gix used directly by nxvim-git's hand-rolled reset --hard (build an
+# Sub-crates of gix used directly by bemtvi-git's hand-rolled reset --hard (build an
 # index from a tree, then check it out over the worktree). Pinned to the EXACT versions
 # gix 0.86 resolves internally so the `gix_index::State` we pass into
 # `gix_worktree_state::checkout` is the same type gix uses (type identity across the
@@ -208,17 +208,17 @@ gix = { version = "=0.86.0", default-features = false }
 gix-index = { version = "=0.54.0", default-features = false }
 gix-worktree-state = { version = "=0.33.0", default-features = false }
 # Dev-only: real grammars compiled into a test fixture (never linked into the
-# editor — nxvim loads grammars dynamically at runtime). `tree-sitter-md` is a host
+# editor — bemtvi loads grammars dynamically at runtime). `tree-sitter-md` is a host
 # grammar that injects (markdown fenced code blocks → the fence's language), so the
 # injection tests can exercise cross-language + nested injections, not just
 # rust-in-rust self-injection.
 tree-sitter-rust = "=0.24.2"
 tree-sitter-md = "=0.5.3"
 
-# `:TSInstall` grammar fetch + compile (nxvim-ts `install` module). All in-process
-# so a *prebuilt* nxvim needs no external curl/git/tar at runtime. `ureq` is the
+# `:TSInstall` grammar fetch + compile (bemtvi-ts `install` module). All in-process
+# so a *prebuilt* bemtvi needs no external curl/git/tar at runtime. `ureq` is the
 # blocking HTTP client over its bundled rustls (`tls`); rustls builds `ring` at
-# *build* time (a cc/perl compile, which whoever builds nxvim has) — the
+# *build* time (a cc/perl compile, which whoever builds bemtvi has) — the
 # runtime-no-compiler goal is about the end user, so this is fine, and it avoids
 # the manual TLS-connector wiring `native-tls` would need. GitHub source tarballs
 # are `.tar.gz` (`flate2` + `tar`); the fetched Zig toolchain ships `.tar.xz`
@@ -226,16 +226,16 @@ tree-sitter-md = "=0.5.3"
 # deflate via its `deflate-flate2` feature so we don't pull a second inflate
 # stack). `sha2` verifies the pinned Zig checksum before we execute it.
 ureq = { version = "=2.12.0", default-features = false, features = ["tls"] }
-# The `nx.http.mount` listener (`nxvim-server`'s `httpmount` module) — the INBOUND
+# The `btv.http.mount` listener (`bemtvi-server`'s `httpmount` module) — the INBOUND
 # twin of `ureq` above, which is outbound-only. One editor-owned origin serves every
 # plugin's mounted subroute (`/plugin/<name>/*`); see
-# `docs/plans/2026-07-14-nx-http-mount.md`. `axum` rather than a hand-rolled HTTP/1.1
+# `docs/plans/2026-07-14-btv-http-mount.md`. `axum` rather than a hand-rolled HTTP/1.1
 # parser because inbound framing (chunked bodies, keep-alive, header edge cases) is a
 # well-known footgun class, and rather than bare `hyper` because `axum::serve` is the
 # one thing we need from it. `default-features = false` + `http1`/`tokio` keeps the
 # tree to hyper/tower/http-body-util: no multipart, no ws, no macros, no `tower-http`,
 # and NO tokio `rt-multi-thread` (the server is a current-thread runtime — axum needs
-# a running reactor, not a threaded one). Native-gated in `nxvim-server` exactly like
+# a running reactor, not a threaded one). Native-gated in `bemtvi-server` exactly like
 # `ureq`: a browser tab cannot bind a port, so the wasm build reaches the same mount
 # contract through a Service Worker instead.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
@@ -244,13 +244,13 @@ flate2 = "=1.1.9"
 xz2 = "=0.1.7"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
 sha2 = "=0.11.0"
-# Hash digests for the `nx.hash.*` Lua utilities (alongside `sha2`, which doubles
+# Hash digests for the `btv.hash.*` Lua utilities (alongside `sha2`, which doubles
 # as the zig-checksum verifier above). All RustCrypto, pure Rust and wasm-safe;
 # they share the `digest = 0.11` trait surface so one `Digest` import covers all.
 sha1 = "=0.11.0"
 md-5 = "=0.11.0"
 
-# LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP
+# LSP client stack — reached only through `bemtvi-lsp` (Decision 1/2 of the LSP
 # design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and
 # `$/cancelRequest`; lsp-types is the protocol type vocabulary.
 #

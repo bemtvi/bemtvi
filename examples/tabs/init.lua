@@ -1,12 +1,12 @@
--- ~~~ nxvim tabs playground: tab pages, the tabline, and the nvim_tabpage_* API ~~~
+-- ~~~ bemtvi tabs playground: tab pages, the tabline, and the nvim_tabpage_* API ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/tabs \
---       cargo run -p nxvim -- examples/tabs/sample.txt
+--     BEMTVI_CONFIG=examples/tabs \
+--       cargo run -p bemtvi -- examples/tabs/sample.txt
 --
 -- A "tab page" is a named collection of windows: each tab owns its own split
--- layout, and only one tab is visible at a time. nxvim draws a tabline across the
+-- layout, and only one tab is visible at a time. bemtvi draws a tabline across the
 -- top when more than one is open. This config wires the tab autocmds and a couple
 -- of helper commands so you can watch the tab lifecycle and drive it from Lua.
 --

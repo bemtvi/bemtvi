@@ -22,7 +22,7 @@ LSP plan's promise that `gd`/`K`/… are rebindable. The LSP design doc
 section at the end is the integration contract that keeps this engine a clean
 drop-in there.
 
-This document is both the design for nxvim's key-mapping system **and** a
+This document is both the design for bemtvi's key-mapping system **and** a
 phase-by-phase implementation plan. Each phase is written to be handed off to a
 fresh context window: prerequisites, the exact files it touches, the surface it
 adds, the tests that prove it, and a hard "done when" gate. Read the *Design* half
@@ -30,12 +30,12 @@ first, then execute the phases in order — later phases assume earlier foundati
 
 The closest existing subsystems, and the templates for this work, are the
 **autocmd lifecycle** ([2026-06-04-autocmd-lifecycle-design.md](2026-06-04-autocmd-lifecycle-design.md))
-and **user commands**: a pure-Lua registry (`nx._autocmds` / `nx._user_commands`)
+and **user commands**: a pure-Lua registry (`btv._autocmds` / `btv._user_commands`)
 the server reads back, with callbacks invoked from Rust (`run_user_command` /
 `run_panel_select`) whose effects drain through `apply_lua_effects`. Keymaps add
 **two** twists those don't have: (a) the **LHS is matched against the live input
 stream**, mid-keystroke — the interesting part; and (b) unlike autocmds, where
-*matching* happens in Lua (`nx._fire`), keymap matching happens **in Rust** (the
+*matching* happens in Lua (`btv._fire`), keymap matching happens **in Rust** (the
 trie lives in the server, design §1/D1), so the server must read the registry **as
 data**, not just call into it.
 
@@ -43,7 +43,7 @@ data**, not just call into it.
 
 ## Goal
 
-Make nxvim's keys user-mappable from Lua, the way real configs drive them:
+Make bemtvi's keys user-mappable from Lua, the way real configs drive them:
 
 ```lua
 vim.keymap.set('n', 'gd', vim.lsp.buf.definition, { buffer = bufnr })
@@ -52,9 +52,9 @@ vim.keymap.set({ 'n', 'v' }, '<leader>y', '"+y')
 vim.keymap.set('i', 'jk', '<Esc>')
 ```
 
-while preserving nxvim's two non-negotiables:
+while preserving bemtvi's two non-negotiables:
 
-1. **`nxvim-core` stays pure and synchronous.** No Lua, no user-mapping table, no
+1. **`bemtvi-core` stays pure and synchronous.** No Lua, no user-mapping table, no
    callback types leak into core. The key state machine (`Editor::input(Key)`) is
    untouched; the mapping layer sits **in front of it**, in the server.
 2. **One input path.** Every key still arrives as `nvim_input` notation, is parsed
@@ -80,8 +80,8 @@ legacy Vimscript configs are otherwise a non-goal (as in the LSP plan).
 ## How input works today (on `main`)
 
 - **Transport.** A client sends `nvim_input("<notation>")`; the server's
-  `nvim_input` arm calls `Server::input(keys)` (`crates/nxvim-server/src/lib.rs`).
-- **Parse.** `Server::input` runs `parse_keys(keys)` (`crates/nxvim-core/src/input.rs`)
+  `nvim_input` arm calls `Server::input(keys)` (`crates/bemtvi-server/src/lib.rs`).
+- **Parse.** `Server::input` runs `parse_keys(keys)` (`crates/bemtvi-core/src/input.rs`)
   → a `Vec<Key>`. `Key { code: KeyCode, ctrl, alt, shift }`; `parse_keys` understands
   literal chars and `<C-..>`/`<Esc>`/`<CR>`/… notation.
 - **Per-key loop — *no interception today*.** The whole of `Server::input` is:
@@ -125,7 +125,7 @@ legacy Vimscript configs are otherwise a non-goal (as in the LSP plan).
 pure. The server owns a per-mode **prefix trie** of LHS → mapping, built from the
 Lua registry, and a small **pending-key buffer** (the N-key withhold/replay buffer).
 `Server::input`'s per-key loop consults the trie before `editor.input`. Recommended
-home: a new **`crates/nxvim-server/src/keymap.rs`** module (sibling to the existing
+home: a new **`crates/bemtvi-server/src/keymap.rs`** module (sibling to the existing
 `syntax.rs`) holding the trie, the pending buffer, and the match function — so
 `Server::input` stays thin and the whole engine is isolated for the backport. The
 matcher does **not** own the editor; it is a pure function of *(mode, incoming key)*
@@ -133,14 +133,14 @@ that returns an owned list of **steps** the server then executes (design §3) �
 also sidesteps borrow conflicts between the matcher state and `self.editor`.
 
 **2. The Lua surface mirrors autocmds/user-commands.** `vim.keymap.set` stores an
-entry in a pure-Lua registry `nx._keymaps`; a **function** RHS is kept in a
-Lua-side table keyed by a stable id (`nx._keymap_fns[id]`), invoked from Rust by
+entry in a pure-Lua registry `btv._keymaps`; a **function** RHS is kept in a
+Lua-side table keyed by a stable id (`btv._keymap_fns[id]`), invoked from Rust by
 `LuaRuntime::run_keymap(id)` (the `run_user_command` / `run_panel_select` analogue),
 effects draining via `apply_lua_effects`. A **string** RHS is fed back into the input
 path. Registration is pure Lua (like `nvim_create_autocmd`); the Rust surface is just
 `run_keymap(id)` plus a **snapshot reader** — see point 6.
 
-**3. Matching without an input timer (the crux).** nxvim processes keys
+**3. Matching without an input timer (the crux).** bemtvi processes keys
 synchronously, in `nvim_input` batches, with **no idle timer**, so vim's
 `timeoutlen` ambiguity ("wait T ms, then take the shorter map") cannot be
 reproduced faithfully. The policy:
@@ -187,7 +187,7 @@ existing `parse_keys` — so `<C-w>`, `<Esc>`, `<leader>`-expanded sequences, an
 literal chars all canonicalize one way. `<leader>` is expanded from
 `vim.g.mapleader` (default `\`) **at set-time**, before `parse_keys`, matching
 neovim. No reverse (Key → notation) is needed: the trie is keyed by `Key`. This
-requires one small **`nxvim-core` change**: derive `Hash` on `Key` and `KeyCode`
+requires one small **`bemtvi-core` change**: derive `Hash` on `Key` and `KeyCode`
 (they are `Eq` today but not `Hash`) so the trie can key children by `Key` in a
 `HashMap`. That is the *only* core change the whole plan needs.
 
@@ -204,10 +204,10 @@ backport sidestep this entirely: they are **native** actions (point D7) that cal
 `request_lsp(kind)` directly rather than feeding keys.
 
 **6. Reading the registry (the one structural difference from autocmds).** Autocmds
-keep *matching* in Lua: Rust calls `nx._fire(event,…)` and Lua walks `nx._autocmds`.
+keep *matching* in Lua: Rust calls `btv._fire(event,…)` and Lua walks `btv._autocmds`.
 Keymaps match **in Rust** (the trie), so `LuaRuntime` gains a **snapshot reader**,
 `keymaps_snapshot() -> Vec<RawKeymap>` plus `keymaps_version() -> u64`, that pulls
-`nx._keymaps` across the bridge as plain data:
+`btv._keymaps` across the bridge as plain data:
 `RawKeymap { modes: Vec<String>, lhs: String, rhs: RawRhs, noremap, buffer: Option<u64>, desc, default }`,
 `RawRhs = Lua(fn_id) | Str(String)`. The server compiles this snapshot into per-mode
 tries of `MappingRhs`. It checks `keymaps_version()` **once per `nvim_input` batch**
@@ -219,14 +219,14 @@ therefore takes effect on the *next* batch — an acceptable ordering, noted.)
 
 - **D1 — Server-side engine, core untouched.** Mappings invoke Lua and re-feed input;
   both are server concerns. Putting the whole layer in the server (a new `keymap.rs`)
-  keeps `nxvim-core` pure (modulo the one `Hash` derive) and gives one place to
+  keeps `bemtvi-core` pure (modulo the one `Hash` derive) and gives one place to
   reason about match ordering. `Editor::input(Key)` is unchanged.
 - **D2 — One withhold/replay matcher, general from the start.** The pending-key
   buffer is built general (N-key, multi-mode, user-populated) rather than as a
   one-off. On the backport it **replaces** the bespoke `lsp_pending_g` /
   `lsp_pending_ctrl_x` recognizers; the LSP keys become ordinary default mappings
   (D6/D7). One matcher, not two.
-- **D3 — Registry mirrors autocmds; rebuild-on-version, not per-key.** `nx._keymaps`
+- **D3 — Registry mirrors autocmds; rebuild-on-version, not per-key.** `btv._keymaps`
   is read into a cached trie via the snapshot reader (point 6); a version counter
   invalidates it on `set`/`del`, checked once per batch. Per keystroke the server
   only walks the trie.
@@ -261,25 +261,25 @@ therefore takes effect on the *next* batch — an acceptable ordering, noted.)
 
 ### Files (touched across phases)
 
-- `crates/nxvim-lua/src/prelude.lua` — `vim.keymap.set`/`del`, the `nx._keymaps`
-  registry + `nx._keymap_fns` + `nx._run_keymap(id)` + `nx._keymaps_version`,
+- `crates/bemtvi-lua/src/prelude.lua` — `vim.keymap.set`/`del`, the `btv._keymaps`
+  registry + `btv._keymap_fns` + `btv._run_keymap(id)` + `btv._keymaps_version`,
   `nvim_set_keymap`/`nvim_buf_set_keymap`/`nvim_del_keymap`, `<leader>` expansion,
   mode normalization. (Pure-Lua, like the autocmd registration helpers.)
-- `crates/nxvim-lua/src/lib.rs` — `LuaRuntime::run_keymap(id)` (the
+- `crates/bemtvi-lua/src/lib.rs` — `LuaRuntime::run_keymap(id)` (the
   `run_user_command` / `run_panel_select` analogue), and the **snapshot reader**
   `keymaps_snapshot()` + `keymaps_version()` (point 6 — new, because matching is
   Rust-side).
-- `crates/nxvim-server/src/keymap.rs` *(new)* — the trie + `pending` matcher and its
+- `crates/bemtvi-server/src/keymap.rs` *(new)* — the trie + `pending` matcher and its
   `feed(mode, key) -> Vec<Step>` surface; `MappingRhs`, `Step`, the per-mode trie
   build from a snapshot, and the precedence ladder (D6).
-- `crates/nxvim-server/src/lib.rs` — a single new `Server` field (the `Keymaps`
+- `crates/bemtvi-server/src/lib.rs` — a single new `Server` field (the `Keymaps`
   engine state: cached tries + version + pending buffer); `Server::input` drives the
   matcher's steps in place of the bare `editor.input` loop; RHS execution
   (Lua-fn → `run_keymap` + `apply_lua_effects`; string → feed); the per-batch
   version check/rebuild.
-- `crates/nxvim-core/src/input.rs` — **add `#[derive(Hash)]`** to `Key` and `KeyCode`
+- `crates/bemtvi-core/src/input.rs` — **add `#[derive(Hash)]`** to `Key` and `KeyCode`
   (the only core change). `parse_keys` is reused as-is.
-- Tests: `crates/nxvim-server/tests/keymaps.rs` (new) — black-box via `nvim_input`,
+- Tests: `crates/bemtvi-server/tests/keymaps.rs` (new) — black-box via `nvim_input`,
   asserting observable effects (a mapping that runs a `:` command, edits the buffer,
   or `print`s a marker), per the no-unit-test rule. Carries its own
   `start`/`feed`/`lines` helpers (integration files don't share a module).
@@ -297,12 +297,12 @@ one focused context window.
 
 ### Phase 1 — The matcher + normal-mode `vim.keymap.set` (global) — ✅ implemented
 
-> **Landed.** The engine is in `crates/nxvim-server/src/keymap.rs` (trie +
+> **Landed.** The engine is in `crates/bemtvi-server/src/keymap.rs` (trie +
 > withhold/replay matcher), wired through `Server::input`; the Lua surface is in
-> `prelude.lua` (`vim.keymap.set`, `nx._keymaps`/`_keymap_fns`/`_keymaps_version`,
-> `nx._run_keymap`) with the snapshot reader / `run_keymap` in `nxvim-lua`'s
+> `prelude.lua` (`vim.keymap.set`, `btv._keymaps`/`_keymap_fns`/`_keymaps_version`,
+> `btv._run_keymap`) with the snapshot reader / `run_keymap` in `bemtvi-lua`'s
 > `lib.rs`; the one core change (`#[derive(Hash)]` on `Key`/`KeyCode`) is in
-> `input.rs`. Covered by `crates/nxvim-server/tests/keymaps.rs`. **One realized
+> `input.rs`. Covered by `crates/bemtvi-server/tests/keymaps.rs`. **One realized
 > divergence (since fixed):** with no input timer, a trailing live-prefix stayed
 > buffered until the next key flushed it (rather than firing at a `timeoutlen`
 > boundary), so the `gg`-replay test originally sent a final motion to flush — the
@@ -322,19 +322,19 @@ proves the multi-key withhold/replay engine that the backport reuses to retire
 here.)
 
 **Scope (in).**
-- The `nxvim-core` change: `#[derive(Hash)]` on `Key`/`KeyCode` (design §5).
+- The `bemtvi-core` change: `#[derive(Hash)]` on `Key`/`KeyCode` (design §5).
 - `vim.keymap.set(mode, lhs, rhs, opts)` for a **string** `mode` (normal: `'n'`),
   `rhs` a **function** or **string**, `opts` honoring `noremap` (default true) and
-  `desc` (stored, unused). Stored in `nx._keymaps` with a stable id; a function rhs
-  in `nx._keymap_fns[id]`; bump `nx._keymaps_version`.
-- `nx._run_keymap(id)` (Lua) + `LuaRuntime::run_keymap(id)` (Rust), plus the
+  `desc` (stored, unused). Stored in `btv._keymaps` with a stable id; a function rhs
+  in `btv._keymap_fns[id]`; bump `btv._keymaps_version`.
+- `btv._run_keymap(id)` (Lua) + `LuaRuntime::run_keymap(id)` (Rust), plus the
   `keymaps_snapshot()` / `keymaps_version()` reader (design §6).
 - The server-side `keymap.rs` module: the **prefix trie** (per mode; Phase 1 only
   builds the Normal trie) + the `pending` withhold/replay matcher with the
   `feed(mode, key) -> Vec<Step>` surface (design §3), the precedence ladder shell
   (D6), and `MappingRhs::{Lua, Keys}` (D7). Wire it into `Server::input` as the
   **first** interception layer (`main` has none today), rebuilt when
-  `nx._keymaps_version` advances (checked once per batch).
+  `btv._keymaps_version` advances (checked once per batch).
 - RHS execution: a `Lua(id)` fire calls `run_keymap(id)` then `apply_lua_effects()`
   (which folds in the callback's highlights/commands/output — its direct `vim.cmd`s
   run there via `take_commands`); any *further* deferred ex-commands converge in the
@@ -348,7 +348,7 @@ ambiguity-timer, `expr`/`<Plug>`, `:map` ex-commands. **No built-in/LSP defaults
 installed in `main`** — the `Native` RHS variant and the four LSP default maps are
 added on the backport (D6/D7).
 
-**Tests** (`crates/nxvim-server/tests/keymaps.rs`).
+**Tests** (`crates/bemtvi-server/tests/keymaps.rs`).
 - A function map (`vim.keymap.set('n','<Space>x', function() vim.cmd('…') end)`) fires
   on the sequence and its effect is observable; the keys don't also reach the editor.
 - A string map (`'n','Y','y$'`, noremap) yanks to end-of-line.
@@ -361,7 +361,7 @@ added on the backport (D6/D7).
   defaults first exist).
 
 **Done when.** The above pass; `main`'s `Server::input` runs every normal-mode key
-through the matcher; `nxvim-core` still has no Lua deps (only the `Hash` derive); the
+through the matcher; `bemtvi-core` still has no Lua deps (only the `Hash` derive); the
 three gates are green.
 
 ---
@@ -382,7 +382,7 @@ three gates are green.
 > now re-processes the ambiguous *remainder* after firing a shorter map (Phase 1
 > replayed it raw). Covered by the Phase 2 block in `tests/keymaps.rs`.
 >
-> **`omap` deferred (the decision this phase owed).** nxvim still has no
+> **`omap` deferred (the decision this phase owed).** bemtvi still has no
 > operator-pending *mode* — a pending operator lives in private `editor.operator`
 > while `editor.mode == Normal`, so there is no trie the matcher could select by.
 > `mode_buckets("o")` therefore maps to nothing and `''` expands to normal+visual
@@ -406,12 +406,12 @@ configs target.
   before `parse_keys`. (`vim.g` already exists in the prelude.) If `<leader>w` →
   `<cmd>write<cr>` is wanted here, resolve the `<cmd>…<cr>` caveat (design §5):
   special-case a leading `<cmd>…<cr>` to run the inner text as an ex-command.
-- **mode lists** (`{'n','v'}`) and the mapping of nxvim's `Mode`
+- **mode lists** (`{'n','v'}`) and the mapping of bemtvi's `Mode`
   (`Normal/Insert/Replace/Visual/VisualLine/Command`, codes `n/i/R/v/V/c`) → mode
-  char(s): `n` Normal; `v`/`x` Visual + VisualLine (nxvim has no Select mode, so both
+  char(s): `n` Normal; `v`/`x` Visual + VisualLine (bemtvi has no Select mode, so both
   map there); `o` operator-pending; `''` = n+v+o. Build a trie per resolved mode; the
   matcher selects the trie by `editor.mode`.
-- Operator-pending interaction. **Note (verified):** nxvim has no operator-pending
+- Operator-pending interaction. **Note (verified):** bemtvi has no operator-pending
   *mode* — while an operator is pending, `editor.mode == Normal` and the pending
   operator lives in a **private** `editor.operator: Option<char>` field (no public
   accessor today). So an `o`-specific trie can't be selected by `editor.mode` alone.
@@ -451,7 +451,7 @@ ambiguity timer and `expr` (Phase 4).
 > version check it is once-per-batch, so a mid-batch switch takes effect next batch.
 > A startup seed (`set_buf_snapshot` before `source_init`) makes `buffer = 0`
 > resolve to the real startup buffer at config-time, matching neovim (the same
-> `nx._cur_buf` snapshot `nvim_create_autocmd`'s `buffer = 0` already used).
+> `btv._cur_buf` snapshot `nvim_create_autocmd`'s `buffer = 0` already used).
 > `vim.keymap.set`/`del` and the `nvim_*` family share two pure-Lua helpers
 > (`keymap_register`/`keymap_remove`); the only behavioral split is the `noremap`
 > default (D5 — `set` true, the `nvim_*`/`:map` family false). `keymap_remove`
@@ -497,7 +497,7 @@ with the completion popup is **backport** work, not this phase.
 
 > **Idle-flush landed (the `timeoutlen` item).** The TUI arms a `TIMEOUT_LEN`
 > (1000ms, vim's default) timer after each keystroke and, on idle, notifies
-> `nxvim_input_flush`; the server turns that into `Keymaps::flush(mode)`, which
+> `bemtvi_input_flush`; the server turns that into `Keymaps::flush(mode)`, which
 > resolves a trailing live-prefix exactly as the next-key break path would —
 > firing the longest complete (ambiguous *shorter*) map, else replaying the
 > withheld keys raw. The server stays timer-free (the timer lives in the client's
@@ -512,7 +512,7 @@ with the completion popup is **backport** work, not this phase.
 > to the top *on idle* without a following key." That is now stronger: `gg` and
 > every other multi-key **built-in** under a colliding user prefix fire on the
 > keystroke alone, with **no flush and no next key**, via the unified command
-> grammar the matcher consults as a read-only oracle (`nxvim_core::command_status`,
+> grammar the matcher consults as a read-only oracle (`bemtvi_core::command_status`,
 > a fold over the shared `parse_step`). See
 > [2026-06-05-keymap-builtin-disambiguation-design.md](2026-06-05-keymap-builtin-disambiguation-design.md).
 > The idle flush is now relegated to the two cases where holding is genuinely
@@ -540,11 +540,11 @@ ambiguity-resolution policy better than "next key", `expr` maps, `<Plug>`, `nowa
     to the editor (noremap — the computed keys aren't themselves remapped, matching
     `<expr>`'s noremap-by-default use).
   - **Sandbox (textlock).** An `<expr>` RHS must *compute*, not mutate. It runs under
-    the prelude's `nx._expr_lock`, which makes `vim.cmd` raise (the main mutation
+    the prelude's `btv._expr_lock`, which makes `vim.cmd` raise (the main mutation
     funnel); the server additionally **discards** any effects it queued (`print`,
     highlights, panel ops), so only the returned keys take effect. A throwing handler
     or a textlock violation surfaces an error and feeds nothing. (Scope cut: only a
-    Lua function RHS is `<expr>` — nxvim has no expression evaluator for a string
+    Lua function RHS is `<expr>` — bemtvi has no expression evaluator for a string
     RHS; and the sandbox guards `vim.cmd` rather than every conceivable mutation,
     with the discard as the catch-all.) Covered by the `expr_*` tests in
     `tests/keymaps.rs`.
@@ -630,8 +630,8 @@ was reversed once `main`'s built-in-disambiguation oracle landed —
 commit `b23735f` — and was merged into this branch. The history below is kept for the
 rationale.)
 
-The original objection: nxvim's core `g`-motions (`gg`/`ge`/`gj`/`g_`/`gv`/…) live in
-`nxvim-core`, **not in the server's trie**. With `gd` a trie default, a matcher that
+The original objection: bemtvi's core `g`-motions (`gg`/`ge`/`gj`/`g_`/`gv`/…) live in
+`bemtvi-core`, **not in the server's trie**. With `gd` a trie default, a matcher that
 only knew user/native mappings could not tell that a second `g` *completes* `gg` versus
 *continuing* toward `gd`; timer-less, it withheld the `g` and on the next key folded it
 into `gd`, breaking `gg`, `ggdG`, `ggdap`, `dgg`, and even `gg` followed by a later `d`.
@@ -639,7 +639,7 @@ So `gd`/`gD`/`gr` were first resolved by a bespoke in-batch `Server::lsp_g_prefi
 recognizer, at the cost of being **un-overridable**.
 
 That objection no longer holds. The merged disambiguation oracle teaches the matcher the
-*built-in* command grammar via the read-only `nxvim_core::command_status`: on the break
+*built-in* command grammar via the read-only `bemtvi_core::command_status`: on the break
 path, when a withheld run replays raw and re-feeding the next key would only re-withhold
 it, but `raw_run + key` already forms a complete built-in, the key is **released to the
 editor** — so `gg` (under the `g`-prefix collision with `gd`) fires whole, instantly, no
@@ -701,8 +701,8 @@ algorithm, the trie shape, the registry, or the Lua surface.
 ## Compared to neovim
 
 - **Server-side matcher, core stays pure** — neovim resolves maps inside its input
-  loop next to the editor; nxvim keeps the map trie in the server (a new `keymap.rs`)
-  so `nxvim-core`'s key state machine never learns about user mappings (the same split
+  loop next to the editor; bemtvi keeps the map trie in the server (a new `keymap.rs`)
+  so `bemtvi-core`'s key state machine never learns about user mappings (the same split
   as the autocmd emission). The one concession is a `Hash` derive on `Key`/`KeyCode`.
 - **No real `timeoutlen`** — the single deliberate divergence (design §3 / D4); every
   non-ambiguous and within-batch case is faithful.

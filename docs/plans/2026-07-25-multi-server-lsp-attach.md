@@ -18,7 +18,7 @@ spawned=[alpha,beta]  attached_to_buffer=[beta]
 spawned=[alpha,beta]  attached_to_buffer=[alpha]
 ```
 
-`nx.lsp._on_filetype` iterates `pairs(nx.lsp._enabled)` — unspecified hash order —
+`btv.lsp._on_filetype` iterates `pairs(btv.lsp._enabled)` — unspecified hash order —
 and queues an `LspOp::Start` per matching server. Each `Start` overwrites a single
 slot:
 
@@ -34,7 +34,7 @@ requests, `publishDiagnostics`, semantic tokens, inlay hints, folding.
 
 ### What this already invalidates
 
-- `nxvim-workspaces`' README claims each enabled server "attaches when you open a
+- `bemtvi-workspaces`' README claims each enabled server "attaches when you open a
   matching file", and its shipped example enables `pyright` **and** `ruff` for
   Python. That example cannot work as documented.
 - `vim.lsp.buf.format({ name = … })` was just made to *reject* `name` (`f516cbe3`)
@@ -50,8 +50,8 @@ Both transports drive N servers keyed by `ServerKey` and need **no change**:
 - native `LspManager` — `lsp_servers: HashMap<ServerKey, ServerRuntime>`;
 - wasm `SyncLspClient` — `servers: HashMap<ServerKey, ServerState>` (`sync_client.rs`).
 
-The Lua mirror is also already a set: `nx.lsp._attached[buf][client_id] = true`,
-and `nx.lsp.clients{bufnr}` iterates it with `pairs`. It reports one client today
+The Lua mirror is also already a set: `btv.lsp._attached[buf][client_id] = true`,
+and `btv.lsp.clients{bufnr}` iterates it with `pairs`. It reports one client today
 only because the core fires one `LspAttach`.
 
 So the work is confined to **`EditHost`'s per-buffer document/request layer**. That
@@ -235,7 +235,7 @@ and a slow server cannot stall the other's reply.
 `accepting_a_candidate_applies_its_own_server_encoding`,
 `a_lazy_docs_resolve_goes_back_to_the_items_own_server` and
 `a_completion_burst_does_not_accumulate_candidates` in
-`crates/nxvim/tests/lsp_complete.rs`. The last is the amplification guard the risk
+`crates/bemtvi/tests/lsp_complete.rs`. The last is the amplification guard the risk
 section asks for: a 12-keystroke burst inside one word must leave exactly one row per
 server, so a cache that accumulated per keystroke fails rather than merely looking
 busy. The encoding and resolve-routing tests were both mutation-checked — restoring
@@ -261,7 +261,7 @@ per server, and merge at projection. Three things that were forced by the work:
   **single-target**: a buffer has one fold structure, and merging two containment
   trees is not defined.
 - **The mirrors are per buffer, so they rebuild across servers.**
-  `nx._semantic_tokens[buf]` / `nx._inlay_hints[buf]` are one flat list each; pushing
+  `btv._semantic_tokens[buf]` / `btv._inlay_hints[buf]` are one flat list each; pushing
   the answering server's half would erase the other's. Both are rebuilt from every
   attached server's cache, each entry tagged with its producing `client_id`, sorted
   line-then-column. The projections likewise re-sort the merged spans — inlay hints
@@ -280,21 +280,21 @@ correct columns under differing negotiated encodings.
 Covered by `semantic_tokens_merge_from_every_capable_server`,
 `inlay_hints_merge_from_every_capable_server` and
 `a_named_formatter_applies_edits_at_its_own_encoding` in
-`crates/nxvim/tests/lsp_config.rs` — each mock pair negotiates utf-8 against utf-16
+`crates/bemtvi/tests/lsp_config.rs` — each mock pair negotiates utf-8 against utf-16
 over a line (`let föö = 1`) whose byte and code-unit columns disagree, so a shared
 encoding fails the assertion rather than passing by luck.
 
 ### Phase 5 — the Lua/compat surface catches up (done)
 
-- `nx.lsp.format{ name = … }` / `vim.lsp.buf.format{ name = … }` **modeled** —
+- `btv.lsp.format{ name = … }` / `vim.lsp.buf.format{ name = … }` **modeled** —
   replacing the `f516cbe3` rejection. `LspOp::Format` carries the name, and
   `:LspFormat [server]` is the ex twin. A name not attached to the buffer reports
   so and resolves `nil`; it never silently falls back to a different server, which
   is the failure the option exists to prevent. `bufnr`/`range`/`filter` stay
-  rejected (nxvim formats the current buffer whole).
-- `nx.lsp.clients{bufnr}` documented as returning N, with the warning not to index
+  rejected (bemtvi formats the current buffer whole).
+- `btv.lsp.clients{bufnr}` documented as returning N, with the warning not to index
   `[1]` expecting "the" server.
-- `nxvim-workspaces` README/example corrected — multi-server is now described as
+- `bemtvi-workspaces` README/example corrected — multi-server is now described as
   the normal case, and the Python example names `ruff` as its formatter because
   pyright also advertises formatting.
 - `docs/architecture.md` needed no change: it never claimed one server per buffer.
@@ -305,7 +305,7 @@ The multi-server layer is *plausible* remotely by construction — it all lives 
 `EditHost`, and both transports are already keyed by `ServerKey` — but "the design
 says it should" is not a verification, so both legs are now driven with two servers.
 
-**Native daemon** (`crates/nxvim/tests/daemon_lsp.rs`). A new harness helper,
+**Native daemon** (`crates/bemtvi/tests/daemon_lsp.rs`). A new harness helper,
 `spawn_with_daemon_lsp`, injects a `RemoteLspTransport` talking to a
 `serve_lsp_daemon` over an in-process duplex, so each mock server is a real child on
 the daemon side with its stdio tunneled. Two tests: both servers attach and *both*
@@ -316,7 +316,7 @@ capability across the tunnel. Mutation-checked by stopping the daemon side from
 serving — both tests then fail, so the wire is load-bearing rather than a local
 fallback.
 
-**Browser / wasm** (`crates/nxvim-edithost/web/verify-lsp.mjs`). Extended from one
+**Browser / wasm** (`crates/bemtvi-edithost/web/verify-lsp.mjs`). Extended from one
 mock server to two for the same filetype. Each of the three added checks is a merge
 or a routing decision a one-server session cannot satisfy: both servers' diagnostics
 merge, the hover reaches the one advertising `hoverProvider` (`mock2` withholds it),
@@ -326,7 +326,7 @@ Mutation-checked by enabling only `mock` — all three then fail.
 Two pre-existing breaks surfaced and were fixed to get there, neither caused by this
 work (both reproduce with the multi-server changes stashed):
 
-- `nxvim-edithost` did not compile to wasm at all: `GitJob::Fetch` had no arm in the
+- `bemtvi-edithost` did not compile to wasm at all: `GitJob::Fetch` had no arm in the
   browser git-job encoder (added by the gix work, whose decoder side already handled
   `"fetch"`). The wasm build is a tier-1 target, so this was a silent hole — nothing
   in `cargo test --workspace` builds that crate for wasm.
@@ -335,7 +335,7 @@ work (both reproduce with the multi-server changes stashed):
   `floating == true`) — the same place the native `lsp_config.rs` helpers read. It was
   failing against a *single* server before this phase touched it.
 
-`--no-default-features` compiles (`cargo check -p nxvim-server --no-default-features`),
+`--no-default-features` compiles (`cargo check -p bemtvi-server --no-default-features`),
 which is the other half of the wasm-eligible build.
 
 ### Phase 7 — the surfaces that still resolved "the" server by position (done)
@@ -345,7 +345,7 @@ places: a path answering "which server?" with the buffer's **first** attached on
 instead of the one actually involved. Phases 1–6 fixed it for sync, request routing
 and the decorations; these are the request *context*, the merged results, and the
 apply/dispatch follow-ups. Each is covered by a test confirmed failing first, in
-`crates/nxvim/tests/lsp_config.rs`.
+`crates/bemtvi/tests/lsp_config.rs`.
 
 - **`context.diagnostics` is per server.** The code-action fan-out asked every
   server but handed them all one list harvested from the first. A linter gates its
@@ -371,10 +371,10 @@ apply/dispatch follow-ups. Each is covered by a test confirmed failing first, in
   origin it had just been handed. `a_rename_applies_its_edits_at_the_answering_servers_encoding`.
 - **A code action's `command` runs on the server that offered it.** The merged
   chooser tracked each action's origin for `codeAction/resolve` and then dropped it
-  for the command. Found while testing it: `nx.lsp._dispatch_command` **did not
+  for the command. Found while testing it: `btv.lsp._dispatch_command` **did not
   exist** — the neovim-compat removal took `vim.lsp.commands` with it, so every
   command-carrying action had been failing with an `E5108` since. Implemented for
-  real (a `nx.lsp.commands[name]` client-side registry, else
+  real (a `btv.lsp.commands[name]` client-side registry, else
   `workspace/executeCommand` on the origin client), with `vim.lsp.commands` aliased
   to the same table. `a_code_actions_command_runs_on_the_server_that_offered_it`.
 - **The signature-help auto-trigger gates by capability.** Core's trigger set is a
@@ -408,7 +408,7 @@ Fallout the above made possible: `LspDocState::primary` is gone and `primary_key
 survives only as `reply_encoding`'s last-resort fallback for an edit with no
 producing server (one built in Lua). `request_lsp` now rejects a non-cursor kind by
 name instead of falling through to a request of a *different* kind — a raw
-`nx._lsp_buf(10)` used to issue `documentSymbol` for a code-action ask — and the
+`btv._lsp_buf(10)` used to issue `documentSymbol` for a code-action ask — and the
 single-slot `PendingLspReq.code_action` field went with the dead single-target
 code-action reply arm (code actions always fan out).
 
@@ -444,7 +444,7 @@ thin wrappers over it, and deleted the bespoke by-name lookup Phase 5 grew insid
   `declaration`, `type_definition`, `implementation`, `references`, `signature_help`,
   `document_symbol`, `workspace_symbol`, `rename`, `code_action`, alongside the
   existing `format`. `LspOp::{BufRequest, Rename, CodeAction, WorkspaceSymbol}` carry
-  it. `nx.lsp.request`/`notify` take `{ bufnr =, name = }` in place of a bare bufnr,
+  it. `btv.lsp.request`/`notify` take `{ bufnr =, name = }` in place of a bare bufnr,
   so a server's own method reaches *that* server rather than the first attached one.
   `vim.lsp.buf.rename{ name = … }` / `workspace_symbol(query, opts)` are the aliases —
   `name` is neovim's own meaning for the key, so it stops being a rejected option.
@@ -457,7 +457,7 @@ thin wrappers over it, and deleted the bespoke by-name lookup Phase 5 grew insid
 Covered by `a_request_routes_to_the_named_server`,
 `a_named_route_that_cannot_be_honored_says_why` and
 `a_named_code_action_round_asks_only_that_server` in
-`crates/nxvim/tests/lsp_config.rs`, over the same `alpha`/`beta` mock pair: `alpha`
+`crates/bemtvi/tests/lsp_config.rs`, over the same `alpha`/`beta` mock pair: `alpha`
 sorts first, so naming `beta` fails the moment the route is ignored.
 
 ### Phase 9 — a stated preference, and hover stops picking one (done)
@@ -467,9 +467,9 @@ answer when nobody names one — that was the `ServerKey` order, i.e. the config
 alphabetically. Deterministic, and a fine tiebreak, but as a *preference* it is
 arbitrary: `pyright` beats `ruff` for hover because of how the two words sort.
 
-- **`nx.lsp.config{ priority = <int> }`** (default `0`, higher first) is that
+- **`btv.lsp.config{ priority = <int> }`** (default `0`, higher first) is that
   preference, stated. It rides `LspOp::Start` (and `Restart`, so
-  `nx.lsp.restart(name)` applies a changed rank to a running server) into
+  `btv.lsp.restart(name)` applies a changed rank to a running server) into
   `EditHost::lsp_priorities`, keyed by config **name** — the rank is the config's, so
   it holds across roots and survives a respawn under a new key.
 - **One comparator.** `lsp_routing_order` (priority desc, then key) is used by
@@ -480,7 +480,7 @@ arbitrary: `pyright` beats `ruff` for hover because of how the two words sort.
   Capability still decides *whether* a server is asked; priority only decides
   *who first* among those that can.
 - **Hover joins the fan-out.** `vim.lsp.buf.hover` asks every client and composes one
-  float; nxvim now does the same, for the reason every other merge exists — on a
+  float; bemtvi now does the same, for the reason every other merge exists — on a
   two-server buffer each server knows something the other doesn't, and answering from
   one silently hides the other. Sections are headed `# <client>` and separated by
   `---`, **only** when more than one server contributed (a heading naming the only
@@ -514,7 +514,7 @@ answer is *information*, and a second server's is not a worse copy of the first'
   line each, prefixed `<client>: ` when more than one answered. This is a deliberate
   **divergence from neovim**, which shows one at a time as `(1/3)` with `<C-s>` to
   cycle: cycling needs a focusable, key-grabbing float with session state, while
-  nxvim's is a passive doc float the next keystroke dismisses — and a signature is one
+  bemtvi's is a passive doc float the next keystroke dismisses — and a signature is one
   short line, so there is nothing to page through. Both editors ask every server; only
   the presentation differs. The auto-trigger's per-buffer gate now asks whether *any*
   capable server wants the typed character, which is exactly the condition under which
@@ -538,10 +538,10 @@ and `goto_still_jumps_when_the_merged_list_holds_one_place`.
 ## Testing
 
 Per repo convention every phase is black-box through the running server. The mock
-(`nxvim --__lsp-mock`) already answers from real document state; multi-server tests
+(`bemtvi --__lsp-mock`) already answers from real document state; multi-server tests
 need it spawnable **twice with different scripts**, which today is blocked by
-`$NXVIM_LSP_CMD` overriding the argv globally. Phase 2 therefore also introduces a
-per-server mock override (`$NXVIM_LSP_CMD_<name>`), or the tests cannot distinguish
+`$BEMTVI_LSP_CMD` overriding the argv globally. Phase 2 therefore also introduces a
+per-server mock override (`$BEMTVI_LSP_CMD_<name>`), or the tests cannot distinguish
 which server answered — a prerequisite, not an afterthought.
 
 ## Risks

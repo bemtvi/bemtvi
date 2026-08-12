@@ -1,15 +1,15 @@
--- ~~~ nxvim autocmd playground: the :autocmd / :augroup / :doautocmd commands ~~~
+-- ~~~ bemtvi autocmd playground: the :autocmd / :augroup / :doautocmd commands ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/autocmd \
---       cargo run -p nxvim -- examples/autocmd/sample.txt
+--     BEMTVI_CONFIG=examples/autocmd \
+--       cargo run -p bemtvi -- examples/autocmd/sample.txt
 --
 -- An *autocommand* runs an ex-command (or, from Lua, a callback) when an event
 -- fires — opening a file, switching buffers, entering insert mode, or a custom
 -- `User` event you trigger yourself. An *augroup* is a named bucket of them, so a
 -- config can clear and re-register its own autocmds without touching anyone
--- else's. nxvim drives the same store from two front-ends: the `vim.api.nvim_*`
+-- else's. bemtvi drives the same store from two front-ends: the `vim.api.nvim_*`
 -- functions (used below in §1 and §5) and the Vimscript-style `:`-commands
 -- (§2–§4), which this example exists to show off. §5 wires the editor-lifecycle
 -- events (BufWritePre/Post, InsertLeave, TextChanged, BufNewFile, …) that fire as

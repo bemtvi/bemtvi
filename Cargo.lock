@@ -454,6 +454,227 @@ dependencies = [
 ]
 
 [[package]]
+name = "bemtvi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-lsp",
+ "bemtvi-lua",
+ "bemtvi-rpc",
+ "bemtvi-server",
+ "bemtvi-test-harness",
+ "bemtvi-tui",
+ "bemtvi-view",
+ "clap",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "rmpv",
+ "serde_json",
+ "tokio",
+ "tree-sitter-md",
+ "tree-sitter-rust",
+ "vt100",
+]
+
+[[package]]
+name = "bemtvi-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-regex",
+ "encoding_rs",
+ "globset",
+ "nucleo-matcher",
+ "pulldown-cmark",
+ "regex",
+ "ropey",
+ "serde",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "bemtvi-git"
+version = "0.1.0"
+dependencies = [
+ "bemtvi-lua",
+ "gix",
+ "gix-index",
+ "gix-worktree-state",
+]
+
+[[package]]
+name = "bemtvi-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "bemtvi-rpc",
+ "bemtvi-server",
+ "bemtvi-view",
+ "clap",
+ "cosmic-text",
+ "glyphon",
+ "image",
+ "libc",
+ "pollster",
+ "rfd",
+ "rmpv",
+ "tokio",
+ "unicode-script",
+ "unicode-segmentation",
+ "unicode-width",
+ "wgpu",
+ "winit",
+ "winresource",
+]
+
+[[package]]
+name = "bemtvi-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-lsp",
+ "futures",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "bemtvi-lua"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-core",
+ "bemtvi-regex",
+ "bemtvi-ts",
+ "encoding_rs",
+ "form_urlencoded",
+ "getrandom 0.4.3",
+ "md-5",
+ "mlua",
+ "percent-encoding",
+ "regex",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "unicode-width",
+]
+
+[[package]]
+name = "bemtvi-regex"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "bemtvi-rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmpv",
+ "tokio",
+]
+
+[[package]]
+name = "bemtvi-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bemtvi-core",
+ "bemtvi-git",
+ "bemtvi-lsp",
+ "bemtvi-lua",
+ "bemtvi-rpc",
+ "bemtvi-test-harness",
+ "bemtvi-ts",
+ "form_urlencoded",
+ "getrandom 0.4.3",
+ "notify",
+ "portable-pty",
+ "redb",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tree-sitter-rust",
+ "ureq",
+ "vt100",
+ "wtransport",
+]
+
+[[package]]
+name = "bemtvi-test-harness"
+version = "0.1.0"
+dependencies = [
+ "bemtvi-core",
+ "bemtvi-rpc",
+ "bemtvi-server",
+ "libc",
+ "rmpv",
+ "tokio",
+]
+
+[[package]]
+name = "bemtvi-ts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-core",
+ "flate2",
+ "libloading 0.9.0",
+ "ropey",
+ "serde_json",
+ "sha2 0.11.0",
+ "streaming-iterator",
+ "tar",
+ "tree-sitter",
+ "tree-sitter-md",
+ "tree-sitter-rust",
+ "ureq",
+ "xz2",
+ "zip",
+]
+
+[[package]]
+name = "bemtvi-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bemtvi-rpc",
+ "bemtvi-view",
+ "crossterm",
+ "futures",
+ "image",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "ratatui-image",
+ "rmpv",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
+name = "bemtvi-view"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "libc",
+ "rmpv",
+]
+
+[[package]]
 name = "bisync"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3981,227 +4202,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "nxvim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "nxvim-lsp",
- "nxvim-lua",
- "nxvim-rpc",
- "nxvim-server",
- "nxvim-test-harness",
- "nxvim-tui",
- "nxvim-view",
- "portable-pty",
- "ratatui",
- "rmpv",
- "serde_json",
- "tokio",
- "tree-sitter-md",
- "tree-sitter-rust",
- "vt100",
-]
-
-[[package]]
-name = "nxvim-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "encoding_rs",
- "globset",
- "nucleo-matcher",
- "nxvim-regex",
- "pulldown-cmark",
- "regex",
- "ropey",
- "serde",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
-name = "nxvim-git"
-version = "0.1.0"
-dependencies = [
- "gix",
- "gix-index",
- "gix-worktree-state",
- "nxvim-lua",
-]
-
-[[package]]
-name = "nxvim-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "clap",
- "cosmic-text",
- "glyphon",
- "image",
- "libc",
- "nxvim-rpc",
- "nxvim-server",
- "nxvim-view",
- "pollster",
- "rfd",
- "rmpv",
- "tokio",
- "unicode-script",
- "unicode-segmentation",
- "unicode-width",
- "wgpu",
- "winit",
- "winresource",
-]
-
-[[package]]
-name = "nxvim-lsp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-lsp",
- "futures",
- "lsp-types",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "nxvim-lua"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "encoding_rs",
- "form_urlencoded",
- "getrandom 0.4.3",
- "md-5",
- "mlua",
- "nxvim-core",
- "nxvim-regex",
- "nxvim-ts",
- "percent-encoding",
- "regex",
- "rmpv",
- "serde",
- "serde_json",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "unicode-width",
-]
-
-[[package]]
-name = "nxvim-regex"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "nxvim-rpc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rmpv",
- "tokio",
-]
-
-[[package]]
-name = "nxvim-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "form_urlencoded",
- "getrandom 0.4.3",
- "notify",
- "nxvim-core",
- "nxvim-git",
- "nxvim-lsp",
- "nxvim-lua",
- "nxvim-rpc",
- "nxvim-test-harness",
- "nxvim-ts",
- "portable-pty",
- "redb",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "tree-sitter-rust",
- "ureq",
- "vt100",
- "wtransport",
-]
-
-[[package]]
-name = "nxvim-test-harness"
-version = "0.1.0"
-dependencies = [
- "libc",
- "nxvim-core",
- "nxvim-rpc",
- "nxvim-server",
- "rmpv",
- "tokio",
-]
-
-[[package]]
-name = "nxvim-ts"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "flate2",
- "libloading 0.9.0",
- "nxvim-core",
- "ropey",
- "serde_json",
- "sha2 0.11.0",
- "streaming-iterator",
- "tar",
- "tree-sitter",
- "tree-sitter-md",
- "tree-sitter-rust",
- "ureq",
- "xz2",
- "zip",
-]
-
-[[package]]
-name = "nxvim-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "futures",
- "image",
- "libc",
- "nxvim-rpc",
- "nxvim-view",
- "portable-pty",
- "ratatui",
- "ratatui-image",
- "rmpv",
- "tokio",
- "unicode-width",
-]
-
-[[package]]
-name = "nxvim-view"
-version = "0.1.0"
-dependencies = [
- "image",
- "libc",
- "rmpv",
 ]
 
 [[package]]

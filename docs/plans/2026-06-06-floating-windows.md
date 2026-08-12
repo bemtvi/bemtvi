@@ -2,7 +2,7 @@
 
 ## Why this document exists
 
-nxvim has **multiple windows** — splits, the layout tree, per-window view state,
+bemtvi has **multiple windows** — splits, the layout tree, per-window view state,
 the `<C-w>` family, and the `nvim_win_*` / Lua API (see
 [`architecture.md` → *Windows*](../architecture.md#windows)). What it does **not**
 have is the *other* kind of window neovim grew: a **floating window** — a free
@@ -12,10 +12,10 @@ hover, signature help, key-hint popups, fuzzy-finder pickers, notifications,
 borders around `vim.ui.select`. Today `nvim_open_win` accepts **only the split
 form** and raises/ignores the float config:
 
-| surface | neovim semantics | nxvim today | where |
+| surface | neovim semantics | bemtvi today | where |
 | --- | --- | --- | --- |
 | `nvim_open_win(buf, enter, {relative=…})` | open a float positioned by `relative`/`anchor`/`row`/`col` | **split form only** — `relative` is dropped, a split is made instead | `dispatch.rs` `nvim_open_win`; `nvim_api.lua` `nvim_open_win` |
-| `nvim_win_set_config(win, cfg)` | move/resize a float, convert split↔float | **absent** (`nx._notimpl`/unknown method) | — |
+| `nvim_win_set_config(win, cfg)` | move/resize a float, convert split↔float | **absent** (`btv._notimpl`/unknown method) | — |
 | `nvim_win_get_config(win)` | read a window's float config (`{relative=""}` for non-floats) | **absent** | — |
 | a window drawn over the tiled area with a border | a float with `border`, `title`, `zindex` | only the **completion pmenu** floats, and it is bespoke client chrome, not a window | `render.rs` `render_pmenu` |
 
@@ -63,7 +63,7 @@ render them as misplaced tiled windows); (2) `relayout` guards its cursor-cell
 computation against the transient invalid `current` during a focused-window close
 (`cursor_virtcol` reads the current window's buffer), and `remove_window` re-lays
 once the survivor is entered so cursor-relative floats settle correctly. Coverage:
-9 float tests in `crates/nxvim-server/tests/windows.rs` (positioning, anchor,
+9 float tests in `crates/bemtvi-server/tests/windows.rs` (positioning, anchor,
 editor/win/cursor relativity, zindex order, focus/close, off-screen clamp,
 get_config round-trip, loud rejection).
 
@@ -74,7 +74,7 @@ get_config round-trip, loud rejection).
 **A float is a `Window` that the layout tree does not own.** Every tiled window
 today is a `Node::Leaf(WindowId)` inside `WindowTree::root`; `WindowTree::layout`
 divides the windows area across that tree and writes each window's `rect`
-(`crates/nxvim-core/src/editor.rs`). A float must **not** be in that tree — it
+(`crates/bemtvi-core/src/editor.rs`). A float must **not** be in that tree — it
 steals no space from its siblings, it sits at absolute coordinates, and it paints
 on top. So the model is:
 
@@ -101,7 +101,7 @@ on top" idea from bespoke client chrome (`render_pmenu`) into a first-class
 
 ## The current state (what we are extending — the seams)
 
-`crates/nxvim-core/src/editor.rs`:
+`crates/bemtvi-core/src/editor.rs`:
 
 - **`Window`** — `{ buffer, saved_cursor, saved_top, rect }`. A float adds its
   config; the cleanest shape is `float: Option<FloatConfig>` (`None` = tiled).
@@ -118,14 +118,14 @@ on top" idea from bespoke client chrome (`render_pmenu`) into a first-class
   **`window_rect`/`window_buffer`/`window_cursor`** — already id-addressed; they
   work on a float id as soon as the float is in `windows`.
 
-`crates/nxvim-core/src/view.rs`:
+`crates/bemtvi-core/src/view.rs`:
 
 - **`WindowView`** (`rect`, `buffer`, `focused`, `lines`, cursor, `selection`,
   `search`, `numbers`, …) and **`View { windows, separators, … }`**. A float adds
   a few fields (`floating`, `border`, `zindex`) so the client can overlay it.
 - **`ViewRect`**, **`Separator`** — the wire rect/border types.
 
-`crates/nxvim-server/src/`:
+`crates/bemtvi-server/src/`:
 
 - **`dispatch.rs`** `nvim_open_win` — split form only today; **`resolve_win`** maps
   a wire handle (`0` = current) to a `WindowId`.
@@ -134,18 +134,18 @@ on top" idea from bespoke client chrome (`render_pmenu`) into a first-class
 - **`effects.rs`** — drains `WindowOp`s and runs the `emit_lifecycle_events`
   diff (`WinNew`/`WinEnter`/`WinLeave`/`WinClosed`).
 
-`crates/nxvim-tui/src/`:
+`crates/bemtvi-tui/src/`:
 
 - **`render.rs`** `render()` paints each window at `window_area(...)`, then
   `render_separators`; **`render_pmenu`** is the float-overlay precedent
   (`Clear` + bordered `Block` + inner content). **`view.rs`** parses `windows`.
 
-`crates/nxvim-lua/src/`:
+`crates/bemtvi-lua/src/`:
 
 - **`ops.rs`** `WindowOp` (`SetCurrent`/`SetBuf`/`SetCursor`/`SetWidth`/`SetHeight`/
   `Close`/`Open`). Floats add `OpenFloat` and `SetConfig`.
-- **`prelude/nvim_api.lua`** `nvim_open_win` (split form, write-through to `nx._wins`),
-  `nx._next_win`, the `nx._wins` mirror the server refreshes before each chunk.
+- **`prelude/nvim_api.lua`** `nvim_open_win` (split form, write-through to `btv._wins`),
+  `btv._next_win`, the `btv._wins` mirror the server refreshes before each chunk.
 
 ---
 
@@ -179,7 +179,7 @@ on top" idea from bespoke client chrome (`render_pmenu`) into a first-class
 - **Float-tagged `WindowView` (Phase 2).** `WindowView` carries `floating`,
   `border`, `zindex`; the redraw serializes them; the TUI overlays them.
 - **`OpenFloat`/`SetConfig` `WindowOp`s + the config RPC (Phase 3).**
-  `nvim_open_win` float form, `nvim_win_set_config`/`get_config`, the `nx._wins`
+  `nvim_open_win` float form, `nvim_win_set_config`/`get_config`, the `btv._wins`
   mirror's float fields, write-through in `nvim_api.lua`.
 - **The lifecycle span (Phase 4).** Floats participate in `nvim_list_wins`, the
   focus cycle (honoring `focusable`), `:q`/`:only`/`<C-w>` semantics, and the
@@ -206,10 +206,10 @@ in isolation, where a wrong rect is a failed assertion on `nvim_win_get_position
 before any pixels are involved.
 
 **Scope (files).**
-- `crates/nxvim-core/src/editor.rs` — `FloatConfig`, `Window.float`, the float
+- `crates/bemtvi-core/src/editor.rs` — `FloatConfig`, `Window.float`, the float
   list on `WindowTree`, the second layout pass, `open_float_window`,
   `window_layouts` appends floats, the config getter.
-- `crates/nxvim-server/src/dispatch.rs` — `nvim_open_win` branches on
+- `crates/bemtvi-server/src/dispatch.rs` — `nvim_open_win` branches on
   `config.relative`; new `nvim_win_get_config`, `nvim_win_get_position`.
 
 **Approach.**
@@ -273,12 +273,12 @@ before any pixels are involved.
      windows area (works for tiled and float; the test oracle for geometry).
 
 **No-stub discipline.** Per the project rule, an unsupported float option must
-fail **loud**, not be silently dropped: a `relative` value nxvim doesn't position
+fail **loud**, not be silently dropped: a `relative` value bemtvi doesn't position
 yet (`"mouse"`, `"laststatus"`, `"tabline"`) raises with the name, rather than
 quietly falling back to `editor`. Supported set in Phase 1: `editor`, `win`,
 `cursor`.
 
-**Tests** (`crates/nxvim-server/tests/windows.rs`, black-box).
+**Tests** (`crates/bemtvi-server/tests/windows.rs`, black-box).
 - `nvim_open_win(buf, true, {relative="editor", row=2, col=5, width=20, height=4})`
   then `nvim_win_get_position` is `[2,5]` and the *tiled* window's rect is
   **unchanged** (a float steals no space — the regression guard for the model).
@@ -323,8 +323,8 @@ divergence from the literal phase split:** the *minimal* Lua open-float
 Phase 3, because the project's example-config convention requires a *runnable*
 `examples/floats/` and a pure-RPC float can't be opened from an `init.lua`. The
 *rest* of the config surface — `nvim_win_set_config`/`get_config` fidelity, the
-`nx._wins` float mirror, split↔float conversion — stays Phase 3. Coverage: 4
-screen tests in `crates/nxvim/tests/screen.rs` (opacity/`Clear`, border+title,
+`btv._wins` float mirror, split↔float conversion — stays Phase 3. Coverage: 4
+screen tests in `crates/bemtvi/tests/screen.rs` (opacity/`Clear`, border+title,
 zindex-over-creation-order, focused-float cursor) + 1 that boots the shipped
 `examples/floats/` config and asserts the startup float paints; 2 Lua-path tests
 in `windows.rs` (open-from-Lua round-trip, loud border rejection).
@@ -337,21 +337,21 @@ when focused — the terminal cursor placed in it. The completion pmenu still fl
 above everything. This is the phase where `nvim_open_win` becomes visible.
 
 **Why.** Phase 1 made floats real in the model; rendering is a genuinely separate
-concern living in a different crate (`nxvim-tui`), with the pmenu already proving
+concern living in a different crate (`bemtvi-tui`), with the pmenu already proving
 the overlay primitive (`Clear` + bordered `Block`). Splitting it out keeps each
 phase end-to-end testable: Phase 1 tested geometry over RPC, Phase 2 tests pixels
 over the screen harness.
 
 **Scope (files).**
-- `crates/nxvim-core/src/view.rs` — `WindowView` gains `floating: bool`,
+- `crates/bemtvi-core/src/view.rs` — `WindowView` gains `floating: bool`,
   `border: BorderStyle`, `title: Option<String>`, `zindex: u32`; `window_view`
   populates them from the `WindowLayout`. `View.windows` stays one list (tiled +
   floats), already z-ordered by `window_layouts`.
-- `crates/nxvim-server/src/redraw.rs` — serialize the new per-window fields into
+- `crates/bemtvi-server/src/redraw.rs` — serialize the new per-window fields into
   each `windows[i]` sub-map.
-- `crates/nxvim-tui/src/view.rs` — parse `floating`/`border`/`title`/`zindex` on
+- `crates/bemtvi-tui/src/view.rs` — parse `floating`/`border`/`title`/`zindex` on
   each `WindowView`.
-- `crates/nxvim-tui/src/render.rs` — the overlay pass.
+- `crates/bemtvi-tui/src/render.rs` — the overlay pass.
 
 **Approach.**
 
@@ -386,7 +386,7 @@ over the screen harness.
    or the nearest); `None` skips the block. `title` renders on the top border
    (ratatui `Block::title`).
 
-**Tests** (Tier-2 screen tests — `crates/nxvim-server/tests/screen.rs` and the
+**Tests** (Tier-2 screen tests — `crates/bemtvi-server/tests/screen.rs` and the
 example below; follow the take-latest redraw helper rule).
 - Open a float over text; the float's text cells appear at its rect and the cells
   it covers no longer show the underlying buffer (the `Clear` proof).
@@ -422,10 +422,10 @@ things by case: move/resize/restyle a float (merge over its live `FloatConfig`);
 **tiled → float** (`remove_leaf` detaches it from the tree, a sibling expands, the
 window joins `floats` — refused for the last tiled window via an `echo`); and
 **float → tiled** (`convert_float_to_tiled` clears `float` and `split_leaf`s it
-back into the tree as a horizontal split of the focused window). The `nx._wins`
+back into the tree as a horizontal split of the focused window). The `btv._wins`
 mirror gained the float fields: `WindowMirror` became a struct with an
 `Option<FloatMirror>` (the placement pre-formatted into the strings
-`nvim_win_get_config` returns, so nxvim-lua never sees the core's enums —
+`nvim_win_get_config` returns, so bemtvi-lua never sees the core's enums —
 `effects.rs::float_mirror` translates), serialized as a nested `float` table by
 `runtime.rs::set_buf_mirror`. `nvim_api.lua` gained `nvim_win_get_config` (reads
 `w.float` off the mirror) and `nvim_win_set_config` (loud-validates the enumerated
@@ -440,7 +440,7 @@ via an empty `title` string); (3) `convert_float_to_tiled` always makes a
 placement neovim's docs leave unspecified). Coverage: 5 RPC tests in `windows.rs`
 (move-keeps-absent-fields, resize, tiled↔float round-trip, same-chunk get_config
 write-through, Lua `nvim_win_set_config`) + 3 example-driven screen tests in
-`crates/nxvim/tests/screen.rs` (the shipped `examples/floats/` `:FloatMove` /
+`crates/bemtvi/tests/screen.rs` (the shipped `examples/floats/` `:FloatMove` /
 `:FloatGrow` / `:FloatToSplit` commands, which exercise `set_config`/`get_config`
 and the split conversion through the real client). The `examples/floats/init.lua`
 config grew those three commands.
@@ -448,18 +448,18 @@ config grew those three commands.
 ## Phase 3 (original plan) — The full config surface: `set_config`/`get_config`, split↔float, the Lua API
 
 **Already landed in Phase 2 (don't redo):** `WindowOp::OpenFloat`, the
-`nx._open_float` bridge, `nvim_api.lua`'s `nvim_open_win` float branch (with loud
+`btv._open_float` bridge, `nvim_api.lua`'s `nvim_open_win` float branch (with loud
 validation), and the `effects.rs` drain into `open_float_window`. So the **open**
 path from Lua works. Phase 3 is the *remaining* surface below: `set_config`
 (move/resize/restyle + split↔float conversion), `get_config` reading the live
-`nx._wins` mirror, and seeding the float fields into that mirror so a
+`btv._wins` mirror, and seeding the float fields into that mirror so a
 `get_config` *within the same chunk* sees a just-opened float.
 
 **Goal.** Floats are **dynamic** and reachable from Lua. `nvim_win_set_config(win,
 config)` moves/resizes a float, changes its border/title/zindex, and converts a
 tiled window into a float (and a float back into a split); `nvim_win_get_config`
 round-trips full fidelity; `vim.api.nvim_open_win` builds the float config and the
-`nx._wins` mirror reflects it so reads within the same `:lua` chunk see it.
+`btv._wins` mirror reflects it so reads within the same `:lua` chunk see it.
 
 **Why.** Phase 1–2 made a float openable and visible from the RPC layer; the
 *plugin* surface is `vim.api` + `set_config` (every float-using UI repositions
@@ -468,17 +468,17 @@ the cursor). This phase makes floats a first-class Lua citizen, following the
 established **"Lua queues, core mutates"** flow windows already use.
 
 **Scope (files).**
-- `crates/nxvim-lua/src/ops.rs` — `WindowOp::OpenFloat { ... }` and
+- `crates/bemtvi-lua/src/ops.rs` — `WindowOp::OpenFloat { ... }` and
   `WindowOp::SetConfig { win, ... }` (the float-config payload as plain fields, no
   Lua types, like the existing `Open`).
-- `crates/nxvim-lua/src/prelude/nvim_api.lua` — `nvim_open_win` builds the float config
-  and write-throughs it into `nx._wins`; new `nvim_win_set_config`/
+- `crates/bemtvi-lua/src/prelude/nvim_api.lua` — `nvim_open_win` builds the float config
+  and write-throughs it into `btv._wins`; new `nvim_win_set_config`/
   `nvim_win_get_config` against the mirror + a queued op.
-- `crates/nxvim-server/src/effects.rs` — drain `OpenFloat`/`SetConfig` into
+- `crates/bemtvi-server/src/effects.rs` — drain `OpenFloat`/`SetConfig` into
   `open_float_window` / a new `Editor::set_window_config`; the mirror push
-  (`effects.rs` already builds `nx._wins`) gains the float fields.
-- `crates/nxvim-server/src/dispatch.rs` — `nvim_win_set_config` RPC entry.
-- `crates/nxvim-core/src/editor.rs` — `set_window_config(id, config)`: reposition
+  (`effects.rs` already builds `btv._wins`) gains the float fields.
+- `crates/bemtvi-server/src/dispatch.rs` — `nvim_win_set_config` RPC entry.
+- `crates/bemtvi-core/src/editor.rs` — `set_window_config(id, config)`: reposition
   a float, or **convert** (tiled→float removes the id from `root` and collapses
   its split, then adds it to `floats`; float→split re-inserts it into the tree as
   a split of the current window). Relayout after.
@@ -491,11 +491,11 @@ established **"Lua queues, core mutates"** flow windows already use.
    `set_window_config`. `nvim_open_win`'s split-vs-float decision moves into
    `nvim_api.lua` (which op to queue), matching where `vertical` is decided today.
 
-2. **The mirror (`nx._wins`).** `effects.rs` pushes `nx._wins` before each
+2. **The mirror (`btv._wins`).** `effects.rs` pushes `btv._wins` before each
    chunk; add the float fields (`relative`, `anchor`, `row`, `col`, `width`,
    `height`, `zindex`, `focusable`, `border`) so `nvim_win_get_config` reads the
    live value. `nvim_api.lua`'s `nvim_open_win` write-through (it already seeds a
-   `nx._wins[id]` entry) seeds the float fields too, so a `get_config` *later in
+   `btv._wins[id]` entry) seeds the float fields too, so a `get_config` *later in
    the same chunk* sees the just-opened float before the op drains — the exact
    write-through pattern already there for the split form.
 
@@ -514,7 +514,7 @@ established **"Lua queues, core mutates"** flow windows already use.
 4. **`nvim_win_get_config`** gains full fidelity (Phase 1's getter extended with
    `border`/`title` once Phase 2 added them).
 
-**Tests** (`crates/nxvim-server/tests/windows.rs`).
+**Tests** (`crates/bemtvi-server/tests/windows.rs`).
 - `nvim_win_set_config(float, {relative="editor", row=0, col=0})` moves it;
   `get_position` reflects the move; `get_config` round-trips the new values.
 - `set_config` resize changes the painted inner area (cross-check via a screen
@@ -562,7 +562,7 @@ already re-clamps every layout; Phase 4 adds the test. **Deliberate divergence
 from the literal plan:** the spatial `<C-w>h/j/k/l` does **not** descend into
 floats (only the `<C-w>w` cycle does), since a float overlapping the tiled grid
 has no well-defined direction — neovim's directional moves likewise stay in the
-tiled layout. Coverage: 8 edge tests in `crates/nxvim-server/tests/windows.rs`
+tiled layout. Coverage: 8 edge tests in `crates/bemtvi-server/tests/windows.rs`
 (float `:q`, last-tiled quit, `:only` closes floats, parent-close cascade, cycle
 includes/skips focusable, last-tiled-close refusal, resize re-clamp) + 2 autocmd
 tests in `autocmds.rs` (float WinNew/WinEnter/WinClosed, `set_config` WinResized)
@@ -584,10 +584,10 @@ plugin's `WinClosed` cleanup) — are concentrated here. Doing them as one harde
 pass keeps the earlier phases focused and gives the edge rules a single home.
 
 **Scope (files).**
-- `crates/nxvim-server/src/effects.rs` — the `emit_lifecycle_events` diff already
+- `crates/bemtvi-server/src/effects.rs` — the `emit_lifecycle_events` diff already
   fires `WinNew`/`WinEnter`/`WinLeave`/`WinClosed`; confirm it spans floats and add
   `WinResized` on a `set_config` size change.
-- `crates/nxvim-core/src/editor.rs` — the `:q`/`:only`/`<C-w>o`/`<C-w>w`/focus
+- `crates/bemtvi-core/src/editor.rs` — the `:q`/`:only`/`<C-w>o`/`<C-w>w`/focus
   rules with floats; `focusable`; terminal-resize re-clamp; parent-close handling.
 
 **Approach & the semantics to pin down.**
@@ -628,7 +628,7 @@ pass keeps the earlier phases focused and gives the edge rules a single home.
      (min 1×1 inner) or hide it — pick one, test it, document it.
    - **zindex ties** break by creation order (the `(zindex, id)` sort from Phase 1).
 
-**Tests** (`crates/nxvim-server/tests/windows.rs` + `autocmds.rs`).
+**Tests** (`crates/bemtvi-server/tests/windows.rs` + `autocmds.rs`).
 - Opening a float fires `WinNew` + `WinEnter`; closing it fires `WinClosed`;
   `set_config` resize fires `WinResized` (extend the existing window-autocmd
   coverage).
@@ -669,7 +669,7 @@ The running scoreboard is the float API surface a real plugin exercises:
 
 The conventions are unchanged (`architecture.md` → *Testing philosophy*): **no
 unit tests**; drive a real server over RPC and assert on observable state
-(`crates/nxvim-server/tests/windows.rs`, helpers `start`/`feed`/`lines`/`cursor`;
+(`crates/bemtvi-server/tests/windows.rs`, helpers `start`/`feed`/`lines`/`cursor`;
 screen assertions follow the **take-latest redraw** rule — drain to the most
 recent `redraw`, never the first, or the test flakes under load). Two oracles
 cover the float surface:

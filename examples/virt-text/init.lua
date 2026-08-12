@@ -1,11 +1,11 @@
--- ~~~ nxvim virtual-text & virtual-lines playground ~~~
+-- ~~~ bemtvi virtual-text & virtual-lines playground ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/virt-text \
---       cargo run -p nxvim -- examples/virt-text/sample.txt
+--     BEMTVI_CONFIG=examples/virt-text \
+--       cargo run -p bemtvi -- examples/virt-text/sample.txt
 --
--- Extmark virtual text/lines is nxvim's own feature, driven through the neovim
+-- Extmark virtual text/lines is bemtvi's own feature, driven through the neovim
 -- compat surface (`nvim_create_namespace` + `nvim_buf_set_extmark`). An extmark's
 -- `decoration` table can carry:
 --   * virt_text          inline / eol / overlay / right_align / win_col text on a line

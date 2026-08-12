@@ -3,26 +3,26 @@
 **Status:** **complete (2026-06-16) — all four phases landed.** Made every
 interactive widget's keys rebindable through the *real* keymap engine — no bespoke
 per-widget config table, no hardcoded `match key.code` grammar a user can't override.
-The fuzzy picker (`nx.picker`) was the named offender and the Phase 1 reference; the
+The fuzzy picker (`btv.picker`) was the named offender and the Phase 1 reference; the
 same mechanism then converted the select list (Phase 2), the panel + explorer
 (Phase 3), and the command line (Phase 4). See each phase's ✅ note below.
 
-> **Superseded for the explorer (and the later `nx.view`):** the unify-special-buffer
+> **Superseded for the explorer (and the later `btv.view`):** the unify-special-buffer
 > work (`docs/plans/2026-06-16-unify-special-buffer-kinds.md`, Phase 2) moved the
 > **file explorer** *off* its `'E'` widget bucket. It is not a grabbing widget — it is
 > an ordinary `nomodifiable` buffer in a window — so its keys are now ordinary
-> **buffer-local default maps** installed by a `FileType nxdir` autocmd (and `nx.view`
-> by `FileType nxview` / a create-time install, quickfix `<CR>` by `FileType qf`),
-> rebound the standard `nx.keymap.set('n', lhs, rhs, { buffer = … })` way. The `'E'`
+> **buffer-local default maps** installed by a `FileType btvdir` autocmd (and `btv.view`
+> by `FileType btvview` / a create-time install, quickfix `<CR>` by `FileType qf`),
+> rebound the standard `btv.keymap.set('n', lhs, rhs, { buffer = … })` way. The `'E'`
 > (and the never-shipped `'W'`) buckets were removed. The genuinely-grabbing widgets
 > below — **picker / select / panel** (`'P'`/`'S'`/`'L'`) — keep their buckets.
 
 ## Why
 
-The keymap engine (`crates/nxvim-server/src/keymap.rs`) already lets a user rebind
+The keymap engine (`crates/bemtvi-server/src/keymap.rs`) already lets a user rebind
 any **editing-mode** key (`vim.keymap.set('n'|'i'|'v'|'m', …)`) via per-mode prefix
 tries with a precedence ladder (buffer-local > global, user > default). But the
-**grabbing widgets** — picker, `nx.ui.select`, the message/quickfix panel, the file
+**grabbing widgets** — picker, `btv.ui.select`, the message/quickfix panel, the file
 explorer, the command line, the confirm dialog — intercept keys in
 `Editor::input` *before* the per-mode dispatch and match them with hardcoded Rust
 (`handle_picker_key`, `handle_select_key`, `handle_panel`, `handle_command`, …).
@@ -32,7 +32,7 @@ picker selection, `<CR>` to confirm, `<Esc>` to cancel are all frozen.
 The fix is the pattern multi-cursor *placement* mode already proves: a widget gets
 its **own keymap mode** (its own trie bucket, like `'m'`), its operations become
 **named actions**, and the built-in keys ship as **overridable default maps** in
-that bucket. `vim.keymap.set('picker', '<C-j>', nx.picker.actions.next)` then works
+that bucket. `vim.keymap.set('picker', '<C-j>', btv.picker.actions.next)` then works
 exactly like any other map, last-set-wins. As a bonus this is **source C** of the
 `KeyPending` event (active-widget key tables) — once widget keys live in the trie,
 which-key shows them for free.
@@ -47,7 +47,7 @@ addressed by a readable mode-code string in Lua:
 | Lua mode code | bucket | widget                         |
 | ------------- | ------ | ------------------------------ |
 | `"picker"`    | `'P'`  | prompted fuzzy picker          |
-| `"select"`    | `'S'`  | promptless `nx.ui.select` list |
+| `"select"`    | `'S'`  | promptless `btv.ui.select` list |
 | `"panel"`     | `'L'`  | message / quickfix panel       |
 | ~~`"explorer"`~~ | ~~`'E'`~~ | file-explorer listing — **removed**; now buffer-local maps (see the superseded note above) |
 
@@ -84,28 +84,28 @@ maps** in the widget's bucket (dogfooding the keymap API, no new Rust native-def
 machinery):
 
 ```lua
-nx.picker.actions = {
-  next    = function() nx._picker_action("next") end,
-  prev    = function() nx._picker_action("prev") end,
-  confirm = function() nx._picker_action("confirm") end,
-  cancel  = function() nx._picker_action("cancel") end,
-  preview_half_down = function() nx._picker_action("preview_half_down") end,
+btv.picker.actions = {
+  next    = function() btv._picker_action("next") end,
+  prev    = function() btv._picker_action("prev") end,
+  confirm = function() btv._picker_action("confirm") end,
+  cancel  = function() btv._picker_action("cancel") end,
+  preview_half_down = function() btv._picker_action("preview_half_down") end,
   -- … preview_half_up / preview_page_down / preview_page_up
-  backspace = function() nx._picker_action("backspace") end,
+  backspace = function() btv._picker_action("backspace") end,
   -- … delete / left / right / home / end
 }
 -- registered once, lowest precedence (default = true):
-nx.keymap.set("picker", "<C-n>", nx.picker.actions.next,    { default = true, desc = "Next item" })
-nx.keymap.set("picker", "<CR>",  nx.picker.actions.confirm, { default = true, desc = "Confirm" })
+btv.keymap.set("picker", "<C-n>", btv.picker.actions.next,    { default = true, desc = "Next item" })
+btv.keymap.set("picker", "<CR>",  btv.picker.actions.confirm, { default = true, desc = "Confirm" })
 -- … etc.
 ```
 
-`nx._picker_action(name)` queues the action onto a `Shared.picker_actions` vec; the
+`btv._picker_action(name)` queues the action onto a `Shared.picker_actions` vec; the
 server drains it in `run_pending` and calls `editor.apply_picker_action` — the same
 queue-effect-then-drain shape every other picker op uses (`picker_pushes`,
 `picker_finishes`, `picker_query_changes`). A user override is an ordinary
 non-default `picker` map and wins by the precedence ladder; rebinding to a built-in
-is `set('picker', key, nx.picker.actions.next)`; disabling is `set('picker', key,
+is `set('picker', key, btv.picker.actions.next)`; disabling is `set('picker', key,
 '<Nop>')`.
 
 The **only** key that can't be a map is an arbitrary printable character (you can't
@@ -124,19 +124,19 @@ same cost any mapped key already pays).
 - core: `KeyContext`, `Editor::key_context()`, `PickerAction` + `apply_picker_action`,
   and a slimmed picker-text fallthrough (printable → query) replacing the nav/confirm/
   cancel/preview arms of `handle_picker_key` / the picker branch of `handle_menu`.
-- Lua/bridge: `nx._picker_action`, `Shared.picker_actions`, the `nx.picker.actions`
+- Lua/bridge: `btv._picker_action`, `Shared.picker_actions`, the `btv.picker.actions`
   table + the default `picker` maps (in `prelude/picker.lua`); server drain.
 - Tests (`tests/picker.rs` / a new `tests/widget_keys.rs`): the default keys still
   navigate/confirm/cancel/scroll-preview; a user `set('picker', …)` rebinds and the
   default no longer fires; `<Nop>` disables; an unmapped printable still edits the
   query; a normal-mode `<C-n>` map does **not** leak into the picker.
 
-### Phase 2 — `nx.ui.select` (the promptless list, `'S'` bucket)  ✅ LANDED (2026-06-16)
+### Phase 2 — `btv.ui.select` (the promptless list, `'S'` bucket)  ✅ LANDED (2026-06-16)
 
 Converted `handle_select_key` (`j`/`k`/`gg`/`G`/`<C-n>`/`<C-p>`/`<CR>`/`<Esc>`/`q`) to
 `select` default maps (`prelude/ui.lua`) + `Editor::apply_select_action` (next / prev
-/ first / last / confirm / cancel), dispatched via `nx.ui.select_actions` →
-`nx._select_action` → `Shared.select_actions`. `KeyContext::Select` + the `'S'`
+/ first / last / confirm / cancel), dispatched via `btv.ui.select_actions` →
+`btv._select_action` → `Shared.select_actions`. `KeyContext::Select` + the `'S'`
 bucket; the select arm of `Editor::input` is now inert (a promptless list has no text
 fallthrough). `gg` is a two-key default map — the multi-key widget map the same trie
 handles. `handle_menu` / `handle_select_key` and the `Menu::gpending` field are gone.
@@ -148,7 +148,7 @@ editing-map leak); all 8 existing `ui_select.rs` tests pass unchanged.
 Converted `handle_panel` → `Editor::apply_panel_action` (next / prev / first / last /
 half_down / half_up / confirm / close) and `handle_explorer` → `Editor::apply_explorer_action`
 (open / up / next / prev / first / last / half + page scroll), each dispatched via the new
-`nx.panel.actions` / `nx.explorer.actions` tables → `nx._panel_action` / `nx._explorer_action`
+`btv.panel.actions` / `btv.explorer.actions` tables → `btv._panel_action` / `btv._explorer_action`
 → `Shared.{panel,explorer}_actions`, drained in `apply_lua_effects`. `KeyContext::{Panel,
 Explorer}` + the `'L'`/`'E'` buckets (`mode_buckets`, `widget_bucket`); `key_context()` now
 reports them by reading the existing grab state (panel first, then the menus, then a
@@ -166,7 +166,7 @@ rebound key, the explorer `:` fall-through, no editing-map leak); all existing `
 
 Converted `handle_command`'s control keys to `cmdline` default maps + `Editor::apply_cmdline_action`
 (cancel / submit / backspace / delete / left / right / to_start / to_end / history_prev /
-history_next / insert_register), dispatched via `nx.cmdline.actions` → `nx._cmdline_action` →
+history_next / insert_register), dispatched via `btv.cmdline.actions` → `btv._cmdline_action` →
 `Shared.cmdline_actions`, drained in `apply_lua_effects`. Unlike the other widgets this is **not** a
 new bucket or a `KeyContext`: the command line already runs in `Mode::Command`, whose `mode_key`
 is `'c'`, so `mode = "cmdline"` is just the readable alias (`mode_buckets("cmdline") == ['c']`) and
@@ -180,7 +180,7 @@ instead of feeding a synthetic `<Esc>` (which is a map now). `:s///c` answers we
 substitute-confirm path, untouched. Tests: `tests/widget_keys.rs` gains 8 cmdline tests (submit/cancel,
 history recall, to_start + insert, backspace, `<C-r>` raw register read, user rebind, `<CR>`-disable,
 no normal-map leak); all existing `editing::search` / `ex_substitute` / `registers` / `global_cmd` /
-`ui_prompt` / `dock` / `keymaps` / `excmd` suites pass unchanged; full nxvim-server suite green.
+`ui_prompt` / `dock` / `keymaps` / `excmd` suites pass unchanged; full bemtvi-server suite green.
 
 With this the configurable-widget-keys feature is complete: every grabbing widget (picker, select,
 panel, explorer, command line) is driven by the real keymap engine — no hardcoded `match key.code`
@@ -196,7 +196,7 @@ grammar a user can't override.
   runaway PTY). Terminal *job* mode is a later, careful consideration if at all.
 - **Literal-argument reads** (`r{char}`, `f{char}`, `"{reg}`) and the `:s///c` answer
   alphabet are fixed grammars, not key tables — out of scope.
-- **No parallel config table.** There is deliberately no `nx.picker.setup{ mappings
+- **No parallel config table.** There is deliberately no `btv.picker.setup{ mappings
   = … }`; the keymap engine *is* the configuration surface (the whole point).
 
 ## Testing (black-box, per the no-unit-test rule)

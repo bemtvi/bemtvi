@@ -1,5 +1,5 @@
 {
-  "//": "Pinned versions + hashes for the LSP end-to-end suite (crates/nxvim/tests/lsp_e2e.rs).",
+  "//": "Pinned versions + hashes for the LSP end-to-end suite (crates/bemtvi/tests/lsp_e2e.rs).",
   "//versions": "Bump a version here, then re-run `scripts/lsp-e2e/lsp-e2e.sh lock` to refresh the hashes below.",
   "//platforms": "Hashes are pinned for the two host arches the suite supports: darwin-arm64 and linux-x86_64.",
 

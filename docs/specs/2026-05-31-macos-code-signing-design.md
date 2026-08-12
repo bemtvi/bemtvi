@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-31
 **Status:** Approved (pending spec review)
-**Scope:** Developer ID sign + notarize the two macOS `nxvim` binaries in the release
+**Scope:** Developer ID sign + notarize the two macOS `bemtvi` binaries in the release
 pipeline so they pass Gatekeeper and run on any Mac.
 
 ## Goal
@@ -121,7 +121,7 @@ rm -f "$CERT"
 
 ```bash
 set -euo pipefail
-BIN="target/${{ matrix.target }}/release/nxvim"
+BIN="target/${{ matrix.target }}/release/bemtvi"
 codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
 codesign --verify --strict --verbose=2 "$BIN"
 ```
@@ -133,9 +133,9 @@ for notarization. `--force` re-signs idempotently if a cache ever carried a prio
 
 ```bash
 set -euo pipefail
-BIN="target/${{ matrix.target }}/release/nxvim"
+BIN="target/${{ matrix.target }}/release/bemtvi"
 KEY="$RUNNER_TEMP/ac_api.p8"
-ZIP="$RUNNER_TEMP/nxvim-notarize.zip"
+ZIP="$RUNNER_TEMP/bemtvi-notarize.zip"
 
 echo "$AC_API_KEY_P8" | base64 --decode > "$KEY"
 ditto -c -k --keepParent "$BIN" "$ZIP"        # notarytool needs a zip/pkg/dmg, not a bare file
@@ -176,8 +176,8 @@ The subsequent existing `Package (Unix)` step then `tar -czf`s the signed binary
 ## Docs
 
 Extend `docs/verifying-downloads.md` with a macOS section: the binaries are Developer
-ID-signed and notarized; users can confirm with `codesign --verify --verbose nxvim` and
-`spctl -a -t exec -vv nxvim` (the latter requires network for the unstapled online check).
+ID-signed and notarized; users can confirm with `codesign --verify --verbose bemtvi` and
+`spctl -a -t exec -vv bemtvi` (the latter requires network for the unstapled online check).
 
 ## Testing strategy
 
@@ -186,9 +186,9 @@ CI configuration — validated by running it, not the Rust test harness:
 1. Add the five secrets, push to `main`, and confirm both macOS build jobs run the Import →
    Codesign → Notarize steps and that `notarytool` reports `status: Accepted`.
 2. Download a published macOS archive and verify locally:
-   - `codesign -dv --verbose=4 nxvim` shows the Developer ID authority + hardened runtime
+   - `codesign -dv --verbose=4 bemtvi` shows the Developer ID authority + hardened runtime
      (`flags=0x10000(runtime)`) + a secure timestamp.
-   - `spctl -a -t exec -vv nxvim` reports `accepted` / `source=Notarized Developer ID`.
+   - `spctl -a -t exec -vv bemtvi` reports `accepted` / `source=Notarized Developer ID`.
    - `xcrun notarytool history --key … ` lists the submission as Accepted.
 3. Confirm Linux/Windows jobs are unaffected and still green.
 4. Confirm the existing `SHA256SUMS` + provenance attestation still pass over the now-signed
@@ -209,15 +209,15 @@ CI configuration — validated by running it, not the Rust test harness:
 
 ## Revision — 2026-06-08 (GUI added + macOS artifact shapes changed)
 
-The pipeline now builds **two** binaries per release — the TUI (`nxvim`) and the GUI
-(`nxvim-gui`, winit + wgpu) — and the macOS artifacts changed shape. The sections above
+The pipeline now builds **two** binaries per release — the TUI (`bemtvi`) and the GUI
+(`bemtvi-gui`, winit + wgpu) — and the macOS artifacts changed shape. The sections above
 describe the original TUI-only, bare-`.tar.gz` design; the differences now in `build.yml`:
 
 - **macOS TUI → stapled `.pkg`.** Instead of a notarized-but-unstapled bare binary in a
   `.tar.gz`, the TUI now ships as a Developer ID Installer–signed `.pkg` (installs to
   `/usr/local/bin`), notarized **and stapled** (`xcrun stapler staple`) — a `.pkg` supports
   stapling, so Gatekeeper no longer needs a network check on first launch.
-- **macOS GUI → stapled `.app` in a `.dmg`.** The GUI is bundled as `nxvim.app`
+- **macOS GUI → stapled `.app` in a `.dmg`.** The GUI is bundled as `bemtvi.app`
   (Developer ID Application–signed, hardened runtime), placed in a drag-to-Applications
   `.dmg`; the `.dmg` is signed, notarized, and stapled.
 - **Two new secrets (precondition).** Signing a `.pkg` requires a **Developer ID Installer**

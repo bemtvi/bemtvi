@@ -1,3 +1,3 @@
-module example.com/nxvim/codeactioncommand
+module example.com/bemtvi/codeactioncommand
 
 go 1.21

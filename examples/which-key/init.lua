@@ -1,9 +1,9 @@
--- ~~~ nxvim native which-key: a live popup of pending-key hints ~~~
+-- ~~~ bemtvi native which-key: a live popup of pending-key hints ~~~
 --
 -- Run it (from the repo root):
 --
---     NXVIM_CONFIG=examples/which-key \
---       cargo run -p nxvim -- examples/which-key/sample.txt
+--     BEMTVI_CONFIG=examples/which-key \
+--       cargo run -p bemtvi -- examples/which-key/sample.txt
 --
 -- TRY IT: press <leader> (Space) and pause. A bordered popup appears in the
 -- BOTTOM-RIGHT corner (relative = "bottom", the classic which-key spot) listing
@@ -19,13 +19,13 @@
 -- them with `available == false`, and this plugin DROPS those rows so the popup only
 -- ever shows keys you can actually press.
 --
--- This is a real which-key built as an `nx.component` over the pending-key ORACLE — no
+-- This is a real which-key built as an `btv.component` over the pending-key ORACLE — no
 -- blocking key reads, no key interception. The component (reactive state + a pure render +
 -- lifecycle) is the SAME model the checklist dialog uses; the only difference is the
 -- SURFACE: which-key renders on the non-focus "float" backend (it must never take focus or
--- bind keys), the checklist on the focus-taking "view". The two nx signals it reads:
+-- bind keys), the checklist on the focus-taking "view". The two btv signals it reads:
 --
---   * nx.on_key_pending(fn)   the engine's pending-prefix ORACLE. The server
+--   * btv.on_key_pending(fn)   the engine's pending-prefix ORACLE. The server
 --                             watches the mapped-prefix trie and pushes a context
 --                             — { mode, keys, continuations = {{key,desc,kind}}, label }
 --                             — every time the withheld prefix changes (grows /
@@ -42,12 +42,12 @@
 --                             the built-in motions with any maps that share the `g`
 --                             prefix (the LSP `gd`/`gD`/`gr` defaults), so one popup
 --                             shows both.
---   * nx.component{ surface="float" }   the component renders onto a persistent
---                             nx.ui.float under the hood (a non-focus content float that
+--   * btv.component{ surface="float" }   the component renders onto a persistent
+--                             btv.ui.float under the hood (a non-focus content float that
 --                             survives keystrokes). The component owns the open/refresh/
 --                             close — an empty `render` hides it — so the plugin never
 --                             touches the float handle directly.
---   * nx.utils.debounce(fn, ms)         coalesce the oracle's bursts so a fast,
+--   * btv.utils.debounce(fn, ms)         coalesce the oracle's bursts so a fast,
 --                             deliberate sequence (`<Space>w` typed quickly) never
 --                             flashes the popup — it only appears when you PAUSE.
 --
@@ -59,32 +59,32 @@ vim.g.mapleader = " "
 -- which-key's own highlight groups, so the popup is PRETTY — keys, group labels,
 -- and descriptions each in their own colour. Defined explicitly (not borrowed from
 -- the colorscheme) so the demo looks right with no theme loaded; a real config
--- would link these to its scheme. Phase 4 of the source-B plan gave `nx.ui.float`
+-- would link these to its scheme. Phase 4 of the source-B plan gave `btv.ui.float`
 -- per-segment highlighting (a line can be a list of `{ text, hl_group }` chunks),
 -- which is what makes this colouring possible.
-nx.hl.define(0, "WhichKey", { fg = "#7dcfff" }) -- the key itself (cyan)
-nx.hl.define(0, "WhichKeyGroup", { fg = "#bb9af7", bold = true }) -- a +prefix group
-nx.hl.define(0, "WhichKeyDesc", { fg = "#c0caf5" }) -- a mapping's description
+btv.hl.define(0, "WhichKey", { fg = "#7dcfff" }) -- the key itself (cyan)
+btv.hl.define(0, "WhichKeyGroup", { fg = "#bb9af7", bold = true }) -- a +prefix group
+btv.hl.define(0, "WhichKeyDesc", { fg = "#c0caf5" }) -- a mapping's description
 
 -- A small leader menu. `ff`/`fg` and `gs`/`gc` are two-key sequences, so `f` and
 -- `g` show up as GROUPS (`kind = "group"`) that lead deeper; the single-key maps
 -- complete immediately (`kind = "map"`, carrying their `desc`).
-nx.keymap.set("n", "<leader>w", function()
+btv.keymap.set("n", "<leader>w", function()
   print("write")
 end, { desc = "write" })
-nx.keymap.set("n", "<leader>q", function()
+btv.keymap.set("n", "<leader>q", function()
   print("quit")
 end, { desc = "quit" })
-nx.keymap.set("n", "<leader>ff", function()
+btv.keymap.set("n", "<leader>ff", function()
   print("find file")
 end, { desc = "find file" })
-nx.keymap.set("n", "<leader>fg", function()
+btv.keymap.set("n", "<leader>fg", function()
   print("live grep")
 end, { desc = "live grep" })
-nx.keymap.set("n", "<leader>gs", function()
+btv.keymap.set("n", "<leader>gs", function()
   print("git status")
 end, { desc = "git status" })
-nx.keymap.set("n", "<leader>gc", function()
+btv.keymap.set("n", "<leader>gc", function()
   print("git commit")
 end, { desc = "git commit" })
 
@@ -153,12 +153,12 @@ local function lines_for(ctx)
   return rows
 end
 
--- The plugin is a FLOAT-backed nx.component: the pending context is reactive state, a pure
+-- The plugin is a FLOAT-backed btv.component: the pending context is reactive state, a pure
 -- `render` maps it to the popup's rows, and an EMPTY render hides the popup — so the popup's
 -- whole show/refresh/hide lifecycle is declarative. The same component model the checklist
 -- dialog uses, but on the "float" surface — which takes NO focus and binds NO keys (which-key
 -- must never interrupt the sequence you're typing), instead of the focus-taking "view".
-nx.component({
+btv.component({
   surface = "float",
   setup = function(ctx)
     -- The one piece of state: the current pending context (or nil when there's none).
@@ -167,11 +167,11 @@ nx.component({
     -- Debounce the SHOW so a fast, deliberate sequence (`<Space>w` typed quickly) never
     -- flashes the popup — it only appears when you PAUSE. The HIDE is immediate (below), so
     -- the popup never lingers after you've answered.
-    local show = nx.utils.debounce(function(c)
+    local show = btv.utils.debounce(function(c)
       state.pending = c
     end, DELAY)
 
-    nx.on_key_pending(function(c)
+    btv.on_key_pending(function(c)
       -- Cleared context (prefix completed, broke, or timed out): cancel the pending show
       -- and hide at once. A live source-B state (find-char, …) has empty continuations but
       -- a non-empty `keys`/`label`, so gate on `keys` alone.

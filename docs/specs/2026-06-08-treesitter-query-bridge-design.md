@@ -2,7 +2,7 @@
 
 **Status:** accepted; **implemented — but not as this document first proposed.**
 The original plan (below) routed query *resolution* through the vendored neovim
-`query.lua` (`query.get` + a `_resolved_query_string` wrapper). The `nx.*`
+`query.lua` (`query.get` + a `_resolved_query_string` wrapper). The `btv.*`
 migration ([ADR 0002](../decisions/0002-native-plugin-system.md)) **deleted** that
 vendored Lua, so the resolver is now a small **Rust resolver on the server**, not a
 Lua one. The historical "Lua resolves" sections are kept below for rationale, but
@@ -13,9 +13,9 @@ the as-built shape is:
 > designed and unchanged. What differs is *who resolves*:
 > - `Engine::base_query(lang, name)` exposes the on-disk base text.
 > - `EditHost::resolve_runtimepath_queries(lang)`
->   ([`treesitter.rs`](../../crates/nxvim-server/src/treesitter.rs)) runs once per
+>   ([`treesitter.rs`](../../crates/bemtvi-server/src/treesitter.rs)) runs once per
 >   language at its buffer's first highlight (guarded by `resolved_ts_langs`). For
->   each engine query (`nxvim_core::ENGINE_QUERY_NAMES` — `highlights` / `indents` /
+>   each engine query (`bemtvi_core::ENGINE_QUERY_NAMES` — `highlights` / `indents` /
 >   `injections` / `folds` / `textobjects`) it gathers, via `collect_query_parts`,
 >   the engine base + every runtimepath `queries/<lang>/<name>.scm` and
 >   `after/queries/<lang>/<name>.scm`, for this language *and* each language it
@@ -42,8 +42,8 @@ the as-built shape is:
 >   merged base is handed back byte-for-byte, so an uncustomized language stays on
 >   the plain disk-read path. This is what lets a config *remove* or redefine a
 >   pattern rather than only pile onto the shipped set. The
->   `vim.treesitter.query.set` in-memory path is **not** wired (no `nx`-public query
->   setter; the native `nx._nx_set_ts_query` raw-replace exists but is unused).
+>   `vim.treesitter.query.set` in-memory path is **not** wired (no `btv`-public query
+>   setter; the native `btv._btv_set_ts_query` raw-replace exists but is unused).
 > `:TSInstall` follows the same `; inherits:` modelines and fetches the inherited
 > query sets to disk (`javascript` → `ecma`,`jsx`), so the resolver has them to merge
 > and base js/ts highlighting carries the `ecma` patterns. See
@@ -59,9 +59,9 @@ the as-built shape is:
 
 ## Problem
 
-The native engine ([`nxvim-ts`](../../crates/nxvim-ts)) compiles its highlight
+The native engine ([`bemtvi-ts`](../../crates/bemtvi-ts)) compiles its highlight
 and indent queries from **one file each** —
-[`loader.rs::Grammar::load`](../../crates/nxvim-ts/src/loader.rs) does
+[`loader.rs::Grammar::load`](../../crates/bemtvi-ts/src/loader.rs) does
 `read_to_string(query_path(data_dir, lang, "highlights.scm"))` and the same for
 `indents.scm`. It does **not** run neovim's query-resolution logic. So three
 things the ecosystem routinely uses to customize highlighting are inert against
@@ -69,7 +69,7 @@ the paint:
 
 1. **In-memory overrides** — `vim.treesitter.query.set(lang, name, text)` (stores
    into the Lua `explicit_queries` table; see
-   [`query.lua`](../../crates/nxvim-lua/src/vendor/nvim/vim/treesitter/query.lua)).
+   [`query.lua`](../../crates/bemtvi-lua/src/vendor/nvim/vim/treesitter/query.lua)).
 2. **`after/queries/<lang>/*.scm` overlays** — the standard "add rules on top of
    the base grammar's query" mechanism most highlight tweaks ship as.
 3. **`;extends` / `;inherits` modeline merges** and runtimepath ordering across
@@ -105,7 +105,7 @@ This subsumes all three cases at once — `query.set`, `after/queries`, and
 ### The one real constraint: push-on-change, never pull-in-redraw
 
 The engine runs **synchronously** during `redraw` (queried from
-[`treesitter.rs::refresh_highlights`](../../crates/nxvim-server/src/treesitter.rs)),
+[`treesitter.rs::refresh_highlights`](../../crates/bemtvi-server/src/treesitter.rs)),
 so it cannot call Lua mid-parse. Resolution therefore happens on the server's
 **async side, ahead of redraw**, at well-defined moments, and the engine only ever
 executes a *cached* compiled query:
@@ -121,7 +121,7 @@ keystroke, so a push model is the natural fit.
 
 Same effect-queue → engine shape as the other bridges:
 
-1. **Lua seam** — in [`prelude/treesitter.lua`](../../crates/nxvim-lua/src/prelude/treesitter.lua),
+1. **Lua seam** — in [`prelude/treesitter.lua`](../../crates/bemtvi-lua/src/prelude/treesitter.lua),
    wrap `vim.treesitter.query.set` (like the existing snapshot seams) to emit a
    `ts_set_query(lang, name)` effect after updating `explicit_queries`. The server
    resolves the *string* via `query.get` rather than trusting the raw `set` text,
@@ -138,7 +138,7 @@ Same effect-queue → engine shape as the other bridges:
    loud** (no-silent-stubs), exactly like a broken on-disk query today.
 4. **Invalidation** — after a push, drop the highlight memo for that language's
    open buffers (the per-buffer memo in
-   [`treesitter.rs`](../../crates/nxvim-server/src/treesitter.rs)) so the next
+   [`treesitter.rs`](../../crates/bemtvi-server/src/treesitter.rs)) so the next
    redraw repaints; indents recompute naturally on next query.
 
 ## Edge cases

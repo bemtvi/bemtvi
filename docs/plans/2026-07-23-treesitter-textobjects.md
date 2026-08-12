@@ -3,8 +3,8 @@
 Status: **Phase 1 complete** (2026-07-23) — awaiting review before Phase 2.
 
 Phase 1 landed all nine steps below. Verified: 5 hermetic engine tests
-(`crates/nxvim-ts/tests/textobjects.rs`), 5 hermetic server keystroke e2e tests
-(`crates/nxvim-server/tests/treesitter_textobjects.rs`), and the real-network
+(`crates/bemtvi-ts/tests/textobjects.rs`), 5 hermetic server keystroke e2e tests
+(`crates/bemtvi-server/tests/treesitter_textobjects.rs`), and the real-network
 `:TSInstall rust` fetching a 429-line `textobjects.scm` with the
 `@function/@parameter/@class/@comment` captures. `cargo fmt` + `clippy --all-targets
 -D warnings` clean; existing text-object / key-pending / ts-install suites green.
@@ -46,7 +46,7 @@ object", so web degrades gracefully (like tree-sitter folds did before 4b).
 ## Architecture (why these seams)
 
 Tree-sitter is a `Box<dyn SyntaxEngine>` the core `Editor` owns
-(`crates/nxvim-core/src/syntax.rs`); the impl is `nxvim-ts::Engine`. Core stays
+(`crates/bemtvi-core/src/syntax.rs`); the impl is `bemtvi-ts::Engine`. Core stays
 pure — it never touches a `Tree`. The **exact** template is the `folds` query,
 added the same way: a compiled `Option<Query>` on `Grammar`, an `Engine::folds`
 method that runs it, a `SyntaxEngine::folds` trait method, and an
@@ -61,24 +61,24 @@ merge bridge must include `textobjects`.
 
 ## Phase 1 — the four upstream-backed objects, native
 
-### 1. Fetch (`crates/nxvim-ts/src/install.rs`)
+### 1. Fetch (`crates/bemtvi-ts/src/install.rs`)
 - Add `const NVIM_TS_TEXTOBJECTS_REF` + `nvim_ts_textobjects_ref()` env override
   twin of `nvim_ts_ref()`.
 - In `fetch_query_set`, after the nvim-treesitter loop, fetch
   `.../nvim-treesitter-textobjects/<ref>/queries/<lang>/textobjects.scm` (honoring
-  `$NXVIM_TS_MIRROR` via the same `fetch_opt`), write it to
+  `$BEMTVI_TS_MIRROR` via the same `fetch_opt`), write it to
   `<data>/queries/<lang>/textobjects.scm`, add `"textobjects"` to the written
   basenames, and fold its `; inherits:` modeline into the returned inherits set
   (so the inherit-walk in `install_queries` fetches `ecma`'s textobjects too).
 - Do **not** add `"textobjects"` to `QUERY_FILES` (that constant is the
   nvim-treesitter-core repo path, which has no textobjects). Keep it separate.
 
-### 2. Compile (`crates/nxvim-ts/src/loader.rs`)
+### 2. Compile (`crates/bemtvi-ts/src/loader.rs`)
 - Add `pub textobjects: Option<Query>` to `Grammar` (declare it among the query
   fields that drop before `_lib`).
 - Load it in `Grammar::load` via the existing `load_optional_query(…, "textobjects", …)`.
 
-### 3. Query it (`crates/nxvim-ts/src/engine.rs`)
+### 3. Query it (`crates/bemtvi-ts/src/engine.rs`)
 - `is_engine_query`: add `"textobjects"` (so runtimepath overlays can merge, like
   folds/injections).
 - New method
@@ -91,22 +91,22 @@ merge bridge must include `textobjects`.
 - `pub fn text_objects_available(&self, buffer) -> bool` — grammar loaded with a
   `textobjects` query (the `folds_available` twin).
 
-### 4. Trait (`crates/nxvim-core/src/syntax.rs`)
+### 4. Trait (`crates/bemtvi-core/src/syntax.rs`)
 - `fn text_objects_at(&mut self, _buffer, _capture, _byte) -> Vec<(usize,usize)> { Vec::new() }`
 - `fn text_objects_available(&self, _buffer) -> bool { false }`
   Both default so bare-core and the wasm highlighter compile unchanged.
 
-### 5. Editor wrapper (`crates/nxvim-core/src/editor/syntax.rs`)
+### 5. Editor wrapper (`crates/bemtvi-core/src/editor/syntax.rs`)
 - `pub(crate) fn ts_text_objects_at(&mut self, buf, capture, byte)` — call
   `sync_syntax_engine(buf)` then the engine method (the `ts_folds` twin).
 
-### 6. Object alphabet (`crates/nxvim-core/src/editor/command.rs`)
+### 6. Object alphabet (`crates/bemtvi-core/src/editor/command.rs`)
 - `ObjectKind`: add `TsCapture(&'static str)` carrying the base capture name.
 - `from_key`: `'f' => TsCapture("function")`, `'a' => TsCapture("parameter")`,
   `'c' => TsCapture("comment")`, `'t' => TsCapture("class")`.
 - `text_object_continuations`: add the four hint rows.
 
-### 7. Range resolution (`crates/nxvim-core/src/editor/motions.rs`)
+### 7. Range resolution (`crates/bemtvi-core/src/editor/motions.rs`)
 - `text_object_range` is `&self`, but the engine query needs `&mut self`. Add the
   ts branch in the **caller** instead: in `command.rs`'s
   `ResolvedCommand::TextObject` arm (and `apply_text_object_once` for multicursor),
@@ -118,25 +118,25 @@ merge bridge must include `textobjects`.
   yields nothing, fall back to `outer` (upstream often omits `@x.inner`, e.g.
   rust `@comment`). Feeds the **unchanged** `apply_text_object`.
 
-### 8. Runtime inherit merge (`crates/nxvim-server/src/treesitter.rs`)
+### 8. Runtime inherit merge (`crates/bemtvi-server/src/treesitter.rs`)
 - Add `"textobjects"` to the query-name list in `resolve_runtimepath_queries`
   (the `["highlights","indents","injections"]` set) so js/ts merge `ecma`'s
   patterns and users can extend via `after/queries/<lang>/textobjects.scm`.
 
 ### 9. Tests
-- **Hermetic engine test** — `crates/nxvim-ts/tests/textobjects.rs`: use the
+- **Hermetic engine test** — `crates/bemtvi-ts/tests/textobjects.rs`: use the
   `fixture` module (`install_rust_grammar` compiles `tree-sitter-rust` from the
   cargo registry, no network), `write_query(root,"rust","textobjects", …)` with a
   small real rust textobjects query, open a buffer, assert `text_objects_at`
   returns the right byte ranges for `function.inner/outer`, `parameter.*`,
   `class.*`, and that containment + innermost-first ordering hold for nested
   functions. Mutation-check by moving the cursor outside → empty.
-- **Server e2e** — `crates/nxvim-server/tests/treesitter_textobjects.rs`: compile
-  the rust grammar into a temp `NXVIM_DATA_DIR` (reuse the fixture-style compile
+- **Server e2e** — `crates/bemtvi-server/tests/treesitter_textobjects.rs`: compile
+  the rust grammar into a temp `BEMTVI_DATA_DIR` (reuse the fixture-style compile
   helper), open a `.rs` buffer, and assert the keystroke path: `vif` selects the
   function body, `daf` deletes the whole function, `dia` deletes an argument,
   `2if` targets the outer of two nested functions. Serialized on `serial_lock`
-  (process-global `NXVIM_DATA_DIR`), like `treesitter_folds.rs`. Hermetic if `cc`
+  (process-global `BEMTVI_DATA_DIR`), like `treesitter_folds.rs`. Hermetic if `cc`
   is present; otherwise skip-if-missing per the external-dependency convention.
 
 ### Phase 1 acceptance
@@ -155,29 +155,29 @@ upstream nvim-treesitter queries; Helix has them under `@test.*`/`@entry.*` with
 - **which-key hints for the object menu** — DONE. It turned out Phase 1 already
   wired this: `text_object_continuations()` (with the four ts rows) is emitted for
   the `TextObjectPending` stage at `command.rs:1605`, so the pending-key oracle
-  (`nx.on_key_pending`) already lists `f`/`a`/`c`/`t` in both operator (`di`) and
+  (`btv.on_key_pending`) already lists `f`/`a`/`c`/`t` in both operator (`di`) and
   visual (`vi`) mode. Like the bracket/quote objects they are shown as the object
   *alphabet* — always offered, not gated on grammar availability (consistent with
   `di(` showing with no paren at the cursor). Locked in by two new tests in
-  `crates/nxvim-server/tests/key_pending.rs`
+  `crates/bemtvi-server/tests/key_pending.rs`
   (`{,visual_}text_object_introducer_lists_treesitter_kinds`).
 - **`examples/treesitter-textobjects/`** — DONE. `init.lua` (header + numbered
   sections + a TRY-IT list + a `:TextObjects` cheatsheet command) and `sample.rs`
   (nested fns, args, a struct, comments). Run with
-  `NXVIM_CONFIG=examples/treesitter-textobjects cargo run -p nxvim -- examples/treesitter-textobjects/sample.rs`
+  `BEMTVI_CONFIG=examples/treesitter-textobjects cargo run -p bemtvi -- examples/treesitter-textobjects/sample.rs`
   (then `:TSInstall rust` once). Config load verified end-to-end via a throwaway
   harness check (not committed, per the examples convention).
 
-## Phase 3 — user-extensible registry (`nx.textobject.map`) — **complete** (2026-07-23)
+## Phase 3 — user-extensible registry (`btv.textobject.map`) — **complete** (2026-07-23)
 
-Let users add their own tree-sitter objects, without being forced into nxvim's
+Let users add their own tree-sitter objects, without being forced into bemtvi's
 `.inner`/`.outer` convention — the mapping is `full i/a + key` → **exact capture**:
 
 ```lua
-nx.textobject.map("il", "@loop.inner")            -- vil / dil
-nx.textobject.map({ ik = "@call.inner", ak = "@call.outer" })
-nx.textobject.map("if", "@function.inside")        -- override a built-in (Helix naming)
-nx.textobject.unmap("il")
+btv.textobject.map("il", "@loop.inner")            -- vil / dil
+btv.textobject.map({ ik = "@call.inner", ak = "@call.outer" })
+btv.textobject.map("if", "@function.inside")        -- override a built-in (Helix naming)
+btv.textobject.unmap("il")
 ```
 
 - Core: `Editor.textobject_map: HashMap<String,String>` (lhs → capture) +
@@ -192,10 +192,10 @@ nx.textobject.unmap("il")
   capture works. `command_pending` appends registered entries to the object menu
   (overriding a built-in key replaces its row).
 - Plumbing: `TextObjectOp` (ops.rs) → `textobject_ops` queue (runtime.rs) →
-  `nx._textobject_map` (install.rs) → drained **unconditionally** in effects.rs
+  `btv._textobject_map` (install.rs) → drained **unconditionally** in effects.rs
   (`set_textobject_map`) — plain editor state, so it applies in every build, not
-  gated behind the native `ts_ops` path. Prelude `nx.textobject.map`/`.unmap`
-  (`nx.lua`) with validation + table form.
+  gated behind the native `ts_ops` path. Prelude `btv.textobject.map`/`.unmap`
+  (`btv.lua`) with validation + table form.
 - Tests: `user_registered_object_key_resolves`,
   `user_registry_overrides_a_builtin_verbatim`, `unmap_reverts_to_the_builtin`
   (server e2e), `text_object_menu_lists_user_registered_objects` (which-key). The
@@ -203,22 +203,22 @@ nx.textobject.unmap("il")
 
 Query customization was *already* possible before this (drop
 `queries/<lang>/textobjects.scm` / `after/queries/...` on the runtimepath, merged
-by the bridge; or `nx.treesitter.set_query(lang, "textobjects", …)`). Phase 3 adds
+by the bridge; or `btv.treesitter.set_query(lang, "textobjects", …)`). Phase 3 adds
 the missing half: binding keys to captures.
 
 ## Phase 4 — web/wasm — **complete** (2026-07-23)
 
 Text objects now work in the browser build. On web tree-sitter runs JS-side
-(`web-tree-sitter`, `.wasm` grammars) — the native `nxvim-ts::Engine` can't run in
+(`web-tree-sitter`, `.wasm` grammars) — the native `bemtvi-ts::Engine` can't run in
 wasm (it dlopens `.so`) — so this mirrors the **folds** seam exactly, over the
 synchronous `eh_js_ts_*` FFI bridge (the one place the wasm tick calls into JS).
 
-- **Rust** (`nxvim-edithost/src/lib.rs`): `WasmSyntax::text_objects_at` /
+- **Rust** (`bemtvi-edithost/src/lib.rs`): `WasmSyntax::text_objects_at` /
   `text_objects_available` (the `folds` twin, grow-and-retry i32 out-buffer) over two
   new `extern "C"` imports `eh_js_ts_textobjects(lang, text, capture, byte, out, cap)`
   / `_available`. The core's shared `resolve_text_object` logic is unchanged — it just
-  gets ranges from `WasmSyntax` instead of `nxvim-ts::Engine`.
-- **JS**: `eh-lib.js` implements the two imports (forward to `globalThis.__nxvimTs…`).
+  gets ranges from `WasmSyntax` instead of `bemtvi-ts::Engine`.
+- **JS**: `eh-lib.js` implements the two imports (forward to `globalThis.__bemtviTs…`).
   `ts-textobjects.js` is the new worker-thread runner (mirrors `ts-folds.js`): loads
   the grammar + `textobjects.scm`, runs the query synchronously, unions per match,
   keeps regions containing the cursor, innermost first — a JS port of
@@ -230,7 +230,7 @@ synchronous `eh_js_ts_*` FFI bridge (the one place the wasm tick calls into JS).
   (the separate nvim-treesitter-textobjects repo) + `textobjects` in `QUERY_KINDS`;
   `highlight.js` install fetches + caches `textobjects.scm` to OPFS; `gen-treesitter.mjs`
   vendors it offline (`vendor/textobjects/<lang>.scm` + `textobjects.json`, sanitized).
-- **Pre-existing fix**: `nxvim-server`'s wasm (`--no-default-features`) build was broken
+- **Pre-existing fix**: `bemtvi-server`'s wasm (`--no-default-features`) build was broken
   at `extmarks.rs:359` (unconditional `self.syntax_states`, a native-only field) —
   cfg-gated it (on wasm, highlighting is JS-side, so there are no block-bg lines). This
   was failing at HEAD before this work; fixing it was required to build the web at all.

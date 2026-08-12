@@ -1,6 +1,6 @@
 workspace example — open me in a split (:vsplit sample.txt), then :qa and relaunch.
 
-The layout you leave behind comes back on the next `nxvim --workspace .` launch,
+The layout you leave behind comes back on the next `bemtvi --workspace .` launch,
 and your marks / registers / search history for this directory stay private to it.
 
 Press \w to see the workspace root and its derived shada namespace.

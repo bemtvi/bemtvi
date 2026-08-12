@@ -6,7 +6,7 @@
 > day (`eh_fs_read_complete` now takes the file's raw bytes ptr+len; the Worker stops
 > `TextDecoder`-ing OPFS/daemon/real-FS reads and routes them through
 > `Editor::load_bytes_into`). Verified in headless Chromium by
-> `crates/nxvim-edithost/web/verify-encoding.mjs` (latin1 decode + invalid-UTF-8
+> `crates/bemtvi-edithost/web/verify-encoding.mjs` (latin1 decode + invalid-UTF-8
 > byte-identical round-trip). All read/write surfaces — native, daemon, wasm — now
 > share the one decoder and the one encoder.
 >
@@ -30,15 +30,15 @@
 
 ## Why this document exists
 
-nxvim is **UTF-8-only at the I/O boundary**, and the two read paths disagree:
+bemtvi is **UTF-8-only at the I/O boundary**, and the two read paths disagree:
 
-- The local read path (`Buffer::from_file`, `crates/nxvim-core/src/buffer.rs:264`)
+- The local read path (`Buffer::from_file`, `crates/bemtvi-core/src/buffer.rs:264`)
   does `Rope::from_reader(...)?`, which **errors on the first invalid byte**. A
   file with a few bad bytes — or any latin1 / utf-16 file — refuses to open and
   falls back to an empty *named* buffer (`Buffer::named`, `buffer.rs:227`; see the
   test `unreadable_startup_file_keeps_its_name_and_echoes_the_error`,
-  `crates/nxvim-server/tests/editing/core_editing.rs:10`).
-- The daemon read path (`crates/nxvim-server/src/lifecycle.rs:35`) silently does
+  `crates/bemtvi-server/tests/editing/core_editing.rs:10`).
+- The daemon read path (`crates/bemtvi-server/src/lifecycle.rs:35`) silently does
   `String::from_utf8_lossy`. So the *same file* behaves differently local vs.
   remote, and lossy decode **destroys the original bytes** on the next `:w`.
 
@@ -52,11 +52,11 @@ We want two things, decided with the requester:
 
 The internal text model is a `ropey::Rope` (UTF-8 only, byte-offset indexed) and
 everything downstream — grapheme/width (`unicode.rs`), the vendored vim regex
-engine (`nxvim-regex`), LSP position math (`lsp/mod.rs:480`) — depends on that.
+engine (`bemtvi-regex`), LSP position math (`lsp/mod.rs:480`) — depends on that.
 So the rope **stays UTF-8**, exactly as neovim keeps its internal encoding UTF-8.
 All conversion lives at the byte↔str seam.
 
-The guiding principle, as elsewhere in nxvim: **fail loud.** An unrepresentable
+The guiding principle, as elsewhere in bemtvi: **fail loud.** An unrepresentable
 character on write aborts with a named error rather than mangling the file.
 
 This plan is divided into self-contained phases. Each is sized to be picked up in
@@ -79,7 +79,7 @@ a single focused session. Later phases assume earlier ones landed.
     surrogates, the only safe choice, cannot be stored in a Rust `String` — so we
     minimize, not eliminate, the risk.)
 - **One conversion implementation, shared by every path.** Pure helpers live in
-  `nxvim-core` (transcoding is pure CPU and is part of "Buffer file read/write",
+  `bemtvi-core` (transcoding is pure CPU and is part of "Buffer file read/write",
   so it respects the pure-sync-core rule in CLAUDE.md). Local-sync, daemon, and
   wasm read paths all funnel through the same decoder; all write paths through the
   same encoder. **No behavior fork.**
@@ -100,16 +100,16 @@ a single focused session. Later phases assume earlier ones landed.
 ## Phase 0 — Dependency + core conversion module  ✅ (foundation only)
 
 > **Landed (partial):** the dependency and the `Encoding` name/registry type
-> (`crates/nxvim-core/src/encoding.rs`: `Encoding`, `from_label`, `Display` →
+> (`crates/bemtvi-core/src/encoding.rs`: `Encoding`, `from_label`, `Display` →
 > vim spelling, `is_fileencodings_entry`) are in. The transcode helpers
 > (`decode_to_rope` / `encode_from_str` + PUA escape) are **not** yet — they land
 > with the read/write seams in Phases 2–3, which is where they're first used.
 >
-> **Deviation from the original plan:** `encoding_rs` is added to `nxvim-core` as
+> **Deviation from the original plan:** `encoding_rs` is added to `bemtvi-core` as
 > a *plain, always-on* dependency, **not** behind a feature gate. It is pure Rust
 > (no C), compiles for `wasm32-unknown-emscripten`, and pulls in no native-only
-> deps — verified: `cargo build -p nxvim-core --no-default-features` and
-> `cargo build -p nxvim-server --no-default-features` both compile. Feature-gating
+> deps — verified: `cargo build -p bemtvi-core --no-default-features` and
+> `cargo build -p bemtvi-server --no-default-features` both compile. Feature-gating
 > would have forced `#[cfg]` on the `BufferOptions`/`Options` fields and every
 > mirror, for no benefit. `simd-accel` stays off (its default).
 
@@ -117,12 +117,12 @@ a single focused session. Later phases assume earlier ones landed.
 black-box path; nothing is wired into open/save yet.
 
 - Add `encoding_rs` (pure Rust; Firefox's encoding library) to root `Cargo.toml`
-  `[workspace.dependencies]` pinned `=x.y.z`; pull into `nxvim-core` via
+  `[workspace.dependencies]` pinned `=x.y.z`; pull into `bemtvi-core` via
   `<dep>.workspace = true`. **Disable the `simd-accel` feature** (it needs
   nightly). Gate behind a **default-on** core feature so the
   `--no-default-features` edithost build still pulls it in (mirror the existing
-  `vim-regex` / `serde` feature pattern in `crates/nxvim-core/Cargo.toml`).
-- New `crates/nxvim-core/src/encoding.rs`:
+  `vim-regex` / `serde` feature pattern in `crates/bemtvi-core/Cargo.toml`).
+- New `crates/bemtvi-core/src/encoding.rs`:
   - `decode_to_rope(bytes, fileencodings) -> (String, Encoding, bool /*bomb*/)`
     — BOM sniff → try the `fileencodings` list in order → transcode to UTF-8,
     applying the **bijective** PUA escape on the lossy path.
@@ -143,7 +143,7 @@ emscripten target (`wasm32-unknown-emscripten`) builds with the feature on.
 > equivalents are accepted, validated (E474 on a bad label, fail-loud), and read
 > back through `:set …?` and the Lua mirrors. Setting `fenc` marks the buffer
 > modified. No I/O effect yet (Phases 2–3). Covered by 10 black-box tests in
-> `crates/nxvim-server/tests/editing/encoding.rs`; full workspace green.
+> `crates/bemtvi-server/tests/editing/encoding.rs`; full workspace green.
 
 **Goal:** `:set fileencoding=…`, `:set fileencodings=…`, `:set bomb`, and the
 `vim.bo` equivalents are accepted and round-trip through `:set fenc?`. No effect
@@ -151,16 +151,16 @@ on I/O yet (still wired in Phases 2–3).
 
 Model everything on the existing `regexsyntax` enum-string buffer option:
 
-- `crates/nxvim-core/src/options.rs`: `BufferOptions` (struct `:220`, default
+- `crates/bemtvi-core/src/options.rs`: `BufferOptions` (struct `:220`, default
   `:259`) gains `fileencoding` and `bomb: bool`; global `Options` gains
   `fileencodings: Vec<String>`. Add canonical names (`:527` region):
   `fileencoding`/`fenc`, `fileencodings`/`fencs`, `bomb`.
-- `crates/nxvim-core/src/editor/options.rs` `apply_set_str` (`:178`, enum branch
+- `crates/bemtvi-core/src/editor/options.rs` `apply_set_str` (`:178`, enum branch
   at `:208`): validate `fileencoding` against known encodings; parse
   `fileencodings`; toggle `bomb`. Setting `fenc` marks the buffer modified (it
   implies a re-encode next write), matching vim.
-- `crates/nxvim-core/src/editor/windows.rs:1073` and the `_buf_set_option` bridge
-  in `crates/nxvim-server/src/effects.rs` (around `:400`): forward
+- `crates/bemtvi-core/src/editor/windows.rs:1073` and the `_buf_set_option` bridge
+  in `crates/bemtvi-server/src/effects.rs` (around `:400`): forward
   `vim.bo.fileencoding` / `vim.bo.bomb`.
 
 **Dependencies:** Phase 0 (for the encoding name parse/validate).
@@ -179,16 +179,16 @@ Model everything on the existing `regexsyntax` enum-string buffer option:
 non-UTF-8 files **open** and carry their detected `fileencoding`/`bomb`. Local and
 daemon agree.
 
-- `crates/nxvim-core/src/buffer.rs` `from_file` (`:256`): read raw bytes →
+- `crates/bemtvi-core/src/buffer.rs` `from_file` (`:256`): read raw bytes →
   `decode_to_rope` → store `fileencoding`/`bomb` → `ensure_trailing_newline` →
   stat as today. (Forfeits the current streaming `from_reader` 1×-memory open;
   ~2× peak at open. Optionally keep `from_reader` for the detected-clean-utf-8
   fast path.)
-- `crates/nxvim-core/src/editor/buffers.rs`: add `load_bytes_into(buffer, name,
+- `crates/bemtvi-core/src/editor/buffers.rs`: add `load_bytes_into(buffer, name,
   bytes, &fileencodings)` beside `load_str_into` (`:454`) — decodes via the core
   helper, sets encoding state, roots undo on the converted text. Keep
   `load_str_into` for genuinely-already-str callers (scratch buffers).
-- `crates/nxvim-server/src/lifecycle.rs` `apply_open`/`load_replica` (`:34`/`:65`):
+- `crates/bemtvi-server/src/lifecycle.rs` `apply_open`/`load_replica` (`:34`/`:65`):
   pass the raw `bytes` to `load_bytes_into` instead of `from_utf8_lossy`. Do the
   same for the wasm replica loader. This removes the local/daemon fork.
 - Ensure the `:e!` reload path re-runs the same decode (the undo root must match
@@ -213,7 +213,7 @@ meaning — such a file now *opens* (and round-trips in Phase 3). Update it.
 reproduces original bytes exactly for resilience buffers; unrepresentable chars
 abort loudly.
 
-- `crates/nxvim-core/src/buffer.rs` `to_save_bytes` (`:652`) and `write` (`:628`):
+- `crates/bemtvi-core/src/buffer.rs` `to_save_bytes` (`:652`) and `write` (`:628`):
   replace `self.text.to_string().as_bytes()` with `encode_from_str(rope,
   fileencoding, bomb)`. The daemon (`to_save_bytes`) and wasm (`eh_save_bytes`)
   write paths already route through `to_save_bytes`, so fixing it once covers
@@ -227,7 +227,7 @@ abort loudly.
 
 ## Phase 4 — Tests, example, docs  ✅ DONE (2026-06-15)
 
-> **Landed.** 7 new round-trip tests in `crates/nxvim-server/tests/editing/encoding.rs`
+> **Landed.** 7 new round-trip tests in `crates/bemtvi-server/tests/editing/encoding.rs`
 > (invalid-UTF-8 byte-identical, latin1, utf-16le+BOM, utf-8+BOM, `fenc` conversion,
 > fail-loud `E513`, valid-UTF-8 SPUA scalar). The `unreadable_startup_file…` test
 > became `invalid_utf8_startup_file_opens_named_and_resilient`. A daemon test
@@ -235,12 +235,12 @@ abort loudly.
 > `examples/encoding/` ships a latin1 + an invalid-UTF-8 sample with an `init.lua`
 > walkthrough (both verified to round-trip byte-identically through the seam).
 > `architecture.md` → *Text model* gained the UTF-8-internal / `'fileencoding'` note.
-> **Note:** because nxvim maintains a trailing newline in the rope, a byte-identical
+> **Note:** because bemtvi maintains a trailing newline in the rope, a byte-identical
 > round-trip needs the source file to already end in one (every fixture/sample does).
 
 **Goal:** end-to-end coverage and a runnable example.
 
-New `crates/nxvim-server/tests/editing/encoding.rs` (behind the `editing.rs`
+New `crates/bemtvi-server/tests/editing/encoding.rs` (behind the `editing.rs`
 entrypoint), each test writing a temp file then `:e`-ing it:
 
 - **Invalid UTF-8 round-trips**: write `[..valid.., 0xff, 0xfe, ..]`, `:e`, assert
@@ -279,17 +279,17 @@ governs the on-disk form.
 
 ## Phase 5 — (Later / optional) legibility & breadth
 
-- **Status line shows the encoding ✅ (2026-06-15).** nxvim's built-in default
+- **Status line shows the encoding ✅ (2026-06-15).** bemtvi's built-in default
   `'statusline'` now renders the buffer's `'fileencoding'` (with a `[bom]` suffix
   when `'bomb'` is set): ` MODE  %f%m%=<enc>  %l,%c `. `StatuslineCtx` carries
   `fileencoding`/`bomb` (filled in `view.rs`), and `default_statusline` splices the
   label in as an escaped literal (no new `%`-item — neovim has none; a custom
   `'statusline'` would use `%{&fenc}`, which needs the `&opt` expr path, still TODO).
-  Covered by `nxvim/tests/screen.rs` (utf-8 default + a latin1 file).
+  Covered by `bemtvi/tests/screen.rs` (utf-8 default + a latin1 file).
 
 - **`%{&option}` in custom `'statusline'` expressions ✅ (2026-06-15).** A
   statusline `%{…}` item that isn't `v:lua.…` now runs through the pure core
-  Vim-expression evaluator (`crates/nxvim-core/src/editor/expr.rs`, the one that
+  Vim-expression evaluator (`crates/bemtvi-core/src/editor/expr.rs`, the one that
   already backed `:echo`), extended with `&option` references, the ternary
   `a ? b : c`, the comparison operators (`==` `!=` `<` `<=` `>` `>=`), and the
   logical operators (`&&` `||` `!`). `eval_expr(input, resolver)` takes a
@@ -311,7 +311,7 @@ governs the on-disk form.
   undefined windows-1252 high bytes `0x81`/`0x8d`/… pass through to `U+0081`/…),
   or an embedded C0 control — used to paint as a font tofu box. It now shows
   vim-style: C0 controls + DEL as `^@`..`^?` caret notation (2 cells), C1 controls
-  as `<xx>` hex (4 cells). `crates/nxvim-core/src/unicode.rs` owns the model —
+  as `<xx>` hex (4 cells). `crates/bemtvi-core/src/unicode.rs` owns the model —
   `control_width` (the authoritative display width, so cursor / span / scroll
   column math all key off it), `control_repr`, `display_line`,
   `unprintable_positions` — and `grapheme_width` now counts these chars at their
@@ -321,7 +321,7 @@ governs the on-disk form.
   `nvim_buf_get_lines`) stays raw, so plugins and `:w` see the original scalars
   and the round-trip is byte-identical. The `^X`/`<xx>` tokens are overlaid with a
   top-priority (`SPECIAL_KEY_PRIORITY`) `SpecialKey` highlight (native build) so
-  they read as non-text — themed by the `nxvim` colorscheme, with a standout
+  they read as non-text — themed by the `bemtvi` colorscheme, with a standout
   LightMagenta `group_style` fallback when no colorscheme is loaded. The block
   cursor (normal / visual) **envelops the whole multi-cell token** rather than its
   first cell: the server projects `cursor_width` (the display width of the
@@ -330,7 +330,7 @@ governs the on-disk form.
   trailing cells beneath its one hardware cursor, and the GUI widens its cursor
   quad to match. Covered by a black-box test (`tests/editing/encoding.rs`: display
   line + SpecialKey spans + byte-identical `:w`) and two TUI paint tests
-  (`nxvim/tests/screen.rs`: the highlighted token, and the enveloping cursor).
+  (`bemtvi/tests/screen.rs`: the highlighted token, and the enveloping cursor).
   Printable
   high bytes (`é`, `ÿ`) still render as their glyph — they were never tofu — so
   only the genuinely-unprintable bytes get the hex treatment. **Closed
@@ -359,7 +359,7 @@ governs the on-disk form.
   `'fileencodings'` Just Works. The phase added the parts that didn't: vim's
   muscle-memory codepage spellings (`cp932`→shift_jis, `cp936`/`euc-cn`→gbk,
   `cp949`→euc-kr, `cp950`→big5) are aliased in `Encoding::from_label`
-  (`crates/nxvim-core/src/encoding.rs`, `vim_cjk_alias`) so `:set fenc=cp932` works,
+  (`crates/bemtvi-core/src/encoding.rs`, `vim_cjk_alias`) so `:set fenc=cp932` works,
   reading back as the canonical WHATWG-lowercased name (`shift_jis`); and the WHATWG
   `replacement` codec (decodes everything to a single `U+FFFD` — pure data loss) is
   now **rejected** by `from_label`, so it fails loud (`E474`) instead of silently
@@ -401,11 +401,11 @@ output paths.
 
 ## Verification (whole feature)
 
-- `cargo test -p nxvim-server --test editing encoding`
+- `cargo test -p bemtvi-server --test editing encoding`
 - `cargo test --workspace` (no regression; the `unreadable_startup_file…` test
   changes meaning in Phase 2)
 - `cargo clippy --all-targets -- -D warnings` && `cargo fmt --all`
 - Both build configs: default, and `--no-default-features --features lua51`
   (edithost); then the `wasm32-unknown-emscripten` edithost build.
-- Manual: `cargo run -p nxvim -- examples/encoding/latin1.txt`, confirm render
+- Manual: `cargo run -p bemtvi -- examples/encoding/latin1.txt`, confirm render
   and that `:w` keeps bytes identical (`cmp` before/after).

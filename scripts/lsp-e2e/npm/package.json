@@ -1,8 +1,8 @@
 {
-  "name": "nxvim-lsp-e2e",
+  "name": "bemtvi-lsp-e2e",
   "version": "0.0.0",
   "private": true,
-  "description": "Pinned node-based language servers for the nxvim LSP end-to-end suite. Run `npm ci` (not `npm install`) to install exactly these versions with integrity verification against package-lock.json.",
+  "description": "Pinned node-based language servers for the bemtvi LSP end-to-end suite. Run `npm ci` (not `npm install`) to install exactly these versions with integrity verification against package-lock.json.",
   "dependencies": {
     "pyright": "1.1.410",
     "typescript": "5.9.3",

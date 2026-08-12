@@ -30,13 +30,13 @@ Two things discovered while mapping the code changed the plan from what was
 floated in chat:
 
 1. **There is no `stylize_markdown`.** Hover / signature / completion-docs all
-   strip markdown to **plain text** today (`nxvim-lsp/src/convert.rs::markup_lines`).
+   strip markdown to **plain text** today (`bemtvi-lsp/src/convert.rs::markup_lines`).
    So markdown *styling* is a net-new feature, not part of getting mouse+scroll.
    It is **out of scope** here. (Possible cheap follow-up: set
    `filetype=markdown` on the scratch buffer so tree-sitter highlights it for
    free — the neovim trick — but that is a separate change.)
 
-2. **The completion-docs sidebar is not a `nx.ui.float`.** It is server-projected
+2. **The completion-docs sidebar is not a `btv.ui.float`.** It is server-projected
    in `redraw.rs::project_complete_docs` as a *sibling of the bespoke completion
    menu*, and that menu **already has its own bespoke mouse + wheel handling**
    (`mouse.rs::mouse_complete_wheel`, `mouse_menu_wheel`; geometry from
@@ -120,5 +120,5 @@ unchanged, wheel-up returns to the top.
 - Markdown styling / `stylize_markdown` (separate follow-up).
 - Converting the completion *menu* itself to a window (stays bespoke — fuzzy
   filter, 100k windowing, prompt/preview).
-- `nx.ui.float` content floats stay as-is (which-key relies on the styled,
+- `btv.ui.float` content floats stay as-is (which-key relies on the styled,
   short, non-scrolling surface).

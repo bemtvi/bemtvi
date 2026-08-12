@@ -1,4 +1,4 @@
-nx.picker include / exclude filters
+btv.picker include / exclude filters
 ===================================
 
 Open a picker and press <C-g> to reveal the two glob boxes.

@@ -2,7 +2,7 @@
   This is the TEMPLATE for the book's table of contents.
 
   `book/gen/generate.py` renders it into src/SUMMARY.md, replacing the
-  {{API_REFERENCE}} marker below with the auto-generated nx.* namespace list.
+  {{API_REFERENCE}} marker below with the auto-generated btv.* namespace list.
   Edit THIS file (committed), never src/SUMMARY.md (git-ignored, regenerated).
 
   Pages under guide/ and plugins/overview are committed curated chapters.
@@ -22,7 +22,7 @@
 
 # Beyond vim
 
-- [What nxvim adds](features/index.md)
+- [What bemtvi adds](features/index.md)
   - [Helix mode (selection-first)](features/helix-mode.md)
   - [Multi-cursor mode](features/multicursor.md)
   - [Smooth scrolling](features/smooth-scrolling.md)
@@ -39,13 +39,13 @@
 
 - [Overview](plugins/overview.md)
 - [First-party plugins](plugins/first-party.md)
-- [The nx.* model](plugins/nx-model.md)
+- [The btv.* model](plugins/btv-model.md)
 - [Writing plugins](plugins/authoring.md)
 - [Async & promises](plugins/async.md)
 - [Testing plugins](plugins/testing.md)
 - [Autocommand events](plugins/autocmd-events.md)
 
-# nx.* API Reference
+# btv.* API Reference
 
 - [Overview](api/index.md)
 {{API_REFERENCE}}

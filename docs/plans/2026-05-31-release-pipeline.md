@@ -1,6 +1,6 @@
 # GitHub Release Pipeline Implementation Plan
 
-**Goal:** Stand up a hand-rolled GitHub Actions release pipeline that builds `nxvim` for five native targets, publishes a review-gated stable release and a rolling `edge` prerelease, with rust-cache for light incremental builds, SLSA provenance attestation, and git-cliff changelogs.
+**Goal:** Stand up a hand-rolled GitHub Actions release pipeline that builds `bemtvi` for five native targets, publishes a review-gated stable release and a rolling `edge` prerelease, with rust-cache for light incremental builds, SLSA provenance attestation, and git-cliff changelogs.
 
 **Architecture:** One reusable build workflow (`build.yml`) defines the five-target matrix and uploads archives as artifacts. `edge.yml` (on `main` push) and a two-workflow stable flow — `release-prep.yml` (manual PR) + `release.yml` (on merged release PR) — reuse it to publish. CI never pushes to `main`; the stable changelog/version bump lands via a reviewed PR, and merging it auto-tags `v<version>` and publishes in one run.
 
@@ -33,7 +33,7 @@ These are one-time repository settings, done in the GitHub UI. No code.
 
 - [ ] **Step 1: Confirm repo visibility for free attestation**
 
-`actions/attest-build-provenance` is free on **public** repositories. Confirm `davidrios/nxvim` is public (Settings → General). If private, attestation requires a Team/Enterprise plan — otherwise drop the attest steps later.
+`actions/attest-build-provenance` is free on **public** repositories. Confirm `davidrios/bemtvi` is public (Settings → General). If private, attestation requires a Team/Enterprise plan — otherwise drop the attest steps later.
 
 - [ ] **Step 2: Allow Actions to create PRs**
 
@@ -73,7 +73,7 @@ strip = true
 
 - [ ] **Step 2: Verify it builds and the lockfile is unaffected**
 
-Run: `cargo build --release -p nxvim`
+Run: `cargo build --release -p bemtvi`
 Expected: builds successfully. `git status` shows only `Cargo.toml` modified (no `Cargo.lock` change — profile settings don't touch the lock).
 
 - [ ] **Step 3: Commit**
@@ -97,7 +97,7 @@ Create `cliff.toml` at the repo root with this exact content:
 
 ```toml
 # git-cliff configuration — https://git-cliff.org
-# Conventional-commit changelog for nxvim. The rolling `edge` tag is ignored so
+# Conventional-commit changelog for bemtvi. The rolling `edge` tag is ignored so
 # it is never treated as a release boundary.
 
 [changelog]
@@ -222,7 +222,7 @@ jobs:
 
       - name: Compute asset name
         shell: bash
-        run: echo "ASSET=nxvim-${{ inputs.version }}-${{ matrix.suffix }}.${{ matrix.ext }}" >> "$GITHUB_ENV"
+        run: echo "ASSET=bemtvi-${{ inputs.version }}-${{ matrix.suffix }}.${{ matrix.ext }}" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -253,21 +253,21 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cargo build --release -p nxvim --target ${{ matrix.target }}
+        run: cargo build --release -p bemtvi --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: matrix.os != 'windows'
         shell: bash
         run: |
           mkdir -p dist
-          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" nxvim
+          tar -czf "dist/$ASSET" -C "target/${{ matrix.target }}/release" bemtvi
 
       - name: Package (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path "target/${{ matrix.target }}/release/nxvim.exe" -DestinationPath "dist/$env:ASSET"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/bemtvi.exe" -DestinationPath "dist/$env:ASSET"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -338,7 +338,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: nxvim-edge-*
+          pattern: bemtvi-edge-*
           path: dist
           merge-multiple: true
 
@@ -346,12 +346,12 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum nxvim-edge-* > SHA256SUMS
+          sha256sum bemtvi-edge-* > SHA256SUMS
 
       - name: Attest provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: "dist/nxvim-edge-*"
+          subject-path: "dist/bemtvi-edge-*"
 
       - name: Build release notes
         shell: bash
@@ -368,7 +368,7 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/nxvim"
+            echo "gh attestation verify <file> --repo davidrios/bemtvi"
             echo '```'
           } > EDGE_BODY.md
 
@@ -590,7 +590,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: nxvim-${{ needs.tag.outputs.version }}-*
+          pattern: bemtvi-${{ needs.tag.outputs.version }}-*
           path: dist
           merge-multiple: true
 
@@ -598,12 +598,12 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum nxvim-* > SHA256SUMS
+          sha256sum bemtvi-* > SHA256SUMS
 
       - name: Attest provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: "dist/nxvim-${{ needs.tag.outputs.version }}-*"
+          subject-path: "dist/bemtvi-${{ needs.tag.outputs.version }}-*"
 
       - name: Build release notes
         shell: bash
@@ -614,7 +614,7 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/nxvim"
+            echo "gh attestation verify <file> --repo davidrios/bemtvi"
             echo '```'
           } > RELEASE_NOTES.md
 
@@ -653,7 +653,7 @@ Create `docs/verifying-downloads.md` with this exact content:
 ````markdown
 # Verifying downloads
 
-Every released `nxvim` binary ships with a SHA-256 checksum and a signed
+Every released `bemtvi` binary ships with a SHA-256 checksum and a signed
 [build provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 proving it was built by this repository's release workflow.
 
@@ -672,10 +672,10 @@ Requires the [GitHub CLI](https://cli.github.com). Verify an archive against the
 attestation GitHub stores for it:
 
 ```sh
-gh attestation verify nxvim-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/nxvim
+gh attestation verify bemtvi-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/bemtvi
 ```
 
-A successful run confirms the artifact was produced by the `nxvim` release
+A successful run confirms the artifact was produced by the `bemtvi` release
 workflow at a specific commit, and was not tampered with afterwards.
 ````
 
@@ -702,8 +702,8 @@ After the merge lands on `main`, open the Actions tab. Expected: the `edge` work
 
 Run (locally, to confirm provenance):
 ```bash
-gh release download edge --repo davidrios/nxvim --pattern 'nxvim-edge-x86_64-linux-musl.tar.gz' --dir /tmp
-gh attestation verify /tmp/nxvim-edge-x86_64-linux-musl.tar.gz --repo davidrios/nxvim
+gh release download edge --repo davidrios/bemtvi --pattern 'bemtvi-edge-x86_64-linux-musl.tar.gz' --dir /tmp
+gh attestation verify /tmp/bemtvi-edge-x86_64-linux-musl.tar.gz --repo davidrios/bemtvi
 ```
 Expected: `✓ Verification succeeded`.
 
@@ -727,8 +727,8 @@ Merge the `release: v0.2.0` PR. Expected:
 - [ ] **Step 6: Final provenance check**
 
 ```bash
-gh release download v0.2.0 --repo davidrios/nxvim --pattern 'nxvim-0.2.0-x86_64-linux-musl.tar.gz' --dir /tmp
-gh attestation verify /tmp/nxvim-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/nxvim
+gh release download v0.2.0 --repo davidrios/bemtvi --pattern 'bemtvi-0.2.0-x86_64-linux-musl.tar.gz' --dir /tmp
+gh attestation verify /tmp/bemtvi-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/bemtvi
 ```
 Expected: `✓ Verification succeeded`.
 
@@ -738,7 +738,7 @@ No commit for this task (verification only). If the `aarch64-unknown-linux-musl`
 
 ## Notes for the implementer
 
-- **No unit tests here.** This is CI configuration; the project's integration-test harness (`crates/nxvim-server/tests/editing.rs`) does not apply. Validation is `actionlint` + the live GitHub run in Task 8. Do not add `#[test]` code.
+- **No unit tests here.** This is CI configuration; the project's integration-test harness (`crates/bemtvi-server/tests/editing.rs`) does not apply. Validation is `actionlint` + the live GitHub run in Task 8. Do not add `#[test]` code.
 - **Action versions are pinned to major tags** (`@v4`, `@v2`) deliberately — these are first-party/well-maintained actions and major tags get security patches. If you prefer full SHA pinning, that's a reasonable hardening follow-up, out of scope here.
 - **`GITHUB_TOKEN` tag pushes don't trigger workflows** — this is why `release.yml` tags *and* publishes in one run instead of relying on a tag-push event. Don't "simplify" it into a separate `on: push: tags` workflow; it would silently never fire.
 - **musl env var names**: `CC_<target_with_underscores>` (lowercase) for the `cc` crate, `CARGO_TARGET_<TARGET_UPPERCASE>_LINKER` for the linker. The `Configure musl C toolchain` step derives both from `matrix.target`.

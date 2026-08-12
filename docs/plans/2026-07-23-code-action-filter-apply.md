@@ -1,8 +1,8 @@
-# `nx.lsp.code_action(opts)` — kind filter + auto-apply
+# `btv.lsp.code_action(opts)` — kind filter + auto-apply
 
 **Status:** phase 1 (only phase).
 
-`nx.lsp.code_action()` today is unconditionally *interactive*: it requests every action
+`btv.lsp.code_action()` today is unconditionally *interactive*: it requests every action
 at the cursor and opens the chooser. That makes it unusable as a **save action** — the
 canonical `[organize imports / fixAll, format]` on-write chain — because a chooser pops
 on every write, and because there is no way to say *which* action you mean.
@@ -10,13 +10,13 @@ on every write, and because there is no way to say *which* action you mean.
 Add the two neovim-shaped options that make it non-interactive when it can be:
 
 ```lua
-nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
+btv.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
 ```
 
-and, declaratively (the shape `nxvim-workspaces` puts in `.nxvim/config.json`):
+and, declaratively (the shape `bemtvi-workspaces` puts in `.bemtvi/config.json`):
 
 ```json
-{ "require": "nx.lsp", "method": "code_action",
+{ "require": "btv.lsp", "method": "code_action",
   "params": { "context": { "only": ["source.fixAll"] }, "apply": true } }
 ```
 
@@ -42,20 +42,20 @@ and, declaratively (the shape `nxvim-workspaces` puts in `.nxvim/config.json`):
 
 | crate | change |
 | ----- | ------ |
-| `nxvim-lsp/protocol.rs` | `LspRequest::CodeAction { .., only: Vec<String> }`; `CodeActionData { .., kind: Option<String> }` |
-| `nxvim-lsp/convert.rs` | carry each action's `kind` through the distillation |
-| `nxvim-lsp/dispatch.rs` | send `context.only` (native async client) |
-| `nxvim-lsp/sync_client.rs` | send `context.only` (wasm sync client) |
-| `nxvim-lsp/mock.rs` | **react to** `only`: filter the scripted actions by it; `code_action_ignore_only` scripts a non-compliant server so the client-side filter is testable |
-| `nxvim-server/lsp/mod.rs` | `CodeActionOpts { only, apply }` on `PendingLspReq` (the reply needs both) |
-| `nxvim-server/lsp/request.rs` | `request_lsp_code_action(cb_id, opts)`; carry the opts to the reply |
-| `nxvim-server/lsp/edit.rs` | `show_code_actions` filters, then one-shot-applies or opens the chooser |
-| `nxvim-lua/ops.rs`, `install.rs` | `LspOp::CodeAction { cb_id, only, apply }`; `nx._lsp_buf_code_action(cb_id, only, apply)` |
-| `nxvim-lua/prelude/lsp.lua` | `nx.lsp.code_action(opts)` — parse/validate, fail loud on unsupported keys |
+| `bemtvi-lsp/protocol.rs` | `LspRequest::CodeAction { .., only: Vec<String> }`; `CodeActionData { .., kind: Option<String> }` |
+| `bemtvi-lsp/convert.rs` | carry each action's `kind` through the distillation |
+| `bemtvi-lsp/dispatch.rs` | send `context.only` (native async client) |
+| `bemtvi-lsp/sync_client.rs` | send `context.only` (wasm sync client) |
+| `bemtvi-lsp/mock.rs` | **react to** `only`: filter the scripted actions by it; `code_action_ignore_only` scripts a non-compliant server so the client-side filter is testable |
+| `bemtvi-server/lsp/mod.rs` | `CodeActionOpts { only, apply }` on `PendingLspReq` (the reply needs both) |
+| `bemtvi-server/lsp/request.rs` | `request_lsp_code_action(cb_id, opts)`; carry the opts to the reply |
+| `bemtvi-server/lsp/edit.rs` | `show_code_actions` filters, then one-shot-applies or opens the chooser |
+| `bemtvi-lua/ops.rs`, `install.rs` | `LspOp::CodeAction { cb_id, only, apply }`; `btv._lsp_buf_code_action(cb_id, only, apply)` |
+| `bemtvi-lua/prelude/lsp.lua` | `btv.lsp.code_action(opts)` — parse/validate, fail loud on unsupported keys |
 
 `:LspCodeAction` keeps its no-filter, always-interactive behavior (`opts` default).
 
-## Tests (`crates/nxvim/tests/lsp_features.rs`, mock LSP)
+## Tests (`crates/bemtvi/tests/lsp_features.rs`, mock LSP)
 
 1. `only` reaches the server — the mock filters on it, so a scripted `quickfix` action is
    *not* offered when `only = {"source.fixAll"}`.

@@ -1,12 +1,12 @@
 # Helix editing model — selection-first grammar on a shared selection engine
 
-> **Status: shipped** (all five phases; opt-in via `:helix` / `nx.helix.enable()`).
+> **Status: shipped** (all five phases; opt-in via `:helix` / `btv.helix.enable()`).
 > This doc is the design record: the phase plan it grew from, corrected to the
 > as-built shape, with the deviations from the original plan and the remaining
 > gaps called out at the end. The code lives in
-> `crates/nxvim-core/src/editor/helix.rs` (grammar + verbs),
-> `crates/nxvim-core/src/editor/selection.rs` (the shared range vocabulary), and
-> `crates/nxvim-lua/src/prelude/helix.lua` (the bundled keymap plugin).
+> `crates/bemtvi-core/src/editor/helix.rs` (grammar + verbs),
+> `crates/bemtvi-core/src/editor/selection.rs` (the shared range vocabulary), and
+> `crates/bemtvi-lua/src/prelude/helix.lua` (the bundled keymap plugin).
 
 ## What this is (and is not)
 
@@ -14,7 +14,7 @@ This adds Helix's **editing model** — selection-first (noun→verb), multi-sel
 as the always-on default — not merely Helix keybindings. Rebinding keys is the
 easy 20%; the hard 80% is that a *motion means something different* in Helix.
 
-- **vim / nxvim default:** verb→noun. The cursor is a **point** (`Cursor { line,
+- **vim / bemtvi default:** verb→noun. The cursor is a **point** (`Cursor { line,
   col }`). `d` sets a pending operator and *waits* for a motion. Selection exists
   only transiently in visual mode (`Editor::cursor` + `Editor::visual_anchor`,
   alive only while `mode.is_visual()`).
@@ -26,7 +26,7 @@ easy 20%; the hard 80% is that a *motion means something different* in Helix.
 So this cannot be expressed by remapping keys to key-strings: the semantics of the
 motions themselves change, and there is no "operator-pending" wait state. That is
 why the model is native Rust (a genuine core-grammar constraint, per the design
-principles) while the *key layout* ships as a bundled `nx` plugin.
+principles) while the *key layout* ships as a bundled `btv` plugin.
 
 ## Design decision (settled, held up)
 
@@ -148,10 +148,10 @@ server). `enable_helix`/`disable_helix` work from any mode; everything else
 requires an active Helix mode. The count falls back to the digits typed before
 the verb (`helix_count`) when the caller passes none.
 
-The seam to Lua is `nx._helix_action(name, count?)` (queued, drained by the
+The seam to Lua is `btv._helix_action(name, count?)` (queued, drained by the
 server into `apply_helix_action`). The bundled opt-in plugin
-(`prelude/helix.lua`) publishes `nx.helix.enable/disable` and
-`nx.helix.actions.<name>`, and binds only what a bare key can't reach: insert
+(`prelude/helix.lua`) publishes `btv.helix.enable/disable` and
+`btv.helix.actions.<name>`, and binds only what a bare key can't reach: insert
 entry (`i`/`a`/`I`/`A`/`o`/`O` — collapse to the selection edge, then a
 multi-cursor Insert), the goto `g` menu (`gg`/`ge`/`gh`/`gl`/`gs` + LSP
 `gd`/`gy`/`gr`/`gi`), the `<Space>` leader menu (pickers + LSP), and `u`/`U`
@@ -162,7 +162,7 @@ is the runnable walkthrough.
 
 - Mode codes are `hn`/`hs` (`Mode::short_code`), statusline `HELIX`/`HELIX-SEL`
   — distinct from `n`/`v` so `ModeChanged` fires and plugins can tell them apart.
-- Both Helix modes share one keymap bucket, `'h'` (`nx.keymap.set("helix", …)`),
+- Both Helix modes share one keymap bucket, `'h'` (`btv.keymap.set("helix", …)`),
   which **falls through** to the native `handle_helix` grammar on no match (like
   the multicursor `'m'` bucket) — Helix stays usable without the plugin.
 - The keymap disambiguation **oracle is off** in Helix modes: it folds over the
@@ -214,7 +214,7 @@ same way the multicursor suite asserts. Each new verb was mutation-tested.
   `r` is a char-argument grammar key. (`editor/operators.rs`, `editor/helix.rs`.)
 - **Match mode (`m`)** — `mm` goto-match, `mi`/`ma` text objects (through the
   shared `resolve_text_object` dispatch — vim objects, tree-sitter captures, and
-  `nx.textobject.map` keys alike), and `ms`/`md`/`mr` surround, all
+  `btv.textobject.map` keys alike), and `ms`/`md`/`mr` surround, all
   across **every** selection. A multi-key sub-grammar (`helix_match:
   Option<HelixMatch>`) read raw via `awaiting_command_continuation`. Surround's
   multi-selection edits are placed via a running byte-offset shift
@@ -232,7 +232,7 @@ same way the multicursor suite asserts. Each new verb was mutation-tested.
   (a two-key `helix_view` stage reusing the vim `view_reposition`); the selection
   is untouched.
 - **`]d`/`[d` (and `]e`/`[e`)** diagnostic navigation, bound in the `helix` keymap
-  bucket over `nx.diagnostic.goto_*`, mirroring the vim-mode defaults.
+  bucket over `btv.diagnostic.goto_*`, mirroring the vim-mode defaults.
 - **`Alt-,` remove-primary-selection** — drops the primary, promoting the next
   selection in document order (the inverse of `,` keep-primary).
 - **Register selection (`"{reg}`)** — a two-key `helix_register` stage sets
@@ -244,11 +244,11 @@ same way the multicursor suite asserts. Each new verb was mutation-tested.
   dispatch (the same one vim's operator/visual paths use), so match mode reaches
   the tree-sitter captures (`f`=function / `a`=parameter / `c`=comment / `t`=class,
   `i`→`.inner` / `a`→`.outer` with the inner→outer fallback and the `count`-th
-  enclosing scope) and any `nx.textobject.map` registry key — no longer only the
+  enclosing scope) and any `btv.textobject.map` registry key — no longer only the
   vim `&self` object alphabet. One dispatch, so a key can never mean different
   things in vim vs. Helix. This landed for free on web too (the change is in
-  `nxvim-core`, over the same engine the vim path uses). Tests:
-  `crates/nxvim-server/tests/treesitter_textobjects.rs` (the `helix_*` cases —
+  `bemtvi-core`, over the same engine the vim path uses). Tests:
+  `crates/bemtvi-server/tests/treesitter_textobjects.rs` (the `helix_*` cases —
   `maf`/`2maf`/`mia`/registry `mig`, sharing the vim suite's real-rust-grammar
   fixture).
 - **`Alt-)` / `Alt-(` rotate selection contents** — rotate the *text* among the
@@ -276,7 +276,7 @@ same way the multicursor suite asserts. Each new verb was mutation-tested.
   next operator span from its head back to the primary's anchor, since
   `for_each_cursor` only restores each cursor's `visual_anchor` from a present
   anchor mark. (That collapse now also tightens multi-cursor `c`/`i`/`a` exits.)
-- **which-key (`nx.on_key_pending`) for the native Helix sub-grammars** — the
+- **which-key (`btv.on_key_pending`) for the native Helix sub-grammars** — the
   keys-helper popup now lights up mid-sequence for Helix's own multi-key states, not
   just the plugin-mapped menus. The plugin-mapped prefixes (the `g` goto menu, the
   `<Space>` leader) already surfaced via **source A** (the mapped-prefix trie, which

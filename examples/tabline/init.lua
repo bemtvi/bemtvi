@@ -1,9 +1,9 @@
--- ~~~ nxvim tabline playground: a custom 'tabline' built from vim.fn ~~~
+-- ~~~ bemtvi tabline playground: a custom 'tabline' built from vim.fn ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/tabline \
---       cargo run -p nxvim -- examples/tabline/sample.txt
+--     BEMTVI_CONFIG=examples/tabline \
+--       cargo run -p bemtvi -- examples/tabline/sample.txt
 --
 -- The tabline is driven by the 'tabline' option's %-format engine — the SAME
 -- engine as 'statusline', plus the %nT / %X tab click-region items (clicking a
@@ -24,7 +24,7 @@
 --   click a tab label                   switches to it (the %nT click region)
 --   edit a tab's buffer (i…<Esc>)       that tab's label gains a `*` modified marker
 --   :tabclose                           back to one tab — showtabline=1 hides the line
---   :set tabline=                       fall back to nxvim's built-in tab cells
+--   :set tabline=                       fall back to bemtvi's built-in tab cells
 
 --------------------------------------------------------------------------------
 -- Tabline highlight groups. `%#TabLineSel#` (active tab), `%#TabLine#` (inactive),

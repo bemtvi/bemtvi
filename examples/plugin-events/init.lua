@@ -2,7 +2,7 @@
 --
 -- Run this example (config isolated from your real one):
 --
---   NXVIM_CONFIG=examples/plugin-events cargo run -p nxvim -- examples/plugin-events/sample.txt
+--   BEMTVI_CONFIG=examples/plugin-events cargo run -p bemtvi -- examples/plugin-events/sample.txt
 --
 -- It declares three tiny *local-dir* plugins that live next to this file (no network,
 -- no :PluginSync) — two eager (alpha, beta) and one lazy (gamma, behind :GammaHello) —
@@ -16,14 +16,14 @@ local here = vim.fn.stdpath("config")
 --    alpha & beta are EAGER (no trigger) — they load at startup.
 --    gamma is LAZY — it loads the first time you run :GammaHello.
 ------------------------------------------------------------------------------
-nx.plugins({
+btv.plugins({
   {
     name = "alpha",
     dir = here .. "/demo-plugins/alpha",
-    -- An ASYNC config (it nx.awaits a file read). `PluginsLoaded` waits for this to
+    -- An ASYNC config (it btv.awaits a file read). `PluginsLoaded` waits for this to
     -- finish, not merely for the load to start.
     config = function()
-      local txt = nx.await(nx.fs.read_text(here .. "/demo-plugins/alpha/lua/alpha/init.lua"))
+      local txt = btv.await(btv.fs.read_text(here .. "/demo-plugins/alpha/lua/alpha/init.lua"))
       _G.alpha_bytes = #txt
       require("alpha").setup()
     end,
@@ -54,8 +54,8 @@ nx.plugins({
 --    `:lua print(_G.alpha_ready, _G.beta_ready, _G.alpha_bytes)` prints
 --    `true  true  <a number>` — proof both eager configs finished before it fired.
 ------------------------------------------------------------------------------
-nx.on("PluginsLoaded", {}, function()
-  nx.notify(
+btv.on("PluginsLoaded", {}, function()
+  btv.notify(
     string.format(
       "PluginsLoaded: eager plugins ready (alpha=%s, beta=%s)",
       tostring(_G.alpha_ready),
@@ -72,8 +72,8 @@ end)
 --    `:GammaHello` — you'll see gamma's own greeting AND the notification below,
 --    then `:lua print(_G.gamma_ready)` prints `true`.
 ------------------------------------------------------------------------------
-nx.on("PluginLoaded", { pattern = "gamma" }, function(ev)
-  nx.notify("PluginLoaded: '" .. ev.data.name .. "' just loaded", 2)
+btv.on("PluginLoaded", { pattern = "gamma" }, function(ev)
+  btv.notify("PluginLoaded: '" .. ev.data.name .. "' just loaded", 2)
 end)
 
 ------------------------------------------------------------------------------
@@ -83,7 +83,7 @@ end)
 --    have missed it. It hasn't: every read from before the plugins landed is
 --    replayed to the handlers they registered, once PluginsLoaded fires.
 --    Beta registers plain `BufReadPost` / `FileType` handlers (see
---    demo-plugins/beta/lua/beta/init.lua) — no nxvim-specific event, no sweep.
+--    demo-plugins/beta/lua/beta/init.lua) — no bemtvi-specific event, no sweep.
 --
 --    Type-this / see-that: start with the command line at the top of this file,
 --    then run
@@ -96,6 +96,6 @@ end)
 --      :lua print(_G.cfg_reads)   -->  1
 ------------------------------------------------------------------------------
 _G.cfg_reads = 0
-nx.on("BufReadPost", {}, function()
+btv.on("BufReadPost", {}, function()
   _G.cfg_reads = _G.cfg_reads + 1
 end)

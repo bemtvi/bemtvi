@@ -1,11 +1,11 @@
 # Autocommand events
 
-These are the events the nxvim editor currently **emits**. Register a handler for
-one with `nx.autocmd.create` (or `vim.api.nvim_create_autocmd`). The event name is
+These are the events the bemtvi editor currently **emits**. Register a handler for
+one with `btv.autocmd.create` (or `vim.api.nvim_create_autocmd`). The event name is
 matched exactly, and a handler's `callback` receives the event table
 `{ id, event, match, buf, file, data }`.
 
-> **The list is the emitted set, not all of vim's events.** nxvim fires events as
+> **The list is the emitted set, not all of vim's events.** bemtvi fires events as
 > features come to need them. A handler registered for an event that isn't emitted
 > yet (e.g. `OptionSet`) is accepted but simply never
 > fires — it does not error. If you need one that's missing, it's a feature gap, not
@@ -38,19 +38,19 @@ return nothing:
 
 ```lua
 -- WRONG: raises. Nothing awaits this.
-nx.autocmd.create("CursorMoved", { callback = function()
-  return nx.lsp.buf.hover()
+btv.autocmd.create("CursorMoved", { callback = function()
+  return btv.lsp.buf.hover()
 end })
 
--- Right: fire-and-forget, or defer with nx.schedule / nx.on_next_tick.
-nx.autocmd.create("CursorMoved", { callback = function()
-  nx.lsp.buf.hover()
+-- Right: fire-and-forget, or defer with btv.schedule / btv.on_next_tick.
+btv.autocmd.create("CursorMoved", { callback = function()
+  btv.lsp.buf.hover()
 end })
 ```
 
 Every **other** event is async-capable: a `callback` may return a promise
-(`nx.promise`, or the result of an `nx.*` async call). A returned promise is never
-dropped — a rejection surfaces like any unhandled `nx.promise` rejection, named for the
+(`btv.promise`, or the result of an `btv.*` async call). A returned promise is never
+dropped — a rejection surfaces like any unhandled `btv.promise` rejection, named for the
 event that raised it.
 
 The split exists so the machinery below never touches the per-keypress path.
@@ -63,7 +63,7 @@ synchronous.
 **Late subscribers still get the event.** If a handler registers *another* handler for
 the same event while the first is still running, the newcomer receives that event too.
 This is what makes a lazily-loaded plugin work: `FileType` wakes the plugin, the
-plugin's `config` runs (possibly `nx.await`-ing), it registers its own `FileType`
+plugin's `config` runs (possibly `btv.await`-ing), it registers its own `FileType`
 handler — and that handler still fires for the buffer that woke it. Nothing fires
 twice: delivery is filtered by registration order, not replayed wholesale.
 
@@ -88,12 +88,12 @@ half-initialised. Blowing it warns, naming the handler's file:line; finishing la
 warns again with the elapsed time. Raise it for a handler you know is slow:
 
 ```lua
-nx.autocmd.create("FileType", { timeout = 5000, callback = function() … end })
+btv.autocmd.create("FileType", { timeout = 5000, callback = function() … end })
 ```
 
 A handler that never settles at all never reports completion, so it stays listed in
-`nx.autocmd.pending()` — inspect with
-`:lua print(vim.inspect(nx.autocmd.pending()))`. Warnings go to `:messages`.
+`btv.autocmd.pending()` — inspect with
+`:lua print(vim.inspect(btv.autocmd.pending()))`. Warnings go to `:messages`.
 
 ## Buffer lifecycle
 
@@ -104,7 +104,7 @@ A handler that never settles at all never reports completion, so it stays listed
 | `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
 | `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. On the first announce it is ordered behind `BufReadPost`'s handlers, including async ones — see [What happens when a handler is async](#what-happens-when-a-handler-is-async). |
 | `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read), and `BufEnter` again on a **re-read of the buffer that is already current** (`:e!`) — a reload re-enters what it re-read. | `buf` / `file` set. Hot-path, so handlers must be synchronous. `BufLeave` fires **before** the incoming buffer is read, `BufEnter` after: a switch is `BufLeave` → `BufReadPost` → `FileType` → `BufEnter`, so the outgoing buffer's teardown always precedes the incoming one's setup. On a buffer's first announce `BufEnter` is ordered last, after `BufReadPost` and `FileType` have settled. A reload fires no `BufLeave` — nothing was left. Restoring a session does **not** fire either for background windows — nothing became current there. |
-| `BufWinEnter` | A window *displays* a buffer it wasn't displaying — a switch (`:b`, `:e`), a split onto a file, a window a session/workspace restore fills (including non-current ones the current-buffer events never visit), and a re-read of a displayed buffer (`:e!`). Fires **per window**, so opening a buffer in a second window fires again even though it was already on screen, and again each time you switch back and forth. **Navigation never fires it**: a tab switch, `<C-w>w`, and a no-arg `:split` (which inherits the buffer it was split off) display nothing new. | `buf` / `file` set. **Gated on a registered handler.** Fires **last** on a buffer's first announce — after `BufReadPost`, `FileType` and `BufEnter` have settled, async handlers included. The handler runs **with the window that displayed as the current one** — `nx.win.current()`, `nx.wo`, and the cursor reads all address it, including for a session/workspace restore filling background windows. That context is the mirror one, not a focus change: the editor never moves your cursor to run a handler. So a mutation that binds to "current" only when it drains (`nx.cmd`, feedkeys) **raises** while the two differ, naming the fire — run it outside, or use an explicit-handle API (`nx.wo[win]`, `nx.bo[buf]`, `nx.win.set_cursor`). When the displaying window *is* the focused one — everything you type — nothing is locked. The window context covers the handler's **synchronous** run: past an `await`, an async handler is back in the ordinary context, so capture `local win = nx.win.current()` before the first await and write through `nx.wo[win]`. Every window that displayed the buffer gets its own fire, including ones that displayed it while an async `BufReadPost` was still settling; a window closed before that read completes fires nothing. |
+| `BufWinEnter` | A window *displays* a buffer it wasn't displaying — a switch (`:b`, `:e`), a split onto a file, a window a session/workspace restore fills (including non-current ones the current-buffer events never visit), and a re-read of a displayed buffer (`:e!`). Fires **per window**, so opening a buffer in a second window fires again even though it was already on screen, and again each time you switch back and forth. **Navigation never fires it**: a tab switch, `<C-w>w`, and a no-arg `:split` (which inherits the buffer it was split off) display nothing new. | `buf` / `file` set. **Gated on a registered handler.** Fires **last** on a buffer's first announce — after `BufReadPost`, `FileType` and `BufEnter` have settled, async handlers included. The handler runs **with the window that displayed as the current one** — `btv.win.current()`, `btv.wo`, and the cursor reads all address it, including for a session/workspace restore filling background windows. That context is the mirror one, not a focus change: the editor never moves your cursor to run a handler. So a mutation that binds to "current" only when it drains (`btv.cmd`, feedkeys) **raises** while the two differ, naming the fire — run it outside, or use an explicit-handle API (`btv.wo[win]`, `btv.bo[buf]`, `btv.win.set_cursor`). When the displaying window *is* the focused one — everything you type — nothing is locked. The window context covers the handler's **synchronous** run: past an `await`, an async handler is back in the ordinary context, so capture `local win = btv.win.current()` before the first await and write through `btv.wo[win]`. Every window that displayed the buffer gets its own fire, including ones that displayed it while an async `BufReadPost` was still settling; a window closed before that read completes fires nothing. |
 | `BufReadCmd` | A deferred open is about to perform its default read — vim's "replace the default read" hook. A handler that returns `true` **claims** the read: it owns filling the buffer (e.g. the file explorer listing a directory) and the default load is skipped. | `match` / `file` is the path; `args.isdir` says whether it's a directory. **Gated on a registered handler.** |
 | `BufDelete` | Just before a buffer is deleted (`:bdelete`), while its state still exists. | `buf` / `file` set. |
 
@@ -112,11 +112,11 @@ Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a 
 
 ### Plugins and the startup file
 
-Plugins load **asynchronously**. `nx.plugins` awaits a spec's directory before sourcing
-it, and a spec's `config` may `nx.await` on its own — so a plugin's `config`, and every
+Plugins load **asynchronously**. `btv.plugins` awaits a spec's directory before sourcing
+it, and a spec's `config` may `btv.await` on its own — so a plugin's `config`, and every
 autocmd that config registers, lands several ticks into startup. The file you named on
 the command line has already been read by then. Painting before the plugins are up is
-deliberate: it is what makes `nxvim file.txt` open instantly.
+deliberate: it is what makes `bemtvi file.txt` open instantly.
 
 You do not have to work around it. Every first-announce event fired before the plugins
 were ready is **replayed** to the handlers that registered while they were loading, when
@@ -133,7 +133,7 @@ PluginsLoaded -> BufReadPost / FileType replayed to exactly those handlers
 
 So a plugin registers a plain `BufReadPost` handler and sees the startup file, with the
 buffer and the match it was read with. There is no separate event to hook and no sweep
-of `nx.buf.list()` to write. Restored session windows are covered the same way.
+of `btv.buf.list()` to write. Restored session windows are covered the same way.
 
 Three things worth knowing:
 
@@ -195,7 +195,7 @@ no autocmd listens for them they cost nothing.
 | --- | --- | --- |
 | `LspAttach` | A language server attaches to a buffer. | `data = { client_id = … }`. |
 | `LspDetach` | A language server detaches from a buffer. | `data = { client_id = … }`. |
-| `LspProgress` | A server reports on long-running work (`$/progress`) — indexing, loading a workspace. | The **pattern is the kind** (`begin` / `report` / `end`), so `pattern = "end"` narrows to completions. `data = { client_id, token, kind, title, message, percentage, cancellable }`, with `nil` for a field the server didn't send. Read the settled state with `nx.lsp.progress()` rather than accumulating updates yourself. |
+| `LspProgress` | A server reports on long-running work (`$/progress`) — indexing, loading a workspace. | The **pattern is the kind** (`begin` / `report` / `end`), so `pattern = "end"` narrows to completions. `data = { client_id, token, kind, title, message, percentage, cancellable }`, with `nil` for a field the server didn't send. Read the settled state with `btv.lsp.progress()` rather than accumulating updates yourself. |
 
 ## Files & environment
 
@@ -212,7 +212,7 @@ no autocmd listens for them they cost nothing.
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `VimEnter` | Once, after the editor has finished starting (config sourced, first frame imminent). | `vim.v.vim_did_enter` is `1` from this point on. The built-in plugin manager's first-run prompt hooks it. |
-| `UIEnter` | Each time a client attaches its UI — after `VimEnter`, since startup completes before any client connects. | `nx.ui.caps()` describes the client that just attached (`keyboard_protocol` / `truecolor` / `osc52`) and is refreshed immediately before this fires. Hook it for setup that depends on what the terminal can do — notably a `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` mapping, which is only distinguishable from `<BS>` / `<Tab>` / `<CR>` / `<Esc>` under the kitty keyboard protocol. Fires again on a daemon re-dial (a second attach), so a handler must be idempotent. |
+| `UIEnter` | Each time a client attaches its UI — after `VimEnter`, since startup completes before any client connects. | `btv.ui.caps()` describes the client that just attached (`keyboard_protocol` / `truecolor` / `osc52`) and is refreshed immediately before this fires. Hook it for setup that depends on what the terminal can do — notably a `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` mapping, which is only distinguishable from `<BS>` / `<Tab>` / `<CR>` / `<Esc>` under the kitty keyboard protocol. Fires again on a daemon re-dial (a second attach), so a handler must be idempotent. |
 
 ## Quitting & exit
 
@@ -235,37 +235,37 @@ the editor leave.
 
 ## Plugins
 
-Fired by the built-in plugin manager (`nx.plugins`). See [Writing nxvim plugins](plugin-authoring.md).
+Fired by the built-in plugin manager (`btv.plugins`). See [Writing bemtvi plugins](plugin-authoring.md).
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. It is also the point the startup announce window closes — see [Plugins and the startup file](#plugins-and-the-startup-file). |
-| `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `nx.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |
+| `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `btv.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |
 
-To hook one named plugin, prefer **`nx.plugins.on_loaded(name, fn)`** over subscribing to
+To hook one named plugin, prefer **`btv.plugins.on_loaded(name, fn)`** over subscribing to
 `PluginLoaded` yourself. The event only reports a load that happens *later*, so the raw
 subscription silently never runs if that plugin turns out to be eager and already loaded;
 `on_loaded` runs `fn` immediately in that case and waits otherwise, so it fires exactly
 once either way:
 
 ```lua
-nx.plugins.on_loaded("nxvim-lspconfig", function()
-  require("nxvim-lspconfig").setup()
+btv.plugins.on_loaded("bemtvi-lspconfig", function()
+  require("bemtvi-lspconfig").setup()
 end)
 ```
 
 ## User
 
-`User` is the freeform event namespace: any plugin (or nxvim itself) fires one with
-`nx.autocmd.exec("User", { pattern = "MyEvent", data = … })`, and a handler
-subscribes by `pattern`. nxvim fires `User DaemonStatusChanged` whenever a daemon
-session's connection phase changes (read the phase with `nx.daemon.status()`).
+`User` is the freeform event namespace: any plugin (or bemtvi itself) fires one with
+`btv.autocmd.exec("User", { pattern = "MyEvent", data = … })`, and a handler
+subscribes by `pattern`. bemtvi fires `User DaemonStatusChanged` whenever a daemon
+session's connection phase changes (read the phase with `btv.daemon.status()`).
 
 ## Event aliases
 
-A handful of neovim event names are aliases for another event. nxvim honors these
+A handful of neovim event names are aliases for another event. bemtvi honors these
 by **canonicalizing the alias to its real event at registration** — so a config
-that does `nx.autocmd.create("BufRead", …)` (muscle memory from neovim) behaves
+that does `btv.autocmd.create("BufRead", …)` (muscle memory from neovim) behaves
 exactly as if it had used `"BufReadPost"`, and the callback's `event` field reports
 the canonical name. Aliases are accepted anywhere an event name is (`create`,
 `exec`, `get`, `clear`).
@@ -277,6 +277,6 @@ the canonical name. Aliases are accepted anywhere an event name is (`create`,
 | `BufCreate` | `BufAdd` |
 | `FileEncoding` | `EncodingChanged` |
 
-Every alias's target event is one nxvim actually emits — registering on an alias
+Every alias's target event is one bemtvi actually emits — registering on an alias
 whose target never fired would be a silent no-op, so we don't add one until the
 target exists.

@@ -8,9 +8,12 @@
 //! sessions contend; output/exit timing is unreliable). Run them deliberately on a
 //! real terminal with `cargo test -p bemtvi --test e2e -- --ignored`. They are
 //! otherwise hermetic — each spawns with a throwaway empty `BEMTVI_CONFIG`
-//! ([`empty_config_dir`]) so a run never depends on the developer's
-//! `~/.config/bemtvi` (only the `catppuccin` test additionally needs that plugin
-//! installed, and skips when it is absent).
+//! ([`empty_config_dir`]) and a throwaway `XDG_DATA_HOME` ([`empty_data_dir`]),
+//! so a run never depends on — or writes to — the developer's `~/.config/bemtvi`
+//! or `~/.local/share/bemtvi` (only the `catppuccin` test additionally needs that
+//! plugin installed, and skips when it is absent; it resolves the checkout in the
+//! parent and passes it explicitly via `BEMTVI_RUNTIMEPATH`, so the data-dir
+//! isolation leaves it alone).
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -30,6 +33,9 @@ struct Session {
     /// The throwaway empty config dir injected for hermeticity (removed on drop);
     /// `None` when the test supplied its own `BEMTVI_CONFIG`.
     _cfg_dir: Option<PathBuf>,
+    /// The throwaway empty data dir injected for hermeticity (removed on drop);
+    /// `None` when the test supplied its own `XDG_DATA_HOME`.
+    _data_dir: Option<PathBuf>,
     /// Every byte the child wrote, kept alongside the parsed screen. `vt100`
     /// renders the *display*, so escapes that aren't display state (an OSC 52
     /// clipboard write) are invisible there — the raw log is the only place a test
@@ -46,6 +52,27 @@ fn empty_config_dir() -> PathBuf {
     let dir =
         bemtvi_test_harness::temp_root().join(format!("bemtvi_e2e_cfg_{}_{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create empty config dir");
+    dir
+}
+
+/// Create a fresh, empty data directory under the temp dir, unique per call, so a
+/// spawned `bemtvi` neither reads nor writes the developer's `~/.local/share/bemtvi`
+/// (plugins, treesitter grammars). Isolating the config dir alone is not enough:
+/// `stdpath("data")` keys off `XDG_DATA_HOME`.
+///
+/// A *fresh* data dir is a **first run**, which opens the recommended-plugins
+/// welcome — a focus-grabbing float that would swallow the keystrokes these tests
+/// send and clone real plugins over the network. So the dir is pre-marked as
+/// already-asked (the same `.recommended-prompted` marker `btv.plugins.bootstrap`
+/// writes), putting the session in the state a returning user is in.
+fn empty_data_dir() -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = bemtvi_test_harness::temp_root()
+        .join(format!("bemtvi_e2e_data_{}_{n}", std::process::id()));
+    let plugins = dir.join("bemtvi").join("plugins");
+    std::fs::create_dir_all(&plugins).expect("create empty data dir");
+    std::fs::write(plugins.join(".recommended-prompted"), b"1\n").expect("pre-mark first run");
     dir
 }
 
@@ -81,6 +108,15 @@ impl Session {
             cmd.env("BEMTVI_CONFIG", &dir);
             dir
         });
+        // Same deal for the data dir: unless the test supplies its own
+        // `XDG_DATA_HOME`, point the child at a fresh one that is already marked
+        // as having been offered the recommended plugins, so no first-run welcome
+        // grabs focus and nothing is fetched over the network.
+        let data_dir = (!env.iter().any(|(k, _)| *k == "XDG_DATA_HOME")).then(|| {
+            let dir = empty_data_dir();
+            cmd.env("XDG_DATA_HOME", &dir);
+            dir
+        });
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -113,6 +149,7 @@ impl Session {
             _child: child,
             _master: pair.master,
             _cfg_dir: cfg_dir,
+            _data_dir: data_dir,
             raw,
         }
     }
@@ -189,6 +226,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self._child.kill();
         if let Some(dir) = &self._cfg_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(dir) = &self._data_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

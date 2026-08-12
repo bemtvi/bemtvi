@@ -170,3 +170,32 @@ sites; if it turns out to reach further than expected, interior mutability
 phase 2 is a load that never completes leaving a language wedged in `Slot::Loading`
 forever — the outcome channel must deliver on failure too, and the panic path of a
 `spawn_blocking` task counts as a failure.
+
+---
+
+## Outcome
+
+All three phases landed: `4a8c68cb` (lazy query compile), `08ef2f0c` (the load moves
+off-tick), `1b7a02a8` (the one-shot surfaces). Measured on the five-query fixture,
+a load went from ~300ms to ~130ms, and what remains no longer runs on the tick.
+
+Four things the plan did not anticipate, each now a test:
+
+- **Text may not wait for a grammar.** An indent or a text object answers the
+  keystroke that asked; a deferred load there silently produces wrong indentation or
+  a `vif` that does nothing. `SyntaxEngine::load_language_now` forces the load in
+  front of those two. A paint and a fold self-correct, so they wait.
+- **Folds are driven from the input loop**, not from a redraw, so a
+  `foldmethod=expr` buffer that asked before its grammar existed stayed unfolded
+  until the next keystroke. Installing a grammar recomputes them.
+- **A query override can arrive while its grammar is in flight.** The runtimepath
+  bridge resolves a language's queries around the same tick the grammar is asked
+  for, so the worker usually compiles against a snapshot that predates the resolved
+  query — the ordinary case, not a race. They are re-applied on install.
+- **"No parser installed" must not repaint.** Nothing on screen changes, and a
+  repaint re-dispatches every decoration provider — which is what the decor pacing
+  tests measure. `GrammarInstall` distinguishes the three verdicts for this.
+
+The trait grew two more methods than scoped (`load_language_now`, `language_pending`)
+for the first and last points above. `install_grammar` returns `GrammarInstall`
+rather than `OpenOutcome`, since "missing" and "loaded" needed telling apart.

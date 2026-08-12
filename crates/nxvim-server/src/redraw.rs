@@ -2446,23 +2446,19 @@ impl EditHost {
         } else {
             None
         };
-        let (highlights, block_bg_lines) = lang.map_or_else(
-            || (HashMap::new(), std::collections::HashSet::new()),
-            |lang| {
-                // Trailing newline to match the engine's buffer invariant (it treats
-                // the last line as a phantom: `len_lines - 1`); without it a
-                // single-line file parses to zero lines and drops every span.
-                let text = lines.join("\n") + "\n";
-                let (spans, bg) = self
-                    .editor
-                    .preview_highlights_bg(lang, &text, 0, lines.len());
-                let mut by_line: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
-                for span in spans {
-                    by_line.entry(span.line).or_default().push(span);
-                }
-                (by_line, bg.into_iter().collect())
-            },
-        );
+        let mut highlights: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
+        let mut block_bg_lines = std::collections::HashSet::new();
+        if let Some(lang) = lang {
+            // Trailing newline to match the engine's buffer invariant (it treats
+            // the last line as a phantom: `len_lines - 1`); without it a
+            // single-line file parses to zero lines and drops every span.
+            let text = lines.join("\n") + "\n";
+            let (spans, bg) = self.resolved_preview_highlights(lang, &text, 0, lines.len());
+            for span in spans {
+                highlights.entry(span.line).or_default().push(span);
+            }
+            block_bg_lines = bg.into_iter().collect();
+        }
         self.preview_cache = PreviewCache {
             path: Some(p.to_path_buf()),
             lines,

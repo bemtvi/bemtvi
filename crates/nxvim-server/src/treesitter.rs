@@ -150,7 +150,20 @@ impl EditHost {
 
         // Miss: re-query the engine (this also drains the buffer's edit journal
         // into the engine and reparses incrementally) and re-index by line.
-        let spans = self.editor.highlights(buffer, first, last);
+        let mut spans = self.editor.highlights(buffer, first, last);
+        // The buffer's *injected* languages exist only once that query has built the
+        // child layers, so — unlike its own filetype above — they resolve here. A
+        // newly installed overlay changes what its layer paints (and, for an
+        // `injections` overlay, which deeper layers there are), so re-query rather
+        // than leave this frame painted from the un-overlaid queries. Terminates: a
+        // round only repeats when it added to `resolved_ts_langs`, which never shrinks.
+        loop {
+            let injected = self.editor.ts_injected_languages(buffer);
+            if !self.resolve_injected_queries(injected) {
+                break;
+            }
+            spans = self.editor.highlights(buffer, first, last);
+        }
         // Read the line-background lines this same query produced (markdown fenced
         // code blocks) — the engine stashed them during `highlights` above.
         let block_bg_lines = self
@@ -193,9 +206,14 @@ impl EditHost {
     /// overlay and inherits cases configs actually ship. Guarded by
     /// `resolved_ts_langs` so resolution runs at most once per language, not per
     /// frame.
-    fn resolve_runtimepath_queries(&mut self, lang: &str) {
+    ///
+    /// Returns whether an override was actually installed — the signal a caller
+    /// needs to re-run a query it has already computed, since those spans were
+    /// painted with the un-overlaid queries. `false` both for a language already
+    /// resolved and for one with nothing on the runtimepath (the common case).
+    fn resolve_runtimepath_queries(&mut self, lang: &str) -> bool {
         if !self.resolved_ts_langs.insert(lang.to_string()) {
-            return; // already resolved this language
+            return false; // already resolved this language
         }
         let rtp = self.lua.runtimepath().to_vec();
         let mut applied = false;
@@ -219,6 +237,56 @@ impl EditHost {
         if applied {
             self.syntax_states.clear();
         }
+        applied
+    }
+
+    /// Resolve the runtimepath queries of every language in `langs`, reporting
+    /// whether any of them installed an override.
+    ///
+    /// The counterpart to resolving a buffer's *own* filetype: a language reaches the
+    /// engine as an **injected** layer too, and until this existed only a language
+    /// that was some buffer's filetype ever got its `after/queries` overlay. So a
+    /// config customizing `after/queries/typescript/highlights.scm` saw it applied in
+    /// a `.ts` buffer but not in the typescript inside a `.vue` file — the same
+    /// grammar, painted two different ways depending on how it was reached.
+    fn resolve_injected_queries(&mut self, langs: Vec<String>) -> bool {
+        let mut applied = false;
+        for lang in langs {
+            applied |= self.resolve_runtimepath_queries(&lang);
+        }
+        applied
+    }
+
+    /// A stateless highlight of `text` as `lang` with the runtimepath queries of
+    /// `lang` **and** everything it injects resolved first — what the picker preview,
+    /// an LSP doc float and `nx.treesitter.highlight` paint through.
+    ///
+    /// The buffer path resolves its language in
+    /// [`refresh_buffer_highlights`](Self::refresh_buffer_highlights); these surfaces
+    /// have no buffer, so a language they are the first to touch would otherwise
+    /// reach the engine with none of its overlays. Returns the spans and the
+    /// full-line-background lines, exactly as
+    /// [`preview_highlights_bg`](nxvim_core::Editor::preview_highlights_bg) does.
+    pub(crate) fn resolved_preview_highlights(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> (Vec<nxvim_core::Span>, Vec<usize>) {
+        self.resolve_runtimepath_queries(lang);
+        let mut out = self.editor.preview_highlights_bg(lang, text, first, last);
+        // Same shape as the buffer path: the injected languages are only knowable
+        // once the parse has run, so resolve them and repaint. Terminates because a
+        // round only repeats when it added to `resolved_ts_langs`, which never shrinks.
+        loop {
+            let injected = self.editor.ts_preview_injected_languages();
+            if !self.resolve_injected_queries(injected) {
+                break;
+            }
+            out = self.editor.preview_highlights_bg(lang, text, first, last);
+        }
+        out
     }
 
     /// Gather the query texts for `(lang, name)` in merge order — the language's

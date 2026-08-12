@@ -314,6 +314,28 @@ impl Editor {
         }
     }
 
+    /// The languages `buf` has treesitter *injected* layers for (the typescript of a
+    /// vue `<script setup lang="ts">`). Only known once the engine has parsed, so the
+    /// server reads it right after [`highlights`](Self::highlights) — see
+    /// [`SyntaxEngine::injected_languages`]. Empty with no engine.
+    pub fn ts_injected_languages(&self, buf: BufferId) -> Vec<String> {
+        match self.syntax.as_ref() {
+            Some(engine) => engine.injected_languages(buf),
+            None => Vec::new(),
+        }
+    }
+
+    /// [`ts_injected_languages`](Self::ts_injected_languages) for the most recent
+    /// **preview** highlight ([`preview_highlights`](Self::preview_highlights) and
+    /// friends), which has no buffer to key off. Read immediately after that call.
+    /// Empty with no engine.
+    pub fn ts_preview_injected_languages(&self) -> Vec<String> {
+        match self.syntax.as_ref() {
+            Some(engine) => engine.text_injected_languages(),
+            None => Vec::new(),
+        }
+    }
+
     /// Highlight an **off-buffer** snippet — `text` in `language`, over `[first,
     /// last)` — without registering a buffer. For read-only surfaces (the picker
     /// preview pane) that paint a file which is not an open buffer. Empty when there

@@ -922,7 +922,7 @@ impl EditHost {
                         format!("{text}\n")
                     };
                     let nlines = text.matches('\n').count();
-                    let (spans, _bg) = self.editor.preview_highlights_bg(&lang, &text, 0, nlines);
+                    let (spans, _bg) = self.resolved_preview_highlights(&lang, &text, 0, nlines);
                     let spans = spans
                         .into_iter()
                         .map(|s| (s.line, s.start_byte, s.end_byte, s.group))

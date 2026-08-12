@@ -114,6 +114,27 @@ pub trait SyntaxEngine {
         false
     }
 
+    /// The languages `buffer` has injected layers for — the typescript inside a vue
+    /// file's `<script setup lang="ts">`, the rust inside a markdown fence.
+    ///
+    /// Read by the server right after [`highlights`](Self::highlights) so those
+    /// languages' runtimepath queries get resolved too. They cannot be resolved any
+    /// earlier: an injected language is usually read out of the document
+    /// (`lang="ts"` is node text), so it isn't known until the parse has run. The
+    /// default is empty — an engine with no injections has nothing to report.
+    fn injected_languages(&self, _buffer: BufferId) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// [`injected_languages`](Self::injected_languages) for the most recent
+    /// **stateless** highlight ([`highlight_text`](Self::highlight_text) and
+    /// friends), which injects the same way but owns no [`BufferId`] to key off.
+    /// Read immediately after that call, like
+    /// [`line_background_lines`](Self::line_background_lines). Empty by default.
+    fn text_injected_languages(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Highlight an **off-buffer** snippet — `text` in `language`, over the line
     /// range `[first, last)` — without registering a [`BufferId`]. A stateless,
     /// full parse (no incremental reuse, no injections) for read-only surfaces like

@@ -77,11 +77,44 @@ struct BufferState {
     /// re-running the host's injection query over the whole tree. See
     /// [`Engine::update_injection_layers`].
     injection_regions: Vec<InjectionRegion>,
+    /// Child parses [`INJECTION_DEADLINE`] cancelled with no previous tree to fall
+    /// back on — the injection analogue of [`incomplete`](Self::incomplete). Each
+    /// keeps its own `Parser`, which still holds the outstanding parse, so the next
+    /// [`Engine::highlights`] *resumes* it a budget further rather than restarting
+    /// it; an injected region too big for one frame colours in progressively, the
+    /// way the host tree already does, instead of waiting for the next edit.
+    pending_injections: Vec<PendingInjection>,
     /// Lines a full-line-background capture ([`LINE_BACKGROUND_GROUPS`]) touched in
     /// the most recent [`Engine::highlights`] call — read back by the server via
     /// [`line_background_lines`](nxvim_core::syntax::SyntaxEngine::line_background_lines)
     /// to paint the `line_bg` layer under a markdown fenced code block.
     line_bg_lines: Vec<usize>,
+}
+
+/// A child parse still in flight: cancelled by [`INJECTION_DEADLINE`] before it
+/// produced a tree, and kept whole so the next refresh can resume it.
+///
+/// The `parser` is the point of this type. tree-sitter retains a cancelled parse on
+/// the parser that ran it, so calling `parse` again continues from where the budget
+/// ran out — dropping the parser instead (what the engine used to do) would restart
+/// the region from scratch every frame and, for a region genuinely larger than one
+/// budget, never finish. The rest of the fields are what
+/// [`Engine::build_injection_layers`] matches it back to its region by.
+///
+/// A *nested* pending region needs no depth or injector stored alongside it: the
+/// pass that resumes it re-derives its parent layer first (from the parent's own
+/// tree, so no reparse), and the parent's injection query re-enqueues the child at
+/// the right depth and under the right injector, where `(language, ranges)` finds
+/// this parser again.
+struct PendingInjection {
+    /// The injected language (normalized), half of the key matching it to a region.
+    language: String,
+    /// The buffer byte ranges the parse covers, already merged and ascending — the
+    /// other half of the key, so a region the text moved gets a fresh parse rather
+    /// than one resumed against bytes it never started on.
+    ranges: Vec<Range<usize>>,
+    /// Holds the outstanding parse; `parse` on it resumes rather than restarts.
+    parser: Parser,
 }
 
 /// One injected sub-language layer: a child grammar's parse of the host buffer
@@ -189,6 +222,14 @@ pub struct Engine {
     /// its own, in order of preference. Set from Lua
     /// (`nx.treesitter.fragment_context`), which also ships the defaults.
     fragment_contexts: HashMap<String, Vec<FragmentContext>>,
+    /// The languages the most recent **stateless** highlight
+    /// ([`Engine::highlight_text_bg`] / [`Engine::highlight_fragment`]) injected,
+    /// read back by
+    /// [`text_injected_languages`](Engine::text_injected_languages). Stashed rather
+    /// than returned for the same reason [`BufferState::line_bg_lines`] is: the
+    /// callers go through the [`SyntaxEngine`] trait, whose return types the wasm
+    /// implementor shares.
+    last_text_injections: Vec<String>,
 }
 
 /// One framing a fragment can be parsed inside — a template split at its `%s`.
@@ -274,6 +315,7 @@ impl Engine {
             retired_grammars: Vec::new(),
             query_overrides: QueryOverrides::new(),
             fragment_contexts: HashMap::new(),
+            last_text_injections: Vec::new(),
         }
     }
 
@@ -494,6 +536,31 @@ impl Engine {
         self.build_injection_layers(buffer, regions, HashMap::new());
     }
 
+    /// Advance the child parses [`INJECTION_DEADLINE`] cut short, one budget further.
+    ///
+    /// Called from [`highlights`](Self::highlights) — so the server's "repaint while
+    /// [`parse_pending`](Self::parse_pending)" loop drives it, exactly as it already
+    /// drives the root parse's resumption. The regions come from the cache rather
+    /// than a fresh query: this path runs only when the text has not changed, so
+    /// re-running the host's injection query would rediscover the same set at the
+    /// cost of a whole-tree walk.
+    fn resume_pending_injections(&mut self, buffer: BufferId) {
+        let Some(state) = self.buffers.get_mut(&buffer) else {
+            return;
+        };
+        let regions = state.injection_regions.clone();
+        // The layers that already landed, handed back as their own parse hints so
+        // this pass re-derives them from their trees instead of reparsing them.
+        let mut old_by_lang: HashMap<String, Vec<Tree>> = HashMap::new();
+        for layer in std::mem::take(&mut state.injections) {
+            old_by_lang
+                .entry(layer.language)
+                .or_default()
+                .push(layer.tree);
+        }
+        self.build_injection_layers(buffer, regions, old_by_lang);
+    }
+
     /// Re-derive a buffer's injected child layers **incrementally** after an edit.
     /// Each surviving child tree is `edit`ed with this frame's deltas and reused as
     /// the parse hint for the region of its language, so unchanged subtrees are not
@@ -701,11 +768,26 @@ impl Engine {
         let Some(host_lang) = self.buffers.get(&buffer).map(|s| s.language.clone()) else {
             return;
         };
+        // Whatever the last refresh left mid-parse. A region that still exists takes
+        // its parser back below and resumes; one that doesn't drops with this vec.
+        let mut resumable: Vec<PendingInjection> = Vec::new();
         if let Some(state) = self.buffers.get_mut(&buffer) {
             state.injection_regions = regions.clone();
+            resumable = std::mem::take(&mut state.pending_injections);
         }
         let started = Instant::now();
+        // Time spent loading child grammars, which the budget below discounts. A
+        // language's first region pays a `dlopen` plus a compile of every `.scm` it
+        // ships — tens of milliseconds. Charged to the parse budget (as it once was)
+        // that alone exhausted it, so the very parse it was meant to bound was
+        // cancelled before it started and the region silently kept the host's flat
+        // paint: a vue file's `<script setup lang="ts">` never coloured until the
+        // first keystroke. The bound is meant for pathological *parsing*, and the
+        // load is one-off per language per session, so it is excluded rather than
+        // counted.
+        let mut loading = Duration::ZERO;
         let mut layers = Vec::with_capacity(regions.len());
+        let mut still_pending: Vec<PendingInjection> = Vec::new();
         // (language, ranges, depth, injector) — `injector` is the language that
         // injected this region, used as `injection.parent` when recursing into it.
         let mut queue: VecDeque<(String, Vec<Range<usize>>, usize, String)> = regions
@@ -716,17 +798,12 @@ impl Engine {
         while let Some((language, mut ranges, depth, injector)) = queue.pop_front() {
             // Lazily load (cache) the child grammar; skip silently if it is missing
             // or broken — the region just keeps the host's flat paint.
+            let load_started = Instant::now();
             let child_language = match self.grammar(&language) {
                 Slot::Loaded(g) => g.language.clone(),
                 _ => continue,
             };
-            let mut parser = Parser::new();
-            if parser.set_language(&child_language).is_err() {
-                continue;
-            }
-            // An edit-shifted tree of this language, reused as the incremental parse
-            // hint and the stale fallback if this frame's parse is cancelled.
-            let old = old_by_lang.get_mut(&language).and_then(Vec::pop);
+            loading += load_started.elapsed();
 
             // `included_ranges` must be ascending and non-overlapping. A combined
             // pattern can match *nested* nodes (a section inside a section), whose
@@ -743,6 +820,33 @@ impl Engine {
                     false
                 }
             });
+            // The parser that already holds this region's cancelled parse, if the
+            // last refresh left one — resuming it continues from where the budget
+            // ran out, where a fresh parser would restart the region from scratch.
+            // Keyed by the merged ranges, so a region the edit moved gets a fresh
+            // parse rather than one resumed against the wrong text.
+            let resumed = resumable
+                .iter()
+                .position(|p| p.language == language && p.ranges == ranges)
+                .map(|i| resumable.remove(i));
+            let resuming = resumed.is_some();
+            let mut parser = match resumed {
+                Some(p) => p.parser,
+                None => Parser::new(),
+            };
+            if !resuming && parser.set_language(&child_language).is_err() {
+                continue;
+            }
+            // An edit-shifted tree of this language, reused as the incremental parse
+            // hint and the stale fallback if this frame's parse is cancelled. Never
+            // handed to a *resumed* parse: that parse already fixed its old tree when
+            // it started, and swapping one in mid-flight would parse against a hint
+            // it never began from.
+            let old = match resuming {
+                true => None,
+                false => old_by_lang.get_mut(&language).and_then(Vec::pop),
+            };
+
             let Some(state) = self.buffers.get(&buffer) else {
                 return;
             };
@@ -753,7 +857,7 @@ impl Engine {
                 continue;
             }
             let tree = {
-                let mut budget = deadline_budget(started, INJECTION_DEADLINE);
+                let mut budget = deadline_budget(started + loading, INJECTION_DEADLINE);
                 let options = ParseOptions::new().progress_callback(&mut budget);
                 let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
                 parser.parse_with_options(&mut callback, old.as_ref(), Some(options))
@@ -762,14 +866,22 @@ impl Engine {
                 Some(tree) => tree,
                 // Budget exhausted (or parse cancelled): keep the last-good child
                 // tree if there is one, painting one frame stale. A brand-new region
-                // with no prior tree is dropped this frame and re-attempted next.
+                // has nothing to paint, so its parse is kept alive instead — the next
+                // refresh resumes it a budget further (see [`PendingInjection`]),
+                // which is what makes a region larger than one budget colour in over
+                // a few frames rather than wait for an edit that rebuilds it.
                 None => {
-                    if let Some(tree) = old {
-                        layers.push(InjectionLayer {
+                    match old {
+                        Some(tree) => layers.push(InjectionLayer {
                             language,
                             tree,
                             ranges,
-                        });
+                        }),
+                        None => still_pending.push(PendingInjection {
+                            language,
+                            ranges,
+                            parser,
+                        }),
                     }
                     continue;
                 }
@@ -792,6 +904,7 @@ impl Engine {
 
         if let Some(state) = self.buffers.get_mut(&buffer) {
             state.injections = layers;
+            state.pending_injections = still_pending;
         }
     }
 
@@ -840,6 +953,7 @@ impl Engine {
             incomplete: false,
             injections: Vec::new(),
             injection_regions: Vec::new(),
+            pending_injections: Vec::new(),
             line_bg_lines: Vec::new(),
         };
         state.reparse();
@@ -903,6 +1017,10 @@ impl Engine {
         if state.incomplete {
             state.parser.reset();
         }
+        // Same hazard one layer down: a child parse still in flight was reading the
+        // *pre-edit* shadow, so resuming it now would parse stale bytes. Drop them —
+        // the rebuild below re-derives the regions and starts their parses fresh.
+        state.pending_injections.clear();
         // The edited-but-not-yet-reparsed tree, kept to ask tree-sitter which byte
         // ranges the reparse actually *changed* — the input to the incremental
         // injection update below. Cloning a `Tree` is a refcount bump, not a copy.
@@ -957,18 +1075,63 @@ impl Engine {
         self.buffers.remove(&buffer);
     }
 
-    /// Whether `buffer`'s parse was cancelled by [`PARSE_DEADLINE`] and still has
-    /// work pending — a large file mid-parse. The server polls this after each
-    /// redraw to decide whether to schedule another frame, which resumes the parse
-    /// via [`Self::highlights`], until it converges. False for an unknown buffer or
-    /// a fully-parsed one.
+    /// Whether `buffer` still has parse work pending — the root parse cancelled by
+    /// [`PARSE_DEADLINE`] mid-way, or an injected region's child parse cancelled by
+    /// [`INJECTION_DEADLINE`]. The server polls this after each redraw to decide
+    /// whether to schedule another frame, which resumes the outstanding parses via
+    /// [`Self::highlights`], until they converge. False for an unknown buffer or a
+    /// fully-parsed one.
+    ///
+    /// Injections count because the server's highlight memo hits on every frame that
+    /// changed neither the text nor the viewport: without this, a child parse the
+    /// budget cut short would never be resumed and the injected language would stay
+    /// unpainted until the next edit.
     pub fn parse_pending(&self, buffer: BufferId) -> bool {
-        self.buffers.get(&buffer).is_some_and(|s| s.incomplete)
+        self.buffers
+            .get(&buffer)
+            .is_some_and(|s| s.incomplete || !s.pending_injections.is_empty())
     }
 
     /// Whether a buffer is known (opened) and which language it uses.
     pub fn language_of(&self, buffer: BufferId) -> Option<&str> {
         self.buffers.get(&buffer).map(|b| b.language.as_str())
+    }
+
+    /// Every language `buffer` currently has an injected layer for, deepest nesting
+    /// included and deduplicated — the typescript of a vue file's `<script setup
+    /// lang="ts">`, the rust of a markdown fence.
+    ///
+    /// The set is only knowable *after* a parse: an injected language usually comes
+    /// from the document itself (`lang="ts"` is node text, not a constant in the
+    /// query), so nothing upstream can predict it. The server reads this right after
+    /// [`highlights`](Self::highlights) to resolve those languages' runtimepath
+    /// queries, which would otherwise reach only a language that is some buffer's own
+    /// filetype. A region whose parse is still pending counts: its layer is coming,
+    /// and resolving its queries now saves re-painting it later.
+    pub fn injected_languages(&self, buffer: BufferId) -> Vec<String> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        let injected = state.injections.iter().map(|l| &l.language);
+        let pending = state.pending_injections.iter().map(|p| &p.language);
+        for lang in injected.chain(pending) {
+            if !out.iter().any(|l| l == lang) {
+                out.push(lang.clone());
+            }
+        }
+        out
+    }
+
+    /// [`injected_languages`](Self::injected_languages) for the most recent
+    /// **stateless** highlight — [`highlight_text`](Self::highlight_text),
+    /// [`highlight_text_bg`](Self::highlight_text_bg) or
+    /// [`highlight_fragment`](Self::highlight_fragment). Those surfaces (the picker
+    /// preview, an LSP doc float, `nx.treesitter.highlight`) inject exactly as an
+    /// open buffer does but own no [`BufferId`] to key off, so the languages are
+    /// stashed by the call and read back immediately after it.
+    pub fn text_injected_languages(&self) -> Vec<String> {
+        self.last_text_injections.clone()
     }
 
     /// Extract highlight spans for the visible line range `[first_line, last_line)`,
@@ -996,6 +1159,17 @@ impl Engine {
             // The freshly-completed root tree needs its injection layers built, just
             // as the open/edit paths do after their reparse.
             self.rebuild_injection_layers(buffer);
+        } else if self
+            .buffers
+            .get(&buffer)
+            .is_some_and(|s| !s.pending_injections.is_empty())
+        {
+            // A child parse the budget cut short. Re-run the build over the *cached*
+            // regions (the text has not changed, so they still hold): each pending
+            // region takes its parser back and resumes a budget further, while the
+            // layers that already landed are re-derived from their own trees, which
+            // with no edits to replay is a refcount bump rather than a parse.
+            self.resume_pending_injections(buffer);
         }
 
         // Reset the line-background memo up front, so a buffer with no tree / grammar
@@ -1327,6 +1501,9 @@ impl Engine {
         // The host language is an alias-resolvable name too: this is fed a fence's
         // info string (a markdown doc float's code block) as often as a filetype.
         let lang = nxvim_core::resolve_language(lang);
+        // Cleared up front so an early return below reports *this* call's (empty) set
+        // rather than leaving the previous call's languages behind.
+        self.last_text_injections.clear();
         let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
             _ => return (Vec::new(), Vec::new()), // silent: no grammar (or load failed)
@@ -1443,6 +1620,17 @@ impl Engine {
                     depth: this_depth + 1,
                     injector: Some(this_lang.clone()),
                 });
+            }
+        }
+
+        // Stash the injected languages for
+        // [`text_injected_languages`](Self::text_injected_languages), which the server
+        // reads right after this call to resolve their runtimepath queries. The host
+        // (index 0) is excluded: its caller resolved it before calling.
+        self.last_text_injections.clear();
+        for l in owned.iter().skip(1) {
+            if !self.last_text_injections.contains(&l.language) {
+                self.last_text_injections.push(l.language.clone());
             }
         }
 
@@ -1863,6 +2051,14 @@ impl SyntaxEngine for Engine {
 
     fn parse_pending(&self, buffer: BufferId) -> bool {
         Engine::parse_pending(self, buffer)
+    }
+
+    fn injected_languages(&self, buffer: BufferId) -> Vec<String> {
+        Engine::injected_languages(self, buffer)
+    }
+
+    fn text_injected_languages(&self) -> Vec<String> {
+        Engine::text_injected_languages(self)
     }
 
     fn highlight_text(&mut self, lang: &str, text: &str, first: usize, last: usize) -> Vec<Span> {

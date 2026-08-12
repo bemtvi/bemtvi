@@ -124,3 +124,116 @@ async fn inherits_pulls_runtimepath_query_of_inherited_lang() {
 
     std::env::remove_var("NXVIM_DATA_DIR");
 }
+
+/// An overlay must reach a language the buffer **injects**, not only the language
+/// the buffer *is*.
+///
+/// Resolution used to key off `ts_language_for(buffer)` — a buffer's own filetype —
+/// so a language only ever reached the engine overlaid if some buffer was written in
+/// it. The typescript inside a `.vue` file's `<script setup lang="ts">`, the rust
+/// inside a markdown fence, and every nested layer under them got the bundled query
+/// and nothing else: the same grammar painted two different ways depending on how it
+/// was reached. Here the rust overlay is only reachable through markdown's fence
+/// injection, so the custom capture painting proves the injected layer resolved.
+#[tokio::test]
+#[ignore = "needs network + a C compiler to install real grammars; opt-in like the other ts e2e tests"]
+async fn overlay_reaches_an_injected_language() {
+    let _guard = serial_lock().lock().await;
+
+    let data = temp_dir("ts_injected_data");
+    nxvim_ts::install::install(&data, "markdown").expect("install markdown");
+    nxvim_ts::install::install(&data, "rust").expect("install rust");
+    std::env::set_var("NXVIM_DATA_DIR", &data);
+
+    // A capture the bundled rust query never emits, on a node it definitely has.
+    let rtp = temp_dir("ts_injected_rtp");
+    let qdir = rtp.join("after/queries/rust");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(
+        qdir.join("highlights.scm"),
+        ";; extends\n(function_item name: (identifier) @nxvim.injected.test)\n",
+    )
+    .unwrap();
+
+    // No `.rs` buffer anywhere: rust is reached *only* as markdown's injected fence.
+    let file = write_temp("ts_injected", "md", "# t\n\n```rust\nfn zzz() {}\n```\n");
+    let (_rpc, mut incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            runtimepath: vec![rtp],
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+
+    let map = wait_redraw(&mut incoming, |m| {
+        payload_has_group(m, "nxvim.injected.test")
+    })
+    .await;
+    assert!(
+        payload_has_group(&map, "nxvim.injected.test"),
+        "an `after/queries/rust` overlay should reach the rust injected into a markdown fence"
+    );
+
+    std::env::remove_var("NXVIM_DATA_DIR");
+}
+
+/// The same gap on the **stateless** highlighter — the picker preview, an LSP doc
+/// float, `nx.treesitter.highlight`. Those surfaces have no buffer at all, so before
+/// this neither the language they paint nor anything it injects was ever resolved.
+/// Driven through `nx.treesitter.highlight` because it returns the spans to Lua;
+/// the preview pane and doc floats go through the same call.
+#[tokio::test]
+#[ignore = "needs network + a C compiler to install real grammars; opt-in like the other ts e2e tests"]
+async fn overlay_reaches_the_stateless_highlighter() {
+    let _guard = serial_lock().lock().await;
+
+    let data = temp_dir("ts_stateless_data");
+    nxvim_ts::install::install(&data, "markdown").expect("install markdown");
+    nxvim_ts::install::install(&data, "rust").expect("install rust");
+    std::env::set_var("NXVIM_DATA_DIR", &data);
+
+    let rtp = temp_dir("ts_stateless_rtp");
+    let qdir = rtp.join("after/queries/rust");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(
+        qdir.join("highlights.scm"),
+        ";; extends\n(function_item name: (identifier) @nxvim.stateless.test)\n",
+    )
+    .unwrap();
+
+    // No file: nothing opens a buffer, so no language is resolved by the buffer path
+    // and the snippet below is the first thing to touch either grammar.
+    let (rpc, _incoming) = start_attached(
+        ServerInit {
+            runtimepath: vec![rtp],
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+
+    exec_lua(
+        &rpc,
+        "_G.seen = {}\n\
+         nx.async(function()\n\
+           local spans = nx.await(nx.treesitter.highlight('markdown', '```rust\\nfn zzz() {}\\n```\\n'))\n\
+           for _, s in ipairs(spans) do _G.seen[s.group] = true end\n\
+           _G.done = true\n\
+         end)()",
+    )
+    .await;
+    poll_true(&rpc, "return _G.done").await;
+
+    let found = exec_lua(&rpc, "return _G.seen['nxvim.stateless.test'] == true").await;
+    assert_eq!(
+        found,
+        Value::Boolean(true),
+        "an `after/queries/rust` overlay should reach the stateless highlighter's injected rust"
+    );
+
+    std::env::remove_var("NXVIM_DATA_DIR");
+}

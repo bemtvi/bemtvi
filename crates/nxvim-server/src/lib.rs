@@ -90,6 +90,30 @@ mod shada;
 #[cfg(feature = "native")]
 mod treesitter;
 
+/// The wasm twin of [`treesitter::EditHost::resolved_preview_highlights`] — the
+/// stateless highlight the picker preview, LSP doc floats and
+/// `nx.treesitter.highlight` go through.
+///
+/// The native side resolves the language's (and its injected languages')
+/// runtimepath queries before painting; the whole runtimepath query bridge lives in
+/// the native-gated `treesitter` module because the serverless browser build has no
+/// tree-sitter engine to install queries into — it highlights JS-side
+/// (web-tree-sitter), and its `SyntaxEngine` returns no spans here at all. So on
+/// this build there is nothing to resolve and the call is the plain one, keeping the
+/// two shared call sites (`redraw.rs`, `effects.rs`) cfg-free.
+#[cfg(not(feature = "native"))]
+impl EditHost {
+    pub(crate) fn resolved_preview_highlights(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> (Vec<nxvim_core::Span>, Vec<usize>) {
+        self.editor.preview_highlights_bg(lang, text, first, last)
+    }
+}
+
 /// The process-spawning seam (`vim.system` / `jobstart` / `:!`) and its types,
 /// re-exported for [`ServerInit::host_proc`] — the edit-host split injects a
 /// daemon-backed [`HostProc`] here (the process-side companion to

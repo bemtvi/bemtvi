@@ -102,17 +102,21 @@ async fn initialize_advertises_window_work_done_progress() {
     let dir = temp_dir("lsp_progress");
     let rec = dir.join("rec.jsonl");
     arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, rec.display()));
-    let (_rpc, _incoming) = open_with_server(&dir, "").await;
+    let (rpc, _incoming) = open_with_server(&dir, "").await;
 
-    // The handshake is async; wait for the recorded `initialize` to appear.
-    let mut recorded = String::new();
-    for _ in 0..200 {
-        recorded = std::fs::read_to_string(&rec).unwrap_or_default();
-        if recorded.contains("\"initialize\"") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // Wait for the LSP client to attach before reading the recorded wire. The
+    // handshake (initialize → initialized) completes before `LspAttach` fires, so
+    // once the client is visible the `initialize` message is guaranteed to be on
+    // disk. Without this barrier the test races the mock process start and flakes
+    // under load (the polling loop below can exhaust its tries before the process
+    // has even spawned).
+    assert_eq!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "1",
+        "the mock client should be attached before we read its recorded initialize"
+    );
+
+    let recorded = std::fs::read_to_string(&rec).unwrap_or_default();
     let init = recorded
         .lines()
         .find(|l| l.contains("\"initialize\""))

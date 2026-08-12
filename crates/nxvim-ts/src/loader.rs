@@ -14,6 +14,7 @@
 //! ```
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -41,28 +42,112 @@ pub enum LoadError {
     Failed(anyhow::Error),
 }
 
+/// A query file whose **compile** waits until something asks for it.
+///
+/// Compiling a query is the whole cost of loading a grammar: the `dlopen` is
+/// ~0.1 ms, while one `Query::new` is ~60 ms for a rust-sized grammar — and it is
+/// the grammar, not the query, that sets that price (halving a `highlights.scm`
+/// removes ~15% of its compile time, because `ts_query_new` analyzes each pattern
+/// against the parse table). The cost is therefore *(query files) x (a per-grammar
+/// constant)*, and a language that ships all five costs five times what painting it
+/// needs — painting needs `highlights`, plus `injections` to find its child layers.
+/// The other three answer a keypress that may never come: `indents` an `=`, `folds`
+/// a `foldmethod=expr`, `textobjects` a `vif`.
+///
+/// So the source is read at load (cheap, and it is what makes "does this language
+/// have folds" answerable without a compile) and compiled on the first ask. The
+/// result — including a failure, which stays [`Err`] rather than being retried on
+/// every later keypress — is remembered.
+pub struct LazyQuery {
+    /// `"<lang> <name>"`, the label a compile error carries — the grammar knows its
+    /// `Language` but not the name it was loaded under.
+    label: String,
+    /// The `<name>.scm` text, or `None` when the language ships no such file.
+    source: Option<String>,
+    /// The compile, run at most once. Empty until something asks.
+    cell: OnceCell<Result<Query, String>>,
+}
+
+impl LazyQuery {
+    /// A query source (`None` when the language ships no such file) to compile on
+    /// the first ask.
+    fn deferred(label: String, source: Option<String>) -> Self {
+        LazyQuery {
+            label,
+            source,
+            cell: OnceCell::new(),
+        }
+    }
+
+    /// An **already-compiled** query, for the one caller that must compile eagerly:
+    /// `set_query` installs a resolved override on behalf of a user action, so a
+    /// broken one has to fail *that* action rather than a later keypress.
+    pub fn ready(label: String, source: String, query: Query) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(Ok(query));
+        LazyQuery {
+            label,
+            source: Some(source),
+            cell,
+        }
+    }
+
+    /// No such query — the language ships no file and none was set.
+    pub fn absent(label: String) -> Self {
+        LazyQuery {
+            label,
+            source: None,
+            cell: OnceCell::new(),
+        }
+    }
+
+    /// Whether the language *has* this query at all. Answerable without compiling,
+    /// which is what the `…_available` probes need.
+    pub fn is_present(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// The compiled query, compiling it now if this is the first ask: `Ok(None)`
+    /// when the language ships no such file, `Err` with the labelled compile error
+    /// (the same one every later ask gets — the failure is not retried).
+    pub fn get(&self, language: &Language) -> Result<Option<&Query>, &str> {
+        if self.source.is_none() {
+            return Ok(None);
+        }
+        let compiled = self.cell.get_or_init(|| {
+            let src = self.source.as_deref().unwrap_or_default();
+            compile_query(language, src).map_err(|e| format!("compiling {}: {e}", self.label))
+        });
+        match compiled {
+            Ok(query) => Ok(Some(query)),
+            Err(msg) => Err(msg.as_str()),
+        }
+    }
+}
+
 /// A loaded grammar: the dynamic library (kept alive because `language` borrows
-/// code inside it), the `Language`, the compiled highlights `Query`, and the
-/// optional compiled queries — indents (treesitter indentation), injections (the
-/// injection-query bridge — which patterns mark a node's text as another
-/// language), folds, and textobjects. Each optional is absent when the language
-/// ships no `<name>.scm` for it.
+/// code inside it), the `Language`, the compiled highlights `Query`, the compiled
+/// injections query (the injection-query bridge — which patterns mark a node's text
+/// as another language), and the three [`LazyQuery`] slots nothing needs to paint:
+/// indents (treesitter indentation), folds, and textobjects.
+///
+/// `highlights` and `injections` are compiled at load because every painted buffer
+/// wants both immediately; see [`LazyQuery`] for why the rest wait.
 pub struct Grammar {
     // Field order matters: every query field drops before `_lib`, so the loaded
     // code outlives anything pointing into it.
     pub language: Language,
     pub query: Query,
-    pub indents: Option<Query>,
     pub injections: Option<Query>,
-    /// Compiled `folds.scm` (`@fold` captures → foldable node ranges), or `None`
-    /// when the language ships no fold query. Drives `foldmethod=expr` with the
-    /// tree-sitter foldexpr (the core builds per-line levels from the ranges).
-    pub folds: Option<Query>,
-    /// Compiled `textobjects.scm` (`@function.inner/outer`, `@parameter.*`,
-    /// `@class.*`, `@comment.*`, … captures → syntactic text-object ranges), or
-    /// `None` when the language ships no textobjects query. Drives the tree-sitter
-    /// text objects (`vif`, `daf`, `dia`, …).
-    pub textobjects: Option<Query>,
+    /// `indents.scm` — treesitter indentation, compiled on the first `=` / `o`.
+    pub indents: LazyQuery,
+    /// `folds.scm` (`@fold` captures → foldable node ranges), compiled the first
+    /// time `foldmethod=expr` asks. The core builds per-line levels from the ranges.
+    pub folds: LazyQuery,
+    /// `textobjects.scm` (`@function.inner/outer`, `@parameter.*`, `@class.*`,
+    /// `@comment.*`, … captures → syntactic text-object ranges), compiled on the
+    /// first `vif` / `daf` / `dia`.
+    pub textobjects: LazyQuery,
     _lib: libloading::Library,
 }
 
@@ -129,22 +214,25 @@ impl Grammar {
             .with_context(|| format!("compiling {lang} highlights"))
             .map_err(LoadError::Failed)?;
 
-        // `indents.scm` / `injections.scm` are optional: a language with no indent
-        // query simply has no treesitter indentation (the editor falls back); one
-        // with no injection query has no sub-language layers. A *present* file that
-        // fails to compile is a real error, surfaced like a broken highlights query.
-        let indents = load_optional_query(data_dir, lang, &language, "indents", overrides)?;
+        // `injections.scm` is optional but wanted immediately — a buffer's child
+        // layers are found on its first highlight — so it is compiled here, and a
+        // present-but-broken one is a real error, surfaced like a broken highlights
+        // query. The other three are only ever wanted by a keypress, so their source
+        // is read (that is what `is_present` answers) and the compile waits; a broken
+        // one fails the keypress that asks, not the load.
         let injections = load_optional_query(data_dir, lang, &language, "injections", overrides)?;
-        let folds = load_optional_query(data_dir, lang, &language, "folds", overrides)?;
-        let textobjects = load_optional_query(data_dir, lang, &language, "textobjects", overrides)?;
+        let lazy = |name: &str| -> Result<LazyQuery, LoadError> {
+            let source = optional_query_source(data_dir, lang, name, overrides)?;
+            Ok(LazyQuery::deferred(format!("{lang} {name}"), source))
+        };
 
         Ok(Grammar {
             language,
             query,
-            indents,
             injections,
-            folds,
-            textobjects,
+            indents: lazy("indents")?,
+            folds: lazy("folds")?,
+            textobjects: lazy("textobjects")?,
             _lib: lib,
         })
     }
@@ -163,22 +251,34 @@ fn load_optional_query(
     name: &str,
     overrides: &QueryOverrides,
 ) -> Result<Option<Query>, LoadError> {
-    let src = match overrides.get(&(lang.to_string(), name.to_string())) {
-        Some(text) => Some(text.clone()),
-        None => resolve_query(data_dir, lang, name).map_err(|e| {
-            LoadError::Failed(anyhow::Error::new(e).context(format!(
-                "reading {}",
-                query_path(data_dir, lang, &format!("{name}.scm")).display()
-            )))
-        })?,
-    };
-    match src {
+    match optional_query_source(data_dir, lang, name, overrides)? {
         Some(s) => Ok(Some(
             compile_query(language, &s)
                 .with_context(|| format!("compiling {lang} {name}"))
                 .map_err(LoadError::Failed)?,
         )),
         None => Ok(None),
+    }
+}
+
+/// The source text of an **optional** query: the `overrides` entry wins, else the
+/// on-disk `<name>.scm`, else `None`. Reading is cheap — it is the compile that
+/// costs (see [`LazyQuery`]) — so both the eager and the deferred slots resolve
+/// their source here, at load.
+fn optional_query_source(
+    data_dir: &Path,
+    lang: &str,
+    name: &str,
+    overrides: &QueryOverrides,
+) -> Result<Option<String>, LoadError> {
+    match overrides.get(&(lang.to_string(), name.to_string())) {
+        Some(text) => Ok(Some(text.clone())),
+        None => resolve_query(data_dir, lang, name).map_err(|e| {
+            LoadError::Failed(anyhow::Error::new(e).context(format!(
+                "reading {}",
+                query_path(data_dir, lang, &format!("{name}.scm")).display()
+            )))
+        }),
     }
 }
 

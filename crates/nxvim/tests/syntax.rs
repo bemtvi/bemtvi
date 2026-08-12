@@ -65,6 +65,20 @@ fn fixture_data_dir() -> &'static Path {
             write_query(&dir, "markdown", name, &scm);
         }
 
+        // `brokenfolds`: the rust grammar again under a name of its own (the loader
+        // resolves `tree_sitter_<lang>`, so the export is renamed with a `-D`), with a
+        // valid highlights query and a `folds.scm` that does not compile. Its own
+        // language so the shared `rust` / `markdown` keep the query set every other
+        // test expects.
+        compile_grammar_as(&dir, "brokenfolds", "rust", &rust_src);
+        write_query(
+            &dir,
+            "brokenfolds",
+            "highlights",
+            tree_sitter_rust::HIGHLIGHTS_QUERY,
+        );
+        write_query(&dir, "brokenfolds", "folds", "(function_item @fold");
+
         // The engine loads grammars + queries from here, in-process.
         std::env::set_var("NXVIM_DATA_DIR", &dir);
         dir
@@ -76,10 +90,19 @@ fn fixture_data_dir() -> &'static Path {
 /// loader tries first), via the system C compiler — mirroring how a user installs a
 /// parser, but hermetic.
 fn compile_grammar(data_dir: &Path, lang: &str, src_dir: &Path) {
+    compile_grammar_as(data_dir, lang, lang, src_dir)
+}
+
+/// [`compile_grammar`], but installed under a different name than the one the
+/// sources export: the loader looks up `tree_sitter_<lang>`, so `real`'s export is
+/// renamed to `lang`'s with a `-D`. Lets one real grammar stand in for a second
+/// language whose query set differs.
+fn compile_grammar_as(data_dir: &Path, lang: &str, real: &str, src_dir: &Path) {
     let out = data_dir.join("parser").join(format!("{lang}.so"));
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = std::process::Command::new(compiler)
         .args(["-shared", "-fPIC", "-O1"])
+        .arg(format!("-Dtree_sitter_{real}=tree_sitter_{lang}"))
         .arg("-I")
         .arg(src_dir)
         .arg(src_dir.join("parser.c"))
@@ -1885,5 +1908,52 @@ async fn replacing_an_inherited_language_leaves_the_inheritor_alone() {
     assert!(
         groups.iter().any(|g| g == "keyword"),
         "but the inheriting language's bundled query is untouched: {groups:?}"
+    );
+}
+
+/// A query no paint needs — `folds.scm` here — is compiled the first time something
+/// asks for it, not at grammar load (compiling is what a load costs). So a broken one
+/// no longer fails the load: the buffer highlights fine, and the failure surfaces at
+/// the fold that wanted it. It has to reach the user there, or a fold that silently
+/// does nothing looks like a language with nothing foldable.
+#[tokio::test]
+async fn a_broken_fold_query_still_highlights_and_says_why_folding_did_nothing() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    // No extension the filetype table knows: the language is chosen explicitly below.
+    let file = write_temp(
+        "ts-brokenfolds",
+        "brokenfolds",
+        "fn zzz() {\n    let x = 1;\n}\n",
+    );
+    let (rpc, mut incoming) = start(Some(file)).await;
+    exec_lua(&rpc, "nx.cmd('set filetype=brokenfolds')").await;
+
+    // The grammar loaded despite the broken query: the buffer paints.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| row_keyword_at(hl, 0, 0)).await;
+    assert!(
+        row_keyword_at(&hl, 0, 0),
+        "a broken fold query must not cost the buffer its highlights: {hl:?}"
+    );
+
+    // Now ask for folds. The message is the one the load failure used to carry.
+    exec_lua(&rpc, "nx.cmd('set foldmethod=expr')").await;
+    exec_lua(&rpc, "nx.cmd('set foldexpr=nx.treesitter.foldexpr')").await;
+    let mut message = String::new();
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            let msg = message_of(&params);
+            if msg.contains("treesitter") {
+                message = msg;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        message.contains("brokenfolds folds"),
+        "the fold that asked for a broken query must say so: {message:?}"
     );
 }

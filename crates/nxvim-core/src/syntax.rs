@@ -266,6 +266,16 @@ pub trait SyntaxEngine {
     /// final `text`; the engine compiles + caches it, consulting it in place of
     /// the on-disk query. Only `highlights` / `indents` affect the paint; other
     /// names are no-ops. `Err(reason)` on a compile failure, for a loud echo.
+    /// Drain the query-compile failures the engine has hit since the last call, for
+    /// the editor to echo. An engine that compiles every query up front has none;
+    /// one that defers a query until a keypress asks for it (the tree-sitter engine
+    /// does — compiling is the whole cost of a grammar load) reports a broken one
+    /// here instead of at load, once per query. Never silently swallowed: the
+    /// feature degrades, and the editor says why.
+    fn take_query_errors(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn set_query(&mut self, lang: &str, name: &str, text: Option<String>) -> Result<(), String>;
 
     /// Install a *resolved on-disk overlay* for `(lang, name)` at buffer-open: the

@@ -6,6 +6,7 @@
 //! — not the file. Highlights are extracted by running the grammar's query over
 //! just the requested line range.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use tree_sitter::{
     QueryPredicateArg, Tree,
 };
 
-use crate::loader::{compile_query, query_path, Grammar, LoadError, QueryOverrides};
+use crate::loader::{compile_query, query_path, Grammar, LazyQuery, LoadError, QueryOverrides};
 
 const LINE_TYPE: LineType = LineType::LF_CR;
 
@@ -239,6 +240,23 @@ pub struct Engine {
     /// callers go through the [`SyntaxEngine`] trait, whose return types the wasm
     /// implementor shares.
     last_text_injections: Vec<String>,
+    /// Compile failures from the deferred query slots ([`LazyQuery`]), waiting to be
+    /// echoed. A `folds.scm` that doesn't compile no longer stops its language from
+    /// loading — it fails the fold that asks for it — and that has to be as loud as
+    /// the load failure it replaced, so the message is queued here and the editor
+    /// drains it ([`Engine::take_query_errors`]). Interior-mutable because the ask
+    /// sites hold a `&Grammar` borrowed out of `grammars` across the report.
+    query_errors: RefCell<QueryErrors>,
+}
+
+/// The deferred-compile failures an [`Engine`] has to report, and the ones it
+/// already has. `LazyQuery::get` hands back the same error on every later ask (the
+/// compile is not retried), so without `seen` a broken fold query would re-echo on
+/// every keypress that asks for it.
+#[derive(Default)]
+struct QueryErrors {
+    seen: HashSet<String>,
+    pending: Vec<String>,
 }
 
 /// One framing a fragment can be parsed inside — a template split at its `%s`.
@@ -325,6 +343,7 @@ impl Engine {
             query_overrides: QueryOverrides::new(),
             fragment_contexts: HashMap::new(),
             last_text_injections: Vec::new(),
+            query_errors: RefCell::default(),
         }
     }
 
@@ -346,6 +365,31 @@ impl Engine {
     /// Lazily load (and cache) the grammar for `lang`, returning its cache slot.
     /// The load — and its outcome (loaded / not-installed / failed) — happens once
     /// per language; later calls are a cache hit.
+    /// Unwrap a deferred query slot's compile ([`LazyQuery::get`]): the query when it
+    /// compiled, `None` when the language ships no such file, and `None` *plus a
+    /// queued error* when it is present but broken. Never silently swallows the
+    /// failure — the caller degrades (no folds, no treesitter indent) and the editor
+    /// says why, once.
+    fn lazy_query<'q>(&self, slot: Result<Option<&'q Query>, &str>) -> Option<&'q Query> {
+        match slot {
+            Ok(query) => query,
+            Err(msg) => {
+                let mut errors = self.query_errors.borrow_mut();
+                if errors.seen.insert(msg.to_string()) {
+                    errors.pending.push(msg.to_string());
+                }
+                None
+            }
+        }
+    }
+
+    /// Drain the deferred-compile failures reported since the last call, for the
+    /// editor to echo. Empty in the ordinary case: a query that compiles, or a
+    /// language that ships none, never queues anything.
+    pub fn take_query_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.query_errors.borrow_mut().pending)
+    }
+
     fn grammar(&mut self, lang: &str) -> &Slot {
         if !self.grammars.contains_key(lang) {
             // Pick the first search root that actually has this parser (its queries
@@ -514,10 +558,26 @@ impl Engine {
                 g.query = compile_query(&language, &s)
                     .map_err(|e| format!("compiling {lang} highlights: {e}"))?;
             }
-            "indents" => g.indents = compile_opt(src, "indents")?,
             "injections" => g.injections = compile_opt(src, "injections")?,
-            "folds" => g.folds = compile_opt(src, "folds")?,
-            "textobjects" => g.textobjects = compile_opt(src, "textobjects")?,
+            // The deferred slots (see [`LazyQuery`]) are filled *compiled* here: an
+            // override arrives from a user action with a channel to report on, so a
+            // broken one must fail that action rather than a later `=` or `vif`.
+            "indents" | "folds" | "textobjects" => {
+                let label = format!("{lang} {name}");
+                let slot = match src {
+                    Some(s) => {
+                        let q = compile_query(&language, &s)
+                            .map_err(|e| format!("compiling {lang} {name}: {e}"))?;
+                        LazyQuery::ready(label, s, q)
+                    }
+                    None => LazyQuery::absent(label),
+                };
+                match name {
+                    "indents" => g.indents = slot,
+                    "folds" => g.folds = slot,
+                    _ => g.textobjects = slot,
+                }
+            }
             _ => unreachable!("guarded above"),
         }
         Ok(())
@@ -1695,7 +1755,7 @@ impl Engine {
         let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
             return None;
         };
-        let query = grammar.indents.as_ref()?;
+        let query = self.lazy_query(grammar.indents.get(&grammar.language))?;
         let rope = &state.shadow;
         let root = tree.root_node();
         let maps = build_indent_maps(query, &root, rope);
@@ -1830,7 +1890,7 @@ impl Engine {
         let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
             return Vec::new();
         };
-        let Some(query) = grammar.folds.as_ref() else {
+        let Some(query) = self.lazy_query(grammar.folds.get(&grammar.language)) else {
             return Vec::new();
         };
         let rope = &state.shadow;
@@ -1884,7 +1944,7 @@ impl Engine {
         let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
             return Vec::new();
         };
-        let Some(query) = grammar.textobjects.as_ref() else {
+        let Some(query) = self.lazy_query(grammar.textobjects.get(&grammar.language)) else {
             return Vec::new();
         };
         let rope = &state.shadow;
@@ -2126,7 +2186,7 @@ impl SyntaxEngine for Engine {
         };
         matches!(
             self.grammars.get(&state.language),
-            Some(Slot::Loaded(g)) if g.indents.is_some()
+            Some(Slot::Loaded(g)) if g.indents.is_present()
         )
     }
 
@@ -2140,7 +2200,7 @@ impl SyntaxEngine for Engine {
         };
         matches!(
             self.grammars.get(&state.language),
-            Some(Slot::Loaded(g)) if g.folds.is_some()
+            Some(Slot::Loaded(g)) if g.folds.is_present()
         )
     }
 
@@ -2159,8 +2219,12 @@ impl SyntaxEngine for Engine {
         };
         matches!(
             self.grammars.get(&state.language),
-            Some(Slot::Loaded(g)) if g.textobjects.is_some()
+            Some(Slot::Loaded(g)) if g.textobjects.is_present()
         )
+    }
+
+    fn take_query_errors(&mut self) -> Vec<String> {
+        Engine::take_query_errors(self)
     }
 
     fn set_query(&mut self, lang: &str, name: &str, text: Option<String>) -> Result<(), String> {

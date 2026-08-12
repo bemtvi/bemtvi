@@ -408,10 +408,12 @@ impl Editor {
     /// per-line levels and then the nested fold tree.
     pub(crate) fn ts_folds(&mut self, buf: BufferId) -> Vec<crate::syntax::FoldRange> {
         self.sync_syntax_engine(buf);
-        match self.syntax.as_mut() {
+        let folds = match self.syntax.as_mut() {
             Some(engine) => engine.folds(buf),
             None => Vec::new(),
-        }
+        };
+        self.echo_ts_query_errors();
+        folds
     }
 
     /// Whether tree-sitter folds are *available* for `buf` — a grammar with a
@@ -435,9 +437,29 @@ impl Editor {
         byte: usize,
     ) -> Vec<(usize, usize)> {
         self.sync_syntax_engine(buf);
-        match self.syntax.as_mut() {
+        let objects = match self.syntax.as_mut() {
             Some(engine) => engine.text_objects_at(buf, capture, byte),
             None => Vec::new(),
+        };
+        self.echo_ts_query_errors();
+        objects
+    }
+
+    /// Echo whatever query-compile failures the engine queued during the call just
+    /// made ([`SyntaxEngine::take_query_errors`]).
+    ///
+    /// A query nothing paints with — `folds.scm`, `indents.scm`, `textobjects.scm` —
+    /// is compiled the first time a keypress asks for it rather than at grammar load,
+    /// because compiling is what a load costs. A broken one therefore surfaces here,
+    /// at the fold or the `vif` that wanted it, instead of as a load failure. The
+    /// engine reports each one once, so this is a no-op on every later ask.
+    fn echo_ts_query_errors(&mut self) {
+        let Some(engine) = self.syntax.as_mut() else {
+            return;
+        };
+        let errors = engine.take_query_errors();
+        for reason in errors {
+            self.echo(format!("treesitter: {reason}"));
         }
     }
 
@@ -489,6 +511,7 @@ impl Editor {
             Some(s) => (s.indent(buf, line, &p), s.indents_available(buf)),
             None => (None, false),
         };
+        self.echo_ts_query_errors();
         if let Some(w) = ts {
             return w;
         }

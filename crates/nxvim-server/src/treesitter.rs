@@ -97,6 +97,45 @@ impl EditHost {
     /// Refresh one buffer's highlight memo for the absolute line range `first..last`,
     /// re-querying the engine only on a memo miss (its content, the range, or its
     /// language changed since the last fetch).
+    /// Answer one `nx.treesitter.highlight`: highlight `text` as `lang` and settle the
+    /// promise with the spans — unless that language's grammar is still loading, in
+    /// which case the ask is parked and re-run when it lands
+    /// ([`run_parked_ts_highlights`](Self::run_parked_ts_highlights)). Settling it now
+    /// would resolve the promise with an empty span list, which reads as "this text has
+    /// no highlights" rather than "not yet".
+    pub(crate) fn settle_ts_highlight(
+        &mut self,
+        lang: String,
+        text: String,
+        nlines: usize,
+        cb_id: u64,
+    ) {
+        let (spans, _bg) = self.resolved_preview_highlights(&lang, &text, 0, nlines);
+        if spans.is_empty() && self.editor.ts_language_pending(&lang) {
+            self.parked_ts_highlights.push((lang, text, nlines, cb_id));
+            return;
+        }
+        let spans = spans
+            .into_iter()
+            .map(|s| (s.line, s.start_byte, s.end_byte, s.group))
+            .collect();
+        if let Err(e) =
+            self.lua
+                .run_callback(cb_id, false, nxvim_lua::CallbackArgs::TsHighlight { spans })
+        {
+            self.editor
+                .echo(format!("E: nx.treesitter.highlight callback: {e}"));
+        }
+    }
+
+    /// Re-run the `nx.treesitter.highlight` asks parked on a grammar that has now
+    /// landed. One that is *still* pending (a different language) parks again.
+    fn run_parked_ts_highlights(&mut self) {
+        for (lang, text, nlines, cb_id) in std::mem::take(&mut self.parked_ts_highlights) {
+            self.settle_ts_highlight(lang, text, nlines, cb_id);
+        }
+    }
+
     /// Hand every grammar the engine asked for to the host, to load off the editor
     /// thread. Called once a frame (from [`redraw`](crate::EditHost::redraw), after the
     /// highlight refresh), which is after everything that can ask: a buffer's own
@@ -139,6 +178,13 @@ impl EditHost {
             return false;
         }
         self.syntax_states.clear();
+        // The one-shot surfaces: each was painted once, while this grammar was still
+        // loading, and nothing re-derives them from a frame. The picker preview keeps
+        // its lines and re-highlights them; a parked `nx.treesitter.highlight` runs
+        // now and settles its promise. (The doc floats are repainted by the editor, in
+        // `install_ts_grammar` — their styling lives in core.)
+        self.rehighlight_preview();
+        self.run_parked_ts_highlights();
         true
     }
 

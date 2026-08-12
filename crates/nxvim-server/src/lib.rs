@@ -112,6 +112,30 @@ impl EditHost {
     ) -> (Vec<nxvim_core::Span>, Vec<usize>) {
         self.editor.preview_highlights_bg(lang, text, first, last)
     }
+
+    /// The wasm twin of [`treesitter::EditHost::settle_ts_highlight`]. Nothing to park
+    /// on: this build loads no grammars (it highlights JS-side), so the answer this
+    /// call produces is the final one and the promise settles here.
+    pub(crate) fn settle_ts_highlight(
+        &mut self,
+        lang: String,
+        text: String,
+        nlines: usize,
+        cb_id: u64,
+    ) {
+        let (spans, _bg) = self.resolved_preview_highlights(&lang, &text, 0, nlines);
+        let spans = spans
+            .into_iter()
+            .map(|s| (s.line, s.start_byte, s.end_byte, s.group))
+            .collect();
+        if let Err(e) =
+            self.lua
+                .run_callback(cb_id, false, nxvim_lua::CallbackArgs::TsHighlight { spans })
+        {
+            self.editor
+                .echo(format!("E: nx.treesitter.highlight callback: {e}"));
+        }
+    }
 }
 
 /// The process-spawning seam (`vim.system` / `jobstart` / `:!`) and its types,
@@ -1447,6 +1471,13 @@ pub struct EditHost {
     /// Reset when the path differs; dropped implicitly when the picker closes (the
     /// next picker repopulates it). See [`redraw::project_menu`](crate::redraw).
     preview_cache: redraw::PreviewCache,
+    /// `nx.treesitter.highlight` asks waiting on a grammar that is still loading:
+    /// `(language, text, line count, callback id)`. Settling one early would fulfil its
+    /// promise with an empty span list — "this text has no highlights" — so it is
+    /// re-run when the grammar lands ([`EditHost::settle_ts_highlight`]). Native only:
+    /// the browser build's engine loads nothing, so nothing is ever pending.
+    #[cfg(feature = "native")]
+    parked_ts_highlights: Vec<(String, String, usize, u64)>,
     /// The picker preview pane's manual scroll offset: a signed line delta added to
     /// the auto-computed window start (which centers a `location` match ~a third down).
     /// `<C-d>`/`<C-u>`/`<C-f>`/`<C-b>` fold into it in [`redraw::project_preview`]; it
@@ -1824,6 +1855,8 @@ impl EditHost {
             quit_all_replay: None,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
+            #[cfg(feature = "native")]
+            parked_ts_highlights: Vec::new(),
             preview_scroll: 0,
             preview_hscroll: 0,
             preview_anchor: None,

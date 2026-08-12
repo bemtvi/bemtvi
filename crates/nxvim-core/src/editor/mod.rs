@@ -1011,6 +1011,12 @@ pub struct Editor {
     /// dismisses it in [`Editor::input`] — but a mouse wheel never reaches `input`,
     /// so it scrolls the popup instead of closing it.
     doc_float_wins: Vec<(String, WindowId)>,
+    /// What each open doc float was rendered from, keyed by float name. Kept so a
+    /// fenced code block can be repainted once its language's grammar lands — the
+    /// float is built once and never re-derived from a redraw, so without this a block
+    /// in a still-loading language would stay plain for the life of the float. See
+    /// [`Editor::repaint_doc_float_code`].
+    doc_float_rendered: Vec<(String, (BufferId, crate::markdown::Rendered))>,
     /// The signature of the currently-open **completion docs float** — its markdown +
     /// the popup box geometry it was placed against + `wrap`. `open_completion_docs_float`
     /// skips a redundant close+reopen when the signature is unchanged (a bare mouse wheel
@@ -2043,6 +2049,7 @@ impl Editor {
             panel_buffers: Vec::new(),
             doc_float_buffers: Vec::new(),
             doc_float_wins: Vec::new(),
+            doc_float_rendered: Vec::new(),
             completion_docs_sig: None,
             panel: None,
             view_float_lock: Vec::new(),

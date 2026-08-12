@@ -2437,6 +2437,18 @@ impl EditHost {
     /// syntax-highlighting the whole file once here (so moving the selection within one
     /// file's matches never re-parses). Highlights are keyed by 0-based file line; empty
     /// when the read failed (`ok = false`) or no grammar is installed for the path.
+    /// Recompute the cached preview's highlights in place — its language's grammar
+    /// just landed, and the preview was stored while the load was still in flight (so
+    /// it painted as plain text). The file is not re-read: only the spans change.
+    pub(crate) fn rehighlight_preview(&mut self) {
+        let Some(path) = self.preview_cache.path.clone() else {
+            return;
+        };
+        let lines = std::mem::take(&mut self.preview_cache.lines);
+        let ok = self.preview_cache.ok;
+        self.store_preview(&path, lines, ok);
+    }
+
     fn store_preview(&mut self, p: &std::path::Path, lines: Vec<String>, ok: bool) {
         // The highlight language: the extension's grammar, or — for a vim help
         // `doc/*.txt`, which no extension rule catches — `vimdoc`, decided from the

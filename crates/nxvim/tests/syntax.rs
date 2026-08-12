@@ -1442,9 +1442,13 @@ nx.complete.setup { sources = { { 'hover' } } }",
             if let Some(win) = named_win(&params, "[CompletionDocs]") {
                 let lines = win_text(&win);
                 if let Some(row) = lines.iter().position(|l| l.contains("field: Vec<String>")) {
+                    // Non-empty: the float paints plain first and colours in when the
+                    // grammar lands, so an empty row is "not yet", not "no spans".
                     if let Some(row_spans) = win_hl(&win).get(row) {
-                        spans = Some(row_spans.clone());
-                        break;
+                        if !row_spans.is_empty() {
+                            spans = Some(row_spans.clone());
+                            break;
+                        }
                     }
                 }
             }
@@ -2001,5 +2005,54 @@ async fn a_cold_grammar_loads_off_the_editor_thread() {
         round_trips > 4,
         "the server answered only {round_trips} requests before the grammar landed: \
          the load ran on the editor thread"
+    );
+}
+
+/// `nx.treesitter.highlight` on a language this session has never loaded must wait
+/// for the grammar, not resolve empty.
+///
+/// It is a promise over a *stateless* highlight: no buffer, so nothing repaints it
+/// later — whatever it resolves with is what the caller gets. Resolving it while the
+/// grammar is still loading would hand back an empty span list, which reads as "this
+/// text has no highlights" and is indistinguishable from a language with nothing to
+/// paint. So the ask is parked and re-run when the grammar lands.
+#[tokio::test]
+async fn a_stateless_highlight_waits_for_its_grammar_instead_of_resolving_empty() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    // An extension with no grammar: nothing loads rust before the ask below.
+    let file = write_temp("stateless-cold", "unknownext", "x\n");
+    let (rpc, _incoming) = start(Some(file)).await;
+
+    exec_lua(
+        &rpc,
+        "_G.groups = nil\n\
+         nx.async(function()\n\
+           local spans = nx.await(nx.treesitter.highlight('rust', 'fn zzz() {}\\n'))\n\
+           local g = {}\n\
+           for _, s in ipairs(spans) do g[#g + 1] = s.group end\n\
+           _G.groups = g\n\
+         end)()",
+    )
+    .await;
+
+    let mut groups = Vec::new();
+    for _ in 0..100 {
+        let done = exec_lua(&rpc, "return _G.groups ~= nil").await;
+        if done == Value::Boolean(true) {
+            let listed = exec_lua(&rpc, "return table.concat(_G.groups or {}, ',')").await;
+            groups = listed
+                .as_str()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        groups.iter().any(|g| g == "keyword"),
+        "the promise resolved before the grammar was there: {groups:?}"
     );
 }

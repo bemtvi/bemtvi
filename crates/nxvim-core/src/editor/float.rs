@@ -403,6 +403,30 @@ impl Editor {
         self.place_doc_float(name, buf, &lines);
     }
 
+    /// Repaint the open doc floats holding a fenced block in `language` — the grammar
+    /// just became available, and the block was painted plain (its code background
+    /// only) when the float was built.
+    ///
+    /// Re-running the render is the whole repaint: it clears [`DOC_MD_NS`] and lays the
+    /// styling down again from the document the float was built from, so this is the
+    /// same result as having had the grammar all along. Nothing is re-measured or
+    /// re-placed — the display lines are identical.
+    pub(crate) fn repaint_doc_float_code(&mut self, language: &str) {
+        let stale: Vec<(String, BufferId, crate::markdown::Rendered)> = self
+            .doc_float_rendered
+            .iter()
+            .filter(|(_, (_, r))| {
+                r.code
+                    .iter()
+                    .any(|b| b.lang.as_deref().is_some_and(|l| l == language))
+            })
+            .map(|(name, (buf, r))| (name.clone(), *buf, r.clone()))
+            .collect();
+        for (name, buf, rendered) in stale {
+            self.render_rendered_into(buf, &name, rendered);
+        }
+    }
+
     /// Render an already-[`Rendered`](crate::markdown::Rendered) markdown document into
     /// the doc-float scratch buffer `buf`: load the stripped display lines, leave the
     /// buffer untyped, and repaint its [`DOC_MD_NS`] styling from scratch — inline
@@ -422,6 +446,13 @@ impl Editor {
         if rendered.lines.is_empty() {
             return Vec::new();
         }
+        // Kept so the float can be repainted from the same document later — a fenced
+        // block whose grammar was still loading when this ran has nothing but the code
+        // background to show for it until then ([`repaint_doc_float_code`]).
+        self.doc_float_rendered
+            .retain(|(open, _)| open.as_str() != name);
+        self.doc_float_rendered
+            .push((name.to_string(), (buf, rendered.clone())));
 
         self.load_str_into(buf, Some(name.to_string()), &rendered.lines.join("\n"));
         self.buffers.get_mut(buf).buffer.options.modifiable = false;

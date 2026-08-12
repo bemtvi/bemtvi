@@ -310,6 +310,16 @@ pub trait SyntaxEngine {
         Vec::new()
     }
 
+    /// Whether `language`'s load is in flight — asked for, no verdict yet.
+    ///
+    /// The one-shot surfaces (a picker preview, a doc float, a stateless
+    /// `highlight_text`) paint nothing for a language that isn't loaded, and this is
+    /// how they tell "nothing will ever paint here" from "come back when it lands".
+    /// False by default, and for an engine that never defers: its answer is final.
+    fn language_pending(&self, _language: &str) -> bool {
+        false
+    }
+
     /// Load `language` synchronously, even if this engine defers loads
     /// ([`take_grammar_requests`](Self::take_grammar_requests)) — for an ask whose
     /// answer cannot arrive a frame later.

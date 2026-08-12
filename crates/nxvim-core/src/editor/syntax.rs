@@ -446,6 +446,15 @@ impl Editor {
         objects
     }
 
+    /// Whether `language`'s grammar is still loading — asked for, no verdict yet.
+    /// The one-shot surfaces use this to tell "this will never paint" from "ask again
+    /// when it lands" ([`SyntaxEngine::language_pending`]).
+    pub fn ts_language_pending(&self, language: &str) -> bool {
+        self.syntax
+            .as_ref()
+            .is_some_and(|engine| engine.language_pending(language))
+    }
+
     /// Force `buf`'s grammar to load *now* if the engine is deferring loads — in
     /// front of an ask that answers a keystroke and cannot be corrected on a later
     /// frame ([`SyntaxEngine::load_language_now`]).
@@ -512,6 +521,10 @@ impl Editor {
         // would keep its unfolded state until the next keystroke. A grammar landing
         // is a fold input changing, so it recomputes here like `:set foldexpr` does.
         self.refresh_folds();
+        // A doc float's fenced code block is painted once, when the float is built —
+        // there is no redraw that re-derives it — so a block whose language was still
+        // loading then has to be repainted here.
+        self.repaint_doc_float_code(language);
         if let crate::syntax::GrammarInstall::Failed(reason) = outcome {
             if self.syntax_failed.insert(language.to_string()) {
                 self.echo(format!(

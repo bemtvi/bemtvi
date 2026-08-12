@@ -922,18 +922,7 @@ impl EditHost {
                         format!("{text}\n")
                     };
                     let nlines = text.matches('\n').count();
-                    let (spans, _bg) = self.resolved_preview_highlights(&lang, &text, 0, nlines);
-                    let spans = spans
-                        .into_iter()
-                        .map(|s| (s.line, s.start_byte, s.end_byte, s.group))
-                        .collect();
-                    if let Err(e) =
-                        self.lua
-                            .run_callback(cb_id, false, CallbackArgs::TsHighlight { spans })
-                    {
-                        self.editor
-                            .echo(format!("E: nx.treesitter.highlight callback: {e}"));
-                    }
+                    self.settle_ts_highlight(lang, text, nlines, cb_id);
                 }
                 #[cfg(feature = "native")]
                 TsOp::SetQuery { lang, name, text } => {

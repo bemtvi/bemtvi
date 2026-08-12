@@ -474,14 +474,8 @@ impl Engine {
         &self.grammars[lang]
     }
 
-    /// The grammar for `lang`, loaded **now** even in deferred mode — the one-shot
-    /// surfaces ([`highlight_text_bg`](Self::highlight_text_bg),
-    /// [`highlight_fragment`](Self::highlight_fragment) and the fragment probe) have
-    /// nothing to paint later: they own no buffer to repaint and their caller wants
-    /// spans from this call. They are also user-initiated and rare (a picker preview,
-    /// a doc float), so the load lands on a frame the user asked for. Phase 3 of
-    /// `docs/plans/2026-08-12-async-grammar-load.md` gives them a repaint and this
-    /// goes away.
+    /// The grammar for `lang`, loaded **now** even in deferred mode — for
+    /// [`load_language_now`](Self::load_language_now), the ask that cannot wait.
     fn grammar_now(&mut self, lang: &str) -> &Slot {
         if self.defer_loads && !matches!(self.grammars.get(lang), Some(Slot::Loaded(_))) {
             let root = self.root_for(lang).to_path_buf();
@@ -519,6 +513,16 @@ impl Engine {
     /// an embedder that just wants spans keeps the synchronous path.
     pub fn defer_loads(&mut self, defer: bool) {
         self.defer_loads = defer;
+    }
+
+    /// Whether `lang` has been asked for and has no verdict yet — its load is in
+    /// flight. The one-shot surfaces (a picker preview, a doc float, a
+    /// `nx.treesitter.highlight`) ask this after painting nothing: it separates "this
+    /// language will never paint" from "ask me again when the grammar lands", which is
+    /// what lets them come back instead of returning plain text for good.
+    pub fn language_pending(&self, lang: &str) -> bool {
+        let lang = nxvim_core::resolve_language(lang);
+        matches!(self.grammars.get(lang), Some(Slot::Loading))
     }
 
     /// Drain the grammars queued for the host to load. See [`Self::defer_loads`].
@@ -1718,7 +1722,7 @@ impl Engine {
     /// and the caller paints nothing either way.
     fn parses_cleanly(&mut self, lang: &str, text: &str) -> bool {
         let lang = nxvim_core::resolve_language(lang);
-        let language = match self.grammar_now(lang) {
+        let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
             _ => return true,
         };
@@ -1772,7 +1776,7 @@ impl Engine {
         // Cleared up front so an early return below reports *this* call's (empty) set
         // rather than leaving the previous call's languages behind.
         self.last_text_injections.clear();
-        let language = match self.grammar_now(lang) {
+        let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
             _ => return (Vec::new(), Vec::new()), // silent: no grammar (or load failed)
         };
@@ -1849,7 +1853,7 @@ impl Engine {
                 _ => Vec::new(),
             };
             for (child_lang, mut ranges) in regions {
-                let child_language = match self.grammar_now(&child_lang) {
+                let child_language = match self.grammar(&child_lang) {
                     Slot::Loaded(g) => g.language.clone(),
                     _ => continue, // missing/broken child grammar → region keeps host paint
                 };
@@ -2414,6 +2418,10 @@ impl SyntaxEngine for Engine {
 
     fn load_language_now(&mut self, language: &str) -> bool {
         Engine::load_language_now(self, language)
+    }
+
+    fn language_pending(&self, language: &str) -> bool {
+        Engine::language_pending(self, language)
     }
 
     fn install_grammar(&mut self, language: &str, loaded: Box<dyn Any + Send>) -> GrammarInstall {

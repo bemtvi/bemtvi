@@ -3544,6 +3544,12 @@ impl EditHost {
 #[cfg(feature = "native")]
 type InstallOutcome = (String, anyhow::Result<nxvim_ts::install::InstallReport>);
 
+/// A finished off-tick grammar load on its way back to the editor thread: the
+/// language, and the engine's own opaque result payload (only the engine reads it —
+/// see [`HostEffects::ts_load_grammar`](crate::edithost::HostEffects::ts_load_grammar)).
+#[cfg(feature = "native")]
+type GrammarOutcome = (String, Box<dyn std::any::Any + Send>);
+
 /// Run the server over a connected stream until the client disconnects or the
 /// editor quits.
 #[cfg(feature = "native")]
@@ -3649,7 +3655,12 @@ where
     // synchronously for highlights (and, later, indentation). It loads
     // installable grammars from the data dir at runtime; a buffer with no grammar
     // simply isn't highlighted.
-    editor.set_syntax_engine(Box::new(nxvim_ts::Engine::new(nxvim_ts::data_dir())));
+    // Grammar loads go through the run loop's worker rather than the tick that first
+    // needs the language — the server drives the other half of that handshake
+    // (`dispatch_grammar_requests` → `ts_load_grammar` → `on_grammars_loaded`).
+    let mut engine = nxvim_ts::Engine::new(nxvim_ts::data_dir());
+    engine.defer_loads(true);
+    editor.set_syntax_engine(Box::new(engine));
     // The `"+` / `"*` registers route through an injected clipboard provider.
     // `System` resolves a real host clipboard tool (best effort), falling back to
     // the client terminal's OSC 52 clipboard when this machine has none that could
@@ -3851,6 +3862,10 @@ where
     // `:TSInstall` runs the fetch+compile off-thread (`spawn_blocking`); results
     // come back here and are applied on the one server thread.
     let (install_tx, mut install_events) = unbounded_channel::<InstallOutcome>();
+    // A grammar the engine asked for is loaded on a `spawn_blocking` worker (compiling
+    // its queries is hundreds of ms); the loaded grammar comes back here and is
+    // installed on the one server thread.
+    let (grammar_tx, mut grammar_events) = unbounded_channel::<GrammarOutcome>();
     // Off-tick `:w`s (the daemon save path) push their bytes over the wire from a
     // spawned task; the finished write comes back here and finalizes on the one
     // server thread. Idle for a local/bare session (no daemon fs → no off-tick saves).
@@ -3910,6 +3925,7 @@ where
             chdir_done_tx,
             lsp,
             install_tx,
+            grammar_tx,
             terminals,
             host_term,
         )),
@@ -4179,6 +4195,9 @@ where
             // A `:TSInstall` background job finished (grammar fetched + compiled, or it
             // failed): reload the grammar so open buffers re-highlight/indent, echo.
             Some(outcome) = install_events.recv() => host.on_installs(outcome, &mut install_events),
+            // An off-tick grammar load finished: install it into the engine and repaint,
+            // so the buffer that opened before its language was ready colours in.
+            Some(loaded) = grammar_events.recv() => host.on_grammars_loaded(loaded, &mut grammar_events),
             // An off-tick `:w` finished on the daemon (the save path): finalize the
             // buffer's saved-state and replay any deferred `:wq`/`:x` quit. A replayed quit
             // may ask the editor to exit — caught by the post-`select!` quit funnel below.

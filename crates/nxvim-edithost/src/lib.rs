@@ -859,6 +859,18 @@ impl HostEffects for WasmEffects {
         self.sink.borrow_mut().term_kills.push(buf);
     }
 
+    fn ts_load_grammar(&mut self, request: nxvim_core::syntax::GrammarRequest) {
+        // Unreachable by construction: the browser build highlights JS-side
+        // (web-tree-sitter) and its `SyntaxEngine` owns no grammars, so nothing ever
+        // asks for one to be loaded. If that changes, this must grow a real leg rather
+        // than dropping the request — a grammar wedged "loading" forever would leave
+        // the language silently unpainted.
+        unreachable!(
+            "the browser edit-host has no grammar to load ('{}')",
+            request.language
+        );
+    }
+
     fn ts_install(&mut self, lang: String) {
         // `:TSInstall <lang>` on the browser build: record the request for the Worker to
         // forward to the UI thread (`eh_take_ts_requests` → `ts_install` postMessage),

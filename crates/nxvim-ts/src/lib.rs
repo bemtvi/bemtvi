@@ -20,7 +20,7 @@ pub mod lua_pattern;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub use engine::Engine;
+pub use engine::{load_requested, Engine};
 pub use loader::{Grammar, LoadedLanguage};
 
 /// Resolve nxvim's data directory (where `parser/` and `queries/` live).

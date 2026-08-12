@@ -97,6 +97,51 @@ impl EditHost {
     /// Refresh one buffer's highlight memo for the absolute line range `first..last`,
     /// re-querying the engine only on a memo miss (its content, the range, or its
     /// language changed since the last fetch).
+    /// Hand every grammar the engine asked for to the host, to load off the editor
+    /// thread. Called once a frame (from [`redraw`](crate::EditHost::redraw), after the
+    /// highlight refresh), which is after everything that can ask: a buffer's own
+    /// language, the languages it injects, a fold or an indent query.
+    ///
+    /// Fire-and-forget — the loaded grammar returns on the run loop's grammar arm
+    /// ([`on_grammars_loaded`](Self::on_grammars_loaded)). The engine records each
+    /// request as `Slot::Loading`, so a language is asked for once, not once a frame.
+    pub(crate) fn dispatch_grammar_requests(&mut self) {
+        for request in self.editor.take_ts_grammar_requests() {
+            self.fx.ts_load_grammar(request);
+        }
+    }
+
+    /// Coalesce a burst of finished grammar loads: install each into the engine (which
+    /// re-opens the buffers that were waiting on it), then settle + repaint.
+    pub(crate) fn on_grammars_loaded(
+        &mut self,
+        first: crate::GrammarOutcome,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::GrammarOutcome>,
+    ) {
+        let mut changed = self.install_grammar(first);
+        while let Ok(outcome) = rx.try_recv() {
+            changed |= self.install_grammar(outcome);
+        }
+        // A load that found no parser installed leaves the frame exactly as it was, and
+        // repainting for it is not free — every decoration provider is re-dispatched.
+        if changed {
+            self.settle_events(true);
+        }
+    }
+
+    /// Install one finished load. The server's highlight memo is keyed on
+    /// `(changedtick, viewport)` — neither changes when a grammar lands — so it is
+    /// dropped here for the same reason `:TSInstall` drops it: otherwise a buffer
+    /// opened before its grammar was ready stays plain until the next edit or scroll.
+    fn install_grammar(&mut self, outcome: crate::GrammarOutcome) -> bool {
+        let (lang, loaded) = outcome;
+        if !self.editor.install_ts_grammar(&lang, loaded) {
+            return false;
+        }
+        self.syntax_states.clear();
+        true
+    }
+
     fn refresh_buffer_highlights(&mut self, buffer: BufferId, first: usize, last: usize) {
         // Buffer-open half of the query bridge: resolve this language's runtimepath
         // queries (`queries/` + `after/queries`, `;; extends`) onto the engine once,

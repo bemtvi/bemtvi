@@ -436,6 +436,7 @@ impl Editor {
         capture: &str,
         byte: usize,
     ) -> Vec<(usize, usize)> {
+        self.ts_load_language_now(buf);
         self.sync_syntax_engine(buf);
         let objects = match self.syntax.as_mut() {
             Some(engine) => engine.text_objects_at(buf, capture, byte),
@@ -443,6 +444,82 @@ impl Editor {
         };
         self.echo_ts_query_errors();
         objects
+    }
+
+    /// Force `buf`'s grammar to load *now* if the engine is deferring loads — in
+    /// front of an ask that answers a keystroke and cannot be corrected on a later
+    /// frame ([`SyntaxEngine::load_language_now`]).
+    fn ts_load_language_now(&mut self, buf: BufferId) {
+        let Some(language) = self.ts_language_for(buf) else {
+            return;
+        };
+        let loaded = match self.syntax.as_mut() {
+            Some(engine) => engine.load_language_now(&language),
+            None => false,
+        };
+        if loaded {
+            self.reopen_buffers_of(&language);
+        }
+    }
+
+    /// Forget the "opened in this language" markers for `language`, so the next
+    /// [`sync_syntax_engine`](Self::sync_syntax_engine) re-opens each affected buffer.
+    /// A buffer opened while its grammar was still loading was recorded as opened but
+    /// the engine kept nothing for it — without this it would stay unparsed until its
+    /// language changed.
+    fn reopen_buffers_of(&mut self, language: &str) {
+        self.syntax_opened
+            .retain(|_buf, opened| opened.as_str() != language);
+    }
+
+    /// Drain the grammars the engine wants loaded off the editor thread, for the
+    /// server to run on a worker and hand back to
+    /// [`install_ts_grammar`](Self::install_ts_grammar). Empty unless the host put
+    /// the engine in deferred-loading mode (nothing to defer *to*, otherwise).
+    pub fn take_ts_grammar_requests(&mut self) -> Vec<crate::syntax::GrammarRequest> {
+        match self.syntax.as_mut() {
+            Some(engine) => engine.take_grammar_requests(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Install a grammar the host finished loading, and drop the per-buffer "opened
+    /// in this language" markers so the next sync re-opens each affected buffer
+    /// against it — the buffers that wanted this grammar were opened while it was
+    /// still missing.
+    ///
+    /// A grammar that is *installed but broken* is echoed once per language, exactly
+    /// as a synchronous load failure is ([`sync_syntax_engine`](Self::sync_syntax_engine));
+    /// a missing one stays silent, since highlighting is best-effort.
+    /// Reports whether the frame has anything new to show for it: a language with no
+    /// parser installed changes nothing on screen, and repainting for it would be a
+    /// visible cost (every decoration provider re-dispatched) for no visible result.
+    pub fn install_ts_grammar(
+        &mut self,
+        language: &str,
+        loaded: Box<dyn std::any::Any + Send>,
+    ) -> bool {
+        let Some(engine) = self.syntax.as_mut() else {
+            return false;
+        };
+        let outcome = engine.install_grammar(language, loaded);
+        if matches!(outcome, crate::syntax::GrammarInstall::Missing) {
+            return false;
+        }
+        self.reopen_buffers_of(language);
+        // Folds are recomputed from the input loop and the option setters, so a
+        // buffer whose `foldmethod=expr` asked for this grammar before it existed
+        // would keep its unfolded state until the next keystroke. A grammar landing
+        // is a fold input changing, so it recomputes here like `:set foldexpr` does.
+        self.refresh_folds();
+        if let crate::syntax::GrammarInstall::Failed(reason) = outcome {
+            if self.syntax_failed.insert(language.to_string()) {
+                self.echo(format!(
+                    "treesitter: grammar '{language}' failed to load: {reason}"
+                ));
+            }
+        }
+        true
     }
 
     /// Echo whatever query-compile failures the engine queued during the call just
@@ -499,6 +576,7 @@ impl Editor {
     /// edits since the last redraw) — currency is required for a correct verdict.
     pub(crate) fn indent_for(&mut self, line: usize) -> usize {
         let buf = self.current_buffer_id();
+        self.ts_load_language_now(buf);
         self.sync_syntax_engine(buf);
         let opts = self.buffer().options;
         let p = IndentParams {

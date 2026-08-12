@@ -1114,6 +1114,13 @@ nx.decor.provider {
     // pass each measurement RPC itself drives. (A loop served on demand would add
     // thousands of runs over this window; the pacing makes the cost O(1) per pass,
     // which is what a provider dispatched per keystroke already costs.)
+    //
+    // Measured over the *second* idle window. The first absorbs the one-off repaint
+    // this buffer's grammar causes when it finishes loading — that load runs off the
+    // editor thread now, so it lands a little after the open rather than during it.
+    // One repaint is not what this test is about; a spin would show in both windows.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let idle = lua_u64(&rpc, "return _G.runs").await.unwrap();
     assert!(
@@ -1239,11 +1246,15 @@ nx.decor.provider {
     );
     // Not free-running: idling adds nothing beyond the pass the measurement itself
     // drives, where an on-demand loop would add thousands of runs over this window.
+    // Measured over the second window, so the one-off repaint from this buffer's
+    // grammar finishing its (off-thread) load doesn't count as a spin.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let settled = lua_u64(&rpc, "return _G.runs").await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let idle = lua_u64(&rpc, "return _G.runs").await.unwrap();
     assert!(
-        idle - after_open <= 2,
-        "idling adds at most the measurement's own pass, not a spin: {after_open} -> {idle}"
+        idle - settled <= 2,
+        "idling adds at most the measurement's own pass, not a spin: {settled} -> {idle}"
     );
 
     // Recovery: a real viewport change is never paced, so decoration still works after

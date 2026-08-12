@@ -404,6 +404,16 @@ pub trait HostEffects {
     /// grammar and echoes. The native impl runs the work on a `spawn_blocking` worker;
     /// the wasm build (Phase 5) supplies its own grammar-fetch path.
     fn ts_install(&mut self, lang: String);
+
+    /// Load a treesitter grammar off the editor thread. Compiling a language's
+    /// queries is what a grammar load costs — hundreds of ms for a big one, none of
+    /// it interruptible — so the engine asks rather than loading on the frame that
+    /// first needs the language ([`Editor::take_ts_grammar_requests`](nxvim_core::Editor::take_ts_grammar_requests)).
+    /// Fire-and-forget; the loaded grammar comes back *inbound* on the run loop's
+    /// grammar arm, which installs it and repaints. The native impl runs the load on a
+    /// `spawn_blocking` worker; the browser build has no engine to load into (it
+    /// highlights JS-side) and never receives a request.
+    fn ts_load_grammar(&mut self, request: nxvim_core::syntax::GrammarRequest);
 }
 
 /// The native implementation of [`HostEffects`]: the client wire is msgpack-RPC and
@@ -437,6 +447,8 @@ pub struct NativeEffects {
     /// The effect spawns the fetch+compile on a `spawn_blocking` worker and forwards the
     /// outcome here.
     install_tx: UnboundedSender<crate::InstallOutcome>,
+    /// Where a finished off-tick grammar load lands (the run loop's grammar arm).
+    grammar_tx: UnboundedSender<crate::GrammarOutcome>,
     /// The terminal command sink — the actor the editor tick fires `Open` / `Write` /
     /// `Resize` / `Kill` at. Its inbound output/exit stream (`term_events`) is owned by
     /// the run loop's `select!`, not here (the [`EventLoop`] pattern).
@@ -464,6 +476,7 @@ impl NativeEffects {
         chdir_done_tx: UnboundedSender<crate::cwd::ChdirDone>,
         lsp: LspManager,
         install_tx: UnboundedSender<crate::InstallOutcome>,
+        grammar_tx: UnboundedSender<crate::GrammarOutcome>,
         terminals: crate::terminal::native::TerminalManager,
         host_term: Option<crate::daemon::RemoteHostTerm>,
     ) -> Self {
@@ -476,6 +489,7 @@ impl NativeEffects {
             chdir_done_tx,
             lsp,
             install_tx,
+            grammar_tx,
             terminals,
             host_term,
         }
@@ -625,6 +639,16 @@ impl HostEffects for NativeEffects {
 
     fn lsp_apply_edit_response(&mut self, key: ServerKey, id: u64, outcome: ApplyEditOutcome) {
         self.lsp.apply_edit_response(key, id, outcome);
+    }
+
+    fn ts_load_grammar(&mut self, request: nxvim_core::syntax::GrammarRequest) {
+        let tx = self.grammar_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let loaded = nxvim_ts::load_requested(request.payload);
+            // The receiver only drops at shutdown; a send error means we're exiting, so
+            // there's nothing to report to.
+            let _ = tx.send((request.language, loaded));
+        });
     }
 
     fn ts_install(&mut self, lang: String) {

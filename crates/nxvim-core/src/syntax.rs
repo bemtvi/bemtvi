@@ -10,6 +10,8 @@
 //! A front end with no engine (a bare-core test) simply has no highlighting and
 //! no treesitter indentation.
 
+use std::any::Any;
+
 use crate::buffer::BufferEdit;
 use crate::editor::BufferId;
 
@@ -67,6 +69,33 @@ pub struct IndentParams {
 /// The engine keeps its **own shadow text** per buffer, so its methods never
 /// borrow the editor's buffers: `edit` takes deltas by value, and
 /// `highlights`/`indent` query the engine's own shadow.
+/// A grammar an engine wants loaded off the editor thread
+/// ([`SyntaxEngine::take_grammar_requests`]).
+///
+/// `payload` is opaque to everyone in between: the engine that produced it and that
+/// engine's loader are the only two that read it, so the host just carries it to a
+/// worker and carries the result back. That keeps the paths, query overrides and
+/// grammar types of a particular engine out of the editor and the server.
+/// What a finished grammar load turned out to be
+/// ([`SyntaxEngine::install_grammar`]).
+pub enum GrammarInstall {
+    /// A usable grammar landed: the buffers waiting on it can parse now, so the frame
+    /// has something new to show.
+    Loaded,
+    /// No parser installed for this language. Silent, and nothing to repaint — the
+    /// buffer was already painting as plain text and will keep doing so.
+    Missing,
+    /// Installed but broken; the reason to echo, once.
+    Failed(String),
+}
+
+pub struct GrammarRequest {
+    /// The language, for reporting and for keying the result back.
+    pub language: String,
+    /// What that engine's loader needs to do the load. Opaque here.
+    pub payload: Box<dyn Any + Send>,
+}
+
 pub trait SyntaxEngine {
     /// (Re)initialize `buffer` from full `text` in `language` and parse it. Used
     /// on open and on a whole-rope replacement (undo/redo, reload). The
@@ -266,6 +295,48 @@ pub trait SyntaxEngine {
     /// final `text`; the engine compiles + caches it, consulting it in place of
     /// the on-disk query. Only `highlights` / `indents` affect the paint; other
     /// names are no-ops. `Err(reason)` on a compile failure, for a loud echo.
+    /// Drain the grammars the engine wants loaded **off the editor thread**, for the
+    /// host to run and hand back through [`install_grammar`](Self::install_grammar).
+    ///
+    /// Loading a grammar is not cheap enough to do on a tick — it is dominated by
+    /// compiling the language's queries, hundreds of ms for a big grammar — and none
+    /// of it is interruptible, so an engine that loads inline freezes the editor on
+    /// the frame that first needs a language. An engine that defers instead paints
+    /// what it can, asks here, and gets the result back a frame or two later.
+    ///
+    /// Empty by default, and empty for an engine the host never told to defer: the
+    /// request only exists because something has a thread to run it on.
+    fn take_grammar_requests(&mut self) -> Vec<GrammarRequest> {
+        Vec::new()
+    }
+
+    /// Load `language` synchronously, even if this engine defers loads
+    /// ([`take_grammar_requests`](Self::take_grammar_requests)) — for an ask whose
+    /// answer cannot arrive a frame later.
+    ///
+    /// A paint or a fold self-corrects when the grammar lands: the editor repaints and
+    /// recomputes. An indent or a text object cannot — they answer the keystroke that
+    /// asked, and it does not come back, so a deferred load there silently degrades to
+    /// the non-treesitter answer (wrong indentation, a `vif` that does nothing). The
+    /// editor calls this in front of those. No-op by default, and for an engine that
+    /// wasn't deferring in the first place.
+    /// Reports whether this call is what made the grammar available, so the editor
+    /// can re-open the buffers that were opened while it was missing.
+    fn load_language_now(&mut self, _language: &str) -> bool {
+        false
+    }
+
+    /// Install a grammar the host finished loading — the other half of
+    /// [`take_grammar_requests`](Self::take_grammar_requests). `loaded` is the opaque
+    /// payload that engine's own loader produced, so only it can read it.
+    ///
+    /// The verdict tells the editor both what to echo and whether the frame changed:
+    /// a language with no parser installed is silent *and* leaves the buffer painting
+    /// exactly as it already was, so it must not cost a repaint.
+    fn install_grammar(&mut self, _language: &str, _loaded: Box<dyn Any + Send>) -> GrammarInstall {
+        GrammarInstall::Missing
+    }
+
     /// Drain the query-compile failures the engine has hit since the last call, for
     /// the editor to echo. An engine that compiles every query up front has none;
     /// one that defers a query until a keypress asks for it (the tree-sitter engine

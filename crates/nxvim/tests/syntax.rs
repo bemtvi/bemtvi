@@ -1957,3 +1957,49 @@ async fn a_broken_fold_query_still_highlights_and_says_why_folding_did_nothing()
         "the fold that asked for a broken query must say so: {message:?}"
     );
 }
+
+/// A grammar loads **off** the editor thread: the server keeps answering while it
+/// happens, and the buffer colours in a few frames later with no keystroke.
+///
+/// Loading is dominated by compiling the language's queries — tens to hundreds of ms,
+/// none of it interruptible — so doing it on the tick that first needs the language
+/// freezes the editor there. The proof is concurrency, not a clock: count the request
+/// round-trips the server completes between asking for the language and painting it.
+/// A load on the tick answers the request that triggered it only once the whole load
+/// is done, so the count is one or two; off the thread, the server answers throughout.
+#[tokio::test]
+async fn a_cold_grammar_loads_off_the_editor_thread() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    // Plain text to start with: nothing to load until the filetype is set below, so
+    // this measures a cold load and not the startup frames around it.
+    let file = write_temp("cold-async", "unknownext", "fn zzz() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    barrier(&rpc).await;
+    let _ = drain_latest_redraw(&mut incoming);
+
+    // `brokenfolds` is its own fixture grammar, so this server has never loaded it.
+    exec_lua(&rpc, "nx.cmd('set filetype=brokenfolds')").await;
+    let mut round_trips = 0;
+    let mut painted = false;
+    for _ in 0..2000 {
+        barrier(&rpc).await;
+        round_trips += 1;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if row_keyword_at(&highlights_of(&params), 0, 0) {
+                painted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        painted,
+        "the buffer never coloured in after its language was set"
+    );
+    assert!(
+        round_trips > 4,
+        "the server answered only {round_trips} requests before the grammar landed: \
+         the load ran on the editor thread"
+    );
+}

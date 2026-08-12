@@ -6,12 +6,14 @@
 //! — not the file. Highlights are extracted by running the grammar's query over
 //! just the requested line range.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use nxvim_core::syntax::{GrammarInstall, GrammarRequest};
 use nxvim_core::{BufferEdit, BufferId, FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
@@ -190,6 +192,49 @@ enum Slot {
     NotInstalled,
     /// Installed but broken; the reason to echo.
     Failed(String),
+    /// Asked for, being loaded off the editor thread — no grammar *yet*. Distinct
+    /// from `NotInstalled` so the ask isn't repeated every frame, and so the miss
+    /// stays temporary: [`Engine::install_grammar`] replaces it with the verdict.
+    Loading,
+}
+
+/// What a deferred load needs, produced by [`Engine::grammar`] and consumed by
+/// [`load_requested`] on whatever thread the host runs it on. Opaque to the editor
+/// and the server, which only carry it.
+struct LoadRequest {
+    root: PathBuf,
+    language: String,
+    overrides: QueryOverrides,
+}
+
+/// What a deferred load produced, handed back through [`Engine::install_grammar`].
+struct LoadResult {
+    slot: Slot,
+}
+
+/// Run a deferred grammar load — the worker half of [`Engine::defer_loads`]. Pure
+/// and thread-safe: it touches only the request's own paths, so the host runs it
+/// wherever it likes (a `spawn_blocking` worker, natively) and hands the result back
+/// on the editor thread.
+///
+/// A payload that didn't come from this engine is a wiring bug; it comes back as a
+/// load failure rather than a silent no-op, so the language reports rather than
+/// hanging in [`Slot::Loading`].
+pub fn load_requested(payload: Box<dyn Any + Send>) -> Box<dyn Any + Send> {
+    let slot = match payload.downcast::<LoadRequest>() {
+        Ok(req) => load_slot(&req.root, &req.language, &req.overrides),
+        Err(_) => Slot::Failed("internal: unknown grammar load request".to_string()),
+    };
+    Box::new(LoadResult { slot })
+}
+
+/// The load itself, shared by the synchronous path and the deferred worker.
+fn load_slot(root: &Path, lang: &str, overrides: &QueryOverrides) -> Slot {
+    match Grammar::load(root, lang, overrides) {
+        Ok(g) => Slot::Loaded(Box::new(g)),
+        Err(LoadError::NotInstalled) => Slot::NotInstalled,
+        Err(LoadError::Failed(e)) => Slot::Failed(format!("{e:#}")),
+    }
 }
 
 /// Owns every buffer's parse state and a lazily-populated grammar cache.
@@ -247,6 +292,11 @@ pub struct Engine {
     /// drains it ([`Engine::take_query_errors`]). Interior-mutable because the ask
     /// sites hold a `&Grammar` borrowed out of `grammars` across the report.
     query_errors: RefCell<QueryErrors>,
+    /// Whether a grammar miss defers to the host instead of loading inline. See
+    /// [`Engine::defer_loads`].
+    defer_loads: bool,
+    /// Grammars asked for and not yet loaded, waiting for the host to drain them.
+    wanted_grammars: Vec<GrammarRequest>,
 }
 
 /// The deferred-compile failures an [`Engine`] has to report, and the ones it
@@ -344,6 +394,8 @@ impl Engine {
             fragment_contexts: HashMap::new(),
             last_text_injections: Vec::new(),
             query_errors: RefCell::default(),
+            defer_loads: false,
+            wanted_grammars: Vec::new(),
         }
     }
 
@@ -362,9 +414,6 @@ impl Engine {
             .unwrap_or(&self.data_dir)
     }
 
-    /// Lazily load (and cache) the grammar for `lang`, returning its cache slot.
-    /// The load — and its outcome (loaded / not-installed / failed) — happens once
-    /// per language; later calls are a cache hit.
     /// Unwrap a deferred query slot's compile ([`LazyQuery::get`]): the query when it
     /// compiled, `None` when the language ships no such file, and `None` *plus a
     /// queued error* when it is present but broken. Never silently swallows the
@@ -390,20 +439,135 @@ impl Engine {
         std::mem::take(&mut self.query_errors.borrow_mut().pending)
     }
 
+    /// Lazily load (and cache) the grammar for `lang`, returning its cache slot.
+    /// The load — and its outcome (loaded / not-installed / failed) — happens once
+    /// per language; later calls are a cache hit.
+    ///
+    /// With [`defer_loads`](Self::defer_loads) on, a miss does not load here: it
+    /// queues the work for the host ([`take_grammar_requests`](Self::take_grammar_requests))
+    /// and returns [`Slot::Loading`], which every caller treats as "no grammar yet" —
+    /// the buffer paints plain, an injected region stays pending — until the loaded
+    /// grammar is handed back. The load is dominated by compiling queries (hundreds
+    /// of ms for a big language, uninterruptible), so doing it here freezes the frame
+    /// that first needs the language.
     fn grammar(&mut self, lang: &str) -> &Slot {
         if !self.grammars.contains_key(lang) {
             // Pick the first search root that actually has this parser (its queries
             // load from the same root); fall back to the writable data dir so a
             // genuinely-missing grammar still reports NotInstalled from there.
             let root = self.root_for(lang).to_path_buf();
-            let slot = match Grammar::load(&root, lang, &self.query_overrides) {
-                Ok(g) => Slot::Loaded(Box::new(g)),
-                Err(LoadError::NotInstalled) => Slot::NotInstalled,
-                Err(LoadError::Failed(e)) => Slot::Failed(format!("{e:#}")),
+            let slot = if self.defer_loads {
+                self.wanted_grammars.push(GrammarRequest {
+                    language: lang.to_string(),
+                    payload: Box::new(LoadRequest {
+                        root,
+                        language: lang.to_string(),
+                        overrides: self.query_overrides.clone(),
+                    }),
+                });
+                Slot::Loading
+            } else {
+                load_slot(&root, lang, &self.query_overrides)
             };
             self.grammars.insert(lang.to_string(), slot);
         }
         &self.grammars[lang]
+    }
+
+    /// The grammar for `lang`, loaded **now** even in deferred mode — the one-shot
+    /// surfaces ([`highlight_text_bg`](Self::highlight_text_bg),
+    /// [`highlight_fragment`](Self::highlight_fragment) and the fragment probe) have
+    /// nothing to paint later: they own no buffer to repaint and their caller wants
+    /// spans from this call. They are also user-initiated and rare (a picker preview,
+    /// a doc float), so the load lands on a frame the user asked for. Phase 3 of
+    /// `docs/plans/2026-08-12-async-grammar-load.md` gives them a repaint and this
+    /// goes away.
+    fn grammar_now(&mut self, lang: &str) -> &Slot {
+        if self.defer_loads && !matches!(self.grammars.get(lang), Some(Slot::Loaded(_))) {
+            let root = self.root_for(lang).to_path_buf();
+            let slot = load_slot(&root, lang, &self.query_overrides);
+            self.grammars.insert(lang.to_string(), slot);
+            // A deferred request for this language is now moot; dropping it keeps the
+            // host from loading it a second time.
+            self.wanted_grammars.retain(|r| r.language != lang);
+        }
+        self.grammar(lang)
+    }
+
+    /// Load `language` **now**, even in deferred mode — for an ask that cannot be
+    /// answered a frame later.
+    ///
+    /// A paint or a fold that arrives late self-corrects: the frame after the grammar
+    /// lands repaints, and the fold recomputes. An indent or a text object does not —
+    /// they produce text (or a selection) on the keystroke that asked, and a keystroke
+    /// does not come back. So the editor forces the load in front of those two rather
+    /// than silently falling back to the non-treesitter answer. Rare in practice: the
+    /// buffer's first paint already put the load in flight, so this only bites in the
+    /// frames right after an open.
+    /// Reports whether this call is what made the grammar available — the buffers
+    /// opened while it was missing have to be re-opened, and only the caller knows how.
+    pub fn load_language_now(&mut self, language: &str) -> bool {
+        let language = nxvim_core::resolve_language(language);
+        let known = matches!(self.grammars.get(language), Some(Slot::Loaded(_)));
+        matches!(self.grammar_now(language), Slot::Loaded(_)) && !known
+    }
+
+    /// Load grammars **off** the editor thread from now on: a miss queues a
+    /// [`GrammarRequest`] instead of loading inline. Off by default — the engine is
+    /// a library, and deferring only works for a host that drives the other half
+    /// (drain the requests, run them, hand the results back). The server turns it on;
+    /// an embedder that just wants spans keeps the synchronous path.
+    pub fn defer_loads(&mut self, defer: bool) {
+        self.defer_loads = defer;
+    }
+
+    /// Drain the grammars queued for the host to load. See [`Self::defer_loads`].
+    pub fn take_grammar_requests(&mut self) -> Vec<GrammarRequest> {
+        std::mem::take(&mut self.wanted_grammars)
+    }
+
+    /// Install a grammar the host finished loading, replacing its [`Slot::Loading`].
+    /// Reports an installed-but-broken grammar as [`OpenOutcome::LoadFailed`] for the
+    /// editor to echo; a missing one is silent.
+    ///
+    /// A payload that isn't this engine's own (only [`load_requested`] produces one)
+    /// is a wiring bug, not a user error, so it fails loud rather than leaving the
+    /// language wedged in `Loading` forever.
+    pub fn install_grammar(&mut self, lang: &str, loaded: Box<dyn Any + Send>) -> GrammarInstall {
+        let Ok(result) = loaded.downcast::<LoadResult>() else {
+            return GrammarInstall::Failed(format!(
+                "internal: grammar load result for '{lang}' came back in an unknown form"
+            ));
+        };
+        let outcome = match &result.slot {
+            Slot::Failed(reason) => GrammarInstall::Failed(reason.clone()),
+            Slot::Loaded(_) => GrammarInstall::Loaded,
+            _ => GrammarInstall::Missing,
+        };
+        self.grammars.insert(lang.to_string(), result.slot);
+
+        // An override that arrived *while* this was loading missed the snapshot the
+        // worker compiled against — the runtimepath bridge resolves a language's
+        // queries around the same tick the grammar is asked for, so this is the
+        // ordinary case, not a rare one. Recompile those in place now, or the grammar
+        // would paint (and fold, and indent) from the on-disk query the resolution was
+        // supposed to replace.
+        let overridden: Vec<(String, String)> = self
+            .query_overrides
+            .keys()
+            .filter(|(l, _)| l == lang)
+            .cloned()
+            .collect();
+        for (_, name) in overridden {
+            let text = self
+                .query_overrides
+                .get(&(lang.to_string(), name.clone()))
+                .cloned();
+            // A broken override is already reported by whoever installed it; here it
+            // just leaves the on-disk query in place.
+            let _ = self.recompile_query(lang, &name, text);
+        }
+        outcome
     }
 
     /// Install (or, with `text = None`, clear) a resolved query override for
@@ -908,6 +1072,20 @@ impl Engine {
             // or broken — the region just keeps the host's flat paint.
             let child_language = match self.grammar(&language) {
                 Slot::Loaded(g) => g.language.clone(),
+                // Being loaded off the editor thread: the region is not lost, it is
+                // waiting. Keeping it pending is what makes the host repaint (the
+                // server redraws while `parse_pending`), so the layer builds on the
+                // frame after the grammar lands rather than on the next edit. Bounded:
+                // `Loading` always resolves to a verdict, and a `NotInstalled` one
+                // drops the region here.
+                Slot::Loading => {
+                    still_pending.push(PendingInjection {
+                        language,
+                        ranges,
+                        parser: None,
+                    });
+                    continue;
+                }
                 _ => continue,
             };
             // The parser that already holds this region's cancelled parse, if the
@@ -1013,9 +1191,12 @@ impl Engine {
         let lang = nxvim_core::resolve_language(lang);
         let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
-            Slot::NotInstalled => {
-                // Silent: best-effort. But a switch away from a highlighted
-                // language must still forget the stale parse state.
+            // Nothing to parse *yet*: no grammar installed, or one still loading off
+            // the editor thread. Silent either way — best-effort — and the deferred
+            // case re-opens when the load lands (the editor drops its
+            // "opened in this language" marker on install). A switch away from a
+            // highlighted language must still forget the stale parse state.
+            Slot::NotInstalled | Slot::Loading => {
                 self.buffers.remove(&buffer);
                 return OpenOutcome::Ok;
             }
@@ -1537,7 +1718,7 @@ impl Engine {
     /// and the caller paints nothing either way.
     fn parses_cleanly(&mut self, lang: &str, text: &str) -> bool {
         let lang = nxvim_core::resolve_language(lang);
-        let language = match self.grammar(lang) {
+        let language = match self.grammar_now(lang) {
             Slot::Loaded(g) => g.language.clone(),
             _ => return true,
         };
@@ -1591,7 +1772,7 @@ impl Engine {
         // Cleared up front so an early return below reports *this* call's (empty) set
         // rather than leaving the previous call's languages behind.
         self.last_text_injections.clear();
-        let language = match self.grammar(lang) {
+        let language = match self.grammar_now(lang) {
             Slot::Loaded(g) => g.language.clone(),
             _ => return (Vec::new(), Vec::new()), // silent: no grammar (or load failed)
         };
@@ -1668,7 +1849,7 @@ impl Engine {
                 _ => Vec::new(),
             };
             for (child_lang, mut ranges) in regions {
-                let child_language = match self.grammar(&child_lang) {
+                let child_language = match self.grammar_now(&child_lang) {
                     Slot::Loaded(g) => g.language.clone(),
                     _ => continue, // missing/broken child grammar → region keeps host paint
                 };
@@ -2225,6 +2406,18 @@ impl SyntaxEngine for Engine {
 
     fn take_query_errors(&mut self) -> Vec<String> {
         Engine::take_query_errors(self)
+    }
+
+    fn take_grammar_requests(&mut self) -> Vec<GrammarRequest> {
+        Engine::take_grammar_requests(self)
+    }
+
+    fn load_language_now(&mut self, language: &str) -> bool {
+        Engine::load_language_now(self, language)
+    }
+
+    fn install_grammar(&mut self, language: &str, loaded: Box<dyn Any + Send>) -> GrammarInstall {
+        Engine::install_grammar(self, language, loaded)
     }
 
     fn set_query(&mut self, lang: &str, name: &str, text: Option<String>) -> Result<(), String> {

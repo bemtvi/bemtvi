@@ -56,6 +56,12 @@ impl EditHost {
         // the next budget's progress (and re-arm until it converges).
         #[cfg(feature = "native")]
         self.arm_parse_resume_if_pending();
+        // Hand off any grammar the frame's work asked for (a buffer's language, one it
+        // injects, a fold query) to be loaded off this thread — compiling a language's
+        // queries is hundreds of ms and would otherwise stall the frame that needed it.
+        // The load returns on the run loop and repaints.
+        #[cfg(feature = "native")]
+        self.dispatch_grammar_requests();
         // Drive LSP document sync for the current buffer (non-blocking) — on BOTH builds:
         // native runs the server locally / over the daemon, wasm over the daemon's `lsp_*`
         // wire (Phase 6e). This is what sends the pending `didOpen` after a server's

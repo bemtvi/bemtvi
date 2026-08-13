@@ -1524,6 +1524,13 @@ pub struct EditHost {
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
     feed_buffer: VecDeque<(Key, bool)>,
+    /// The keys of a bracketed paste being collected — `Some` between the client's
+    /// `<PasteStart>` and `<PasteEnd>` markers, `None` the rest of the time. A paste
+    /// is one edit, not a burst of typing, so the payload is gathered here (never
+    /// reaching the keymap matcher) and applied in one go by `apply_paste`. Cleared
+    /// at the end of every input batch, so a feed truncated before its closing
+    /// marker can't strand the payload and swallow the keys that follow.
+    paste_payload: Option<Vec<Key>>,
     /// Plugin-test mode, flipped on by the `btv_enable_test_mode` RPC the
     /// `bemtvi --test-plugin` runner sends at startup. While set, [`redraw`] mirrors the
     /// projected UI into `btv._ui` (for `btv.test`'s `t:float()` / `t:message()` reads)
@@ -1891,6 +1898,7 @@ impl EditHost {
             preview_hscroll: 0,
             preview_anchor: None,
             feed_buffer: VecDeque::new(),
+            paste_payload: None,
             test_mode: false,
             lua_stdio: false,
             saves_inflight: HashSet::new(),

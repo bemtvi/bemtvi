@@ -2306,6 +2306,25 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
+        // The bracketed-paste markers carry no text and mutate nothing — they only
+        // open / close the span in which insert mode takes keys literally. The live
+        // input path consumes them server-side (it buffers the payload and inserts it
+        // in one edit), so the pair reaches *here* on the dot-repeat replay of a
+        // change that contained a paste: `paste_literal` records them around the
+        // payload precisely so `.` re-enters paste mode instead of re-indenting the
+        // text it replays.
+        if matches!(key.code, KeyCode::PasteStart | KeyCode::PasteEnd) {
+            // Recorded like any other key of the change in flight, so a `.` of a
+            // change containing a paste replays the span and not just its contents.
+            // (At a clean Normal boundary the following key opens a fresh recording
+            // and drops this marker — correct: a Normal-mode paste is a run of
+            // commands, and each repeats on its own terms.)
+            if !self.replaying_change {
+                self.redo_recording.push(key);
+            }
+            self.set_paste_active(key.code == KeyCode::PasteStart);
+            return;
+        }
         // The keyboard takes the viewport back from the mouse: any `'scrolloff'`
         // suspended for a click / drag is restored for this key, so the margin the
         // user configured is in force again from the next motion on (the cursor a
@@ -2523,6 +2542,26 @@ impl Editor {
             }
         }
 
+        self.settle_after_edit(pre_tick);
+
+        // Leaving insert mode (the `<Esc>` that just processed) ends an open signature
+        // session and closes its sticky float — you are no longer filling the call.
+        if in_signature_session && !self.mode.is_insert() {
+            self.end_signature_session();
+        }
+    }
+
+    /// Settle the editor after an input has mutated it: refresh `curswant`,
+    /// recompute folds, keep the cursor on screen, resolve the scroll gesture, and
+    /// queue decor for any window whose viewport moved. `pre_tick` is the buffer's
+    /// `changedtick` from before the mutation.
+    ///
+    /// Two callers share it so they cannot drift: [`Editor::input`] runs it after
+    /// dispatching one key, and [`Editor::paste_literal`] after inserting a whole
+    /// bracketed-paste payload as a *single* edit. That sharing is the point — a
+    /// paste that ran this work per pasted character instead paid ~73k redundant
+    /// fold refreshes on a 2000-line paste.
+    fn settle_after_edit(&mut self, pre_tick: u64) {
         // Update vim's `curswant`: vertical motions keep the remembered column,
         // every other action recomputes it from where the cursor landed.
         if !self.preserve_desired {
@@ -2551,12 +2590,6 @@ impl Editor {
         // motion off-screen, buffer/window switch, edit reflow) and queue it for the
         // server to dispatch to `btv.decor` providers off-tick (`editor/decor.rs`).
         self.recompute_decor_dirty();
-
-        // Leaving insert mode (the `<Esc>` that just processed) ends an open signature
-        // session and closes its sticky float — you are no longer filling the call.
-        if in_signature_session && !self.mode.is_insert() {
-            self.end_signature_session();
-        }
     }
 
     /// Open a scroll-animation gesture around work that moves the viewport from

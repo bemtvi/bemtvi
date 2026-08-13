@@ -50,8 +50,11 @@ impl EditHost {
         // A paste is by construction one batch — the client has the whole payload
         // before it sends anything — so close the span here even if the `<PasteEnd>`
         // bracket never arrived. Without this a truncated or malformed feed would
-        // leave the editor in paste mode indefinitely, where auto-indent, auto-pairs
-        // and the completion popup silently stop working with nothing to point at.
+        // strand the payload in the collector, unapplied, and leave every following
+        // keystroke being swallowed into it.
+        if let Some(payload) = self.paste_payload.take() {
+            self.apply_paste(payload);
+        }
         self.editor.set_paste_active(false);
         self.run_pending();
         // Typeahead queued by `nvim_feedkeys` during this batch (e.g. a keymap RHS
@@ -59,24 +62,57 @@ impl EditHost {
         self.drain_feedkeys();
     }
 
+    /// Apply one bracketed paste's payload, collected between the client's
+    /// `<PasteStart>` / `<PasteEnd>` markers.
+    ///
+    /// The fast path hands the whole payload to core as a **single** edit
+    /// ([`Editor::paste_literal`]): one rope insert, one settle, and — because the
+    /// text never becomes keys — no way for it to trip a mapping, a snippet jump or
+    /// a completion confirm. Core declines when the payload has to stay a key
+    /// stream (Normal mode, the command line, a terminal job, a grabbing menu,
+    /// Replace mode's overtype), and then it is replayed key by key *inside* a paste
+    /// span, where the insert-mode guards still keep it literal — slower, same text.
+    fn apply_paste(&mut self, payload: Vec<Key>) {
+        if let Some(text) = payload_text(&payload) {
+            if self.editor.paste_literal(&text) {
+                return;
+            }
+        }
+        // `Editor::input` (not `process_key`) for the markers: they must be recorded
+        // into the dot-repeat stream so a `.` of this change re-enters paste mode,
+        // and they must not reach the keymap matcher.
+        self.editor.input(Key::new(KeyCode::PasteStart));
+        for key in payload {
+            self.process_key(key);
+        }
+        self.editor.input(Key::new(KeyCode::PasteEnd));
+    }
+
     /// Route one input key through the completion popup / mapping engine.
     pub(crate) fn process_key(&mut self, key: Key) {
         // The bracketed-paste brackets are not keys the user pressed — they delimit a
         // payload the client already had (`bemtvi_view::encode_paste`). Consume them
         // here, ahead of the matcher and the editor, so they can neither be mapped nor
-        // reach the buffer as text; all they do is put the editor in paste mode for
-        // the span, where insert mode types the payload in literally (no auto-indent,
-        // no soft tabs, no auto-pairs).
+        // reach the buffer as text, and *collect* what they enclose rather than
+        // dispatching it: a paste is one edit, and `apply_paste` below applies it as
+        // one. Keys arriving between the brackets go nowhere near the matcher, so the
+        // payload cannot fire a mapping on its way in.
         match key.code {
             KeyCode::PasteStart => {
-                self.editor.set_paste_active(true);
+                self.paste_payload = Some(Vec::new());
                 return;
             }
             KeyCode::PasteEnd => {
-                self.editor.set_paste_active(false);
+                if let Some(payload) = self.paste_payload.take() {
+                    self.apply_paste(payload);
+                }
                 return;
             }
             _ => {}
+        }
+        if let Some(payload) = self.paste_payload.as_mut() {
+            payload.push(key);
+            return;
         }
         // The `btv.complete` engine's popup (incl. the built-in `lsp` source, Phase
         // 4-C) is **non-grabbing** and handled in core: while it is open,
@@ -499,4 +535,25 @@ impl EditHost {
             self.emit_lifecycle_events();
         }
     }
+}
+
+/// Reconstruct the pasted text from the keys collected between the brackets — the
+/// inverse of the client's `encode_paste`. `None` when the payload holds anything
+/// that is not plain text (a modified key, a named key other than the line break /
+/// tab the encoder emits), which sends the whole paste down the key-replay path
+/// rather than guessing at a character for it.
+fn payload_text(payload: &[Key]) -> Option<String> {
+    let mut out = String::new();
+    for key in payload {
+        if key.ctrl || key.alt {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char(c) => out.push(c),
+            KeyCode::Enter => out.push('\n'),
+            KeyCode::Tab => out.push('\t'),
+            _ => return None,
+        }
+    }
+    Some(out)
 }

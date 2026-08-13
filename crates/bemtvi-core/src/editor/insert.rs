@@ -613,6 +613,66 @@ impl Editor {
         self.insert_text_session(&text);
     }
 
+    /// Insert a whole bracketed-paste payload as **one** edit, and report whether
+    /// that was possible.
+    ///
+    /// This is the fast path the server takes when a paste lands in ordinary Insert
+    /// mode: the payload goes in through the same primitive as `<C-r>{register}` —
+    /// a single rope insert at every cursor — instead of being replayed as one
+    /// keystroke per character. That is both faster (a 2000-line paste ran the
+    /// per-key settle 73k times) and *safer*: text that never becomes keys cannot
+    /// trip a mapping, a snippet jump, or a completion confirm on its way in.
+    ///
+    /// Returns `false` when the payload must stay a key stream — Normal mode (where
+    /// the clipboard's characters are commands), the command line, a terminal job,
+    /// a grabbing menu, and Replace mode (whose overtype semantics live in the
+    /// per-key path). The caller then replays the keys inside a paste span, where
+    /// the insert-mode guards still keep the payload literal; only the speed is lost.
+    pub fn paste_literal(&mut self, text: &str) -> bool {
+        if self.mode != Mode::Insert || self.menu_grabs_input() {
+            return false;
+        }
+        if !self.modifiable() {
+            self.refuse_edit();
+            return true;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        // The prologue every input shares: the keyboard takes the viewport back from
+        // the mouse, and the transient floats a previous key left up are dismissed.
+        self.mouse_dragging = false;
+        self.dismiss_transient_content_float();
+        self.close_transient_doc_floats();
+        let pre_tick = self.buffer().changedtick;
+
+        // Nothing that reacts to *typing* may see the payload: an open popup would
+        // still be matching a prefix the paste invalidates, and a half-typed `<C-r>`
+        // has no register to name. The auto-indent scrub is disarmed too — the text
+        // arriving is real content, not an indent nobody typed into.
+        self.close_completion();
+        self.awaiting_register = false;
+        self.ai_open_line = None;
+
+        // Record the payload for dot-repeat, bracketed exactly as the client sent it.
+        // Without the brackets `.` would replay the characters as ordinary typing and
+        // re-indent every line of them; without the payload it would replay an insert
+        // session that inserts nothing.
+        if !self.replaying_change {
+            self.redo_recording.push(Key::new(KeyCode::PasteStart));
+            self.redo_recording.extend(insert_text_keys(text));
+            self.redo_recording.push(Key::new(KeyCode::PasteEnd));
+        }
+
+        self.insert_text_session(text);
+        // A paste into an active tabstop replaces its value — mirror it out.
+        if self.snippet_active() {
+            self.snippet_sync();
+        }
+        self.settle_after_edit(pre_tick);
+        true
+    }
+
     /// Insert `text` at every cursor as part of the current insert session — the
     /// shared body of `<C-r>{register}` and `<C-r><C-w>`. Records the text once in
     /// the `".` last-insert accumulator (not once per cursor), matching how a

@@ -309,12 +309,20 @@ The client-protocol verbs — the ones a UI actually speaks (input, attach,
 resize) — are `btv_*`: `btv_input`, `btv_input_mouse`, `btv_ui_attach`,
 `btv_ui_try_resize`, `btv_command`. A **paste** rides `btv_input` too, as one
 batch wrapped in `<PasteStart>` … `<PasteEnd>` (what
-[`bemtvi_view::encode_paste`](../crates/bemtvi-view/src/keys.rs) emits): the
+[`bemtvi_view::encode_paste`](../crates/bemtvi-view/src/keys.rs) emits). The
 brackets mark the payload as text the user already had rather than keys they
-typed, so the server takes it in literally instead of running the insert-mode
-helpers — auto-indent, soft tabs, auto-pairs, the completion popup — over text
-that already carries its own shape. Because it is only notation, every transport
-(local, daemon, browser) gets it for free. The editing-API methods keep the familiar
+typed, and the server *collects* what they enclose instead of dispatching it: in
+ordinary Insert mode the whole payload goes into core as a **single** edit
+(`Editor::paste_literal`), so it is one rope insert and one settle, and — never
+having become keys — it cannot trip a mapping, a snippet jump or a completion
+confirm on the way in. Modes whose behavior is inherently per-character (Normal,
+the command line, a terminal job, a grabbing menu, Replace's overtype) replay the
+payload key by key *inside* the span, where the insert-mode helpers — auto-indent,
+soft tabs, auto-pairs — still stand down; only the speed is lost. Either way the
+span is recorded around the payload, so a `.` of a change containing a paste
+re-enters paste mode rather than re-indenting what it replays. Because it is only
+notation, every transport (local, daemon, browser) gets all of this for free. The
+editing-API methods keep the familiar
 neovim spelling (`nvim_buf_get_lines`, `nvim_open_win`, `nvim_win_set_cursor`,
 …) as muscle-memory names, but they are bemtvi's own methods with bemtvi's own
 semantics (a read-heavy subset is also aliased into Lua as `vim.api.*`; the

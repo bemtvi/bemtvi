@@ -1166,6 +1166,27 @@ pub struct Editor {
     /// workspace shada and re-applied at load. Empty outside a workspace / before any
     /// override.
     workspace_options: crate::options::WorkspaceOptions,
+    /// The byte span the most recent deletion covered, in the coordinates that were
+    /// live when it ran. Set by [`Editor::delete_range`] — the chokepoint every
+    /// deletion funnels through — and read (then cleared) by the multi-cursor sweep,
+    /// which is the only consumer: it is how [`Editor::edit_each_cursor`] tells a
+    /// cursor an edit **swallowed** from one that merely ended up where the acting
+    /// cursor came to rest. Position alone cannot tell those apart (a mark at the
+    /// deletion's start does not move either way), and getting it wrong either
+    /// double-applies the edit or silently drops a cursor's turn.
+    pub(crate) last_delete_span: Option<std::ops::Range<usize>>,
+    /// Monotonic "option-state" version, bumped by **every** write that can change a row of
+    /// the Lua `bo` mirror ([`Editor::bump_options_generation`] for the full inventory):
+    /// any `:set`-family / `vim.o` / `vim.bo` / `btv.wso` write, a filetype or
+    /// `ts_highlight` change, and a completed save (which clears `modified` and
+    /// re-derives `endofline`). A consumer
+    /// that mirrors `bo` per event (the server's `push_buf_mirror`) can compare this against
+    /// the generation it last pushed to skip the wholesale rebuild when nothing moved —
+    /// the same staleness gate the extmark mirror gets from
+    /// [`ExtmarkStore::generation`](crate::extmark::ExtmarkStore::generation). Text edits
+    /// deliberately do **not** bump it (they don't change a `bo` row except `modified`,
+    /// which the mirror's per-buffer `changedtick` gate already covers).
+    options_generation: u64,
     /// The **global values** of the buffer-local options — vim's `:setglobal` tier. Every
     /// buffer created from here on is born from these
     /// ([`BufferOptions::inherit_settable`](crate::options::BufferOptions::inherit_settable),
@@ -2035,6 +2056,8 @@ impl Editor {
             // a workspace seed or an `btv.wso` write later diverges them via recompute.
             global_base: Options::default(),
             workspace_options: crate::options::WorkspaceOptions::new(),
+            last_delete_span: None,
+            options_generation: 0,
             // The buffer-local tier starts at the same defaults a fresh buffer would get,
             // so an editor whose config sets nothing behaves exactly as before.
             buf_opts_global: crate::options::BufferOptions::default(),
@@ -2799,7 +2822,15 @@ impl Editor {
         let (lo, hi, _) = self.visual_range_lw(linewise);
         let buffer = self.buffer();
         let s_row = buffer.byte_to_line(lo);
-        let e_row = buffer.byte_to_line(hi);
+        // `hi` is end-exclusive and can equal the buffer's byte length when the
+        // selection runs to the last char — that byte lies on the phantom
+        // trailing line, which must never leak into a position (LSP row 1 of an
+        // empty buffer). Clamp to the last real row; `e_col` below then points
+        // one byte past the last char, still a valid end-exclusive column.
+        // An empty buffer has only the phantom trailing line; `line_count() - 1`
+        // underflows there (a debug panic via `:LspCodeAction` on an empty file).
+        let last_row = buffer.line_count().saturating_sub(1);
+        let e_row = buffer.byte_to_line(hi).min(last_row);
         let e_col = hi - buffer.line_start(e_row);
         // A charwise selection ends one *byte* past the cursor (the char under it is
         // selected), which lands mid-cluster on anything multi-byte — and a position

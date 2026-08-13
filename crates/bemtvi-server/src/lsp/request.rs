@@ -333,7 +333,7 @@ impl EditHost {
             LspReply::Completion {
                 is_incomplete,
                 items,
-            } => self.on_completion_reply(buffer, key, is_incomplete, items),
+            } => self.on_completion_reply(buffer, tick, key, is_incomplete, items),
             _ => {}
         }
     }
@@ -748,12 +748,14 @@ impl EditHost {
                 .echo("btv.lsp: the buffer has no file path to ask about");
             return Vec::new();
         };
-        // Supersede any open round for this kind before issuing the new one.
-        if let Some(prev) = self.lsp_fanouts.remove(&kind) {
-            if prev.cb_id != 0 {
-                self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
-            }
-        }
+        // Supersede any open round for this kind before issuing the new one. The
+        // round must be in place BEFORE the superseded promise is settled: settling
+        // runs the Lua continuation synchronously, and a continuation that chains
+        // another request of this kind would otherwise insert its own round here and
+        // have it overwritten by this one, orphaning its outstanding generations (its
+        // replies would find no matching entry, and its promise would hang until the
+        // next supersede).
+        let prev = self.lsp_fanouts.remove(&kind);
         let mut round = LspFanout {
             outstanding: HashMap::new(),
             cb_id,
@@ -782,6 +784,11 @@ impl EditHost {
             asked.push(key);
         }
         self.lsp_fanouts.insert(kind, round);
+        if let Some(prev) = prev {
+            if prev.cb_id != 0 {
+                self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
+            }
+        }
         asked
     }
 

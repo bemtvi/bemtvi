@@ -58,7 +58,9 @@ function btv.run(spec)
         stderr = result.stderr or "",
       })
     end
-    btv._system_async(id, build_argv(spec), spec.cwd, spec.env, spec.stdin)
+    btv._bridge(id, function()
+      btv._system_async(id, build_argv(spec), spec.cwd, spec.env, spec.stdin)
+    end)
   end)
 end
 
@@ -169,7 +171,14 @@ function btv.run_stream(spec)
       waiter(nil)
     end
   end
-  btv._spawn_stream(id, build_argv(spec), spec.cwd, spec.env)
+  -- A bad spec (non-string cmd element / cwd, unencodable env) throws during the
+  -- bridge conversion after both entries were registered — drop both on the way
+  -- out so a retrying consumer doesn't leak a pump per attempt.
+  btv._bridge(id, function()
+    btv._spawn_stream(id, build_argv(spec), spec.cwd, spec.env)
+  end, function(cb_id)
+    btv._stdout_fns[cb_id] = nil
+  end)
   return self
 end
 
@@ -280,7 +289,13 @@ function btv.process.open(spec)
       end
     end,
   }
-  btv._proc_open(id, build_argv(spec), spec.cwd, spec.env)
+  -- A bad spec throws during the bridge conversion after the handler was
+  -- registered — drop it so a throwing call doesn't leak the handler table.
+  btv._bridge(id, function()
+    btv._proc_open(id, build_argv(spec), spec.cwd, spec.env)
+  end, function(cb_id)
+    btv._proc_handlers[cb_id] = nil
+  end)
   return handle
 end
 
@@ -378,6 +393,12 @@ function btv.socket.connect(spec)
       end
     end,
   }
-  btv._sock_connect(id, spec.host, spec.port)
+  -- A port that fails the u16 conversion throws after the handler was
+  -- registered — drop it so a throwing call doesn't leak the handler table.
+  btv._bridge(id, function()
+    btv._sock_connect(id, spec.host, spec.port)
+  end, function(cb_id)
+    btv._sock_handlers[cb_id] = nil
+  end)
   return handle
 end

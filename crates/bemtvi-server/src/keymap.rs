@@ -581,9 +581,14 @@ impl Keymaps {
     /// `pending` makes this a no-op, so the client can flush unconditionally on idle.
     ///
     /// The loop drains any remainder a re-feed re-withholds (overlapping maps can
-    /// leave a deeper prefix buffered); it terminates because each pass consumes at
-    /// least one key, so `pending` strictly shrinks. The defensive break guards the
-    /// invariant in case that ever fails to hold.
+    /// leave a deeper prefix buffered). A pass normally shrinks `pending`, but a
+    /// fired map's RHS can re-withhold a prefix *as long as* the keys it consumed
+    /// (`ab`→`cd` under a deeper `cde`) — that is a live prefix, not a leftover, so
+    /// the pass leaves it buffered for the next keystroke instead of draining it
+    /// raw (draining would make the deeper map unreachable). The break also bounds
+    /// the loop against a mutually-remapping pair (`ab`↔`cd`), which re-cycles its
+    /// own prefix: that re-fires on the next flush (or key), bounded per call by the
+    /// remap budget, exactly as vim's `maxmapdepth` bounds it.
     pub fn flush(&mut self, scope: MatchScope) -> Vec<Step> {
         self.remap_budget = MAX_MAP_DEPTH;
         let mut steps = Vec::new();
@@ -603,7 +608,14 @@ impl Keymaps {
                 steps.extend(buffered.into_iter().map(Step::Editor));
             }
             if self.pending.len() >= before {
-                steps.extend(self.pending.drain(..).map(Step::Editor));
+                // The pass re-withheld at least as many keys as it consumed — the
+                // fired map's RHS is a *live prefix* (or a mutual pair re-cycled).
+                // Leave it pending, so the next keystroke can still complete the
+                // deeper map (vim's timeout re-arms on the re-scanned RHS). The
+                // clients fire the idle flush at most once per idle gap and disarm
+                // after, so an infinite idle does not drain it — the RHS executes
+                // on the next keystroke instead (or a later idle), which is the
+                // same deferral vim's re-armed timeoutlen gives.
                 break;
             }
         }

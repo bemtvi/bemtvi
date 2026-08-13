@@ -14,6 +14,15 @@ EXTERN buf_T *curbuf INIT( = NULL);
 EXTERN win_T *curwin INIT( = NULL);
 
 /// Set by the host (e.g. on Ctrl-C) to interrupt long-running matches.
+///
+/// Deliberately a plain `volatile int`, not `_Atomic`: this is vim's own shape,
+/// and an interrupt signal is inherently asynchronous (setting it while no match
+/// runs is harmless; the engine polls it only at safe points, so a torn or
+/// stale read can at worst delay the interrupt by one poll). `volatile` forces
+/// a reload per read, which is all the handoff needs on every supported
+/// platform. Making it atomic would change the type of a vendored-engine
+/// global used by the unmodified `regexp.c` — a C type-compatibility risk for
+/// zero correctness gain.
 EXTERN volatile int got_int INIT( = false);
 
 /// Incremented by emsg(); the engine uses it to detect reported errors.

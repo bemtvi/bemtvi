@@ -45,12 +45,16 @@ impl FileKind {
         }
     }
 
-    /// Reconstruct from the wire string; anything unknown is a plain file.
-    pub fn from_wire(s: &str) -> FileKind {
+    /// Reconstruct from the wire string. Strict: the encoder only ever emits the closed
+    /// vocabulary below ([`Self::as_str`]), so an unknown string is a first-party wire
+    /// bug and fails loud — the wire decode must not silently turn it into a plain file
+    /// (the module's strict-when-present policy, see `fswire`'s doc header).
+    pub fn from_wire(s: &str) -> Result<FileKind, String> {
         match s {
-            "directory" => FileKind::Dir,
-            "link" => FileKind::Link,
-            _ => FileKind::File,
+            "file" => Ok(FileKind::File),
+            "directory" => Ok(FileKind::Dir),
+            "link" => Ok(FileKind::Link),
+            other => Err(format!("unknown file kind '{other}'")),
         }
     }
 }
@@ -293,18 +297,22 @@ impl LuaFs for StdLuaFs {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            let kind = entry
-                .file_type()
-                .map(|ft| {
-                    if ft.is_dir() {
-                        FileKind::Dir
-                    } else if ft.is_symlink() {
-                        FileKind::Link
-                    } else {
-                        FileKind::File
-                    }
-                })
-                .unwrap_or(FileKind::File);
+            // Tolerate a per-entry `file_type` failure — an OS-level hiccup on an
+            // entry that could still be listed (read_dir needs no stat), and one
+            // bad entry must not fail the whole listing. This is the *fs* layer's
+            // asymmetry with the wire decode (fswire's `decode_dir` is strict): the
+            // wire is first-party and a malformed row is a bug to surface, while
+            // this metadata probe is external and transient. The misreporting a
+            // tolerated failure causes is confined to that one entry's kind.
+            let kind = entry.file_type().map_or(FileKind::File, |ft| {
+                if ft.is_dir() {
+                    FileKind::Dir
+                } else if ft.is_symlink() {
+                    FileKind::Link
+                } else {
+                    FileKind::File
+                }
+            });
             out.push(LuaDirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 kind,

@@ -38,6 +38,15 @@ use crate::{EditHost, InstallOutcome};
 /// coalesces into a single repaint.
 const TERM_BATCH_BYTES: usize = 256 * 1024;
 
+/// How many event-loop events to process per [`EditHost::on_loop_events`] call
+/// before settling + repainting — the count analog of [`TERM_BATCH_BYTES`]. A
+/// burst of discrete events (an fs-watch storm over a huge repo, a flood of
+/// timers / proc exits) must not block the editor with no repaint until the
+/// queue runs dry; the run loop's `select!` re-fires the arm for the next batch
+/// (interleaving keystrokes between batches), so the screen stays live while the
+/// storm drains.
+const LOOP_EVENT_BATCH: usize = 256;
+
 impl EditHost {
     /// Apply one client message (an `nvim_*` request or notification). Whether it asked the
     /// editor to quit is decided by the run loop's single post-`select!` [`quitting`](Self::quitting)
@@ -83,7 +92,10 @@ impl EditHost {
         let mut shada_due = false;
         let mut resume_due = false;
         let mut diag_due = false;
-        for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+        let mut budget = LOOP_EVENT_BATCH;
+        let mut event = first;
+        while budget > 0 {
+            budget -= 1;
             if crate::is_shada_flush_timer(&event) {
                 shada_due = true;
             } else if crate::is_diag_debounce_timer(&event) {
@@ -102,6 +114,17 @@ impl EditHost {
             } else {
                 self.on_loop_event(event);
                 had_real = true;
+            }
+            if budget == 0 {
+                // Hit the batch cap: stop before the next `try_recv` so a 257th
+                // event isn't consumed into `event` and dropped at scope end —
+                // the run loop's `select!` re-fires this arm for the rest (same
+                // break-before-recv pattern as [`on_term_events`]).
+                break;
+            }
+            match rx.try_recv() {
+                Ok(next) => event = next,
+                Err(_) => break, // drained the burst — nothing more queued
             }
         }
         if shada_due {

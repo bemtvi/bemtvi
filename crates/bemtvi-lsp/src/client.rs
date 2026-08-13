@@ -282,9 +282,12 @@ pub(crate) fn new_client(
         // requests a server shrugs off. gopls reads the reply, and async-lsp's
         // method-not-found default made it conclude the client cannot do progress, so
         // it sent no `$/progress` at all: the whole chain below received nothing while
-        // every layer of it worked. (The wasm `SyncLspClient` acks every unmodelled
-        // request with `null` and so was never affected — the two legs had silently
-        // drifted, which is exactly what the tier-1 rule forbids.)
+        // every layer of it worked. (The wasm `SyncLspClient` answers unmodelled
+        // requests with the same `-32601` METHOD_NOT_FOUND error via `send_error`,
+        // built in async-lsp's exact native-leg wire shape — `code`/`message`/
+        // `data` fields, colon in the message, `data: null` — so a reply-reading
+        // server must draw the same conclusion on both legs, which is exactly what
+        // the tier-1 rule demands.)
         //
         // The token is not recorded: bemtvi keys tasks off the token the `$/progress`
         // itself carries, which covers both server-minted (`create`) and client-minted

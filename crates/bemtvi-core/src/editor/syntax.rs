@@ -166,12 +166,16 @@ impl Editor {
     /// filetype". Drops stale parse state so the next sync re-opens against the
     /// new language (or, if it now resolves to nothing, paints nothing).
     pub fn set_filetype(&mut self, buf: BufferId, ft: &str) {
+        // The filetype is a `bo` mirror row — see `bump_options_generation`.
+        self.bump_options_generation();
         self.ts_filetype.insert(buf, ft.to_string());
         self.refresh_syntax(buf);
     }
 
     /// Reset `buf` to its extension-derived filetype (`:set filetype&`).
     pub fn reset_filetype(&mut self, buf: BufferId) {
+        // The filetype is a `bo` mirror row — see `bump_options_generation`.
+        self.bump_options_generation();
         self.ts_filetype.remove(&buf);
         self.refresh_syntax(buf);
     }
@@ -180,12 +184,16 @@ impl Editor {
     /// noun / the `start`/`stop` verbs). Leaves the filetype untouched, so a
     /// disabled buffer still reports its language to LSP/indent.
     pub fn set_ts_highlight(&mut self, buf: BufferId, on: bool) {
+        // `ts_highlight` is a `bo` mirror row — see `bump_options_generation`.
+        self.bump_options_generation();
         self.ts_enabled.insert(buf, on);
         self.refresh_syntax(buf);
     }
 
     /// Reset `buf`'s highlight-enable to the default (on).
     pub fn reset_ts_highlight(&mut self, buf: BufferId) {
+        // `ts_highlight` is a `bo` mirror row — see `bump_options_generation`.
+        self.bump_options_generation();
         self.ts_enabled.remove(&buf);
         self.refresh_syntax(buf);
     }

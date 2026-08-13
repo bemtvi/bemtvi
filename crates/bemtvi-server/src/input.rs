@@ -454,8 +454,13 @@ impl EditHost {
         // Core's fixed-grammar raw reads own the next key ahead of any map, exactly as
         // in `feed_matcher`: a `<C-r>{reg}` name, a `confirm` answer, or the argument
         // of an in-progress multi-key command (`f{char}`, the motion after an
-        // operator). Feed those straight to the editor.
-        if self.editor.awaiting_command_continuation() || self.editor.cmdline_reads_raw() {
+        // operator). Feed those straight to the editor. The `pending_empty` guard
+        // mirrors `feed_matcher`'s: a map prefix still mid-match must resolve through
+        // the matcher (or the `command_status` oracle), never be abandoned to a raw
+        // read.
+        if (self.editor.awaiting_command_continuation() || self.editor.cmdline_reads_raw())
+            && self.keymaps.pending_empty()
+        {
             self.editor.input(key);
             self.emit_lifecycle_events();
             return;

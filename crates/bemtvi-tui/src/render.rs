@@ -503,7 +503,9 @@ pub(crate) fn render(
         // The thin bar (insert) / underline (replace) shapes don't envelop.
         if !view.is_insert() && !view.is_replace() {
             for extra in 1..win.cursor_width {
-                let x = col + extra;
+                // Saturate: `cursor_width` is server-derived, and the clamp below
+                // must run before `col + extra` can overflow (a debug panic).
+                let x = col.saturating_add(extra);
                 if x >= inner.right() {
                     break;
                 }
@@ -745,8 +747,11 @@ impl DockLayout {
 fn window_area(wins_area: Rect, win: &WindowView) -> Rect {
     match win.rect {
         Some(r) => Rect {
-            x: wins_area.x + r.x,
-            y: wins_area.y + r.y,
+            // The wire rect is server-derived; saturate the origin adds (a bogus
+            // offset near `u16::MAX` would otherwise overflow — a debug panic).
+            // The width/height already saturate the same way below.
+            x: wins_area.x.saturating_add(r.x),
+            y: wins_area.y.saturating_add(r.y),
             width: r.width.min(wins_area.width.saturating_sub(r.x)),
             height: r.height.min(wins_area.height.saturating_sub(r.y)),
         },
@@ -1334,10 +1339,12 @@ fn paint_cursor_cell(
 fn render_separators(frame: &mut Frame, dock: &DockLayout, separators: &[Separator], view: &View) {
     let style = separator_style(view);
     for sep in separators {
-        // Each separator is relative to its region's content origin.
+        // Each separator is relative to its region's content origin. The origin
+        // adds are saturated (the offsets are server-derived, and the clamps
+        // below must not be preceded by an overflow — a debug panic).
         let wins_area = dock.content(sep.region);
-        let x = wins_area.x + sep.x;
-        let y = wins_area.y + sep.y;
+        let x = wins_area.x.saturating_add(sep.x);
+        let y = wins_area.y.saturating_add(sep.y);
         // Clamp the run to the windows area so a separator near an edge can't paint
         // past it (the guard reproduces the old zero-size-rect clamp exactly).
         if sep.vertical {

@@ -98,7 +98,9 @@ local function lsp_promise(issue)
     btv._cb_fns[id] = function(_err, result)
       fulfil(result)
     end
-    issue(id)
+    btv._bridge(id, function()
+      issue(id)
+    end)
   end)
 end
 
@@ -1410,7 +1412,14 @@ local client_handle = {}
 function client_handle:request(method, params, handler, _bufnr)
   local cb_id = btv._next_cb_id()
   btv._cb_fns[cb_id] = handler or function() end
-  btv._lsp_client_request(self.id, method, params, cb_id)
+  -- An unencodable `params` (function key, cycle, >256-deep, NUL in a key)
+  -- throws during the bridge conversion and the request never reaches the
+  -- server — so the server-side settlements never fire and the entry would
+  -- leak. `_bridge` drops it and rethrows into the caller (or the promise
+  -- executor) as a loud rejection.
+  btv._bridge(cb_id, function()
+    btv._lsp_client_request(self.id, method, params, cb_id)
+  end)
 end
 
 -- `client:notify(method, params)`: fire-and-forget a generic LSP notification.

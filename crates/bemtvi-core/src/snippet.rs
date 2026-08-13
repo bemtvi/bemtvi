@@ -250,15 +250,19 @@ fn parse_choices(bytes: &[u8], pos: &mut usize) -> Result<Vec<String>, SnippetEr
         let c = bytes[*pos];
         match c {
             b'\\' if *pos + 1 < bytes.len() => {
-                // Inside a choice, `,` and `|` are escapable too.
+                // Inside a choice, `,` and `|` are escapable too. Any other `\x`
+                // keeps the backslash literally and leaves `x` to the normal UTF-8
+                // arm below — consuming 2 bytes here would split a multibyte char
+                // (the lead byte pushed raw as a `char`, `*pos` landing mid-char,
+                // where a continuation byte's `utf8_len` of 4 can slice OOB).
                 let n = bytes[*pos + 1];
                 if matches!(n, b',' | b'|' | b'\\') {
                     cur.push(n as char);
+                    *pos += 2;
                 } else {
                     cur.push('\\');
-                    cur.push(n as char);
+                    *pos += 1;
                 }
-                *pos += 2;
             }
             b',' => {
                 choices.push(std::mem::take(&mut cur));

@@ -265,10 +265,39 @@ impl Highlights {
     /// first candidate that resolves wins; an unknown capture yields `None`.
     ///
     /// `function.call` -> `@function.call` -> `@function` -> `Function`.
+    ///
+    /// Candidates are built into a scratch buffer that only grows to the longest
+    /// capture seen, so resolving a capture — which the redraw does for every
+    /// syntax span, every paint — allocates nothing steady-state, and stops at
+    /// the first candidate that resolves instead of building the whole chain.
     pub fn resolve_capture(&self, capture: &str) -> Option<Style> {
-        capture_fallbacks(capture)
-            .into_iter()
-            .find_map(|group| self.resolve(&group))
+        // `@` + each dotted prefix of `capture`, longest first; the prefixes are
+        // byte slices of `capture`, so the "@"-joined candidate lives in `buf`.
+        let mut buf = Vec::with_capacity(64);
+        let mut end = capture.len();
+        loop {
+            buf.clear();
+            buf.push(b'@');
+            buf.extend_from_slice(&capture.as_bytes()[..end]);
+            let group = std::str::from_utf8(&buf).ok()?;
+            if let Some(style) = self.resolve(group) {
+                return Some(style);
+            }
+            match capture[..end].rfind('.') {
+                Some(dot) => end = dot,
+                None => break,
+            }
+        }
+        // Legacy syntax group for the major segment (e.g. `function` -> `Function`):
+        // the FIRST dot-separated segment, matching the old `parts[0]` fallback —
+        // a 3+ segment capture like `string.special.symbol` must fall back through
+        // its major `string` (-> `String`), not the truncated `string.special`,
+        // which no legacy group maps.
+        let major = match capture.find('.') {
+            Some(dot) => &capture[..dot],
+            None => capture,
+        };
+        self.resolve(legacy_group(major)?)
     }
 }
 
@@ -400,26 +429,11 @@ fn named_color(name: &str) -> Option<Rgb> {
     }
 }
 
-/// Build the ordered candidate groups for a capture name. For `a.b.c`:
-/// `@a.b.c`, `@a.b`, `@a`, then the legacy syntax group for the major segment
-/// (`a`) if one exists. This mirrors neovim's treesitter default-link fallback,
-/// so a theme styling only the broad group still colors specific captures.
-fn capture_fallbacks(capture: &str) -> Vec<String> {
-    let parts: Vec<&str> = capture.split('.').collect();
-    let mut out = Vec::with_capacity(parts.len() + 1);
-    for i in (1..=parts.len()).rev() {
-        out.push(format!("@{}", parts[..i].join(".")));
-    }
-    if let Some(legacy) = legacy_group(parts[0]) {
-        out.push(legacy.to_string());
-    }
-    out
-}
-
 /// Map a capture's major segment to the legacy syntax group that themes have
 /// always styled (`Comment`, `Function`, `Keyword`, …). The terminal fallback
-/// in [`capture_fallbacks`]: covers the captures bemtvi-ts emits, so even a
-/// minimal theme that only sets legacy groups colors the buffer.
+/// in [`resolve_capture`](Highlights::resolve_capture): covers the captures
+/// bemtvi-ts emits, so even a minimal theme that only sets legacy groups colors
+/// the buffer.
 fn legacy_group(major: &str) -> Option<&'static str> {
     Some(match major {
         "comment" => "Comment",

@@ -498,7 +498,11 @@ function btv.fname.modify(fname, mods)
       i = i + 2
     elseif m == ":." then
       local cwd = vim.fn.getcwd()
-      if cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then
+      if cwd ~= "" and fname == cwd then
+        -- The cwd itself reduces to ".", as in vim; the prefix test below needs one
+        -- more character than the path has, so it can't catch the exact match.
+        fname = "."
+      elseif cwd ~= "" and fname:sub(1, #cwd + 1) == cwd .. "/" then
         fname = fname:sub(#cwd + 2)
       end
       i = i + 2
@@ -896,5 +900,7 @@ function btv._qf_make(cmd, efm, title, open, jump, loclist_win)
     end
     btv._qf_populate(lines, efm, title, open, jump, loclist_win)
   end
-  btv._system_async(id, { "sh", "-c", cmd }, nil, nil, nil)
+  btv._bridge(id, function()
+    btv._system_async(id, { "sh", "-c", cmd }, nil, nil, nil)
+  end)
 end

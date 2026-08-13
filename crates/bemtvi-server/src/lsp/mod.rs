@@ -1252,23 +1252,31 @@ pub(crate) fn severity_from_code(code: u8) -> DiagnosticSeverity {
 /// so the renderer reads them back at [`PositionEncoding::Utf8`]. Only the fields
 /// bemtvi's surfaces consume (range / severity / message / source) are carried; the
 /// rest default.
-pub(crate) fn client_diagnostic(d: &DiagnosticData) -> Diagnostic {
-    Diagnostic {
+///
+/// `Err` names the first position field that cannot be expressed in the LSP wire
+/// (`u32`). Failing loud is deliberate: silently truncating an i64 (as the old
+/// `as u32` did) maps a huge line number to a small one, planting a real squiggle
+/// on the wrong line — the caller rejects the whole set instead.
+pub(crate) fn client_diagnostic(d: &DiagnosticData) -> Result<Diagnostic, String> {
+    let pos = |v: i64, what: &str| -> Result<u32, String> {
+        u32::try_from(v).map_err(|_| format!("{what} {v}"))
+    };
+    Ok(Diagnostic {
         range: Range {
             start: Position {
-                line: d.lnum.max(0) as u32,
-                character: d.col.max(0) as u32,
+                line: pos(d.lnum.max(0), "lnum")?,
+                character: pos(d.col.max(0), "col")?,
             },
             end: Position {
-                line: d.end_lnum.max(0) as u32,
-                character: d.end_col.max(0) as u32,
+                line: pos(d.end_lnum.max(0), "end_lnum")?,
+                character: pos(d.end_col.max(0), "end_col")?,
             },
         },
         severity: Some(severity_from_code(d.severity)),
         message: d.message.clone(),
         source: d.source.clone(),
         ..Default::default()
-    }
+    })
 }
 
 /// Translate the LSP crate's [`ProviderCaps`] into the Lua-runtime

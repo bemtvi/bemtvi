@@ -1080,3 +1080,69 @@ async fn deleting_a_live_terminal_buffer_kills_the_child() {
     }
     panic!("the terminal's child (pid {pid}) survived :bd! on its buffer");
 }
+
+/// A full-screen repainting TUI (`top`, `watch`) emits tens of newlines per frame that
+/// never scroll anything: it homes the cursor and overwrites the same rows. Counting
+/// raw `\n`s in the byte stream therefore reads a perfectly idle program as a flood,
+/// and the next `^C` — the one meant to interrupt the *program* — trims a scrollback
+/// that never grew, throwing away the user's earlier session.
+///
+/// The flood signal is scrollback GROWTH, measured where rows actually enter the
+/// history, so a repainting child never arms the trim however much it writes.
+///
+/// The shape matters: the trim also requires a buffer longer than the keep window, so
+/// a repaint on its own could not fire it either way. This floods first (a real
+/// scrollback worth losing), resets the flood counter with a keystroke, and only then
+/// repaints — which is exactly the sequence a user hits when they run `top` after a
+/// long build.
+#[tokio::test]
+async fn ctrl_c_does_not_trim_after_a_repainting_child_that_never_scrolled() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await; // 80x24
+
+    // NOTE the doubled backslash: Lua's `\ddd` escape is DECIMAL, so a single
+    // `\033` would be char 33 (`!`) and nothing would home the cursor. The shell's
+    // `printf` wants the literal `\033` (octal ESC).
+    exec_lua(
+        &rpc,
+        r#"btv.terminal.open{ cmd = {'sh','-c',
+             'seq 1000; read _; '
+             .. 'for i in $(seq 1 60); do printf "\\033[H"; '
+             .. '  for j in $(seq 1 20); do printf "row $j frame $i\\n"; done; '
+             .. 'done; trap "" INT; cat'} }"#,
+    )
+    .await;
+
+    // A real flood first: 1000 lines into the scrollback, the history a wrong trim
+    // would destroy.
+    wait_lines(&rpc, "the full flood (line 1000)", |ls| {
+        has_line(ls, "1000")
+    })
+    .await;
+    let flooded = line_count(&rpc).await;
+    assert!(flooded > 500, "the flood mirrored, got {flooded} lines");
+
+    // The keystroke satisfies the child's `read` AND resets the flood counter — from
+    // here on, the trim must be armed only by what actually scrolls.
+    feed(&rpc, "<CR>");
+
+    // 60 frames x 20 lines = 1200 newlines, far past the 200-row trim threshold —
+    // but the cursor is homed each frame, so nothing enters the scrollback.
+    wait_lines(&rpc, "the last repaint frame", |ls| {
+        ls.iter().any(|l| l.contains("frame 60"))
+    })
+    .await;
+
+    feed(&rpc, "<C-c>");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ls = lines(&rpc).await;
+    assert!(
+        !ls.iter().any(|l| l.contains("earlier lines trimmed")),
+        "the repaint scrolled nothing, so `^C` must not read it as a flood: {ls:?}"
+    );
+    assert!(
+        has_line(&ls, "1"),
+        "and the earlier session's scrollback must survive it: {} lines",
+        ls.len()
+    );
+}

@@ -147,6 +147,31 @@ fn attach_head(repo: &gix::Repository, branch_ref: &gix::refs::FullName) -> Resu
     Ok(())
 }
 
+/// Reset `repo`'s worktree to `commit_id` and leave HEAD detached onto it — the state
+/// `git checkout --detach <sha>` produces. Shared by [`checkout`]'s detach mode and
+/// [`update_submodules_of`], which already holds the opened submodule repository and
+/// must not re-discover it from its path just to check it out.
+fn checkout_commit(repo: &gix::Repository, commit_id: gix::ObjectId) -> Result<(), GitError> {
+    let commit = repo
+        .find_object(commit_id)
+        .map_err(|e| egit("read object", e))?
+        .peel_to_kind(gix::object::Kind::Commit)
+        .map_err(|e| err("EGIT", format!("'{commit_id}' is not a commit: {e}")))?;
+    // Detach at the *peeled* commit: gix's `rev_parse_single` returns an annotated
+    // tag's object id verbatim (like `git rev-parse v1.0`), while `git checkout
+    // --detach v1.0` writes the peeled commit into HEAD — the id `head().sha` must
+    // name, since a consumer feeding it to a commit-only op (merge-base, log) needs
+    // an actual commit.
+    let commit_id = commit.id;
+    let tree_id = commit
+        .peel_to_tree()
+        .map_err(|e| egit("peel to tree", e))?
+        .id;
+    reset_worktree_to_tree(repo, tree_id)?;
+    detach_head(repo, commit_id)?;
+    Ok(())
+}
+
 /// Record that the local branch `short` tracks `remote`, by writing the `branch.<short>.
 /// remote` / `.merge` pair `git checkout <branch>` writes when it creates a branch from a
 /// remote-tracking ref. This is not cosmetic: [`pull`] resolves the upstream tip through
@@ -546,20 +571,7 @@ fn checkout(dir: &str, rev: &str, detach: bool) -> Result<GitValue, GitError> {
     let id = repo
         .rev_parse_single(rev)
         .map_err(|e| err("ENOENT", format!("no such revision '{rev}': {e}")))?;
-    let commit = id
-        .object()
-        .map_err(|e| egit("read object", e))?
-        .peel_to_kind(gix::object::Kind::Commit)
-        .map_err(|e| err("EGIT", format!("'{rev}' is not a commit: {e}")))?;
-    let commit_id = commit.id;
-    let tree_id = commit
-        .peel_to_tree()
-        .map_err(|e| egit("peel to tree", e))?
-        .id;
-    reset_worktree_to_tree(&repo, tree_id)?;
-    // Detach HEAD onto the commit: replace the symbolic HEAD with a direct object
-    // target (`deref: false`), matching `git checkout --detach <sha>`.
-    detach_head(&repo, commit_id)?;
+    checkout_commit(&repo, id.detach())?;
     Ok(GitValue::Nil)
 }
 
@@ -658,6 +670,15 @@ fn pull(dir: &str) -> Result<GitValue, GitError> {
         .merge_base(old_id, new_id)
         .map_err(|e| err("ENOTFF", format!("not a fast-forward: {e}")))?
         .detach();
+    if base == new_id {
+        // The upstream tip is at or behind our tip (local-only commits): nothing to
+        // move the branch to. `git pull --ff-only` prints "Already up to date." and
+        // exits 0 in this state — resolving beats rejecting a non-divergence.
+        return Ok(GitValue::Pull {
+            updated: false,
+            sha: old_id.to_string(),
+        });
+    }
     if base != old_id {
         return Err(err(
             "ENOTFF",
@@ -737,21 +758,19 @@ fn update_submodules_of(
         // Open the submodule if already cloned; otherwise clone it (only under `init`,
         // matching `--init`). A missing, un-init'd submodule is left alone.
         let sub_repo = match sm.open().map_err(|e| egit("open submodule", e))? {
-            Some(r) => {
-                checkout(&abs.to_string_lossy(), &pinned.to_string(), true)?;
-                r
-            }
+            Some(r) => r,
             None => {
                 if !init {
                     continue;
                 }
                 let _ = std::fs::create_dir_all(&abs);
-                let r = clone_at(&url, &abs, None, None)
-                    .map_err(|e| err(&e.code, format!("submodule '{name}': {e}", e = e.message)))?;
-                checkout(&abs.to_string_lossy(), &pinned.to_string(), true)?;
-                r
+                clone_at(&url, &abs, None, None)
+                    .map_err(|e| err(&e.code, format!("submodule '{name}': {e}", e = e.message)))?
             }
         };
+        // Check out the gitlink-pinned commit on the repository we already opened —
+        // `checkout` would only re-discover the same repo from `abs`.
+        checkout_commit(&sub_repo, pinned)?;
 
         if recursive {
             update_submodules_of(&sub_repo, init, recursive)?;
@@ -876,10 +895,21 @@ fn diff_counts(old: &[u8], new: &[u8]) -> GitValue {
         }
         hunks.push(GitHunk {
             // Unified-diff headers are 1-based; imara's ranges are 0-based line indices.
-            // Match `@@ -old_start,old_count +new_start,new_count @@`.
-            old_start: h.before.start + 1,
+            // Match `@@ -old_start,old_count +new_start,new_count @@`. The zero-count
+            // side's start is the line BEFORE the hunk, printed as its 0-based index —
+            // `git diff -U0` shows `@@ -0,0 +1 @@` for an insertion at the top of the
+            // file and `@@ -3,0 +4 @@` for one after line 3, never `-1,0` / `-4,0`.
+            old_start: if old_count == 0 {
+                h.before.start
+            } else {
+                h.before.start + 1
+            },
             old_count,
-            new_start: h.after.start + 1,
+            new_start: if new_count == 0 {
+                h.after.start
+            } else {
+                h.after.start + 1
+            },
             new_count,
         });
     }

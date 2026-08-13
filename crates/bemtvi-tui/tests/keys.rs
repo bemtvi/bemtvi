@@ -212,3 +212,125 @@ fn combined_ctrl_alt_prefixes_both() {
         Some("<C-A-a>")
     );
 }
+
+// ---------------------------------------------- the C0 fallback is protocol-gated
+//
+// The `Char('4'..'7') + CONTROL` remap above exists for a LEGACY terminal, where
+// those events really are the 0x1C..0x1F control bytes. Under the kitty keyboard
+// protocol the same crossterm event means the literal key: the terminal reports
+// Ctrl+4 as `CSI 52;5u` and Ctrl+\ as its own CSI-u sequence, so remapping there
+// folds four real keys onto `<C-\>`/`<C-]>`/`<C-^>`/`<C-_>` — destroying exactly
+// the distinguishability the protocol is enabled to buy.
+
+fn note_kitty(code: KeyCode, mods: KeyModifiers) -> Option<String> {
+    bemtvi_tui::encode_key_with(KeyEvent::new(code, mods), true)
+}
+
+#[test]
+fn under_the_kitty_protocol_ctrl_digits_stay_digits() {
+    for (ch, legacy) in [
+        ('4', "<C-\\>"),
+        ('5', "<C-]>"),
+        ('6', "<C-^>"),
+        ('7', "<C-_>"),
+    ] {
+        // Legacy: the C0 remap applies.
+        assert_eq!(
+            note(KeyCode::Char(ch), KeyModifiers::CONTROL).as_deref(),
+            Some(legacy),
+            "without the protocol, Ctrl+{ch} is the C0 byte"
+        );
+        // Kitty on: the same event is the real Ctrl+digit.
+        assert_eq!(
+            note_kitty(KeyCode::Char(ch), KeyModifiers::CONTROL).as_deref(),
+            Some(format!("<C-{ch}>").as_str()),
+            "under the protocol, Ctrl+{ch} is the digit key, not the C0 byte"
+        );
+    }
+}
+
+#[test]
+fn the_default_entry_point_still_assumes_the_legacy_encoding() {
+    // `encode_key` is the protocol-less spelling of `encode_key_with`, so the
+    // clients that never negotiated the protocol keep the legacy behaviour.
+    assert_eq!(
+        note(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        bemtvi_tui::encode_key_with(
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
+            false
+        )
+    );
+}
+
+// ------------------------------------------- xterm reports Ctrl chords as C0 chars
+//
+// The other CSI-u shape: an xterm-family terminal reports a Ctrl chord by its
+// CONTROL codepoint (`CSI 28;5u` for Ctrl+\) rather than the base key's printable
+// one. crossterm decodes that as `Char('\x1c') + CONTROL` — a shape the legacy C0
+// decode never produces — and the notation encoder had no mapping for it, so it
+// emitted a raw control byte inside `<C-…>` that matched no mapping at all: a
+// `<C-\>` mapping silently died on those terminals.
+
+#[test]
+fn a_control_codepoint_is_folded_back_to_its_key() {
+    for (byte, want) in [
+        ('\u{1c}', "<C-\\>"),
+        ('\u{1d}', "<C-]>"),
+        ('\u{1e}', "<C-^>"),
+        ('\u{1f}', "<C-_>"),
+    ] {
+        assert_eq!(
+            note(KeyCode::Char(byte), KeyModifiers::CONTROL).as_deref(),
+            Some(want),
+            "the control codepoint must name the key it folds from"
+        );
+    }
+}
+
+#[test]
+fn a_control_letter_codepoint_folds_back_to_its_letter() {
+    // 0x01..0x1A are Ctrl+A..Ctrl+Z; neovim's model lowercases the letter.
+    assert_eq!(
+        note(KeyCode::Char('\u{1}'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-a>")
+    );
+    assert_eq!(
+        note(KeyCode::Char('\u{17}'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-w>"),
+        "<C-w> is the window prefix — it must survive an xterm-style report"
+    );
+}
+
+#[test]
+fn nul_folds_onto_ctrl_space() {
+    // An XKB-off xterm's keysym for Ctrl+Space / Ctrl+@ is NUL. Folding it onto
+    // `<C-Space>` keeps the default completion trigger alive there.
+    assert_eq!(
+        note(KeyCode::Char('\0'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-space>")
+    );
+}
+
+#[test]
+fn control_codepoint_folding_holds_under_the_kitty_protocol_too() {
+    // A terminal only emits a control codepoint for the chord that produces it, so
+    // no distinct key is folded onto another — the fold is correct either way.
+    assert_eq!(
+        note_kitty(KeyCode::Char('\u{1c}'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-\\>")
+    );
+}
+
+#[test]
+fn the_named_control_keys_are_not_folded() {
+    // Tab / CR / Esc have their own `KeyCode`s — crossterm maps their codepoints
+    // first, so they must never reach the fold and come back as `<C-i>` &c.
+    assert_eq!(
+        note(KeyCode::Tab, KeyModifiers::NONE).as_deref(),
+        Some("<Tab>")
+    );
+    assert_eq!(
+        note(KeyCode::Enter, KeyModifiers::NONE).as_deref(),
+        Some("<CR>")
+    );
+}

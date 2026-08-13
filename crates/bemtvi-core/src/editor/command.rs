@@ -1985,6 +1985,12 @@ impl Editor {
                 }
             }
             ResolvedCommand::Replace(c) => {
+                if self.mode.is_visual() {
+                    // Vim's visual `r`: the whole selection becomes `c`, then
+                    // visual mode exits — not the normal-mode one-char replace.
+                    self.visual_replace(c);
+                    return;
+                }
                 let count = self.effective_count();
                 self.edit_each_cursor(|ed| ed.replace_char(c, count));
                 self.reset_pending();

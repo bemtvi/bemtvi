@@ -184,6 +184,13 @@ fn ssh_daemon_argv(target: &str) -> Result<Vec<String>> {
     // the host (we don't parse bracketed IPv6 literals here).
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            // A bare IPv6 literal (`::1`) mis-splits at its last colon into host `::`
+            // + port `1` — a silently wrong dial. Refuse it and ask for brackets,
+            // which ssh accepts as-is. A *bracketed* literal (`[::1]:2222`) splits
+            // cleanly (host `[::1]` + port `2222`) and passes through unchanged.
+            if h.contains(':') && !h.starts_with('[') {
+                bail!("connect: IPv6 target {target:?} must be bracketed ([::1]:2222) for the ssh fallback");
+            }
             (h, Some(p))
         }
         _ => (hostport, None),

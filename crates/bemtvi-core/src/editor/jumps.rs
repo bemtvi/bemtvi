@@ -76,6 +76,7 @@ impl Editor {
         }
         win.jumps.push(entry);
         win.jump_idx = win.jumps.len();
+        win.jump_gen = win.jump_gen.wrapping_add(1);
     }
 
     /// `<C-o>` — move to an older position in the jumplist, `count` steps back.
@@ -114,6 +115,7 @@ impl Editor {
         let win = self.windows.cur_mut();
         win.jumps = entries;
         win.jump_idx = win.jumps.len();
+        win.jump_gen = win.jump_gen.wrapping_add(1);
     }
 
     /// Walk the jumplist `count` entries in one direction, mirroring vim's
@@ -151,6 +153,7 @@ impl Editor {
         }
         idx += delta;
         win.jump_idx = idx as usize;
+        win.jump_gen = win.jump_gen.wrapping_add(1);
         let target = win.jumps[idx as usize];
         self.jump_to_entry(target);
     }
@@ -220,6 +223,27 @@ impl Editor {
         Some((entries, win.jump_idx))
     }
 
+    /// Window `id`'s jumplist **generation** — bumped whenever its entries or
+    /// navigation pointer change. The server gates its per-window mirror push on
+    /// this, so an unchanged jumplist is not re-serialized into the Lua mirror on
+    /// every repaint (the same structural-generation gate the extmark mirror
+    /// uses). `None` for an unknown window id.
+    pub fn window_jumplist_gen(&self, id: WindowId) -> Option<u64> {
+        let (_, tree) = self.any_tab_tree_of_window(id)?;
+        let win = tree.try_get(id)?;
+        Some(win.jump_gen)
+    }
+
+    /// Window `id`'s jumplist navigation pointer alone — the half of
+    /// [`Editor::window_jumplist`] the server still reads on every repaint for a
+    /// window whose generation has not moved (one usize, no list clone). `None`
+    /// for an unknown window id.
+    pub fn window_jumplist_idx(&self, id: WindowId) -> Option<usize> {
+        let (_, tree) = self.any_tab_tree_of_window(id)?;
+        let win = tree.try_get(id)?;
+        Some(win.jump_idx)
+    }
+
     /// `:jumps` — list the focused window's jumplist into a read-only scratch
     /// listing, mirroring vim's `jump line  col file/text` table (rendered by the
     /// shared [`Editor::open_position_listing`]). A row in the current buffer shows
@@ -281,4 +305,5 @@ fn shift_window_jumps(
     }
     win.jumps = kept;
     win.jump_idx = idx.min(win.jumps.len());
+    win.jump_gen = win.jump_gen.wrapping_add(1);
 }

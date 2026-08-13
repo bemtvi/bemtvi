@@ -1012,6 +1012,16 @@ pub struct SegmentLayout {
     pub separator: String,
 }
 
+impl SegmentLayout {
+    /// Whether the layout references the built-in segment `name` on either side.
+    /// The server uses this to gate per-frame inputs only a specific built-in
+    /// reads — the `diagnostics` segment's counts are collected by walking the
+    /// whole merged set, so a layout that never shows them shouldn't pay for it.
+    pub fn uses_builtin(&self, name: &str) -> bool {
+        self.left.iter().chain(self.right.iter()).any(|s| s == name)
+    }
+}
+
 /// Whether `name` is a built-in segment (resolved natively each frame from the
 /// [`StatuslineCtx`]) rather than a custom Lua segment. The server uses this to
 /// tell which names a `btv.statusline.setup{}` layout must re-render through Lua.

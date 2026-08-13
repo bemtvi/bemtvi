@@ -17,6 +17,12 @@
 //!   `textDocumentSync` capability.
 //! - `exit_after_initialize`: if `true`, the mock replies to `initialize` then
 //!   exits, to exercise the supervisor's respawn/breaker path.
+//! - `never_answer_initialize`: if `true`, the mock accepts the pipe and then blocks
+//!   forever without answering `initialize` — a server that spawns but never speaks.
+//!   Distinct from `exit_after_initialize`: the process stays ALIVE, so the usual
+//!   death detection never fires and only the supervisor's `INIT_GRACE` gets it.
+//! - `never_answer_shutdown`: if `true`, the mock serves normally but blocks forever
+//!   on `shutdown`, so teardown has to fall back on `SHUTDOWN_GRACE` and kill it.
 //! - `diagnostics`: an array of LSP `Diagnostic` objects (`{range, severity,
 //!   message}`). When set, the mock pushes a `textDocument/publishDiagnostics`
 //!   notification for a document the moment it receives that document's
@@ -282,6 +288,19 @@ pub fn run(script_path: &str) {
         let id = msg.get("id").cloned();
         match method {
             "initialize" => {
+                // A server that accepts the pipe and then never speaks — the "wedged
+                // on startup" case the supervisor's `INIT_GRACE` exists for. It must
+                // keep the process alive (a server that EXITS is detected by the
+                // ordinary death path); only the answer is withheld.
+                if script
+                    .get("never_answer_initialize")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
                 if let Some(id) = id {
                     write_response(&stdout, id, initialize_result(&script));
                 }
@@ -294,6 +313,18 @@ pub fn run(script_path: &str) {
                 }
             }
             "shutdown" => {
+                // A server that stops answering at teardown — the case
+                // `SHUTDOWN_GRACE` bounds. It must stay alive and ignore `exit` too,
+                // or the ordinary teardown completes and the grace is never reached.
+                if script
+                    .get("never_answer_shutdown")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                }
                 if let Some(id) = id {
                     write_response(&stdout, id, Value::Null);
                 }

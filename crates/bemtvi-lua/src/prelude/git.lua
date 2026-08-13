@@ -41,7 +41,9 @@ local function run_git(bridge, job)
         resolve(value)
       end
     end
-    bridge(job, id)
+    btv._bridge(id, function()
+      bridge(job, id)
+    end)
   end)
 end
 

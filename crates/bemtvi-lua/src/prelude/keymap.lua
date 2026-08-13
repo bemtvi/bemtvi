@@ -519,13 +519,13 @@ btv.autocmd.create("FileType", {
   end,
 })
 
+btv.panels = btv.panels or {}
+btv.panels.actions = btv.panels.actions or {}
 -- `:lspanels` opens a `btvpanels` panel listing the named panels (rows begin with the panel
 -- buffer's number). `<CR>` parses that number and `:b`-switches to it — but the current
 -- window IS the panel window, so `switch_buffer` swaps it *in place*, showing that panel's
 -- last content (no close, no regenerating command). Contrast `btvbuffers`, which targets a
 -- document and so closes the panel and lands the switch in the main window.
-btv.panels = btv.panels or {}
-btv.panels.actions = btv.panels.actions or {}
 btv.panels.actions.open = function()
   local n = tostring(btv.current_line()):match("^%s*(%d+)")
   if n then
@@ -656,6 +656,7 @@ for _, m in ipairs({
 end
 
 -- ----- the pending-key event (which-key / showcmd) -------------------------
+btv._on_key_pending = btv._on_key_pending or {}
 -- `btv.on_key_pending`(fn): subscribe to the engine-computed pending-key signal. The
 -- server fires it whenever the *pending key-context changes* — a mapped prefix
 -- grows (you type <leader>, then w) or clears (the sequence completed, broke, or
@@ -689,8 +690,6 @@ end
 -- the mapped-prefix trie (user + native-default maps, sources A/C) AND the built-in
 -- command grammar's finite prefixes (source B); the open built-in states are
 -- surfaced via `label` instead.
-btv._on_key_pending = btv._on_key_pending or {}
-
 function btv.on_key_pending(fn)
   if type(fn) ~= "function" then
     error("btv.on_key_pending: expects a function", 2)

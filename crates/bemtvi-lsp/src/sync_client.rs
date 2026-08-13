@@ -49,10 +49,11 @@ use crate::convert::{
     resolved_inlay_hint, semantic_tokens_delta_data, semantic_tokens_full, signature_help_reply,
     try_normalize_workspace_edit_value, workspace_symbols,
 };
-use crate::log::LspLog;
+use crate::log::{LogLevel, LspLog};
 use crate::protocol::{
     progress_token, progress_update, ApplyEditOutcome, CapabilityRegistration, LspEvent, LspNotify,
-    LspReply, LspRequest, RefreshKind, ReqToken, ServerKey, ServerSpawn,
+    LspReply, LspRequest, RefreshKind, ReqToken, ServerKey, ServerSpawn, DYN_NOTIFY_METHODS,
+    DYN_REQUEST_METHODS,
 };
 
 /// One raw operation the wasm host forwards to the daemon's LSP leg. `Spawn`/`Kill`
@@ -134,6 +135,16 @@ enum ReqKind {
     FoldingRange,
     Raw,
 }
+
+/// Bound on [`ServerState::queued`]. Commands issued before `initialize`
+/// completes are buffered there; if the handshake never completes the queue
+/// would grow without bound as the editor keeps issuing document-sync
+/// notifications and language requests. At the cap the server is killed as
+/// wedged (the wasm-leg analogue of the native manager's `INIT_GRACE` timeout)
+/// and everything buffered is resolved with degraded replies — 4096 entries
+/// is comfortably above anything a slow-but-live handshake legitimately
+/// accumulates, and a hard bound on the failure case.
+const QUEUED_CAP: usize = 4096;
 
 /// Per-server state: its wire id, handshake phase, the inbound byte buffer the
 /// frame parser drains, the outgoing JSON-RPC id counter and pending-reply map, the
@@ -234,8 +245,16 @@ impl SyncLspClient {
     }
 
     /// Fire-and-forget a document-sync notification (or generic `client:notify`).
-    /// Dropped if no server for `key`; buffered until `Ready` otherwise.
+    /// Dropped if no server for `key`; buffered until `Ready` otherwise. A raw
+    /// method outside the shared whitelist is dropped, exactly as the native
+    /// leg drops it (it logs and drops — a notification carries no reply; the
+    /// wasm log is silent by design).
     pub fn notify(&mut self, key: ServerKey, note: LspNotify) {
+        if let LspNotify::Raw { method, .. } = &note {
+            if !DYN_NOTIFY_METHODS.contains(&method.as_str()) {
+                return;
+            }
+        }
         match self.phase(&key) {
             Some(Phase::Ready) => {
                 let (method, params) = notify_wire(note);
@@ -249,7 +268,28 @@ impl SyncLspClient {
     /// Fire a language-feature request; its reply returns later as an
     /// [`LspEvent::Reply`] carrying `token`. Dropped if no server for `key`;
     /// buffered until `Ready` otherwise.
+    ///
+    /// A raw `client:request` for a method outside the shared whitelist is
+    /// answered **immediately** with the identical `Err` the native leg's
+    /// dispatch table produces — on the wasm leg a whitelisted method is
+    /// buffered while the handshake runs and answered with the server's real
+    /// result, so without this check an unsupported method would have queued
+    /// and come back as a degraded "nothing found" instead (two-leg
+    /// divergence).
     pub fn request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest) {
+        if let LspRequest::Raw { method, .. } = &req {
+            if !DYN_REQUEST_METHODS.contains(&method.as_str()) {
+                self.events.push(LspEvent::Reply {
+                    key,
+                    token,
+                    reply: LspReply::Raw(Err(format!(
+                        "bemtvi: client:request: unsupported method '{method}' \
+                         (add a row to lsp_dyn_request_rows! in bemtvi-lsp/src/protocol.rs)"
+                    ))),
+                });
+                return;
+            }
+        }
         match self.phase(&key) {
             Some(Phase::Ready) => {
                 let (method, params, kind) = request_wire(req);
@@ -368,10 +408,53 @@ impl SyncLspClient {
         self.servers.get(key).map(|s| s.phase)
     }
 
+    /// Buffer an outbound command until the server finishes its handshake.
+    /// Bounded by [`QUEUED_CAP`]: a handshake that never completes would
+    /// otherwise accumulate every subsequent notification and request forever
+    /// (unbounded memory on a wedged server), so overflow kills the server as
+    /// wedged instead of buffering.
     fn queue(&mut self, key: &ServerKey, ob: Outbound) {
+        let overflow = self
+            .servers
+            .get(key)
+            .map(|s| s.queued.len() >= QUEUED_CAP)
+            .unwrap_or(false);
+        if overflow {
+            // Push *before* the kill: `kill_wedged`'s settle loop resolves every
+            // buffered request with a degraded reply, and this one is a request
+            // too — dropped un-settled, its `ReqToken` leaks (no settle ever
+            // fires for it).
+            if let Some(state) = self.servers.get_mut(key) {
+                state.queued.push(ob);
+            }
+            self.kill_wedged(key, "initialize never completed");
+            return;
+        }
         if let Some(state) = self.servers.get_mut(key) {
             state.queued.push(ob);
         }
+    }
+
+    /// Drop a server whose handshake never completed (its queued buffer hit
+    /// the cap): kill the child so the daemon doesn't hold a zombie, resolve
+    /// every buffered request with its degraded reply (no [`ReqToken`] leaks),
+    /// and surface [`LspEvent::ServerExited`] so the editor tells the user.
+    /// This is the sync-leg analogue of the native manager's `INIT_GRACE`
+    /// kill; without either, a server that never answers `initialize` grows
+    /// its command buffer without bound.
+    fn kill_wedged(&mut self, key: &ServerKey, reason: &str) {
+        let Some(state) = self.servers.remove(key) else {
+            return;
+        };
+        self.by_id.remove(&state.id);
+        self.wire.push(WireOp::Kill { id: state.id });
+        self.events.push(LspEvent::ServerExited {
+            key: key.clone(),
+            message: format!("killed wedged server: {reason}"),
+            code: None,
+            signal: None,
+        });
+        self.fail_pending(key, state, reason);
     }
 
     /// Send a JSON-RPC request, recording its pending reply. Two short borrows
@@ -413,7 +496,29 @@ impl SyncLspClient {
         }
     }
 
+    /// Reply to a server request with an error object — the shape a response
+    /// takes when `result` is not applicable (async-lsp's router emits
+    /// `{"code": -32601, "message": "No such method: X", "data": null}` for an
+    /// unmodelled method on the native leg; the caller must build the object
+    /// byte-identically — message colon and all — for the wire bytes to match).
+    fn send_error(&mut self, key: &ServerKey, resp_id: Value, error: Value) {
+        if let Some(wire_id) = self.servers.get(key).map(|s| s.id) {
+            let body = json!({"jsonrpc": "2.0", "id": resp_id, "error": error});
+            self.wire.push(WireOp::Stdin {
+                id: wire_id,
+                bytes: frame(&body),
+            });
+        }
+    }
+
     fn handle_message(&mut self, key: &ServerKey, msg: Value) {
+        // A frame from a server removed earlier in this batch (a malformed
+        // `initialize` result tears the server down mid-`feed_stdout`) must not
+        // yield events *after* its `ServerExited` — the editor would re-apply
+        // diagnostics for a client it was just told is gone.
+        if !self.servers.contains_key(key) {
+            return;
+        }
         // Borrow `method`/`id` out of the owned `msg` rather than cloning them up
         // front — only the server-request branch needs an owned `id`.
         let method = msg.get("method").and_then(Value::as_str);
@@ -433,9 +538,28 @@ impl SyncLspClient {
                         None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                     };
                     self.on_response(key, rid, result);
+                } else {
+                    // A non-numeric response id is a protocol violation: every request
+                    // this client sends carries a numeric id, and a response must echo
+                    // it. There is no pending entry to settle, so fail loud instead of
+                    // silently dropping — a silent fall-through leaves the caller
+                    // waiting on a promise that can never resolve.
+                    self.log.log(
+                        LogLevel::Error,
+                        &key.name,
+                        &format!(
+                            "lsp: response with a non-numeric id ({req_id:?}) — not ours; dropped"
+                        ),
+                    );
                 }
             }
-            (None, None) => {}
+            // Neither a method nor an id: not a request, notification, or response —
+            // invalid JSON-RPC, never silent.
+            (None, None) => self.log.log(
+                LogLevel::Error,
+                &key.name,
+                "lsp: message with neither a method nor an id — dropped",
+            ),
         }
     }
 
@@ -686,10 +810,40 @@ impl SyncLspClient {
                 });
                 self.send_response(key, req_id, Value::Null);
             }
-            // Everything else a server may request (workDoneProgress/create, …) is
-            // acked with a null result so the server proceeds — matching async-lsp's
-            // lenient default.
-            _ => self.send_response(key, req_id, Value::Null),
+            // `window/workDoneProgress/create`: the server asking permission to
+            // report on a token it just minted. It MUST be acked — gopls reads the
+            // reply and sends no `$/progress` at all for a token the client refused,
+            // and async-lsp's method-not-found default made it conclude the client
+            // cannot do progress (the exact reason the native router handles this
+            // request explicitly). The token is not recorded: bemtvi keys tasks off
+            // the token the `$/progress` itself carries, which covers both
+            // server-minted (`create`) and client-minted (`workDoneToken`) tokens
+            // with one path.
+            //
+            // (Unmodelled requests in the default arm below answer with async-lsp's
+            // exact native-leg error shape — `code`/`message`/`data` fields and all —
+            // so a reply-reading server draws the same conclusion on both legs.)
+            "window/workDoneProgress/create" => {
+                self.send_response(key, req_id, Value::Null);
+            }
+            // Everything else a server may request (`window/showMessageRequest`,
+            // custom experimental methods, …) is answered with the same
+            // METHOD_NOT_FOUND error async-lsp's router produces for an unmodelled
+            // request on the native leg — there is no lenient null-ack default, and
+            // a server that reads the reply must draw the same conclusion on both
+            // legs (a refused `workDoneProgress/create` and an answered
+            // `showMessageRequest` are exactly such reply-reading cases).
+            _ => {
+                // Byte-identical to async-lsp's native-leg method-not-found reply:
+                // `{"code":-32601,"message":"No such method: X","data":null}` (its
+                // `ResponseError` serializes the `data` field unconditionally).
+                let error = json!({
+                    "code": -32601,
+                    "message": format!("No such method: {method}"),
+                    "data": null,
+                });
+                self.send_error(key, req_id, error);
+            }
         }
     }
 
@@ -851,10 +1005,17 @@ fn notify_wire(note: LspNotify) -> (String, Value) {
                 "contentChanges": changes,
             }),
         ),
-        LspNotify::DidSave { uri, text } => (
-            "textDocument/didSave".into(),
-            json!({"textDocument": {"uri": uri}, "text": text}),
-        ),
+        LspNotify::DidSave { uri, text } => {
+            // `text` is optional: omit the key rather than sending
+            // `"text": null` — the exact shape the native typed path emits
+            // (lsp-types skips the field when `None`), so both legs put the
+            // same bytes on the wire.
+            let mut params = json!({"textDocument": {"uri": uri}});
+            if let Some(text) = text {
+                params["text"] = json!(text);
+            }
+            ("textDocument/didSave".into(), params)
+        }
         LspNotify::DidClose { uri } => (
             "textDocument/didClose".into(),
             json!({"textDocument": {"uri": uri}}),

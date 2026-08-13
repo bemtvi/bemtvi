@@ -215,6 +215,9 @@ impl Editor {
     /// buffer-local (on the current buffer); the rest are global search options on
     /// the editor.
     fn apply_set_bool(&mut self, name: &str, op: SetOp, scope: SetScope) {
+        // Any local write below changes a `bo` mirror row; a query bump is a
+        // harmless one-tick over-push. See `bump_options_generation`.
+        self.bump_options_generation();
         // `ts_highlight` is the buffer-local *whether-treesitter-paints* noun —
         // orthogonal to `filetype` (the language). It lives in the per-buffer
         // enable map (`set_ts_highlight`), not a plain `options` bool slot, so it
@@ -381,6 +384,9 @@ impl Editor {
     /// `E487`): `tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`, the scroll
     /// options `≥ 0`.
     fn apply_set_num(&mut self, name: &str, op: NumOp, scope: SetScope) {
+        // Any local write below changes a `bo` mirror row; a query bump is a
+        // harmless one-tick over-push. See `bump_options_generation`.
+        self.bump_options_generation();
         // The numeric **buffer-local** options, reachable in either tier through one
         // accessor pair (see `apply_set_bool`). All five are settable — none is
         // read-derived — so a `:set tabstop=3` in a config reaches every file opened
@@ -399,15 +405,28 @@ impl Editor {
         if let Some((get, set)) = buf_num {
             match op {
                 NumOp::Set(v) => {
+                    // `'softtabstop'`'s `-1` sentinel is its only negative;
+                    // `'shiftwidth'` / `'foldminlines'` / `'foldnestmax'` accept 0
+                    // (vim allows `foldnestmax=0`, which collapses every fold).
                     let min = if name == "softtabstop" {
                         -1
-                    } else if name == "shiftwidth" || name == "foldminlines" {
+                    } else if matches!(name, "shiftwidth" | "foldminlines" | "foldnestmax") {
                         0
                     } else {
                         1
                     };
                     if v < min {
                         self.echo(format!("E487: Argument must be positive: {name}={v}"));
+                        return;
+                    }
+                    // The indent widths feed `" ".repeat` fills and `fill_indent`'s
+                    // tab loop, so an unbounded value turns a `<Tab>` / `>>` into a
+                    // capacity-overflow panic (or OOM). vim caps `tabstop` at 9999
+                    // (10000+ is refused) and *accepts* an absurd `shiftwidth` /
+                    // `softtabstop` — then hangs inserting that many spaces. bemtvi
+                    // rejects all three above 10000 loud (E474) instead.
+                    if matches!(name, "tabstop" | "shiftwidth" | "softtabstop") && v > 10000 {
+                        self.echo(format!("E474: Invalid argument: {name}={v}"));
                         return;
                     }
                     if scope.writes_local() {
@@ -514,6 +533,9 @@ impl Editor {
     /// [`Editor::set_global_option_str`] setter so the `:set` and `vim.o` paths
     /// share one home. `&` resets to the default (empty); `?` echoes the value.
     fn apply_set_str(&mut self, name: &str, op: StrOp, scope: SetScope) {
+        // Any local write below changes a `bo` mirror row; a query bump is a
+        // harmless one-tick over-push. See `bump_options_generation`.
+        self.bump_options_generation();
         // `filetype` is buffer-local and special: it drives the per-buffer
         // treesitter language override (the same seam as `btv.bo.filetype`), not a
         // global string slot. This is the no-Lua way to force a

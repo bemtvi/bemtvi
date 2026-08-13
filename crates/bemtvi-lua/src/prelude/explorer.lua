@@ -191,6 +191,7 @@ function btv.explorer._up(buf)
   replace_with(buf, parent)
 end
 
+btv.explorer.actions = btv.explorer.actions or {}
 -- `btv.explorer.actions` — the public, rebindable activation actions (current-buffer
 -- wrappers over the stateless `_open`/`_up`). A user/plugin extends or rebinds the
 -- explorer with an ordinary buffer-local map in a `FileType btvdir` autocmd, e.g.
@@ -198,7 +199,6 @@ end
 --     `btv.keymap.set("n", "<C-j>", btv.explorer.actions.open, { buffer = a.buf })`
 --   `end })`
 -- The default `<CR>`/`-`/`<2-LeftMouse>` maps (prelude/keymap.lua) are these too.
-btv.explorer.actions = btv.explorer.actions or {}
 btv.explorer.actions.open = function()
   btv.explorer._open(vim.api.nvim_get_current_buf())
 end

@@ -405,6 +405,11 @@ pub(crate) struct Window {
     /// The navigation pointer into [`Window::jumps`]: `jumps.len()` means "at the
     /// present, not navigating"; `<C-o>` walks it toward 0, `<C-i>` back up.
     pub(crate) jump_idx: usize,
+    /// Jumplist **generation** — bumped on every mutation of [`Window::jumps`] or
+    /// [`Window::jump_idx`]. The server compares it against the last value it
+    /// pushed to the Lua window mirror and skips re-serializing the list when
+    /// nothing moved; see [`Editor::window_jumplist_gen`](crate::Editor::window_jumplist_gen).
+    pub(crate) jump_gen: u64,
     /// A non-Normal mode to **resume** the next time this window is focused via the
     /// `<C-w><C-w>` dock chord (see [`Editor::dock_chord_intercept`]). Set when the
     /// chord crosses *out* of a window that was in insert / visual / terminal mode,
@@ -602,6 +607,7 @@ impl WindowTree {
             float: None,
             jumps: Vec::new(),
             jump_idx: 0,
+            jump_gen: 0,
             resume: None,
             loclist: None,
             loclist_bufnr: None,
@@ -1588,6 +1594,26 @@ impl Editor {
         }
     }
 
+    /// The option-state version a `bo`-mirror consumer gates its push on (see the
+    /// field docs on [`Editor::options_generation`]).
+    pub fn options_generation(&self) -> u64 {
+        self.options_generation
+    }
+
+    /// Mark the option state changed. Called at every site a Lua `bo` mirror row
+    /// derives from: the three `apply_set_*` entry points (buffer-local, window-local
+    /// and global `:set`-family writes), the `vim.bo` bridge (`set_buffer_option_*`),
+    /// [`recompute_effective_options`](Self::recompute_effective_options)
+    /// (which every global-tier write funnels through — `vim.o` / `btv.o` / `btv.wso`
+    /// / the workspace seed), a filetype or `ts_highlight` change (both are `bo`
+    /// fields), and a completed save (which clears `modified` and re-derives
+    /// `endofline`). Text edits must **not** call it — the mirror's `changedtick`
+    /// gate covers `modified` on the edit path, and bumping here would defeat the
+    /// whole point of a staleness gate.
+    pub(crate) fn bump_options_generation(&mut self) {
+        self.options_generation = self.options_generation.wrapping_add(1);
+    }
+
     /// Set a boolean global option from outside the editor (the Lua `vim.o`
     /// bridge), the global analogue of [`Editor::set_window_option_bool`]. The
     /// wired global options are all the search booleans; an unknown name is a
@@ -1612,6 +1638,9 @@ impl Editor {
         for (name, value) in self.workspace_options.iter() {
             self.options.set_scalar(name, value);
         }
+        // Every global-tier write funnels through here, so one bump covers `vim.o`
+        // / `btv.o` / `btv.wso` / the workspace seed — see `bump_options_generation`.
+        self.bump_options_generation();
     }
 
     /// Set (or, with `None`, clear) a per-workspace **option override** — the `btv.wso`

@@ -6,9 +6,16 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageReader};
+
+/// How long after a failed remote fetch to retry it (see
+/// [`RemoteState::Failed`]) — the same cooldown the clients' local decode cache
+/// applies, so a transient failure (the read racing an in-progress external
+/// write) recovers without re-issuing a request every paint.
+const RETRY_AFTER: Duration = Duration::from_millis(500);
 
 /// Cap the longest edge of a decoded image (pixels) before handing it to the
 /// client's paint layer. A preview never needs more than the screen can show, so
@@ -44,8 +51,13 @@ enum RemoteState {
     Pending,
     /// The fetched bytes, ready to decode.
     Ready(Vec<u8>),
-    /// The fetch failed (a read error / vanished file); paint the error placeholder.
-    Failed,
+    /// The fetch failed (a read error / vanished file); paint the error
+    /// placeholder and retry once the cooldown has elapsed (see
+    /// [`ensure_fetch`](RemoteImages::ensure_fetch)).
+    Failed {
+        /// The earliest instant a fresh fetch may be re-issued.
+        retry_after: Instant,
+    },
 }
 
 /// The out-of-band byte fetches for remote (daemon-session) previews, keyed by
@@ -65,14 +77,33 @@ impl RemoteImages {
 
     /// Make sure a fetch is in flight (or already resolved) for `path` at
     /// `version`, returning the [`ImageFetch`] to issue when a new request is
-    /// needed. Emits exactly one request per (path, version): the slot dedupes
-    /// re-requests while a fetch is pending and across frames, and a changed
-    /// version (a watch reload) supersedes with a fresh request. The reply
-    /// returns via [`deliver`](Self::deliver).
+    /// needed. Emits at most one request per (path, version) at a time: the slot
+    /// dedupes re-requests while a fetch is pending and across frames, and a
+    /// changed version (a watch reload) supersedes with a fresh request. A
+    /// **failed** fetch is re-issued once its retry cooldown has elapsed — a
+    /// transient failure (the read racing an in-progress external write) would
+    /// otherwise paint the error placeholder forever, since the version never
+    /// moves again once the write completes. The reply returns via
+    /// [`deliver`](Self::deliver).
     #[must_use = "send the returned ImageFetch over the client's transport, or the fetch never happens"]
     pub fn ensure_fetch(&mut self, path: &str, version: (u64, u64)) -> Option<ImageFetch> {
-        if self.slots.get(path).map(|s| s.version) == Some(version) {
-            return None; // already fetching this version, or its bytes/failure are cached
+        match self.slots.get(path) {
+            // Already in flight at this version, or its bytes are cached: nothing to do.
+            Some(RemoteSlot {
+                version: v,
+                state: RemoteState::Pending,
+            }) if *v == version => return None,
+            Some(RemoteSlot {
+                version: v,
+                state: RemoteState::Ready(_),
+            }) if *v == version => return None,
+            // A failed fetch waits out its cooldown before re-issuing, so a
+            // genuinely dead file doesn't trigger a request per paint.
+            Some(RemoteSlot {
+                version: v,
+                state: RemoteState::Failed { retry_after },
+            }) if *v == version && *retry_after > Instant::now() => return None,
+            _ => {}
         }
         self.slots.insert(
             path.to_string(),
@@ -109,16 +140,22 @@ impl RemoteImages {
     }
 
     /// Receive an `bemtvi_image_read` reply (routed from the client's event loop):
-    /// cache the bytes, or mark the fetch failed, so the next paint decodes /
-    /// falls back. A reply for a version no longer requested is dropped (a newer
-    /// fetch superseded it). The caller repaints afterward.
+    /// cache the bytes, or mark the fetch failed (scheduling a retry), so the
+    /// next paint decodes / falls back. A reply for a version no longer
+    /// requested is dropped (a newer fetch superseded it). The caller repaints
+    /// afterward.
     pub fn deliver(&mut self, path: String, version: (u64, u64), result: Result<Vec<u8>, String>) {
         if self.slots.get(&path).map(|s| s.version) != Some(version) {
             return; // a newer fetch (or a closed preview) superseded this reply
         }
         let state = match result {
             Ok(bytes) => RemoteState::Ready(bytes),
-            Err(_) => RemoteState::Failed,
+            // Schedule a retry: the failure may be transient (a daemon read
+            // racing an external write), and a version-bump-free file would
+            // otherwise never be re-requested (see [`ensure_fetch`]).
+            Err(_) => RemoteState::Failed {
+                retry_after: Instant::now() + RETRY_AFTER,
+            },
         };
         self.slots.insert(path, RemoteSlot { version, state });
     }
@@ -178,6 +215,41 @@ fn downscale(img: DynamicImage, cap: u32) -> DynamicImage {
         img.resize(cap, cap, FilterType::Triangle)
     } else {
         img
+    }
+}
+
+/// A preview decode the clients' paint paths off-load onto a blocking task. A
+/// disk read (local) or a full-resolution decode + downscale (both) on the
+/// paint/UI thread would stall every keystroke and repaint for the file's read
+/// time, no matter how big the image is — the never-freeze guard. `Local` reads
+/// the shared disk; `Remote` decodes bytes already fetched from the daemon.
+/// Failures travel as `None`; the clients' per-path retry machinery owns them.
+pub enum DecodeReq {
+    /// A local preview: read the file from the shared disk.
+    Local { path: String, version: (u64, u64) },
+    /// A remote preview: decode the daemon-fetched bytes in memory.
+    Remote {
+        path: String,
+        version: (u64, u64),
+        bytes: Vec<u8>,
+    },
+}
+
+impl DecodeReq {
+    /// Run the decode (CPU-bound and possibly blocking on the read — call on a
+    /// blocking task, never the paint path) and return the outcome in the
+    /// `(path, version, decoded)` shape the clients' deliver paths expect.
+    pub fn decode(self, max_edge: u32) -> (String, (u64, u64), Option<DynamicImage>) {
+        match self {
+            DecodeReq::Local { path, version } => {
+                (path.clone(), version, decode_file(&path, max_edge))
+            }
+            DecodeReq::Remote {
+                path,
+                version,
+                bytes,
+            } => (path.clone(), version, decode_bytes(&bytes, max_edge)),
+        }
     }
 }
 

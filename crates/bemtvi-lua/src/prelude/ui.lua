@@ -61,7 +61,9 @@ local function select_into(items, opts, cb)
     end
     return cb(items[idx], idx)
   end
-  btv._ui_select(labels, opts.prompt or "", id)
+  btv._bridge(id, function()
+    btv._ui_select(labels, opts.prompt or "", id)
+  end)
 end
 
 -- `btv.ui.select(items, opts)` -> a PROMISE that resolves to the chosen item, or to
@@ -211,14 +213,16 @@ function btv.ui.input(opts, on_confirm)
           btv._do_prompt_complete(complete, line, col)
         end, debounce_ms)
       or nil
-    btv._ui_input(
-      tostring(opts.prompt or ""),
-      tostring(opts.default or ""),
-      id,
-      history,
-      complete ~= nil,
-      complete_docs
-    )
+    btv._bridge(id, function()
+      btv._ui_input(
+        tostring(opts.prompt or ""),
+        tostring(opts.default or ""),
+        id,
+        history,
+        complete ~= nil,
+        complete_docs
+      )
+    end)
   end)
 end
 
@@ -235,7 +239,10 @@ btv._prompt_complete_debounced = btv._prompt_complete_debounced or nil
 -- menu just closes — a completion hiccup must not break the prompt). Shared by the
 -- immediate path and the debounced refresh path.
 function btv._do_prompt_complete(fn, line, col)
-  btv.promise.resolve(fn(line, col)):next(function(cands)
+  -- `try` folds a synchronous throw from `fn` into a rejection, so the error
+  -- handler below still closes the menu (a completion hiccup must not break the
+  -- prompt) instead of the throw escaping the callback uncaught.
+  btv.promise.try(fn, line, col):next(function(cands)
     btv._prompt_complete_show(cands or {})
   end, function()
     btv._prompt_complete_show({})
@@ -302,7 +309,9 @@ function btv.ui.confirm(message, opts, on_choice)
       resolve(tonumber(idx_str) == 1)
     end
     -- accelerators are matched lowercase against the keypress, in button order.
-    btv._confirm(label, { "y", "n" }, default_yes and 1 or 2, id)
+    btv._bridge(id, function()
+      btv._confirm(label, { "y", "n" }, default_yes and 1 or 2, id)
+    end)
   end)
 end
 

@@ -105,11 +105,15 @@ pub(crate) struct TermEmu {
     /// The `'scrollback'` cap this emulator was created with — kept so an interrupt
     /// trim can re-seed a fresh parser with the same cap (see [`EditHost::terminal_trim`]).
     scrollback: usize,
-    /// Newlines fed since the last user keystroke went to the child — the flood
-    /// signal a `^C` consults: a command that dumped many lines since you last typed
-    /// is "actively flooding", so `^C` trims the scrollback to the recent tail. Reset
-    /// to 0 on every input (so steady typing never reads as a flood).
-    lines_since_input: usize,
+    /// Rows that actually entered the scrollback since the last user keystroke went
+    /// to the child — the flood signal a `^C` consults: a command that scrolled many
+    /// rows since you last typed is "actively flooding", so `^C` trims the scrollback
+    /// to the recent tail. Measured as scrollback *growth* (accumulated in
+    /// [`EditHost::terminal_project`]), not raw `\n`s in the byte stream: a full-screen
+    /// repainting TUI (`top`, `watch`) emits tens of cursor-advance newlines per frame
+    /// that never scroll, and counting them falsely arms the trim against an idle
+    /// child. Reset to 0 on every input (so steady typing never reads as a flood).
+    scrolled_since_input: usize,
 }
 
 impl TermEmu {
@@ -124,14 +128,15 @@ impl TermEmu {
             // and lay out the full buffer.
             last_held: usize::MAX,
             scrollback,
-            lines_since_input: 0,
+            scrolled_since_input: 0,
         }
     }
 }
 
 /// How many recent lines an interrupt (`^C`) keeps when it trims a flooding
-/// terminal's scrollback — and, reused as the flood threshold, how many lines must
-/// have streamed since the last keystroke for a `^C` to trigger the trim at all.
+/// terminal's scrollback — and, reused as the flood threshold, how many rows must
+/// have scrolled into the scrollback since the last keystroke for a `^C` to
+/// trigger the trim at all.
 const TERM_TRIM_KEEP: usize = 200;
 
 impl EditHost {
@@ -156,8 +161,10 @@ impl EditHost {
         let replies = match self.terminals.get_mut(&buf) {
             Some(emu) => {
                 emu.parser.process(bytes);
-                // Track output volume since the last keystroke (the `^C` flood signal).
-                emu.lines_since_input += bytes.iter().filter(|&&b| b == b'\n').count();
+                // The `^C` flood signal is measured as scrollback growth in
+                // `terminal_project` — NOT as newlines here: a full-screen repainting
+                // TUI's cursor-advance `\n`s never scroll, and counting them would arm
+                // the trim against an idle child.
                 std::mem::take(&mut emu.parser.callbacks_mut().replies)
             }
             None => return,
@@ -235,12 +242,14 @@ impl EditHost {
 
     /// React to a keystroke about to be sent to `buf`'s child. A bare `^C` (the
     /// single byte `0x03`) on a terminal that has been *actively flooding* — at least
-    /// [`TERM_TRIM_KEEP`] lines streamed since the last keystroke — trims the
-    /// scrollback to the recent tail with a marker ([`terminal_trim`]), so cancelling
-    /// a runaway command leaves a readable buffer instead of thousands of lines. A
-    /// `^C` at an idle prompt (nothing flooded) is left alone, so normal shell use
-    /// keeps its full scrollback. Either way the flood counter resets — the next
-    /// command's output is measured from here.
+    /// [`TERM_TRIM_KEEP`] rows scrolled into the scrollback since the last keystroke —
+    /// trims the scrollback to the recent tail with a marker ([`terminal_trim`]), so
+    /// cancelling a runaway command leaves a readable buffer instead of thousands of
+    /// lines. A `^C` at an idle prompt (nothing flooded) is left alone, so normal
+    /// shell use keeps its full scrollback — including a full-screen repainting TUI
+    /// (`top`, `watch`), whose redraws scroll nothing and so never arm the trim.
+    /// Either way the flood counter resets — the next command's output is measured
+    /// from here.
     ///
     /// Returns whether it trimmed — the daemon/edit-host uses that as the signal to also
     /// discard the child's in-flight backlog (the browser leg can't otherwise stop a flood
@@ -249,7 +258,7 @@ impl EditHost {
     /// [`terminal_trim`]: EditHost::terminal_trim
     pub(crate) fn terminal_on_input(&mut self, buf: BufferId, bytes: &[u8]) -> bool {
         let flooding = match self.terminals.get(&buf) {
-            Some(emu) => emu.lines_since_input >= TERM_TRIM_KEEP,
+            Some(emu) => emu.scrolled_since_input >= TERM_TRIM_KEEP,
             None => return false,
         };
         let trimmed = bytes == [0x03] && flooding;
@@ -257,7 +266,7 @@ impl EditHost {
             self.terminal_trim(buf);
         }
         if let Some(emu) = self.terminals.get_mut(&buf) {
-            emu.lines_since_input = 0;
+            emu.scrolled_since_input = 0;
         }
         trimmed
     }
@@ -307,7 +316,7 @@ impl EditHost {
         emu.history.clear();
         emu.history_styles.clear();
         emu.last_held = usize::MAX;
-        emu.lines_since_input = 0;
+        emu.scrolled_since_input = 0;
         self.terminal_project(buf);
     }
 
@@ -317,12 +326,13 @@ impl EditHost {
     /// the cursor and line numbers stay stable across `<C-\><C-n>` / `i` — there is no
     /// live-vs-browse buffer flip.
     ///
-    /// Cost is kept bounded so a flood never stalls: the history mirror is re-read
-    /// from vt100 **only when the scrollback length changed** (something scrolled),
-    /// and even then we splice — the leading history lines are unchanged, so we rewrite
-    /// only from the first changed row. A refresh where nothing scrolled (steady
-    /// typing) rewrites just the live-screen region. Called once per repaint, not per
-    /// PTY chunk.
+    /// Cost is kept bounded so a flood never stalls: while the history is
+    /// *growing*, a scrolled batch appends only the newly-scrolled rows (the
+    /// leading lines are unchanged); a saturated scrollback — length pinned at
+    /// the cap while contents shift — or a shrink (`:clear`) falls back to a
+    /// full re-read from vt100. A refresh where nothing scrolled (steady
+    /// typing) rewrites just the live-screen region. Called once per repaint,
+    /// not per PTY chunk.
     pub(crate) fn terminal_project(&mut self, buf: BufferId) {
         let Some(emu) = self.terminals.get_mut(&buf) else {
             return;
@@ -333,7 +343,11 @@ impl EditHost {
         // frame. The length alone can't tell: once the scrollback saturates at the cap
         // it stays `cap` forever while its *contents* keep shifting, so we also compare
         // the newest scrolled row (the row just above the live screen) against the last
-        // one we captured — that changes on every scroll, saturated or not.
+        // one we captured — that changes on every scroll, saturated or not. (The one
+        // churn vt100's text API cannot see: a flood whose scrolled rows are textually
+        // identical to the last captured row, e.g. `yes y` — no signal exists, and
+        // none is needed: the rows it can't detect are exactly the rows whose absence
+        // the buffer never shows, since the live screen still updates each frame.)
         let held = {
             let screen = emu.parser.screen_mut();
             screen.set_scrollback(usize::MAX);
@@ -353,7 +367,33 @@ impl EditHost {
         let scrolled =
             held != emu.last_held || newest.as_deref() != emu.history.last().map(String::as_str);
         if scrolled {
-            emu.history = read_scrollback_text(emu.parser.screen_mut(), held, rows, cols);
+            if held > emu.last_held && emu.last_held != usize::MAX {
+                // Rows that actually scrolled into the scrollback: the `^C` flood
+                // signal (see `scrolled_since_input`). Growth only — saturated churn
+                // counts 0, so an idle repainting TUI at the cap never arms the trim.
+                emu.scrolled_since_input += held - emu.last_held;
+                // Growing history: only the newest `held - last_held` rows are new —
+                // the leading rows are untouched — so read just those and append,
+                // instead of re-reading the whole retained scrollback on every
+                // scrolled batch of a flood. Paged through the view-window exactly
+                // like `read_scrollback_text`: at offset `k` window row 0 is
+                // scrollback row `held - k`, so the first page starts at the first
+                // new row and pages walk forward in order.
+                let mut idx = emu.last_held;
+                while idx < held {
+                    let k = held - idx;
+                    emu.parser.screen_mut().set_scrollback(k);
+                    let take = k.min(rows as usize).min(held - idx);
+                    emu.history
+                        .extend(emu.parser.screen_mut().rows(0, cols).take(take));
+                    idx += take;
+                }
+            } else {
+                // Saturated scrollback (length pinned at the cap while its contents
+                // shift) or a shrink (terminal reset / `:clear`): no prefix is known
+                // to survive, so fall back to the full re-read.
+                emu.history = read_scrollback_text(emu.parser.screen_mut(), held, rows, cols);
+            }
             emu.parser.screen_mut().set_scrollback(0); // restore the live view
             emu.last_held = held;
             // History changed; any browse-time color cache is stale. It is re-filled

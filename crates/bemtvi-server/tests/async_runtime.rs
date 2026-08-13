@@ -27,7 +27,9 @@
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, lua_bool, lua_u64, poll_true, settle_ms, start_attached};
+use bemtvi_test_harness::{
+    exec_lua, feed, lines, lua_bool, lua_u64, poll_true, settle_ms, start_attached,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread (its runtime has timers enabled, so the
@@ -760,5 +762,92 @@ async fn btv_hash_new_hashes_a_stream_via_await_each() {
         got.as_str(),
         Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
         "hashing a stream's chunks via await_each yields sha256 of the concatenated data"
+    );
+}
+
+// ============================================ a burst of loop events is batched, not lost
+//
+// The run loop drains the event-loop queue in bounded batches so a storm — an fs-watch
+// flood over a huge repo, a pile of timers, a rush of process exits — cannot hold the
+// editor with no repaint until the queue runs dry.
+//
+// The subtle half is the batch BOUNDARY. The drain loop reads its next event with a
+// `try_recv` at the bottom; stopping at the cap *after* that read would consume one
+// more event into the loop variable and drop it at scope end. The loop breaks before
+// the read instead.
+//
+// SCOPE: this asserts the property (no event is lost), not that detail. Swapping the
+// break to after the read leaves it green — the run loop turns often enough that the
+// queue does not reach the cap, even with the tick held busy below to make it try. The
+// boundary is real but not reachable by driving the editor from outside.
+
+#[tokio::test]
+async fn a_burst_past_the_batch_cap_loses_no_events() {
+    let (rpc, _incoming) = start().await;
+    // Well past the 256-event batch, so the drain has to hand back and resume several
+    // times. Each timer is its own loop event.
+    const N: usize = 1000;
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"_G.fired = 0
+               for _ = 1, {N} do
+                 btv.timer(function() _G.fired = _G.fired + 1 end, 0)
+               end
+               -- Hold the tick busy so the fired timers QUEUE on the event-loop
+               -- actor instead of being served one turn at a time. Without this the
+               -- run loop drains a handful per turn and the batch boundary — the
+               -- part under test — is never reached.
+               local t = os.clock()
+               while os.clock() - t < 0.4 do end"#
+        ),
+    )
+    .await;
+
+    let mut fired = 0;
+    for _ in 0..400 {
+        fired = exec_lua(&rpc, "return _G.fired")
+            .await
+            .as_i64()
+            .unwrap_or(0);
+        if fired as usize >= N {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fired as usize, N,
+        "every queued event must run — {fired}/{N} did, so the batch boundary is \
+         eating one event per turn"
+    );
+}
+
+#[tokio::test]
+async fn the_editor_stays_live_while_a_burst_drains() {
+    // The reason the cap exists: the screen must not freeze until the queue is dry.
+    // A keystroke fed while the burst drains has to reach the buffer.
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.fired = 0
+           for _ = 1, 2000 do
+             btv.timer(function() _G.fired = _G.fired + 1 end, 0)
+           end"#,
+    )
+    .await;
+
+    feed(&rpc, "ilive<Esc>");
+    let mut got = Vec::new();
+    for _ in 0..400 {
+        got = lines(&rpc).await;
+        if got == vec!["live".to_string()] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got,
+        vec!["live"],
+        "input must be served while the event burst drains, not after it"
     );
 }

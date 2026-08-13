@@ -214,13 +214,29 @@ impl Editor {
     /// and unknown buffers are ignored (the Lua side only forwards the wired set,
     /// and the buffer is mirror-guarded).
     pub fn set_buffer_option_num(&mut self, id: BufferId, name: &str, value: i64) {
+        // Every arm below writes a `bo` mirror row (`tabstop`/`shiftwidth`/
+        // `softtabstop`/the `fold*` knobs) — see `bump_options_generation`. The
+        // bump also covers the `refresh_folds()` rebuild below (a fold change
+        // repaints but never moves a `bo` row, so it is harmless over-push).
+        self.bump_options_generation();
         let Some(ob) = self.buffers.map.get_mut(&id) else {
             return;
         };
         match name {
-            "tabstop" => ob.buffer.options.tabstop = value.max(1) as usize,
-            "shiftwidth" => ob.buffer.options.shiftwidth = value.max(0) as usize,
-            "softtabstop" => ob.buffer.options.softtabstop = value.max(-1) as isize,
+            // The indent widths feed `" ".repeat` fills and `fill_indent`'s tab
+            // loop, so an unbounded value turns a `<Tab>` / `>>` into a
+            // capacity-overflow panic (or OOM) — the same 10000 cap the `:set`
+            // path enforces loud (E474); here, matching this bridge's ignore-garbage
+            // convention, it is clamped silently.
+            "tabstop" => {
+                ob.buffer.options.tabstop = value.clamp(1, 10000) as usize;
+            }
+            "shiftwidth" => {
+                ob.buffer.options.shiftwidth = value.clamp(0, 10000) as usize;
+            }
+            "softtabstop" => {
+                ob.buffer.options.softtabstop = value.clamp(-1, 10000) as isize;
+            }
             "foldnestmax" => ob.buffer.options.foldnestmax = value.max(1) as usize,
             "foldminlines" => ob.buffer.options.foldminlines = value.max(0) as usize,
             _ => return,
@@ -233,6 +249,10 @@ impl Editor {
     /// Set a boolean buffer-local option (`expandtab`, `ts_highlight`) on buffer
     /// `id`. The boolean companion to [`Editor::set_buffer_option_num`].
     pub fn set_buffer_option_bool(&mut self, id: BufferId, name: &str, value: bool) {
+        // Every arm below writes a `bo` mirror row (`expandtab`/`autoindent`/
+        // `modified`/…); `ts_highlight` bumps again via `set_ts_highlight` — see
+        // `bump_options_generation`.
+        self.bump_options_generation();
         // `ts_highlight` is the treesitter-enable noun (`btv.bo.ts_highlight`); it
         // lives in the per-buffer enable map, not an `options` slot, so route it
         // through the dedicated setter (which also drops/restores the parse).
@@ -281,6 +301,11 @@ impl Editor {
     /// `:set` ex path is where a bad value fails loud (`E474`), so a raw `vim.bo`
     /// write of garbage leaves the option untouched.
     pub fn set_buffer_option_str(&mut self, id: BufferId, name: &str, value: &str) {
+        // Every arm below writes a `bo` mirror row (`filetype`/`commentstring`/
+        // `foldexpr`/`foldmarker`/`regexsyntax`/`fileencoding`/`fileformat`); the
+        // `filetype` and `ts_highlight` arms bump again internally — see
+        // `bump_options_generation`.
+        self.bump_options_generation();
         // `filetype` is the treesitter language noun (`btv.bo.filetype`); route it
         // through `set_filetype` (which refreshes the parse). `""` = no filetype.
         if name == "filetype" {
@@ -494,6 +519,18 @@ impl Editor {
     /// A no-op if `id` is not an open buffer.
     pub fn set_current_buffer(&mut self, id: BufferId) {
         self.switch_buffer(id);
+    }
+
+    /// The file path buffer `id` is bound to, or `None` if it has none (a
+    /// scratch surface) or no such buffer is open. [`buffer_name`](Self::buffer_name)
+    /// is the display spelling of the same fact; callers that need the path (a
+    /// filetype derivation, a disk comparison) read it here, not off the current
+    /// buffer — a `BufLeave` handler inspects the buffer being *left*.
+    pub fn buffer_path(&self, id: BufferId) -> Option<&std::path::Path> {
+        self.buffers
+            .map
+            .get(&id)
+            .and_then(|ob| ob.buffer.path.as_deref())
     }
 
     /// The file name of buffer `id` (`""` for an unnamed buffer), or `None` if
@@ -900,11 +937,15 @@ impl Editor {
         match read {
             Ok(mut buf) => {
                 let ob = self.buffers.get_mut(buffer);
-                // Carry `save_tick` and the buffer's own settable options across the
-                // swap — a deferred read landing is not a save, and must not reset the
-                // options the buffer was born with (see `load_into_current`).
+                // Carry `save_tick`, the buffer's own settable options, and
+                // `changedtick` across the swap — a deferred read landing is not a
+                // save, and must not reset the options the buffer was born with (see
+                // `load_into_current`). The `changedtick` carry keeps the counter
+                // monotonic per bufnr (as in neovim) and avoids the mirror-gate
+                // collision the other swaps guard against (see `load_into_current`).
                 buf.save_tick = ob.buffer.save_tick;
                 buf.options.inherit_settable(&ob.buffer.options);
+                buf.changedtick = ob.buffer.changedtick;
                 ob.buffer = buf;
                 ob.undo = UndoTree::new(&ob.buffer);
                 ob.saved_seq = Some(ob.undo.cur_seq());
@@ -1013,6 +1054,9 @@ impl Editor {
             return;
         }
         let moved_on = self.buffers.get(buffer).buffer.changedtick != snapshot_tick;
+        // `mark_written` clears `modified` and re-derives `endofline`, both `bo`
+        // mirror rows — see `bump_options_generation`.
+        self.bump_options_generation();
         self.buffers
             .get_mut(buffer)
             .buffer
@@ -1100,6 +1144,9 @@ impl Editor {
         let fs = self.host_fs.clone();
         let outcome = match self.buffers.get_mut(buffer).buffer.write(path, &*fs) {
             Ok((bytes, lines)) => {
+                // A save clears `modified` and re-derives `endofline`, both `bo`
+                // mirror rows — see `bump_options_generation`.
+                self.bump_options_generation();
                 // The current state is now what's on disk — undoing/redoing back to it
                 // should read as clean, and the saved node carries a save number.
                 self.mark_undo_saved(buffer);
@@ -1731,6 +1778,14 @@ impl Editor {
                 // defaults on reload. The read still decides encoding / BOM / fileformat /
                 // endofline — that is the split `inherit_settable` draws.
                 buf.options.inherit_settable(&ob.buffer.options);
+                // Carry `changedtick` across as well: the fresh read starts it at 0
+                // and the `mark_resync` below bumps it to exactly 1, which collides
+                // with a previously-recorded 1 (one edit since the last mirror push)
+                // — the server's `buf_mirror_ticks` gate then skips the whole-array
+                // push, leaving `btv._bufs[buf].lines` and the `vim.bo.*` rows stale
+                // after `:e!`. Monotonic per bufnr (as in neovim), so the mirror's
+                // delta machinery stays sound.
+                buf.changedtick = ob.buffer.changedtick;
                 ob.buffer = buf;
                 // Reloaded from disk: discard the old history and start a fresh
                 // tree rooted at the reloaded text — a state that is, by
@@ -1780,10 +1835,13 @@ impl Editor {
         let is_current = buffer == self.cur_buffer();
         {
             let ob = self.buffers.get_mut(buffer);
-            // Carry `save_tick` across the swap — an autoread/`:checktime` reload
-            // is not a save (see `load_into_current`).
+            // Carry `save_tick` and `changedtick` across the swap — an
+            // autoread/`:checktime` reload is not a save, and the fresh read's
+            // restarted `changedtick` would collide with the mirror's last-recorded
+            // 1, staling `btv._bufs[buf].lines` (see `load_into_current`).
             let mut new_buf = new_buf;
             new_buf.save_tick = ob.buffer.save_tick;
+            new_buf.changedtick = ob.buffer.changedtick;
             ob.buffer = new_buf;
             // Reloaded from disk: discard the old history and start a fresh tree
             // rooted at the reloaded text, a state that is by definition saved.
@@ -2930,10 +2988,13 @@ impl Editor {
         // The layer is the focused one, since the focused window is losing `target`.
         // Deleting a **live** terminal buffer takes its PTY child with it: enqueue
         // the kill for the server's effect loop, or the child would be orphaned (a
-        // leaked process per wiped terminal). Only for a still-live session — an
-        // exited terminal's kind was already flipped back to `Ordinary` by
-        // `terminal_closed`, so a normal exit never double-kills.
-        if self.is_terminal_buffer(target) {
+        // leaked process per wiped terminal). An exited terminal's kind was already
+        // flipped back to `Ordinary` by `terminal_closed`, but `was_terminal` stays
+        // set — its server-side frozen-color capture (`terminal_frozen`) would
+        // otherwise leak per wiped dead terminal, so those queue the kill too. A
+        // normal exit never double-kills a live child, and the daemon's kill is a
+        // tolerant no-op for a dead PTY.
+        if self.is_terminal_buffer(target) || self.buffers.get(target).buffer.was_terminal {
             self.pending_terminal
                 .push(crate::editor::terminal::TerminalOp::Kill { buf: target });
         }

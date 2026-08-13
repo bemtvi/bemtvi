@@ -263,9 +263,27 @@ impl HttpMounts {
     /// resolved address (an ephemeral `:0` is concrete by now — the whole reason the mount
     /// promise carries the origin) or a human error for the reject.
     async fn bind(&self, host: &str, port: u16) -> Result<Bound, String> {
-        let listener = TcpListener::bind((host, port)).await.map_err(|e| {
-            format!("btv.http.mount: cannot bind {host}:{port}: {e} (see 'httphost' / 'httpport')")
-        })?;
+        // Bounded: resolving a `host` *name* (not a literal address) can stall on a
+        // dead resolver for seconds, and `mount`/`rebind` await this inline on the
+        // shared event-loop actor — every timer and process would park behind it.
+        let listener = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TcpListener::bind((host, port)),
+        )
+        .await
+        {
+            Ok(Ok(listener)) => listener,
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "btv.http.mount: cannot bind {host}:{port}: {e} (see 'httphost' / 'httpport')"
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                "btv.http.mount: timed out binding {host}:{port} (host resolution may be stalled)"
+            ))
+            }
+        };
         let addr = listener.local_addr().map_err(|e| {
             format!("btv.http.mount: bound {host}:{port} but cannot read it back: {e}")
         })?;

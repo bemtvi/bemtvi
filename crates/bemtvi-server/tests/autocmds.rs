@@ -3775,3 +3775,92 @@ async fn ui_enter_reports_truecolor_and_osc52_from_the_attach_map() {
         "truecolor and osc52 come through the same mirror"
     );
 }
+
+// --------------------------------------------------------- deletion is not a wipe
+//
+// `nvim_del_autocmd(id)` filters the registry with `au.id ~= id`. A `nil` id makes
+// that predicate true for EVERY autocmd, so a single mistyped call silently deleted
+// the whole registry — every plugin's handlers gone, with no error to point at. It
+// now raises instead.
+
+#[tokio::test]
+async fn deleting_an_autocmd_with_no_id_raises_instead_of_wiping_the_registry() {
+    let dir = temp_dir("au_del_nil");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_autocmd('User', { pattern = 'M',\n\
+         \x20 callback = function() print('alive') end })\n",
+    )
+    .await;
+
+    // The bad call is loud…
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "local ok, err = pcall(vim.api.nvim_del_autocmd, nil) print('ok=' .. tostring(ok))",
+    )
+    .await;
+    assert_eq!(msg, "ok=false", "a nil autocmd id must raise");
+
+    // …and, crucially, the registry survived it.
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'M' })",
+    )
+    .await;
+    assert_eq!(
+        msg, "alive",
+        "the unrelated autocmd must still be registered — a nil id used to wipe every one"
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_autocmd_by_id_still_removes_exactly_that_one() {
+    // The control: real deletion must keep working, and must not take its
+    // neighbours with it.
+    let dir = temp_dir("au_del_one");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.id = vim.api.nvim_create_autocmd('User', { pattern = 'M',\n\
+         \x20 callback = function() print('doomed') end })\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'M',\n\
+         \x20 callback = function() print('kept') end })\n",
+    )
+    .await;
+    lua_message(&rpc, &mut incoming, "vim.api.nvim_del_autocmd(_G.id)").await;
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'M' })",
+    )
+    .await;
+    assert_eq!(msg, "kept", "only the named autocmd is gone");
+}
+
+// ------------------------------------------------- `buffer = 0` means the current one
+//
+// `nvim_create_autocmd` resolves `buffer = 0` to the current buffer, but
+// `nvim_exec_autocmds` did not — so a buffer-local autocmd registered for the
+// current buffer could not be fired for it by the same spelling.
+
+#[tokio::test]
+async fn exec_autocmds_resolves_buffer_zero_to_the_current_buffer() {
+    let dir = temp_dir("au_exec_buf0");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_autocmd('User', { pattern = 'M', buffer = 0,\n\
+         \x20 callback = function() print('local fired') end })\n",
+    )
+    .await;
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'M', buffer = 0 })",
+    )
+    .await;
+    assert_eq!(
+        msg, "local fired",
+        "`buffer = 0` must mean the current buffer on BOTH the register and fire sides"
+    );
+}

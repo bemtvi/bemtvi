@@ -2270,23 +2270,26 @@ impl Editor {
     }
 
     /// The visible window of rows `[start, start+count)` of the open menu: each
-    /// row's label and its matched-character spans (empty in passthrough). Clones
-    /// only the requested window — O(count), independent of the list size. Empty
-    /// when closed or out of range.
-    pub fn menu_rows(&self, start: usize, count: usize) -> Vec<(String, Vec<Range<usize>>)> {
-        let Some(m) = self.menu.as_ref() else {
+    /// row's label and its matched-character spans (empty in passthrough).
+    /// **Borrows** the requested window from the live menu — O(count) pointers,
+    /// independent of the list size, and no per-frame clone of the whole list (the
+    /// cursor-placement arm projects the entire view; the server consumes the
+    /// borrow into RPC values before its next `&mut self` call). Empty when closed
+    /// or out of range.
+    pub fn menu_rows(&self, start: usize, count: usize) -> Vec<(&str, &[Range<usize>])> {
+        let Some(m) = &self.menu else {
             return Vec::new();
         };
         let end = start.saturating_add(count).min(m.view_len());
         (start..end)
             .map(|i| {
-                let label = m.all_items[m.item_at(i)].label.clone();
-                let spans = if m.filtered.is_some() {
-                    m.match_spans[i].clone()
+                let item = &m.all_items[m.item_at(i)];
+                let spans: &[Range<usize>] = if m.filtered.is_some() {
+                    &m.match_spans[i]
                 } else {
-                    Vec::new()
+                    &[]
                 };
-                (label, spans)
+                (item.label.as_str(), spans)
             })
             .collect()
     }
@@ -2295,14 +2298,14 @@ impl Editor {
     /// parallel to [`Editor::menu_rows`] — the short category the client right-aligns
     /// on each completion row (`"Snippet"`, `"Function"`, …). `None` for a row whose
     /// source declares no kind (`buffer` words, `select` / picker rows); empty when no
-    /// menu is open.
-    pub fn menu_kinds_window(&self, start: usize, count: usize) -> Vec<Option<String>> {
-        let Some(m) = self.menu.as_ref() else {
+    /// menu is open. Borrows from the live menu like [`Editor::menu_rows`].
+    pub fn menu_kinds_window(&self, start: usize, count: usize) -> Vec<Option<&str>> {
+        let Some(m) = &self.menu else {
             return Vec::new();
         };
         let end = start.saturating_add(count).min(m.view_len());
         (start..end)
-            .map(|i| m.all_items[m.item_at(i)].kind.clone())
+            .map(|i| m.all_items[m.item_at(i)].kind.as_deref())
             .collect()
     }
 
@@ -2346,7 +2349,7 @@ impl Editor {
     /// so a click lands on the row the user sees. The server fills the content
     /// (labels' styling, the preview pane, the docs sidebar) around the returned
     /// box; the box, `start`, and rows come from here.
-    pub fn menu_geom(&self, m: &MenuView, metrics: MenuMetrics) -> MenuGeom {
+    pub fn menu_geom<'a>(&'a self, m: &MenuView, metrics: MenuMetrics) -> MenuGeom<'a> {
         const MAX_H: usize = 10;
         let MenuMetrics {
             cursor_row,
@@ -2600,7 +2603,7 @@ fn menu_start(selected: Option<usize>, list_rows: usize) -> usize {
 /// The cursor-screen metrics a menu's box is placed against — read from the
 /// focused window's projection ([`WindowView`](crate::view::WindowView)) at redraw,
 /// or recomputed in core for mouse hit-testing. `text_width` / `text_height` are
-/// the focused window's text-area size (its width minus the number gutter, and its
+/// the focused window's text-area size (its width minus every left gutter, and its
 /// visible row count); the cursor fields are window-relative (the cursor popup
 /// anchors under the caret). `editor_w` / `editor_h` are the WHOLE editor's
 /// windows-area size — an `Editor` / `Bottom` placement (the picker) sizes and
@@ -2627,7 +2630,7 @@ pub struct MenuMetrics {
 /// `[start, start + rows.len())`; `selected` is the highlighted row rebased into
 /// that window (add `start` for the absolute view index).
 #[derive(Debug, Clone)]
-pub struct MenuGeom {
+pub struct MenuGeom<'a> {
     pub row: usize,
     pub col: usize,
     pub width: usize,
@@ -2636,8 +2639,11 @@ pub struct MenuGeom {
     pub selected: usize,
     /// Scroll offset of the first visible row (`0` for the whole-list placements).
     pub start: usize,
-    /// The visible rows `[start, start + rows.len())`: label + matched-char spans.
-    pub rows: Vec<(String, Vec<Range<usize>>)>,
+    /// The visible rows `[start, start + rows.len())`: label + matched-char spans,
+    /// borrowed from the editor's live menu — the projection and the mouse hit-test
+    /// read them without cloning the list. The server must consume the borrow (into
+    /// RPC values) before its next `&mut self` call.
+    pub rows: Vec<(&'a str, &'a [Range<usize>])>,
     /// The content column where the aligned **kind** labels start (just past the widest
     /// label), for a completion popup that carries kinds. `None` for a kind-less popup,
     /// a `select` / picker / cmdline menu, or a box too narrow to hold a kind column.

@@ -152,8 +152,8 @@ fn mark_json_object(lua: &Lua, t: &Table) -> mlua::Result<()> {
     t.set_metatable(Some(meta))
 }
 
-/// The shape of a Lua table once classified: a sequence (every key an integer in
-/// `1..=len`) or a map (anything else). `Map` keeps the keys *raw* so each caller
+/// The shape of a Lua table once classified: a sequence (its keys are exactly
+/// the integers `1..=len`) or a map (anything else). `Map` keeps the keys *raw* so each caller
 /// coerces them into its own key space ([`lua_to_rmpv`] vs [`json_key`]); the
 /// integer keys of a non-sequence table are re-emitted into the map, after the
 /// string-keyed entries, exactly as the old per-format walkers did.
@@ -189,7 +189,13 @@ fn classify_table<V>(
             }
         }
     }
-    if is_seq {
+    // `is_seq` alone is not enough: Lua's `#` returns a *border*, which for a
+    // sparse table whose array part ends on its largest present index can exceed
+    // the number of integer keys in `1..=len` (`{[1]="a",[2]="b",[4]="d"}` reports
+    // `#t == 4`). Treating that as a sequence would silently renumber key 4 to
+    // index 3. A sequence requires every position `1..=len` to be present, which
+    // `entries.len() == len` checks (Lua keys are unique, so count is coverage).
+    if is_seq && entries.len() as i64 == len {
         entries.sort_by_key(|(i, _)| *i);
         Ok(LuaTable::Array(
             entries.into_iter().map(|(_, v)| v).collect(),
@@ -222,7 +228,14 @@ fn lua_to_rmpv_at(value: &mlua::Value, depth: usize) -> mlua::Result<rmpv::Value
         L::Boolean(b) => rmpv::Value::from(*b),
         L::Integer(i) => rmpv::Value::from(*i),
         L::Number(n) => rmpv::Value::from(*n),
-        L::String(s) => rmpv::Value::from(s.to_str()?.to_string()),
+        // A valid-UTF-8 string crosses as msgpack `str`; a non-UTF-8 Lua byte-string
+        // (e.g. `string.char(0xff)` returned from a chunk) as msgpack `bin`, exactly
+        // as neovim's encoder passes Lua string bytes through — never fail the whole
+        // call on bytes that msgpack can represent.
+        L::String(s) => match s.to_str() {
+            Ok(t) => rmpv::Value::from(t.to_string()),
+            Err(_) => rmpv::Value::from(s.as_bytes().to_vec()),
+        },
         L::Table(t) => match classify_table(t, |v| lua_to_rmpv_at(v, depth + 1))? {
             LuaTable::Array(items) => rmpv::Value::Array(items),
             LuaTable::Map(pairs) => {
@@ -273,8 +286,12 @@ fn rmpv_to_lua_at(lua: &Lua, value: &rmpv::Value, depth: usize) -> mlua::Result<
         R::Map(pairs) => {
             let t = lua.create_table_with_capacity(0, pairs.len())?;
             for (k, v) in pairs {
+                // A non-UTF-8 msgpack key must not collapse to "" — every such key in
+                // a server-built map would silently land on the same empty key and
+                // clobber each other. Lossy is the honest reconstruction; the string
+                // is only used as a table key.
                 let key = match k {
-                    R::String(s) => s.as_str().unwrap_or_default().to_string(),
+                    R::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
                     other => other.to_string(),
                 };
                 t.raw_set(key, rmpv_to_lua_at(lua, v, depth + 1)?)?;
@@ -381,7 +398,9 @@ fn lua_to_json_at(value: &mlua::Value, depth: usize) -> mlua::Result<serde_json:
         L::Boolean(b) => serde_json::Value::Bool(*b),
         L::Integer(i) => serde_json::Value::from(*i),
         L::Number(n) => serde_json::Value::from(*n),
-        L::String(s) => serde_json::Value::from(s.to_str()?.to_string()),
+        // JSON has no binary form; lossy keeps the payload crossing (the same intent
+        // as the other Lua-string boundaries) instead of failing the whole LSP op.
+        L::String(s) => serde_json::Value::from(s.to_string_lossy()),
         L::Table(t) => match json_mark(value).as_deref() {
             Some("null") => serde_json::Value::Null,
             // Marked an object, so it stays one however it is filled in afterwards —

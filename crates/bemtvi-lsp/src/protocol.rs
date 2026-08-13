@@ -204,6 +204,204 @@ pub enum LspNotify {
     },
 }
 
+// ---------------------------------------------------------------------------
+// The generic `client:request` / `client:notify` method whitelist.
+//
+// The native leg dispatches a raw method through a compile-time `Request`/`Notification`
+// impl table (`dyn_requests!` / `dyn_notifications!` in `dispatch.rs`); the wasm sync
+// client can't build that table (async-lsp doesn't exist there) but MUST reject the
+// same methods — a method the native leg refuses with an `Err` would otherwise be
+// buffered and answered with a degraded empty reply on the wasm leg (two-leg
+// divergence; the tier-1 remote rule makes the bytes behave identically). One row
+// list feeds both: `lsp_dyn_request_rows!(mac)` / `lsp_dyn_notify_rows!(mac)` expand
+// `mac!` once with every row `(method, unique-type-name)`, and `mac` is either the
+// native table generator or the const collector below. Add a method by adding ONE
+// row here — both legs pick it up.
+// ---------------------------------------------------------------------------
+
+/// The generic-request rows: every standard LSP request the editor doesn't
+/// already drive through a typed [`LspRequest`], plus the server-specific
+/// methods the headline configs reach for via `client:request`. All are
+/// relayed as raw JSON, so a row is just `(method, unique-type-name)`.
+#[macro_export]
+macro_rules! lsp_dyn_request_rows {
+    ($f:ident) => {
+        $f!(
+            ("workspace/executeCommand", req_workspace_executeCommand),
+            ("workspace/symbol", req_workspace_symbol),
+            ("workspaceSymbol/resolve", req_workspaceSymbol_resolve),
+            ("workspace/willCreateFiles", req_workspace_willCreateFiles),
+            ("workspace/willRenameFiles", req_workspace_willRenameFiles),
+            ("workspace/willDeleteFiles", req_workspace_willDeleteFiles),
+            (
+                "textDocument/documentSymbol",
+                req_textDocument_documentSymbol
+            ),
+            (
+                "textDocument/documentHighlight",
+                req_textDocument_documentHighlight
+            ),
+            ("textDocument/documentLink", req_textDocument_documentLink),
+            ("documentLink/resolve", req_documentLink_resolve),
+            ("textDocument/foldingRange", req_textDocument_foldingRange),
+            (
+                "textDocument/selectionRange",
+                req_textDocument_selectionRange
+            ),
+            (
+                "textDocument/prepareCallHierarchy",
+                req_textDocument_prepareCallHierarchy
+            ),
+            (
+                "callHierarchy/incomingCalls",
+                req_callHierarchy_incomingCalls
+            ),
+            (
+                "callHierarchy/outgoingCalls",
+                req_callHierarchy_outgoingCalls
+            ),
+            (
+                "textDocument/prepareTypeHierarchy",
+                req_textDocument_prepareTypeHierarchy
+            ),
+            ("typeHierarchy/supertypes", req_typeHierarchy_supertypes),
+            ("typeHierarchy/subtypes", req_typeHierarchy_subtypes),
+            (
+                "textDocument/semanticTokens/full",
+                req_textDocument_semanticTokens_full
+            ),
+            (
+                "textDocument/semanticTokens/full/delta",
+                req_textDocument_semanticTokens_full_delta
+            ),
+            (
+                "textDocument/semanticTokens/range",
+                req_textDocument_semanticTokens_range
+            ),
+            ("textDocument/inlayHint", req_textDocument_inlayHint),
+            ("inlayHint/resolve", req_inlayHint_resolve),
+            ("textDocument/codeLens", req_textDocument_codeLens),
+            ("codeLens/resolve", req_codeLens_resolve),
+            ("textDocument/documentColor", req_textDocument_documentColor),
+            (
+                "textDocument/colorPresentation",
+                req_textDocument_colorPresentation
+            ),
+            (
+                "textDocument/linkedEditingRange",
+                req_textDocument_linkedEditingRange
+            ),
+            ("textDocument/moniker", req_textDocument_moniker),
+            ("textDocument/prepareRename", req_textDocument_prepareRename),
+            (
+                "textDocument/rangeFormatting",
+                req_textDocument_rangeFormatting
+            ),
+            (
+                "textDocument/onTypeFormatting",
+                req_textDocument_onTypeFormatting
+            ),
+            ("completionItem/resolve", req_completionItem_resolve),
+            // The typed native features are also reachable generically, for a config
+            // that routes them through `client:request` (e.g. a custom `handlers` entry).
+            ("textDocument/definition", req_textDocument_definition),
+            ("textDocument/declaration", req_textDocument_declaration),
+            (
+                "textDocument/typeDefinition",
+                req_textDocument_typeDefinition
+            ),
+            (
+                "textDocument/implementation",
+                req_textDocument_implementation
+            ),
+            ("textDocument/references", req_textDocument_references),
+            ("textDocument/hover", req_textDocument_hover),
+            ("textDocument/signatureHelp", req_textDocument_signatureHelp),
+            ("textDocument/completion", req_textDocument_completion),
+            ("textDocument/formatting", req_textDocument_formatting),
+            ("textDocument/rename", req_textDocument_rename),
+            ("textDocument/codeAction", req_textDocument_codeAction),
+            ("codeAction/resolve", req_codeAction_resolve),
+            // Server-specific methods the headline configs drive via `client:request`.
+            (
+                "rust-analyzer/reloadWorkspace",
+                req_rustAnalyzer_reloadWorkspace
+            ),
+            ("rust-analyzer/expandMacro", req_rustAnalyzer_expandMacro),
+            (
+                "rust-analyzer/analyzerStatus",
+                req_rustAnalyzer_analyzerStatus
+            ),
+            (
+                "rust-analyzer/viewSyntaxTree",
+                req_rustAnalyzer_viewSyntaxTree
+            ),
+            (
+                "rust-analyzer/openCargoToml",
+                req_rustAnalyzer_openCargoToml
+            ),
+            ("experimental/externalDocs", req_experimental_externalDocs),
+            (
+                "textDocument/switchSourceHeader",
+                req_textDocument_switchSourceHeader
+            ),
+        );
+    };
+}
+
+/// The generic-notification rows — the fire-and-forget twin of
+/// [`lsp_dyn_request_rows!`].
+#[macro_export]
+macro_rules! lsp_dyn_notify_rows {
+    ($f:ident) => {
+        $f!(
+            ("$/setTrace", notif_setTrace),
+            ("$/cancelRequest", notif_cancelRequest),
+            (
+                "window/workDoneProgress/cancel",
+                notif_window_workDoneProgress_cancel
+            ),
+            (
+                "workspace/didChangeWatchedFiles",
+                notif_workspace_didChangeWatchedFiles
+            ),
+            (
+                "workspace/didChangeWorkspaceFolders",
+                notif_workspace_didChangeWorkspaceFolders
+            ),
+            ("workspace/didCreateFiles", notif_workspace_didCreateFiles),
+            ("workspace/didRenameFiles", notif_workspace_didRenameFiles),
+            ("workspace/didDeleteFiles", notif_workspace_didDeleteFiles),
+        );
+    };
+}
+
+/// Collect the request rows into the method whitelist the sync wasm client
+/// pre-flights a raw `client:request` against (the native table generator is
+/// `dyn_requests!` in `dispatch.rs`, invoked with the same rows).
+macro_rules! collect_dyn_request_methods {
+    ($(($method:literal, $ty:ident)),* $(,)?) => {
+        /// The [`LspRequest::Raw`] methods both legs accept, in dispatch order.
+        /// Consumed by the sync wasm client's pre-flight check; dead under
+        /// `native`, where the dispatch table itself is the whitelist.
+        #[cfg_attr(feature = "native", allow(dead_code))]
+        pub(crate) const DYN_REQUEST_METHODS: &[&str] = &[$($method),*];
+    };
+}
+lsp_dyn_request_rows!(collect_dyn_request_methods);
+
+/// Collect the notification rows into the whitelist the sync client checks a
+/// raw `client:notify` against.
+macro_rules! collect_dyn_notify_methods {
+    ($(($method:literal, $ty:ident)),* $(,)?) => {
+        /// The [`LspNotify::Raw`] methods both legs accept. Dead under
+        /// `native`, like [`DYN_REQUEST_METHODS`].
+        #[cfg_attr(feature = "native", allow(dead_code))]
+        pub(crate) const DYN_NOTIFY_METHODS: &[&str] = &[$($method),*];
+    };
+}
+lsp_dyn_notify_rows!(collect_dyn_notify_methods);
+
 /// A language-feature request the editor fires; its reply returns later as an
 /// [`LspEvent::Reply`] carrying the same [`ReqToken`] (Decision 3). Already in LSP
 /// coordinates — the server converts the cursor's byte column to the negotiated

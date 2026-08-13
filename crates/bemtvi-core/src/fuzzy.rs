@@ -10,10 +10,21 @@
 //! the command oracle lives in `editor::command`. A **dynamic** source (live grep)
 //! bypasses this entirely; the widget forwards each query change to the source.
 
+use std::cell::RefCell;
 use std::ops::Range;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+thread_local! {
+    /// One scratch matcher, reused across queries. `Matcher::new` eagerly allocates
+    /// ~135KB (its own docs say to reuse it when called often), so constructing one
+    /// per query would cost that every keystroke in a picker or completion popup;
+    /// the slab is pure scratch and safe to reuse for any query. Thread-local rather
+    /// than a global `Mutex`: the core is synchronous, so there is no contention to
+    /// arbitrate (the same choice `glob.rs` makes for its compile caches).
+    static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::new(Config::DEFAULT));
+}
 
 /// Fuzzy-rank `candidates` against `query`, best first.
 ///
@@ -44,24 +55,29 @@ pub fn rank_scored(query: &str, candidates: &[&str]) -> Vec<(usize, u32, Vec<Ran
         return (0..candidates.len()).map(|i| (i, 0, Vec::new())).collect();
     }
 
-    let mut matcher = Matcher::new(Config::DEFAULT);
     // `Smart` case/normalization: case-insensitive until the query has an
     // uppercase char, and unicode-normalized — the fzf-like default users expect.
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
 
-    let mut char_buf: Vec<char> = Vec::new();
-    let mut positions: Vec<u32> = Vec::new();
-    let mut scored: Vec<(usize, u32, Vec<Range<usize>>)> = Vec::with_capacity(candidates.len());
+    // The whole sweep runs inside `with`: the thread-local's borrow cannot escape
+    // the closure, so the scratch matcher is held for the query and dropped after.
+    let mut scored = MATCHER.with(|m| {
+        let mut matcher = m.borrow_mut();
+        let mut char_buf: Vec<char> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        let mut scored: Vec<(usize, u32, Vec<Range<usize>>)> = Vec::with_capacity(candidates.len());
 
-    for (i, cand) in candidates.iter().enumerate() {
-        let haystack = Utf32Str::new(cand, &mut char_buf);
-        positions.clear();
-        if let Some(score) = pattern.indices(haystack, &mut matcher, &mut positions) {
-            positions.sort_unstable();
-            positions.dedup();
-            scored.push((i, score, coalesce(&positions)));
+        for (i, cand) in candidates.iter().enumerate() {
+            let haystack = Utf32Str::new(cand, &mut char_buf);
+            positions.clear();
+            if let Some(score) = pattern.indices(haystack, &mut matcher, &mut positions) {
+                positions.sort_unstable();
+                positions.dedup();
+                scored.push((i, score, coalesce(&positions)));
+            }
         }
-    }
+        scored
+    });
 
     // Higher score first; equal scores keep input order (stable streaming).
     scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

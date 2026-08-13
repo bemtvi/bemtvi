@@ -436,7 +436,7 @@ impl SyntaxEngine for WasmSyntax {
             eh_js_ts_indent(
                 lang.as_ptr(),
                 text.as_ptr(),
-                line as i32,
+                line.min(i32::MAX as usize) as i32,
                 p.shiftwidth as i32,
                 p.tabstop as i32,
             )
@@ -539,9 +539,9 @@ impl SyntaxEngine for WasmSyntax {
                     lang.as_ptr(),
                     text.as_ptr(),
                     capture.as_ptr(),
-                    byte as i32,
+                    byte.min(i32::MAX as usize) as i32,
                     buf.as_mut_ptr(),
-                    buf.len() as i32,
+                    buf.len().min(i32::MAX as usize) as i32,
                 )
             };
             if needed < 0 {
@@ -1114,6 +1114,31 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     Box::into_raw(Box::new(WasmEditHost { host, sink }))
 }
 
+/// Unwrap the host behind a `*mut WasmEditHost` — or trace loud and return. A null
+/// host means a request reached the edit-host without its box: a fatal wiring bug
+/// (the wasm build should never run without [`eh_new`]'s allocation). These exports
+/// are `()`-returning, so there is nothing to return but a loud trace — a silent
+/// return (the bare `else { return }` these replaced) makes the request look
+/// answered (no-silent-stubs). Use as `let handle = host_or!(h);` — `macro_rules!`
+/// hygiene keeps a binding made *inside* the expansion invisible to the caller, so
+/// the macro returns the unwrapped handle instead of naming it.
+macro_rules! host_or {
+    ($h:expr) => {
+        match $h.as_mut() {
+            Some(handle) => handle,
+            None => {
+                // The pointer value identifies which allocation was freed (or never made).
+                eprintln!(
+                    "bemtvi-edithost: an eh_* request reached the edit-host with a null \
+                     host ({}; use-after-free, or eh_new never ran?)",
+                    format_args!("{:p}", $h)
+                );
+                return;
+            }
+        }
+    };
+}
+
 /// Feed vim key-notation (e.g. `"ihello<Esc>"`) through the real tick and project the
 /// resulting frame into the [`Sink`] (read back via [`eh_redraw_json`]).
 ///
@@ -1121,7 +1146,7 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
 /// `h` must come from [`eh_new`] and not yet be freed; `notation` a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_input(h: *mut WasmEditHost, notation: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle.host.feed(as_str(notation));
 }
 
@@ -1144,7 +1169,7 @@ pub unsafe extern "C" fn eh_input_mouse(
     row: usize,
     col: usize,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle
         .host
         .mouse(as_str(button), as_str(action), as_str(modifier), row, col);
@@ -1215,7 +1240,7 @@ pub unsafe extern "C" fn eh_apply_remote_config(
 /// `h` must come from [`eh_new`] and not yet be freed; `cwd` a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_seed_remote_cwd(h: *mut WasmEditHost, cwd: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let cwd = as_str(cwd);
     if !cwd.is_empty() {
         handle.host.seed_remote_cwd(std::path::PathBuf::from(cwd));
@@ -1244,7 +1269,7 @@ pub unsafe extern "C" fn eh_boot_finish(h: *mut WasmEditHost) {
 /// `h` must come from [`eh_new`] and not yet be freed.
 #[no_mangle]
 pub unsafe extern "C" fn eh_attach(h: *mut WasmEditHost, cols: usize, rows: usize) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle.host.attach_ui(cols.max(1), rows.max(1));
 }
 
@@ -1443,7 +1468,7 @@ pub unsafe extern "C" fn eh_take_clipboard_writes(h: *mut WasmEditHost) -> *mut 
 /// `h` must come from [`eh_new`] and not yet be freed; `text` is a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_clipboard_push(h: *mut WasmEditHost, text: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle.sink.borrow_mut().clipboard_get = Some(as_str(text).to_string());
 }
 
@@ -1461,7 +1486,7 @@ pub unsafe extern "C" fn eh_ts_install_complete(
     ok: i32,
     msg: *const c_char,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle
         .host
         .complete_ts_install(as_str(lang).to_string(), ok != 0, as_str(msg).to_string());
@@ -1475,7 +1500,7 @@ pub unsafe extern "C" fn eh_ts_install_complete(
 /// `h` must come from [`eh_new`] and not yet be freed; `json` is a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_ts_seed_installed(h: *mut WasmEditHost, json: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let langs: Vec<String> = serde_json::from_str(as_str(json)).unwrap_or_default();
     handle.host.seed_ts_installed(langs);
 }
@@ -1547,7 +1572,7 @@ pub unsafe extern "C" fn eh_fs_read_complete(
     size: f64,
     mtime_ms: f64,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let buffer = BufferId(buffer.max(0.0) as u64);
     let path = as_str(path).to_string();
     if kind == 2 {
@@ -1612,7 +1637,7 @@ pub unsafe extern "C" fn eh_fs_write_complete(
     mtime_ms: f64,
     err: *const c_char,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let Some(save) = handle
         .sink
         .borrow_mut()
@@ -1651,7 +1676,7 @@ pub unsafe extern "C" fn eh_remote_file_changed(
     size: f64,
     mtime_ms: f64,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let mtime = if mtime_ms < 0.0 { -1 } else { mtime_ms as i64 };
     handle.host.remote_file_changed(
         as_str(path).to_string(),
@@ -1677,7 +1702,7 @@ pub unsafe extern "C" fn eh_daemon_status(
     phase: *const c_char,
     reconnected: i32,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle
         .host
         .apply_daemon_phase(as_str(phase), reconnected != 0);
@@ -1767,7 +1792,7 @@ pub unsafe extern "C" fn eh_proc_spawned(h: *mut WasmEditHost, id: f64, pid: f64
 /// `h` must come from [`eh_new`] and not yet be freed; `lines_json` a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_proc_stdout(h: *mut WasmEditHost, id: f64, lines_json: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let lines: Vec<String> = serde_json::from_str(as_str(lines_json)).unwrap_or_default();
     handle.host.proc_stdout(id.max(0.0) as u64, lines);
 }
@@ -1792,7 +1817,7 @@ pub unsafe extern "C" fn eh_proc_exited(
     err: *const u8,
     err_len: usize,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let stdout = as_byte_vec(out, out_len);
     let stderr = as_byte_vec(err, err_len);
     handle
@@ -1858,7 +1883,7 @@ pub unsafe extern "C" fn eh_dproc_out(
     len: usize,
     stderr: i32,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let bytes = as_byte_vec(data, len);
     handle
         .host
@@ -1926,7 +1951,7 @@ pub unsafe extern "C" fn eh_sock_connected(h: *mut WasmEditHost, id: f64) {
 /// `h` from [`eh_new`], not freed; `data` points to `len` readable bytes (or null when 0).
 #[no_mangle]
 pub unsafe extern "C" fn eh_sock_data(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let bytes = as_byte_vec(data, len);
     handle.host.sock_data(id.max(0.0) as u64, bytes);
 }
@@ -1938,7 +1963,7 @@ pub unsafe extern "C" fn eh_sock_data(h: *mut WasmEditHost, id: f64, data: *cons
 /// `h` from [`eh_new`], not freed; `err` a valid C string or null.
 #[no_mangle]
 pub unsafe extern "C" fn eh_sock_closed(h: *mut WasmEditHost, id: f64, err: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let error = if err.is_null() {
         None
     } else {
@@ -2181,7 +2206,7 @@ pub unsafe extern "C" fn eh_fs_op_result(
     data: *const u8,
     len: usize,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let reply = as_byte_vec(data, len);
     handle.host.fs_op_result(id.max(0.0) as u64, reply);
 }
@@ -2225,7 +2250,7 @@ pub unsafe extern "C" fn eh_take_git_op_requests(h: *mut WasmEditHost) -> *mut c
 /// bytes (or be null when `len` is 0).
 #[no_mangle]
 pub unsafe extern "C" fn eh_git_op_result(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let reply = as_byte_vec(data, len);
     handle.host.git_op_result(id.max(0.0) as u64, reply);
 }
@@ -2376,7 +2401,7 @@ pub unsafe extern "C" fn eh_http_mount_result(
     ok: i32,
     text: *const c_char,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let text = as_str(text).to_string();
     handle
         .host
@@ -2396,7 +2421,7 @@ pub unsafe extern "C" fn eh_http_mount_result(
 /// `h` must come from [`eh_new`] and not yet be freed; `json` must be a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_http_server_request(h: *mut WasmEditHost, json: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(as_str(json)) else {
         // The Worker builds this, so a malformed relay is a bug in our own JS — and with no
         // usable `req_id` there is nothing to answer, so it must not pass silently.
@@ -2496,7 +2521,7 @@ pub unsafe extern "C" fn eh_http_result(
     data: *const u8,
     len: usize,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let reply = as_byte_vec(data, len);
     handle.host.http_result(id.max(0.0) as u64, reply);
 }
@@ -2539,7 +2564,7 @@ pub unsafe extern "C" fn eh_fs_watch_change(
     kind: *const c_char,
     paths_json: *const c_char,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let paths: Vec<String> = serde_json::from_str(as_str(paths_json)).unwrap_or_default();
     handle
         .host
@@ -2554,7 +2579,7 @@ pub unsafe extern "C" fn eh_fs_watch_change(
 /// `h` must come from [`eh_new`] and not yet be freed; `message` a valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn eh_fs_watch_err(h: *mut WasmEditHost, id: f64, message: *const c_char) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     handle
         .host
         .fs_watch_error(id.max(0.0) as u64, as_str(message).to_string());
@@ -2627,7 +2652,7 @@ pub unsafe extern "C" fn eh_terminal_data(
     data: *const u8,
     len: usize,
 ) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let bytes = as_bytes(data, len);
     handle
         .host
@@ -2730,7 +2755,7 @@ pub unsafe extern "C" fn eh_take_lsp_requests(h: *mut WasmEditHost) -> *mut c_ch
 /// bytes (or be null when `len` is 0).
 #[no_mangle]
 pub unsafe extern "C" fn eh_lsp_stdout(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let bytes = as_byte_vec(data, len);
     handle.host.lsp_stdout(id.max(0.0) as u64, bytes);
 }
@@ -2746,7 +2771,7 @@ pub unsafe extern "C" fn eh_lsp_stdout(h: *mut WasmEditHost, id: f64, data: *con
 /// bytes (or be null when `len` is 0).
 #[no_mangle]
 pub unsafe extern "C" fn eh_lsp_stderr(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
-    let Some(handle) = h.as_mut() else { return };
+    let handle = host_or!(h);
     let bytes = as_byte_vec(data, len);
     handle.host.lsp_stderr(id.max(0.0) as u64, bytes);
 }

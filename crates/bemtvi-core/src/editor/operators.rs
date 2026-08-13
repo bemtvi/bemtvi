@@ -538,6 +538,117 @@ impl Editor {
         self.apply_operator_to_range(op, lo, hi, linewise, first_line);
     }
 
+    /// Visual-mode `r{char}` (reached as `ResolvedCommand::Replace` while
+    /// `mode.is_visual()`): every character of the selection becomes `c` —
+    /// each line's selected span is replaced by `c` repeated for its char
+    /// count (linewise: the whole line), leaving newlines — and thus line
+    /// structure — untouched, exactly as vim's visual `r` does. The cursor
+    /// settles on the first replaced character (the selection's low end,
+    /// vim's placement for both forward and backward selections), and visual
+    /// mode exits. With a multi-cursor set placed, every cursor's own
+    /// selection is replaced as one undo group.
+    pub(crate) fn visual_replace(&mut self, c: char) {
+        // A live terminal buffer is read-only — refuse like every other
+        // text-changing operator (`replace_char` guards on its own path);
+        // without this, visual `r` on a terminal buffer edits it freely.
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        if self.has_secondary_cursors() {
+            self.visual_replace_multi(c);
+            return;
+        }
+        let (lo, hi, linewise, first_line) = self.visual_range();
+        self.record_visual_marks();
+        self.push_undo();
+        // `replace_range_in_place` records the `` `[ `` / `` `] `` bounds itself,
+        // after the edit — see the note there.
+        self.replace_range_in_place(c, lo, hi, linewise, first_line);
+        self.mode = Mode::Normal;
+        self.reset_pending();
+    }
+
+    fn visual_replace_multi(&mut self, c: char) {
+        let linewise = self.mode == Mode::VisualLine;
+        self.record_visual_marks();
+        self.edit_each_cursor(|ed| ed.visual_replace_once(c, linewise));
+        self.mode = Mode::Normal;
+        self.clear_anchor_marks();
+        self.reset_pending();
+    }
+
+    /// One cursor's slice of a multi-cursor visual `r`: replace the selection
+    /// between this cursor's `visual_anchor` and head. Opens no undo group of
+    /// its own — [`edit_each_cursor`] wraps the whole sweep in one. The `` `[ ``
+    /// / `` `] `` change bounds are recorded per cursor by
+    /// [`replace_range_in_place`](Self::replace_range_in_place) — after the edit,
+    /// for the reason noted there.
+    fn visual_replace_once(&mut self, c: char, linewise: bool) {
+        let (lo, hi, first_line) = self.visual_range_lw(linewise);
+        self.replace_range_in_place(c, lo, hi, linewise, first_line);
+    }
+
+    /// The shared body of visual `r{char}`: replace every character of `[lo,
+    /// hi)` with `c`, per line. Iterated bottom-up so the byte offsets of
+    /// earlier lines stay valid when `c` changes a line's byte width. The
+    /// cursor settles on the first replaced character.
+    fn replace_range_in_place(
+        &mut self,
+        c: char,
+        lo: usize,
+        hi: usize,
+        linewise: bool,
+        first_line: usize,
+    ) {
+        // Snap the selection to the current text: a visual selection held
+        // across a later rope mutation can land off a grapheme boundary (or
+        // past the end), and `slice(s..e)` then panics in ropey.
+        let (lo, hi) = self.snap_range(lo, hi);
+        let (first, last) = self.line_span(lo, hi);
+        // How much the replaced text grew or shrank in bytes, summed over the
+        // lines — `c` need not be as wide as what it replaces. Used below to
+        // place the `` `] `` change bound on the *new* text.
+        let mut delta: isize = 0;
+        for line in (first..=last).rev() {
+            let ls = self.buffer().line_start(line);
+            let le = ls + self.buffer().line_len(line);
+            // `le` already excludes the trailing newline, so a charwise span
+            // ending past the line's last char (a selection that includes the
+            // newline) is clipped back to the content.
+            let (s, e) = if linewise {
+                (ls, le)
+            } else {
+                (lo.max(ls), hi.min(le))
+            };
+            if e <= s {
+                continue;
+            }
+            let n = self.buffer().text.slice(s..e).chars().count();
+            let repl: String = std::iter::repeat_n(c, n).collect();
+            delta += repl.len() as isize - (e - s) as isize;
+            // One journaled edit per line, not a remove+insert pair: the pair
+            // can't fold into a single delta (see [`Buffer::replace`]), so every
+            // mirror consumer would take a full-text resync per replaced line.
+            self.buffer_mut().replace(s..e, &repl);
+        }
+        // The `` `[ `` / `` `] `` bounds are recorded *after* the edit, unlike the
+        // delete-shaped operators. Those record first because a deletion leaves
+        // its marks at the deletion point; an in-place replacement instead drags
+        // a mark sitting at the range's start along with the inserted text, so a
+        // pre-edit record would leave BOTH bounds past the replacement.
+        let new_hi = (hi as isize + delta).max(lo as isize) as usize;
+        self.record_change_bounds(lo, new_hi);
+        self.buffer_mut().modified = true;
+        if linewise {
+            self.cursor.line = first_line;
+            self.cursor.col = 0;
+        } else {
+            self.set_cursor_char(lo);
+        }
+        self.clamp_cursor();
+    }
+
     /// Snap `[lo, hi)` and extract it as register-bound text + its kind, or
     /// `None` when the range is empty.
     fn slice_for_register(
@@ -610,6 +721,15 @@ impl Editor {
         if lo >= hi {
             return;
         }
+        // The multi-cursor sweep reads this to tell a cursor an edit SWALLOWED from
+        // one it merely landed next to (see `edit_each_cursor`). Only a deletion can
+        // swallow a cursor, and every deletion funnels through here, so this is the
+        // one place it needs recording. Widened, never narrowed, within one `f`: a
+        // verb that deletes twice (`c` = delete + reopen) must report the whole span.
+        self.last_delete_span = Some(match self.last_delete_span.take() {
+            Some(prev) => prev.start.min(lo)..prev.end.max(hi),
+            None => lo..hi,
+        });
         self.push_undo();
         self.buffer_mut().remove(lo..hi);
         self.buffer_mut().normalize();

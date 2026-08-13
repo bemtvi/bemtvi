@@ -50,11 +50,11 @@ use wtransport::{
     ClientConfig, Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig,
 };
 
-use bemtvi_rpc::connect;
+use bemtvi_rpc::{connect, connect_bounded};
 
 use crate::daemon::{
     connect_reconnecting_thread, DaemonClient, DialedConnection, GroupLink, LegGroup,
-    ReconnectHandle, ReconnectPolicy,
+    ReconnectHandle, ReconnectPolicy, TermGroupLink, TERM_LEG_IN_CAP,
 };
 use crate::run_daemon_group;
 
@@ -285,10 +285,26 @@ pub fn connect_quic_reconnecting(
             let (endpoint, connection, streams) = quic_dial(&connect_url, cert_hash).await?;
             // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp/Term). Each rides its
             // own QUIC stream, so a flood on one group can't head-of-line-block another.
-            let [control, proc, lsp, term] = streams.map(|(send, recv)| {
-                let (rpc, incoming) = connect(recv, send);
+            let [(cs, cr), (ps, pr), (ls, lr), (ts, tr)] = streams;
+            let control = {
+                let (rpc, incoming) = connect(cr, cs);
                 GroupLink { rpc, incoming }
-            });
+            };
+            let proc = {
+                let (rpc, incoming) = connect(pr, ps);
+                GroupLink { rpc, incoming }
+            };
+            let lsp = {
+                let (rpc, incoming) = connect(lr, ls);
+                GroupLink { rpc, incoming }
+            };
+            // The Term stream's inbound is *bounded*: the daemon floods it with a remote
+            // child's output, and the reader parking on a full channel is what backpressures
+            // the daemon's `term_data` forwarder into throttling the child — an unbounded
+            // queue would just grow (see `bemtvi_rpc::connect_bounded`; the leg is
+            // notification-only, so no response can be stranded behind the full channel).
+            let (rpc, incoming) = connect_bounded(tr, ts, TERM_LEG_IN_CAP);
+            let term = TermGroupLink { rpc, incoming };
             // Keep the new endpoint + connection alive; replacing the slot drops the previous.
             *live.lock().unwrap() = Some((endpoint, connection));
             Ok(DialedConnection::from_groups(control, proc, lsp, term))

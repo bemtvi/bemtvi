@@ -161,6 +161,12 @@ pub struct WindowMirror {
     /// into `jumps`, equal to `jumps.len()` when sitting at the present (not
     /// navigating with `<C-o>`/`<C-i>`).
     pub jump_idx: u64,
+    /// The jumplist's **generation** — bumped by the core whenever the entries or
+    /// the pointer change. The server pushes the full [`jumps`](Self::jumps) list
+    /// only when this moved; when it matches the last push, `jumps` is omitted and
+    /// the Lua side carries the old list over, so a repaint never re-serializes a
+    /// whole jumplist.
+    pub jump_gen: u64,
 }
 
 /// One jumplist entry's row in a [`WindowMirror`], pre-shaped into the dict
@@ -2724,7 +2730,7 @@ impl LuaRuntime {
         let run: mlua::Function = btv.get("_picker_send")?;
         let arg = self
             .lua
-            .create_sequence_from(keys.into_iter().map(|k| k as i64))?;
+            .create_sequence_from(keys.into_iter().map(|k| lua_int(k as i64)))?;
         run.call::<()>((arg, self.resume_keys_seq(resume_keys)?, query))
     }
 
@@ -2735,10 +2741,9 @@ impl LuaRuntime {
         if keys.is_empty() {
             return Ok(mlua::Value::Nil);
         }
-        Ok(mlua::Value::Table(
-            self.lua
-                .create_sequence_from(keys.iter().map(|&k| k as i64))?,
-        ))
+        Ok(mlua::Value::Table(self.lua.create_sequence_from(
+            keys.iter().map(|&k| lua_int(k as i64)),
+        )?))
     }
 
     /// Dispatch an LSP code-action `command` (Phase 8): runs
@@ -2928,8 +2933,8 @@ impl LuaRuntime {
         let run: mlua::Function = btv.get("_statusline_click")?;
         run.call::<()>((
             handler.to_string(),
-            minwid as i64,
-            clicks as i64,
+            lua_int(minwid as i64),
+            lua_int(clicks as i64),
             button.to_string(),
             modifiers.to_string(),
         ))
@@ -3134,7 +3139,7 @@ impl LuaRuntime {
         let btv = self.btv()?;
         let f: Option<mlua::Function> = btv.get("_view_select")?;
         if let Some(f) = f {
-            f.call::<()>((id, line as i64 + 1))?;
+            f.call::<()>((id, lua_int(line as i64 + 1)))?;
         }
         Ok(())
     }
@@ -3375,7 +3380,7 @@ impl LuaRuntime {
     /// the base the server stamps onto undo-node timestamps, so the undotree
     /// visualizer's `localtime() - node.time` elapsed math is correct.
     pub fn set_mono_secs(&self, secs: i64) -> mlua::Result<()> {
-        self.btv()?.set("_mono_secs", secs)
+        self.btv()?.set("_mono_secs", lua_int(secs))
     }
 
     /// Refresh the `btv._undotree` mirror that `vim.fn.undotree(bufnr)` reads.
@@ -3427,7 +3432,13 @@ impl LuaRuntime {
         let btv = self.btv()?;
         let fire: mlua::Function = btv.get("_buf_changed")?;
         for &(buf, tick, old, new) in changes {
-            fire.call::<()>((buf, tick, 0u64, old as u64, new as u64))?;
+            fire.call::<()>((
+                lua_int(buf as i64),
+                lua_int(tick as i64),
+                lua_int(0),
+                lua_int(old as i64),
+                lua_int(new as i64),
+            ))?;
         }
         Ok(())
     }
@@ -3871,18 +3882,24 @@ impl LuaRuntime {
     /// read for the wired buffer-local options. Pushed alongside the buffer mirror
     /// before any Lua that can read options, so a read reflects the core's current
     /// value — the option's default until set, and a value set through the `:set`
-    /// ex-command path (not just one written from Lua). `bufs` is
-    /// `(bufnr, tabstop, shiftwidth, softtabstop, expandtab, modified)` per open
-    /// buffer (`modified` backs `vim.bo[n].modified`, which a `'tabline'` label
-    /// reads).
-    pub fn set_bo_mirror(&self, bufs: &[BoMirror]) -> mlua::Result<()> {
+    /// ex-command path (not just one written from Lua). `bufs` is only the rows
+    /// that moved since the last push — the core's option-state generation changed
+    /// (an option / filetype / save) or the buffer's `changedtick` moved (a text
+    /// edit, which flips `modified`) — and `removed` the bufnrs whose buffers
+    /// vanished since the last push; the Lua side merges the rows into the table it
+    /// holds and deletes the removed keys.
+    pub fn set_bo_mirror(&self, bufs: &[BoMirror], removed: &[u64]) -> mlua::Result<()> {
         let btv = self.btv()?;
         let entries = self.lua.create_table()?;
         for b in bufs {
             entries.set(b.bufnr, self.to_lua(b)?)?;
         }
+        let drops = self.lua.create_table()?;
+        for (i, bufnr) in removed.iter().enumerate() {
+            drops.set(i + 1, *bufnr)?;
+        }
         let set: mlua::Function = btv.get("_set_bo_mirror")?;
-        set.call(entries)
+        set.call((entries, drops))
     }
 
     /// Refresh the Rust→Lua mirror of the **global values** of the buffer-local options
@@ -3994,9 +4011,9 @@ impl LuaRuntime {
         for (i, m) in marks.iter().enumerate() {
             let e = self.lua.create_table()?;
             e.set("name", m.name.to_string())?;
-            e.set("bufnr", m.bufnr)?;
-            e.set("line", m.line as u64)?;
-            e.set("col", m.col as u64)?;
+            e.set("bufnr", lua_int(m.bufnr as i64))?;
+            e.set("line", lua_int(m.line as i64))?;
+            e.set("col", lua_int(m.col as i64))?;
             e.set("path", m.path.as_str())?;
             e.set("text", m.text.as_str())?;
             arr.set(i + 1, e)?;
@@ -4203,10 +4220,7 @@ impl LuaRuntime {
                 Ok(())
             }
             mlua::Value::String(s) => {
-                self.shared
-                    .borrow_mut()
-                    .commands
-                    .push(s.to_str()?.to_string());
+                self.shared.borrow_mut().commands.push(s.to_string_lossy());
                 Ok(())
             }
             _ => Ok(()),

@@ -779,11 +779,11 @@ impl EditHost {
 
     pub(crate) fn get_lines(&self, params: &[Value]) -> Value {
         // An unknown handle yields an empty list rather than erroring.
-        let lines = match self.editor.lines_of(self.resolve_buf(params.first())) {
-            Some(lines) => lines,
-            None => return Value::Array(Vec::new()),
+        let id = self.resolve_buf(params.first());
+        let Some(count) = self.editor.line_count_of(id) else {
+            return Value::Array(Vec::new());
         };
-        let n = lines.len() as i64;
+        let n = count as i64;
         let norm = |i: i64| -> i64 {
             if i < 0 {
                 (n + i + 1).max(0)
@@ -794,7 +794,13 @@ impl EditHost {
         let start = norm(params.get(1).and_then(Value::as_i64).unwrap_or(0));
         let end = norm(params.get(2).and_then(Value::as_i64).unwrap_or(-1));
         let (start, end) = (start as usize, end.max(start) as usize);
-        lines_value(&lines[start..end.min(lines.len())])
+        // Range-only read: `lines_range_of` skips `lines_of`'s whole-buffer copy,
+        // so a plugin polling a slice of a huge buffer pays only the rows it asked
+        // for rather than a full re-serialize per call.
+        match self.editor.lines_range_of(id, start, end) {
+            Some(lines) => lines_value(&lines),
+            None => Value::Array(Vec::new()),
+        }
     }
 }
 

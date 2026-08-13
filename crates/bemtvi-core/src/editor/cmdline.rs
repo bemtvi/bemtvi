@@ -22,6 +22,10 @@ impl Editor {
         self.cmdline.clear();
         self.cmdline_col = 0;
         self.cmdline_kind = CmdlineKind::Ex;
+        // Never inherit a pending `<C-r>` register-read into a fresh line — e.g.
+        // the dock-chord cancel path can leave `awaiting_register` armed and the
+        // next line's first typed key would be swallowed as a register name.
+        self.awaiting_register = false;
         self.hist_idx = None;
         self.message.clear();
         self.reset_pending();
@@ -51,6 +55,8 @@ impl Editor {
         self.cmdline.clear();
         self.cmdline_col = 0;
         self.cmdline_kind = CmdlineKind::Search(dir);
+        // Never inherit a pending `<C-r>` register-read (see `enter_command`).
+        self.awaiting_register = false;
         self.pending_search_count = count.max(1);
         self.hist_idx = None;
         self.search_origin = self.cursor;
@@ -187,6 +193,8 @@ impl Editor {
         // highlighted) leaves the typed line unchanged. Either way the popup closes.
         self.cmdline_complete_accept();
         self.close_cmdline_menu();
+        // Never inherit a pending `<C-r>` register-read (see `enter_command`).
+        self.awaiting_register = false;
         let text = std::mem::take(&mut self.cmdline);
         self.cmdline_col = 0;
         let kind = self.cmdline_kind;
@@ -294,6 +302,8 @@ impl Editor {
     pub fn cancel_cmdline(&mut self) {
         // Abandoning the line also dismisses any open completion popup.
         self.close_cmdline_menu();
+        // Never inherit a pending `<C-r>` register-read (see `enter_command`).
+        self.awaiting_register = false;
         // Drop any Helix selection-regex preview ranges (an abandoned `s`/`S`/… line).
         self.helix_regex_ranges = Vec::new();
         if matches!(self.cmdline_kind, CmdlineKind::Search(_)) {
@@ -367,6 +377,8 @@ impl Editor {
         self.cmdline = default;
         self.cmdline_col = self.cmdline.len();
         self.cmdline_kind = CmdlineKind::Prompt;
+        // See `enter_command`: never inherit a stale `<C-r>` register-read.
+        self.awaiting_register = false;
         self.cmdline_prompt = label;
         // The prompt's history namespace (`btv.ui.input{ history = … }`): drives
         // `<Up>`/`<Down>` recall and what `submit` records. Reset the browse position
@@ -395,6 +407,8 @@ impl Editor {
         self.cmdline.clear();
         self.cmdline_col = 0;
         self.cmdline_kind = CmdlineKind::Confirm;
+        // Never inherit a pending `<C-r>` register-read (see `enter_command`).
+        self.awaiting_register = false;
         self.cmdline_prompt = label;
         self.confirm_accelerators = accelerators;
         self.confirm_default = default;

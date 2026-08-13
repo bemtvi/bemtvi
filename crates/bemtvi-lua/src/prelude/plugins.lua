@@ -841,6 +841,11 @@ end
 -- (and its `init` run) immediately, while an enabled eager spec that is already on
 -- disk begins loading. Returns the name of the LAST spec added (so a single-spec
 -- `add` — as dependency registration uses — yields that dependency's name).
+--
+-- The FIRST declaration of a name arms it; re-declaring the same name (a config
+-- re-sourced, or a shared dependency re-added through a second plugin) updates the
+-- stored spec without re-arming — re-arming would double-register every trigger
+-- (autocmd / command / keymap) and re-run `init`.
 function M.add(specs)
   -- A bare spec (string, or a table that is itself a spec rather than a list of
   -- them) is wrapped into a one-element list. A list of specs has a [1] that is
@@ -863,12 +868,66 @@ function M.add(specs)
   local last
   for _, raw in ipairs(list) do
     local spec = normalize(raw)
-    if not M._specs[spec.name] then
+    -- The FIRST declaration of a name arms it; a re-declaration (the config re-sourced,
+    -- or a shared dependency re-added through a second plugin — `normalize` re-enters
+    -- `M.add` for every dependent) must NOT re-arm: `arm_lazy` registers triggers
+    -- (autocmds / commands / keymaps) and re-runs `init` unconditionally, so a second
+    -- pass would double-fire every trigger and re-run `init`. First-declaration-wins for
+    -- arming; the re-declared spec still replaces the stored definition (so an edited
+    -- spec updates what a later `M.load` runs), just without a second arm.
+    local fresh = not M._specs[spec.name]
+    local old = fresh and nil or M._specs[spec.name]
+    if fresh then
       M._order[#M._order + 1] = spec.name
     end
     M._specs[spec.name] = spec
     last = spec.name
-    if enabled(spec) then
+    -- A re-declaration that changes the armed-ness-relevant fields is dead on
+    -- arrival: the plugin is already registered, so neither its triggers
+    -- (cmd/event/ft/keys) nor its `init` will re-register/rerun. Compare the
+    -- *outcome* of `enabled` (not the predicate's identity — a re-sourced
+    -- config rebuilds the closure every time), the resolved `lazy`, and the
+    -- trigger sets, and flag a difference loud instead of silently storing an
+    -- enabled-but-never-armed spec.
+    if not fresh and (enabled(old) ~= enabled(spec) or old.lazy ~= spec.lazy) then
+      btv.notify(
+        "btv.plugins["
+          .. spec.name
+          .. "]: re-declared with changed enablement or laziness — "
+          .. "the plugin is already registered and will not re-arm; restart the session "
+          .. "(or drop the earlier declaration) for the change to take effect",
+        4
+      )
+    elseif not fresh then
+      local changed
+      for _, k in ipairs({ "cmd", "event", "ft", "keys" }) do
+        local a, b = old._triggers[k], spec._triggers[k]
+        if #a ~= #b then
+          changed = true
+          break
+        end
+        for i = 1, #a do
+          if a[i] ~= b[i] then
+            changed = true
+            break
+          end
+        end
+        if changed then
+          break
+        end
+      end
+      if changed then
+        btv.notify(
+          "btv.plugins["
+            .. spec.name
+            .. "]: re-declared with changed triggers — the plugin "
+            .. "is already registered and will not re-arm them; restart the session (or drop "
+            .. "the earlier declaration) for the change to take effect",
+          4
+        )
+      end
+    end
+    if fresh and enabled(spec) then
       if spec.lazy then
         arm_lazy(spec)
       else
@@ -2453,21 +2512,23 @@ end, {
   complete = complete_plugin_names,
 })
 -- Report a `restore()` outcome on the message line. Shared by `:PluginRestore` and the
--- dashboard's `R` verb so both say the same thing. The failures go out LOUD (level 4) and
--- separately from the summary: a rollback that silently skipped a plugin is the one case
--- the user must not miss, because they would stop looking for the real problem.
+-- dashboard's `R` verb so both say the same thing. The failures ride IN the summary, not
+-- in a separate notify: the message line only ever shows the latest message, so a
+-- level-4 failure notify would be immediately overwritten by the summary. A rollback
+-- that silently skipped a plugin is the one case the user must not miss, because they
+-- would stop looking for the real problem — hence the level 4 (error) whenever any
+-- failed.
 function M._restore_notify(r)
+  local lines = {
+    "btv.plugins: restored " .. #r.restored .. ", already current " .. #r.current,
+  }
   if #r.failed > 0 then
-    local lines = { "btv.plugins.restore: " .. #r.failed .. " plugin(s) could NOT be restored:" }
+    lines[#lines + 1] = #r.failed .. " plugin(s) could NOT be restored:"
     for _, f in ipairs(r.failed) do
       lines[#lines + 1] = "  " .. f.name .. ": " .. f.message
     end
-    btv.notify(table.concat(lines, "\n"), 4)
   end
-  btv.notify(
-    "btv.plugins: restored " .. #r.restored .. ", already current " .. #r.current,
-    #r.restored > 0 and 2 or 3
-  )
+  btv.notify(table.concat(lines, "\n"), #r.failed > 0 and 4 or (#r.restored > 0 and 2 or 3))
   return r
 end
 

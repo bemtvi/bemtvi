@@ -185,3 +185,187 @@ async fn sock_leg_reports_connect_failure() {
         "the connect failure carried an error string; got {got:?}"
     );
 }
+
+// ================================================== a bad port never dials a wrong one
+//
+// The port arrives as a wire integer and used to be cast with `as u16`, which
+// TRUNCATES: `70000` silently becomes `4464`, so `btv.socket.connect{ port = 70000 }`
+// dialed a completely different service — and, worse, one that might answer. It is
+// refused loudly now, through the same `sock_closed` channel a refused connect uses
+// (a connect that never began has no other error channel).
+
+#[tokio::test]
+async fn sock_leg_refuses_a_port_outside_the_dial_range() {
+    let (client, mut inc) = wire_leg(bemtvi_server::serve_sock_daemon_on);
+    // 70000 truncates to 4464 in 16 bits.
+    client.notify(
+        "sock_connect",
+        vec![
+            Value::from(9u64),
+            Value::from("127.0.0.1"),
+            Value::from(70_000u64),
+        ],
+    );
+    let got = drain_until(&mut inc, |g| g.iter().any(|(m, _)| m == "sock_closed")).await;
+    let closed = got
+        .iter()
+        .find(|(m, _)| m == "sock_closed")
+        .expect("an out-of-range port must be answered, not silently dialed");
+    assert_eq!(
+        closed.1.first().and_then(Value::as_u64),
+        Some(9),
+        "the refusal must be for the stream that asked; got {got:?}"
+    );
+    let msg = closed.1.get(1).and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        msg.contains("70000") && msg.contains("range"),
+        "the error must name the port and why it was refused, got {msg:?}"
+    );
+    assert!(
+        !got.iter().any(|(m, _)| m == "sock_connected"),
+        "nothing may be dialed for an out-of-range port; got {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn sock_leg_still_accepts_the_top_of_the_range() {
+    // The boundary the other way: 65535 is a legal port, so the guard must refuse
+    // only what genuinely does not fit. Nothing listens there, so the observable is
+    // a connect FAILURE rather than a range refusal.
+    let (client, mut inc) = wire_leg(bemtvi_server::serve_sock_daemon_on);
+    client.notify(
+        "sock_connect",
+        vec![
+            Value::from(10u64),
+            Value::from("127.0.0.1"),
+            Value::from(65_535u64),
+        ],
+    );
+    let got = drain_until(&mut inc, |g| g.iter().any(|(m, _)| m == "sock_closed")).await;
+    let closed = got
+        .iter()
+        .find(|(m, _)| m == "sock_closed")
+        .expect("sock_closed");
+    let msg = closed.1.get(1).and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        !msg.contains("range"),
+        "65535 fits in the dial range — it must be dialed, not refused: {msg:?}"
+    );
+}
+
+// ============================================= a dropped link does not orphan children
+//
+// The daemon outlives its connections — that is its job. So a leg that spawned child
+// processes must reap them when its edit-host goes away, or a long-running child runs
+// forever and every reconnect stacks a fresh set on top of the last.
+
+/// Whether `pid` is still a live process (Linux: the `/proc` entry exists and is not
+/// a zombie). Used to observe the reap from outside.
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // `(state)` is the field after the parenthesised comm; `Z` is a reaped-but-
+        // unwaited zombie, which is not "still running".
+        Ok(stat) => match stat.rsplit_once(") ") {
+            Some((_, rest)) => !rest.starts_with('Z'),
+            None => true,
+        },
+        Err(_) => false,
+    }
+}
+
+/// The one-shot leg's half of the same property, observed through the pid it reports.
+/// See the note on `a_dropped_link_leaves_no_duplex_child_running`: this pins the
+/// PROPERTY, not one of the two mechanisms that enforce it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_the_link_reaps_the_children_the_leg_spawned() {
+    // The one-shot process leg, because it is the one that reports the child's pid
+    // (`proc_spawned [id, pid]`) — which is how the reap is observed from outside.
+    let (client, mut inc) = wire_leg(bemtvi_server::serve_proc_daemon_on);
+
+    client.notify(
+        "proc_spawn",
+        vec![
+            Value::from(77u64),
+            Value::Array(vec![Value::from("sleep"), Value::from("300")]),
+            Value::Nil,
+            Value::Array(vec![]),
+            Value::Binary(Vec::new()),
+        ],
+    );
+    let got = drain_until(&mut inc, |g| g.iter().any(|(m, _)| m == "proc_spawned")).await;
+    let pid = got
+        .iter()
+        .find(|(m, _)| m == "proc_spawned")
+        .and_then(|(_, p)| p.get(1))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("the leg must report the child's pid; got {got:?}"))
+        as u32;
+    assert!(
+        pid_alive(pid),
+        "the child is running before we drop the link"
+    );
+
+    drop(client);
+    drop(inc);
+
+    let mut reaped = false;
+    for _ in 0..100 {
+        if !pid_alive(pid) {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        reaped,
+        "the child (pid {pid}) outlived the connection that spawned it — every \
+         reconnect would stack another"
+    );
+}
+
+/// The same property for the DUPLEX leg, which reports no pid: observe the child by
+/// what it would DO if it lived. A reaped child never reaches its `touch`.
+///
+/// This is the shape that pins the guarantee independently of which mechanism
+/// enforces it. The leg has two — the child's event sink closing when the connection
+/// ends, and the explicit abort of every handle it kept — so removing just one still
+/// leaves the property true. That is deliberate: what must never regress is the
+/// PROPERTY (a dropped link leaves nothing running), not a particular mechanism.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dropped_link_leaves_no_duplex_child_running() {
+    let dir = bemtvi_test_harness::temp_dir("dproc_orphan");
+    let marker = dir.join("survived");
+    let script = format!("sleep 3; touch {}", marker.to_string_lossy());
+
+    let (client, inc) = wire_leg(bemtvi_server::serve_dproc_daemon_on);
+    client.notify(
+        "dproc_open",
+        vec![
+            Value::from(88u64),
+            Value::Array(vec![
+                Value::from("sh"),
+                Value::from("-c"),
+                Value::from(script.as_str()),
+            ]),
+            Value::Nil,
+            Value::Array(vec![]),
+        ],
+    );
+    // Let it actually start before the link goes away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(client);
+    drop(inc);
+
+    // Well past the child's own sleep: if it were still running it would have
+    // touched the marker by now.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !marker.exists(),
+        "a child kept running after its connection was dropped — it reached its \
+         side effect at {}",
+        marker.display()
+    );
+}

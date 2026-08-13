@@ -43,7 +43,9 @@ function btv.run_local(spec)
         stderr = result.stderr or "",
       })
     end
-    btv._local_system_async(id, build_argv(spec), spec.cwd, spec.env, spec.stdin)
+    btv._bridge(id, function()
+      btv._local_system_async(id, build_argv(spec), spec.cwd, spec.env, spec.stdin)
+    end)
   end)
 end
 
@@ -61,7 +63,9 @@ local function local_fs_op(job)
         resolve(value)
       end
     end
-    btv._local_fs_op(job, id)
+    btv._bridge(id, function()
+      btv._local_fs_op(job, id)
+    end)
   end)
 end
 

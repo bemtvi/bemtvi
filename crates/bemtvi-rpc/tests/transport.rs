@@ -280,3 +280,310 @@ async fn writer_delivers_a_burst_of_notifications_in_order() {
         );
     }
 }
+
+// ============================================================ resumable framing
+//
+// The reader used to re-walk the whole buffered prefix on every read, so a large
+// frame arriving in many small reads cost O(bytes x reads) marker walking — a
+// 64 MiB frame in 8 KiB reads re-walks ~256 GiB. The walk is now resumable: it
+// rewinds only to the start of the one value whose bytes have not all arrived, so
+// each read re-parses at most that value's header.
+
+/// One `[2, "ping", [<n small ints>]]` notification frame.
+fn wide_notification(n: usize) -> Vec<u8> {
+    let mut frame = Vec::new();
+    rmpv::encode::write_value(
+        &mut frame,
+        &Value::Array(vec![
+            Value::from(2u64),
+            Value::from("ping"),
+            Value::Array((0..n).map(|i| Value::from(i as u64)).collect()),
+        ]),
+    )
+    .unwrap();
+    frame
+}
+
+#[tokio::test]
+async fn a_large_frame_split_into_many_reads_still_decodes() {
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+    // Wide, not deep: the value budget is what the resumed walk carries across
+    // reads, so a frame with many values is the one that exercises it.
+    let frame = wide_notification(200_000);
+
+    // Chunks small enough that the frame spans hundreds of reads.
+    for chunk in frame.chunks(4096) {
+        peer.write_all(chunk).await.unwrap();
+    }
+    let msg = tokio::time::timeout(Duration::from_secs(20), incoming.recv())
+        .await
+        .expect("the reassembled frame must be dispatched");
+    match msg {
+        Some(Incoming::Notification { method, params }) => {
+            assert_eq!(method, "ping");
+            // `params` is the frame's third element, already unwrapped into its
+            // elements — so its length is the array's.
+            assert_eq!(
+                params.len(),
+                200_000,
+                "every element survived the split reads"
+            );
+            assert_eq!(
+                params.last().and_then(Value::as_u64),
+                Some(199_999),
+                "and the tail is intact, not truncated at a chunk boundary"
+            );
+        }
+        other => panic!("expected the ping notification, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn one_big_frame_costs_about_the_same_as_the_same_bytes_in_whole_frames() {
+    // The perf guard for the resumable walk, shaped so a regression cannot hide.
+    //
+    // Comparing a coarse against a fine delivery of the SAME frame does not work:
+    // a non-resumable walk re-walks the buffered prefix in both (even a "coarse"
+    // write arrives in several reads), so both arms slow down together and the
+    // ratio between them barely moves.
+    //
+    // The baseline that cannot re-walk is the same total bytes delivered as many
+    // WHOLE frames — each completes in the read that carries it, so there is no
+    // buffered prefix to re-scan. Against that, one big frame trickled in small
+    // chunks is O(bytes) when the walk resumes and O(bytes x reads) when it does
+    // not. The budget is a ratio, so it does not encode this machine's speed.
+    async fn deliver(frames: &[Vec<u8>], chunk: usize, expect: usize) -> Duration {
+        let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+        let start = std::time::Instant::now();
+        for f in frames {
+            for c in f.chunks(chunk) {
+                peer.write_all(c).await.unwrap();
+            }
+        }
+        for _ in 0..expect {
+            tokio::time::timeout(Duration::from_secs(60), incoming.recv())
+                .await
+                .expect("every frame dispatched")
+                .expect("a message");
+        }
+        start.elapsed()
+    }
+
+    // ~1.4 MB either way: 40 whole frames, or one frame of the same total size.
+    let small: Vec<Vec<u8>> = (0..40).map(|_| wide_notification(9_000)).collect();
+    let total: usize = small.iter().map(Vec::len).sum();
+    let big = vec![wide_notification(360_000)];
+    assert!(
+        big[0].len() * 2 > total && total * 2 > big[0].len(),
+        "the two deliveries must carry comparable bytes ({} vs {total})",
+        big[0].len()
+    );
+
+    let whole = deliver(&small, usize::MAX, small.len()).await;
+    // 2 KiB chunks: the big frame spans hundreds of reads.
+    let trickled = deliver(&big, 2048, 1).await;
+
+    let budget = whole.max(Duration::from_millis(20)) * 6;
+    assert!(
+        trickled < budget,
+        "one big frame in small reads cost {trickled:?} against {whole:?} for the \
+         same bytes in whole frames (budget {budget:?}) — the frame scan is being \
+         restarted from the frame head on every read"
+    );
+}
+
+#[tokio::test]
+async fn a_frame_nested_past_the_depth_budget_is_rejected() {
+    // An over-deep frame is refused, whichever layer refuses it. NOTE the limit of
+    // what a black-box test can claim here: the scan's own depth pre-check has no
+    // observable of its own — rmpv is depth-capped too, so a frame that slips past
+    // the scan is torn down a moment later by the decode error instead. What the
+    // pre-check buys is refusing it *before* buffering toward it, which the wire
+    // cannot show. The per-path CHARGE MODEL is the part with real consequences,
+    // and `a_wide_but_shallow_frame_is_not_mistaken_for_a_deep_one` is its guard.
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+    // 200 nested single-element arrays (`0x91` = fixarray of 1): 400 depth units,
+    // past the 128 budget. `0xc0` is the nil at the bottom.
+    let mut frame = vec![0x91u8; 200];
+    frame.push(0xc0);
+    peer.write_all(&frame).await.unwrap();
+
+    let closed = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+        .await
+        .expect("the reader must tear down, not hang on the over-deep frame");
+    assert!(
+        closed.is_none(),
+        "an over-budget frame closes the connection, got {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_wide_but_shallow_frame_is_not_mistaken_for_a_deep_one() {
+    // The counterpart: the budget is per path, so siblings share their parent's
+    // allowance. A flat frame of any width must pass — a frame-cumulative charge
+    // would reject ordinary traffic.
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+    peer.write_all(&wide_notification(50_000)).await.unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .expect("a wide frame is legitimate")
+        .expect("a message");
+    match msg {
+        Incoming::Notification { method, .. } => assert_eq!(method, "ping"),
+        other => panic!("expected the ping notification, got {other:?}"),
+    }
+}
+
+// ====================================================== the sender's frame budget
+//
+// The reader rejects any frame past MAX_FRAME by tearing the WHOLE connection
+// down — taking every unrelated in-flight request with it. So the sender refuses
+// an over-large frame per call instead of shipping it: an `Err` for `request`, an
+// error reply for `respond`, a dropped frame plus a stderr line for `notify`.
+
+/// A `Value` that encodes to more than `MAX_FRAME` (64 MiB) bytes.
+fn oversized_value() -> Value {
+    Value::Binary(vec![0u8; 65 * 1024 * 1024])
+}
+
+#[tokio::test]
+async fn an_oversized_request_errors_instead_of_killing_the_link() {
+    let (_peer, rpc, _peer_reader, mut incoming) = rig();
+    // Bounded: a regression SHIPS the frame, and the writer then blocks forever
+    // filling a pipe nobody drains — so the refusal must be observed on a clock,
+    // or the failure mode is a hung suite rather than a red test.
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        rpc.request("huge", vec![oversized_value()]),
+    )
+    .await
+    .expect("the refusal must be immediate — an over-large frame must never be sent")
+    .expect_err("an over-large request must be refused");
+    assert!(
+        err.to_string().contains("too large"),
+        "the refusal must name the real cause, got {err}"
+    );
+    // The link is still up: a normal notification still reaches the peer's reader
+    // (and nothing has closed `incoming`).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), incoming.recv())
+            .await
+            .is_err(),
+        "the connection must stay open after a refused frame"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_notification_is_dropped_and_the_link_survives() {
+    let (_peer, rpc, mut peer_reader, mut incoming) = rig();
+    rpc.notify("huge", vec![oversized_value()]);
+    // …then a small one, which must arrive: the drop is per-frame, not a teardown.
+    rpc.notify("small", vec![Value::from(1u64)]);
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer_reader.read(&mut buf))
+        .await
+        .expect("the small notification must reach the peer")
+        .expect("read");
+    let v = rmpv::decode::read_value(&mut &buf[..n]).expect("a frame");
+    let arr = v.as_array().expect("array");
+    assert_eq!(
+        arr.get(1).and_then(Value::as_str),
+        Some("small"),
+        "the oversized frame must never reach the wire; the next one must"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), incoming.recv())
+            .await
+            .is_err(),
+        "the connection must stay open"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_response_answers_with_an_error_not_a_teardown() {
+    let (_peer, rpc, mut peer_reader, _incoming) = rig();
+    // Answer request id 7 with a payload no frame can carry.
+    rpc.respond(7, Ok(oversized_value()));
+
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer_reader.read(&mut buf))
+        .await
+        .expect("a reply must still be sent")
+        .expect("read");
+    let v = rmpv::decode::read_value(&mut &buf[..n]).expect("a frame");
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.first().and_then(Value::as_u64), Some(1), "a response");
+    assert_eq!(arr.get(1).and_then(Value::as_u64), Some(7), "for id 7");
+    let err = arr.get(2).and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        err.contains("exceeds"),
+        "the requester must get a normal RPC error naming the cause, got {err:?}"
+    );
+    assert_eq!(arr.get(3), Some(&Value::Nil), "and no result");
+}
+
+// ============================================ a cancelled request is not mis-answered
+//
+// A `request().await` dropped before its response arrives (a caller-side timeout)
+// used to leave its oneshot in the pending map until the response came or the
+// link tore down. The entry is now removed when the future drops — and, whatever
+// the bookkeeping, a late reply for a cancelled id must never be handed to a
+// LATER request.
+
+#[tokio::test]
+async fn a_late_reply_for_a_cancelled_request_is_not_delivered_to_the_next_one() {
+    let (mut peer, rpc, mut peer_reader, _incoming) = rig();
+
+    // Issue a request and abandon it before any reply.
+    let cancelled = rpc.clone();
+    let handle = tokio::spawn(async move { cancelled.request("first", vec![]).await });
+    // Read its frame off the wire to learn the id the client assigned.
+    let mut buf = vec![0u8; 4096];
+    let n = peer_reader.read(&mut buf).await.expect("the request frame");
+    let sent = rmpv::decode::read_value(&mut &buf[..n]).expect("a frame");
+    let first_id = sent
+        .as_array()
+        .and_then(|a| a.get(1)?.as_u64())
+        .expect("id");
+    handle.abort();
+    let _ = handle.await;
+
+    // Now a second request, which must get its OWN answer.
+    let rpc2 = rpc.clone();
+    let second = tokio::spawn(async move { rpc2.request("second", vec![]).await });
+    let n = peer_reader.read(&mut buf).await.expect("the second frame");
+    let sent = rmpv::decode::read_value(&mut &buf[..n]).expect("a frame");
+    let second_id = sent
+        .as_array()
+        .and_then(|a| a.get(1)?.as_u64())
+        .expect("id");
+    assert_ne!(first_id, second_id, "ids are not reused");
+
+    // Answer the CANCELLED id first, then the live one.
+    for (id, payload) in [(first_id, "stale"), (second_id, "fresh")] {
+        let mut frame = Vec::new();
+        rmpv::encode::write_value(
+            &mut frame,
+            &Value::Array(vec![
+                Value::from(1u64),
+                Value::from(id),
+                Value::Nil,
+                Value::from(payload),
+            ]),
+        )
+        .unwrap();
+        peer.write_all(&frame).await.unwrap();
+    }
+
+    let got = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the live request must resolve")
+        .expect("join")
+        .expect("ok");
+    assert_eq!(
+        got.as_str(),
+        Some("fresh"),
+        "the live request must get its own reply, never the cancelled one's"
+    );
+}

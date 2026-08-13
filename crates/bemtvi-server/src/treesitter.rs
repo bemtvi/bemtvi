@@ -176,6 +176,12 @@ impl EditHost {
     fn install_grammar(&mut self, outcome: crate::GrammarOutcome) -> bool {
         let (lang, loaded) = outcome;
         if !self.editor.install_ts_grammar(&lang, loaded) {
+            // `Missing` — no parser installed. The engine still replaced its
+            // `Loading` slot with a terminal `NotInstalled` verdict, so the settle's
+            // re-check resolves a parked `btv.treesitter.highlight` ask (empty spans)
+            // instead of parking it forever — the promise must not hang the whole
+            // session because no other grammar ever lands.
+            self.run_parked_ts_highlights();
             return false;
         }
         self.syntax_states.clear();

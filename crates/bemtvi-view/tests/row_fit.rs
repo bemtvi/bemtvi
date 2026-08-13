@@ -239,3 +239,39 @@ fn a_path_row_still_keeps_its_tail() {
         "{out:?}"
     );
 }
+
+// ------------------------------------------------------------- a zero-cell column
+//
+// `elide_keep_tail` returned the label untouched when `width == 0` (the `n <= width`
+// arm caught it only for an empty label). A 0-cell column shows nothing, so handing
+// back the whole row overflowed the picker column and left the highlight spans
+// pointing at chars the renderer cuts. `fit_row` already guarded its own `width == 0`
+// on the two-column path; this mirrors it.
+
+#[test]
+fn a_zero_width_column_elides_to_nothing() {
+    let (out, spans) = elide_keep_tail("a/long/path/to/file.rs", &[], 0);
+    assert_eq!(out, "", "a 0-cell column shows nothing at all");
+    assert!(
+        spans.is_empty(),
+        "and carries no spans into a row it cannot draw"
+    );
+}
+
+#[test]
+fn a_zero_width_column_drops_its_spans() {
+    // With spans that would otherwise be remapped into the returned string.
+    let (out, spans) = elide_keep_tail("src/main.rs", &[(0, 3)], 0);
+    assert_eq!(out, "");
+    assert!(
+        spans.is_empty(),
+        "a span pointing into a string the renderer cannot draw is worse than none"
+    );
+}
+
+#[test]
+fn a_one_cell_column_still_returns_something() {
+    // The boundary the other way: 1 is a real width, so the guard must not swallow it.
+    let (out, _) = elide_keep_tail("src/main.rs", &[], 1);
+    assert_eq!(out.chars().count(), 1, "one cell holds one char");
+}

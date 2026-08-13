@@ -504,7 +504,10 @@ local FLUSH_N = 256
 local function complete_cancel_inflight(c)
   if c.reapers then
     for _, reap in ipairs(c.reapers) do
-      pcall(reap)
+      local ok, err = pcall(reap)
+      if not ok then
+        btv.notify("btv.complete: on_cancel error: " .. tostring(err), 4)
+      end
     end
   end
   if c.timers then

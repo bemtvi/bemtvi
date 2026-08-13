@@ -109,6 +109,12 @@ pub(crate) struct LspComplete {
     /// while the cursor stays in this word; invalidated when it moves on.
     pub buffer: BufferId,
     pub anchor: (usize, usize),
+    /// The buffer's `changedtick` when the round was requested. The items' `textEdit`
+    /// ranges are authored against the text at that moment; re-serving or accepting
+    /// them after a text change would splice the replacement into the middle of the
+    /// grown word. Cursor movement within the word leaves the tick untouched, so
+    /// reuse survives it; a typed character bumps it and forces a fresh round.
+    pub tick: u64,
     /// `isIncomplete` **OR-ed** across the servers that have replied: if any narrowed
     /// its list to the old prefix, a prefix edit must re-request rather than re-serve
     /// the cached list.
@@ -137,10 +143,17 @@ impl EditHost {
         let line = self.editor.buffer().line(row);
         let (word_start, _prefix) = completion_word(&line, col);
 
-        // Cache hit: same buffer + same word start, and the cached list is complete
-        // (covers every candidate for this word). Re-serve it; core filters by prefix.
+        // Cache hit: same buffer + same word start + the text is unchanged since the
+        // round was requested, and the cached list is complete (covers every candidate
+        // for this word). Re-serve it; core filters by prefix. The `tick` arm is what
+        // makes typing more word characters re-request: the cached items' `textEdit`
+        // ranges cover the word as it was at request time, so re-serving them over the
+        // grown word would let an accept splice the replacement into its middle.
         let reuse = self.lsp_complete.as_ref().is_some_and(|c| {
-            !c.is_incomplete && c.buffer == buffer && c.anchor == (row, word_start)
+            !c.is_incomplete
+                && c.buffer == buffer
+                && c.anchor == (row, word_start)
+                && c.tick == self.editor.buffer().changedtick
         });
         if reuse {
             self.complete_lsp_push(gen);
@@ -196,6 +209,7 @@ impl EditHost {
             rows: Vec::new(),
             buffer,
             anchor: (row, word_start),
+            tick: self.editor.buffer().changedtick,
             is_incomplete: false,
         });
         // A new round supersedes any in-flight docs resolve: its key indexed the old
@@ -234,6 +248,7 @@ impl EditHost {
     pub(crate) fn on_completion_reply(
         &mut self,
         buffer: BufferId,
+        tick: u64,
         server: ServerKey,
         is_incomplete: bool,
         items: Vec<CompletionItemData>,
@@ -242,6 +257,14 @@ impl EditHost {
             return;
         }
         if buffer != self.editor.current_buffer_id() {
+            return;
+        }
+        // The items' `textEdit` ranges were computed against the text at request time;
+        // the user typed while the request was in flight, so they no longer describe
+        // the buffer. Dropping the reply forces the next keystroke's dispatch to issue
+        // a fresh round — caching ranges that point into superseded text would let an
+        // accept corrupt the word it replaced.
+        if tick != self.editor.buffer().changedtick {
             return;
         }
         // Where this server sits in the buffer's routing order, and the priority a row
@@ -434,14 +457,26 @@ impl EditHost {
         let line = self.editor.buffer().line(row);
         let (word_start, _) = completion_word(&line, col);
 
+        // A cached item's explicit `textEdit` is authored against the buffer text at
+        // request time. The dispatch guard normally re-requests on the keystroke that
+        // changed the text (so the cache is reset before an accept can see it), but a
+        // text change that lands without a dispatch — a settle-order edit from an
+        // autocmd, a paste that didn't re-arm the source — leaves the stale range
+        // behind; applying it would splice the replacement into the middle of the
+        // grown word. When the tick moved, ignore the item's range and fall back to
+        // the word replacement, which is recomputed against the live text.
+        let tick_stale = self
+            .lsp_complete
+            .as_ref()
+            .is_some_and(|c| c.tick != self.editor.buffer().changedtick);
         // The primary edit: the item's explicit textEdit, else replace the word
         // (word_start..cursor) with insertText (falling back to the label).
-        let (mut primary_range, primary_text) = match &item.text_edit {
-            Some(edit) => (
+        let (mut primary_range, primary_text) = match (&item.text_edit, tick_stale) {
+            (Some(edit), false) => (
                 self.lsp_range_to_bytes(&edit.range, encoding),
                 edit.new_text.clone(),
             ),
-            None => {
+            _ => {
                 let start = self.editor.buffer().line_start(row) + word_start;
                 let end = self.editor.buffer().line_start(row) + col;
                 let text = item

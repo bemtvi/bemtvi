@@ -242,6 +242,14 @@ pub struct Buffer {
     /// explorer dir path / view id and makes [`Buffer::read_only`] true. See
     /// [`BufferKind`] for the per-kind details.
     pub kind: BufferKind,
+    /// True once this buffer hosted a terminal whose child exited — the kind
+    /// flipped back to [`BufferKind::Ordinary`] at exit ([`Editor::terminal_closed`]),
+    /// but the server keeps a per-line color capture for the dead buffer's rendering
+    /// (`terminal_frozen`) that only a wipe tears down. Wiping a buffer with this set
+    /// must therefore still enqueue the terminal Kill (which drops the capture); the
+    /// daemon's kill is a tolerant no-op for a dead PTY. Lives for the buffer's whole
+    /// life — it is only ever set, never cleared.
+    pub was_terminal: bool,
     /// A terminal-job buffer's display name — the child's window title (the OSC
     /// `\e]0;…`/`\e]2;…` sequence a shell or program sets, e.g. `user@host: ~/dir` or
     /// `vim README.md`), surfaced as the buffer name in the statusline. Seeded from the
@@ -305,6 +313,7 @@ impl Buffer {
             marks: HashMap::new(),
             last_visual: None,
             kind: BufferKind::Ordinary,
+            was_terminal: false,
             terminal_title: None,
             view_name: None,
             image_gen: 0,
@@ -625,6 +634,44 @@ impl Buffer {
         });
     }
 
+    /// Replace the byte range `range` with `s` in a **single** journaled edit.
+    /// The remove+insert pair a caller would otherwise write can never fold
+    /// (the removal's end-point minus the insertion's row shift goes negative
+    /// in `fold_edit_rows`, degrading the delta to a full-text push), so a
+    /// replacement that is semantically one edit must be recorded as one
+    /// `BufferEdit` — extmarks shift once, `changedtick` bumps once, and the
+    /// mirror wire gets a spliceable delta. The degenerate forms delegate to
+    /// the [`remove`](Self::remove)/[`insert`](Self::insert) choke points, so a
+    /// true no-op still does not bump `changedtick`.
+    pub fn replace(&mut self, range: Range<usize>, s: &str) {
+        if range.start >= range.end {
+            if s.is_empty() {
+                return;
+            }
+            self.insert(range.start, s);
+            return;
+        }
+        if s.is_empty() {
+            self.remove(range);
+            return;
+        }
+        let start_point = self.point_at(range.start);
+        let old_end_point = self.point_at(range.end);
+        self.text.remove(range.clone());
+        self.text.insert(range.start, s);
+        let new_end_byte = range.start + s.len();
+        let new_end_point = self.point_at(new_end_byte);
+        self.record(BufferEdit {
+            start_byte: range.start,
+            old_end_byte: range.end,
+            new_end_byte,
+            start_point,
+            old_end_point,
+            new_end_point,
+            text: s.to_string(),
+        });
+    }
+
     /// Mark that the whole rope was replaced (undo/redo, file reload), so any
     /// pending deltas are moot and the consumer must re-sync from full text. Every
     /// delta journal (syntax, LSP, Lua-treesitter, the Lua buffer mirror, and the
@@ -774,6 +821,17 @@ impl Buffer {
     /// `\n` is journaled like any edit, so a shadow buffer stays byte-identical.
     pub fn normalize(&mut self) {
         let n = self.text.len();
+        if n != 0
+            && self
+                .text
+                .get_char(n - 1)
+                .map(|c| c == '\n')
+                .unwrap_or(false)
+        {
+            // Invariant already holds — the common (no-op) path must not touch the
+            // marks or changelist, whose snapshots below would allocate.
+            return;
+        }
         // The maintenance insert below is bookkeeping, not a user edit, so it must
         // not claim the `'.'` last-change mark `record` sets. Save it and restore it
         // across the insert; the phantom newline is always at the buffer's end,
@@ -784,10 +842,8 @@ impl Buffer {
         let saved_changelist = (self.changelist.clone(), self.changelistidx);
         if n == 0 {
             self.insert(0, "\n");
-        } else if self.text.get_char(n - 1).map(|c| c != '\n').unwrap_or(true) {
-            self.insert(n, "\n");
         } else {
-            return;
+            self.insert(n, "\n");
         }
         match saved_dot {
             Some(p) => self.marks.insert('.', p),

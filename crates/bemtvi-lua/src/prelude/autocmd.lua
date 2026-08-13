@@ -442,6 +442,12 @@ end
 -- `btv.autocmd.del(id)` [alias `nvim_del_autocmd`]: remove the autocmd with this id,
 -- so it stops firing.
 function btv.autocmd.del(id)
+  -- A nil id must not wipe the whole registry: `au.id ~= nil` is true for every
+  -- autocmd, so the filter below would silently delete all of them — the exact
+  -- silent-degradation failure `au_resolve_group` guards against elsewhere.
+  if id == nil then
+    error("nvim_del_autocmd: an autocmd id is required", 2)
+  end
   btv._autocmds = vim.tbl_filter(function(au)
     return au.id ~= id
   end, btv._autocmds)
@@ -515,10 +521,16 @@ end
 -- `min_id` (optional) restricts the pass to autocmds registered *after* that id — the
 -- replay filter: it re-delivers an event to handlers that appeared while the first
 -- dispatch's async handlers were still running, without re-running the ones that
--- already saw it. Ids are monotonic (`autocmd_seq`), so the comparison is exact and no
--- handler can ever observe the same fire twice.
+-- already saw it.
+-- Returns the **delivered-up-to watermark**: the highest id this pass actually ran
+-- (never below `min_id`). The `ipairs` walk reaches autocmds APPENDED mid-pass, so a
+-- handler registered by another handler during the fire is already served by this
+-- pass — the caller feeds the watermark back as the next round's `min_id`, which skips
+-- it. Ids are monotonic (`autocmd_seq`), so the comparison is exact and no handler can
+-- ever observe the same fire twice.
 local function au_dispatch(event, pattern, buf, run, group, min_id)
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
+  local wm = min_id or 0
   for _, au in ipairs(btv._autocmds) do
     local ev = au.event
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
@@ -532,6 +544,9 @@ local function au_dispatch(event, pattern, buf, run, group, min_id)
       -- every subscriber. See `btv.autocmd.exec`.
       and (group == nil or au.group == group)
     then
+      if au.id > wm then
+        wm = au.id
+      end
       run(au)
       if au.opts.once then
         fired = fired or {}
@@ -544,6 +559,7 @@ local function au_dispatch(event, pattern, buf, run, group, min_id)
       return not fired[au.id]
     end, btv._autocmds)
   end
+  return wm
 end
 
 -- ----- hot-path events --------------------------------------------------------
@@ -761,15 +777,18 @@ arm_settle = function(ctx, cursor, waits, round, on_done)
   }
 
   -- Deliver the event to handlers registered since `cursor.hw`, and if any of *those* go
-  -- async, arm the next round for them. Reads `autocmd_seq` before dispatching, since
-  -- dispatching can register more. Returns whether a nested round was armed and given
+  -- async, arm the next round for them. Returns whether a nested round was armed and given
   -- ownership of `finish` — when it wasn't, this fire has converged here.
   -- `chain` false means nobody is waiting on convergence any more (we already advanced
   -- past a timeout), so a nested round runs purely for the late subscribers' benefit.
   local function replay(chain)
-    local next_hw = autocmd_seq
     local late
-    au_dispatch(ctx.event, ctx.pattern, ctx.buf, function(au)
+    -- The pass advances the shared cursor to the highest id it actually delivered —
+    -- mid-pass registrations fire in THIS round (the `ipairs` walk reaches appends), so
+    -- they fall under the new watermark and no later round re-runs them. The watermark
+    -- only moves forward, so whichever of the fire's live paths gets here first
+    -- delivers, and the other serves only what appeared in between.
+    cursor.hw = au_dispatch(ctx.event, ctx.pattern, ctx.buf, function(au)
       local cb = au.opts.callback
       if type(cb) == "function" then
         local ret = cb({
@@ -789,9 +808,6 @@ arm_settle = function(ctx, cursor, waits, round, on_done)
         vim.cmd(au.opts.command)
       end
     end, ctx.group, cursor.hw)
-    -- `next_hw` was read before the dispatch, and `autocmd_seq` only grows, so this is
-    -- monotonic no matter which of the fire's live paths gets here first.
-    cursor.hw = next_hw
     if late then
       arm_settle(ctx, cursor, late, round + 1, chain and finish or nil)
       return chain
@@ -939,12 +955,14 @@ function btv._replay_startup_announces()
     local grew = false
     for _, rec in ipairs(records) do
       local ctx, cursor = rec.ctx, rec.cursor
-      local next_hw = autocmd_seq
       -- A nil mirror means "not published yet", not "no buffers": never let a missing
       -- mirror silently swallow every replay.
       local bufs = btv._bufs
-      if next_hw > cursor.hw and (ctx.buf == nil or bufs == nil or bufs[ctx.buf] ~= nil) then
-        au_dispatch(ctx.event, ctx.pattern, ctx.buf, function(au)
+      -- `autocmd_seq` past the cursor means handlers registered since the fire's pass;
+      -- the dispatch returns the delivered-up-to id, so a handler another handler
+      -- registered mid-replay fires in THIS round and no later round re-runs it.
+      if autocmd_seq > cursor.hw and (ctx.buf == nil or bufs == nil or bufs[ctx.buf] ~= nil) then
+        local new_hw = au_dispatch(ctx.event, ctx.pattern, ctx.buf, function(au)
           local cb = au.opts.callback
           if type(cb) == "function" then
             -- Nothing is sequenced behind a replay, so a returned promise is tracked
@@ -966,8 +984,10 @@ function btv._replay_startup_announces()
             delivered = delivered + 1
           end
         end, nil, cursor.hw)
-        cursor.hw = next_hw
-        grew = true
+        if new_hw > cursor.hw then
+          cursor.hw = new_hw
+          grew = true
+        end
       end
     end
     if not grew then
@@ -1005,11 +1025,13 @@ end
 function btv._fire(event, pattern, buf, file, data, group)
   local any = false
   local hot = HOT_EVENTS[event]
-  -- Ids at or below this existed when we dispatched; anything above registered DURING
-  -- this fire and never saw it. Captured before the pass, used by the replay.
-  local watermark = autocmd_seq
   local waits -- nil unless a non-hot handler returned a pending promise
-  au_dispatch(event, pattern, buf, function(au)
+  -- The delivered-up-to watermark, shared by the async settle's replay rounds and the
+  -- startup-window replay so neither re-runs a handler the other already served.
+  -- `au_dispatch` returns it: it counts registrations made DURING the pass (the
+  -- `ipairs` walk reaches appends), so a handler registered mid-fire by another
+  -- handler observes the fire exactly once — every later round skips it.
+  local cursor_hw = au_dispatch(event, pattern, buf, function(au)
     local cb = au.opts.callback
     if type(cb) == "function" then
       local ret = cb({
@@ -1052,11 +1074,7 @@ function btv._fire(event, pattern, buf, file, data, group)
   if waits or replayable then
     local ctx =
       { event = event, pattern = pattern, buf = buf, file = file, data = data, group = group }
-    -- The delivered-up-to watermark, shared by the async settle's replay rounds and the
-    -- startup-window replay so neither re-runs a handler the other already served. A
-    -- fire that stayed synchronous has reached every handler registered so far — even
-    -- one a handler added mid-pass — so its cursor starts at the current id instead.
-    local cursor = { hw = waits and watermark or autocmd_seq }
+    local cursor = { hw = cursor_hw }
     if waits then
       arm_settle(ctx, cursor, waits, 1)
     end
@@ -1092,9 +1110,11 @@ end
 -- `BufReadPost` handler has finished *and* anything it registered has run.
 function btv._fire_gated(event, pattern, buf, file, gate_id, data)
   local hot = HOT_EVENTS[event]
-  local watermark = autocmd_seq
   local waits -- nil until a handler returns a pending promise
-  au_dispatch(event, pattern, buf, function(au)
+  -- One shared watermark per fire — see the twin in `btv._fire`: the delivered-up-to
+  -- id the pass returns, so a handler registered mid-fire by another handler observes
+  -- the fire exactly once and the replay serves only later arrivals.
+  local cursor_hw = au_dispatch(event, pattern, buf, function(au)
     local cb = au.opts.callback
     local ret
     if type(cb) == "function" then
@@ -1128,8 +1148,7 @@ function btv._fire_gated(event, pattern, buf, file, gate_id, data)
     return true
   end
   local ctx = { event = event, pattern = pattern, buf = buf, file = file, data = data }
-  -- One shared watermark per fire — see the twin in `btv._fire`.
-  local cursor = { hw = waits and watermark or autocmd_seq }
+  local cursor = { hw = cursor_hw }
   if replayable then
     record_startup_announce(ctx, cursor)
   end
@@ -1270,7 +1289,9 @@ function btv.autocmd.exec(event, opts)
   opts = opts or {}
   local events = au_canon_event(type(event) == "table" and event or { event })
   local buf = opts.buffer
-  if buf == nil then
+  -- 0 means "the current buffer", resolved like `btv.autocmd.create` does — a
+  -- buffer-local autocmd registered for the current buffer must fire under it.
+  if buf == nil or buf == 0 then
     buf = btv._cur_buf and btv._cur_buf.bufnr or nil
   end
   local file
@@ -1363,6 +1384,11 @@ local function au_matches(au, group, events, patterns)
   if group ~= nil and au.group ~= group then
     return false
   end
+  -- The filter speaks the same alias language registration does: autocmds are
+  -- STORED canonical (`BufReadPost`), so a `:autocmd! BufRead` must clear (and
+  -- `:autocmd BufRead` list) a `BufReadPost` autocmd — the aliasing contract the
+  -- API clear already honors, here applied to the ex-command front-end too.
+  events = events and au_canon_event(events) or nil
   if events ~= nil and not vim.tbl_contains(events, "*") then
     local evs = type(au.event) == "table" and au.event or { au.event }
     local hit = false

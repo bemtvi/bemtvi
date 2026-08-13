@@ -468,15 +468,30 @@ pub fn is_match(pattern: &str, path: impl AsRef<[u8]>, opts: &GlobOpts) -> Resul
 /// "src/**, docs/**"            -> ["src/**", "docs/**"]
 /// "**/{a,b}/**"                -> ["**/{a,b}/**"]     ( one pattern )
 /// "  , *.lock ,, "             -> ["*.lock"]          ( blanks dropped )
+/// "\{a,b\}"                    -> ["\{a,b\}"]         ( one pattern )
+/// "\{a,b\},c"                  -> ["\{a,b\},c"]       ( one pattern )
+/// "{a,b\},c,d}"                -> ["{a,b\},c,d}"]     ( one pattern )
 /// ```
 pub fn split_patterns(list: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0usize;
+    // Literal-brace region depth: how many `\{` pairs are open. An escaped `{` is
+    // a literal `{` that opens no alternation, so its comma is literal text of one
+    // pattern, not a separator — but tracking it as *alternation* depth would make
+    // an escaped `\}` close the alternation (a literal `}` never closes one), so
+    // it gets its own counter, closed by an unescaped `}` or the list end.
+    let mut lit = 0usize;
     let mut start = 0usize;
     let mut escaped = false;
     for (i, c) in list.char_indices() {
         if escaped {
             escaped = false;
+            // Only `\{` opens a literal region; a `\}` is a literal `}` and never
+            // closes anything (globset parses the region's comma — including one
+            // after the `\}` — as literal until an unescaped `}` or the end).
+            if c == '{' {
+                lit += 1;
+            }
             continue;
         }
         match c {
@@ -484,9 +499,13 @@ pub fn split_patterns(list: &str) -> Vec<String> {
             '{' => depth += 1,
             // Saturating: a stray `}` with no opener is a malformed pattern globset
             // will reject by name later — it must not wrap the depth into splitting
-            // every following comma inside a brace group.
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
+            // every following comma inside a brace group. An unescaped `}` also ends
+            // any open literal region (it cannot close one with a stray brace).
+            '}' => {
+                depth = depth.saturating_sub(1);
+                lit = 0;
+            }
+            ',' if depth == 0 && lit == 0 => {
                 let piece = list[start..i].trim();
                 if !piece.is_empty() {
                     out.push(piece.to_string());

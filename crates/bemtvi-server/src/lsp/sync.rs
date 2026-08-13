@@ -135,12 +135,32 @@ impl EditHost {
                 self.lsp_dirty = true;
                 return;
             }
-            LspOp::SetClientDiagnostics { bufnr, diags } => {
+            LspOp::SetClientDiagnostics {
+                bufnr,
+                diags: op_diags,
+            } => {
                 let buffer = BufferId(bufnr);
                 // An empty set (a cleared namespace, or every namespace reset) drops
                 // the buffer's entry so it stops projecting entirely; the held form of
                 // that is an empty pending list.
-                let diags: Vec<_> = diags.iter().map(client_diagnostic).collect();
+                let mut diags = Vec::with_capacity(op_diags.len());
+                for d in &op_diags {
+                    match client_diagnostic(d) {
+                        Ok(d) => diags.push(d),
+                        // Loud, not truncated: a position the LSP wire can't carry
+                        // is a bug in the calling plugin, and half-applying the set
+                        // would drop its diagnostics silently. Keep the previous
+                        // store; the plugin sees its next call land or reads the
+                        // mirror's absence.
+                        Err(what) => {
+                            eprintln!(
+                                "bemtvi: vim.diagnostic.set rejected: {what} is outside \
+                                 the u32 LSP position range; set unchanged"
+                            );
+                            return;
+                        }
+                    }
+                }
                 if self.diagnostics_paused() {
                     self.pending_client_diagnostics.insert(buffer, diags);
                     self.arm_diag_debounce();
@@ -592,9 +612,19 @@ impl EditHost {
         // syncs, each on its own clock, in key order.
         let keys: Vec<ServerKey> = match self.lsp_states.get(&buffer) {
             Some(state) => state.servers().map(|(k, _)| k.clone()).collect(),
-            None => return,
+            None => {
+                // No server is (or ever was) attached to this buffer, so nothing will
+                // consume its journal. Drop it here rather than let it grow with the
+                // session's typing: a server that attaches later receives full text
+                // via `didOpen`, which supersedes journaled deltas.
+                let _ = self.editor.buffer_mut().take_lsp_edits();
+                return;
+            }
         };
         if keys.is_empty() {
+            // Every server this buffer was bound to has exited or detached — same as
+            // no attachment: nothing can replay the journal.
+            let _ = self.editor.buffer_mut().take_lsp_edits();
             return;
         }
         let Some(path) = self.editor.buffer().path.clone() else {
@@ -721,8 +751,13 @@ impl EditHost {
         }
 
         // Every attached server saw this tick's deltas (or opened fresh at it), so the
-        // journal has served its purpose and must not replay on the next sync.
-        if batch.is_none() && content_synced {
+        // journal has served its purpose and must not replay on the next sync. When no
+        // server wanted deltas this tick — every attached server is sync-NONE or not
+        // yet initialized — the entries are dropped instead: a server that opens
+        // later receives full text via `didOpen` (which supersedes journaled deltas),
+        // and a sync-NONE server never reads deltas, so keeping the entries would
+        // grow the journal without bound across the session's typing.
+        if batch.is_none() {
             let _ = self.editor.buffer_mut().take_lsp_edits();
         }
 
@@ -779,6 +814,11 @@ impl EditHost {
             })
             .collect();
         if targets.is_empty() {
+            // No attached server wants deltas (unopened / unattached / every server
+            // sync-NONE) — the journal can never be replayed to any of them, so drop
+            // it instead of growing without bound (a later open receives full text
+            // via `didOpen`, which supersedes journaled deltas).
+            let _ = self.editor.take_lsp_edits_of(id);
             return;
         }
         // Drained once and replayed into each server's own shadow — see `sync_lsp`.
@@ -909,9 +949,31 @@ impl EditHost {
             .copied()
             .filter(|id| !live.contains(id))
             .collect();
-        for id in dead {
-            if let Some(state) = self.lsp_states.remove(&id) {
-                self.close_lsp_state(id, state);
+        for id in &dead {
+            if let Some(state) = self.lsp_states.remove(id) {
+                self.close_lsp_state(*id, state);
+            }
+        }
+        // In-flight requests and resolves for a closed buffer can never be superseded
+        // by a fresh request (the request paths gate on `lsp_states`, which is gone),
+        // so with a hung server they would live until it exits — and every open/close
+        // cycle would add more. Drop them here; a late reply finds no entry and is
+        // ignored.
+        if !dead.is_empty() {
+            self.lsp_multi_requests
+                .retain(|_, p| !dead.contains(&p.buffer));
+            self.inlay_resolves.retain(|_, t| !dead.contains(&t.buffer));
+            // The client-side diagnostic caches are keyed by buffer and only ever
+            // removed when a fresh empty set lands (`refresh_diagnostic_marks`), so a
+            // closed buffer would keep its full `Vec<Diagnostic>` (message strings
+            // included) — and a pending batch for it would land straight back into
+            // `client_diagnostics` on the next drain — for the rest of the session.
+            // Buffer ids are never recycled, so dropping them here is final.
+            for id in &dead {
+                self.client_diagnostics.remove(id);
+                self.pending_client_diagnostics.remove(id);
+                self.diag_mark_counts.remove(id);
+                self.diag_mark_gens.remove(id);
             }
         }
     }

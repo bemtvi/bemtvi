@@ -344,3 +344,62 @@ async fn unsupported_construct_errors_loud() {
     expand(&rpc, "$TM_FILENAME").await;
     assert_eq!(lines(&rpc).await, vec![String::new()]);
 }
+
+/// A choice alternative may contain a multibyte character next to a backslash.
+///
+/// The choice parser treats `\,` / `\|` / `\\` as escapes and used to consume TWO
+/// bytes for any other `\x` — pushing the escaped byte as a `char`. On a multibyte
+/// char that splits the encoding: the lead byte is pushed raw and `*pos` lands
+/// mid-character, where the next `utf8_len` read off a continuation byte can slice
+/// past the end of the input. Any other `\x` now keeps the backslash and leaves the
+/// following character to the normal UTF-8 arm.
+#[tokio::test]
+async fn a_choice_alternative_survives_a_backslash_before_a_multibyte_char() {
+    let dir = temp_dir("snippet-choice-utf8");
+    let (rpc, mut incoming) = start(&dir, "btv.snippet.setup{}").await;
+
+    // `\é` is not one of the choice escapes, so it stays a literal backslash
+    // followed by `é` — and, critically, parsing it must not slice the char.
+    expand(&rpc, r"${1|\é,plain|}").await;
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("choice dropdown opens");
+    assert_eq!(
+        menu_items(&map),
+        vec![r"\é", "plain"],
+        "a non-escape backslash keeps both the backslash and the whole character"
+    );
+}
+
+#[tokio::test]
+async fn a_choice_alternative_keeps_its_real_escapes() {
+    // The control: the three genuine escapes still drop their backslash, so the
+    // multibyte fix did not turn every `\x` into literal text.
+    let dir = temp_dir("snippet-choice-esc");
+    let (rpc, mut incoming) = start(&dir, "btv.snippet.setup{}").await;
+
+    expand(&rpc, r"${1|a\,b,c\|d|}").await;
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("choice dropdown opens");
+    assert_eq!(
+        menu_items(&map),
+        vec!["a,b", "c|d"],
+        r"`\,` and `\|` are escapes: one alternative each, backslash dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_multibyte_choice_alternative_round_trips() {
+    // A plain multibyte alternative (no backslash) — the accept path must write the
+    // whole character back into the buffer.
+    let dir = temp_dir("snippet-choice-mb");
+    let (rpc, mut incoming) = start(&dir, "btv.snippet.setup{}").await;
+
+    expand(&rpc, "${1|café,tea|}").await;
+    assert_eq!(lines(&rpc).await, vec!["café".to_string()]);
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("choice dropdown opens");
+    assert_eq!(menu_items(&map), vec!["café", "tea"]);
+}

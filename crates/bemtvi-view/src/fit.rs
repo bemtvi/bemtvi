@@ -72,7 +72,14 @@ pub fn elide_keep_tail(
 ) -> (String, Vec<(u16, u16)>) {
     let chars: Vec<char> = label.chars().collect();
     let n = chars.len();
-    if n <= width || width == 0 {
+    if width == 0 {
+        // A 0-cell column shows nothing — an over-wide row (the whole label)
+        // would overflow the picker column, and the highlight spans would point
+        // at chars the renderer cuts. Mirrors `fit_row`'s own `width == 0`
+        // guard on the two-column path.
+        return (String::new(), Vec::new());
+    }
+    if n <= width {
         return (label.to_string(), spans.to_vec());
     }
     if !label.contains('/') {
@@ -340,6 +347,17 @@ pub fn doc_box(area: CellRect, popup: CellRect, doc: &[String]) -> Option<CellRe
     } else {
         return None; // no room either side
     };
+    // The documented guarantee: a box that would hang off the area is not drawn
+    // at all. The side math above only sizes against the room on that side, so a
+    // popup that itself hangs off the area (its rect comes off the wire) could
+    // place the box outside it — e.g. a popup past the area's right edge puts
+    // the left-side box between the popup and the area's right edge, and a popup
+    // past the top edge top-aligns the box above the area. Check the placement
+    // against the area itself (the height is clamped to the rows below `popup.y`
+    // later, so the top edge is the only vertical hole).
+    if x < area.x || x.saturating_add(box_w) > area.right() || popup.y < area.y {
+        return None;
+    }
 
     // Height from the wrapped line count, clamped to the cap and the room below.
     let content_w = box_w.saturating_sub(2).max(1);

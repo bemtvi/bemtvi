@@ -29,7 +29,7 @@ use crate::client::{init_params, new_client, read_init_result, ApplyEditDone};
 use crate::dispatch::{apply_notify, issue_request};
 use crate::log::{LogLevel, LspLog};
 use crate::protocol::{
-    ApplyEditOutcome, LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn,
+    ApplyEditOutcome, LspEvent, LspNotify, LspReply, LspRequest, ReqToken, ServerKey, ServerSpawn,
 };
 use crate::transport::{LocalLspTransport, LspTransport};
 
@@ -283,6 +283,27 @@ async fn run_server(
 /// complete the handshake (emitting [`LspEvent::Initialized`]), then ferry
 /// commands to it until it is asked to stop or its pipe closes. Returns
 /// [`ServerOutcome::Failed`] on any unexpected death so the breaker can decide.
+///
+/// How long a graceful `shutdown` handshake may take before the server is
+/// killed instead. A healthy server answers in milliseconds; the bound only
+/// exists so a wedged one cannot hang teardown (and defer the child reap)
+/// forever.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// How long the `initialize` handshake may take before the child is killed as
+/// wedged. A healthy server answers in seconds (jdtls, the slowest mainstream
+/// one, answers within a few seconds of JVM start); the bound only exists for
+/// a server that spawns but never speaks — it accepted the pipe, so the
+/// mainloop keeps running and the usual death detection never fires. Without
+/// the bound such a server would hold its per-server task hostage forever: the
+/// serve loop never starts, every command for the key queues in the unbounded
+/// channel (unbounded memory), a `Shutdown` command is deferred indefinitely,
+/// and a re-`Ensure` for the key no-ops on the still-open channel. On timeout
+/// the child is killed and the breaker decides whether to try again, exactly
+/// as for a server that died on its own. Generous so a slow cold start is
+/// never mistaken for a wedge.
+const INIT_GRACE: Duration = Duration::from_secs(30);
+
 async fn run_server_once(
     key: &ServerKey,
     spawn: &ServerSpawn,
@@ -313,6 +334,7 @@ async fn run_server_once(
         Err(e) => {
             let message = format!("failed to spawn {}: {e}", spawn.program);
             log.log(LogLevel::Error, name, &message);
+            drain_queued(rx, key, event_tx, "language server exited");
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message,
@@ -383,10 +405,27 @@ async fn run_server_once(
     );
     let init_result = tokio::select! {
         res = socket.initialize(init) => res,
+        // A server that never answers `initialize` is wedged, not slow: kill it
+        // rather than hold the task hostage forever (see `INIT_GRACE`).
+        _ = tokio::time::sleep(INIT_GRACE) => {
+            mainloop_fut.abort();
+            process.start_kill();
+            let _ = process.wait().await;
+            log.log(LogLevel::Error, name, "server did not answer initialize; killing it");
+            drain_queued(rx, key, event_tx, "language server exited");
+            let _ = event_tx.send(LspEvent::ServerExited {
+                key: key.clone(),
+                message: "server did not answer initialize".to_string(),
+                code: None,
+                signal: None,
+            });
+            return ServerOutcome::Failed;
+        }
         _ = &mut mainloop_fut => {
             process.start_kill();
             let _ = process.wait().await;
             log.log(LogLevel::Error, name, "server exited during initialize");
+            drain_queued(rx, key, event_tx, "language server exited");
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message: "server exited during initialize".to_string(),
@@ -403,6 +442,7 @@ async fn run_server_once(
             process.start_kill();
             let _ = process.wait().await;
             log.log(LogLevel::Error, name, &format!("initialize failed: {e}"));
+            drain_queued(rx, key, event_tx, "language server exited");
             let _ = event_tx.send(LspEvent::ServerExited {
                 key: key.clone(),
                 message: format!("initialize failed: {e}"),
@@ -469,13 +509,28 @@ async fn run_server_once(
                     let _ = socket.emit(ApplyEditDone { id, outcome });
                 }
                 // Explicit shutdown, or the manager dropped our sender: tear down.
+                // The graceful stop is bounded: a wedged server that never answers
+                // `shutdown` must not hang this loop forever (its child is only
+                // reaped by the kill below, which the hang would defer to process
+                // exit) — once the deadline passes it is killed regardless, exactly
+                // as a server that died on its own. A healthy server answers in
+                // milliseconds, well inside the grace.
                 Some(ServerMsg::Shutdown) | None => {
                     log.log(LogLevel::Info, name, "shutting down");
-                    let _ = socket.shutdown(()).await;
-                    let _ = socket.exit(());
+                    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+                        let _ = socket.shutdown(()).await;
+                        let _ = socket.exit(());
+                    })
+                    .await;
                     mainloop_fut.abort();
                     process.start_kill();
                     let _ = process.wait().await;
+                    // Requests that queued behind this shutdown are never going to
+                    // reach a socket: resolve their tokens the same degraded way the
+                    // sync client's `fail_pending` does, so no token is dropped on
+                    // the floor (a Lua `client:request`'s deferred callback is
+                    // settled rather than leaked).
+                    drain_queued(rx, key, event_tx, "language server shut down");
                     return ServerOutcome::Shutdown;
                 }
             },
@@ -486,6 +541,13 @@ async fn run_server_once(
                 process.start_kill();
                 let (code, signal) = process.wait().await;
                 log.log(LogLevel::Warn, name, "language server exited");
+                // Degrade the requests queued behind the dead connection BEFORE the
+                // exit event, so the editor's pending state is settled while the
+                // server is still attached (the sync leg's `exited()` resolves
+                // pending and queued requests the same way, in the same order).
+                // In-flight requests degrade through their detached tasks' socket
+                // errors as usual.
+                drain_queued(rx, key, event_tx, "language server exited");
                 let _ = event_tx.send(LspEvent::ServerExited {
                     key: key.clone(),
                     message: "language server exited".to_string(),
@@ -494,6 +556,76 @@ async fn run_server_once(
                 });
                 return ServerOutcome::Failed;
             }
+        }
+    }
+}
+
+/// Resolve every [`ServerMsg::Request`] still queued in the command channel as
+/// the serve loop exits, with the degraded empty reply its socket would have
+/// produced on a transport error — the native twin of the sync client's
+/// `fail_pending` (`distill(kind, Err(reason))`), so both legs settle a queued
+/// request's [`ReqToken`] the same way and no Lua `client:request` deferred
+/// callback is leaked. `Notify`s and `ApplyEditResponse`s die with the
+/// connection. The queue is drained rather than left to a respawn because a
+/// fresh instance re-handshakes into [`LspEvent::Initialized`], which makes the
+/// editor re-issue its own requests — replaying the old instance's leftovers
+/// would double-issue them.
+fn drain_queued(
+    rx: &mut UnboundedReceiver<ServerMsg>,
+    key: &ServerKey,
+    event_tx: &UnboundedSender<LspEvent>,
+    reason: &str,
+) {
+    while let Ok(msg) = rx.try_recv() {
+        if let ServerMsg::Request(token, req) = msg {
+            let reply = degrade_request(&req, reason);
+            let _ = event_tx.send(LspEvent::Reply {
+                key: key.clone(),
+                token,
+                reply,
+            });
+        }
+    }
+}
+
+/// The degraded reply a queued [`LspRequest`] gets when its server dies before
+/// the serve loop could issue it — exactly the empty case each [`crate::dispatch`]
+/// distiller produces on a transport error, so a reply carries the same shape
+/// whether the request was in flight or merely queued (mirrors the sync client's
+/// `distill(kind, Err(reason))`; the `Raw` variant surfaces the reason string,
+/// which is what settles a Lua `client:request` handler with the error).
+fn degrade_request(req: &LspRequest, reason: &str) -> LspReply {
+    match req {
+        LspRequest::Definition { .. }
+        | LspRequest::Declaration { .. }
+        | LspRequest::TypeDefinition { .. }
+        | LspRequest::Implementation { .. }
+        | LspRequest::References { .. } => LspReply::Locations(Vec::new()),
+        LspRequest::DocumentSymbol { .. } | LspRequest::WorkspaceSymbol { .. } => {
+            LspReply::Symbols(Vec::new())
+        }
+        LspRequest::Hover { .. } => LspReply::Hover(Vec::new()),
+        LspRequest::SignatureHelp { .. } => LspReply::SignatureHelp(None),
+        LspRequest::Completion { .. } => LspReply::Completion {
+            is_incomplete: false,
+            items: Vec::new(),
+        },
+        LspRequest::Formatting { .. } => LspReply::Edits(Vec::new()),
+        LspRequest::Rename { .. } => LspReply::WorkspaceEdit(Default::default()),
+        LspRequest::CodeAction { .. } => LspReply::CodeActions(Vec::new()),
+        LspRequest::ResolveCodeAction { .. } => LspReply::ResolvedCodeAction(None),
+        LspRequest::ResolveCompletion { .. } => LspReply::ResolvedCompletion {
+            documentation: None,
+            detail: None,
+        },
+        LspRequest::SemanticTokensFull { .. } | LspRequest::SemanticTokensDelta { .. } => {
+            LspReply::SemanticTokens(crate::convert::empty_semantic_tokens())
+        }
+        LspRequest::InlayHint { .. } => LspReply::InlayHints(Vec::new()),
+        LspRequest::ResolveInlayHint { .. } => LspReply::ResolvedInlayHint { label: None },
+        LspRequest::FoldingRange { .. } => LspReply::Folds(Vec::new()),
+        LspRequest::Raw { method, .. } => {
+            LspReply::Raw(Err(format!("{reason} before answering {method}")))
         }
     }
 }

@@ -41,15 +41,19 @@ enum Compiled {
 }
 
 /// The next scan offset after a match `[start, end)` — past its end, or one char on
-/// for an empty (zero-width) match so a backward walk can't spin.
+/// for an empty (zero-width) match so a backward walk can't spin. The vim engine is
+/// byte-oriented and can report the empty match on a non-char boundary (e.g. `\zs`
+/// after a look-behind), so round the position up to a boundary before stepping —
+/// `line[end..]` on a mid-char offset would panic.
 fn advance(line: &str, start: usize, end: usize) -> usize {
     if end > start {
         end
     } else {
-        line[end..]
-            .chars()
-            .next()
-            .map_or(end + 1, |c| end + c.len_utf8())
+        let mut at = end;
+        while at < line.len() && !line.is_char_boundary(at) {
+            at += 1;
+        }
+        at + line[at..].chars().next().map_or(1, |c| c.len_utf8())
     }
 }
 
@@ -79,9 +83,9 @@ impl Compiled {
     }
 
     /// The first match whose start is at byte offset `from` or later.
-    fn first_from(&self, line: &str, from: usize) -> Option<LineHit> {
+    fn first_from(&self, line: &str, from: usize) -> mlua::Result<Option<LineHit>> {
         if from > line.len() {
-            return None;
+            return Ok(None);
         }
         // A match can only start on a char boundary, but `from` is a caller-chosen
         // byte offset that may point inside a multi-byte char (e.g. a `:find` init).
@@ -91,7 +95,7 @@ impl Compiled {
         while !line.is_char_boundary(from) {
             from += 1;
         }
-        match self {
+        Ok(match self {
             Compiled::Plain { needle, ignorecase } => {
                 let hay = if *ignorecase {
                     line.to_ascii_lowercase() // ascii-fold preserves byte length → offsets stay valid
@@ -111,19 +115,22 @@ impl Compiled {
             // earlier (pre-`from`) one is still found — walking the non-overlapping
             // match set from offset 0 would skip it (and rescan the prefix for nothing).
             Compiled::Pcre(re) => re.captures_at(line, from).map(|c| pcre_hit(&c)),
+            // An engine-level failure (a NUL byte in the line, a timeout, a failed
+            // NFA→BT fallback) is a loud error, not a "no match" — the same policy
+            // `vim.fn.substitute` applies (vimregex.rs).
             Compiled::Vim { re, ignorecase } => re
                 .exec_line(line, from, *ignorecase)
-                .ok()
-                .flatten()
-                .map(|m| vim_hit(line, &m)),
-        }
+                .map_err(vim_engine_err)?
+                .map(|m| vim_hit(line, &m))
+                .transpose()?,
+        })
     }
 
     /// The last match whose start is strictly before `before` (the whole line when
     /// `before` is `None`).
-    fn last_before(&self, line: &str, before: Option<usize>) -> Option<LineHit> {
+    fn last_before(&self, line: &str, before: Option<usize>) -> mlua::Result<Option<LineHit>> {
         let limit = before.unwrap_or(usize::MAX);
-        match self {
+        Ok(match self {
             Compiled::Plain { needle, ignorecase } => {
                 let hay = if *ignorecase {
                     line.to_ascii_lowercase()
@@ -159,25 +166,28 @@ impl Compiled {
                 let mut from = 0;
                 let mut best: Option<LineHit> = None;
                 while from <= line.len() {
-                    let Some(m) = re.exec_line(line, from, *ignorecase).ok().flatten() else {
+                    let Some(m) = re
+                        .exec_line(line, from, *ignorecase)
+                        .map_err(vim_engine_err)?
+                    else {
                         break;
                     };
                     if m.start >= limit {
                         break;
                     }
                     let next = advance(line, m.start, m.end);
-                    best = Some(vim_hit(line, &m));
+                    best = Some(vim_hit(line, &m)?);
                     from = next;
                 }
                 best
             }
-        }
+        })
     }
 
     /// Every non-overlapping match in `line`, left to right (a zero-width match
     /// advances one char so the walk can't spin). Used by the `btv.regex` object's
     /// `:gmatch` / `:gsub`, which need the whole match set in one pass.
-    fn all(&self, line: &str) -> Vec<LineHit> {
+    fn all(&self, line: &str) -> mlua::Result<Vec<LineHit>> {
         let mut out = Vec::new();
         match self {
             Compiled::Pcre(re) => {
@@ -209,25 +219,28 @@ impl Compiled {
             Compiled::Vim { re, ignorecase } => {
                 let mut from = 0;
                 while from <= line.len() {
-                    let Some(m) = re.exec_line(line, from, *ignorecase).ok().flatten() else {
+                    let Some(m) = re
+                        .exec_line(line, from, *ignorecase)
+                        .map_err(vim_engine_err)?
+                    else {
                         break;
                     };
                     let next = advance(line, m.start, m.end);
-                    out.push(vim_hit(line, &m));
+                    out.push(vim_hit(line, &m)?);
                     from = next;
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Whether `line` matches anywhere (cheaper than [`Compiled::first_from`] for
     /// pcre, which can answer without building captures).
-    fn is_match(&self, line: &str) -> bool {
-        match self {
+    fn is_match(&self, line: &str) -> mlua::Result<bool> {
+        Ok(match self {
             Compiled::Pcre(re) => re.is_match(line),
-            _ => self.first_from(line, 0).is_some(),
-        }
+            _ => self.first_from(line, 0)?.is_some(),
+        })
     }
 }
 
@@ -246,23 +259,31 @@ fn pcre_hit(c: &regex::Captures) -> LineHit {
 }
 
 /// Captures `\1`.. from a vim match, trimmed to the highest participating group.
-fn vim_hit(line: &str, m: &bemtvi_regex::LineMatch) -> LineHit {
+/// Each submatch range goes through [`slice`] — the engine never clamps a
+/// submatch the way it clamps group 0, so `\zs`/`\ze`/look-around can hand back a
+/// backward or off-char-boundary range (the vimregex.rs `safe_slice` precedent).
+fn vim_hit(line: &str, m: &bemtvi_regex::LineMatch) -> mlua::Result<LineHit> {
     let highest = (1..m.submatches.len())
         .rev()
         .find(|&i| m.submatches[i].is_some())
         .unwrap_or(0);
     let captures = (1..=highest)
-        .map(|i| {
-            m.submatches[i]
-                .map(|(s, e)| line[s..e].to_string())
-                .unwrap_or_default()
+        .map(|i| match m.submatches[i] {
+            Some((s, e)) => Ok(slice(line, s, e)?.to_string()),
+            None => Ok(String::new()),
         })
-        .collect();
-    LineHit {
+        .collect::<mlua::Result<Vec<_>>>()?;
+    Ok(LineHit {
         start: m.start,
         end: m.end,
         captures,
-    }
+    })
+}
+
+/// An engine-level failure from `VimRegex::exec_line` as a Lua error (matching
+/// the `vim.fn.substitute` policy) rather than a silent "no match".
+fn vim_engine_err(e: bemtvi_regex::VimRegexError) -> mlua::Error {
+    mlua::Error::runtime(format!("btv.regex: vim engine: {e}"))
 }
 
 /// `btv._buf_search(lines, pattern, opts)` — see the module header. `lines` is the
@@ -307,7 +328,7 @@ pub fn buf_search(lua: &Lua, lines: Table, pattern: String, opts: Table) -> mlua
             } else {
                 None
             };
-            if let Some(hit) = compiled.last_before(line, before) {
+            if let Some(hit) = compiled.last_before(line, before)? {
                 return make_match(lua, i, line, &hit);
             }
         }
@@ -321,7 +342,7 @@ pub fn buf_search(lua: &Lua, lines: Table, pattern: String, opts: Table) -> mlua
             } else {
                 0
             };
-            if let Some(hit) = compiled.first_from(line, from) {
+            if let Some(hit) = compiled.first_from(line, from)? {
                 return make_match(lua, i, line, &hit);
             }
         }
@@ -337,7 +358,7 @@ fn make_match(lua: &Lua, line_no: usize, line: &str, hit: &LineHit) -> mlua::Res
     t.set("col", hit.start)?;
     t.set("end_line", line_no)?;
     t.set("end_col", hit.end)?;
-    t.set("text", &line[hit.start..hit.end])?;
+    t.set("text", slice(line, hit.start, hit.end)?)?;
     t.set(
         "captures",
         // Borrow each capture as `&str` — mlua copies the bytes into the Lua string
@@ -406,7 +427,7 @@ impl UserData for BtvRegex {
             |lua, this, (text, init): (mlua::LuaString, Option<i64>)| {
                 let s = text.to_str()?;
                 let from = norm_init(init, s.len());
-                let Some(hit) = this.re.first_from(&s, from) else {
+                let Some(hit) = this.re.first_from(&s, from)? else {
                     // No match -> a single nil, like string.find.
                     return Ok(Variadic::from_iter([Value::Nil]));
                 };
@@ -428,7 +449,7 @@ impl UserData for BtvRegex {
             |lua, this, (text, init): (mlua::LuaString, Option<i64>)| {
                 let s = text.to_str()?;
                 let from = norm_init(init, s.len());
-                let Some(hit) = this.re.first_from(&s, from) else {
+                let Some(hit) = this.re.first_from(&s, from)? else {
                     // No match -> a single nil, like string.match.
                     return Ok(Variadic::from_iter([Value::Nil]));
                 };
@@ -451,7 +472,7 @@ impl UserData for BtvRegex {
         methods.add_method("gmatch", |lua, this, text: mlua::LuaString| {
             let s = text.to_str()?;
             let mut items: Vec<Vec<String>> = Vec::new();
-            for hit in this.re.all(&s) {
+            for hit in this.re.all(&s)? {
                 if hit.captures.is_empty() {
                     items.push(vec![slice(&s, hit.start, hit.end)?.to_string()]);
                 } else {
@@ -484,7 +505,7 @@ impl UserData for BtvRegex {
                 let mut out = String::new();
                 let mut last = 0usize;
                 let mut count = 0usize;
-                for hit in this.re.all(&s) {
+                for hit in this.re.all(&s)? {
                     if max.is_some_and(|m| count >= m) {
                         break;
                     }
@@ -504,7 +525,7 @@ impl UserData for BtvRegex {
 
         // `re:test(s)` -> bool: does the pattern match anywhere.
         methods.add_method("test", |_, this, text: mlua::LuaString| {
-            Ok(this.re.is_match(&text.to_str()?))
+            this.re.is_match(&text.to_str()?)
         });
     }
 }

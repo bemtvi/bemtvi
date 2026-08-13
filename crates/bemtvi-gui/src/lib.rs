@@ -188,6 +188,7 @@ impl GuiConfig {
 // preview it can't read off local disk; the IO thread fulfils it with
 // `bemtvi_image_read` and posts the bytes back as [`UserEvent::ImageBytes`]. The
 // request type itself is the shared client model's (`bemtvi_view::images`).
+pub(crate) use bemtvi_view::images::DecodeReq;
 pub(crate) use bemtvi_view::images::ImageFetch;
 
 /// A request from the App to bring up a **new** session, swapping the live one. Built off
@@ -210,6 +211,13 @@ pub enum UserEvent {
         path: String,
         version: (u64, u64),
         result: Result<Vec<u8>, String>,
+    },
+    /// An off-thread preview decode's outcome (or failure), to hand to the image
+    /// store and repaint. Carries the version the decode was requested at.
+    ImageDecoded {
+        path: String,
+        version: (u64, u64),
+        decoded: Option<image::DynamicImage>,
     },
     /// A `:connect` brought up a new (daemon or local) session: swap the App's live
     /// RPC handle to it, mark whether it is remote, and re-attach the UI.
@@ -283,6 +291,12 @@ pub fn run(
     // fulfils each over `bemtvi_image_read` on the *current* session and posts the bytes
     // back as `UserEvent::ImageBytes`.
     let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<ImageFetch>();
+    // Preview decodes, the same shape: the (synchronous) paint can only enqueue a
+    // decode request — local previews carry just the path, remote ones their fetched
+    // bytes — and the IO thread runs the disk read + full-res decode on a blocking
+    // task, never on the UI thread, posting the outcome back as
+    // `UserEvent::ImageDecoded`.
+    let (decode_tx, mut decode_rx) = tokio::sync::mpsc::unbounded_channel::<DecodeReq>();
     let initial_remote = initial.remote;
 
     let io = std::thread::spawn(move || {
@@ -471,6 +485,22 @@ pub fn run(
                                 });
                             });
                         },
+                        // A preview needs decoding: run the disk read + full-res decode
+                        // on a blocking task (a slow disk or a huge image must never
+                        // stall repaints) and post the outcome back as
+                        // `UserEvent::ImageDecoded`.
+                        decode = decode_rx.recv() => if let Some(req) = decode {
+                            let proxy = proxy.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let (path, version, decoded) =
+                                    req.decode(bemtvi_view::images::MAX_EDGE);
+                                let _ = proxy.send_event(UserEvent::ImageDecoded {
+                                    path,
+                                    version,
+                                    decoded,
+                                });
+                            });
+                        },
                         // The UI exited: stop, so dropping the runtime below closes the
                         // connection and the server winds down.
                         _ = io_shutdown.notified() => break 'session,
@@ -522,6 +552,7 @@ pub fn run(
         initial_remote,
         reconnect_tx,
         fetch_tx,
+        decode_tx,
     );
     let run_result = event_loop.run_app(&mut app);
 
@@ -639,6 +670,10 @@ struct App {
     /// the editor RPC (a daemon session's image files aren't on local disk). The IO
     /// thread drains it and posts replies back as [`UserEvent::ImageBytes`].
     fetch_tx: tokio::sync::mpsc::UnboundedSender<ImageFetch>,
+    /// Handed to the renderer's image store so it can off-load preview decodes (a
+    /// disk read + full-res decode must not block repaints). The IO thread drains
+    /// it and posts outcomes back as [`UserEvent::ImageDecoded`].
+    decode_tx: tokio::sync::mpsc::UnboundedSender<DecodeReq>,
 }
 
 impl App {
@@ -649,6 +684,7 @@ impl App {
         remote: bool,
         reconnect: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
         fetch_tx: tokio::sync::mpsc::UnboundedSender<ImageFetch>,
+        decode_tx: tokio::sync::mpsc::UnboundedSender<DecodeReq>,
     ) -> Self {
         Self {
             rpc,
@@ -673,6 +709,7 @@ impl App {
             remote,
             reconnect,
             fetch_tx,
+            decode_tx,
         }
     }
 
@@ -872,9 +909,6 @@ impl App {
         let Some((col, row)) = self.pointer_cell() else {
             return;
         };
-        if self.renderer.is_none() {
-            return;
-        }
         self.mouse_down = true;
         self.last_drag_cell = Some((col, row));
 
@@ -1148,7 +1182,12 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        match Renderer::new(window.clone(), &self.config, self.fetch_tx.clone()) {
+        match Renderer::new(
+            window.clone(),
+            &self.config,
+            self.fetch_tx.clone(),
+            self.decode_tx.clone(),
+        ) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
                 eprintln!("bemtvi-gui: failed to init renderer: {e}");
@@ -1200,6 +1239,21 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 if let Some(r) = self.renderer.as_mut() {
                     r.deliver_image(path, version, result);
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
+            }
+            // An off-paint decode finished (or failed): hand the outcome to the image
+            // store — which drops it if a newer version superseded it — and repaint,
+            // so the picture replaces its loading placeholder.
+            UserEvent::ImageDecoded {
+                path,
+                version,
+                decoded,
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.deliver_image_decode(path, version, decoded);
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }

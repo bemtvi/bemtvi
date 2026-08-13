@@ -321,6 +321,13 @@ btv._o_known = btv._o_known
     for k in pairs(btv._o_store) do
       known[k] = true
     end
+    -- The runtimepath family is modeled by the `btv.opt` machinery (`OPT_RTP`): a
+    -- `vim.opt.rtp:append(...)` write is expected and seeds package.path, so it must
+    -- store silently like the seeds — the "unknown option 'rtp'" warning would tell a
+    -- user the exactly-documented pattern is a typo.
+    for _, k in ipairs({ "runtimepath", "rtp", "packpath", "pp" }) do
+      known[k] = true
+    end
     return known
   end)()
 
@@ -1640,13 +1647,20 @@ btv._cur_cmdtype = btv._cur_cmdtype or ""
 btv._bo_store = btv._bo_store or {}
 -- Rust→Lua mirror of the core's buffer-local option values, refreshed by the
 -- server (`btv._set_bo_mirror`) before any Lua that can read options. Keyed by
--- bufnr → { tabstop, shiftwidth, expandtab }. Authoritative for the wired
--- options, so a read reflects the core default until set and a value set through
--- the `:set` ex path, not just one written from Lua.
+-- bufnr → row. Authoritative for the wired options, so a read reflects the core
+-- default until set and a value set through the `:set` ex path, not just one
+-- written from Lua. The server pushes only the rows that moved since the last
+-- refresh (an option change or a buffer edit) plus the bufnrs to drop (deleted
+-- buffers), so an untouched push costs nothing.
 btv._bo_mirror = btv._bo_mirror or {}
 
-function btv._set_bo_mirror(entries)
-  btv._bo_mirror = entries or {}
+function btv._set_bo_mirror(entries, removed)
+  for bufnr, row in pairs(entries or {}) do
+    btv._bo_mirror[bufnr] = row
+  end
+  for _, bufnr in ipairs(removed or {}) do
+    btv._bo_mirror[bufnr] = nil
+  end
 end
 
 -- Rust→Lua mirror of the GLOBAL values of the buffer-local options (the tier a newly
@@ -1927,6 +1941,14 @@ function btv._set_buf_mirror(entries, row, col, win, wins, cur_wins, next_win, m
   -- will get, so it can return synchronously.
   local by_id, order = {}, {}
   for _, w in ipairs(wins or {}) do
+    local prev = btv._wins[w.id]
+    -- The jumplist is gated on its generation: the server omits `jumps` unless
+    -- the list moved since the last push, and an unchanged row carries the old
+    -- list over — a repaint never re-serializes a whole jumplist (`jump_idx` is
+    -- always fresh).
+    if prev and w.jump_gen == prev.jump_gen then
+      w.jumps = prev.jumps
+    end
     by_id[w.id] = w
     order[#order + 1] = w.id
   end

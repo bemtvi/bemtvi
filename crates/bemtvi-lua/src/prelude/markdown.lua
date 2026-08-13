@@ -14,7 +14,7 @@ btv.markdown = btv.markdown or {}
 --
 -- Parse `src` (CommonMark + GFM: tables, strikethrough, task lists) into stripped
 -- display lines with the markup syntax removed (`**bold**` -> `bold`, `# Title` ->
--- `Title`, ` ``` ` fences dropped, `- x` -> `• x`, `> q` -> `▎ q`, `- [ ]` -> `☐`),
+-- `Title`, ```` ``` ```` fences dropped, `- x` -> `• x`, `> q` -> `▎ q`, `- [ ]` -> `☐`),
 -- plus the styling to paint over them. Each highlight is a table:
 --
 -- ```
@@ -35,7 +35,7 @@ btv.markdown = btv.markdown or {}
 --
 -- `code` are the fenced code blocks, each
 -- `{ first_line = <1-based>, last_line = <1-based, inclusive>, lang = "<fence language>"? }`
--- — `lang` is absent for a bare ` ``` ` fence. Use it to back a block as a code region
+-- — `lang` is absent for a bare ```` ``` ```` fence. Use it to back a block as a code region
 -- (set `line_hl_group = "@markup.raw.block"` on `first_line..last_line` — the doc-float
 -- look) or to syntax-highlight its body in `lang`.
 --
@@ -62,7 +62,7 @@ end
 --   * Prose is *rendered*: the stripped lines, styled with `render`'s `@markup.*` spans
 --     (as ranged `hl_group` extmarks in byte columns).
 --   * Thematic breaks / table separators become a full-line rule glyph.
---   * Fenced code blocks are LEFT as raw ` ``` ` fences (so tree-sitter can highlight
+--   * Fenced code blocks are LEFT as raw ```` ``` ```` fences (so tree-sitter can highlight
 --     them — see below), backed with a full-width `line_hl_group` code background, and
 --     their fence delimiter lines are hidden behind a blanking `virt_text` overlay so the
 --     block reads as rendered.

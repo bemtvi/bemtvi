@@ -229,7 +229,9 @@ local function do_fetch(who, bridge, url, opts)
         resolve(setmetatable(response, Response))
       end
     end
-    bridge(id, u, method, headers, body, timeout, redirect, max_redirects)
+    btv._bridge(id, function()
+      bridge(id, u, method, headers, body, timeout, redirect, max_redirects)
+    end)
   end)
 end
 

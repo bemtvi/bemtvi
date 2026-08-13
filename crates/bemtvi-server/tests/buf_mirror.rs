@@ -285,3 +285,116 @@ async fn typing_in_a_large_buffer_does_not_scale_with_the_buffer() {
         format!("{}line 9999 with some text", "z".repeat(300))
     );
 }
+
+// ------------------------------------------------- reloads and the mirror's gate
+//
+// The mirror is gated per buffer on `changedtick`: an unchanged buffer is not
+// re-pushed. A reload (`:e!`, an autoread `:checktime`, a deferred read landing)
+// swaps in a freshly-read `Buffer` — whose `changedtick` starts at 0, which
+// `mark_resync` then bumps to exactly 1. That collides with a previously-recorded
+// tick of 1 (one edit since the last push), so the gate concluded "nothing moved"
+// and the mirror kept serving the PRE-reload text forever. The reload now carries
+// the old counter across, keeping it monotonic per bufnr the way neovim does.
+//
+// The trap is the *exact* tick: a buffer edited twice before the reload lands on 2
+// and the collision doesn't happen, so these tests edit exactly once.
+
+#[tokio::test]
+async fn a_discard_reload_refreshes_the_mirror_after_a_single_edit() {
+    let path = bemtvi_test_harness::write_temp("mirror_ereload", "txt", "alpha\nbeta\n");
+    let (rpc, _i) = bemtvi_test_harness::start_attached(
+        bemtvi_server::ServerInit {
+            file: Some(path.clone()),
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+    push_every_key(&rpc).await;
+
+    // Exactly ONE edit, so the reload's restarted counter would land on the same
+    // tick the mirror last recorded.
+    feed(&rpc, "x");
+    let _ = lines(&rpc).await;
+    assert_eq!(mirror(&rpc).await, vec!["lpha", "beta"]);
+
+    command(&rpc, "edit!").await;
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta"],
+        "the core reloaded from disk"
+    );
+    assert_eq!(
+        mirror(&rpc).await,
+        vec!["alpha", "beta"],
+        "the mirror must follow the reload — a colliding changedtick used to leave \
+         btv._bufs serving the pre-reload text",
+    );
+}
+
+#[tokio::test]
+async fn a_reload_onto_different_content_refreshes_the_mirror() {
+    // The same collision, but the file changed underneath: the stale mirror would
+    // report the edited buffer rather than what `:e!` actually loaded.
+    let path = bemtvi_test_harness::write_temp("mirror_ereload2", "txt", "one\ntwo\n");
+    let (rpc, _i) = bemtvi_test_harness::start_attached(
+        bemtvi_server::ServerInit {
+            file: Some(path.clone()),
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+    push_every_key(&rpc).await;
+
+    feed(&rpc, "x");
+    let _ = lines(&rpc).await;
+    std::fs::write(&path, "ONE\nTWO\nTHREE\n").expect("rewrite the file");
+
+    command(&rpc, "edit!").await;
+    let _ = lines(&rpc).await;
+    assert_eq!(lines(&rpc).await, vec!["ONE", "TWO", "THREE"]);
+    assert_eq!(
+        mirror(&rpc).await,
+        vec!["ONE", "TWO", "THREE"],
+        "the mirror must show the reloaded file, not the pre-reload buffer",
+    );
+}
+
+#[tokio::test]
+async fn changedtick_never_goes_backwards_across_a_reload() {
+    // The invariant behind the fix: `b:changedtick` is monotonic per bufnr, as in
+    // neovim. A reload that restarted it at 0 is what let the gate collide.
+    let path = bemtvi_test_harness::write_temp("mirror_tick", "txt", "alpha\n");
+    let (rpc, _i) = bemtvi_test_harness::start_attached(
+        bemtvi_server::ServerInit {
+            file: Some(path),
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+    // Several edits, so the pre-reload counter is comfortably above where a fresh
+    // read would restart it — one edit lands on the same tick either way and would
+    // make this pass for the wrong reason.
+    feed(&rpc, "xxx");
+    let _ = lines(&rpc).await;
+    let before = match exec_lua(&rpc, "return btv.buf.changedtick(0)").await {
+        Value::Integer(n) => n.as_i64().unwrap_or(-1),
+        other => panic!("changedtick: {other:?}"),
+    };
+    command(&rpc, "edit!").await;
+    let _ = lines(&rpc).await;
+    let after = match exec_lua(&rpc, "return btv.buf.changedtick(0)").await {
+        Value::Integer(n) => n.as_i64().unwrap_or(-1),
+        other => panic!("changedtick: {other:?}"),
+    };
+    assert!(
+        after >= before,
+        "changedtick went backwards across a reload ({before} -> {after})",
+    );
+}

@@ -52,18 +52,33 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("luafs_op: op '{op}' missing string field '{key}'"))
     };
-    let bool_field = |key: &str| get(key).and_then(Value::as_bool).unwrap_or(false);
-    // Unix permission bits for `mkdir`; default 0o755 when absent (older peers).
-    let u32_field = |key: &str, default: u32| {
-        get(key)
-            .and_then(Value::as_u64)
-            .map(|n| n as u32)
-            .unwrap_or(default)
+    // ABSENT fields keep their defaults (an older peer never sends them); a
+    // present-but-wrong-typed field is a malformed request and fails loud — a
+    // `recursive = true` must not silently become a non-recursive remove.
+    let bool_field = |key: &str| -> Result<bool, String> {
+        match get(key) {
+            None => Ok(false),
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| format!("luafs_op: op '{op}' field '{key}' is not a bool")),
+        }
     };
+    // Unix permission bits for `mkdir`; default 0o755 when absent (older peers).
+    let u32_field =
+        |key: &str, default: u32| -> Result<u32, String> {
+            match get(key) {
+                None => Ok(default),
+                Some(v) => u32::try_from(v.as_u64().ok_or_else(|| {
+                    format!("luafs_op: op '{op}' field '{key}' is not an integer")
+                })?)
+                .map_err(|_| format!("luafs_op: op '{op}' field '{key}' exceeds the u32 range")),
+            }
+        };
     let bytes_field = |key: &str| -> Result<Vec<u8>, String> {
-        get(key)
-            .map(value_to_bytes)
-            .ok_or_else(|| format!("luafs_op: op '{op}' missing bytes field '{key}'"))
+        match get(key) {
+            None => Err(format!("luafs_op: op '{op}' missing bytes field '{key}'")),
+            Some(v) => value_to_bytes(v),
+        }
     };
     Ok(match op {
         "stat" => FsJob::Stat {
@@ -84,10 +99,14 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
         "read_text" => FsJob::ReadText {
             path: str_field("path")?,
             // The wrapper always sends an explicit encoding; default to UTF-8 if absent.
-            encoding: get("encoding")
-                .and_then(Value::as_str)
-                .unwrap_or("utf-8")
-                .to_string(),
+            encoding: match get("encoding") {
+                // The wrapper always sends an explicit encoding; default to UTF-8 if absent.
+                None => "utf-8".to_string(),
+                Some(v) => v
+                    .as_str()
+                    .ok_or_else(|| format!("luafs_op: op '{op}' field 'encoding' is not a string"))?
+                    .to_string(),
+            },
         },
         "write" => FsJob::Write {
             path: str_field("path")?,
@@ -99,8 +118,8 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
         },
         "mkdir" => FsJob::Mkdir {
             path: str_field("path")?,
-            recursive: bool_field("recursive"),
-            mode: u32_field("mode", 0o755),
+            recursive: bool_field("recursive")?,
+            mode: u32_field("mode", 0o755)?,
         },
         "rename" => FsJob::Rename {
             from: str_field("from")?,
@@ -108,12 +127,12 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
         },
         "remove" => FsJob::Remove {
             path: str_field("path")?,
-            recursive: bool_field("recursive"),
+            recursive: bool_field("recursive")?,
         },
         "copy" => FsJob::Copy {
             src: str_field("src")?,
             dst: str_field("dst")?,
-            recursive: bool_field("recursive"),
+            recursive: bool_field("recursive")?,
         },
         "realpath" => FsJob::Realpath {
             path: str_field("path")?,
@@ -293,20 +312,30 @@ fn fs_value_from_value(v: &Value) -> Result<FsValue, FsError> {
     let payload = arr.get(1);
     Ok(match tag {
         "nil" => FsValue::Nil,
-        "bool" => FsValue::Bool(payload.and_then(Value::as_bool).unwrap_or(false)),
-        "bytes" => FsValue::Bytes(payload.map(value_to_bytes).unwrap_or_default()),
+        // A present-but-wrong-typed payload is a malformed reply, never a silent
+        // default — a mangled `read` body must not resolve as a 0-byte success.
+        "bool" => FsValue::Bool(
+            payload
+                .ok_or_else(|| wire_error("bool value has no payload"))?
+                .as_bool()
+                .ok_or_else(|| wire_error("bool payload is not a bool"))?,
+        ),
+        "bytes" => FsValue::Bytes(
+            value_to_bytes(payload.ok_or_else(|| wire_error("bytes value has no payload"))?)
+                .map_err(|e| wire_error(&e))?,
+        ),
         "text" => FsValue::Text(
             payload
-                .and_then(Value::as_str)
-                .unwrap_or_default()
+                .ok_or_else(|| wire_error("text value has no payload"))?
+                .as_str()
+                .ok_or_else(|| wire_error("text payload is not a string"))?
                 .to_string(),
         ),
         "stat" => FsValue::Stat(
-            payload
-                .and_then(decode_stat)
-                .ok_or_else(|| wire_error("malformed stat payload"))?,
+            decode_stat(payload.ok_or_else(|| wire_error("stat value has no payload"))?)
+                .map_err(|e| wire_error(&e))?,
         ),
-        "dir" => FsValue::Dir(decode_dir(payload)),
+        "dir" => FsValue::Dir(decode_dir(payload).map_err(|e| wire_error(&e))?),
         other => return Err(wire_error(&format!("unknown fs value tag '{other}'"))),
     })
 }
@@ -336,48 +365,88 @@ fn encode_stat(st: &LuaStat) -> Value {
     ])
 }
 
-/// Decode a positional [`LuaStat`] array (the inverse of [`encode_stat`]). `None` on a
-/// shape too short to read the kind.
-fn decode_stat(v: &Value) -> Option<LuaStat> {
-    let a = v.as_array()?;
-    let kind = FileKind::from_wire(a.first()?.as_str()?);
-    let u64_at = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0);
-    let u32_at = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
-    let opt_time = |si: usize, ni: usize| -> Option<(i64, u32)> {
-        a.get(si)
-            .and_then(Value::as_i64)
-            .map(|s| (s, a.get(ni).and_then(Value::as_u64).unwrap_or(0) as u32))
+/// Decode a positional [`LuaStat`] array (the inverse of [`encode_stat`]).
+fn decode_stat(v: &Value) -> Result<LuaStat, String> {
+    let a = v
+        .as_array()
+        .ok_or_else(|| "stat payload is not an array".to_string())?;
+    // Every field our encoder always emits is required; a short or wrong-typed row is
+    // malformed, not zeroed metadata (a truncated stat must not silently report
+    // size 0 / mode 0).
+    let n = |i: usize| -> Result<u64, String> {
+        a.get(i)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("stat field {i} is missing or not an integer"))
     };
-    Some(LuaStat {
+    let u32_at = |i: usize| -> Result<u32, String> {
+        u32::try_from(n(i)?).map_err(|_| format!("stat field {i} exceeds the u32 range"))
+    };
+    let kind = FileKind::from_wire(
+        a.first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| "stat has no kind string".to_string())?,
+    )?;
+    let opt_time = |si: usize, ni: usize| -> Result<Option<(i64, u32)>, String> {
+        // Absent is encoded as `Value::Nil` at the seconds slot (see `encode_stat`).
+        match a.get(si) {
+            None | Some(Value::Nil) => Ok(None),
+            Some(v) => {
+                let secs = v
+                    .as_i64()
+                    .ok_or_else(|| format!("stat field {si} is not an integer"))?;
+                let nsecs = a
+                    .get(ni)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("stat field {ni} is missing or not an integer"))?;
+                Ok(Some((
+                    secs,
+                    u32::try_from(nsecs)
+                        .map_err(|_| format!("stat field {ni} exceeds the u32 range"))?,
+                )))
+            }
+        }
+    };
+    Ok(LuaStat {
         kind,
-        size: u64_at(1),
-        mode: u32_at(2),
-        mtime: opt_time(3, 4),
-        atime: opt_time(5, 6),
-        ino: u64_at(7),
-        uid: u32_at(8),
-        gid: u32_at(9),
-        nlink: u64_at(10),
-        dev: u64_at(11),
+        size: n(1)?,
+        mode: u32_at(2)?,
+        mtime: opt_time(3, 4)?,
+        atime: opt_time(5, 6)?,
+        ino: n(7)?,
+        uid: u32_at(8)?,
+        gid: u32_at(9)?,
+        nlink: n(10)?,
+        dev: n(11)?,
     })
 }
 
-/// Decode the `[[kind, name], …]` directory listing (skipping any malformed row rather
-/// than failing the whole listing).
-fn decode_dir(v: Option<&Value>) -> Vec<LuaDirEntry> {
-    v.and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let e = row.as_array()?;
-                    Some(LuaDirEntry {
-                        kind: FileKind::from_wire(e.first()?.as_str().unwrap_or("file")),
-                        name: e.get(1)?.as_str()?.to_string(),
-                    })
-                })
-                .collect()
+/// Decode the `[[kind, name], …]` directory listing. Strict: a malformed row is a
+/// first-party wire bug and fails the whole decode — this side reads bytes a peer we
+/// own encoded (see the module doc header), unlike the fs layer, which tolerates a
+/// per-entry `file_type()` failure as an external/transient error (`luafs::scandir`).
+fn decode_dir(v: Option<&Value>) -> Result<Vec<LuaDirEntry>, String> {
+    let rows = v
+        .ok_or_else(|| "dir value has no payload".to_string())?
+        .as_array()
+        .ok_or_else(|| "dir payload is not an array".to_string())?;
+    rows.iter()
+        .map(|row| {
+            let e = row
+                .as_array()
+                .ok_or_else(|| "dir row is not an array".to_string())?;
+            let kind = e
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| "dir row has no kind string".to_string())
+                .and_then(FileKind::from_wire)?;
+            let name = e
+                .get(1)
+                .and_then(Value::as_str)
+                .ok_or_else(|| "dir row has no name string".to_string())?
+                .to_string();
+            Ok(LuaDirEntry { kind, name })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Look up `key` in a `Value::Map` keyed by string (the request map). `None` if `v` isn't
@@ -391,15 +460,22 @@ fn map_get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 
 /// Bytes out of a wire value: a msgpack `bin` (the faithful form), or — defensively — an
 /// array of integers (the JSON-byte-array form a transport might send) or a string.
-fn value_to_bytes(v: &Value) -> Vec<u8> {
+/// Any other shape is a malformed wire, not empty bytes — a `write` whose `data`
+/// arrived as an integer must not silently write an empty file.
+fn value_to_bytes(v: &Value) -> Result<Vec<u8>, String> {
     match v {
-        Value::Binary(b) => b.clone(),
-        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Binary(b) => Ok(b.clone()),
+        Value::String(s) => Ok(s.as_bytes().to_vec()),
         Value::Array(items) => items
             .iter()
-            .map(|n| n.as_u64().unwrap_or(0) as u8)
+            .map(|n| {
+                let b = n
+                    .as_u64()
+                    .ok_or_else(|| "byte-array element is not an integer".to_string())?;
+                u8::try_from(b).map_err(|_| "byte-array element exceeds the u8 range".to_string())
+            })
             .collect(),
-        _ => Vec::new(),
+        other => Err(format!("expected a byte string, got {other:?}")),
     }
 }
 

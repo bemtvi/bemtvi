@@ -510,13 +510,15 @@ async fn issue_dyn_request(
     result
 }
 
-/// Generate the request dispatch table: one `Request` impl per `method => Type`
+/// Generate the request dispatch table: one `Request` impl per `(method, Type)`
 /// row (raw JSON params/result) and the runtime `match` that issues it. Standard
 /// LSP methods and server-specific ones (`rust-analyzer/*`, clangd's
 /// `switchSourceHeader`, …) live side by side — they only differ by the method
-/// string. Add a method by adding a row.
+/// string. The rows come from the single whitelist [`lsp_dyn_request_rows!`]
+/// (protocol.rs), which also feeds the sync wasm client's pre-flight check — a
+/// method is supported on both legs or neither.
 macro_rules! dyn_requests {
-    ($($method:literal => $ty:ident),* $(,)?) => {
+    ($(($method:literal, $ty:ident)),* $(,)?) => {
         $(
             #[allow(non_camel_case_types)]
             enum $ty {}
@@ -535,7 +537,7 @@ macro_rules! dyn_requests {
                 $( $method => sock.request::<$ty>(params).await.map_err(|e| e.to_string()), )*
                 other => Err(format!(
                     "bemtvi: client:request: unsupported method '{other}' \
-                     (add it to dyn_requests! in bemtvi-lsp/src/dispatch.rs)"
+                     (add a row to lsp_dyn_request_rows! in bemtvi-lsp/src/protocol.rs)"
                 )),
             }
         }
@@ -545,7 +547,7 @@ macro_rules! dyn_requests {
 /// Generate the notification dispatch table — the fire-and-forget twin of
 /// [`dyn_requests!`].
 macro_rules! dyn_notifications {
-    ($($method:literal => $ty:ident),* $(,)?) => {
+    ($(($method:literal, $ty:ident)),* $(,)?) => {
         $(
             #[allow(non_camel_case_types)]
             enum $ty {}
@@ -575,79 +577,13 @@ macro_rules! dyn_notifications {
     };
 }
 
-// The supported generic-request methods. Every standard LSP request the editor
-// doesn't already drive through a typed [`LspRequest`], plus the server-specific
-// methods the headline configs reach for via `client:request`. All are relayed
-// as raw JSON, so a row is just `"<method>" => <unique-type-name>`.
-dyn_requests! {
-    "workspace/executeCommand" => req_workspace_executeCommand,
-    "workspace/symbol" => req_workspace_symbol,
-    "workspaceSymbol/resolve" => req_workspaceSymbol_resolve,
-    "workspace/willCreateFiles" => req_workspace_willCreateFiles,
-    "workspace/willRenameFiles" => req_workspace_willRenameFiles,
-    "workspace/willDeleteFiles" => req_workspace_willDeleteFiles,
-    "textDocument/documentSymbol" => req_textDocument_documentSymbol,
-    "textDocument/documentHighlight" => req_textDocument_documentHighlight,
-    "textDocument/documentLink" => req_textDocument_documentLink,
-    "documentLink/resolve" => req_documentLink_resolve,
-    "textDocument/foldingRange" => req_textDocument_foldingRange,
-    "textDocument/selectionRange" => req_textDocument_selectionRange,
-    "textDocument/prepareCallHierarchy" => req_textDocument_prepareCallHierarchy,
-    "callHierarchy/incomingCalls" => req_callHierarchy_incomingCalls,
-    "callHierarchy/outgoingCalls" => req_callHierarchy_outgoingCalls,
-    "textDocument/prepareTypeHierarchy" => req_textDocument_prepareTypeHierarchy,
-    "typeHierarchy/supertypes" => req_typeHierarchy_supertypes,
-    "typeHierarchy/subtypes" => req_typeHierarchy_subtypes,
-    "textDocument/semanticTokens/full" => req_textDocument_semanticTokens_full,
-    "textDocument/semanticTokens/full/delta" => req_textDocument_semanticTokens_full_delta,
-    "textDocument/semanticTokens/range" => req_textDocument_semanticTokens_range,
-    "textDocument/inlayHint" => req_textDocument_inlayHint,
-    "inlayHint/resolve" => req_inlayHint_resolve,
-    "textDocument/codeLens" => req_textDocument_codeLens,
-    "codeLens/resolve" => req_codeLens_resolve,
-    "textDocument/documentColor" => req_textDocument_documentColor,
-    "textDocument/colorPresentation" => req_textDocument_colorPresentation,
-    "textDocument/linkedEditingRange" => req_textDocument_linkedEditingRange,
-    "textDocument/moniker" => req_textDocument_moniker,
-    "textDocument/prepareRename" => req_textDocument_prepareRename,
-    "textDocument/rangeFormatting" => req_textDocument_rangeFormatting,
-    "textDocument/onTypeFormatting" => req_textDocument_onTypeFormatting,
-    "completionItem/resolve" => req_completionItem_resolve,
-    // The typed native features are also reachable generically, for a config that
-    // routes them through `client:request` (e.g. a custom `handlers` entry).
-    "textDocument/definition" => req_textDocument_definition,
-    "textDocument/declaration" => req_textDocument_declaration,
-    "textDocument/typeDefinition" => req_textDocument_typeDefinition,
-    "textDocument/implementation" => req_textDocument_implementation,
-    "textDocument/references" => req_textDocument_references,
-    "textDocument/hover" => req_textDocument_hover,
-    "textDocument/signatureHelp" => req_textDocument_signatureHelp,
-    "textDocument/completion" => req_textDocument_completion,
-    "textDocument/formatting" => req_textDocument_formatting,
-    "textDocument/rename" => req_textDocument_rename,
-    "textDocument/codeAction" => req_textDocument_codeAction,
-    "codeAction/resolve" => req_codeAction_resolve,
-    // Server-specific methods the headline configs drive via `client:request`.
-    "rust-analyzer/reloadWorkspace" => req_rustAnalyzer_reloadWorkspace,
-    "rust-analyzer/expandMacro" => req_rustAnalyzer_expandMacro,
-    "rust-analyzer/analyzerStatus" => req_rustAnalyzer_analyzerStatus,
-    "rust-analyzer/viewSyntaxTree" => req_rustAnalyzer_viewSyntaxTree,
-    "rust-analyzer/openCargoToml" => req_rustAnalyzer_openCargoToml,
-    "experimental/externalDocs" => req_experimental_externalDocs,
-    "textDocument/switchSourceHeader" => req_textDocument_switchSourceHeader,
-}
+// The supported generic-request methods — ONE row list in protocol.rs feeds the
+// table here and the sync wasm client's pre-flight whitelist, so the two legs
+// can't drift. Add a method there, not here.
+crate::lsp_dyn_request_rows!(dyn_requests);
 
 // The supported generic-notification methods.
-dyn_notifications! {
-    "$/setTrace" => notif_setTrace,
-    "$/cancelRequest" => notif_cancelRequest,
-    "window/workDoneProgress/cancel" => notif_window_workDoneProgress_cancel,
-    "workspace/didChangeWatchedFiles" => notif_workspace_didChangeWatchedFiles,
-    "workspace/didChangeWorkspaceFolders" => notif_workspace_didChangeWorkspaceFolders,
-    "workspace/didCreateFiles" => notif_workspace_didCreateFiles,
-    "workspace/didRenameFiles" => notif_workspace_didRenameFiles,
-    "workspace/didDeleteFiles" => notif_workspace_didDeleteFiles,
-}
+crate::lsp_dyn_notify_rows!(dyn_notifications);
 
 /// The `FormattingOptions` for `textDocument/formatting`, built from the
 /// requesting buffer's `tabstop` (`tab_size`) and `expandtab` (`insert_spaces`)

@@ -184,7 +184,11 @@ pub(crate) fn lua_quote(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
+            // The full three-digit form: Lua's `\ddd` decimal escape reads up to
+            // three digits, so a bare `\0` would swallow any digits following the
+            // NUL (e.g. `"\012"` decodes as a newline, not NUL + "12"), silently
+            // corrupting the embedded source.
+            '\0' => out.push_str("\\000"),
             c => out.push(c),
         }
     }
@@ -384,8 +388,21 @@ const LSP_MOCK_FLAG: &str = "--__lsp-mock";
     long_about = "A modal, vim-style editor: a headless editor server plus a terminal UI \
         client, both run from this one binary. With no role flag, bemtvi opens the given \
         file (or an empty buffer) in the terminal.",
-    // The three roles below are mutually exclusive; clap enforces it and documents it.
-    group = clap::ArgGroup::new("role").args(["test_plugin", "connect_daemon", "daemon"]),
+    // The five roles below are mutually exclusive; clap enforces it and documents
+    // it. Each branch returns before the others' dispatch, so a combination would
+    // silently drop the loser instead of failing: `--lua` with `--daemon` /
+    // `--test-plugin` never runs, `--lua` with `--connect-daemon` silently runs a
+    // *local* one-shot (never connecting), and `--extract-lua-runtime` wins over
+    // everything. Reject those loudly. (`--workspace` stays outside the group: it
+    // is a modifier that legitimately combines with `--lua` and the editor roles.)
+    group = clap::ArgGroup::new("role")
+        .args([
+            "test_plugin",
+            "connect_daemon",
+            "daemon",
+            "lua",
+            "extract_lua_runtime",
+        ]),
     after_help = "Environment:\n  BEMTVI_DAEMON_CMD  Command the --connect-daemon role \
         spawns as its daemon, run through `sh -c`\n                    (e.g. \"ssh host \
         bemtvi --daemon\"). Unset = this binary in --daemon mode."
@@ -408,8 +425,12 @@ struct Cli {
     daemon: bool,
 
     /// When connecting to a daemon, run the daemon's config + plugins instead of the
-    /// local config (default: local config)
-    #[arg(long)]
+    /// local config (default: local config). Only meaningful with a connect target,
+    /// so it conflicts with the roles that have no connect target: the daemon loads
+    /// no config at all, and the `--lua` one-shot and plugin-test runner use the
+    /// local config by construction — a silent no-op there would look like the flag
+    /// worked.
+    #[arg(long, conflicts_with_all = ["daemon", "lua", "test_plugin"])]
     remote_config: bool,
 
     /// With --daemon, bind a QUIC listener at [ADDR] (default 127.0.0.1:8765) instead of using stdio
@@ -570,6 +591,27 @@ fn main() -> Result<()> {
     // `btv.test` suite, and exit with the pass/fail code. The positional is the plugin
     // dir (default: the cwd).
     if cli.test_plugin {
+        // A `bemtvi://…` connect URI is not a plugin dir — the first non-URI positional
+        // becomes the dir, so a stray URI would silently fall through to the cwd and
+        // the suite would run against the wrong tree. Reject loudly (same spirit as
+        // the daemon role's positional rejection).
+        if connect_uri.is_some() {
+            bail!(
+                "--test-plugin takes a plugin directory, not a connect URI \
+                 ({connect_uri:?}); drop the URI or run the editor with it instead"
+            );
+        }
+        // The runner's `ServerInit` is deliberately hermetic (its own shada store /
+        // no workspace, so a suite can't depend on the caller's session state). A
+        // workspace / namespace / restore flag would be silently dropped there —
+        // reject loudly (same spirit as the daemon role's rejections).
+        if cli.workspace.is_some() || cli.shada_namespace.is_some() || cli.restore_session {
+            bail!(
+                "--test-plugin takes no --workspace / --shada-namespace / \
+                 --restore-session: the runner boots a hermetic server with its own \
+                 shada store so a suite can't depend on the caller's session state"
+            );
+        }
         let dir = file
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -582,6 +624,29 @@ fn main() -> Result<()> {
     // otherwise it serves over this process's stdin/stdout (the local stand-in), wound
     // down by EOF on stdin.
     if cli.daemon {
+        // The daemon is pure I/O: it has no editor, so a file/URI positional or a
+        // `--workspace` would be silently dropped. `--daemon` and `--connect-daemon`
+        // are one typo apart, so a dropped file would look like a hang — reject
+        // loudly instead.
+        if !cli.targets.is_empty() || cli.workspace.is_some() {
+            bail!(
+                "--daemon takes no file/workspace argument (got {:?}); \
+                 the daemon is the remote half of an edit-host split — run the \
+                 editor with --connect-daemon instead",
+                cli.targets
+            );
+        }
+        // The daemon is pure I/O: shada lives on the editor side of the split, so a
+        // namespace / restore-session on the daemon's own command line has no effect
+        // there (the namespace the editor syncs under arrives over the wire). Reject
+        // loudly — a silent no-op would look like the flags worked.
+        if cli.shada_namespace.is_some() || cli.restore_session {
+            bail!(
+                "--daemon takes no --shada-namespace / --restore-session: the daemon \
+                 persists nothing itself — shada lives on the editor side, which syncs \
+                 it to the daemon under its own namespace (see --connect-daemon)"
+            );
+        }
         if let Some(addr) = cli.listen {
             let addr = addr.unwrap_or_else(|| {
                 DEFAULT_LISTEN_ADDR

@@ -581,7 +581,10 @@ function btv.component(def)
       end
       self._closed = true
       for _, fn in ipairs(self._on_close) do
-        pcall(fn)
+        local ok, err = pcall(fn)
+        if not ok then
+          btv.notify("btv.component: on_close error: " .. tostring(err), 4)
+        end
       end
       backend.close()
     end

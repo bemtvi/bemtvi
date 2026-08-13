@@ -1336,18 +1336,29 @@ fn default_foldmarker() -> (String, String) {
 /// other side, or level 0 when both sides are masked.
 fn resolve_masked_levels(levels: &mut [usize], mask: &[bool]) {
     let n = levels.len();
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         if !mask[i] {
+            i += 1;
             continue;
         }
-        let prev = (0..i).rev().find(|&j| !mask[j]).map(|j| levels[j]);
-        let next = (i + 1..n).find(|&j| !mask[j]).map(|j| levels[j]);
-        levels[i] = match (prev, next) {
+        // A maximal run of masked lines `[i, j)`: every interior line resolves to
+        // `min(prev_unmasked, next_unmasked)` — the shallower of the blocks
+        // bracketing the run — with the run's edges falling out to their single
+        // neighbour, and an all-masked buffer to 0. The bracketing neighbours are
+        // the same for the whole run, so one pass fills it (the naive per-line
+        // backward/forward scan is O(n²) on a fully masked buffer).
+        let prev = (i > 0).then(|| levels[i - 1]);
+        let j = (i..n).find(|&j| !mask[j]).unwrap_or(n);
+        let next = (j < n).then(|| levels[j]);
+        let lvl = match (prev, next) {
             (Some(p), Some(q)) => p.min(q),
             (Some(p), None) => p,
             (None, Some(q)) => q,
             (None, None) => 0,
         };
+        levels[i..j].fill(lvl);
+        i = j;
     }
 }
 

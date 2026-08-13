@@ -297,19 +297,24 @@ impl Options {
             ("relativedocks", Bool(b)) => self.relative_docks = *b,
             ("equalalways", Bool(b)) => self.equalalways = *b,
             ("workspacepersistunnamed", Bool(b)) => self.workspace_persist_unnamed = *b,
-            ("showtabline", Num(n)) => self.showtabline = *n as u8,
-            ("laststatus", Num(n)) => self.laststatus = *n as u8,
-            ("pummaxwidth", Num(n)) => self.pummaxwidth = *n as usize,
-            ("mousetime", Num(n)) => self.mousetime = *n as usize,
-            ("timeoutlen", Num(n)) => self.timeoutlen = *n as usize,
-            ("scrollanimduration", Num(n)) => self.scrollanimduration = *n as usize,
-            ("scrollback", Num(n)) => self.scrollback = *n as usize,
             // Clamped rather than wrapped as a last line of defense — an out-of-range
-            // value is rejected loud (E474) by `Editor::set_global_option_num` before it
-            // reaches here, so this only guards a direct `set_scalar` caller (a shada
-            // restore of a hand-edited file) from a `as u16` wrap binding port 33903.
+            // value is rejected loud (E487/E474) by `Editor::set_global_option_num`
+            // before it reaches here, so this only guards a direct `set_scalar` caller
+            // (the `btv.wso` overlay, which validates kind but not range, and a shada
+            // restore of a hand-edited file) from a `as u8`/`as usize`/`as u16` wrap:
+            // `-1 as usize` on the 64-bit usize slots is 2^64-1, `laststatus` 255 is
+            // not a mode, and `httpport` 33903 is not the intended port.
+            ("showtabline", Num(n)) => self.showtabline = (*n).clamp(0, 2) as u8,
+            ("laststatus", Num(n)) => self.laststatus = (*n).clamp(0, 3) as u8,
+            ("pummaxwidth", Num(n)) => self.pummaxwidth = (*n).clamp(0, i64::MAX) as usize,
+            ("mousetime", Num(n)) => self.mousetime = (*n).clamp(0, i64::MAX) as usize,
+            ("timeoutlen", Num(n)) => self.timeoutlen = (*n).clamp(0, i64::MAX) as usize,
+            ("scrollanimduration", Num(n)) => {
+                self.scrollanimduration = (*n).clamp(0, i64::MAX) as usize
+            }
+            ("scrollback", Num(n)) => self.scrollback = (*n).clamp(0, i64::MAX) as usize,
             ("httpport", Num(n)) => self.httpport = (*n).clamp(0, u16::MAX as i64) as u16,
-            ("history", Num(n)) => self.history = *n as usize,
+            ("history", Num(n)) => self.history = (*n).clamp(0, i64::MAX) as usize,
             ("persisthistory", Str(s)) => self.persisthistory = s.clone(),
             ("statusline", Str(s)) => self.statusline = s.clone(),
             ("tabline", Str(s)) => self.tabline = s.clone(),

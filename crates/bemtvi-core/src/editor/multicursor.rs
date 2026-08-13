@@ -472,8 +472,22 @@ impl Editor {
         let visual = self.mode.shows_selection();
 
         // Park the primary as a head mark too (so it rides the same auto-shift and
-        // is handled like any other cursor), plus its anchor when in visual.
-        let primary = self.set_cursor_mark(None, self.cursor_char());
+        // is handled like any other cursor), plus its anchor when in visual. First
+        // retire any secondary cursor already sitting on the primary's cell — the
+        // primary owns it, and leaving the duplicate in the sweep would make the
+        // edit apply twice at the same spot (e.g. `x` deleting two chars after the
+        // primary is navigated onto a secondary).
+        let pri = self.cursor_char();
+        let dup_marks: Vec<u64> = self
+            .cursor_marks()
+            .filter_map(|m| (m.start == pri).then_some(m.id))
+            .collect();
+        let bid = self.cur_buffer();
+        for id in dup_marks {
+            self.buffers.get_mut(bid).buffer.extmarks.del(CURSOR_NS, id);
+            self.buffers.get_mut(bid).buffer.extmarks.del(ANCHOR_NS, id);
+        }
+        let primary = self.set_cursor_mark(None, pri);
         if visual {
             let ab = self.anchor_byte(self.visual_anchor);
             self.set_anchor_mark(primary, ab);
@@ -484,10 +498,41 @@ impl Editor {
         let mut ids: Vec<(u64, usize)> = self.cursor_marks().map(|m| (m.id, m.start)).collect();
         ids.sort_unstable_by_key(|&(_, start)| std::cmp::Reverse(start));
 
-        for (id, _) in ids {
+        // A cursor an earlier *edit* SWALLOWED must not act again: an operator can
+        // cover a not-yet-visited cursor's position (a `dd` line swallow, an `x`
+        // span), and re-running `f` there applies the edit twice.
+        //
+        // "Swallowed" is decided by the deleted SPAN, not by where the acting cursor
+        // came to rest. Position alone cannot tell the two apart: after `dd` on the
+        // line above, the acting cursor lands exactly where the untouched cursor
+        // already sat — and a mark at a deletion's start does not move either — so a
+        // landed-position test drops a cursor that should still act, while a
+        // "did the mark move" test misses the mark sitting at the deletion's start.
+        // `last_delete_span` is the pre-shift range, which answers exactly.
+        //
+        // A verb that only inserts cannot swallow anything, and leaves no span.
+        //
+        // The pre-`f` read below is per *cursor*, not per buffer byte, so the sweep
+        // stays O(cursors^2) mark lookups in the worst case and never scales with
+        // what the buffer holds.
+        let mut swallowed: Vec<u64> = Vec::new();
+        for i in 0..ids.len() {
+            let (id, _) = ids[i];
+            if swallowed.contains(&id) {
+                // An earlier cursor's edit covered this one — leave the mark in
+                // place and skip it; `merge_overlapping_cursors` retires it.
+                continue;
+            }
             let Some(pos) = self.cursor_mark_pos(id) else {
                 continue;
             };
+            // The not-yet-visited cursors' positions as they stand BEFORE `f` runs,
+            // so the span it deletes can be tested against them un-shifted.
+            let before: Vec<(u64, usize)> = ids[i + 1..]
+                .iter()
+                .filter_map(|&(p, _)| self.cursor_mark_pos(p).map(|q| (p, q)))
+                .collect();
+            self.last_delete_span = None;
             self.set_cursor_char_insert(pos);
             if visual {
                 if let Some(ab) = self.anchor_mark_pos(id) {
@@ -495,6 +540,15 @@ impl Editor {
                 }
             }
             f(self);
+            // Every cursor the deletion covered is retired from the sweep.
+            if let Some(span) = self.last_delete_span.take() {
+                swallowed.extend(
+                    before
+                        .into_iter()
+                        .filter(|&(_, q)| span.contains(&q))
+                        .map(|(p, _)| p),
+                );
+            }
             // Re-anchor where `f` left the cursor; later (lower) edits shift it.
             let landed = self.cursor_char();
             self.set_cursor_mark(Some(id), landed);

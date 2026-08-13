@@ -236,7 +236,7 @@ use bemtvi_lsp::LspManager;
 use bemtvi_lsp::{CodeActionData, ServerKey, ServerSpawn};
 use bemtvi_lua::LuaRuntime;
 #[cfg(feature = "native")]
-use bemtvi_rpc::{connect, Incoming, Rpc};
+use bemtvi_rpc::{connect, connect_bounded, Incoming, Rpc};
 /// The outbound async-effect seam the synchronous [`EditHost`] tick emits through
 /// (redraws / notifications to the client, off-tick fs, the event-loop / LSP command
 /// sinks). Re-exported so the out-of-crate wasm cdylib ([`bemtvi-edithost`], slice 5b)
@@ -1159,6 +1159,14 @@ pub struct EditHost {
     /// stale, and the projection falls back to the published ranges (untracked, never
     /// mis-attributed). Absent for a buffer with no diagnostics.
     diag_mark_counts: HashMap<BufferId, usize>,
+    /// The extmark-store generation of the diagnostic namespace recorded when the anchors
+    /// were placed ([`EditHost::refresh_diagnostic_marks`]). Complements
+    /// [`diag_mark_counts`](Self::diag_mark_counts): a count match can survive an
+    /// undo that restores an older store holding the same number of marks in the
+    /// diagnostic namespace, pointing the anchors at the wrong spans; the
+    /// generation then differs (the placement itself bumped it) and the guard fails.
+    /// Absent for a buffer with no diagnostics.
+    diag_mark_gens: HashMap<BufferId, u64>,
     /// The editor-wide semantic-tokens gate (Phase 3), toggled by
     /// `vim.lsp.semantic_tokens.enable`. Default on; `false` hides the semantic
     /// paint everywhere and stops the refresh requests (the per-buffer
@@ -1333,6 +1341,23 @@ pub struct EditHost {
     /// re-serialized on every Lua entry — only the cheap cursor/window fields
     /// refresh each time (Phase 6).
     buf_mirror_ticks: HashMap<BufferId, u64>,
+    /// The core's option-state generation ([`Editor::options_generation`]) the Lua
+    /// `bo` mirror was last rebuilt from, so [`EditHost::push_buf_mirror`] skips the
+    /// wholesale per-buffer rebuild when no option write / filetype / `ts_highlight`
+    /// change / save moved it. Text edits deliberately do not bump the counter —
+    /// they only change a row's `modified`, which the per-buffer `changedtick` gate
+    /// (`fresh`) covers. Seeded to `u64::MAX` so the first push always rebuilds.
+    bo_mirror_gen: u64,
+    /// The bufnrs a `bo` mirror row is currently held for in the Lua table, so a
+    /// buffer deleted between pushes is dropped from the table explicitly — the
+    /// mirror merges rows now, it no longer wholesale-replaces the table.
+    bo_mirror_known: HashSet<BufferId>,
+    /// Last-pushed per-window jumplist generations ([`Editor::window_jumplist_gen`]):
+    /// when a window's generation matches the last push, its row skips the jumplist
+    /// and the Lua side keeps the old list — a repaint never re-serializes a whole
+    /// jumplist (the structural-generation gate the extmark mirror uses). Pruned
+    /// when a window closes; an id absent here pushes its full list.
+    win_jump_gens: HashMap<WindowId, u64>,
     /// Per-buffer line count last mirrored, so [`EditHost::push_buf_mirror`] can pass
     /// the old line count as `on_lines`' `lastline` when an attached buffer changes
     /// (`nvim_buf_attach`). Tracked only to fire faithful buffer-change callbacks —
@@ -1797,6 +1822,7 @@ impl EditHost {
             client_diagnostics: HashMap::new(),
             pending_client_diagnostics: HashMap::new(),
             diag_mark_counts: HashMap::new(),
+            diag_mark_gens: HashMap::new(),
             semantic_tokens_enabled: true,
             snippet_store: HashMap::new(),
             complete_snippets_active: false,
@@ -1832,6 +1858,9 @@ impl EditHost {
             scheduled: VecDeque::new(),
             buf_mirror_ticks: HashMap::new(),
             buf_mirror_lines: HashMap::new(),
+            bo_mirror_gen: u64::MAX,
+            bo_mirror_known: HashSet::new(),
+            win_jump_gens: HashMap::new(),
             extmark_gens: HashMap::new(),
             undo_mirror_versions: HashMap::new(),
             qf_mirror_version: None,
@@ -3494,15 +3523,27 @@ impl EditHost {
         }
         let _guard = sync.upload.lock().await;
         if let Some((target, bytes)) = self.staged_shada_upload() {
-            if let Err(e) = sync.fs.write(target, bytes).await {
+            // Bounded: the daemon link may be half-dead at exit (TCP still up, the
+            // daemon hung), and an unbounded await would hang the process's exit
+            // forever on a best-effort write. Best-effort — we're leaving.
+            if let Err(e) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sync.fs.write(target, bytes),
+            )
+            .await
+            {
                 eprintln!("shada: final remote upload failed: {e}");
             }
         }
         // Mirror the local clean-exit compaction onto the daemon: the siblings we
         // downloaded were absorbed into our just-uploaded file, so delete them remotely.
+        // Bounded like the upload above.
         for name in &sync.downloaded {
             let target = format!("{}/{}", sync.remote_dir, name);
-            if let Err(e) = sync.fs.remove(target).await {
+            if let Err(e) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), sync.fs.remove(target))
+                    .await
+            {
                 eprintln!("shada: remote compaction (remove {name}) failed: {e}");
             }
         }
@@ -3534,6 +3575,13 @@ impl EditHost {
         }
         let mut snap = self.editor.export_persist();
         snap.exit_cursor = None;
+        // Capture the layout under the same gate as the checkpoint and the final
+        // flush — a snapshot without one makes the store *clear* the SESSION row,
+        // so an ungated `:wshada` would silently erase the persisted workspace
+        // session (`--restore-session` would find no layout after the next crash).
+        if self.session_captures_layout() {
+            snap.session = self.editor.export_session();
+        }
         snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
         // A workspace-scoped session persists its `btv.wso` option overlay too (independent
         // of layout capture); the global store never carries per-workspace overrides.
@@ -4488,10 +4536,7 @@ impl DaemonLegs {
 /// [`run_daemon_io`] (all four groups over one `Rpc`) and the per-stream
 /// [`run_daemon_group`] (one group over its own stream's `Rpc`).
 #[cfg(feature = "native")]
-async fn pump_daemon_legs(
-    mut incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
-    legs: DaemonLegs,
-) {
+async fn pump_daemon_legs(mut incoming: tokio::sync::mpsc::Receiver<Incoming>, legs: DaemonLegs) {
     while let Some(msg) = incoming.recv().await {
         let method = match &msg {
             Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
@@ -4524,7 +4569,10 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    // Bounded like the four-group mux below (same reasoning): the daemon issues no
+    // requests, so a reader parked on a full channel strands nothing — it only delays
+    // draining while the pump is busy serving an earlier op.
+    let (rpc, incoming) = connect_bounded(reader, writer, daemon::SPLIT_LINK_IN_CAP);
     let legs = DaemonLegs::spawn(&[group], &rpc);
     pump_daemon_legs(incoming, legs).await;
     Ok(())
@@ -4559,7 +4607,12 @@ where
     // Single-stream transport (ssh/stdio, the in-process test duplex): all four leg
     // groups share one ordered stream and one `Rpc`, demuxed by method. (The QUIC /
     // WebTransport transports give each group its own stream via [`run_daemon_group`].)
-    let (rpc, incoming) = connect(reader, writer);
+    // The shared inbound is bounded (see `daemon::SPLIT_LINK_IN_CAP`): a Term flood must
+    // stall the wire itself, not pile up in a queue the reader keeps feeding. The daemon
+    // issues no requests, so a parked reader strands nothing; and the daemon's own
+    // `term_data` forwarder awaits its bounded stream channel, so a stalled wire is what
+    // throttles the child.
+    let (rpc, incoming) = connect_bounded(reader, writer, daemon::SPLIT_LINK_IN_CAP);
     let legs = DaemonLegs::spawn(
         &[
             daemon::LegGroup::Control,

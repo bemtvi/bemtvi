@@ -222,13 +222,11 @@ impl EditHost {
         };
 
         // The insert-mode completion popup, `Nil` when none is open. The focused
-        // window's text-area width (its width minus its number gutter) bounds the
-        // overlay so it can't spill past the editable region.
-        let text_width = view
-            .focused()
-            .rect
-            .width
-            .saturating_sub(view.focused().number_width);
+        // window's text-area width bounds the overlay so it can't spill past the
+        // editable region. `text_width` is the text area minus *every* left gutter
+        // (fold + sign + number) plus the padding/float-border insets, exactly the
+        // width the clients paint the text inner at.
+        let text_width = view.focused().text_width;
         // The legacy `pmenu` key is retired (Phase 4-C): all completion — including
         // the `lsp` source — now renders through the unified `menu` widget below, so
         // this is always `Nil`. Kept as a key for client wire compatibility.
@@ -789,7 +787,7 @@ impl EditHost {
         // so each window shows its own cell — no per-frame Lua (ADR 0002 rule 4).
         // The tabline caller passes `None` (it never uses a segment layout).
         if let Some(spec) = layout {
-            let (seg_ctx, custom) = self.segment_render_inputs(win_id, ctx);
+            let (seg_ctx, custom) = self.segment_render_inputs(win_id, spec, ctx);
             let segments = statusline::compose_segments(spec, &seg_ctx, mode_label, width, &custom);
             return self.project_status_segments(&segments, styles);
         }
@@ -836,13 +834,20 @@ impl EditHost {
     fn segment_render_inputs<'a>(
         &'a self,
         win_id: u64,
+        spec: &bemtvi_core::statusline::SegmentLayout,
         ctx: &bemtvi_core::statusline::StatuslineCtx,
     ) -> (
         bemtvi_core::statusline::StatuslineCtx,
         impl Fn(&str) -> Option<Vec<bemtvi_core::statusline::StatusSegment>> + 'a,
     ) {
         let mut seg_ctx = ctx.clone();
-        seg_ctx.diag_counts = self.statusline_diag_counts(bemtvi_core::BufferId(ctx.bufnr as u64));
+        // The diagnostic counts are the only per-frame input with a collection
+        // cost (they walk the whole merged set), and only the `diagnostics`
+        // built-in reads them — skip the walk for a layout that never shows it.
+        if spec.uses_builtin("diagnostics") {
+            seg_ctx.diag_counts =
+                self.statusline_diag_counts(bemtvi_core::BufferId(ctx.bufnr as u64));
+        }
         let cache = &self.statusline_cache;
         let custom = move |name: &str| cache.get(&(win_id, name.to_string())).cloned();
         (seg_ctx, custom)
@@ -907,7 +912,7 @@ impl EditHost {
                 if let Some(layout) = self.resolve_window_layout(win_id) {
                     // Segment layout: a clickable cell carries an `on_click` handler,
                     // which `compose_segments_with_clicks` turns into a column span.
-                    let (seg_ctx, custom) = self.segment_render_inputs(win_id, ctx);
+                    let (seg_ctx, custom) = self.segment_render_inputs(win_id, layout, ctx);
                     let (_segments, clicks) = statusline::compose_segments_with_clicks(
                         layout,
                         &seg_ctx,
@@ -1878,21 +1883,7 @@ impl EditHost {
             ..
         } = geom;
 
-        // The preview pane (Phase 3): a column on the right of an editor-placement
-        // picker rendering the selected row's file. `None` for a `select` / preview-less
-        // picker (and for `Cursor` placement — the cursor float-beside is Phase 4).
-        // Sized against the resolved box; the map carries its own `width` so the client
-        // knows how many columns the list keeps (`box width − preview width − 1`).
-        let preview = if matches!(m.placement, MenuPlacement::Editor) {
-            self.project_preview(m, width, height, styles)
-        } else {
-            None
-        };
-
-        let items: Vec<Value> = rows
-            .iter()
-            .map(|(label, _)| Value::from(label.as_str()))
-            .collect();
+        let items: Vec<Value> = rows.iter().map(|(label, _)| Value::from(*label)).collect();
         // Per-row **kind** labels (parallel to `items`): the short category the client
         // right-aligns on each completion row (`"Snippet"`, `"Function"`, …). `Nil` for
         // a kind-less row (a `buffer` word) and for every non-completion menu. Omitted
@@ -2068,6 +2059,18 @@ impl EditHost {
             }
             map.push((Value::from("filters"), Value::Map(fm)));
         }
+        // The preview pane (Phase 3): a column on the right of an editor-placement
+        // picker rendering the selected row's file. `None` for a `select` / preview-less
+        // picker (and for `Cursor` placement — the cursor float-beside is Phase 4).
+        // Sized against the resolved box; the map carries its own `width` so the client
+        // knows how many columns the list keeps (`box width − preview width − 1`).
+        // Runs after the row conversions above so the rows borrow (which pins
+        // `self.editor`) is released before this `&mut self` call.
+        let preview = if matches!(m.placement, MenuPlacement::Editor) {
+            self.project_preview(m, width, height, styles)
+        } else {
+            None
+        };
         // The preview sub-map (`{ lines, first_line, title, loc, width, highlights }`),
         // present only when this picker carries a preview pane. Its presence tells the
         // client to split the box into a list column + this preview column.

@@ -265,3 +265,122 @@ gate is tested by mutating state through every door that should open it, and by
 checking that a door that should **not** open it (a keystroke that changes
 nothing) leaves the mirror's Lua table identity intact — the same
 table-identity trick `buf_mirror.rs` uses to prove the delta path really ran.
+
+## Follow-up (2026-08-12 audit round): the undo-tree mirror
+
+A later audit round found one more same-shape survivor: `push_undotree_mirror`
+re-projects the buffer's **whole undo tree** on every edit of it — O(history)
+per keystroke — and pushed even when no plugin ever reads
+`vim.fn.undotree`. The first attempt was a reader gate (the
+`key_pending_active` pattern): `btv.undotree.get` flips `btv._undotree_register`
+on first read, and the server skips the walk + push entirely while it stays
+unset. **That gate was reverted**: it breaks the first-read contract in a way
+no test change could paper over. The mirror push for a tick happens *before*
+that tick's Lua chunks, so a read can only arm the gate for pushes of
+*later* ticks — the first read of any session observes a mirror that was
+gated off during every edit before it, and returns the empty zero-tree. The
+unchanged `undotree_*` tests caught it (mutations, then a read in the first
+Lua chunk), but the same staleness would hit any real config that opens the
+undo tree *after* editing — `:UndotreeShow` after typing — and there is no
+synchronous bridge from a Lua chunk to the editor (bridges only queue ops;
+Lua reads mirrors by design). A gate can only be sound when the read itself
+is deferred to a later tick, which the synchronous `vim.fn.undotree` contract
+forbids. The pre-existing per-buffer `undo_version` fingerprint gate is the
+keeper: it bounds re-pushes to buffers whose tree actually changed.
+
+**Still open: the tree itself is never pruned** — bemtvi keeps every undo node
+for the session (vim caps this at `undolevels`, default 1000). This is now
+the *only* fix for the per-edit walk: wiring `'undolevels'` (options registry
++ apply + BoMirror) and pruning the oldest branch on overflow in `undo.rs`
+bounds the walk at the cap. Not done in the audit round: it is an option-
+surface feature, not a defect, and the tree walk is inherent to serving a
+live undo tree.
+
+## Follow-up (2026-08-12 audit round 3): wire/frame bounds, the extmark index
+
+The third audit round (fresh per-crate scan + adversarial review of the
+applied diff) fixed the remaining same-shape defects and recorded the items
+that are accepted risk or a different surface entirely:
+
+- **`ExtmarkStore::shift` is now O(log + moved) instead of O(E)** — the
+  landed shape is a single lazily-rebuilt position index, not the canonical
+  marktree. The first attempt at the index was *too eager* and the benchmark
+  caught it: maintaining two per-mark position BTreeSets at the mutation sites
+  (`by_start` + `by_end`, 4 tree ops per moved mark in the shift) regressed the
+  wide shift to **979 µs/keystroke vs HEAD's 16.5 µs** — a 59x blowup that
+  failed `typing_does_not_scale_with_the_diagnostic_count` (4.6x ratio vs the
+  3.0 cap), the regression test that originally motivated the index. The
+  landed design keeps one index, `sorted: Vec<(u64 start, u64 id, Option<u64>
+  end)>`, plus a dirty flag: the five mutation sites (`set_with_gravity`, `del`,
+  `clear`, `clear_all`, `move_namespace_into`) just mark it dirty, and the next
+  shift rebuilds it in one `sort_unstable` — O(E log E) amortized over the
+  mutation batch (the 5000-mark diagnostic set's inserts stay O(1)), instead
+  of paid per insert. The shift then splits the vector at
+  `partition_point(start < edit start)`: the **covering walk** scans the prefix
+  testing `end >= edit start` against the index itself (no mark lookup for the
+  check — that's why `end` rides in the tuple; only actual straddlers fetch
+  the mark, for its gravity flag), and the **main walk** rewrites each moved
+  suffix entry's anchors in place — both gravity maps are monotone
+  non-decreasing, so the rewritten suffix keeps its sort and no re-sort is
+  needed (verified per piecewise case). Measured after the fix: 139 µs wide
+  (edit at byte 0, all 5000 marks move) and 3.3 µs narrow (edit near the end),
+  and the regression test passes. The residual per-moved-mark `BTreeMap`
+  `get_mut` (~60 ns) is the price of id-keyed lookup — the wide case is 8x
+  HEAD, acceptable next to the render cost the test measures — and the
+  canonical long-term fix remains **marktree** (a real interval tree over the
+  whole store); revisit it when extmark counts per namespace grow past the
+  point where the index rebuild on `clear` is the hot path.
+
+  **Revisited in round 4 and reverted.** A fresh adversarial review of the
+  landed index proved it *strictly worse than HEAD's flat pass*, not better:
+  the covering walk iterates the entire prefix (all E marks when the edit is
+  at byte 0 — the wide case the benchmark measures) and the main walk pays a
+  `BTreeMap` `get_mut` per moved mark, so the honest bound is O(E) with worse
+  constants than the flat `values_mut()` pass it replaced (139 µs wide vs
+  HEAD's 16.5 µs; the narrow case is no better at 3.3 µs vs ~13 µs). The
+  index never paid off because a position index cannot reduce the shift below
+  one visit per mark (a mark's new anchors depend only on its own anchors +
+  the edit), and nothing hot consumes a start-sorted index anyway. `shift` is
+  back to HEAD's flat O(E) pass. What the round kept from the experiment: a
+  per-namespace `gen: u64` generation counter, bumped by structural mutations
+  (never by shift), which the diagnostics anchor-trust guard now uses to
+  detect an undo-restored extmark store (see `diagnostics.rs` — the old
+  count-only guard survived an undo whose restored store held the same number
+  of marks, pointing the anchors at the wrong spans). The canonical long-term
+  fix remains marktree.
+
+- **The RPC frame path is now bounded at both ends.** The reader already tore
+  the connection down past `MAX_FRAME` (64 MiB); the encode side now refuses
+  per-method via `encode_checked` (notify/notify_stream: eprintln + drop;
+  request: `Err` through the `PendingGuard`; respond: a small error reply) —
+  including the Lua-leg guard, where a plugin-built `Value` that encodes past
+  the cap fails loudly instead of wedging the wire. The one residual: a plugin
+  building an enormous value spends the Lua time before the refusal is
+  possible (the size is only known after encoding). `scan_frame`'s depth cap
+  was re-aligned with rmpv's actual accounting (scalars charge 1, containers 2,
+  bins 2, str/ext 3 — every unit decrements via `checked_sub`) and — the
+  subtle part — the budget is **per descending path, not frame-cumulative**:
+  rmpv passes `depth` down by value, so a container's children all run on
+  `depth - 2` and siblings never accumulate against each other. The first
+  attempt charged every value in the frame against one running budget, which
+  rejected any redraw wider than ~40 values (a flat frame is cheap for rmpv,
+  so the scan and the decoder disagreed and the connection died on the first
+  big repaint — the `daemon_lsp` suite caught it). The landed model keeps a
+  per-level budget array, so the cap stops pathological *nesting* while
+  `MAX_FRAME` is the flood bound and flat frames of any width pass; the
+  outbound channel staying unbounded is fine for a queue of ≤64 MiB frames,
+  and cancel-growth is already bounded by the `PendingGuard` (`notify_stream`
+  has a bounded backpressured channel).
+
+- **A silent LSP server keeps its pending entries — accepted risk, both
+  legs.** Neither the native manager nor the wasm `SyncLspClient` has a
+  per-language-request timeout, and this round confirmed that is the right
+  shape: a wedged handshake is bounded (`INIT_GRACE` 30 s kill on the native
+  leg, the 4096-entry `QUEUED_CAP` on the pre-handshake queue on the wasm
+  leg), while *post*-handshake silence on a language request leaves at most
+  the editor's in-flight requests pending (one token per request), and a
+  timeout would fabricate a degraded reply for a merely slow server mid-
+  request. The native leg's respawn/backoff breaker handles a truly dead
+  server at the server level. The wasm leg's string-id fall-through (a
+  response echoing an id we never sent) was the one silent path in that
+  accounting and now logs loud instead.

@@ -1081,3 +1081,79 @@ async fn undo_does_not_import_another_windows_cursors() {
         "undoing another window's multi-cursor edit imports no cursors",
     );
 }
+
+// ------------------------------------------- one cell is edited once, never twice
+//
+// `edit_each_cursor` parks the primary as a cursor mark alongside the secondaries
+// and sweeps them bottom-up. Two ways the same cell got edited twice:
+//
+//  * the primary is navigated ONTO an existing secondary, so the cell holds two
+//    marks and the sweep visits it twice (`x` deleted two chars);
+//  * an operator's span covers a not-yet-visited cursor, which then rides the
+//    edit's shift onto the operated cell and re-runs there.
+//
+// Both are now retired before/while the sweep runs — but only for an *edit*: a pure
+// motion that lands on another cursor's cell must still move that cursor.
+
+#[tokio::test]
+async fn an_operator_that_swallows_another_cursors_line_runs_once() {
+    // Two cursors on the SAME line. `dd` deletes that line for the first cursor,
+    // which swallows the second — whose mark collapses onto the deletion point. Left
+    // to act, it would delete the NEXT line too.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifirst<CR>second<CR>third<Esc>gg0");
+    feed(&rpc, "<A-c>llc0<Esc>"); // cursors at line 1 col 0 and col 2
+    feed(&rpc, "dd");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["second", "third"],
+        "the shared line is deleted once — the swallowed cursor must not delete the next"
+    );
+}
+
+#[tokio::test]
+async fn cursors_on_different_lines_each_delete_their_own() {
+    // The counterpart, and the case a landed-position-only guard breaks: deleting
+    // the LOWER line lands its cursor on the upper cursor's cell, which looks like a
+    // collision but is not — the upper mark never moved, so it must still act.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ifirst<CR>second<CR>third<Esc>gg0");
+    feed(&rpc, "<A-c>jc<Esc>"); // cursors on line 1 and line 2
+    feed(&rpc, "dd");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["third"],
+        "two cursors on two lines delete both lines"
+    );
+}
+
+#[tokio::test]
+async fn a_motion_onto_another_cursors_cell_still_moves_it() {
+    // The `done` bookkeeping is gated on an edit actually happening: a pure motion
+    // must not suppress a cursor just because another cursor passed through its
+    // cell. Cursors at col 0 and col 1; `l` walks them to 1 and 2, then both delete.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabcdef<Esc>gg0");
+    feed(&rpc, "<A-c>lc0<Esc>");
+    feed(&rpc, "l");
+    feed(&rpc, "x");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["adef"],
+        "both cursors moved and both deleted — a motion is not an edit"
+    );
+}
+
+#[tokio::test]
+async fn two_distinct_cursors_on_one_line_both_edit() {
+    // The control for the dedup: two real cursors on one line must both act.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iabcdef<Esc>gg0");
+    feed(&rpc, "<A-c>lllc0<Esc>");
+    feed(&rpc, "x");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["bcef"],
+        "col 0 and col 3 are distinct cursors — both delete"
+    );
+}

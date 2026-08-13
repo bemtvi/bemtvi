@@ -15,8 +15,8 @@ use mlua::{Lua, Table, UserData, UserDataMethods, Variadic};
 use unicode_width::UnicodeWidthStr;
 
 use crate::convert::{
-    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_to_json, opt_table_to_json,
-    stringify, value_to_option,
+    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_int, lua_to_json,
+    opt_table_to_json, stringify, value_to_option,
 };
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
@@ -107,7 +107,7 @@ impl UserData for LuaRegex {
                 .exec_line(&text, 0, false)
                 .map_err(|e| mlua::Error::RuntimeError(format!("vim.regex match_str: {e}")))?;
             Ok(match m {
-                Some(m) => (Some(m.start as i64), Some(m.end as i64)),
+                Some(m) => (Some(lua_int(m.start as i64)), Some(lua_int(m.end as i64))),
                 None => (None, None),
             })
         });
@@ -188,33 +188,28 @@ type PickerOpenArgs = (
 /// carries. An absent table (or an absent field) is the unfiltered default, so a
 /// source that never opted in — and every caller written before the boxes existed —
 /// opens exactly the picker it always did.
-fn filters_from_table(t: Option<&Table>) -> (bool, String, String, bool, Vec<String>, Vec<String>) {
+// The six-tuple is the picker-open payload's long-standing shape (they grow
+// together; see the doc above).
+#[allow(clippy::type_complexity)]
+fn filters_from_table(
+    t: Option<&Table>,
+) -> mlua::Result<(bool, String, String, bool, Vec<String>, Vec<String>)> {
     let Some(t) = t else {
-        return (false, String::new(), String::new(), false, vec![], vec![]);
+        return Ok((false, String::new(), String::new(), false, vec![], vec![]));
     };
-    let str_list = |key: &str| -> Vec<String> {
-        t.get::<Option<Vec<String>>>(key)
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+    // An ABSENT field is the unfiltered default; a present-but-wrong-typed field is a
+    // config error and propagates loudly instead of silently becoming "no filter".
+    let str_list = |key: &str| -> mlua::Result<Vec<String>> {
+        Ok(t.get::<Option<Vec<String>>>(key)?.unwrap_or_default())
     };
-    (
-        t.get::<Option<bool>>("on").ok().flatten().unwrap_or(false),
-        t.get::<Option<String>>("include")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-        t.get::<Option<String>>("exclude")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-        t.get::<Option<bool>>("open")
-            .ok()
-            .flatten()
-            .unwrap_or(false),
-        str_list("include_history"),
-        str_list("exclude_history"),
-    )
+    Ok((
+        t.get::<Option<bool>>("on")?.unwrap_or(false),
+        t.get::<Option<String>>("include")?.unwrap_or_default(),
+        t.get::<Option<String>>("exclude")?.unwrap_or_default(),
+        t.get::<Option<bool>>("open")?.unwrap_or(false),
+        str_list("include_history")?,
+        str_list("exclude_history")?,
+    ))
 }
 
 /// The number of `char`s before byte offset `byte` in `s` — to turn the markdown
@@ -1166,12 +1161,30 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         )?,
     )?;
     // `btv._system_kill(id, signal)`: terminate the async child running under
-    // `id`. `signal` is accepted (neovim's `handle:kill(signal)`) but ignored —
-    // the actor terminates the child unconditionally (see [`LoopOp::Kill`]).
+    // `id`. `signal` mirrors neovim's `handle:kill(signal)` shape. Only 9
+    // (SIGKILL) is accepted, because the actor terminates the child
+    // unconditionally (see [`LoopOp::Kill`]) — 9 is the honest name for that
+    // behavior, and the pre-strict surface hard-killed on it too, so an
+    // external caller's `kill(9)` keeps working. Any other named signal fails
+    // loud rather than silently hard-killing a child the caller wanted to
+    // terminate gracefully (the Lua surface passes no signal today; this guard
+    // is for the caller that will). Signal 0 — the POSIX existence probe — is
+    // refused too: `btv._system_kill` has no reply channel, so a probe could
+    // only no-op silently; probe liveness through the process's exit event
+    // instead.
     let sh = shared.clone();
     btv.set(
         "_system_kill",
-        lua.create_function(move |_, (id, _signal): (u64, Option<i32>)| {
+        lua.create_function(move |_, (id, signal): (u64, Option<i32>)| {
+            if let Some(sig) = signal {
+                if sig != 9 {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "btv._system_kill: signal {sig} is not supported — only SIGKILL (9) \
+                         is; signal 0 (an existence probe) has no reply channel here, \
+                         watch the process's exit event instead"
+                    )));
+                }
+            }
             sh.borrow_mut().loop_ops.push(LoopOp::Kill { id });
             Ok(())
         })?,
@@ -1266,19 +1279,37 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     func.set(
         "has",
         lua.create_function(|_, feature: String| {
-            // Claim a modern neovim so version-gated code takes its full path;
-            // unknown features report absent. Refined as needs surface.
-            // INCOMPLETE: a coarse heuristic, not a real feature table. EVERY
-            // `nvim-X.Y` returns 1 — including future/bogus versions
-            // (`has('nvim-0.99')` → 1, wrong) — and every non-`nvim-` feature
-            // returns 0, including real ones bemtvi could answer (`unix`, `mac`,
-            // `win32`, `gui_running`, …). A real impl would consult an actual
-            // feature/version table instead of pattern-matching the prefix.
-            Ok(if feature.starts_with("nvim-") {
-                1i64
+            // The neovim compat level the `vim.*` glue tracks: the version whose
+            // API surface the colorscheme/config glue was written against. Raised
+            // as the surface grows; `has('nvim-X.Y')` answers truthfully against
+            // it, so future/bogus versions report absent instead of being claimed.
+            let claimed: (u64, u64) = (0, 11);
+            Ok(if let Some(ver) = feature.strip_prefix("nvim-") {
+                // `nvim-X.Y[.Z]`: numeric compare against the claimed level.
+                let mut parts = ver.split('.');
+                let major = parts.next().and_then(|p| p.parse::<u64>().ok());
+                let minor = parts.next().and_then(|p| p.parse::<u64>().ok());
+                match (major, minor) {
+                    (Some(mj), Some(mn)) => (mj, mn) <= claimed,
+                    _ => false, // unparseable (`nvim-x`) — absent
+                }
             } else {
-                0
-            })
+                match feature.as_str() {
+                    // Real platform features answer from the build target; anything
+                    // else — the thousands of features bemtvi does not model — is
+                    // absent (0), the honest answer for a feature it cannot back: a
+                    // plugin gated on it takes the fallback path, not the one bemtvi
+                    // would silently mis-serve.
+                    "nvim" => true,
+                    "unix" => cfg!(target_family = "unix"),
+                    "mac" | "macunix" => cfg!(target_os = "macos"),
+                    "linux" => cfg!(target_os = "linux"),
+                    "win32" => cfg!(windows),
+                    "win64" => cfg!(all(windows, target_pointer_width = "64")),
+                    "gui_running" => false, // a TUI, like nvim
+                    _ => false,
+                }
+            } as i64)
         })?,
     )?;
     vim.set("fn", func)?;
@@ -1416,9 +1447,13 @@ pub(crate) fn install_runtime_api(
                     }
                 }
             }
+            // The `btv._cwd` mirror is set by the server before any Lua runs; this
+            // fallback only serves the tiny window before it. A real failure is loud,
+            // never a silent "" — an empty cwd corrupts every relative-path consumer.
             Ok(std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default())
+                .map_err(|e| mlua::Error::RuntimeError(format!("getcwd: {e}")))?
+                .to_string_lossy()
+                .into_owned())
         })?,
     )?;
 
@@ -2921,7 +2956,9 @@ pub(crate) fn install_runtime_api(
                         end_lnum: d.get("end_lnum").unwrap_or(lnum),
                         end_col: d.get("end_col").unwrap_or(col),
                         severity: d.get("severity").unwrap_or(1),
-                        message: d.get("message").unwrap_or_default(),
+                        // Required: the prelude always sends it (defaulting to ""), so
+                        // an absent one is a malformed entry, not an empty message.
+                        message: d.get("message")?,
                         source: d.get("source").ok(),
                         // `vim.diagnostic.set` has no server behind it; the round
                         // trip back out reports it as client-set, not as some
@@ -3309,7 +3346,7 @@ pub(crate) fn install_runtime_api(
                 filters,
             ) = args;
             let (filterable, include, exclude, filters_open, include_history, exclude_history) =
-                filters_from_table(filters.as_ref());
+                filters_from_table(filters.as_ref())?;
             sh.borrow_mut().picker_opens.push(PickerOpenReq {
                 dynamic,
                 width: width.unwrap_or_default(),

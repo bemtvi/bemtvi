@@ -315,7 +315,15 @@ function btv.http.mount(opts)
     -- Register BEFORE the bridge: the actor can route a request to this mount as soon as
     -- the listener is up, and the reply arrives on a later tick either way.
     btv._http_mounts[id] = { on_request = opts.on_request, name = name, timeout = timeout }
-    btv._http_mount(id, name, timeout)
+    -- If the bridge throws (a conversion error), drop BOTH registrations: the
+    -- callback could never fire, and the mount table describes a listener that
+    -- does not exist. Rethrow so the promise executor rejects.
+    local ok, err = pcall(btv._http_mount, id, name, timeout)
+    if not ok then
+      btv._cb_fns[id] = nil
+      btv._http_mounts[id] = nil
+      error(err, 0)
+    end
   end)
 end
 

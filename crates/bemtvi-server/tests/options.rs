@@ -1411,3 +1411,86 @@ async fn vim_go_reads_every_mirrored_window_option() {
     .await;
     assert_eq!(win.as_str().unwrap_or_default(), "false|1");
 }
+
+// -------------------------------------------------- the indent widths are bounded
+//
+// `'tabstop'` / `'shiftwidth'` / `'softtabstop'` feed `" ".repeat(n)` fills and
+// `fill_indent`'s tab loop, so an unbounded value turns the next `<Tab>` or `>>`
+// into a capacity-overflow panic (or an OOM). vim caps `tabstop` at 9999 and merely
+// *accepts* an absurd `shiftwidth`, then hangs inserting that many spaces; bemtvi
+// refuses all three above 10000, loudly.
+
+#[tokio::test]
+async fn an_absurd_tabstop_is_refused_loudly() {
+    let (rpc, mut incoming) = start().await;
+    let before = exec_lua(&rpc, "return vim.bo.tabstop").await.as_i64();
+    let msg = set_message(&rpc, &mut incoming, "tabstop=100000").await;
+    assert!(
+        msg.contains("E474"),
+        "an out-of-range 'tabstop' must fail loud, got {msg:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.tabstop").await.as_i64(),
+        before,
+        "the refused value must leave the option untouched"
+    );
+}
+
+#[tokio::test]
+async fn an_absurd_shiftwidth_is_refused_loudly() {
+    let (rpc, mut incoming) = start().await;
+    let msg = set_message(&rpc, &mut incoming, "shiftwidth=999999").await;
+    assert!(msg.contains("E474"), "got {msg:?}");
+}
+
+#[tokio::test]
+async fn an_absurd_softtabstop_is_refused_loudly() {
+    let (rpc, mut incoming) = start().await;
+    let msg = set_message(&rpc, &mut incoming, "softtabstop=50000").await;
+    assert!(msg.contains("E474"), "got {msg:?}");
+}
+
+#[tokio::test]
+async fn a_large_but_allowed_tabstop_is_accepted() {
+    // The boundary the other way: 10000 is in range, so the cap must not reject
+    // every big-but-legal value.
+    let (rpc, mut incoming) = start().await;
+    let msg = set_message(&rpc, &mut incoming, "tabstop=10000").await;
+    assert!(!msg.contains("E474"), "10000 is in range, got {msg:?}");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo.tabstop").await.as_i64(),
+        Some(10000),
+    );
+}
+
+#[tokio::test]
+async fn a_huge_tabstop_written_from_lua_is_clamped_not_fatal() {
+    // The `vim.bo` bridge follows this crate's ignore-garbage convention rather
+    // than failing loud, but it must still not leave a value that panics the next
+    // indent fill.
+    let (rpc, _i) = start().await;
+    exec_lua(&rpc, "vim.bo.tabstop = 100000000").await;
+    let ts = exec_lua(&rpc, "return vim.bo.tabstop").await.as_i64();
+    assert!(
+        ts.is_some_and(|n| (1..=10000).contains(&n)),
+        "a Lua-written 'tabstop' must be clamped into range, got {ts:?}"
+    );
+    // And the editor survives actually using it.
+    command(&rpc, "normal! i\t").await;
+    assert!(
+        exec_lua(&rpc, "return 1").await.as_i64() == Some(1),
+        "still alive"
+    );
+}
+
+#[tokio::test]
+async fn foldnestmax_zero_is_accepted() {
+    // vim allows `foldnestmax=0` (it collapses every fold); it used to be rejected
+    // here as "must be positive" alongside the genuinely-1-minimum options.
+    let (rpc, mut incoming) = start().await;
+    let msg = set_message(&rpc, &mut incoming, "foldnestmax=0").await;
+    assert!(
+        !msg.contains("E487"),
+        "`foldnestmax=0` is legal in vim, got {msg:?}"
+    );
+}

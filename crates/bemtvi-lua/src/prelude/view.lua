@@ -222,6 +222,7 @@ function btv._run_view_restores()
   btv._maybe_collapse_view_restores()
 end
 
+btv._view_restore_pending_loads = btv._view_restore_pending_loads or 0
 -- Orphan collapse coordinator. A reserved slot no plugin adopts must eventually collapse (its
 -- placeholder window lingers empty otherwise), but only once no plugin can still claim it.
 -- Two facts gate that: the boot push dispatch has run (synchronous handlers had their turn —
@@ -231,7 +232,6 @@ end
 -- `btv._view_restore_pending_loads` and calls this as each load settles. When both hold,
 -- enqueue the collapse — harmless to call repeatedly, since core reaps the pending list once
 -- and any later call finds it empty.
-btv._view_restore_pending_loads = btv._view_restore_pending_loads or 0
 function btv._maybe_collapse_view_restores()
   if not btv._view_restore_boot_ran then
     return

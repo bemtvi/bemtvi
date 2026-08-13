@@ -260,11 +260,26 @@ pub struct Extmark {
     pub end_right_gravity: bool,
 }
 
-/// Marks within one namespace, plus that namespace's monotonic id allocator.
+/// Marks within one namespace, plus that namespace's monotonic id allocator and
+/// a structural-mutation counter.
+///
 /// Ids are never reused, matching neovim (a deleted id is gone for good).
+///
+/// `marks` is keyed by *id*, so [`ExtmarkStore::shift`]'s per-edit walk covers
+/// every mark in the namespace — O(E), the honest bound (an anchor's new
+/// position depends only on its own anchors and the edit, so a position index
+/// cannot reduce the walk below one visit per mark, and per-mark index
+/// maintenance measured 59x slower in round 3). The `gen` counter, bumped by
+/// every structural mutation and untouched by shifts, lets a caller prove the
+/// marks are the ones *it* placed (see the diagnostics anchor-trust guard in
+/// `bemtvi-server`): an undo that restores an older snapshot of the store
+/// restores its older `gen` too.
 #[derive(Debug, Default, Clone)]
 struct NsMarks {
     marks: BTreeMap<u64, Extmark>,
+    /// Structural-mutation counter: bumped by `set` / `del` / `clear` /
+    /// `clear_all` / `move_namespace_into`, never by [`ExtmarkStore::shift`].
+    gen: u64,
     next_id: u64,
 }
 
@@ -345,12 +360,20 @@ impl ExtmarkStore {
         let slot = self.by_ns.entry(ns).or_default();
         let id = match id {
             Some(id) => {
-                slot.next_id = slot.next_id.max(id + 1);
+                // A caller-supplied id must not roll the counter backwards, but
+                // `id + 1` would wrap (and panic in debug) on `u64::MAX` — a
+                // malicious/errored plugin id must not take the store down.
+                slot.next_id = slot.next_id.max(id.saturating_add(1));
                 id
             }
             None => {
+                // Saturate, never wrap: a caller-supplied `u64::MAX` id parks the
+                // counter there (above), and `+= 1` from `u64::MAX` would panic in
+                // debug and wrap to 0 in release — silently re-issuing id 0 over an
+                // existing mark. At the parked value every auto-id returns
+                // `u64::MAX`, replacing only that one mark; no other id is touched.
                 let id = slot.next_id;
-                slot.next_id += 1;
+                slot.next_id = slot.next_id.saturating_add(1);
                 id
             }
         };
@@ -369,6 +392,7 @@ impl ExtmarkStore {
         // `insert` hands back whatever occupied this id, which is the only way to
         // know whether the count should also drop for a mark just overwritten.
         let lost = replaced.as_ref().is_some_and(has_virt_lines);
+        slot.gen += 1;
         self.virt_lines_marks = self.virt_lines_marks + usize::from(gained) - usize::from(lost);
         id
     }
@@ -382,7 +406,13 @@ impl ExtmarkStore {
     pub fn del(&mut self, ns: u32, id: u64) -> bool {
         self.generation += 1;
         let removed = match self.by_ns.get_mut(&ns) {
-            Some(slot) => slot.marks.remove(&id),
+            Some(slot) => match slot.marks.remove(&id) {
+                Some(m) => {
+                    slot.gen += 1;
+                    Some(m)
+                }
+                None => None,
+            },
             None => None,
         };
         if removed.as_ref().is_some_and(has_virt_lines) {
@@ -403,6 +433,7 @@ impl ExtmarkStore {
             None => {
                 let dropped = slot.marks.values().filter(|m| has_virt_lines(m)).count();
                 slot.marks.clear();
+                slot.gen += 1;
                 self.virt_lines_marks -= dropped;
             }
             Some(r) => {
@@ -410,12 +441,16 @@ impl ExtmarkStore {
                 // `retain` already visits every mark, so the bookkeeping is free.
                 let mut dropped = 0usize;
                 slot.marks.retain(|_, m| {
-                    let keep = !r.contains(&m.start);
-                    if !keep && has_virt_lines(m) {
-                        dropped += 1;
+                    if r.contains(&m.start) {
+                        if has_virt_lines(m) {
+                            dropped += 1;
+                        }
+                        false
+                    } else {
+                        true
                     }
-                    keep
                 });
+                slot.gen += 1;
                 self.virt_lines_marks -= dropped;
             }
         }
@@ -470,6 +505,15 @@ impl ExtmarkStore {
     /// placed, leaving a bookkeeping count that no longer describes it.
     pub fn ns_len(&self, ns: u32) -> usize {
         self.by_ns.get(&ns).map_or(0, |s| s.marks.len())
+    }
+
+    /// The namespace's structural-mutation counter — what the marks' placement
+    /// recorded after its last `set`. The diagnostics anchor-trust guard compares
+    /// it to the recorded value to reject a store an undo resurrected from before
+    /// the placement (its older `gen` fails the equality) while edits that only
+    /// *shift* marks pass (a shift never bumps `gen`).
+    pub fn ns_generation(&self, ns: u32) -> u64 {
+        self.by_ns.get(&ns).map_or(0, |s| s.gen)
     }
 
     /// Every mark of namespace `ns`, **in ascending id order** (the store keys each
@@ -531,6 +575,15 @@ impl ExtmarkStore {
         if old_end == start && new_end == start {
             return; // no-op edit
         }
+        // A mark's new anchors depend only on its own anchors and the edit (each
+        // gravity fn is applied per anchor), so the walk is a flat pass over every
+        // mark — O(E) per namespace, which the never-freeze rule measures and the
+        // round-3 benchmark confirmed is the fastest shape: a position index
+        // cannot skip the walk (an anchor strictly below the edit is unchanged,
+        // but discovering that costs a visit), and per-mark index maintenance
+        // measured 59x slower. `gen` is deliberately NOT bumped: a shift is not a
+        // structural mutation, and the diagnostics anchor-trust guard relies on
+        // `gen` surviving edits.
         for slot in self.by_ns.values_mut() {
             for m in slot.marks.values_mut() {
                 m.start = if m.right_gravity {
@@ -552,25 +605,32 @@ impl ExtmarkStore {
     }
 }
 
-/// Right-gravity anchor shift: an anchor exactly at the edit's `start` slides
-/// with inserted text (stays to its right).
+/// Right-gravity anchor shift, mirroring neovim's `extmark_adjust`: an anchor
+/// inside the replaced region `[start, old_end)` — including one exactly at
+/// `start`, the region's left edge — lands at `new_end` (the new text is
+/// "typed at" the anchor, so right-gravity pushes it past). For a pure
+/// deletion (`new_end == start`) that is the collapse-to-deletion-point case.
 fn shift_right_gravity(p: usize, start: usize, old_end: usize, new_end: usize) -> usize {
     if p < start {
         p
     } else if p < old_end {
-        start // inside deleted region → collapse to the deletion point
+        new_end // inside replaced region → its new end (== start for a pure deletion)
     } else {
         // p >= old_end (includes p == start for a pure insertion)
         (p as isize + (new_end as isize - old_end as isize)) as usize
     }
 }
 
-/// Left-gravity anchor shift: an anchor exactly at the edit's `start` (the
-/// insertion point) stays put.
+/// Left-gravity anchor shift, mirroring neovim's `extmark_adjust`: an anchor
+/// exactly at the edit's `start` (the insertion point) stays put; one strictly
+/// inside the replaced region collapses to `start`. An anchor at exactly
+/// `old_end` — the right edge, the start of the *kept* text — shifts by the
+/// delta instead of collapsing (left-gravity: new text is inserted before it,
+/// so it stays at the kept text's new left edge).
 fn shift_left_gravity(p: usize, start: usize, old_end: usize, new_end: usize) -> usize {
     if p <= start {
         p
-    } else if p <= old_end {
+    } else if p < old_end {
         start // inside deleted region → collapse to the deletion point
     } else {
         (p as isize + (new_end as isize - old_end as isize)) as usize

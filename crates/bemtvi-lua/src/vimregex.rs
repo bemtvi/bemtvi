@@ -84,15 +84,19 @@ pub fn compile(pat: &str) -> Result<VimRegex, String> {
 
 /// The next scan offset after a match `[start, end)` when walking the match
 /// sequence. A non-empty match advances past its end; an empty (zero-width) match
-/// would loop forever there, so step one whole char past it.
+/// would loop forever there, so step one whole char past it. The engine is
+/// byte-oriented and can report the empty match on a non-char boundary (e.g. `\zs`
+/// after a look-behind), so round the position up to a boundary before stepping —
+/// `input[end..]` on a mid-char offset would panic (the search.rs `advance` twin).
 fn advance(input: &str, start: usize, end: usize) -> usize {
     if end > start {
         end
     } else {
-        input[end..]
-            .chars()
-            .next()
-            .map_or(end + 1, |c| end + c.len_utf8())
+        let mut at = end;
+        while at < input.len() && !input.is_char_boundary(at) {
+            at += 1;
+        }
+        at + input[at..].chars().next().map_or(1, |c| c.len_utf8())
     }
 }
 

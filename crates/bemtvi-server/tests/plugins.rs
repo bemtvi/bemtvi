@@ -20,7 +20,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, map_get,
-    message, message_after, poll_true, q, redraw_after_matching, spawn, start_attached, temp_dir,
+    message, message_after, poll_true, q, spawn, start_attached, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -4399,12 +4399,37 @@ async fn scoped_clean_refuses_a_name_that_escapes_the_install_root() {
 /// The freshest redraw whose message line contains `needle` — for a verb summary that
 /// an unrelated async notify (the manager's "declared but not installed" report) can
 /// repaint over before the test reads it.
+///
+/// Deliberately NOT [`redraw_after_matching`], which was flaky here: that helper
+/// DISCARDS everything already queued before it looks, then feeds input and waits ~2s
+/// for a *new* matching frame. Both halves are wrong for an async verb summary.
+///
+/// The summary arrives on its own notify, so whether its frame is already queued when
+/// the test gets here is a race against the client's reader task — and the discard
+/// throws it away when it wins. Once it is gone, the only thing that can still match
+/// is the message line surviving until the barrier repaint, so any later notify makes
+/// the wait time out with "no redraw arrived". (Swap this back and add a
+/// `btv.notify` after the verb to see exactly that.) The ~2s bound compounds it: the
+/// reader ferries the wire into `incoming` asynchronously and lags under a full
+/// `cargo test --workspace`, which compiles while it runs — the failure mode
+/// `CLAUDE.md` calls out for these helpers.
+///
+/// So: scan what has already arrived FIRST, and keep nudging with a barrier (each
+/// settles pending work and repaints) on a generous bound. A real regression — a
+/// summary that never says what it skipped — still fails, just later.
 async fn summary_frame(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
     needle: &'static str,
 ) -> Vec<(Value, Value)> {
-    redraw_after_matching(rpc, incoming, "", move |m| message(m).contains(needle)).await
+    for _ in 0..600 {
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| message(m).contains(needle)) {
+            return map;
+        }
+        barrier(rpc).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no redraw carrying {needle:?} in its message line ever arrived");
 }
 
 // a disabled or uninstalled plugin is routine; scoped, a silent "0 plugin(s)" is

@@ -4924,3 +4924,440 @@ async fn formatting_replaces_the_whole_document_when_it_has_no_trailing_newline(
     );
     std::env::remove_var("BEMTVI_LSP_CMD");
 }
+
+// ===================================================== the two legs' bytes must match
+//
+// The native leg builds `didSave` through lsp-types, which SKIPS an absent `text`
+// field entirely. The wasm sync client built the params by hand and sent
+// `"text": null` instead — a different frame for the same event. A server reading it
+// sees a document whose saved text is explicitly null rather than "not included",
+// which the tier-1 remote rule forbids: the same feature must put the same bytes on
+// the wire whichever leg carries it.
+
+/// The `params` of the `n`th recorded `textDocument/didSave`, if it landed.
+fn recorded_did_save(record: &Path, n: usize) -> Option<serde_json::Value> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| {
+            v.get("method").and_then(serde_json::Value::as_str) == Some("textDocument/didSave")
+        })
+        .nth(n)
+        .and_then(|v| v.get("params").cloned())
+}
+
+#[tokio::test]
+async fn did_save_omits_the_text_field_rather_than_sending_null() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_didsave_shape");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let (rpc, _incoming) = open_with_server(&dir, "let balance = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    feed(&rpc, ":w<CR>");
+    assert_eq!(
+        await_did_saves(&rpc, &record, 1).await,
+        1,
+        "the save landed"
+    );
+
+    let params = recorded_did_save(&record, 0).expect("the didSave params were recorded");
+    let obj = params.as_object().expect("didSave params are an object");
+    assert!(
+        obj.contains_key("textDocument"),
+        "the identifier is always sent: {params}"
+    );
+    // The point: absent, not present-and-null. `serde_json` distinguishes the two,
+    // and so does every server reading the frame.
+    assert!(
+        !obj.contains_key("text"),
+        "this server did not ask for the text on save, so the field must be OMITTED \
+         — `\"text\": null` is a different frame: {params}"
+    );
+}
+
+// ================================================= a dying server settles what it owes
+//
+// Requests a server never answers must still settle their `ReqToken`, or the Lua
+// `client:request` promise behind each one hangs for the session.
+//
+// SCOPE, honestly: this pins the PROPERTY, not one mechanism. There are two — an
+// in-flight request degrades through its own socket error, and one still QUEUED in
+// the command channel is drained as the serve loop exits. Removing the drain alone
+// leaves this green, because a test driving the editor from outside cannot reliably
+// get a request to sit in the queue rather than in flight: the loop consumes the
+// channel in order, so a burst issued before a stop is dispatched before it. The
+// queued case is real (a busy loop, a wedged socket) but not externally schedulable.
+
+#[tokio::test]
+async fn requests_queued_behind_a_shutdown_settle_instead_of_leaking() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_dying_settles");
+    // A normal mock: it must ATTACH first, or there is no server to queue behind and
+    // the test passes for the wrong reason.
+    arm_mock(&dir, r#"{ }"#);
+    let (rpc, _incoming) = open_with_server(&dir, "let balance = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server must attach before we can queue behind its shutdown"
+    );
+
+    // Fire a burst of generic requests and IMMEDIATELY stop the server: they land in
+    // the per-server command channel behind the shutdown, so the serve loop exits
+    // with them still queued — the case that used to drop them (and their tokens)
+    // silently, hanging every promise.
+    exec_lua(
+        &rpc,
+        r#"_G.settled = 0
+           _G.issued = 0
+           local c = btv.lsp.clients({ bufnr = 0 })[1]
+           assert(c, "a client must be attached")
+           for _ = 1, 5 do
+             _G.issued = _G.issued + 1
+             btv.async(function()
+               pcall(function()
+                 btv.await(c:request('textDocument/documentSymbol',
+                   { textDocument = { uri = 'file:///x.rs' } }))
+               end)
+               _G.settled = _G.settled + 1
+             end)()
+           end
+           btv.lsp.stop('mock')"#,
+    )
+    .await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.issued").await.as_i64(),
+        Some(5),
+        "the burst was issued against a live client"
+    );
+
+    let mut settled = 0;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        settled = exec_lua(&rpc, "return _G.settled")
+            .await
+            .as_i64()
+            .unwrap_or(0);
+        if settled == 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        settled, 5,
+        "every request queued behind the shutdown must settle — {settled}/5 did, so \
+         the rest leaked their deferred callbacks with the server"
+    );
+}
+
+// ================================== a Lua range with no upper bound must not crash the server
+//
+// `btv.lsp.code_action{ range = … }` takes its rows from Lua, where nothing bounds
+// them — unlike the LSP wire side, which `lsp_pos_to_byte_in` clamps. A row past the
+// document reached `line_start`, which asserts, taking the whole server thread with
+// it: one bad plugin call and the session is gone.
+//
+// This needs an ATTACHED server: the range is only read while harvesting each
+// server's published diagnostics for the request's `context`, so with no server the
+// crashing path is never entered.
+
+#[tokio::test]
+async fn a_code_action_range_past_the_document_does_not_kill_the_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_range_clamp");
+    // A diagnostic to harvest, so the range really is walked against the rope.
+    arm_mock(
+        &dir,
+        r#"{ "diagnostics": [ { "range": { "start": { "line": 0, "character": 0 },
+                                           "end":   { "line": 0, "character": 3 } },
+                                "severity": 1, "message": "boom" } ],
+             "code_action": [ { "title": "fix it" } ] }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let balance = 1\nlet x = 2\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server must attach — the crashing path needs one"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"pcall(function()
+             btv.lsp.code_action({ range = { start_row = 900000, start_col = 0,
+                                             end_row = 900001, end_col = 0 } })
+           end)"#,
+    )
+    .await;
+
+    // The server is still answering. A panicked tick fails this outright with
+    // "rpc connection closed" rather than returning a value.
+    assert_eq!(
+        exec_lua(&rpc, "return 1 + 1").await.as_i64(),
+        Some(2),
+        "the server survived an out-of-range Lua range"
+    );
+    assert_eq!(lines(&rpc).await.len(), 2, "and the buffer is intact");
+}
+
+// ============================ an out-of-spec legend must not take the editor with it
+//
+// A token's modifiers arrive as a BITSET in a u32, so only the first 32 legend entries
+// can ever be set. A server advertising more used to drive `1 << bit` past the type's
+// width while classifying: a panic in debug, and in release a silent wrap to bit 0 —
+// which relabels every token with the FIRST modifier's name. Names past bit 31 are
+// unreachable by construction, so they are skipped rather than classified.
+
+#[tokio::test]
+async fn a_legend_with_more_than_32_modifiers_does_not_kill_the_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_sem_mods");
+    // 40 modifier names — past the 32 a u32 bitset can address. The token sets bit 0
+    // (`m0`), which is inside the addressable range and must still classify.
+    arm_mock(
+        &dir,
+        r#"{
+            "semantic_tokens": {
+                "legend": { "tokenTypes": ["keyword", "variable"],
+                            "tokenModifiers": ["m0","m1","m2","m3","m4","m5","m6","m7","m8","m9","m10","m11","m12","m13","m14","m15","m16","m17","m18","m19","m20","m21","m22","m23","m24","m25","m26","m27","m28","m29","m30","m31","m32","m33","m34","m35","m36","m37","m38","m39"] },
+                "data": [0, 4, 3, 0, 1]
+            }
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
+
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.semantic_tokens.get_at_pos(0, 0, 4)", "1").await,
+        "the token must still decode against an over-long legend"
+    );
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "(btv.lsp.semantic_tokens.get_at_pos(0, 0, 4)[1] or {}).type",
+            "keyword"
+        )
+        .await,
+        "and keep its type"
+    );
+    // The modifier at bit 0 is inside the addressable range, so it is still named —
+    // the cap must skip only the unreachable tail.
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "table.concat((btv.lsp.semantic_tokens.get_at_pos(0, 0, 4)[1] or {}).modifiers or {}, ',')",
+            "m0"
+        )
+        .await,
+        "bit 0 is addressable and must still classify"
+    );
+
+    // And the server is alive: a panicked tick fails this outright.
+    assert_eq!(
+        exec_lua(&rpc, "return 1 + 1").await.as_i64(),
+        Some(2),
+        "the server survived the out-of-spec legend"
+    );
+}
+
+// ================================ a server that attaches late gets text, not history
+//
+// Every edit journals a delta for the LSP sync to replay as `didChange`. A buffer with
+// no attached server has nobody to replay to, so the journal grew with the session's
+// typing; it is dropped now.
+//
+// SCOPE: the drop's purpose is BOUNDED MEMORY, and memory is not observable from here
+// — removing the drops leaves this green, because `didOpen` re-bases the sync anyway.
+// What this pins is the correctness property that makes the drop safe to do at all: a
+// server attaching late is given the text as it stands, and NOT that text plus a
+// replay of the history behind it, which would apply every edit twice.
+
+/// The recorded `didChange` notifications for `uri`, oldest first.
+fn recorded_did_changes(record: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| {
+            v.get("method").and_then(serde_json::Value::as_str) == Some("textDocument/didChange")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_server_attaching_after_edits_receives_the_text_not_a_replay() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_late_attach");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+
+    // Open the buffer with NO server, and type into it. Each keystroke journals a
+    // delta that nothing can consume.
+    let file_path = dir.join("a.rs");
+    std::fs::write(&file_path, "start\n").expect("write test file");
+    let init = ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    feed(&rpc, "ggIedited ");
+    feed(&rpc, "<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["edited start"], "the edits landed");
+
+    // Now attach a server. Its `didOpen` must carry the CURRENT text…
+    exec_lua(
+        &rpc,
+        "btv._lsp_start('mock', { 'placeholder' }, vim.fn.getcwd(), 'rust', \
+         vim.api.nvim_get_current_buf(), nil, nil, nil)",
+    )
+    .await;
+    let text = await_did_open_text(&rpc, &record).await;
+    assert_eq!(
+        text, "edited start\n",
+        "didOpen carries the text as it stands, which already includes the edits"
+    );
+
+    // …and nothing may follow it replaying the history those edits journaled.
+    for _ in 0..8 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let changes = recorded_did_changes(&record);
+    assert!(
+        changes.is_empty(),
+        "the pre-attach journal must be dropped, not replayed on top of didOpen — \
+         the server would apply every edit twice: {changes:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_attached_server_still_gets_its_deltas() {
+    // The control: dropping the journal when nobody wants it must not stop it
+    // reaching a server that does.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_live_deltas");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let (rpc, _incoming) = open_with_server(&dir, "start\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    feed(&rpc, "ggIedited ");
+    feed(&rpc, "<Esc>");
+    let mut changes = Vec::new();
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        changes = recorded_did_changes(&record);
+        if !changes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !changes.is_empty(),
+        "an attached server must still receive the edits as didChange"
+    );
+}
+
+// ============================ a server that spawns but never speaks must not wedge us
+//
+// A language server that accepts its pipe and then goes silent is NOT caught by the
+// usual death detection — the process is alive, so nothing ever reports an exit. The
+// supervisor bounds the handshake (`INIT_GRACE`) and kills such a child, so its
+// per-server task cannot be held for the session with commands piling up behind it.
+//
+// SCOPE, and it is narrow: what a black-box test can show is that the editor stays
+// usable and never presents the silent server as attached. The GRACE itself has no
+// observable I could find — with the timeout arm removed the editor still recovers
+// and the name can still be re-taken, so a test of the 30s bound would only be
+// measuring the wall clock. Both halves are asserted below; the bound is not.
+
+#[tokio::test]
+async fn a_server_that_never_answers_initialize_does_not_wedge_the_editor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_init_silent");
+    arm_mock(&dir, r#"{ "never_answer_initialize": true }"#);
+    let (rpc, _incoming) = open_with_server(&dir, "let x = 1\n").await;
+
+    // It never attaches — there is no handshake to complete — and must never be
+    // reported as if it had.
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "0").await,
+        "a silent server must not present as attached"
+    );
+
+    // And the editor is entirely usable meanwhile: the silent child must not block
+    // a tick, an edit, or a later request.
+    feed(&rpc, "ggIedited ");
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["edited let x = 1"],
+        "editing must not wait on a server that will never answer"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return 1 + 1").await.as_i64(),
+        Some(2),
+        "and the tick is still serving"
+    );
+}
+
+// ==================================== a wedged shutdown does not hang the teardown
+//
+// The graceful stop sends `shutdown` then `exit`. A server that answers neither would
+// hang the serve loop — and with it the child's reaping and the exit event the editor
+// drops its client on — until the process ends. The handshake out is bounded the same
+// way the handshake in is: past `SHUTDOWN_GRACE` the child is killed regardless.
+//
+// SCOPE: as with `INIT_GRACE` above, this pins the property (stopping a wedged server
+// leaves its name usable) and not the bound — with the timeout removed the restart
+// still succeeds, so the grace has no observable of its own from out here.
+
+#[tokio::test]
+async fn stopping_a_server_that_never_answers_shutdown_frees_its_name() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_shutdown_grace");
+    arm_mock(&dir, r#"{ "never_answer_shutdown": true }"#);
+    let (rpc, _incoming) = open_with_server(&dir, "let x = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#btv.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // `stop` drops the editor's client immediately, so that is NOT the observable —
+    // what depends on the grace is the serve loop behind it ending, which is what
+    // frees the name. Make the next spawn healthy and ask for the server again.
+    exec_lua(&rpc, "btv.lsp.stop('mock')").await;
+    std::fs::write(dir.join("mock.json"), "{}").expect("rewrite mock script");
+
+    let mut back = false;
+    for _ in 0..150 {
+        exec_lua(
+            &rpc,
+            "btv._lsp_start('mock', { 'placeholder' }, vim.fn.getcwd(), 'rust', \
+             vim.api.nvim_get_current_buf(), nil, nil, nil)",
+        )
+        .await;
+        if exec_lua(&rpc, "return #btv.lsp.clients({ bufnr = 0 })")
+            .await
+            .as_i64()
+            == Some(1)
+        {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        back,
+        "a server that never answers `shutdown` must still be torn down — its serve \
+         loop holds the name until it ends, so an open-ended wait swallows every \
+         later start for that server"
+    );
+}

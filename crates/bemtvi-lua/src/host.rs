@@ -106,7 +106,10 @@ pub(crate) fn seed_package_path(lua: &mlua::Lua, runtimepath: &[PathBuf]) -> mlu
         .named_registry_value::<mlua::Value>(STOCK_PATH_KEY)?
         .is_nil()
     {
-        let stock: String = package.get("path").unwrap_or_default();
+        // A non-string `package.path` here means a plugin already corrupted it before
+        // the first seed — failing loud beats silently storing "" as the "stock" path,
+        // which would permanently lose the system tail from every later rebuild.
+        let stock: String = package.get("path")?;
         lua.set_named_registry_value(STOCK_PATH_KEY, stock)?;
     }
     let stock: String = lua.named_registry_value(STOCK_PATH_KEY).unwrap_or_default();

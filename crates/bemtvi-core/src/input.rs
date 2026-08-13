@@ -282,14 +282,17 @@ pub fn parse_keys_raw(input: &str) -> Vec<Key> {
 }
 
 fn parse_keys_inner(input: &str, fold_aliases: bool) -> Vec<Key> {
-    let chars: Vec<char> = input.chars().collect();
+    // Walk the input by byte index over `&str` slices — the per-key path (every
+    // live input event) must not allocate a `Vec<char>` of the whole input nor a
+    // `String` per `<...>` form, both of which the old char-vec version did.
     let mut out = Vec::new();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '<' {
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '>') {
-                let inner: String = chars[i + 1..i + 1 + end].iter().collect();
-                if let Some(key) = parse_special(&inner) {
+    while i < input.len() {
+        let c = input[i..].chars().next().expect("i is a char boundary");
+        if c == '<' {
+            if let Some(rel) = input[i + 1..].find('>') {
+                let inner = &input[i + 1..i + 1 + rel];
+                if let Some(key) = parse_special(inner) {
                     // The fold collapses `<C-i>`→`<Tab>` &c.; the raw path keeps
                     // them distinct (protocol-on terminals). A raw *control byte*
                     // (below) already arrives as its named key, so it needs neither.
@@ -298,7 +301,7 @@ fn parse_keys_inner(input: &str, fold_aliases: bool) -> Vec<Key> {
                     } else {
                         key
                     });
-                    i += end + 2;
+                    i += rel + 2;
                     continue;
                 }
                 // `<lt>` is the canonical escape for a literal '<'.
@@ -309,8 +312,8 @@ fn parse_keys_inner(input: &str, fold_aliases: bool) -> Vec<Key> {
             // A raw control byte (0x00–0x1f) that `nvim_replace_termcodes` emitted
             // is decoded back into its key event, so a feed string built with
             // `replace_termcodes` round-trips through `nvim_feedkeys`.
-            out.push(key_from_control_byte(chars[i]).unwrap_or_else(|| Key::char(chars[i])));
-            i += 1;
+            out.push(key_from_control_byte(c).unwrap_or_else(|| Key::char(c)));
+            i += c.len_utf8();
         }
     }
     out

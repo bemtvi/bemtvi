@@ -366,7 +366,9 @@ function btv.treesitter.highlight(lang, text)
     btv._cb_fns[id] = function(_err, spans)
       resolve(spans or {})
     end
-    btv._ts_highlight(lang or "", text or "", id)
+    btv._bridge(id, function()
+      btv._ts_highlight(lang or "", text or "", id)
+    end)
   end)
 end
 

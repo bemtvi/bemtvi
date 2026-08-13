@@ -532,6 +532,22 @@ pub struct WindowView {
     pub colorcolumn: Vec<usize>,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
+    /// The window's **text-area** width in cells: the content box minus every
+    /// left gutter the client carves off — the fold column, the sign column,
+    /// then the number gutter (the same `width` the projection sizes its rows
+    /// to). Consumers that must match what the client paints (the menu box
+    /// placement, mouse hit-testing) use this, not `rect.width` minus the
+    /// number gutter alone, which would overstate the text width whenever a
+    /// fold or sign column is shown.
+    pub text_width: usize,
+    /// Width in cells of every left gutter the client carves off before the text
+    /// body — the fold column, the sign column, then the number gutter (exactly
+    /// the terms [`text_width`](WindowView::text_width) subtracts from the content
+    /// box). The client's text-body origin is the content origin plus this many
+    /// cells, so a consumer anchoring to the painted text inner (the menu box's
+    /// x-position) adds this, not the number gutter alone, which would land the
+    /// box (fold + sign) cells left of the caret whenever either column shows.
+    pub left_gutters: usize,
     /// `'foldcolumn'` width in cells (`0` when off) — how many cells the client
     /// reserves for the fold-marker gutter, to the left of the sign / number
     /// columns. The per-row markers are in [`foldcolumn`](WindowView::foldcolumn).
@@ -872,6 +888,11 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .saturating_sub(w.options.foldcolumn)
         .saturating_sub(signcol_cells(w.sign_width, &w.options))
         .saturating_sub(number_width);
+    // The left-gutter total the client carves off before the text body (fold +
+    // sign + number, the same terms `width` subtracts). A consumer matching the
+    // painted text inner — the menu box's x-anchor — must offset the content
+    // origin by all three, not just the number gutter.
+    let left_gutters = content_width.saturating_sub(width);
     let top = w.top;
     // A stashed cursor may sit past a buffer that shrank while this window was
     // inactive; clamp it for the rendered ruler / cursor row.
@@ -1054,7 +1075,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     let cursor_folded = collapsed.iter().any(|f| f.contains(cur_line));
     let (cursor_extra_rows, cursor_seg_col, cursor_prefix) = if wrap && width > 0 && !cursor_folded
     {
-        let line = buf.line(cur_line);
+        // `line_cow` borrows the rope chunk (no copy) when the line is contiguous —
+        // the per-frame projection must not copy a huge wrapped line per window.
+        let line = buf.line_cow(cur_line);
         let indent = unicode::cont_indent(&line, tabstop, width, wp);
         let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent);
         let idx = segs
@@ -1068,7 +1091,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         (0, 0, 0)
     };
     let (cursor_screen_col, cursor_width) = {
-        let line = buf.line(cur_line);
+        let line = buf.line_cow(cur_line);
         let tab = buf.options.effective_tabstop();
         (
             unicode::virtcol(&line, w.cursor.col, tab).saturating_sub(cursor_seg_col)
@@ -1088,7 +1111,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 // off-screen) — not `line - top`, which ignores virtual rows.
                 let row = screen_row_of(&rows, line)?;
                 let col = byte - buf.line_start(line);
-                let s = buf.line(line);
+                let s = buf.line_cow(line);
                 let screen_col = unicode::virtcol(&s, col, buf.options.effective_tabstop());
                 Some((row, screen_col))
             })
@@ -1202,6 +1225,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         cursorline: w.options.cursorline,
         colorcolumn: w.options.colorcolumns(),
         number_width,
+        text_width: width,
+        left_gutters,
         foldcolumn_width,
         foldcolumn,
         signcolumn: w.options.signcolumn,
@@ -1448,7 +1473,7 @@ fn row_skeleton(
         // The buffer line's display rows: a single row at `nowrap`, else one per
         // soft-wrap segment. Each carries its byte slice and the screen column it
         // begins at (`start_col`), which `render_rows` uses to clip overlays.
-        let text = buf.line(buf_line);
+        let text = buf.line_cow(buf_line);
         if wrap {
             // The `'breakindent'` / `'showbreak'` prefix on this line's continuation
             // rows; segments wrap into `width - prefix` cells (the first row keeps the
@@ -1487,7 +1512,8 @@ fn row_skeleton(
                     line: buf_line,
                     start_col: 0,
                 },
-                text,
+                // The row owns its text — only the wrap path above could borrow.
+                text.into_owned(),
                 None,
                 usize::MAX,
                 0,

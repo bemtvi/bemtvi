@@ -57,6 +57,29 @@ function btv._next_cb_id()
   return btv._cb_seq
 end
 
+-- `btv._bridge(id, call, cleanup)`: run the Rust bridge `call` (a closure) with the
+-- promise's callback already registered under `id`. The op surfaces call this right
+-- after registering — if the bridge itself throws (an arg-conversion error, a nil
+-- bridge in a session that does not route the op), the entry would otherwise sit in
+-- `btv._cb_fns` forever: the callback only ever fires through `btv._run_cb`, which the
+-- error path never reaches. Drop the dead entry (plus any *other* registry the op
+-- wrote before the call, via the optional `cleanup(id)`), then rethrow so the
+-- enclosing promise executor (`btv.promise.new` pcalls it) still turns the throw
+-- into a rejection. Streams that register a pump alongside the one-shot callback
+-- (`btv.fs.watch`'s `_fs_watch_fns`, `btv.run_stream`'s `_stdout_fns`,
+-- `btv.process.open`'s / `btv.socket.connect`'s `_proc_handlers`/`_sock_handlers`)
+-- pass `cleanup` so a conversion throw leaks neither registry.
+function btv._bridge(id, call, cleanup)
+  local ok, err = pcall(call)
+  if not ok then
+    btv._cb_fns[id] = nil
+    if cleanup then
+      cleanup(id)
+    end
+    error(err, 0)
+  end
+end
+
 -- Run the callback registered under `id`, forwarding any extra args. `keep` is
 -- false for one-shots (`vim.schedule`, `defer_fn`, a system on_exit) — the entry is
 -- dropped *before* the call so a throwing or re-scheduling callback still leaves

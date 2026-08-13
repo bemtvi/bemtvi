@@ -30,6 +30,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -254,19 +255,77 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
         stream_local_process(child, kill_rx, events).await;
         return;
     }
-    let (code, stdout, stderr) = tokio::select! {
-        result = child.wait_with_output() => match result {
-            Ok(out) => (out.status.code().unwrap_or(-1), out.stdout, out.stderr),
-            Err(e) => (-1, Vec::new(), e.to_string().into_bytes()),
-        },
-        _ = &mut kill_rx => (
-            // The `wait_with_output` future is dropped here, dropping the child,
+    // Collect stdout/stderr concurrently — never let a child that writes a lot
+    // deadlock against an unread pipe while we wait for its exit. Then bound the
+    // trailing EOF wait: `wait_with_output` waits for *pipe EOF*, and a forked
+    // grandchild holding an inherited write end would hang the exit — and with it
+    // `btv.run`'s `on_exit` — forever. The exit itself is unbounded (long builds
+    // are legitimate); only the output drain is bounded, the way the LSP flush
+    // bounds its drain (daemon.rs `serve_one_lsp`). On timeout the tail is dropped
+    // loudly, never silently.
+    let stdout_task = child.stdout.take().map(|mut out| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let stderr_task = child.stderr.take().map(|mut err| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let status = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = &mut kill_rx => {
+            // The `child.wait()` future is dropped here, dropping the child,
             // whose `kill_on_drop` terminates it. `on_exit` still fires (code -1).
-            -1,
-            Vec::new(),
-            b"vim.system: process killed".to_vec(),
-        ),
+            None
+        }
     };
+    let Some(status) = status else {
+        for task in [stdout_task, stderr_task].into_iter().flatten() {
+            task.abort();
+        }
+        events.exited(-1, Vec::new(), b"vim.system: process killed".to_vec());
+        return;
+    };
+    let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+    let mut timed_out = false;
+    let stdout = match stdout_task {
+        Some(mut task) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await {
+                Ok(Ok(buf)) => buf,
+                // The collector itself failed (read error) or the bound fired.
+                Ok(Err(_)) | Err(_) => {
+                    task.abort();
+                    timed_out = true;
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    let mut stderr = match stderr_task {
+        Some(mut task) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await {
+                Ok(Ok(buf)) => buf,
+                Ok(Err(_)) | Err(_) => {
+                    task.abort();
+                    timed_out = true;
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    if timed_out {
+        stderr.extend_from_slice(
+            b"vim.system: timed out draining the process output (a descendant may hold the pipe)",
+        );
+    }
     events.exited(code, stdout, stderr);
 }
 
@@ -281,7 +340,7 @@ async fn stream_local_process(
     mut kill_rx: oneshot::Receiver<()>,
     events: ProcEvents,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Collect stderr concurrently in a detached task so a child that writes a lot
     // of stderr can't deadlock against the stdout reader (both pipes full). The
@@ -340,8 +399,19 @@ async fn stream_local_process(
     };
     let stderr = match stderr_task {
         // Natural exit: wait for stderr EOF (every writer closed the pipe), so the
-        // exit result carries the whole stream — `wait_with_output` parity.
-        Some(handle) if !killed => handle.await.unwrap_or_default(),
+        // exit result carries the whole stream — `wait_with_output` parity. Bounded
+        // the way the non-streaming path bounds its drain: a forked grandchild
+        // holding the write end would otherwise hang the exit forever on EOF.
+        Some(mut handle) if !killed => {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle).await {
+                Ok(Ok(buf)) => buf,
+                Ok(Err(_)) | Err(_) => {
+                    handle.abort();
+                    b"vim.system: timed out draining stderr (a descendant may hold the pipe)"
+                        .to_vec()
+                }
+            }
+        }
         // Killed: don't block the exit on a pipe a grandchild may hold open; a
         // kill's stderr is best-effort (and was racy-empty before).
         Some(handle) => {

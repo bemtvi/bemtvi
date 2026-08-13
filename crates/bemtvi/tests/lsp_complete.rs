@@ -876,3 +876,63 @@ async fn completion_rows_break_ties_on_the_servers_sort_text() {
          arrived in, got {rows:?}"
     );
 }
+
+// ================================ a cached item's textEdit is only valid for its text
+//
+// A completion item's `textEdit` range is authored against the buffer AS IT WAS when
+// the round was requested. The cache re-serves a complete list while the word grows,
+// which is what makes typing feel instant — but the ranges do not grow with it. Accept
+// one after the text moved and the replacement is spliced into the MIDDLE of the word:
+// `pri` + a `[0,2)` edit leaves `print_value()i`.
+//
+// The dispatch normally re-requests on the keystroke that changed the text, so the
+// cache is refreshed before an accept can see it. An edit that lands WITHOUT a
+// dispatch — a settle-order edit from an autocmd, a paste that did not re-arm the
+// source — leaves the stale range behind, and the accept path is the last line of
+// defence: when the tick has moved it ignores the item's range and falls back to the
+// word replacement, which is recomputed against the live text.
+
+#[tokio::test]
+async fn accepting_after_an_undispatched_edit_does_not_splice_into_the_word() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_stale_tick");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "BEMTVI_LSP_CMD",
+        format!("{BEMTVI_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    // The item's textEdit covers exactly the two typed chars — correct for `pr`,
+    // stale for anything longer.
+    let completion = r#"[ {
+        "label": "print_value",
+        "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 2 } },
+                      "newText": "print_value()" }
+    } ]"#;
+    let (rpc, mut incoming) = start_typed(&dir, completion, "pr").await;
+    await_items(&rpc, &mut incoming, "print_value").await;
+
+    // Grow the word from Lua — a queued buffer write, NOT a keystroke, so the
+    // completion dispatch never sees it and the cache keeps its `pr`-era ranges.
+    exec_lua(&rpc, r#"btv.buf.set_text(0, 0, 2, 0, 2, { "i" })"#).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["pri"],
+        "the undispatched edit landed"
+    );
+
+    feed(&rpc, "<C-y>");
+    // The item's own text replaces the whole live word. Note it is `print_value`,
+    // not the textEdit's `print_value()`: the range is what has gone stale, so the
+    // fallback distrusts the edit entirely rather than re-siting its `newText`.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["print_value"],
+        "the accept must replace the WHOLE live word with the item's own text — \
+         applying the cached [0,2) range instead splices the textEdit into a word \
+         it was never measured against"
+    );
+
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}

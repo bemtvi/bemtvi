@@ -210,6 +210,10 @@ struct LoadRequest {
 /// What a deferred load produced, handed back through [`Engine::install_grammar`].
 struct LoadResult {
     slot: Slot,
+    /// The query-override snapshot the worker compiled against — the diff
+    /// [`Engine::install_grammar`] recompiles against the live map, so an override
+    /// that arrived (or was cleared) while the load was in flight still takes effect.
+    snapshot: QueryOverrides,
 }
 
 /// Run a deferred grammar load — the worker half of [`Engine::defer_loads`]. Pure
@@ -221,11 +225,19 @@ struct LoadResult {
 /// load failure rather than a silent no-op, so the language reports rather than
 /// hanging in [`Slot::Loading`].
 pub fn load_requested(payload: Box<dyn Any + Send>) -> Box<dyn Any + Send> {
-    let slot = match payload.downcast::<LoadRequest>() {
-        Ok(req) => load_slot(&req.root, &req.language, &req.overrides),
-        Err(_) => Slot::Failed("internal: unknown grammar load request".to_string()),
-    };
-    Box::new(LoadResult { slot })
+    match payload.downcast::<LoadRequest>() {
+        Ok(req) => {
+            let slot = load_slot(&req.root, &req.language, &req.overrides);
+            Box::new(LoadResult {
+                slot,
+                snapshot: req.overrides,
+            })
+        }
+        Err(_) => Box::new(LoadResult {
+            slot: Slot::Failed("internal: unknown grammar load request".to_string()),
+            snapshot: QueryOverrides::new(),
+        }),
+    }
 }
 
 /// The load itself, shared by the synchronous path and the deferred worker.
@@ -257,18 +269,21 @@ pub struct Engine {
     // Rust drops fields in declaration order, so `buffers` is declared first.
     buffers: HashMap<BufferId, BufferState>,
     grammars: HashMap<String, Slot>,
-    /// Grammars evicted from `grammars` by [`Engine::reload_grammar`] whose dlopen'd
-    /// library must stay mapped for the rest of the session. A *loaded* grammar's
-    /// library is referenced by every open buffer's `Parser` and `Tree` (built from
-    /// its `Language`) — including a parser left mid-parse, whose external-scanner
+    /// Grammars evicted from `grammars` (a reload, or an install replacing a grammar
+    /// a forced synchronous load had produced) whose dlopen'd library must stay
+    /// mapped while any buffer still points into it. A *loaded* grammar's library is
+    /// referenced by every open buffer's `Parser` and `Tree` built from its
+    /// `Language` — including a parser left mid-parse, whose external-scanner
     /// payload `ts_parser_delete` frees *through* the library when the buffer is
-    /// re-opened or dropped. Dropping the library at reload time would unmap that
-    /// code out from under those live buffers (the same destroy-after-unload SIGSEGV
-    /// the field order guards against at teardown — see `tests/drop_order.rs`), so a
-    /// reload retires the old grammar here instead of dropping it. Declared **after**
-    /// `buffers` for the same reason `grammars` is: it must outlive every parser/tree
-    /// that points into it.
-    retired_grammars: Vec<Slot>,
+    /// re-opened or dropped. Dropping the library while those live would unmap that
+    /// code out from under them (the destroy-after-unload SIGSEGV the field order
+    /// guards against at teardown — see `tests/drop_order.rs`), so the eviction
+    /// sites retire the old grammar here instead of dropping it; the language name
+    /// rides alongside so [`Self::evict_unreferenced_retired`] can tell when the
+    /// last buffer that references it is gone and the library may finally be freed.
+    /// Declared **after** `buffers` for the same reason `grammars` is: it must
+    /// outlive every parser/tree that points into it.
+    retired_grammars: Vec<(String, Slot)>,
     /// Query-text overrides from the resolution bridge, consulted by
     /// [`Grammar::load`] and applied in place by [`Engine::set_query`].
     query_overrides: QueryOverrides,
@@ -439,6 +454,37 @@ impl Engine {
         std::mem::take(&mut self.query_errors.borrow_mut().pending)
     }
 
+    /// Free the retired grammars no open buffer can still reference. A retired
+    /// grammar's dlopen'd library must stay mapped only while a `Parser` or `Tree`
+    /// built from its `Language` is alive, and every such object lives in a buffer's
+    /// parse state — keyed, here, by the language name it was loaded under — so once
+    /// no buffer state names that language, the slot owns nothing reachable and can
+    /// be dropped. Conservative by construction: a buffer of the language — even one
+    /// built from a *newer* grammar of it — keeps every retired copy of the language
+    /// alive, which costs nothing in practice (reloads and install-retires are rare).
+    fn evict_unreferenced_retired(&mut self) {
+        if self.retired_grammars.is_empty() {
+            return;
+        }
+        // Every way a buffer's parse state holds a grammar's code: its own language,
+        // an injected layer's language, and a pending injection's language (its
+        // `Parser` was set to that grammar, and a mid-parse external scanner frees
+        // through the library when it drops). Computed before the `retain` so the
+        // two disjoint field borrows can't collide.
+        let mut live: HashSet<&str> = HashSet::new();
+        for state in self.buffers.values() {
+            live.insert(state.language.as_str());
+            for layer in &state.injections {
+                live.insert(layer.language.as_str());
+            }
+            for pending in &state.pending_injections {
+                live.insert(pending.language.as_str());
+            }
+        }
+        self.retired_grammars
+            .retain(|(lang, _)| live.contains(lang.as_str()));
+    }
+
     /// Lazily load (and cache) the grammar for `lang`, returning its cache slot.
     /// The load — and its outcome (loaded / not-installed / failed) — happens once
     /// per language; later calls are a cache hit.
@@ -476,8 +522,20 @@ impl Engine {
 
     /// The grammar for `lang`, loaded **now** even in deferred mode — for
     /// [`load_language_now`](Self::load_language_now), the ask that cannot wait.
+    ///
+    /// The load is forced only while there is no verdict yet — no slot at all, or a
+    /// [`Slot::Loading`] one whose request is in flight. A cached `Failed` /
+    /// `NotInstalled` verdict is authoritative until [`reload_grammar`](Self::reload_grammar)
+    /// evicts it; retrying it here would re-run the whole load (dlopen + every query
+    /// compile — for a broken grammar, a full compile that then fails) on **every**
+    /// keystroke that forces, e.g. each Enter on a buffer whose grammar is broken.
     fn grammar_now(&mut self, lang: &str) -> &Slot {
-        if self.defer_loads && !matches!(self.grammars.get(lang), Some(Slot::Loaded(_))) {
+        if self.defer_loads
+            && !matches!(
+                self.grammars.get(lang),
+                Some(Slot::Loaded(_) | Slot::Failed(_) | Slot::NotInstalled)
+            )
+        {
             let root = self.root_for(lang).to_path_buf();
             let slot = load_slot(&root, lang, &self.query_overrides);
             self.grammars.insert(lang.to_string(), slot);
@@ -543,34 +601,69 @@ impl Engine {
                 "internal: grammar load result for '{lang}' came back in an unknown form"
             ));
         };
-        let outcome = match &result.slot {
+        let LoadResult { slot, snapshot } = *result;
+        let outcome = match &slot {
             Slot::Failed(reason) => GrammarInstall::Failed(reason.clone()),
             Slot::Loaded(_) => GrammarInstall::Loaded,
             _ => GrammarInstall::Missing,
         };
-        self.grammars.insert(lang.to_string(), result.slot);
+        // The worker's grammar is replacing whatever verdict is cached — a
+        // `Slot::Loading` one in the ordinary flow. But a forced synchronous load
+        // ([`Self::grammar_now`], in front of an indent or text-object ask) can have
+        // replaced that `Loading` with a real `Loaded` grammar while the worker was
+        // still running, and open buffers are already parsing against it. Dropping
+        // that old slot here would unmap its library out from under those buffers —
+        // the destroy-after-unload SIGSEGV [`Self::retired_grammars`] exists to
+        // prevent — so a loaded old slot is retired instead, staying mapped until
+        // the last buffer that references it closes.
+        if let Some(old) = self.grammars.remove(lang) {
+            // Only a loaded slot owns a library that must stay mapped; a Loading /
+            // NotInstalled / Failed slot is simply dropped with the `if let`.
+            if let Slot::Loaded(_) = old {
+                self.retired_grammars.push((lang.to_string(), old));
+            }
+        }
+        self.grammars.insert(lang.to_string(), slot);
 
-        // An override that arrived *while* this was loading missed the snapshot the
+        // An override that changed *while* this was loading missed the snapshot the
         // worker compiled against — the runtimepath bridge resolves a language's
         // queries around the same tick the grammar is asked for, so this is the
-        // ordinary case, not a rare one. Recompile those in place now, or the grammar
-        // would paint (and fold, and indent) from the on-disk query the resolution was
-        // supposed to replace.
-        let overridden: Vec<(String, String)> = self
+        // ordinary case, not a rare one. Recompile in place wherever the live map
+        // differs from the snapshot, in **both** directions — a name that gained an
+        // override, and one whose override was cleared (back to the on-disk query) —
+        // or the grammar would paint (and fold, and indent) from stale text. A name
+        // whose value is unchanged needs no recompile: the worker already compiled
+        // that exact text.
+        let changed: HashSet<String> = self
             .query_overrides
             .keys()
+            .chain(snapshot.keys())
             .filter(|(l, _)| l == lang)
-            .cloned()
+            .filter(|(_, name)| {
+                let key = (lang.to_string(), name.clone());
+                snapshot.get(&key) != self.query_overrides.get(&key)
+            })
+            .map(|(_, name)| name.clone())
             .collect();
-        for (_, name) in overridden {
+        for name in changed {
             let text = self
                 .query_overrides
                 .get(&(lang.to_string(), name.clone()))
                 .cloned();
-            // A broken override is already reported by whoever installed it; here it
-            // just leaves the on-disk query in place.
-            let _ = self.recompile_query(lang, &name, text);
+            // A broken override cannot have been reported by the `set_query` that
+            // stored it: while the slot was `Loading`, that call's in-place recompile
+            // was a no-op, so the error has had no channel until this install. Queue
+            // it for the editor to echo (via `take_query_errors`) rather than
+            // silently leaving the on-disk query in place.
+            if let Err(reason) = self.recompile_query(lang, &name, text) {
+                let mut errors = self.query_errors.borrow_mut();
+                if errors.seen.insert(reason.clone()) {
+                    errors.pending.push(reason);
+                }
+            }
         }
+        // A grammar replaced above is now free if no open buffer still references it.
+        self.evict_unreferenced_retired();
         outcome
     }
 
@@ -899,6 +992,13 @@ impl Engine {
         // Re-derive within each dirty range. A match is returned when it *intersects*
         // the range, and its captured nodes are reported whole, so a region straddling
         // the edge comes back complete rather than clipped.
+        // Dedup through a set, not a linear scan: on a full-document dirty set (a
+        // large paste) every cached region is dropped and every region is re-found,
+        // and `Vec::contains` over a `String + ranges + extent` region makes that
+        // quadratic in the region count. The set is seeded with the survivors so
+        // the semantics are unchanged (a re-found region matching a surviving one is
+        // still suppressed), not just the cross-dirty-range duplicates.
+        let mut seen: HashSet<InjectionRegion> = regions.iter().cloned().collect();
         for d in dirty {
             for found in collect_injection_regions_in(
                 query,
@@ -910,7 +1010,7 @@ impl Engine {
             ) {
                 // A match can be found from more than one dirty range, and one whose
                 // content sits outside the dirty set may survive above as well.
-                if !regions.contains(&found) {
+                if seen.insert(found.clone()) {
                     regions.push(found);
                 }
             }
@@ -1344,7 +1444,12 @@ impl Engine {
 
     /// Forget a buffer's shadow text and parse tree (the editor deleted it).
     pub fn close(&mut self, buffer: BufferId) {
+        // The state drops here — its `Parser` and `Tree` freed *through* the
+        // grammar's library, which the retire list still maps — and may have been
+        // the last reference to a retired grammar, so free that now rather than
+        // holding its library mapped for the whole session.
         self.buffers.remove(&buffer);
+        self.evict_unreferenced_retired();
     }
 
     /// Whether `buffer` still has parse work pending — the root parse cancelled by
@@ -1943,7 +2048,7 @@ impl Engine {
         let query = self.lazy_query(grammar.indents.get(&grammar.language))?;
         let rope = &state.shadow;
         let root = tree.root_node();
-        let maps = build_indent_maps(query, &root, rope);
+        let maps = build_indent_maps(query, &root, rope, line);
         let indent_size = p.shiftwidth as i64;
 
         let line_count = rope.len_lines(LINE_TYPE).saturating_sub(1);
@@ -2194,10 +2299,23 @@ struct IndentMaps {
     zero: HashSet<usize>,
 }
 
-fn build_indent_maps(query: &Query, root: &Node, rope: &Rope) -> IndentMaps {
+fn build_indent_maps(query: &Query, root: &Node, rope: &Rope, line: usize) -> IndentMaps {
     let mut maps = IndentMaps::default();
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
+    // The algorithm only ever consults captured nodes that *start at or above* the
+    // target line — the decision node on `line` (or the previous non-blank line) and
+    // its ancestors — so the capture pass is restricted to those rows: a keystroke
+    // on a big file no longer walks (and collects) the whole tree, and the per-`=`
+    // / per-Enter cost stops scaling with what the buffer holds past the target
+    // line. Restricting can only drop captures of nodes that start below `line`,
+    // which nothing below consults. `line` can point past the last real line (the
+    // rope's phantom tail line); clamp to the real line count so the byte lookup
+    // stays in bounds (the clamped range covers the whole buffer, which is correct
+    // there — every consulted node is above the phantom).
+    let line_count = rope.len_lines(LINE_TYPE).saturating_sub(1);
+    let end_byte = rope.line_to_byte_idx((line + 1).min(line_count), LINE_TYPE);
+    cursor.set_byte_range(0..end_byte);
     let mut caps = cursor.captures(query, *root, node_text_provider(rope));
     while let Some((m, idx)) = caps.next() {
         let cap = m.captures[*idx];
@@ -2305,9 +2423,11 @@ impl SyntaxEngine for Engine {
         // simply dropped.
         if let Some(slot) = self.grammars.remove(lang) {
             if matches!(slot, Slot::Loaded(_)) {
-                self.retired_grammars.push(slot);
+                self.retired_grammars.push((lang.to_string(), slot));
             }
         }
+        // The evicted slot is safe to free now if no open buffer still references it.
+        self.evict_unreferenced_retired();
     }
 
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span> {
@@ -3014,7 +3134,7 @@ fn collect_injection_regions(
 }
 
 /// One top-level injection region-set, as derived from the host's injection query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct InjectionRegion {
     /// The injected language.
     language: String,

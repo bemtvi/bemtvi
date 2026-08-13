@@ -195,14 +195,17 @@ impl Editor {
         let from = replace_from.min(ob.buffer.line_count());
         let start = ob.buffer.line_start(from);
         let len = ob.buffer.len_bytes();
-        ob.buffer.remove(start..len);
-        ob.buffer.insert(start, &text);
+        // One journaled edit, not remove+insert: a single edit's delta folds and
+        // splices on the mirror wire (extmarks shift in place, `on_bytes` consumers
+        // get real byte edits), where a remove+insert pair at the same offset can't
+        // fold and would degrade the whole push to a full-text resync on *every*
+        // flood batch. No `mark_resync` either — that would wipe the extmark layer
+        // and force the full-buffer mirror rebuild the whole path exists to avoid.
+        ob.buffer.replace(start..len, &text);
         ob.buffer.normalize();
-        // The whole rope was swapped, so the highlight/extmark layers must re-sync.
-        ob.buffer.mark_resync();
         // A terminal buffer is never "modified" relative to a backing store — it has
         // none — and these refreshes must not flip the `[+]` flag or arm a write. This
-        // must run *after* `mark_resync`, which sets `modified = true` (it can't tell a
+        // must run *after* the edit, which sets `modified = true` (it can't tell a
         // live-screen mirror from an edit); resetting before it would be clobbered,
         // leaving a live terminal marked modified and blocking `:qa` with `E37`.
         ob.buffer.modified = false;
@@ -300,6 +303,10 @@ impl Editor {
         // (editable) scratch buffer holding the final output — keystrokes no longer
         // forward, and the read-only edit guard lifts.
         ob.buffer.kind = BufferKind::Ordinary;
+        // Remember it hosted a terminal: the server's frozen-color capture for this
+        // dead buffer is torn down only when the buffer is wiped, and a wipe checks
+        // `was_terminal` (the kind no longer says it). See the field's doc.
+        ob.buffer.was_terminal = true;
         if is_current && self.mode == Mode::Terminal {
             self.mode = Mode::Normal;
             self.terminal_pending_backslash = false;

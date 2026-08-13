@@ -322,3 +322,175 @@ async fn typing_does_not_scale_with_the_diagnostic_count() {
          merged list per frame again",
     );
 }
+
+// ================================================ an end-exclusive span ends where it says
+//
+// A multi-line diagnostic's `end` is EXCLUSIVE: `[2,0)-[4,0)` reaches up to row 4, not
+// onto it. The row clip mapped both anchors of a zero-width intersection to 0 and then
+// widened `(0, 0)` into a 1-cell span, so the row *after* the diagnostic grew a phantom
+// squiggle at column 0 — a red mark on a line the server never flagged.
+
+#[tokio::test]
+async fn a_multiline_span_does_not_squiggle_the_row_it_stops_before() {
+    let (rpc, mut inc) = start_with_file(&sample(20)).await;
+    // Rows 2 and 3 are covered; row 4 is where the span ENDS, so it must be clean.
+    set_diag(&rpc, 2, 0, 4, 0).await;
+    let map = frame(&rpc, &mut inc).await;
+
+    let spans = diag_spans(&map);
+    for line in [2usize, 3] {
+        let row = row_of(&map, line);
+        assert!(
+            !spans.get(row).cloned().unwrap_or_default().is_empty(),
+            "line {line} is inside the span and must be underlined: {spans:?}"
+        );
+    }
+    let end_row = row_of(&map, 4);
+    assert!(
+        spans.get(end_row).cloned().unwrap_or_default().is_empty(),
+        "line 4 is the span's EXCLUSIVE end — it must carry no underline, but got \
+         {:?} (a zero-width intersection widened into a phantom 1-cell squiggle)",
+        spans.get(end_row)
+    );
+}
+
+#[tokio::test]
+async fn a_zero_width_diagnostic_still_paints_on_its_own_row() {
+    // The counterpart: a genuinely zero-width diagnostic resting at its own start is
+    // a real mark (a "missing semicolon here" caret), and must survive the guard that
+    // suppresses the phantom one.
+    let (rpc, mut inc) = start_with_file(&sample(20)).await;
+    set_diag(&rpc, 3, 0, 3, 0).await;
+    let map = frame(&rpc, &mut inc).await;
+
+    let row = row_of(&map, 3);
+    assert!(
+        !diag_spans(&map)
+            .get(row)
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "a zero-width diagnostic on its own row is a real mark and must paint"
+    );
+}
+
+// ========================================== a position the LSP wire cannot carry is refused
+//
+// `vim.diagnostic.set` takes i64 positions from Lua; the LSP wire carries u32. An
+// `as u32` truncation maps a huge line number onto a small one and plants a real
+// squiggle on the WRONG line. The whole set is rejected instead, leaving the previous
+// one in force — a plugin bug must not silently relabel the buffer.
+
+#[tokio::test]
+async fn a_diagnostic_past_the_wire_range_is_rejected_without_disturbing_the_old_set() {
+    let (rpc, mut inc) = start_with_file(&sample(20)).await;
+    set_diag(&rpc, 3, 0, 3, 4).await;
+    let map = frame(&rpc, &mut inc).await;
+    let good_row = row_of(&map, 3);
+    assert!(
+        !diag_spans(&map)
+            .get(good_row)
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the first set is in force"
+    );
+
+    // 2^32 + 5 truncates to 5 in u32 — a line that exists in this buffer, so a
+    // truncating implementation paints a convincing squiggle in the wrong place.
+    exec_lua(
+        &rpc,
+        r#"vim.diagnostic.set(1, 0, {
+             { lnum = 4294967301, col = 0, end_lnum = 4294967301, end_col = 1,
+               severity = 1, message = "out of range" },
+           })"#,
+    )
+    .await;
+    let map = frame(&rpc, &mut inc).await;
+    let spans = diag_spans(&map);
+
+    let bad_row = row_of(&map, 5);
+    assert!(
+        spans.get(bad_row).cloned().unwrap_or_default().is_empty(),
+        "line 5 is where 2^32+5 TRUNCATES to — it must not be flagged: {spans:?}"
+    );
+    assert!(
+        !spans.get(good_row).cloned().unwrap_or_default().is_empty(),
+        "the rejected set must leave the previous one intact, not half-apply: {spans:?}"
+    );
+}
+
+// ====================================== anchors are trusted only while they are OURS
+//
+// Diagnostics are projected from extmark anchors so they ride edits, and the anchors
+// are addressed BY POSITION in the merged list — so they are only meaningful while the
+// list is the one they were placed from. The bookkeeping used to check the mark COUNT
+// alone, which an undo can satisfy by accident: undoing past a re-publish restores the
+// extmark store as it was under the PREVIOUS set, which may hold exactly as many
+// marks. The squiggles then render at the old set's positions.
+//
+// The namespace's mutation generation is recorded alongside the count, and the
+// placement itself bumps it — so a resurrected store carries an older generation and
+// the projection falls back to the published ranges.
+//
+// SCOPE: this pins the user-visible property (an undo never relocates a diagnostic),
+// not the generation check itself. Reverting to the count-only test leaves it green:
+// the anchors are refreshed on the tick after the undo, before the frame projects, so
+// the window in which a resurrected store could be trusted is not reachable by
+// driving the editor from outside. The guard is defence for a narrower ordering than
+// a black-box test can arrange.
+
+#[tokio::test]
+async fn an_undo_that_resurrects_older_anchors_does_not_relocate_the_diagnostics() {
+    let (rpc, mut inc) = start_with_file(&sample(20)).await;
+
+    // The first set anchors on line 2…
+    set_diag(&rpc, 2, 0, 2, 4).await;
+    let map = frame(&rpc, &mut inc).await;
+    let old_row = row_of(&map, 2);
+    assert!(
+        !diag_spans(&map)
+            .get(old_row)
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the first set paints on line 2"
+    );
+
+    // …an edit gives the undo somewhere to land, between the two placements…
+    feed(&rpc, "10Gx");
+    let _ = lines(&rpc).await;
+
+    // …and the second set, the same SIZE (one diagnostic) but a different place,
+    // replaces the anchors.
+    set_diag(&rpc, 7, 0, 7, 4).await;
+    let map = frame(&rpc, &mut inc).await;
+    let new_row = row_of(&map, 7);
+    assert!(
+        !diag_spans(&map)
+            .get(new_row)
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the second set paints on line 7"
+    );
+
+    // Undo past the edit: the extmark store reverts to the snapshot taken while the
+    // FIRST set's anchors were in place — one mark, exactly as many as the live list
+    // has, so a count-only check is satisfied by a store that is not ours.
+    feed(&rpc, "u");
+    let map = frame(&rpc, &mut inc).await;
+    let spans = diag_spans(&map);
+
+    let old_row = row_of(&map, 2);
+    let new_row = row_of(&map, 7);
+    assert!(
+        spans.get(old_row).cloned().unwrap_or_default().is_empty(),
+        "line 2 belongs to a set that is no longer published — trusting the \
+         resurrected anchors puts the squiggle back there: {spans:?}"
+    );
+    assert!(
+        !spans.get(new_row).cloned().unwrap_or_default().is_empty(),
+        "the live set's own published range must still paint on line 7: {spans:?}"
+    );
+}

@@ -146,7 +146,9 @@ pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
 /// msgpack, and hands the bytes across the FFI; this reconstructs the [`RemoteConfigBundle`]
 /// the native client gets from [`decode_config_bundle`].
 pub fn decode_config_bundle_bytes(bytes: &[u8]) -> Result<RemoteConfigBundle, String> {
-    let value = rmpv::decode::read_value(&mut &bytes[..])
+    // Cap nesting at 128 (matches bemtvi-rpc's MAX_DEPTH): a pathologically nested
+    // bundle would otherwise make rmpv recurse unboundedly on the wasm edit-host.
+    let value = rmpv::decode::read_value_with_max_depth(&mut &bytes[..], 128)
         .map_err(|e| format!("config_bundle: undecodable msgpack: {e}"))?;
     decode_config_bundle(value)
 }

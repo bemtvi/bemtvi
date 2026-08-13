@@ -377,3 +377,243 @@ async fn typing_does_not_scale_with_the_register_contents() {
          buffer ({loaded:?} vs {baseline:?}) — the register mirror is copying per tick again",
     );
 }
+
+// ---------------------------------------------------------- the `bo` mirror gate
+//
+// `btv._bo_mirror[bufnr]` carries every buffer-local option `vim.bo` reads. It used
+// to be rebuilt for EVERY open buffer on every tick — i.e. on every keystroke — so a
+// session with many buffers paid a full per-buffer rebuild per key. It is now gated
+// on the core's option-state generation (any `:set`-family / `vim.o` / `vim.bo`
+// write, a filetype or `ts_highlight` change, a completed save) plus the buffer's own
+// `changedtick` (a text edit flips `modified`).
+//
+// The mirror now MERGES rows rather than replacing the whole table, so the table's
+// identity no longer moves on a push — the probe pins the *row* instead, which each
+// push replaces wholesale.
+
+/// Pin the identity of buffer `bufnr`'s `bo` row.
+async fn pin_row(rpc: &Rpc, bufnr: &str) {
+    exec_lua(rpc, &format!("_G.__row = btv._bo_mirror[{bufnr}]")).await;
+}
+
+/// Whether buffer `bufnr`'s row is still the exact table pinned by [`pin_row`].
+async fn same_row(rpc: &Rpc, bufnr: &str) -> bool {
+    matches!(
+        exec_lua(rpc, &format!("return btv._bo_mirror[{bufnr}] == _G.__row")).await,
+        Value::Boolean(true)
+    )
+}
+
+/// The current buffer's number, as a Lua expression string.
+const CUR: &str = "btv._cur_buf.bufnr";
+
+#[tokio::test]
+async fn an_idle_keystroke_does_not_republish_the_bo_mirror() {
+    let (rpc, _i) = open(&sample(20)).await;
+    push_every_key(&rpc).await;
+    let _ = lines(&rpc).await;
+
+    pin_row(&rpc, CUR).await;
+    // A pure cursor move: no option moved, no text changed.
+    feed(&rpc, "j");
+    let _ = lines(&rpc).await;
+    assert!(
+        same_row(&rpc, CUR).await,
+        "a keystroke that changed no option and no text rebuilt the whole bo mirror",
+    );
+}
+
+#[tokio::test]
+async fn a_set_option_reaches_the_bo_mirror() {
+    let (rpc, _i) = open(&sample(20)).await;
+    push_every_key(&rpc).await;
+    let _ = lines(&rpc).await;
+
+    pin_row(&rpc, CUR).await;
+    command(&rpc, "set tabstop=7").await;
+    let _ = lines(&rpc).await;
+    assert!(
+        !same_row(&rpc, CUR).await,
+        "a `:set` did not reach the bo mirror — the gate never opened",
+    );
+    assert_eq!(as_int(&exec_lua(&rpc, "return vim.bo.tabstop").await), 7);
+}
+
+#[tokio::test]
+async fn a_lua_option_write_reaches_the_bo_mirror() {
+    // The `vim.bo` bridge is a different door into the same state than `:set`; the
+    // generation must be bumped there too or a Lua-written option reads stale.
+    let (rpc, _i) = open(&sample(20)).await;
+    push_every_key(&rpc).await;
+    exec_lua(&rpc, "vim.bo.shiftwidth = 3").await;
+    let _ = lines(&rpc).await;
+    assert_eq!(as_int(&exec_lua(&rpc, "return vim.bo.shiftwidth").await), 3);
+}
+
+#[tokio::test]
+async fn a_filetype_change_reaches_the_bo_mirror() {
+    // `filetype` is a `bo` row that does NOT live in the options struct (it is the
+    // treesitter language noun), so it needs its own generation bump.
+    let (rpc, _i) = open(&sample(20)).await;
+    push_every_key(&rpc).await;
+    let _ = lines(&rpc).await;
+
+    pin_row(&rpc, CUR).await;
+    command(&rpc, "set filetype=rust").await;
+    let _ = lines(&rpc).await;
+    assert!(
+        !same_row(&rpc, CUR).await,
+        "a filetype change must republish"
+    );
+    assert_eq!(
+        as_str(&exec_lua(&rpc, "return vim.bo.filetype").await),
+        "rust"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_reaches_the_bo_mirror_through_modified() {
+    // The one `bo` row a *text* edit moves is `modified`, which the per-buffer
+    // `changedtick` gate covers rather than the option generation.
+    let (rpc, _i) = open(&sample(20)).await;
+    push_every_key(&rpc).await;
+    let _ = lines(&rpc).await;
+    assert!(
+        !matches!(
+            exec_lua(&rpc, "return vim.bo.modified").await,
+            Value::Boolean(true)
+        ),
+        "a freshly-opened buffer is unmodified"
+    );
+    feed(&rpc, "x");
+    let _ = lines(&rpc).await;
+    assert!(
+        matches!(
+            exec_lua(&rpc, "return vim.bo.modified").await,
+            Value::Boolean(true)
+        ),
+        "an edit must flip `modified` in the mirror",
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_buffer_is_dropped_from_the_bo_mirror() {
+    // The mirror merges rows now, so a vanished buffer's row has to be deleted
+    // explicitly — otherwise `vim.bo[dead]` keeps reading a live-looking row
+    // forever, and the table grows with every closed buffer.
+    let (rpc, _i) = open(&sample(5)).await;
+    push_every_key(&rpc).await;
+    command(&rpc, "enew").await;
+    let _ = lines(&rpc).await;
+    let dead = as_int(&exec_lua(&rpc, &format!("return {CUR}")).await);
+    assert!(
+        matches!(
+            exec_lua(&rpc, &format!("return btv._bo_mirror[{dead}] ~= nil")).await,
+            Value::Boolean(true)
+        ),
+        "the new buffer has a row while it is open",
+    );
+    command(&rpc, &format!("bwipeout! {dead}")).await;
+    let _ = lines(&rpc).await;
+    assert!(
+        matches!(
+            exec_lua(&rpc, &format!("return btv._bo_mirror[{dead}] == nil")).await,
+            Value::Boolean(true)
+        ),
+        "a wiped buffer's row must be dropped from the merged mirror",
+    );
+}
+
+// ------------------------------------------------------- the jumplist mirror gate
+//
+// Each window's jumplist rides the per-window mirror. It used to be re-serialized in
+// full on every repaint; it is now gated on a per-window structural generation, so an
+// unchanged jumplist costs nothing per keystroke.
+
+/// Pin the identity of the focused window's mirrored jumplist.
+async fn pin_jumps(rpc: &Rpc) {
+    exec_lua(rpc, "_G.__jumps = btv._wins[btv._cur_win].jumps").await;
+}
+
+async fn same_jumps(rpc: &Rpc) -> bool {
+    matches!(
+        exec_lua(rpc, "return btv._wins[btv._cur_win].jumps == _G.__jumps").await,
+        Value::Boolean(true)
+    )
+}
+
+#[tokio::test]
+async fn an_idle_keystroke_does_not_republish_the_jumplist() {
+    let (rpc, _i) = open(&sample(200)).await;
+    push_every_key(&rpc).await;
+    // Seed a couple of entries so there is something worth not re-serializing.
+    feed(&rpc, "50G");
+    feed(&rpc, "100G");
+    let _ = lines(&rpc).await;
+
+    // The identity probe below is only meaningful over a NON-EMPTY list: a mirror
+    // that lost its jumplist entirely pins nil and then compares nil to nil, which
+    // passes for the wrong reason. Pin the length too.
+    let n = as_int(&exec_lua(&rpc, "return #(btv._wins[btv._cur_win].jumps or {})").await);
+    assert_eq!(
+        n, 2,
+        "the two jumps must be in the mirror before we gate on it"
+    );
+
+    pin_jumps(&rpc).await;
+    // `j` is not a jump, so the list must not move.
+    feed(&rpc, "j");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        as_int(&exec_lua(&rpc, "return #(btv._wins[btv._cur_win].jumps or {})").await),
+        2,
+        "the gated push must CARRY the list over, not drop it",
+    );
+    assert!(
+        same_jumps(&rpc).await,
+        "a non-jump keystroke re-serialized the whole jumplist",
+    );
+}
+
+#[tokio::test]
+async fn a_jump_reaches_the_jumplist_mirror() {
+    let (rpc, _i) = open(&sample(200)).await;
+    push_every_key(&rpc).await;
+    feed(&rpc, "50G");
+    let _ = lines(&rpc).await;
+
+    let before = as_int(&exec_lua(&rpc, "return #btv._wins[btv._cur_win].jumps").await);
+    pin_jumps(&rpc).await;
+    feed(&rpc, "150G");
+    let _ = lines(&rpc).await;
+    assert!(
+        !same_jumps(&rpc).await,
+        "a real jump did not reach the mirror — the gate never opened",
+    );
+    assert_eq!(
+        as_int(&exec_lua(&rpc, "return #btv._wins[btv._cur_win].jumps").await),
+        before + 1,
+        "the new jump is in the mirrored list",
+    );
+}
+
+#[tokio::test]
+async fn navigating_the_jumplist_reaches_the_mirror() {
+    // `<C-o>` moves only the navigation POINTER, not the entries. The pointer is
+    // read fresh every tick, but the generation must move too — otherwise a plugin
+    // reading the mirror sees a stale index forever.
+    let (rpc, _i) = open(&sample(200)).await;
+    push_every_key(&rpc).await;
+    feed(&rpc, "50G");
+    feed(&rpc, "150G");
+    let _ = lines(&rpc).await;
+    let idx = as_int(&exec_lua(&rpc, "return btv._wins[btv._cur_win].jump_idx").await);
+
+    feed(&rpc, "<C-o>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        as_int(&exec_lua(&rpc, "return btv._wins[btv._cur_win].jump_idx").await),
+        idx - 1,
+        "`<C-o>` must move the mirrored jumplist pointer",
+    );
+}

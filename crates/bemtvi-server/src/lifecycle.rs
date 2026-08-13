@@ -67,6 +67,11 @@ impl EditHost {
                 self.forced_fetch_enc.remove(&buffer);
                 // A workspace edit never targets a directory; drop any stranded stash.
                 self.pending_replica_edits.remove(&buffer);
+                // A create that resolved to a directory cannot be written out, and a
+                // goto's target line text is not a directory listing — drop both
+                // stashes, or they'd apply to a later landing on the same buffer id.
+                self.pending_create_writes.remove(&buffer);
+                self.pending_goto_cols.remove(&buffer);
                 self.load_dir_listing(buffer, dir, entries);
             }
             Err(e) => {
@@ -281,17 +286,20 @@ impl EditHost {
         let win = self.editor.current_window_id();
         let tab = self.editor.current_tab_id();
         for open in opens {
-            // BufReadCmd (vim's "replace the read" hook): a Lua handler may claim this
-            // open and own filling the buffer — netrw / the explorer-as-plugin rides
-            // this. A claimed read skips the default load entirely (and, per `*Cmd`
-            // semantics, BufReadPost too — the handler sets the filetype, which fires
-            // FileType). An open only reaches here when deferred, which a local session
-            // does *only* when a BufReadCmd handler is registered, so the fire is never
-            // wasted on the common no-handler path.
-            if self.fire_buf_read_cmd(open.buffer, &open.path) {
-                continue;
-            }
             if !remote {
+                // BufReadCmd (vim's "replace the read" hook): a Lua handler may claim this
+                // open and own filling the buffer — netrw / the explorer-as-plugin rides
+                // this. A claimed read skips the default load entirely (and, per `*Cmd`
+                // semantics, BufReadPost too — the handler sets the filetype, which fires
+                // FileType). An open only reaches here when deferred, which a local session
+                // does *only* when a BufReadCmd handler is registered, so the fire is never
+                // wasted on the common no-handler path. The offer is local-only:
+                // `fire_buf_read_cmd` stats the path with local `std::fs` for its
+                // `args.isdir`, which is meaningless for a daemon/browser path — a remote
+                // directory is filled server-side at the fetch landing below.
+                if self.fire_buf_read_cmd(open.buffer, &open.path) {
+                    continue;
+                }
                 // A deferred open no handler claimed, in a local (synchronous) session:
                 // read it now through `host_fs` and drive the lifecycle events the read
                 // implies, the synchronous counterpart of the off-tick `apply_open`
@@ -1787,7 +1795,11 @@ impl EditHost {
     /// effects the callbacks left. Deferred ex-commands the callbacks queue are
     /// drained by the caller's `run_pending`.
     pub(crate) fn fire_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId, file: &str) {
-        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        // The snapshot's filetype is the *event buffer's*, not the current buffer's —
+        // a `BufLeave` carries the buffer being left, and a handler reading
+        // `btv._cur_buf.filetype` (e.g. `btv.lsp.start`'s default `languageId`) must see
+        // the leaving buffer's language, not the one being entered.
+        let ft = filetype_of(self.editor.buffer_path(buf)).unwrap_or("");
         // `file` is the PATH (it is also the `<afile>` the autocmd fires with); the
         // snapshot's name is the DISPLAY name, which for a file-backed buffer is the same
         // string and for a pathless surface — an `btv.view`, a terminal — is its label
@@ -2004,8 +2016,12 @@ impl EditHost {
     /// [`drain_au_gate_done`](Self::drain_au_gate_done), so a just-settled gate resumes here).
     pub(crate) fn drive_exit(&mut self) {
         // A quit committed this convergence begins the sequence. Only `ex_quit_all` sets the
-        // flag, and a re-entrant `:qa` fired *by* an exit handler finds `exit_stage` already
-        // `Some`, so the flag it set is simply consumed and ignored — no restart, no cancel.
+        // flag. A re-entrant quit fired *by* an exit handler (VimLeavePre → `:qa`) is NOT
+        // consumed here: it lands in `exit_requested` while the sequence is mid-flight, and
+        // the `Leaving` arm below drains it after `VimLeave` — so it neither restarts the
+        // sequence from QuitPre (which would re-fire every exit handler each fixpoint round,
+        // spinning to the E132 round cap) nor keeps the run loop's `has_exit_requested`
+        // fixpoint alive past the sequence.
         if self.exit_stage.is_none() && self.editor.take_exit_requested() {
             self.exit_stage = Some(ExitStage::QuitPre);
         }
@@ -2031,6 +2047,12 @@ impl EditHost {
                     // Rust hook), and is harmless — `VimLeave` is post-persist cleanup, so the
                     // shada-relevant `VimLeavePre` above still runs before the write.
                     self.fire_vim_leave();
+                    // Drain any quit a handler re-issued (a `*Pre` stage or `VimLeave`
+                    // itself ran `:qa`/`:wq`): the sequence has run; leaving the flag set
+                    // would restart it from QuitPre next fixpoint round and re-fire every
+                    // exit handler until the E132 round cap. `should_quit` is set
+                    // regardless, so the editor still exits.
+                    self.editor.take_exit_requested();
                     self.exit_stage = None;
                     self.editor.should_quit = true;
                     return;

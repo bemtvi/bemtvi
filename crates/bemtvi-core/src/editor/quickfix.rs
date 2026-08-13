@@ -1321,9 +1321,7 @@ mod engine {
     // The 'errorformat' conversion characters, in vim's `fmt_pat[]` order. The
     // index of each is its capture-group ordinal source and its `qf_parse_fmt`
     // slot. Keep in sync with `PATTERNS` below.
-    const CONV: [u8; 14] = [
-        b'f', b'b', b'n', b'l', b'e', b'c', b'k', b't', b'm', b'r', b'p', b'v', b's', b'o',
-    ];
+    const CONV: &[u8] = b"fbnlecktmrpvso";
     // The regex fragment each conversion expands to (vim's `fmt_pat[].pattern`).
     // `%f` is special-cased in `efm_part_to_regpat` and never reads its slot here.
     const PATTERNS: [&str; 14] = [

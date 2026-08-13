@@ -60,6 +60,14 @@ impl RemoteSpec {
             Some((h, p))
                 if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) =>
             {
+                // A bare IPv6 literal (`::1`) mis-splits at its last colon into host
+                // `::` + port `1` — a silently wrong dial. Refuse it and ask for
+                // brackets, which ssh accepts as-is. A *bracketed* literal
+                // (`[::1]:2222`) splits cleanly (host `[::1]` + port `2222`) and
+                // passes through unchanged.
+                if h.contains(':') && !h.starts_with('[') {
+                    return None;
+                }
                 match p.parse::<u16>() {
                     Ok(port) => (h.to_string(), Some(port)),
                     // A numeric run that overflows u16 isn't a usable port; keep the

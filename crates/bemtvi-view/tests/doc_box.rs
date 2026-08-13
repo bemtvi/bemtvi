@@ -105,3 +105,62 @@ fn wrap_chars_yields_exactly_the_rows_the_height_was_sized_for() {
     // Chars, not bytes: a multi-byte char is one cell's worth here.
     assert_eq!(wrap_chars("héllo", 2), ["hé", "ll", "o"]);
 }
+
+// ------------------------------------------------ the popup itself may be off-area
+//
+// The documented guarantee is that a box which would hang off the area is not drawn
+// at all. The side math only ever sized against the room on *that side*, so it
+// trusted the popup to be inside the area — but the popup rect comes off the wire.
+// A popup past the area's right edge put the box between the popup and that edge
+// (i.e. outside the area), and a popup above the area's top edge top-aligned the box
+// above it.
+
+#[test]
+fn a_popup_past_the_right_edge_draws_no_box() {
+    let area = CellRect::new(0, 0, 80, 24);
+    // The popup starts beyond the area's right edge entirely.
+    let pop = CellRect::new(90, 2, 20, 8);
+    assert_eq!(
+        doc_box(area, pop, &["a doc line".into()]),
+        None,
+        "a box for an off-area popup must not be placed outside the area"
+    );
+}
+
+#[test]
+fn a_popup_above_the_top_edge_draws_no_box() {
+    // An area that does not start at y = 0 (a window below a tabline), with the
+    // popup above it.
+    let area = CellRect::new(0, 5, 80, 19);
+    let pop = CellRect::new(4, 1, 20, 8);
+    assert_eq!(
+        doc_box(area, pop, &["a doc line".into()]),
+        None,
+        "a box must never be placed above its area's top edge"
+    );
+}
+
+#[test]
+fn a_popup_left_of_the_area_draws_no_box() {
+    let area = CellRect::new(20, 0, 60, 24);
+    // Entirely left of the area, so a right-side box would still start before it.
+    let pop = CellRect::new(0, 2, 8, 8);
+    assert_eq!(
+        doc_box(area, pop, &["a doc line".into()]),
+        None,
+        "a box must never start left of its area"
+    );
+}
+
+#[test]
+fn an_in_area_popup_still_gets_its_box() {
+    // The control: the guard must not refuse the ordinary case it was added around.
+    let area = CellRect::new(0, 5, 80, 19);
+    let pop = CellRect::new(4, 7, 20, 8);
+    let b = doc_box(area, pop, &["a doc line".into()]).expect("an in-area popup has a box");
+    assert!(
+        b.x >= area.x && b.right() <= area.right(),
+        "box within the area"
+    );
+    assert!(b.y >= area.y, "box below the area's top");
+}

@@ -389,6 +389,7 @@ impl Renderer {
         window: Arc<Window>,
         cfg: &GuiConfig,
         fetch_tx: tokio::sync::mpsc::UnboundedSender<crate::ImageFetch>,
+        decode_tx: tokio::sync::mpsc::UnboundedSender<crate::DecodeReq>,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
@@ -459,7 +460,7 @@ impl Renderer {
         let (cell_w, cell_h) = measure_cell(&mut font_system, family, font_size, line_height);
 
         let rects = RectPipeline::new(&device, format);
-        let image_store = ImageStore::new(&device, format, max_dim, fetch_tx);
+        let image_store = ImageStore::new(&device, format, fetch_tx, decode_tx);
 
         Ok(Self {
             surface,
@@ -651,6 +652,19 @@ impl Renderer {
         self.image_store.deliver(path, version, result);
     }
 
+    /// Hand an off-thread decode's outcome (routed from the IO thread via
+    /// `UserEvent::ImageDecoded`) to the image store, which uploads it. The caller
+    /// requests a repaint afterward.
+    pub fn deliver_image_decode(
+        &mut self,
+        path: String,
+        version: (u64, u64),
+        decoded: Option<image::DynamicImage>,
+    ) {
+        self.image_store
+            .deliver_decode(&self.device, &self.queue, path, version, decoded);
+    }
+
     /// Drop all cached image state (GPU textures + fetched remote bytes) — used on a
     /// `:connect` swap, where the new session's paths are unrelated to the old's.
     pub fn clear_images(&mut self) {
@@ -730,7 +744,7 @@ impl Renderer {
             .iter()
             .filter_map(|w| w.image.as_ref())
             .collect();
-        self.image_store.ensure(&self.device, &self.queue, &live);
+        self.image_store.ensure(&live);
         self.build_frame(
             view,
             scroll,
@@ -927,7 +941,7 @@ impl Renderer {
 
         // The global (main) tabline on the row below the top dock.
         if tabline_rows > 0 {
-            self.build_tabline(view, cols, quads, items);
+            self.build_tabline(view, cols, top_band, quads, items);
         }
         // Each dock's own tabline at its band's first row.
         self.build_dock_tablines(
@@ -2083,26 +2097,28 @@ impl Renderer {
         }
     }
 
-    /// Paint the tabline on the top row: a custom `'tabline'`'s pre-rendered
-    /// segments when set, else the built-in cells (` {count} {label}{+} `) themed
-    /// from `TabLine`/`TabLineSel`/`TabLineFill` — the GUI port of the TUI's
-    /// `render_tabline`.
+    /// Paint the tabline on `row` (the top row when no top dock is open, else the
+    /// row the top dock band reserves for it — `top_band` in [`Self::build_frame`]):
+    /// a custom `'tabline'`'s pre-rendered segments when set, else the built-in
+    /// cells (` {count} {label}{+} `) themed from `TabLine`/`TabLineSel`/
+    /// `TabLineFill` — the GUI port of the TUI's `render_tabline`.
     fn build_tabline(
         &mut self,
         view: &View,
         cols: u16,
+        row: u16,
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
         let colors = TablineColors::resolve(view);
-        self.fill_row(quads, 0, cols, colors.fill_bg);
+        self.fill_row(quads, row, cols, colors.fill_bg);
 
         // A custom `'tabline'` already rendered to styled segments: paint verbatim.
         if !view.tabline.is_empty() && !view.tabline_segments.is_empty() {
             self.paint_segments(
                 &view.tabline_segments,
                 0,
-                0,
+                row,
                 colors.inactive_fg,
                 quads,
                 items,
@@ -2115,7 +2131,7 @@ impl Renderer {
             &view.tabline,
             view.current_tab,
             0,
-            0,
+            row,
             cols,
             &colors,
             quads,
@@ -4469,14 +4485,15 @@ const GRID_TOL: f32 = 0.15;
 /// with the editor's display-width grid, so the renderer must mask them to spaces and
 /// redraw them separately to keep the rest of the line — and the cursor — aligned.
 ///
-/// `glyphs` is every shaped glyph as `(start_byte, advance_in_cells)` in visual order;
-/// each glyph's advance is credited to the grapheme cluster containing its start byte,
-/// so a base char and its zero-advance combining marks / VS16 (e.g. `❤️`) are weighed
-/// as one unit. A cluster is off-grid when its summed advance differs from its
-/// [`UnicodeWidthStr::width`] by more than [`GRID_TOL`]: the emoji the font draws one
-/// cell wide though the editor reserves two, the fractional-advance Powerline glyph,
-/// the icon a fallback font draws double-wide. Touching off-grid clusters merge. Pure,
-/// so it's unit-tested in `tests/wide.rs`.
+/// `glyphs` is every shaped glyph as `(start_byte, advance_in_cells)` in visual order
+/// (an RTL run therefore *descends* byte-offset); each glyph's advance is credited to
+/// the grapheme cluster containing its start byte, so a base char and its zero-advance
+/// combining marks / VS16 (e.g. `❤️`) are weighed as one unit. A cluster is off-grid
+/// when its summed advance differs from its [`UnicodeWidthStr::width`] by more than
+/// [`GRID_TOL`]: the emoji the font draws one cell wide though the editor reserves
+/// two, the fractional-advance Powerline glyph, the icon a fallback font draws
+/// double-wide. Touching off-grid clusters merge. Pure, so it's unit-tested in
+/// `tests/wide.rs`.
 pub fn offgrid_clusters(text: &str, glyphs: &[(usize, f32)]) -> Vec<(usize, usize)> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
@@ -4484,13 +4501,23 @@ pub fn offgrid_clusters(text: &str, glyphs: &[(usize, f32)]) -> Vec<(usize, usiz
         .grapheme_indices(true)
         .map(|(off, g)| (off, off + g.len(), g.width()))
         .collect();
+    // Sorting makes the credit walk order-independent — exactly the clusters a
+    // per-glyph scan would find, without its O(glyphs × clusters) cost (a
+    // 20k-char minified line would otherwise do ~4×10⁸ comparisons on every
+    // cache miss — the "editor must never freeze" class).
+    let mut glyphs: Vec<(usize, f32)> = glyphs.to_vec();
+    glyphs.sort_by_key(|&(s, _)| s);
     let mut adv = vec![0.0f32; clusters.len()];
-    for &(gstart, cells) in glyphs {
-        if let Some(i) = clusters
-            .iter()
-            .position(|&(s, e, _)| gstart >= s && gstart < e)
-        {
-            adv[i] += cells;
+    // Both lists are byte-ascending now: one pointer per glyph instead of
+    // scanning `clusters` from the start each time.
+    let mut ci = 0;
+    for &(gstart, cells) in &glyphs {
+        while ci + 1 < clusters.len() && clusters[ci + 1].0 <= gstart {
+            ci += 1;
+        }
+        let (s, e, _) = clusters[ci];
+        if gstart >= s && gstart < e {
+            adv[ci] += cells;
         }
     }
     let mut out: Vec<(usize, usize)> = Vec::new();

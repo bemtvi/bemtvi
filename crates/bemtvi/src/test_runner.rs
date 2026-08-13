@@ -52,7 +52,25 @@ pub fn run_test_plugin(dir: PathBuf) -> Result<bool> {
 }
 
 /// Recursively collect `*_spec.lua` files under `dir` (missing dir = no files).
+///
+/// `is_dir()` follows symlinks, so a symlink cycle under `test/` (e.g. a stray
+/// `test/loop -> .`) would recurse forever and abort the runner with a stack
+/// overflow. Each directory is descended at most once, keyed by its canonical
+/// path — a cycle stops at the first repeat, and a tree reachable through two
+/// symlinks is scanned once instead of twice.
 fn discover(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    if let Ok(canon) = std::fs::canonicalize(dir) {
+        visited.insert(canon);
+    }
+    discover_inner(dir, out, &mut visited)
+}
+
+fn discover_inner(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -61,7 +79,10 @@ fn discover(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in entries {
         let path = entry?.path();
         if path.is_dir() {
-            discover(&path, out)?;
+            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if visited.insert(canon) {
+                discover_inner(&path, out, visited)?;
+            }
         } else if path
             .file_name()
             .and_then(|n| n.to_str())
@@ -128,16 +149,23 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             .enable_time()
             .build()
             .expect("test server runtime");
-        let _ = runtime.block_on(run_server(server_end, init));
+        if let Err(e) = runtime.block_on(run_server(server_end, init)) {
+            eprintln!("bemtvi --test-plugin: embedded server failed: {e:#}");
+        }
     });
     let (reader, writer) = tokio::io::split(client_end);
     connect(reader, writer)
 }
 
-/// Drive the suite to completion and print the report. `_incoming` is held (not
-/// read) so the connection's reader task stays alive — dropping it closes the wire.
+/// Drive the suite to completion and print the report. `incoming` is drained (not
+/// read for content) so the connection's reader task stays alive — dropping it
+/// closes the wire — without buffering the redraw notifications the attached UI
+/// makes the server push on every tick. A spec can feed thousands of keys (each
+/// tick projects a full view map); undrained, those pile up in the unbounded
+/// channel for the whole suite instead of being dropped as they arrive.
 async fn run(dir: PathBuf, files: Vec<PathBuf>) -> Result<bool> {
-    let (rpc, _incoming) = spawn_server(dir.clone());
+    let (rpc, mut incoming) = spawn_server(dir.clone());
+    tokio::spawn(async move { while incoming.recv().await.is_some() {} });
 
     // Attach a UI so the server projects redraws (the `btv._ui` mirror a test's
     // `t:float()` / `t:message()` read from is populated on redraw).

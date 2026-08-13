@@ -410,7 +410,11 @@ fn classify(
     let ty = legend.token_types.get(tok.token_type as usize)?.clone();
     let mut mods = Vec::new();
     let mut groups = Vec::new();
-    for (bit, modifier) in legend.token_modifiers.iter().enumerate() {
+    // The bitset is a u32, so only the first 32 legend entries can ever be set; an
+    // out-of-spec server advertising more would drive `1 << bit` past the type's
+    // width (a debug panic, a silent wrap to bit 0 in release). Names past bit 31
+    // are unreachable by construction, so they are skipped, not classified.
+    for (bit, modifier) in legend.token_modifiers.iter().enumerate().take(32) {
         if tok.token_modifiers_bitset & (1 << bit) != 0 {
             groups.push(format!("lsp.typemod.{ty}.{modifier}"));
             mods.push(modifier.clone());

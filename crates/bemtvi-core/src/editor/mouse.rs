@@ -1875,7 +1875,7 @@ impl Editor {
     /// command-line wildmenu (its own frame) or when no menu is open.
     fn menu_screen(&self) -> Option<MenuScreen> {
         let m = self.menu_view()?;
-        let (metrics, win, gutter) = self.menu_anchor()?;
+        let (metrics, win, left_gutters) = self.menu_anchor()?;
         let geom = self.menu_geom(&m, metrics);
         // The box's outer top-left + border layout, in global cells. Three frames: the
         // command-line wildmenu anchors to the command-line area (global x, the row
@@ -1901,18 +1901,20 @@ impl Editor {
             (geom.col, geom.row, 1, 2)
         } else {
             let (wx, wy) = self.window_screen_pos(win)?;
-            // The text inner sits past this window's `'padding'` (left + top) and its
-            // number gutter, matching where the client paints the body.
+            // The text inner sits past this window's `'padding'` (left + top) and
+            // EVERY left gutter (fold + sign + number), matching where the client
+            // paints the body — the number gutter alone would land the box (fold +
+            // sign) cells left of the caret whenever either column is shown.
             let pad = self
                 .window_options(win)
                 .map(|o| o.padding)
                 .unwrap_or_default();
-            let inner_x = wx.saturating_add(pad.left).saturating_add(gutter); // text inner: past padding + the number gutter
-                                                                              // A full border for select / picker; the completion popup omits its top
-                                                                              // border and shifts one cell left so its left border doesn't cover the word
-                                                                              // it completes. `geom.col` is the content anchor for `Cursor` placement and
-                                                                              // the outer-box left for `Editor`; either way the outer box left is
-                                                                              // `geom.col - left_shift` and the content sits one cell in.
+            let inner_x = wx.saturating_add(pad.left).saturating_add(left_gutters); // text inner: past padding + all left gutters
+                                                                                    // A full border for select / picker; the completion popup omits its top
+                                                                                    // border and shifts one cell left so its left border doesn't cover the word
+                                                                                    // it completes. `geom.col` is the content anchor for `Cursor` placement and
+                                                                                    // the outer-box left for `Editor`; either way the outer box left is
+                                                                                    // `geom.col - left_shift` and the content sits one cell in.
             let border_top = !m.completion;
             let left_shift = usize::from(!border_top);
             let vborder = if border_top { 2 } else { 1 };
@@ -1967,8 +1969,9 @@ impl Editor {
     /// The focused window's cursor-screen metrics + screen origin for placing the
     /// open menu's box, recomputed from the same projection the redraw uses so the
     /// hit-test inverts exactly what was painted. Returns the metrics, the focused
-    /// window, and its number-gutter width. Only called while a menu is open, so the
-    /// projection build (bounded by the viewport, not the buffer) is paid rarely.
+    /// window's id, and its left-gutter total (fold + sign + number). Only called
+    /// while a menu is open, so the projection build (bounded by the viewport, not
+    /// the buffer) is paid rarely.
     fn menu_anchor(&self) -> Option<(MenuMetrics, WindowId, usize)> {
         let view = crate::view::View::from_editor(self);
         let f = view.focused();
@@ -1977,12 +1980,19 @@ impl Editor {
             cursor_row: f.cursor_row,
             cursor_screen_col: f.cursor_screen_col,
             leftcol: f.leftcol,
-            text_width: f.rect.width.saturating_sub(f.number_width),
+            // The true text area — `rect.width` minus only the number gutter
+            // would overstate it by the fold and sign columns whenever either
+            // is shown, and the menu box would stick out past the text.
+            text_width: f.text_width,
             text_height: f.rows.len(),
             editor_w,
             editor_h,
         };
-        Some((metrics, f.id, f.number_width))
+        // The gutter total the client's text-body origin sits past (fold + sign +
+        // number — not the number gutter alone, which would anchor the box (fold +
+        // sign) cells left of the caret); `menu_screen` adds it to the window
+        // origin to invert the client's paint exactly.
+        Some((metrics, f.id, f.left_gutters))
     }
 
     /// The open completion popup box's `menu_geom` col/row/width plus its window — the
@@ -2256,7 +2266,15 @@ impl Editor {
         }
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
-        let text_w = content_w.saturating_sub(self.number_width_for(&opts, line_count));
+        // The text width past every left gutter (fold + sign + number — the same
+        // `window_textoff` the click hit-test skips), not the number gutter alone:
+        // the number-only width overstates the visible text by the other two, and
+        // the max scroll would stop (fold + sign) cells short of the widest line's
+        // end whenever either column is shown.
+        let text_w = content_w.saturating_sub(
+            self.window_textoff(win)
+                .unwrap_or_else(|| self.number_width_for(&opts, line_count)),
+        );
         let ts = buf.options.effective_tabstop();
         let widest = (top..top.saturating_add(text_h).min(line_count))
             .map(|l| {

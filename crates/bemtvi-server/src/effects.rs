@@ -1538,7 +1538,12 @@ impl EditHost {
         let Some(state) = self.osc52.as_ref() else {
             return;
         };
-        let pending = std::mem::take(&mut state.lock().unwrap().pending);
+        let pending = std::mem::take(
+            &mut state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending,
+        );
         for seq in pending {
             self.fx.notify("btv_ui_send", vec![Value::from(seq)]);
         }
@@ -2144,7 +2149,16 @@ impl EditHost {
             self.editor.focused_buffer_ids().into_iter().collect();
         // Buffer-local option values, mirrored so `vim.bo` / `nvim_get_option_value`
         // read the core's current value (the default until set, and values set via
-        // the `:set` ex path). Cheap (three scalars per buffer), so it isn't gated.
+        // the `:set` ex path). A row is re-pushed only when something that can move
+        // it changed since the last push: the core's option-state generation (any
+        // `:set`-family / `vim.o` / `btv.wso` write, a filetype or `ts_highlight`
+        // change, a completed save), or the buffer's own `changedtick` (a text edit
+        // flips `modified`). An untouched push — cursor moved, nothing else — skips
+        // the rebuild instead of re-serializing every buffer's row.
+        let opts_moved = self.bo_mirror_gen != self.editor.options_generation();
+        if opts_moved {
+            self.bo_mirror_gen = self.editor.options_generation();
+        }
         let mut bo: Vec<BoMirror> = Vec::new();
         // The extmark snapshot for `nvim_buf_get_extmarks`: only buffers that hold
         // marks contribute, so a session with no decoration plugin pays nothing.
@@ -2216,40 +2230,43 @@ impl EditHost {
             let name = self.editor.display_name(id);
             if let Some(b) = self.editor.buffer_of(id) {
                 let o = b.options;
-                bo.push(BoMirror {
-                    bufnr: id.0,
-                    tabstop: o.tabstop,
-                    shiftwidth: o.shiftwidth,
-                    softtabstop: o.softtabstop,
-                    expandtab: o.expandtab,
-                    autoindent: o.autoindent,
-                    smartindent: o.smartindent,
-                    autopairs: o.autopairs,
-                    indentemptylines: o.indentemptylines,
-                    regexsyntax: self.editor.resolve_regexsyntax(o.regexsyntax).to_string(),
-                    fileencoding: o.fileencoding.to_string(),
-                    bomb: o.bomb,
-                    fileformat: o.fileformat.to_string(),
-                    endofline: o.endofline,
-                    fixendofline: o.fixendofline,
-                    modified: b.modified,
-                    filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
-                    ts_highlight: self.editor.ts_highlight_enabled(id),
-                    commentstring: self.editor.effective_commentstring(id),
-                    modifiable: o.modifiable,
-                    buftype: self.editor.buffer_buftype(id).to_string(),
-                    foldmethod: o.foldmethod.to_string(),
-                    // The *effective* values, like `commentstring` above: a buffer with
-                    // no entry of its own follows the global tier, and `vim.bo` must
-                    // report what folding actually uses.
-                    foldexpr: self.editor.effective_foldexpr(id).to_string(),
-                    foldmarker: {
-                        let (open, close) = self.editor.effective_foldmarker_of(id);
-                        format!("{open},{close}")
-                    },
-                    foldnestmax: o.foldnestmax,
-                    foldminlines: o.foldminlines,
-                });
+                if opts_moved || fresh {
+                    bo.push(BoMirror {
+                        bufnr: id.0,
+                        tabstop: o.tabstop,
+                        shiftwidth: o.shiftwidth,
+                        softtabstop: o.softtabstop,
+                        expandtab: o.expandtab,
+                        autoindent: o.autoindent,
+                        smartindent: o.smartindent,
+                        autopairs: o.autopairs,
+                        indentemptylines: o.indentemptylines,
+                        regexsyntax: self.editor.resolve_regexsyntax(o.regexsyntax).to_string(),
+                        fileencoding: o.fileencoding.to_string(),
+                        bomb: o.bomb,
+                        fileformat: o.fileformat.to_string(),
+                        endofline: o.endofline,
+                        fixendofline: o.fixendofline,
+                        modified: b.modified,
+                        filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
+                        ts_highlight: self.editor.ts_highlight_enabled(id),
+                        commentstring: self.editor.effective_commentstring(id),
+                        modifiable: o.modifiable,
+                        buftype: self.editor.buffer_buftype(id).to_string(),
+                        foldmethod: o.foldmethod.to_string(),
+                        // The *effective* values, like `commentstring` above: a buffer with
+                        // no entry of its own follows the global tier, and `vim.bo` must
+                        // report what folding actually uses.
+                        foldexpr: self.editor.effective_foldexpr(id).to_string(),
+                        foldmarker: {
+                            let (open, close) = self.editor.effective_foldmarker_of(id);
+                            format!("{open},{close}")
+                        },
+                        foldnestmax: o.foldnestmax,
+                        foldminlines: o.foldminlines,
+                    });
+                    self.bo_mirror_known.insert(id);
+                }
                 // A buffer contributes a full re-serialize only when its store's
                 // structural generation moved (a mark set / deleted / cleared). An
                 // untouched buffer contributes nothing at all, and an edited one
@@ -2337,6 +2354,16 @@ impl EditHost {
         self.buf_mirror_ticks.retain(|id, _| live.contains(id));
         self.buf_mirror_lines.retain(|id, _| live.contains(id));
         self.extmark_gens.retain(|id, _| live.contains(id));
+        // The `bo` mirror merges rows into the Lua table, so a buffer that vanished
+        // since the last push is dropped from the table explicitly — `vim.bo` for a
+        // dead bufnr reads `nil` exactly as it did when the table was replaced whole.
+        let removed: Vec<u64> = self
+            .bo_mirror_known
+            .iter()
+            .filter(|id| !live.contains(*id))
+            .map(|id| id.0)
+            .collect();
+        self.bo_mirror_known.retain(|id| live.contains(id));
 
         // Drain each changed buffer's byte-delta journal and project it into neovim's
         // `on_bytes` tuple for the `nvim_buf_attach` `on_bytes` callbacks (fired below,
@@ -2372,17 +2399,32 @@ impl EditHost {
         // current tab's layout order is pushed alongside it (`cur_wins`) for the
         // window-*number* surface (`winnr()` / `win_getid()`), which is per-tab.
         let global_scrollanim = self.editor.global_options().scrollanim;
-        let wins: Vec<WindowMirror> = self
-            .editor
-            .all_window_ids()
-            .into_iter()
+        let win_ids = self.editor.all_window_ids();
+        let wins: Vec<WindowMirror> = win_ids
+            .iter()
+            .copied()
             .map(|id| {
                 let buffer = self.editor.window_buffer(id).map(|b| b.0).unwrap_or(0);
                 let (line, col) = self.editor.window_cursor(id).unwrap_or((0, 0));
                 let (cw, ch) = self.editor.window_content_size(id).unwrap_or((0, 0));
                 let opts = self.editor.window_options(id).unwrap_or_default();
                 let (top, leftcol) = self.editor.window_scroll(id).unwrap_or((0, 0));
-                let (jumps, jump_idx) = self.editor.window_jumplist(id).unwrap_or_default();
+                // The jumplist is gated on its per-window generation (the same
+                // structural gate the extmark mirror uses): unchanged since the last
+                // push, the row carries an empty list and the Lua side keeps the old
+                // one — a repaint never re-serializes a whole jumplist. The pointer
+                // is read fresh either way (it is one usize; a moved generation is
+                // exactly when it changed).
+                let gen = self.editor.window_jumplist_gen(id).unwrap_or(0);
+                let moved = self.win_jump_gens.get(&id).copied() != Some(gen);
+                if moved {
+                    self.win_jump_gens.insert(id, gen);
+                }
+                let (jumps, jump_idx) = if moved {
+                    self.editor.window_jumplist(id).unwrap_or_default()
+                } else {
+                    (Vec::new(), self.editor.window_jumplist_idx(id).unwrap_or(0))
+                };
                 WindowMirror {
                     id: id.0,
                     buffer,
@@ -2430,9 +2472,13 @@ impl EditHost {
                         })
                         .collect(),
                     jump_idx: jump_idx as u64,
+                    jump_gen: gen,
                 }
             })
             .collect();
+        // Prune the jumplist generations of windows that closed — a recycled id
+        // pushes its full list again.
+        self.win_jump_gens.retain(|id, _| win_ids.contains(id));
         let cur_win_id = self.editor.current_window_id();
         let cur_win = cur_win_id.0;
         let next_win = self.editor.next_window_id().0;
@@ -2487,7 +2533,12 @@ impl EditHost {
         let _ = self
             .lua
             .set_alt_buf(self.editor.alternate_buffer().map_or(0, |b| b.0));
-        let _ = self.lua.set_bo_mirror(&bo);
+        // Only the rows that moved since the last push, plus the bufnrs to drop from
+        // the Lua table; an untouched push (no option moved, no buffer edited) sends
+        // nothing at all.
+        if !bo.is_empty() || !removed.is_empty() {
+            let _ = self.lua.set_bo_mirror(&bo, &removed);
+        }
         // …and the tier those buffers were born from, so `vim.go.tabstop` /
         // `vim.opt_global` read the core's global value rather than a Lua-side echo.
         let g = self.editor.buf_opts_global();
@@ -3459,9 +3510,20 @@ impl EditHost {
                 // the watch's stream pump with the coalesced `{ kind, paths }` batch,
                 // or its terminal `error`. Effects the handler queues drain right
                 // after, like the process-event arms.
+                // A terminal arm failure (bad path / watch limit) ends the stream, so
+                // the watch is dead for good. Forget it on the event-loop actor — the
+                // daemon link's `armed` map and the local watcher table — or every
+                // reconnect's `rearm_all` would re-arm the dead watch and push the
+                // error again, once per re-dial, forever. A fresh `btv.fs.watch` mints
+                // a new id and arms clean; a no-op when the arm never reached the
+                // actor (a local arm failure inserts no watcher).
+                let terminal = error.is_some();
                 if let Err(e) = self.lua.run_fs_watch_event(id, error, kind, paths) {
                     self.editor
                         .echo(format!("E5108: Error in btv.fs.watch handler: {e}"));
+                }
+                if terminal {
+                    self.apply_loop_op(LoopOp::FsUnwatch { id });
                 }
                 self.apply_lua_effects();
             }

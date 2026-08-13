@@ -49,20 +49,26 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// enabled, so it can host subprocess workers (LSP, grammar loads) and timers.
 pub fn spawn(init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("server runtime");
-        // `run_server` returns `Ok(())` on a normal client disconnect (test
-        // teardown), so an `Err` here is a genuine server failure. Surface it —
-        // swallowing it leaves the test to die later with an opaque
-        // "rpc connection closed" and no hint of the root cause.
-        if let Err(e) = runtime.block_on(run_server(server_end, init)) {
-            eprintln!("bemtvi-test-harness: server thread exited with error: {e:#}");
-        }
-    });
+    // A named thread: when the server panics, the panic message lands on this
+    // thread — `<unnamed>` would leave the test's eventual "rpc connection
+    // closed" with no hint that the server died, let alone where.
+    std::thread::Builder::new()
+        .name("bemtvi-test-server".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("server runtime");
+            // `run_server` returns `Ok(())` on a normal client disconnect (test
+            // teardown), so an `Err` here is a genuine server failure. Surface it —
+            // swallowing it leaves the test to die later with an opaque
+            // "rpc connection closed" and no hint of the root cause.
+            if let Err(e) = runtime.block_on(run_server(server_end, init)) {
+                eprintln!("bemtvi-test-harness: server thread exited with error: {e:#}");
+            }
+        })
+        .expect("spawn bemtvi-test-server thread");
     let (reader, writer) = tokio::io::split(client_end);
     connect(reader, writer)
 }
@@ -324,7 +330,9 @@ pub async fn buf_lines(rpc: &Rpc, handle: u64) -> Vec<String> {
             .into_iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
-        _ => Vec::new(),
+        // An empty reply is indistinguishable from an unexpected one — fail loud
+        // rather than assert on a phantom empty buffer (no-silent-stubs).
+        other => panic!("buf_lines: unexpected reply {other:?}"),
     }
 }
 
@@ -367,7 +375,9 @@ pub async fn cursor_u64(rpc: &Rpc) -> (u64, u64) {
             a.first().and_then(Value::as_u64).unwrap_or(0),
             a.get(1).and_then(Value::as_u64).unwrap_or(0),
         ),
-        _ => (0, 0),
+        // An unexpected reply would silently read as (0, 0) — fail loud (same
+        // reason as `buf_lines`).
+        other => panic!("cursor_u64: unexpected reply {other:?}"),
     }
 }
 
@@ -830,8 +840,28 @@ pub fn temp_root() -> PathBuf {
         // failing every test in the binary. The per-path `create_dir` /
         // `create_new` below still fail loud on a hostile pre-creation, which is
         // where the symlink/TOCTOU exposure actually is.
-        std::fs::create_dir_all(&root)
-            .unwrap_or_else(|e| panic!("create temp run root {}: {e}", root.display()));
+        //
+        // Owner-only mode (unix): every fixture the helpers hand out lives under
+        // this root, so `0700` here closes the read side of the hostile-temp-dir
+        // model — another local user can neither list the root nor open any
+        // fixture under it, whatever the per-file mode. The editor and any
+        // subprocess a test spawns run as the same user, so nothing they do is
+        // affected.
+        let create_root = || -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.recursive(true);
+                builder.create(&root)
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(&root)
+            }
+        };
+        create_root().unwrap_or_else(|e| panic!("create temp run root {}: {e}", root.display()));
         // Removes the root on a normal exit — including the `process::exit` the
         // libtest harness makes after reporting results, which runs no
         // destructors. A run that dies without unwinding leaves its root for the
@@ -967,9 +997,18 @@ fn unique() -> String {
 /// actual collision / hostile pre-creation, never in normal test flow.
 fn write_new(path: &std::path::Path, content: &[u8]) {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Owner-only on unix (no dependence on the caller's umask): a fixture that
+    // may carry a test's credentials or plugin config is never left world-
+    // readable in the shared temp dir even if the run root above is somehow
+    // bypassed. The editor reads these files as the same user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options
         .open(path)
         .unwrap_or_else(|e| panic!("create temp file {}: {e}", path.display()));
     f.write_all(content).expect("write temp file");
@@ -995,6 +1034,16 @@ pub fn temp_path(tag: &str) -> PathBuf {
 /// path.
 pub fn temp_dir(tag: &str) -> PathBuf {
     let dir = temp_root().join(format!("bemtvi_test_{tag}_{}", unique()));
+    // Owner-only on unix, like the run root it lives under (defence in depth
+    // for fixtures a test writes into it with plain `fs::write`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&dir).expect("create temp dir");
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir(&dir).expect("create temp dir");
     dir
 }
@@ -1053,7 +1102,10 @@ struct WriteGate {
 /// wait is a real blocking wait on the daemon's task, so a test using this **must** run
 /// on a multi-thread runtime (`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`)
 /// or the parked daemon stalls the editor too.
-pub struct WriteHold(Arc<WriteGate>);
+pub struct WriteHold {
+    gate: Arc<WriteGate>,
+    tree: Arc<Mutex<DaemonFsTree>>,
+}
 
 impl WriteHold {
     /// Poll until at least one daemon write is parked on this latch, so the test knows
@@ -1062,7 +1114,7 @@ impl WriteHold {
     /// edits mid-write prove nothing.
     pub async fn await_parked(&self) {
         for _ in 0..200 {
-            if self.0.state.lock().unwrap().1 > 0 {
+            if self.gate.state.lock().unwrap().1 > 0 {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1072,8 +1124,25 @@ impl WriteHold {
 
     /// Let every parked (and future) write through.
     pub fn release(self) {
-        self.0.state.lock().unwrap().0 = true;
-        self.0.cv.notify_all();
+        self.clear();
+    }
+}
+
+impl Drop for WriteHold {
+    fn drop(&mut self) {
+        // Also covers a hold that is dropped without `release()`: without this the
+        // tree's `hold` would stay armed, silently parking every later write in the
+        // process. Clearing on drop makes a forgotten hold benign instead of a
+        // wedge.
+        self.clear();
+    }
+}
+
+impl WriteHold {
+    fn clear(&self) {
+        self.tree.lock().unwrap().hold = None;
+        self.gate.state.lock().unwrap().0 = true;
+        self.gate.cv.notify_all();
     }
 }
 
@@ -1133,9 +1202,19 @@ impl DaemonFs {
     /// is edited *while its write is in flight*. See [`WriteHold`] for the
     /// multi-thread-runtime requirement.
     pub fn hold_writes(&self) -> WriteHold {
+        // A second hold would drop the first gate while its test still relies on it,
+        // silently unparking writes it meant to park — fail loud instead.
+        assert!(
+            self.inner.lock().unwrap().hold.is_none(),
+            "hold_writes: a hold is already armed (the previous WriteHold was \
+             released out of order?)"
+        );
         let gate = Arc::new(WriteGate::default());
         self.inner.lock().unwrap().hold = Some(gate.clone());
-        WriteHold(gate)
+        WriteHold {
+            gate,
+            tree: self.inner.clone(),
+        }
     }
 
     /// Make every subsequent [`write_atomic`](bemtvi_core::HostFs::write_atomic)

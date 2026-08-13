@@ -36,7 +36,9 @@ local function run_fs(job)
         resolve(value)
       end
     end
-    btv._fs_op(job, id)
+    btv._bridge(id, function()
+      btv._fs_op(job, id)
+    end)
   end)
 end
 
@@ -259,6 +261,57 @@ end
 
 -- ----- watch (continuous → async-iterator) -----------------------------------
 --
+-- Persistent per-watch pumps, keyed by stream id (like `btv._stdout_fns` for streams).
+btv._fs_watch_fns = btv._fs_watch_fns or {}
+
+-- The server fires this on each coalesced change (`ev`, nil) or terminal error
+-- (nil, `err`). Routes to the registered pump; a no-op once the stream is stopped.
+function btv._run_fs_watch(id, ev, err)
+  local fn = btv._fs_watch_fns[id]
+  if fn then
+    fn(ev, err)
+  end
+end
+
+local Watch = {}
+Watch.__index = Watch
+
+-- `:next()` -> promise of the next change batch, nil at end (after `:stop()`), or a
+-- rejection carrying the watch error. SEQUENTIAL like the process Stream: one
+-- outstanding `:next()` at a time (what a `for` loop does); batches arriving between
+-- pulls buffer in `_queue`.
+function Watch:next()
+  return btv.promise.new(function(resolve, reject)
+    -- Buffered batches first, then the terminal error (FIFO, like the process
+    -- Stream): events that arrived before the watch failed must not be silently
+    -- lost — a consumer loop gets what it already earned, then the rejection.
+    if #self._queue > 0 then
+      resolve(table.remove(self._queue, 1))
+    elseif self._err ~= nil then
+      reject(self._err)
+    elseif self._done then
+      resolve(nil)
+    else
+      self._waiter = { resolve = resolve, reject = reject }
+    end
+  end)
+end
+
+-- `:stop()` cancels the native watch and ends iteration (a parked `:next` resolves nil).
+function Watch:stop()
+  if self._done then
+    return
+  end
+  self._done = true
+  btv._fs_watch_fns[self._id] = nil
+  btv._fs_unwatch(self._id)
+  local waiter = self._waiter
+  self._waiter = nil
+  if waiter then
+    waiter.resolve(nil)
+  end
+end
+
 -- `btv.fs.watch(path[, { recursive = false }])` -> a Watch you iterate with
 -- `btv.await_each` (the streaming sibling of the one-shot ops, same shape as
 -- `btv.run_stream`). Each step yields a COALESCED change batch:
@@ -284,55 +337,6 @@ end
 -- A watch that can't arm (bad path, watch limit) or a session with no change source at
 -- all (serverless browser) REJECTS the first pull — fail loud, never a dead watch.
 -- `:stop()` cancels the watch and ends the iteration.
-
--- Persistent per-watch pumps, keyed by stream id (like `btv._stdout_fns` for streams).
-btv._fs_watch_fns = btv._fs_watch_fns or {}
-
--- The server fires this on each coalesced change (`ev`, nil) or terminal error
--- (nil, `err`). Routes to the registered pump; a no-op once the stream is stopped.
-function btv._run_fs_watch(id, ev, err)
-  local fn = btv._fs_watch_fns[id]
-  if fn then
-    fn(ev, err)
-  end
-end
-
-local Watch = {}
-Watch.__index = Watch
-
--- `:next()` -> promise of the next change batch, nil at end (after `:stop()`), or a
--- rejection carrying the watch error. SEQUENTIAL like the process Stream: one
--- outstanding `:next()` at a time (what a `for` loop does); batches arriving between
--- pulls buffer in `_queue`.
-function Watch:next()
-  return btv.promise.new(function(resolve, reject)
-    if self._err ~= nil then
-      reject(self._err)
-    elseif #self._queue > 0 then
-      resolve(table.remove(self._queue, 1))
-    elseif self._done then
-      resolve(nil)
-    else
-      self._waiter = { resolve = resolve, reject = reject }
-    end
-  end)
-end
-
--- `:stop()` cancels the native watch and ends iteration (a parked `:next` resolves nil).
-function Watch:stop()
-  if self._done then
-    return
-  end
-  self._done = true
-  btv._fs_watch_fns[self._id] = nil
-  btv._fs_unwatch(self._id)
-  local waiter = self._waiter
-  self._waiter = nil
-  if waiter then
-    waiter.resolve(nil)
-  end
-end
-
 function btv.fs.watch(path, opts)
   local self = setmetatable({ _queue = {}, _done = false, _waiter = nil }, Watch)
   local id = btv._next_cb_id()
@@ -355,6 +359,12 @@ function btv.fs.watch(path, opts)
       self._queue[#self._queue + 1] = ev
     end
   end
-  btv._fs_watch(id, path, opts and opts.recursive or false)
+  -- The pump lives in `_fs_watch_fns` (not `_cb_fns`), so a conversion throw must
+  -- drop it too, or the watch — and its queue — leaks forever.
+  btv._bridge(id, function()
+    btv._fs_watch(id, path, opts and opts.recursive or false)
+  end, function(cb_id)
+    btv._fs_watch_fns[cb_id] = nil
+  end)
   return self
 end

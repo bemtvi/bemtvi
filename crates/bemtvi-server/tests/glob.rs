@@ -1017,3 +1017,58 @@ async fn split_takes_a_comma_separated_line_without_breaking_brace_alternation()
         "an empty line is no patterns at all"
     );
 }
+
+// ----------------------------------------------------------- escaped brace groups
+//
+// `split` walks the list keeping track of brace *alternation* depth, so a comma
+// inside `{a,b}` is part of one pattern. A BACKSLASH-escaped brace is different: it
+// is a literal `{`, opening no alternation — but globset still treats everything up
+// to the next unescaped `}` (or the end) as one literal region, commas included. The
+// splitter used to ignore the escape entirely, so `\{a,b\}` was torn into two
+// patterns that globset then rejected by name.
+
+#[tokio::test]
+async fn an_escaped_brace_group_is_one_pattern() {
+    let (rpc, _i) = start().await;
+    assert_eq!(
+        eval(&rpc, r#"table.concat(btv.glob.split("\\{a,b\\}"), "|")"#).await,
+        r"\{a,b\}",
+        "an escaped brace opens a literal region, so its comma is not a separator"
+    );
+}
+
+#[tokio::test]
+async fn a_literal_region_runs_to_the_end_of_the_list() {
+    let (rpc, _i) = start().await;
+    // `\}` is a literal `}` and closes nothing, so the region — and the pattern —
+    // runs to the end.
+    assert_eq!(
+        eval(&rpc, r#"table.concat(btv.glob.split("\\{a,b\\},c"), "|")"#).await,
+        r"\{a,b\},c",
+        "an escaped closing brace does not end the literal region"
+    );
+}
+
+#[tokio::test]
+async fn an_unescaped_brace_closes_the_literal_region() {
+    let (rpc, _i) = start().await;
+    // The literal region opened by `\{` ends at the first UNESCAPED `}`; the comma
+    // after it is a real separator again.
+    assert_eq!(
+        eval(&rpc, r#"table.concat(btv.glob.split("\\{a,b},c"), "|")"#).await,
+        r"\{a,b}|c",
+        "an unescaped closing brace ends the literal region"
+    );
+}
+
+#[tokio::test]
+async fn a_real_alternation_still_splits_around_it() {
+    // The control: an UNESCAPED brace group keeps its commas, and a comma outside
+    // any group still separates. Guards the escape handling from swallowing the
+    // ordinary case.
+    let (rpc, _i) = start().await;
+    assert_eq!(
+        eval(&rpc, r#"table.concat(btv.glob.split("{a,b},c"), "|")"#).await,
+        "{a,b}|c",
+    );
+}

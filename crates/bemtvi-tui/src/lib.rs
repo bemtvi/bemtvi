@@ -27,7 +27,7 @@ mod render;
 mod signals;
 mod termquery;
 
-pub use keys::encode_key;
+pub use keys::{encode_key, encode_key_with};
 pub use render::{cursor_style, paint, paint_with_cursor, ScrollHarness};
 pub use signals::{exit_as_signal_if_killed, install as install_signal_restore, ShutdownSignal};
 pub use termquery::{has_status_report, parse_term_caps, term_names_a_multiplexer, TermCaps};
@@ -408,6 +408,31 @@ enum Outcome<S> {
     Swap(S),
 }
 
+/// Run a session builder off the event loop (on the blocking pool) and forward its
+/// result to the swap loop. A panic inside the opaque builder — the binary owns it,
+/// so a poisoned lock or an unwrap on a future dial path is possible — would
+/// otherwise be swallowed by tokio (the `JoinHandle` is never awaited) and the
+/// reconnect request would vanish: no swap, no error, the session just keeps
+/// running. Fold the panic into the same `Err` the builder's own failures produce,
+/// so the swap loop reports it and keeps the current session.
+fn build_session_off_loop<S: Send + 'static>(
+    build: SessionBuilder<S>,
+    params: Vec<Value>,
+    tx: tokio::sync::mpsc::UnboundedSender<Result<S>>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(params)));
+        let _ = tx.send(result.unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            Err(anyhow::anyhow!("session builder panicked: {msg}"))
+        }));
+    });
+}
+
 /// Run the client, keeping the window across `btv.session.reconnect` swaps (§B).
 ///
 /// The terminal (raw mode, alternate screen, mouse capture, the panic-restore hook) is set
@@ -563,11 +588,18 @@ where
         tokio::sync::mpsc::unbounded_channel::<images::ImageFetch>();
     let (img_bytes_tx, mut img_bytes_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, (u64, u64), Result<Vec<u8>, String>)>();
+    // Preview decodes, the same shape: the (synchronous) paint can only enqueue a
+    // decode request — local previews carry just the path, remote ones their
+    // fetched bytes — and the loop runs the disk read + decode on a blocking task,
+    // never inside a frame, sending the outcome back on `decode_done_*`.
+    let (decode_tx, mut decode_rx) = tokio::sync::mpsc::unbounded_channel::<images::DecodeReq>();
+    let (decode_done_tx, mut decode_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<images::DecodeResult>();
 
     // The image renderer for `'imagepreview'`: the terminal's graphics protocol and
     // cell size come out of the capability round `run` already ran, so nothing here
     // touches stdio — no second query to race the `EventStream` below.
-    let mut image_store = images::ImageStore::new(img_fetch_tx, caps.term);
+    let mut image_store = images::ImageStore::new(img_fetch_tx, decode_tx, caps.term);
 
     let mut view = View::default();
     let mut anim: Option<ScrollAnim> = None;
@@ -608,7 +640,11 @@ where
             term_event = term_events.next() => match term_event {
                 Some(Ok(Event::Key(key))) => {
                     if key.kind != KeyEventKind::Release {
-                        if let Some(notation) = encode_key(key) {
+                        // `kitty_keyboard` gates the legacy C0 fallback in
+                        // `encode_key_with`: under the protocol, a `Char('4') +
+                        // CONTROL` event is a real Ctrl+4 (CSI-u), not the 0x1C byte
+                        // for Ctrl-\, so it must not be remapped.
+                        if let Some(notation) = encode_key_with(key, caps.keyboard_protocol) {
                             rpc.notify("btv_input", vec![Value::from(notation.as_str())]);
                             flush_armed = true;
                         }
@@ -734,11 +770,7 @@ where
                     // session keeps rendering meanwhile; the result arrives on `built_rx`.
                     // The spec params are forwarded verbatim to the binary's builder.
                     "btv_session_reconnect" => {
-                        let build = build.clone();
-                        let tx = built_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = tx.send(build(params));
-                        });
+                        build_session_off_loop(build.clone(), params, built_tx.clone());
                     }
                     // `:connect <url>` with no matching connect-provider (§C): the raw URL
                     // rides as the single param. Forwarded verbatim to the SAME builder — it
@@ -746,11 +778,7 @@ where
                     // spec (a map) and dials it directly (bemtvi:// / ssh host). Built off the
                     // event loop so this session keeps rendering while the handshake runs.
                     "btv_connect_fallback" => {
-                        let build = build.clone();
-                        let tx = built_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = tx.send(build(params));
-                        });
+                        build_session_off_loop(build.clone(), params, built_tx.clone());
                     }
                     _ => {}
                 },
@@ -817,6 +845,18 @@ where
             // store and repaint, so the picture replaces its loading placeholder.
             bytes = img_bytes_rx.recv() => if let Some((path, version, result)) = bytes {
                 image_store.deliver(path, version, result);
+                draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
+            },
+            // A local preview needs decoding: run the disk read + decode on a
+            // blocking task (a slow disk or a huge image must never stall input or
+            // redraws) and send the outcome back on `decode_done_*`.
+            decode = decode_rx.recv() => if let Some(req) = decode {
+                images::decode_off_loop(req, decode_done_tx.clone());
+            },
+            // A local decode finished (or failed): hand it to the store and repaint,
+            // so the picture replaces its loading placeholder.
+            decoded = decode_done_rx.recv() => if let Some((path, version, decoded)) = decoded {
+                image_store.deliver_local(path, version, decoded);
                 draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
             },
         }

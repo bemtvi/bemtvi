@@ -48,6 +48,18 @@ pub fn git_job_from_value(v: &Value) -> Result<GitJob, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("git_op: op '{op}' missing string field '{key}'"))
     };
+    // Optional booleans: a missing key is the field's default (an older peer that
+    // predates the flag means the pre-flag behavior), a *present* non-bool is a
+    // first-party wire bug and fails loud instead of decoding to the default and
+    // hiding it — the module's stated policy (see the doc header).
+    let bool_field = |key: &str, op_name: &str| -> Result<bool, String> {
+        match get(key) {
+            None => Ok(false),
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| format!("git_op: op '{op_name}' has a non-boolean '{key}'")),
+        }
+    };
     Ok(match op {
         "discover" => GitJob::Discover {
             path: str_field("path")?,
@@ -65,34 +77,50 @@ pub fn git_job_from_value(v: &Value) -> Result<GitJob, String> {
         },
         "status" => GitJob::Status {
             path: str_field("path")?,
-            // Optional, like the mutation verbs' flags below: an older peer that omits
-            // the key means "no ignored reporting", the pre-flag behavior.
-            ignored: get("ignored").and_then(Value::as_bool).unwrap_or(false),
+            ignored: bool_field("ignored", "status")?,
         },
-        "clone" => GitJob::Clone {
-            url: str_field("url")?,
-            dir: str_field("dir")?,
-            // `depth`/`branch` are optional; a missing key is None (full history /
-            // remote-default branch), not an error.
-            depth: get("depth").and_then(Value::as_u64).map(|d| d as u32),
-            branch: get("branch").and_then(Value::as_str).map(str::to_string),
-        },
+        "clone" => {
+            GitJob::Clone {
+                url: str_field("url")?,
+                dir: str_field("dir")?,
+                // `depth`/`branch` are optional; a missing key is None (full history /
+                // remote-default branch), not an error. An out-of-range `depth` fails loud
+                // like the native-bare decode (mlua's `u32` conversion rejects it) rather
+                // than silently truncating to a wrong shallow depth.
+                depth: get("depth")
+                    .map(|d| {
+                        u32::try_from(d.as_u64().ok_or_else(|| {
+                            "git_op: op 'clone' has a non-integer 'depth'".to_string()
+                        })?)
+                        .map_err(|_| "git_op: op 'clone' depth exceeds the u32 range".to_string())
+                    })
+                    .transpose()?,
+                // Optional; a missing key is None (the remote's default branch), a
+                // present non-string is a first-party wire bug and fails loud.
+                branch: match get("branch") {
+                    None => None,
+                    Some(v) => Some(v.as_str().map(str::to_string).ok_or_else(|| {
+                        "git_op: op 'clone' has a non-string 'branch'".to_string()
+                    })?),
+                },
+            }
+        }
         "checkout" => GitJob::Checkout {
             dir: str_field("dir")?,
             rev: str_field("rev")?,
-            detach: get("detach").and_then(Value::as_bool).unwrap_or(false),
+            detach: bool_field("detach", "checkout")?,
         },
         "fetch" => GitJob::Fetch {
             dir: str_field("dir")?,
-            unshallow: get("unshallow").and_then(Value::as_bool).unwrap_or(false),
+            unshallow: bool_field("unshallow", "fetch")?,
         },
         "pull" => GitJob::Pull {
             dir: str_field("dir")?,
         },
         "submodule_update" => GitJob::SubmoduleUpdate {
             dir: str_field("dir")?,
-            init: get("init").and_then(Value::as_bool).unwrap_or(false),
-            recursive: get("recursive").and_then(Value::as_bool).unwrap_or(false),
+            init: bool_field("init", "submodule_update")?,
+            recursive: bool_field("recursive", "submodule_update")?,
         },
         other => return Err(format!("git_op: unknown op '{other}'")),
     })

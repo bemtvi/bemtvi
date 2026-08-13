@@ -893,3 +893,62 @@ async fn normal_takes_a_literal_bar_argument() {
         "`:normal` types the bar instead of chaining"
     );
 }
+
+// ----- confirm over an EOL empty match -----
+//
+// `$` matches the zero-width position at a line's end, so the confirm walk has no
+// character to step onto after answering. It used to step "one char on" regardless,
+// land back on the same byte, and re-prompt the same spot forever — `:%s/$/X/gc` was
+// unanswerable, and with `a` it never terminated. The walk now recognizes that there
+// is no next char and continues on the following line.
+
+#[tokio::test]
+async fn confirm_over_an_eol_empty_match_advances_to_the_next_line() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaa<CR>bb<CR>cc<Esc>");
+    feed(&rpc, ":%s/$/X/gc<CR>");
+    // Three answers for three lines. If the walk failed to advance, the second `y`
+    // would land on line 1 again and line 3 would never be reached.
+    feed(&rpc, "y");
+    feed(&rpc, "y");
+    feed(&rpc, "y");
+    assert_eq!(lines(&rpc).await, vec!["aaX", "bbX", "ccX"]);
+}
+
+#[tokio::test]
+async fn confirm_all_over_an_eol_empty_match_terminates() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaa<CR>bb<CR>cc<Esc>");
+    feed(&rpc, ":%s/$/X/gc<CR>");
+    // `a` takes every remaining match without prompting, so it runs the walk to the
+    // end inside one tick. A walk that cannot step past an EOL empty match spins
+    // there forever, holding the server thread — the read below would never answer.
+    // Bounded so a regression FAILS the suite instead of hanging CI.
+    feed(&rpc, "a");
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), lines(&rpc))
+        .await
+        .expect("the `a` walk must terminate — an EOL empty match used to spin forever");
+    assert_eq!(got, vec!["aaX", "bbX", "ccX"]);
+}
+
+#[tokio::test]
+async fn confirm_skipping_an_eol_empty_match_also_advances() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaa<CR>bb<CR>cc<Esc>");
+    feed(&rpc, ":%s/$/X/gc<CR>");
+    // The `n` (skip) path has its own step, and had the same non-advancing bug.
+    feed(&rpc, "n");
+    feed(&rpc, "y");
+    feed(&rpc, "n");
+    assert_eq!(lines(&rpc).await, vec!["aa", "bbX", "cc"]);
+}
+
+#[tokio::test]
+async fn a_non_confirm_eol_empty_match_still_hits_every_line() {
+    // The control: without `c` the same pattern already worked, so this guards the
+    // confirm fix against being "fixed" by changing the shared match walk.
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iaa<CR>bb<CR>cc<Esc>");
+    feed(&rpc, ":%s/$/X/g<CR>");
+    assert_eq!(lines(&rpc).await, vec!["aaX", "bbX", "ccX"]);
+}

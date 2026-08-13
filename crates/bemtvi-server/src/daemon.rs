@@ -130,7 +130,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+    self, channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -138,7 +138,7 @@ use tokio::sync::watch;
 use bemtvi_core::{DirEntry, FileStat, HostFs};
 use bemtvi_lsp::{LspChannel, LspProcess, LspTransport, ServerSpawn};
 use bemtvi_lua::LuaFs;
-use bemtvi_rpc::{connect, Incoming, Rpc};
+use bemtvi_rpc::{connect, connect_bounded, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
 use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
@@ -146,6 +146,15 @@ use crate::remote_config::{decode_config_bundle, RemoteConfigBundle};
 
 const FS_READ: &str = "fs_read";
 const FS_WRITE: &str = "fs_write";
+
+/// Largest **single frame payload** the daemon ships on the wire. `bemtvi-rpc`'s
+/// reader rejects any frame past its 64 MiB [`MAX_FRAME`](bemtvi_rpc) cap and
+/// tears the whole connection down — taking every leg with it, not just the one
+/// carrying the oversized payload. The cap is not exported, so this mirrors it
+/// at 63 MiB (a margin for the frame's own encoding overhead): a payload
+/// at/above this bound fails LOUD (the caller gets the message) instead of
+/// killing the link.
+const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024 - 1024 * 1024;
 // `:cd` in a daemon session: resolve + validate a directory on the daemon and reply with
 // its canonical path (request/response, like a read). Pure — it does NOT chdir the daemon
 // *process* (one daemon serves many concurrent sessions; a process-global cwd would
@@ -454,18 +463,22 @@ pub(crate) struct DialedConnection {
     control: GroupLink,
     proc: GroupLink,
     lsp: GroupLink,
-    term: GroupLink,
+    /// The Term leg alone rides a **bounded** inbound (see [`TermGroupLink`]): its
+    /// notification-only wire is the one a flood can fill, and a bounded inbound is the
+    /// reader-side backpressure that throttles the child.
+    term: TermGroupLink,
 }
 
 impl DialedConnection {
     /// Assemble a connection from its four already-built per-group links — the QUIC dialer's
-    /// entry point (one `GroupLink` per real bidi stream). The single-stream path builds the
-    /// same shape by splitting one stream ([`split_single_stream`]).
+    /// entry point (one `GroupLink` per real bidi stream; the Term one is a
+    /// [`TermGroupLink`]). The single-stream path builds the same shape by splitting one
+    /// stream ([`split_single_stream`]).
     pub(crate) fn from_groups(
         control: GroupLink,
         proc: GroupLink,
         lsp: GroupLink,
-        term: GroupLink,
+        term: TermGroupLink,
     ) -> DialedConnection {
         DialedConnection {
             control,
@@ -598,24 +611,29 @@ fn build_link() -> (LinkState, DaemonClient) {
 
 /// Serve one connection: publish its per-group `Rpc`s into the swappable cells, then run the
 /// four per-group demuxes (which feed the *stable* push channels). Returns when the
-/// connection drops (all four group streams EOF). The caller [`clear_cells`] afterwards (so
+/// connection drops — a natural end, or a **single leg's** stream dying (a QUIC leg task
+/// crash / RESET_STREAM leaves the other streams alive; waiting for all four would keep the
+/// dead leg's cell routed to a connection that no longer answers, and a spawn issued through
+/// it would park on its reply forever). The caller [`clear_cells`] afterwards (so
 /// the clear also covers the case where serving is *cancelled* by a `:disconnect`).
 async fn run_connection(state: &LinkState, conn: DialedConnection) {
     publish_cells(state, &conn);
 
     // The `luafs_op` job server already runs against the Control cell for the link's
     // lifetime (spawned by the caller), so it is not re-run here. The four demuxes are the
-    // connection's; they end when its streams EOF.
-    tokio::join!(
-        run_control_demux(
+    // connection's; they end when their streams EOF. The first one to end takes the whole
+    // connection down: the survivors are dropped (their inflight maps and cells are cleared
+    // by the caller, which also covers a natural multi-stream EOF where several end at once).
+    tokio::select! {
+        _ = run_control_demux(
             conn.control.incoming,
             state.watch_tx.clone(),
             state.fs_watch_tx.clone()
-        ),
-        run_demux(conn.proc.incoming, state.proc_inflight.clone()),
-        run_lsp_demux(conn.lsp.incoming, state.lsp_inflight.clone()),
-        run_term_demux(conn.term.incoming, state.term_event_tx.clone()),
-    );
+        ) => {}
+        _ = run_demux(conn.proc.incoming, state.proc_inflight.clone()) => {}
+        _ = run_lsp_demux(conn.lsp.incoming, state.lsp_inflight.clone()) => {}
+        _ = run_term_demux(conn.term.incoming, state.term_event_tx.clone()) => {}
+    }
 }
 
 /// Publish `conn`'s four per-group `Rpc`s into the swappable cells, so the seams the editor
@@ -671,6 +689,13 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // The shared single-stream inbound is **unbounded** — unlike the daemon side, this
+    // dialer awaits responses (fs_read/fs_write/sys_run/luafs/LSP all ride the one
+    // shared link), so a bounded cap here would let a Term flood fill the chain and
+    // strand a response frame behind it: the reader parks on notification pushes and
+    // the reply sits unread, hanging the edit-host op forever. Unbounded, the demux
+    // still throttles the Term fan-out (its own bounded group channel); the shared
+    // channel absorbing the flood in memory is the cost of not deadlocking.
     let (rpc, incoming) = connect(reader, writer);
     split_groups(rpc, incoming)
 }
@@ -678,11 +703,21 @@ where
 /// Fan one already-connected single-stream link into the four leg-group
 /// [`GroupLink`]s (spawning the [`split_incoming`] demux) — the body shared by
 /// [`split_single_stream`] and the one-shot [`serve_daemon_link`].
-fn split_groups(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> DialedConnection {
+fn split_groups(rpc: Rpc, incoming: mpsc::UnboundedReceiver<Incoming>) -> DialedConnection {
     let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
     let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
     let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
-    let (term_tx, term_rx) = unbounded_channel::<Incoming>();
+    // The Term fan-out is bounded (see [`TERM_LEG_IN_CAP`]): when the edit-host's
+    // terminal consumer stalls, `split_incoming` parks on this send — bounding the
+    // *fan-out* the run loop drains. The shared inbound is unbounded by design (see
+    // [`split_single_stream`]), so the reader does NOT park on a flood: the wire keeps
+    // draining and the burst is absorbed in the shared channel's memory until the
+    // consumer catches up. That is the deliberate price of not deadlocking the
+    // request/response legs that ride the same stream; only a transport with real
+    // per-group streams (the QUIC daemon-link) can backpressure the child itself. The
+    // other three groups stay unbounded (request/response legs — a bounded queue
+    // there could strand a response behind a full channel).
+    let (term_tx, term_rx) = channel::<Incoming>(TERM_LEG_IN_CAP);
     tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx, term_tx));
     DialedConnection::from_groups(
         GroupLink {
@@ -697,7 +732,7 @@ fn split_groups(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> DialedConnec
             rpc: rpc.clone(),
             incoming: lsp_rx,
         },
-        GroupLink {
+        TermGroupLink {
             rpc,
             incoming: term_rx,
         },
@@ -1342,6 +1377,23 @@ fn forward(inflight: &Inflight, id: u64, ev: DaemonEvent) {
 /// stream throttles the child — so a flood never queues without bound.
 const REMOTE_TERM_EVENT_CAP: usize = 4;
 
+/// Inbound capacity of the edit-host's **Term leg** (the `connect_bounded` wire channel
+/// of a dedicated term stream, and the split path's `term_tx` fan-out): how many decoded
+/// frames may sit between the wire reader and the run loop. On a dedicated stream the
+/// reader stops draining the wire when it fills, the daemon's backpressured `term_data`
+/// forwarder blocks, and the child is throttled. On the split single-stream path the
+/// shared inbound is unbounded (see [`split_single_stream`]), so the cap bounds only how
+/// much decoded flood the run loop is handed per batch — the wire keeps draining and the
+/// surplus accumulates in the shared channel's memory. 64 frames is a burst of PTY output
+/// without letting a runaway child grow memory without bound on the bounded paths.
+pub(crate) const TERM_LEG_IN_CAP: usize = 64;
+
+/// Inbound capacity of a **shared single-stream** link (ssh/stdio, the in-process test
+/// duplex) that carries all four leg groups: larger than [`TERM_LEG_IN_CAP`] because a
+/// term-data flood shares it with Control/Proc/Lsp frames, but still bounded — the reader
+/// stopping on a full channel is the wire-level backpressure that throttles the child.
+pub(crate) const SPLIT_LINK_IN_CAP: usize = 256;
+
 /// The edit-host-side **terminal** seam: forwards `:terminal` ops to the daemon's PTY host
 /// over the Term leg and surfaces the child's output/exit back as [`TermEvent`]s — the
 /// native twin of the wasm `HostEffects::term_*` path. The daemon runs the real PTY
@@ -1372,14 +1424,19 @@ impl RemoteHostTerm {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (rpc, incoming) = connect(reader, writer);
+        // The Term wire is notification-only, so its inbound rides the *bounded* variant
+        // (see `bemtvi_rpc::connect_bounded`): when the run loop can't keep up with a
+        // child's output, the reader stops draining the wire and the daemon's
+        // backpressured `term_data` forwarder throttles the child, instead of the flood
+        // accumulating in an unbounded queue.
+        let (rpc, incoming) = connect_bounded(reader, writer, TERM_LEG_IN_CAP);
         Self::with_link(rpc, incoming)
     }
 
     /// Build the seam over an already-connected Term group link (the
     /// [`serve_daemon_link_inner`] / QUIC multiplexer path): `rpc` sends ops, `incoming`
     /// is the Term group's demuxed inbound stream the term demux drains.
-    pub(crate) fn with_link(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> RemoteHostTerm {
+    pub(crate) fn with_link(rpc: Rpc, incoming: mpsc::Receiver<Incoming>) -> RemoteHostTerm {
         let (event_tx, event_rx) =
             channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
         tokio::spawn(run_term_demux(incoming, event_tx));
@@ -1453,7 +1510,7 @@ impl RemoteHostTerm {
 /// wire EOFs (the channel sender drops, so the run loop's terminal arm sees no more events) or
 /// the run loop drops its receiver (no consumer left).
 async fn run_term_demux(
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: mpsc::Receiver<Incoming>,
     event_tx: Sender<crate::terminal::native::TermEvent>,
 ) {
     use crate::terminal::native::TermEvent;
@@ -1536,27 +1593,75 @@ pub async fn serve_proc_daemon_on(
                         pid.map_or(Value::Nil, |p| Value::from(p as u64)),
                     ],
                 ),
-                LoopEvent::ProcessStdout { id, lines } => reply.notify(
-                    PROC_STDOUT,
-                    vec![
-                        Value::from(id),
-                        Value::Array(lines.into_iter().map(Value::from).collect()),
-                    ],
-                ),
+                LoopEvent::ProcessStdout { id, lines } => {
+                    let batch_bytes: usize = lines.iter().map(String::len).sum();
+                    if batch_bytes > MAX_FRAME_PAYLOAD {
+                        // The 512-line batch bound doesn't bound *bytes* — one
+                        // giant newline-less chunk ships as a batch of one, and
+                        // past the wire cap the edit-host's reader rejects the
+                        // frame and tears the connection down. Replace the batch
+                        // with one loud error line instead.
+                        reply.notify(
+                            PROC_STDOUT,
+                            vec![
+                                Value::from(id),
+                                Value::Array(vec![Value::from(format!(
+                                    "process {id} emitted a {batch_bytes}-byte output batch — too large for one wire frame ({} limit)",
+                                    MAX_FRAME_PAYLOAD
+                                ))]),
+                            ],
+                        );
+                    } else {
+                        reply.notify(
+                            PROC_STDOUT,
+                            vec![
+                                Value::from(id),
+                                Value::Array(lines.into_iter().map(Value::from).collect()),
+                            ],
+                        );
+                    }
+                }
                 LoopEvent::ProcessExit {
                     id,
                     code,
                     stdout,
                     stderr,
-                } => reply.notify(
-                    PROC_EXITED,
-                    vec![
-                        Value::from(id),
-                        Value::from(code as i64),
-                        Value::Binary(stdout),
-                        Value::Binary(stderr),
-                    ],
-                ),
+                } => {
+                    if stdout.len() + stderr.len() > MAX_FRAME_PAYLOAD {
+                        // The captured output rides one frame; past the wire cap the
+                        // edit-host's reader rejects it and tears the connection down
+                        // (with every other leg). Fail the exit loudly instead — the
+                        // edit-host's `on_exit` reports the message. Both streams are
+                        // dropped, because shipping either tail could itself overshoot
+                        // the cap.
+                        reply.notify(
+                            PROC_EXITED,
+                            vec![
+                                Value::from(id),
+                                Value::from(-1i64),
+                                Value::Binary(Vec::new()),
+                                Value::Binary(
+                                    format!(
+                                        "process {id} produced {} bytes of output — too large for one wire frame ({} limit)",
+                                        stdout.len() + stderr.len(),
+                                        MAX_FRAME_PAYLOAD
+                                    )
+                                    .into_bytes(),
+                                ),
+                            ],
+                        );
+                    } else {
+                        reply.notify(
+                            PROC_EXITED,
+                            vec![
+                                Value::from(id),
+                                Value::from(code as i64),
+                                Value::Binary(stdout),
+                                Value::Binary(stderr),
+                            ],
+                        );
+                    }
+                }
                 // The daemon only spawns processes — it arms no timers, no filesystem
                 // watches, no `btv.fs` ops (the luafs leg has its own handler), and no
                 // `btv.http.mount` listener (mounts are always local: the Lua VM that answers
@@ -1583,6 +1688,14 @@ pub async fn serve_proc_daemon_on(
     // Per-child kill channels, keyed by the edit-host's spawn id, so a `proc_kill`
     // can reach the running child (mirrors the event-loop actor's `procs` map).
     let mut kills: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    // Handles to every child task the leg spawned. The daemon outlives its
+    // connections (that's its job), so a dropped link must not orphan its
+    // children: a long-running child would otherwise run forever, and every
+    // reconnect would stack a fresh set on top of the previous one. Abort them
+    // all when the connection ends — dropping the future drops the child, whose
+    // `kill_on_drop` reaps the OS process (aborting a task that already
+    // completed is a no-op).
+    let mut children: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue; // the edit-host drives the daemon with notifications only
@@ -1593,7 +1706,7 @@ pub async fn serve_proc_daemon_on(
                     let (kill_tx, kill_rx) = oneshot::channel();
                     kills.insert(id, kill_tx);
                     let events = ProcEvents::new(id, ev_tx.clone());
-                    tokio::spawn(host.run(spec, kill_rx, events));
+                    children.push(tokio::spawn(host.run(spec, kill_rx, events)));
                 }
             }
             PROC_KILL => {
@@ -1608,6 +1721,15 @@ pub async fn serve_proc_daemon_on(
         // Forget kill channels whose child tasks have closed them (the child exited),
         // the same leak guard the event-loop actor applies to its `procs` map.
         kills.retain(|_, tx| !tx.is_closed());
+        // …and drop the finished handles themselves, so a connection serving many
+        // short `btv.run` calls doesn't accumulate a JoinHandle per call for its
+        // whole life (each holds the task's result until joined). Aborting a
+        // finished task at teardown is a no-op, so pruning loses nothing.
+        children.retain(|h| !h.is_finished());
+    }
+    // The edit-host is gone: reap every child it spawned.
+    for child in children {
+        child.abort();
     }
     Ok(())
 }
@@ -2057,6 +2179,17 @@ impl HostFsAsync for RemoteHostFs {
     ) -> Pin<Box<dyn Future<Output = io::Result<Option<FileStat>>> + Send>> {
         let rpc = self.rpc.clone();
         Box::pin(async move {
+            // The bytes travel as one frame: past the wire's frame cap the peer's
+            // reader would reject it and tear the connection down (with every
+            // other leg). Refuse loudly before sending — the save surfaces the
+            // error and the saved-state never clears on it.
+            if bytes.len() > MAX_FRAME_PAYLOAD {
+                return Err(io::Error::other(format!(
+                    "fs_write: {path} is {} bytes — too large for one wire frame ({} limit)",
+                    bytes.len(),
+                    MAX_FRAME_PAYLOAD
+                )));
+            }
             match rpc
                 .request(FS_WRITE, vec![Value::from(path), Value::Binary(bytes)])
                 .await
@@ -2377,11 +2510,24 @@ fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
         return Err(Value::from("fs_read: missing path"));
     };
     match classify(fs, &path) {
-        Ok(FsRead::File(bytes, stat)) => Ok(Value::Array(vec![
-            Value::from("file"),
-            Value::Binary(bytes),
-            stat.as_ref().map_or(Value::Nil, encode_stat),
-        ])),
+        Ok(FsRead::File(bytes, stat)) => {
+            // The bytes travel as one frame; past the wire cap the edit-host's
+            // reader rejects it and tears the connection down (with every other
+            // leg). Refuse loudly instead — the open fails with this message.
+            if bytes.len() > MAX_FRAME_PAYLOAD {
+                return Err(Value::from(format!(
+                    "fs_read: {} is {} bytes — too large for one wire frame ({} limit)",
+                    path.display(),
+                    bytes.len(),
+                    MAX_FRAME_PAYLOAD
+                )));
+            }
+            Ok(Value::Array(vec![
+                Value::from("file"),
+                Value::Binary(bytes),
+                stat.as_ref().map_or(Value::Nil, encode_stat),
+            ]))
+        }
         Ok(FsRead::New) => Ok(Value::Array(vec![Value::from("new")])),
         Ok(FsRead::Dir { path, entries }) => Ok(Value::Array(vec![
             Value::from("dir"),
@@ -2806,6 +2952,11 @@ pub async fn serve_lsp_daemon_on(
     // `lsp_stdin`/`lsp_kill` can reach the running child (mirrors the process leg's maps).
     let mut stdins: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
     let mut kills: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    // Handles to every spawned server task: a dropped link must not orphan its LSP
+    // servers (see `serve_proc_daemon_on`), or every reconnect would stack fresh
+    // servers on top of the previous session's. Abort them all on connection end;
+    // dropping `serve_one_lsp` drops its child, whose `kill_on_drop` reaps it.
+    let mut children: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue; // the edit-host drives the daemon with notifications only
@@ -2817,7 +2968,7 @@ pub async fn serve_lsp_daemon_on(
                     let (kill_tx, kill_rx) = oneshot::channel();
                     stdins.insert(id, stdin_tx);
                     kills.insert(id, kill_tx);
-                    tokio::spawn(serve_one_lsp(
+                    children.push(tokio::spawn(serve_one_lsp(
                         id,
                         program,
                         args,
@@ -2826,7 +2977,7 @@ pub async fn serve_lsp_daemon_on(
                         stdin_rx,
                         kill_rx,
                         rpc.clone(),
-                    ));
+                    )));
                 }
             }
             LSP_STDIN => {
@@ -2849,6 +3000,13 @@ pub async fn serve_lsp_daemon_on(
         // same leak guard the process leg applies.
         stdins.retain(|_, tx| !tx.is_closed());
         kills.retain(|_, tx| !tx.is_closed());
+        // …and drop the finished handles (a server that exited), so a connection
+        // that cycles many servers doesn't accumulate a JoinHandle per exit.
+        children.retain(|h| !h.is_finished());
+    }
+    // The edit-host is gone: reap every server it spawned.
+    for child in children {
+        child.abort();
     }
     Ok(())
 }
@@ -2920,12 +3078,21 @@ async fn serve_one_lsp(
             }
         }
     };
-    // Flush all stdout/stderr onto the wire *before* signaling exit.
-    if let Some(h) = out_handle.take() {
-        let _ = h.await;
-    }
-    if let Some(h) = err_handle.take() {
-        let _ = h.await;
+    // Flush all stdout/stderr onto the wire *before* signaling exit. Bounded the way
+    // `run_duplex_process` bounds its pump: EOF needs *every* holder of the write end
+    // to close it, and a forked grandchild inherits one, so an unbounded join could
+    // hang the `LSP_EXITED` notification — and with it the LSP manager's shutdown —
+    // forever. A killed child is owed a prompt exit, not its trailing output, and a
+    // child whose pipe stays open past the bound is abandoned the same way.
+    for mut handle in [out_handle.take(), err_handle.take()].into_iter().flatten() {
+        // Flushed naturally (within the bound) when neither condition aborts it.
+        let flushed = !killed
+            && tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+                .await
+                .is_ok();
+        if !flushed {
+            handle.abort();
+        }
     }
     stdin_task.abort();
     let (code, signal) = lsp_exit_code_signal(status);
@@ -3082,6 +3249,11 @@ pub async fn serve_dproc_daemon_on(
 
     let mut stdins: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
     let mut kills: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    // Handles to every spawned child task: a dropped link must not orphan its
+    // duplex children (see `serve_proc_daemon_on`). Abort them all on connection
+    // end; dropping `run_duplex_process` drops the child, whose `kill_on_drop`
+    // reaps it.
+    let mut children: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue;
@@ -3093,7 +3265,7 @@ pub async fn serve_dproc_daemon_on(
                     let (kill_tx, kill_rx) = oneshot::channel();
                     stdins.insert(id, stdin_tx);
                     kills.insert(id, kill_tx);
-                    tokio::spawn(crate::host::run_duplex_process(
+                    children.push(tokio::spawn(crate::host::run_duplex_process(
                         id,
                         argv,
                         cwd,
@@ -3101,7 +3273,7 @@ pub async fn serve_dproc_daemon_on(
                         kill_rx,
                         stdin_rx,
                         ev_tx.clone(),
-                    ));
+                    )));
                 }
             }
             DPROC_WRITE => {
@@ -3123,6 +3295,13 @@ pub async fn serve_dproc_daemon_on(
         }
         stdins.retain(|_, tx| !tx.is_closed());
         kills.retain(|_, tx| !tx.is_closed());
+        // …and drop the finished handles, the same accumulation guard as the
+        // process and LSP legs.
+        children.retain(|h| !h.is_finished());
+    }
+    // The edit-host is gone: reap every duplex child it opened.
+    for child in children {
+        child.abort();
     }
     Ok(())
 }
@@ -3163,6 +3342,10 @@ pub async fn serve_sock_daemon_on(
 
     let mut writes: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
     let mut closes: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    // Handles to every socket task the leg dialed: a dropped link must not leave
+    // them connected (see `serve_proc_daemon_on`). Abort them all on connection
+    // end, which drops the socket.
+    let mut sockets: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue;
@@ -3174,18 +3357,34 @@ pub async fn serve_sock_daemon_on(
                     params.get(1).and_then(|v| v.as_str().map(str::to_owned)),
                     params.get(2).and_then(Value::as_u64),
                 ) {
+                    // A port outside the u16 dial range would silently truncate into a
+                    // different target (`70000` → `4464`); refuse loudly instead. The
+                    // close notification is the error channel for a connect that never
+                    // began, the same shape a refused connect produces.
+                    let Ok(port) = u16::try_from(port) else {
+                        rpc.notify(
+                            SOCK_CLOSED,
+                            vec![
+                                Value::from(id),
+                                Value::from(format!(
+                                    "btv.socket.connect: port {port} out of range"
+                                )),
+                            ],
+                        );
+                        continue;
+                    };
                     let (write_tx, write_rx) = unbounded_channel::<Vec<u8>>();
                     let (close_tx, close_rx) = oneshot::channel();
                     writes.insert(id, write_tx);
                     closes.insert(id, close_tx);
-                    tokio::spawn(crate::host::run_socket_connection(
+                    sockets.push(tokio::spawn(crate::host::run_socket_connection(
                         id,
                         host,
-                        port as u16,
+                        port,
                         close_rx,
                         write_rx,
                         ev_tx.clone(),
-                    ));
+                    )));
                 }
             }
             SOCK_WRITE => {
@@ -3206,7 +3405,12 @@ pub async fn serve_sock_daemon_on(
             _ => {}
         }
         writes.retain(|_, tx| !tx.is_closed());
+        sockets.retain(|h| !h.is_finished());
         closes.retain(|_, tx| !tx.is_closed());
+    }
+    // The edit-host is gone: drop every socket it dialed.
+    for socket in sockets {
+        socket.abort();
     }
     Ok(())
 }
@@ -4013,23 +4217,35 @@ pub async fn serve_config_daemon_on(
 fn serve_config_bundle(params: &[Value]) -> Result<Value, Value> {
     let include_files = params.first().and_then(Value::as_bool).unwrap_or(true);
     match crate::collect_config_bundle(include_files) {
-        Ok((config_dir, runtimepath, files, ts_languages, state_dir)) => Ok(encode_config_bundle(
-            config_dir,
-            runtimepath,
-            files,
-            ts_languages,
-            // The daemon's process cwd, to seed the edit-host's `DirState` so a remote
-            // session's `:pwd` / `getcwd` / `:cd` operate on the daemon's directory
-            // (`docs/plans/2026-06-23-remote-cwd.md`). `None` if it can't be read — the
-            // edit-host then falls back to its own local cwd.
-            std::env::current_dir().ok(),
-            // The daemon's shada base dir, where a `Remote`-config session stages + syncs
-            // its shada over the fs seam (the daemon itself runs no shada logic).
-            state_dir,
-            // The daemon's home dir, so a leading `~` in a file argument (`:e ~/x`)
-            // expands against the daemon's `$HOME` — where the file read lands.
-            std::env::var_os("HOME").map(PathBuf::from),
-        )),
+        Ok((config_dir, runtimepath, files, ts_languages, state_dir)) => {
+            // The whole bundle ships as one frame; past the wire cap the edit-host's
+            // reader rejects it and tears the connection down (with every other leg).
+            // A config tree that huge is a misconfiguration — refuse loudly.
+            let total: usize = files.iter().map(|(_, bytes)| bytes.len()).sum();
+            if total > MAX_FRAME_PAYLOAD {
+                return Err(Value::from(format!(
+                    "config_bundle: config files total {total} bytes — too large for one wire frame ({} limit)",
+                    MAX_FRAME_PAYLOAD
+                )));
+            }
+            Ok(encode_config_bundle(
+                config_dir,
+                runtimepath,
+                files,
+                ts_languages,
+                // The daemon's process cwd, to seed the edit-host's `DirState` so a remote
+                // session's `:pwd` / `getcwd` / `:cd` operate on the daemon's directory
+                // (`docs/plans/2026-06-23-remote-cwd.md`). `None` if it can't be read — the
+                // edit-host then falls back to its own local cwd.
+                std::env::current_dir().ok(),
+                // The daemon's shada base dir, where a `Remote`-config session stages + syncs
+                // its shada over the fs seam (the daemon itself runs no shada logic).
+                state_dir,
+                // The daemon's home dir, so a leading `~` in a file argument (`:e ~/x`)
+                // expands against the daemon's `$HOME` — where the file read lands.
+                std::env::var_os("HOME").map(PathBuf::from),
+            ))
+        }
         Err(e) => Err(Value::from(format!("config_bundle: {e}"))),
     }
 }
@@ -4241,6 +4457,11 @@ where
             Err(_) => return,
         };
         rt.block_on(async move {
+            // Unbounded shared inbound like the reconnecting twin
+            // (`split_single_stream`): this dialer awaits responses (fs/proc/LSP all
+            // ride the one shared link), and a bounded cap would let a Term flood
+            // strand a reply behind it — hanging the seam's request forever. The
+            // per-group Term fan-out still throttles on its own bounded channel.
             let (rpc, incoming) = connect(reader, writer);
             serve_daemon_link(rpc, incoming, client_tx).await;
         });
@@ -4262,6 +4483,17 @@ pub(crate) struct GroupLink {
     pub(crate) incoming: UnboundedReceiver<Incoming>,
 }
 
+/// The Term leg's link, the one group whose inbound is **bounded** ([`TERM_LEG_IN_CAP`]):
+/// its wire is notification-only (no request/response to strand), and it is the leg a
+/// remote child's output floods. On a dedicated stream the bounded inbound is the
+/// reader-side backpressure that throttles the child (see [`bemtvi_rpc::connect_bounded`]);
+/// on the split single-stream path ([`split_groups`]) it bounds only the run-loop fan-out
+/// — the shared unbounded inbound absorbs the flood (see [`split_single_stream`]).
+pub(crate) struct TermGroupLink {
+    pub(crate) rpc: Rpc,
+    pub(crate) incoming: mpsc::Receiver<Incoming>,
+}
+
 /// Drive a **single-stream** link (ssh/stdio, the in-process test duplex): every leg group
 /// shares the one `(rpc, incoming)`, so split the one inbound notification stream into the
 /// four logical groups by method and hand them to the same [`serve_daemon_link_inner`] the
@@ -4269,7 +4501,7 @@ pub(crate) struct GroupLink {
 /// transport-agnostic seam construction lives in `serve_daemon_link_inner`.
 pub(crate) async fn serve_daemon_link(
     rpc: Rpc,
-    incoming: UnboundedReceiver<Incoming>,
+    incoming: mpsc::UnboundedReceiver<Incoming>,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
     serve_daemon_link_inner(split_groups(rpc, incoming), client_tx).await;
@@ -4280,11 +4512,11 @@ pub(crate) async fn serve_daemon_link(
 /// drops (the peer is the same build). On EOF the four senders drop, closing the per-group
 /// demuxes downstream.
 async fn split_incoming(
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: mpsc::UnboundedReceiver<Incoming>,
     ctrl_tx: UnboundedSender<Incoming>,
     proc_tx: UnboundedSender<Incoming>,
     lsp_tx: UnboundedSender<Incoming>,
-    term_tx: UnboundedSender<Incoming>,
+    term_tx: mpsc::Sender<Incoming>,
 ) {
     while let Some(msg) = incoming.recv().await {
         let method = match &msg {
@@ -4296,7 +4528,13 @@ async fn split_incoming(
             Some(LegGroup::Control) => &ctrl_tx,
             Some(LegGroup::Proc) => &proc_tx,
             Some(LegGroup::Lsp) => &lsp_tx,
-            Some(LegGroup::Term) => &term_tx,
+            // The Term leg's bounded send *awaits*: full means the edit-host's terminal
+            // consumer is stalled, so park here instead of draining the shared inbound
+            // into a queue — the reader then stops the wire (see `split_groups`).
+            Some(LegGroup::Term) => {
+                let _ = term_tx.send(msg).await;
+                continue;
+            }
             None => continue, // unknown method (same build) — drop
         };
         let _ = tx.send(msg);

@@ -2399,7 +2399,7 @@ impl Editor {
                 self.subst_confirm_seek();
             }
             'n' => {
-                self.subst_confirm_skip(e);
+                self.subst_confirm_skip(s, e);
                 self.subst_confirm_seek();
             }
             'l' => {
@@ -2446,13 +2446,16 @@ impl Editor {
             None => s + repl.len(),
         };
         let cont_line = line + extra;
-        // An empty match (`s == e`) with an empty/zero-width replacement would
-        // re-fire at the same spot forever; step one grapheme on so the walk
-        // progresses (mirrors the regex crate's empty-match handling).
+        // An empty match (`s == e`) would re-fire at the same spot forever; step
+        // one char on so the walk progresses (mirrors the regex crate's
+        // empty-match handling). `None` when there is no char left to step onto —
+        // the EOL empty match (e.g. `:s/$/X/gc`), where the next line must
+        // continue the walk instead of re-prompting the same spot indefinitely.
         let cont_byte = if global && e == s && extra == 0 {
-            next_char_boundary(&self.buffer().line(cont_line), tail_byte)
+            let nb = next_char_boundary(&self.buffer().line(cont_line), tail_byte);
+            (nb != tail_byte).then_some(nb)
         } else {
-            tail_byte
+            Some(tail_byte)
         };
 
         let sc = self.subst_confirm.as_mut().expect("confirm active");
@@ -2464,8 +2467,14 @@ impl Editor {
         sc.hi += extra;
         sc.last_changed = Some(cont_line);
         if global {
-            sc.line = cont_line;
-            sc.byte = cont_byte;
+            match cont_byte {
+                Some(b) => sc.byte = b,
+                None => {
+                    sc.line = cont_line + 1;
+                    sc.byte = 0;
+                    sc.line_dirty = false;
+                }
+            }
         } else {
             // One substitution per line without `g`: move to the next line.
             sc.line = cont_line + 1;
@@ -2476,19 +2485,35 @@ impl Editor {
 
     /// Decline the match ending at `e` and advance the walk past it (to the next
     /// line without `g`, else just past this match on the same line).
-    fn subst_confirm_skip(&mut self, e: usize) {
-        let (line, byte, global) = {
+    fn subst_confirm_skip(&mut self, s: usize, e: usize) {
+        let (line, global) = {
             let sc = self.subst_confirm.as_ref().expect("confirm active");
-            (sc.line, sc.byte, sc.global)
+            (sc.line, sc.global)
         };
         if global {
-            // Past the match; force a step for an empty one so we make progress.
-            let next = if e > byte {
-                e
+            // Resume just past the match. The step is measured from the match's
+            // OWN end, never from the walk's search start (`sc.byte`) — that start
+            // sits before the match, so `e` is always "past" it and an empty match
+            // would be re-found at `e`, re-prompting the same spot forever.
+            //
+            // An empty match (`s == e`) therefore needs a real one-char step, and
+            // `None` when there is no char left to step onto — the EOL empty match
+            // (`:s/$/X/gc`), where the walk must continue on the next line.
+            let next = if e > s {
+                Some(e)
             } else {
-                next_char_boundary(&self.buffer().line(line), byte)
+                let nb = next_char_boundary(&self.buffer().line(line), e);
+                (nb != e).then_some(nb)
             };
-            self.subst_confirm.as_mut().expect("confirm active").byte = next;
+            let sc = self.subst_confirm.as_mut().expect("confirm active");
+            match next {
+                Some(b) => sc.byte = b,
+                None => {
+                    sc.line += 1;
+                    sc.byte = 0;
+                    sc.line_dirty = false;
+                }
+            }
         } else {
             let sc = self.subst_confirm.as_mut().expect("confirm active");
             sc.line += 1;

@@ -13,16 +13,19 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
-use bemtvi_view::images::{decode_bytes, decode_file, ImageFetch, RemoteImages};
+use bemtvi_view::images::{DecodeReq, ImageFetch, RemoteImages};
 use bemtvi_view::ImageData;
+use image::DynamicImage;
 use tokio::sync::mpsc::UnboundedSender;
 
 // The fetch request / remote byte cache / bounded decode helpers are the
 // toolkit-neutral half shared with the TUI; they live in [`bemtvi_view::images`].
 // The decode cap there ([`bemtvi_view::images::MAX_EDGE`]) also keeps every
-// texture well under wgpu's `max_texture_dimension` (`max_dim` tightens it
-// further on a smaller device limit).
+// uploaded texture well under wgpu's `max_texture_dimension`: the decode now
+// runs off the UI thread at the fixed shared cap, which is below the
+// guaranteed minimum (4096) of every desktop wgpu backend.
 
 /// One preview window's image draw request for a frame: the window's text-body
 /// rect in physical pixels (origin top-left) and the image's disk reference. The
@@ -35,11 +38,20 @@ pub(crate) struct ImageDraw {
 /// One path's cache slot: the on-disk version it was decoded at (size + mtime-ms)
 /// and the uploaded GPU texture, or `None` for a decode failure. Keeping the
 /// version lets a changed-on-disk file re-upload (a stale or once-broken entry is
-/// replaced) while an unchanged one — success or failure — is never re-read.
+/// replaced) while an unchanged one — success or failure — is never re-read —
+/// except a failure, which pins `retry_after` so the next repaint past the
+/// cooldown decodes again (a transient failure — file locked, mid-write read —
+/// would otherwise paint "cannot read" until the file's version next moves).
 struct CacheEntry {
     version: (u64, u64),
     tex: Option<Tex>,
+    retry_after: Option<Instant>,
 }
+
+/// How long after a failed decode to retry it (see `CacheEntry::retry_after`).
+/// Matches the TUI's retry, so both clients recover from a transient read
+/// failure on the same cadence.
+const RETRY_AFTER: Duration = Duration::from_millis(500);
 
 /// An uploaded image: its sampling bind group and pixel size (for the aspect fit).
 struct Tex {
@@ -72,13 +84,21 @@ pub(crate) struct ImageStore {
     /// Per-draw `(vertex range, path)` for this frame, in draw order. The path keys
     /// the cache for the bind group; a draw whose decode failed is omitted.
     draws: Vec<(Range<u32>, String)>,
-    max_dim: u32,
     /// Out-of-band byte fetches for remote (daemon-session) previews (shared with
     /// the TUI; see [`RemoteImages`]).
     remote: RemoteImages,
     /// The sink the App's IO thread drains to issue `bemtvi_image_read` requests; a
     /// reply comes back via [`ImageStore::deliver`].
     fetch_tx: UnboundedSender<ImageFetch>,
+    /// The sink the App's IO thread drains to run a preview's decode off the UI
+    /// thread (a disk read + full-res decode must not block repaints — remote
+    /// previews ride the same channel, carrying their fetched bytes); the outcome
+    /// comes back via [`ImageStore::deliver_decode`].
+    decode_tx: UnboundedSender<DecodeReq>,
+    /// Decodes in flight, by path: the version being decoded. Guards against
+    /// re-enqueuing a decode a repaint already asked for, and lets
+    /// [`ImageStore::deliver_decode`] drop a superseded decode's outcome.
+    pending: HashMap<String, (u64, u64)>,
 }
 
 /// Bytes per vertex: vec2 clip-space position + vec2 texture UV.
@@ -108,8 +128,8 @@ impl ImageStore {
     pub(crate) fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        max_dim: u32,
         fetch_tx: UnboundedSender<ImageFetch>,
+        decode_tx: UnboundedSender<DecodeReq>,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bemtvi-gui image shader"),
@@ -202,23 +222,20 @@ impl ImageStore {
             vbuf,
             capacity,
             draws: Vec::new(),
-            max_dim,
             remote: RemoteImages::new(),
             fetch_tx,
+            decode_tx,
+            pending: HashMap::new(),
         }
     }
 
-    /// Decode/upload any new or changed-on-disk image in `live`, and free the GPU
-    /// texture of any cached path no longer shown. Called *before* the frame is
-    /// built so [`failed`](Self::failed) is accurate the same frame — letting the
-    /// renderer paint the `[image: …]` placeholder for a broken file immediately
-    /// (a one-frame lag could otherwise never repaint, redraws being event-driven).
-    pub(crate) fn ensure(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        live: &[&ImageData],
-    ) {
+    /// Decode any new or changed-on-disk image in `live`, and free the GPU texture
+    /// of any cached path no longer shown. Called *before* the frame is built so
+    /// [`failed`](Self::failed) is accurate the same frame — letting the renderer
+    /// paint the `[image: …]` placeholder for a broken file immediately (a
+    /// one-frame lag could otherwise never repaint, redraws being event-driven).
+    /// The decode itself runs off the UI thread (see [`ImageStore::deliver_decode`]).
+    pub(crate) fn ensure(&mut self, live: &[&ImageData]) {
         // Drop cache entries no shown image references, so a closed preview (or a
         // buffer that switched away from an image) frees its GPU texture and its
         // fetched remote bytes.
@@ -226,6 +243,7 @@ impl ImageStore {
             live.iter().map(|im| im.path.as_str()).collect();
         self.cache.retain(|k, _| keep.contains(k.as_str()));
         self.remote.retain_paths(|k| keep.contains(k));
+        self.pending.retain(|k, _| keep.contains(k.as_str()));
 
         for im in live {
             let path = im.path.as_str();
@@ -237,29 +255,81 @@ impl ImageStore {
                     let _ = self.fetch_tx.send(req);
                 }
             }
-            // (Re)upload when there's no entry or the on-disk version moved (the
-            // latter also retries a file whose earlier decode failed but was fixed).
-            if self.cache.get(path).map(|e| e.version) != Some(version) {
+            // (Re)decode when there's no entry, the on-disk version moved (the
+            // latter also retries a file whose earlier decode failed but was
+            // fixed), or a failed decode's retry cooldown has elapsed (a
+            // transient read failure self-heals on a later repaint).
+            let needs_decode = match self.cache.get(path) {
+                Some(e) => {
+                    e.version != version || e.retry_after.is_some_and(|t| t <= Instant::now())
+                }
+                None => true,
+            };
+            if needs_decode {
                 // The source bytes: a remote preview decodes the fetched bytes (and
                 // skips this frame until they land — keeping any stale texture so a
                 // reload doesn't flash the placeholder); a local preview reads the
-                // shared disk.
-                let decoded = if im.remote {
-                    match self.remote.ready(path, version) {
-                        Some(bytes) => decode_bytes(bytes, self.max_dim),
-                        None => continue,
-                    }
-                } else {
-                    decode_file(path, self.max_dim)
-                };
-                let tex = decoded.map(|img| {
-                    let px = (img.width(), img.height());
-                    let bind_group = self.upload(device, queue, &img);
-                    Tex { bind_group, px }
-                });
-                self.cache
-                    .insert(path.to_string(), CacheEntry { version, tex });
+                // shared disk. Either way the decode runs OFF the UI thread — a disk
+                // read plus a full-res decode on the paint path would stall every
+                // repaint for the file's read time, no matter how big the image is —
+                // through the same pending / [`ImageStore::deliver_decode`] machinery
+                // the TUI uses. Track the in-flight request so a repaint before the
+                // result lands doesn't enqueue a duplicate.
+                if self.pending.get(path) != Some(&version) {
+                    let req = if im.remote {
+                        match self.remote.ready(path, version) {
+                            Some(bytes) => DecodeReq::Remote {
+                                path: path.to_string(),
+                                version,
+                                bytes: bytes.to_vec(),
+                            },
+                            None => continue,
+                        }
+                    } else {
+                        DecodeReq::Local {
+                            path: path.to_string(),
+                            version,
+                        }
+                    };
+                    self.pending.insert(path.to_string(), version);
+                    let _ = self.decode_tx.send(req);
+                }
             }
+        }
+    }
+
+    /// Receive a decode's outcome (routed from the IO thread via
+    /// `UserEvent::ImageDecoded`): upload it, or schedule its retry, exactly as a
+    /// paint-time decode would have — a superseded result (a newer version was
+    /// requested while the decode ran) is dropped. The caller requests a repaint
+    /// afterward.
+    pub(crate) fn deliver_decode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: String,
+        version: (u64, u64),
+        decoded: Option<DynamicImage>,
+    ) {
+        if self.pending.get(&path) == Some(&version) {
+            self.pending.remove(&path);
+            let tex = decoded.map(|img| {
+                let px = (img.width(), img.height());
+                let bind_group = self.upload(device, queue, &img);
+                Tex { bind_group, px }
+            });
+            // A failure pins the version with a retry deadline instead of caching
+            // it forever: the next repaint past the cooldown decodes again (see
+            // `CacheEntry::retry_after`). A success clears any prior deadline.
+            let failed = tex.is_none();
+            self.cache.insert(
+                path.clone(),
+                CacheEntry {
+                    version,
+                    tex,
+                    retry_after: failed.then(|| Instant::now() + RETRY_AFTER),
+                },
+            );
         }
     }
 

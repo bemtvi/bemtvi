@@ -152,6 +152,20 @@ fn ask(query: &[u8], wait: Duration) -> Option<Vec<u8>> {
         if !stdin_readable_within(remain) {
             return (!reply.is_empty()).then_some(reply);
         }
+        // Only consume input that looks like a probe reply. Every answer to our
+        // queries starts with ESC; anything else readable here is a keystroke the
+        // user typed while we waited, and consuming it would swallow the key —
+        // the same failure as the parked read `crate::images` warns about (the
+        // wait can be a full second on a terminal that answers nothing). Peek
+        // the first byte without removing it; when the peek can't be performed
+        // (no data yet, EOF, a platform that rejects MSG_PEEK on stdin) fall
+        // back to reading blindly. Escaped keys (an arrow, Alt+letter) can still
+        // be eaten, but plain typed text — the common case — is left for the
+        // `EventStream`, and the replies that sit behind it are sequences
+        // crossterm drops rather than re-delivers as keys.
+        if !stdin_starts_with_escape() {
+            return (!reply.is_empty()).then_some(reply);
+        }
         match stdin.read(&mut buf) {
             // EOF / error: nothing more is coming.
             Ok(0) | Err(_) => return (!reply.is_empty()).then_some(reply),
@@ -160,6 +174,29 @@ fn ask(query: &[u8], wait: Duration) -> Option<Vec<u8>> {
         if has_status_report(&reply) {
             return Some(reply);
         }
+    }
+}
+
+/// Whether the next byte on stdin is ESC — i.e. the readable input is (part of)
+/// a probe reply rather than a keystroke — peeking without consuming it. Returns
+/// `true` (read anyway) when the peek can't be performed: a poll/recv race with
+/// no data yet, EOF, or a platform that rejects `MSG_PEEK` on stdin. This must
+/// never block: `stdin_readable_within` just reported the byte as ready.
+#[cfg(unix)]
+fn stdin_starts_with_escape() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut byte = 0u8;
+    let n = unsafe {
+        libc::recv(
+            std::io::stdin().as_raw_fd(),
+            &mut byte as *mut u8 as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK,
+        )
+    };
+    match n {
+        1 => byte == 0x1b,
+        _ => true,
     }
 }
 

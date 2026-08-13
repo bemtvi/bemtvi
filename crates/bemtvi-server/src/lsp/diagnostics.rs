@@ -66,6 +66,14 @@ impl TrackedDiagnostic<'_> {
         }
         let start = self.start.saturating_sub(row_start).min(line.len());
         let end = self.end.saturating_sub(row_start).min(line.len());
+        // End-exclusive boundary: a multi-line span ending exactly at this row's
+        // start reaches *up to* the row, not onto it — without this, both anchors
+        // land on 0 and the row clip widens `(0, 0)` into a phantom 1-cell squiggle
+        // at column 0. A zero-width diagnostic resting at its own start row is
+        // untouched (`self.start == row_start`).
+        if start == end && self.start < row_start {
+            return None;
+        }
         Some((start, end.max(start)))
     }
 
@@ -358,15 +366,18 @@ impl EditHost {
             return Vec::new();
         };
         // The anchors are addressed by position in the merged list, so they are only
-        // trustworthy while the list is the one they were placed from.
+        // trustworthy while the list is the one they were placed from. The count and
+        // the namespace generation were recorded together at placement
+        // (`refresh_diagnostic_marks`): the count alone survives an undo that restores
+        // an older store holding the same number of marks, while the generation —
+        // bumped by the placement itself — does not.
         let merged_len = self.merged_len(buffer);
-        let anchored = self.diag_mark_counts.get(&buffer) == Some(&merged_len);
+        let anchored = self.diag_mark_counts.get(&buffer) == Some(&merged_len)
+            && self.diag_mark_gens.get(&buffer) == Some(&buf.extmarks.ns_generation(DIAGNOSTIC_NS));
         // Walking *from* the anchors additionally requires that they all still exist:
         // the slow path falls back to a diagnostic's published range whenever its own
         // anchor is missing, but a walk that starts at the anchors would simply not
-        // see it. An undo can restore a buffer's extmark store from before the set was
-        // placed, which leaves the bookkeeping count matching a store that no longer
-        // holds the marks — so the count alone is not enough to start from them.
+        // see it.
         let all_anchored = anchored && buf.extmarks.ns_len(DIAGNOSTIC_NS) == merged_len;
         if let (Some((lo, hi)), true) = (window, all_anchored) {
             return buf
@@ -518,8 +529,15 @@ impl EditHost {
         }
         if spans.is_empty() {
             self.diag_mark_counts.remove(&buffer);
+            self.diag_mark_gens.remove(&buffer);
         } else {
             self.diag_mark_counts.insert(buffer, spans.len());
+            // Recorded *after* the clear/set above: the placement itself bumps the
+            // namespace generation, so this stamps the store the anchors were placed
+            // into. An undo that restores an older store carries that older
+            // generation, and the anchored projection falls back to published ranges.
+            self.diag_mark_gens
+                .insert(buffer, buf.extmarks.ns_generation(DIAGNOSTIC_NS));
         }
     }
 
@@ -941,6 +959,13 @@ impl EditHost {
         (s_row, s_col, e_row, e_col): (usize, usize, usize, usize),
     ) -> Vec<Diagnostic> {
         let buffer = self.editor.buffer();
+        // The rows come from a Lua `opts.range` with no upper bound (unlike the LSP
+        // wire side, which `lsp_pos_to_byte_in` clamps). Clamp them to the document
+        // — the phantom row is a valid address, anything past it reads as the
+        // document end — or `line_start` asserts past the last line and the server
+        // thread panics.
+        let last_row = buffer.line_count();
+        let (s_row, e_row) = (s_row.min(last_row), e_row.min(last_row));
         let lo = buffer.byte_at(s_row, s_col);
         let hi = buffer.byte_at(e_row, e_col).max(lo);
         self.current_diagnostics_merged()

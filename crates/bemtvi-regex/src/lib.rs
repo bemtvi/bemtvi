@@ -519,6 +519,26 @@ extern "C" fn buffer_mark_lookup(
     }
 }
 
+/// Rejects a position the C engine cannot represent. Positions narrow to
+/// `linenr_T`/`colnr_T` (i32), and no buffer this crate can hold has a line
+/// index or line length beyond i32::MAX (`from_lines` bounds both), so an
+/// out-of-range value is a caller bug: fail loud here rather than silently
+/// wrapping negative and aborting later inside the C line provider (a
+/// negative lnum indexes past the start of the line vector → NULL → the
+/// shim's abort path).
+fn check_position_range(pos: &BufPos) {
+    assert!(
+        LinenrT::try_from(pos.lnum).is_ok(),
+        "lnum {} out of range for the vim engine (max i32)",
+        pos.lnum
+    );
+    assert!(
+        ColnrT::try_from(pos.col).is_ok(),
+        "col {} out of range for the vim engine (max i32)",
+        pos.col
+    );
+}
+
 /// Buffer text plus the editor state vim's context assertions read.
 ///
 /// Positions are 1-based lines and 0-based byte columns, matching vim.
@@ -601,6 +621,7 @@ impl VimBuffer {
 
     /// Places the cursor (the `\%#` assertion).
     pub fn set_cursor(&mut self, pos: BufPos) {
+        check_position_range(&pos);
         let _guard = engine();
         unsafe { btvre_win_set_cursor(self.win, pos.lnum as LinenrT, pos.col as ColnrT) };
     }
@@ -608,6 +629,8 @@ impl VimBuffer {
     /// Sets the last Visual selection (the `\%V` assertion). `mode` is the
     /// vim mode character: `'v'`, `'V'`, or `'\x16'` (blockwise).
     pub fn set_visual(&mut self, start: BufPos, end: BufPos, mode: char) {
+        check_position_range(&start);
+        check_position_range(&end);
         let _guard = engine();
         unsafe {
             btvre_buf_set_visual(
@@ -623,6 +646,7 @@ impl VimBuffer {
 
     /// Sets a mark (the `\%'m` assertions). `name` is the mark character.
     pub fn set_mark(&mut self, name: char, pos: BufPos) {
+        check_position_range(&pos);
         self.data
             .marks
             .insert(name as u8, (pos.lnum as LinenrT, pos.col as ColnrT));

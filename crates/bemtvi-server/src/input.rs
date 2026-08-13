@@ -47,6 +47,12 @@ impl EditHost {
         for key in parsed {
             self.process_key(key);
         }
+        // A paste is by construction one batch — the client has the whole payload
+        // before it sends anything — so close the span here even if the `<PasteEnd>`
+        // bracket never arrived. Without this a truncated or malformed feed would
+        // leave the editor in paste mode indefinitely, where auto-indent, auto-pairs
+        // and the completion popup silently stop working with nothing to point at.
+        self.editor.set_paste_active(false);
         self.run_pending();
         // Typeahead queued by `nvim_feedkeys` during this batch (e.g. a keymap RHS
         // that fed keys) is processed now, after the batch's own keys settle.
@@ -55,6 +61,23 @@ impl EditHost {
 
     /// Route one input key through the completion popup / mapping engine.
     pub(crate) fn process_key(&mut self, key: Key) {
+        // The bracketed-paste brackets are not keys the user pressed — they delimit a
+        // payload the client already had (`bemtvi_view::encode_paste`). Consume them
+        // here, ahead of the matcher and the editor, so they can neither be mapped nor
+        // reach the buffer as text; all they do is put the editor in paste mode for
+        // the span, where insert mode types the payload in literally (no auto-indent,
+        // no soft tabs, no auto-pairs).
+        match key.code {
+            KeyCode::PasteStart => {
+                self.editor.set_paste_active(true);
+                return;
+            }
+            KeyCode::PasteEnd => {
+                self.editor.set_paste_active(false);
+                return;
+            }
+            _ => {}
+        }
         // The `btv.complete` engine's popup (incl. the built-in `lsp` source, Phase
         // 4-C) is **non-grabbing** and handled in core: while it is open,
         // `editor.input` (below, via the matcher) intercepts only its control keys

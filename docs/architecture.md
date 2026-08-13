@@ -307,7 +307,14 @@ protocol, **not** for neovim interop. Messages are msgpack arrays:
 
 The client-protocol verbs — the ones a UI actually speaks (input, attach,
 resize) — are `btv_*`: `btv_input`, `btv_input_mouse`, `btv_ui_attach`,
-`btv_ui_try_resize`, `btv_command`. The editing-API methods keep the familiar
+`btv_ui_try_resize`, `btv_command`. A **paste** rides `btv_input` too, as one
+batch wrapped in `<PasteStart>` … `<PasteEnd>` (what
+[`bemtvi_view::encode_paste`](../crates/bemtvi-view/src/keys.rs) emits): the
+brackets mark the payload as text the user already had rather than keys they
+typed, so the server takes it in literally instead of running the insert-mode
+helpers — auto-indent, soft tabs, auto-pairs, the completion popup — over text
+that already carries its own shape. Because it is only notation, every transport
+(local, daemon, browser) gets it for free. The editing-API methods keep the familiar
 neovim spelling (`nvim_buf_get_lines`, `nvim_open_win`, `nvim_win_set_cursor`,
 …) as muscle-memory names, but they are bemtvi's own methods with bemtvi's own
 semantics (a read-heavy subset is also aliased into Lua as `vim.api.*`; the
@@ -987,7 +994,8 @@ That claim is now load-bearing: **`bemtvi-gui` is a native GUI client**
 ([`crates/bemtvi-gui`](../crates/bemtvi-gui)) on **winit + wgpu + glyphon**. It is
 the GUI sibling of `bemtvi-tui` and reuses the same frontend-neutral
 [`bemtvi-view`](../crates/bemtvi-view) decode/input layer (`View`, `Style`, `Key`,
-`notation`, `encode_paste`) — the seam the view crate was extracted for. The
+`notation`, `encode_text`, `encode_paste`) — the seam the view crate was extracted
+for. The
 `bemtvi-gui` *binary* embeds a server on its own thread exactly like the default
 `bemtvi` binary, joined by the same in-process duplex RPC; the only difference from
 the TUI is the client. winit owns the main thread (its loop is not async), so the RPC runs on a

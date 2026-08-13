@@ -46,7 +46,7 @@ pub use mouse::{
 // The neutral text-insertion encoder, re-exported so the Tier-1 key test can cover
 // the path IME-committed text takes (composed accents, CJK) — the GUI feeds an
 // `Ime::Commit` through this exactly as it does a clipboard paste.
-pub use bemtvi_view::encode_paste;
+pub use bemtvi_view::{encode_paste, encode_text};
 pub use session::{
     parse_connect_uri, spawn_session, spawn_stdio_daemon_session, spawn_workspace_session, Session,
 };
@@ -1366,14 +1366,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             // Composed text from the IME (dead-key accents, AltGr characters, CJK
             // composition, …) lands here as one commit rather than as `KeyboardInput`
-            // — see `set_ime_allowed` in `resumed`. Feed it through the same
-            // `encode_paste` the clipboard path uses (one notify, literal insertion,
-            // `<` escaped) so the committed characters reach the buffer exactly as
-            // typed. The empty `Preedit` winit sends right before each commit, and any
+            // — see `set_ime_allowed` in `resumed`. Feed it through `encode_text` (one
+            // notify, `<` escaped) so the committed characters reach the buffer
+            // exactly as typed. Deliberately NOT `encode_paste`: a commit is the user's
+            // own typing arriving as one string, not a paste, so it drives insert mode
+            // normally (auto-pairs and the rest) rather than going in literally. The
+            // empty `Preedit` winit sends right before each commit, and any
             // in-progress preedit, are ignored: macOS draws its own candidate window,
             // and the final text is what the commit carries.
             WindowEvent::Ime(Ime::Commit(text)) => {
-                let notation = encode_paste(&text);
+                let notation = encode_text(&text);
                 if !notation.is_empty() {
                     self.rpc
                         .notify("btv_input", vec![Value::from(notation.as_str())]);

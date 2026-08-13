@@ -68,6 +68,7 @@ impl Editor {
         // cursor on a blank line one level deeper — `{|}` + <CR> becomes
         // `{` / `····|` / `}`.
         let expand = self.buffer().options.autopairs
+            && !self.paste_active
             && self.mode == Mode::Insert
             && matches!(
                 (self.char_before_cursor(), self.char_after_cursor()),
@@ -84,6 +85,14 @@ impl Editor {
         self.buffer_mut().normalize();
         if expand {
             self.expand_pair_newline();
+            return;
+        }
+        // A pasted line break carries the payload's *own* indentation on the line
+        // that follows it, so adding an auto-indent here would stack one on top of
+        // the other and every further line would drift right. Leave the cursor at
+        // column 0 — the payload's leading whitespace is the next thing inserted.
+        if self.paste_active {
+            self.ai_open_line = None;
             return;
         }
         // Auto-indent the new line (treesitter, else smart/auto-indent, else 0)
@@ -130,16 +139,28 @@ impl Editor {
     }
 
     pub(crate) fn handle_insert(&mut self, key: Key) {
-        // While a snippet expansion is being filled, the jump keys (`<Tab>` /
-        // `<S-Tab>` by default) move between tabstops. They take precedence over both
-        // the completion popup (which shares `<Tab>`/`<S-Tab>` for navigation) and
-        // soft-tab insertion: a snippet session is the more specific context, and the
-        // popup stays navigable via `<C-n>`/`<C-p>` (accept with `<C-y>`/`<CR>`). Any
-        // open popup is dismissed first so it doesn't linger over the jumped-to stop.
-        if let Some(dir) = self.snippet_jump_for(&key) {
-            self.close_completion();
-            self.snippet_jump(dir);
-            return;
+        // Inside a bracketed paste every key is a character of the payload, never a
+        // command aimed at an insert-mode widget. Skipping the two routers below is
+        // what keeps a paste from being silently rewritten: a pasted `<Tab>` would
+        // otherwise jump a snippet tabstop or walk the completion popup, and a pasted
+        // `<CR>` would *accept* a completion row (the popup opens on its own as the
+        // payload types itself in, and `<CR>` is a confirm key). The popup is closed
+        // when the paste opens, and the tail below skips re-triggering it per pasted
+        // character — which also keeps a big paste linear instead of running the
+        // completion engine once per byte.
+        if !self.paste_active {
+            // While a snippet expansion is being filled, the jump keys (`<Tab>` /
+            // `<S-Tab>` by default) move between tabstops. They take precedence over
+            // both the completion popup (which shares `<Tab>`/`<S-Tab>` for
+            // navigation) and soft-tab insertion: a snippet session is the more
+            // specific context, and the popup stays navigable via `<C-n>`/`<C-p>`
+            // (accept with `<C-y>`/`<CR>`). Any open popup is dismissed first so it
+            // doesn't linger over the jumped-to stop.
+            if let Some(dir) = self.snippet_jump_for(&key) {
+                self.close_completion();
+                self.snippet_jump(dir);
+                return;
+            }
         }
 
         // Whether an *open* popup is a manual session, sampled before the block below
@@ -153,7 +174,7 @@ impl Editor {
         // accept / abort and are consumed here; every other key edits the document
         // normally and then re-triggers the engine at the end of this fn. (The
         // popup does not grab input — the buffer is the query.)
-        if self.completion_active() {
+        if self.completion_active() && !self.paste_active {
             use super::complete::CompleteAction;
             match self.complete_action(&key) {
                 Some(CompleteAction::Next) => {
@@ -343,6 +364,7 @@ impl Editor {
         // keeps its preselection rather than degrading to a noselect auto popup
         // halfway through.
         if !self.awaiting_register
+            && !self.paste_active
             && matches!(
                 key.code,
                 KeyCode::Char(_)
@@ -363,8 +385,12 @@ impl Editor {
 
         // Signature-help auto-trigger (opt-in): a `(` / `,` (the server's advertised
         // trigger chars) fires `textDocument/signatureHelp` as you type the call. A
-        // no-op unless the host pushed a trigger set (enabled + supported).
-        self.signature_after_insert(&key);
+        // no-op unless the host pushed a trigger set (enabled + supported), and not
+        // during a paste — the payload's parens are text, not a call being typed, and
+        // one LSP round trip per pasted `(` would be a request storm.
+        if !self.paste_active {
+            self.signature_after_insert(&key);
+        }
 
         // Keep the active tabstop's mirrors in sync with whatever was just typed.
         if self.snippet_active() {
@@ -377,10 +403,15 @@ impl Editor {
     /// every cursor via [`Editor::for_each_cursor`].
     fn insert_char_at_cursor(&mut self, c: char) {
         let opts = self.buffer().options;
-        // Auto-pairs intercept (Insert mode only — Replace overtypes literally).
-        // When it handles the key it has already moved the cursor / inserted the
-        // pair, so there is nothing more to do.
-        if self.mode == Mode::Insert && opts.autopairs && self.autopair_insert(c) {
+        // Auto-pairs intercept (Insert mode only — Replace overtypes literally, and a
+        // paste inserts literally too: its payload already carries its own closers,
+        // so completing them would double every one). When it handles the key it has
+        // already moved the cursor / inserted the pair, so there is nothing more to do.
+        if self.mode == Mode::Insert
+            && opts.autopairs
+            && !self.paste_active
+            && self.autopair_insert(c)
+        {
             return;
         }
         let at = self.cursor_char();
@@ -395,7 +426,11 @@ impl Editor {
         self.buffer_mut().modified = true;
         // smartindent electric dedent: a closing bracket typed as the first
         // non-blank char of a line re-indents that line to its opener's level.
-        if self.mode == Mode::Insert && opts.smartindent && is_close_bracket(c) {
+        if self.mode == Mode::Insert
+            && opts.smartindent
+            && !self.paste_active
+            && is_close_bracket(c)
+        {
             self.smartindent_close(c);
         }
     }
@@ -616,6 +651,20 @@ impl Editor {
     ///
     /// [`softtab_backspace`]: Editor::softtab_backspace
     fn insert_tab(&mut self) {
+        // A `<Tab>` inside a paste is a literal tab *character* of the payload (that
+        // is how the client encodes one), not the user reaching for the Tab key — so
+        // it goes in as-is, untouched by `expandtab` / `softtabstop`. Rewriting it
+        // would both change the bytes and, on an indent, shift the line by whatever
+        // this buffer's tab settings happen to be. (Vim resets `expandtab` under
+        // `'paste'` for the same reason.)
+        if self.paste_active {
+            let at = self.cursor_char();
+            self.buffer_mut().insert_char(at, '\t');
+            self.cursor.col += 1;
+            self.buffer_mut().modified = true;
+            self.insert_text.push('\t');
+            return;
+        }
         let opts = self.buffer().options;
         let unit = opts.effective_softtabstop();
         let start = self.cursor_virtcol();

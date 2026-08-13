@@ -7,7 +7,7 @@
 //! expects. A key with no mapping (a bare modifier, a dead key) yields `None`
 //! and is dropped — the same contract the TUI follows.
 
-use bemtvi_view::{encode_paste, notation, Key as VimKey};
+use bemtvi_view::{encode_text, notation, Key as VimKey};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Encode a winit logical key + modifiers as vim key-notation, or `None` for a
@@ -23,11 +23,12 @@ pub fn encode_key(logical: &Key, mods: ModifiersState) -> Option<String> {
     // A multi-character payload (some layouts / compose fallbacks emit several
     // characters for one keystroke — winit's `Key::Character` is a string, not a
     // char) can't be a `<...>` chord; feed it through the literal-text encoder
-    // (the IME-commit / paste path) rather than silently truncating to the first
-    // char.
+    // (the IME-commit path) rather than silently truncating to the first char. Not
+    // `encode_paste`: this is still the user typing, so it must not open a
+    // bracketed-paste span.
     if let Key::Character(s) = logical {
         if s.chars().count() > 1 {
-            let text = encode_paste(s);
+            let text = encode_text(s);
             return (!text.is_empty()).then_some(text);
         }
     }

@@ -518,7 +518,12 @@ pub(crate) fn key_to_terminal_bytes(key: Key, app_cursor: bool) -> Vec<u8> {
             _ => Vec::new(), // no standard encoding beyond F12
         },
         // A mouse key (`<LeftMouse>` / `<ScrollWheelUp>` …) is resolved server-side and
-        // never reaches the terminal as input — it has no PTY byte encoding.
-        KeyCode::Mouse { .. } | KeyCode::ScrollWheel(_) => Vec::new(),
+        // never reaches the terminal as input — it has no PTY byte encoding. The same
+        // holds for the bracketed-paste brackets: the server consumes them ahead of the
+        // editor (they only toggle paste mode), so the child sees just the payload.
+        KeyCode::Mouse { .. }
+        | KeyCode::ScrollWheel(_)
+        | KeyCode::PasteStart
+        | KeyCode::PasteEnd => Vec::new(),
     }
 }

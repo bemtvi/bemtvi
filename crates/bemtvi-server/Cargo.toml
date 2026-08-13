@@ -134,6 +134,9 @@ bemtvi-ts.workspace = true
 # text-object e2e can compile a real parser into a temp data dir *hermetically* (no
 # network `:TSInstall`), the same fixture pattern bemtvi-ts's engine tests use.
 tree-sitter-rust.workspace = true
+# The client-side input encoder, so the paste tests drive the *real* notation a
+# UI sends on a Cmd/Ctrl+V (`encode_paste`) rather than a hand-written twin of it.
+bemtvi-view.workspace = true
 # `mkfifo(3)`, so `fs_hardening.rs` can build the one file shape the read path must
 # refuse (a FIFO blocks the opener until a writer arrives) without shelling out to
 # an external binary.

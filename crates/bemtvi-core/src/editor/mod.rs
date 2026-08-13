@@ -1337,6 +1337,18 @@ pub struct Editor {
     /// a truly-empty line, not trailing whitespace. Suppressed by the
     /// `indentemptylines` opt-in (same knob as the `=` blank-line rule).
     ai_open_line: Option<usize>,
+    /// Whether the keys currently being processed are a **bracketed paste** — text
+    /// the user already had, delivered as one payload between the client's
+    /// `<PasteStart>` / `<PasteEnd>` brackets (see [`crate::KeyCode::PasteStart`]).
+    /// While set, insert mode types the payload in *literally*: the reactive
+    /// machinery that helps a person typing — auto-indent on `<CR>` (treesitter,
+    /// `smartindent`, `autoindent`), soft-tab expansion of `<Tab>`, auto-pairs and
+    /// their electric dedent — would each fight text that already carries its own
+    /// shape, so each consults this and stands down. This is vim's `'paste'`, scoped
+    /// to the payload instead of being a mode the user has to remember to leave.
+    /// Owned by the server, which brackets the batch via
+    /// [`Editor::set_paste_active`].
+    paste_active: bool,
     /// Current time in **monotonic** seconds, injected by the server before each
     /// message (core does no I/O, so it can't read a clock itself). Stamped onto
     /// undo nodes at commit and surfaced via `vim.fn.undotree()`/`localtime()`;
@@ -1902,6 +1914,28 @@ impl Editor {
         self.session_captures_layout = on;
     }
 
+    /// Open or close a **bracketed paste** span: while it is open, the keys fed to
+    /// [`Editor::input`] are the payload of a paste rather than typing, and insert
+    /// mode takes them literally (see the [`paste_active`](Editor::paste_active)
+    /// field for what stands down). The server calls this when it consumes the
+    /// client's `<PasteStart>` / `<PasteEnd>` brackets.
+    pub fn set_paste_active(&mut self, on: bool) {
+        // An open completion popup must not survive into the payload: `<CR>` is one of
+        // its confirm keys, so a pasted line break would accept a row instead of
+        // breaking the line. Insert mode also stops re-triggering it while the paste
+        // runs, so nothing re-opens mid-payload.
+        if on {
+            self.close_completion();
+        }
+        self.paste_active = on;
+    }
+
+    /// Whether a bracketed paste is being applied right now — the payload is text
+    /// the user already had, so the reactive insert-mode helpers stand down.
+    pub fn paste_active(&self) -> bool {
+        self.paste_active
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         Ok(Editor::with_buffer(Buffer::from_file(
             path.into(),
@@ -2096,6 +2130,7 @@ impl Editor {
             pending_visual: None,
             snapshot_taken: false,
             ai_open_line: None,
+            paste_active: false,
             now_mono: 0,
             now_ms: 0,
             awaiting_register: false,

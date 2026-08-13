@@ -3,8 +3,9 @@
 //! GUI analogue of `bemtvi-tui`'s `keys` test.
 
 use bemtvi_gui::{
-    altgr_composed, dialog_action, encode_key, encode_paste, is_paste, open_dialog_verb,
-    open_path_command, parse_guifont, save_dialog_needed, DialogAction, GuiConfig,
+    altgr_composed, dialog_action, encode_key, encode_paste, encode_text, is_paste,
+    open_dialog_verb, open_path_command, parse_guifont, save_dialog_needed, DialogAction,
+    GuiConfig,
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -331,16 +332,26 @@ fn paste_gestures_are_recognized_and_dont_shadow_ctrl_v() {
 #[test]
 fn ime_committed_text_encodes_multibyte_verbatim() {
     // Composed/non-ASCII input (dead-key accents, AltGr, CJK) arrives as an
-    // `Ime::Commit`, which the GUI feeds through `encode_paste` exactly as it does a
-    // clipboard paste. The committed characters — including multibyte ones — must
-    // reach the server byte-for-byte, not be stripped to a base key or mangled.
-    assert_eq!(encode_paste("é"), "é");
-    assert_eq!(encode_paste("café"), "café");
-    assert_eq!(encode_paste("ñ"), "ñ");
+    // `Ime::Commit`, which the GUI feeds through `encode_text`. The committed
+    // characters — including multibyte ones — must reach the server byte-for-byte,
+    // not be stripped to a base key or mangled.
+    assert_eq!(encode_text("é"), "é");
+    assert_eq!(encode_text("café"), "café");
+    assert_eq!(encode_text("ñ"), "ñ");
     // Full IME composition can commit several characters at once (a CJK word).
-    assert_eq!(encode_paste("日本語"), "日本語");
+    assert_eq!(encode_text("日本語"), "日本語");
     // `<` is still escaped so committed text can't open a `<...>` notation form.
-    assert_eq!(encode_paste("a<b"), "a<lt>b");
+    assert_eq!(encode_text("a<b"), "a<lt>b");
+}
+
+#[test]
+fn an_ime_commit_is_not_encoded_as_a_paste() {
+    // A commit is the user's own typing arriving as one string, so it must NOT be
+    // wrapped in the bracketed-paste markers: those put the editor in paste mode,
+    // where insert-mode behaviour (auto-pairs, auto-indent) stands down. Only the
+    // clipboard path — `encode_paste` — brackets its payload.
+    assert_eq!(encode_text("é"), "é");
+    assert_eq!(encode_paste("é"), "<PasteStart>é<PasteEnd>");
 }
 
 #[test]

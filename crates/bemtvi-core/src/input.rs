@@ -52,6 +52,19 @@ pub enum KeyCode {
         clicks: u8,
         kind: MouseKind,
     },
+    /// The opening bracket of a **bracketed paste** — vim's `<PasteStart>`. A client
+    /// that receives a whole paste as one event (terminal bracketed paste, a GUI
+    /// Cmd+V, the browser's `paste` event) wraps the encoded payload in
+    /// `<PasteStart>` … [`KeyCode::PasteEnd`] (see `bemtvi_view::encode_paste`), which
+    /// tells the editor the keys between them are *text the user already has*, not
+    /// keys they are typing: they insert literally, with none of the reactive
+    /// insert-mode machinery (auto-indent, soft-tab expansion, auto-pairs) firing.
+    /// Like the mouse keys these never reach the buffer as text — the server
+    /// intercepts them ahead of the keymap matcher and toggles
+    /// [`crate::Editor::set_paste_active`].
+    PasteStart,
+    /// The closing bracket of a bracketed paste — see [`KeyCode::PasteStart`].
+    PasteEnd,
     /// A scroll-wheel notch as a mappable key — vim's `<ScrollWheelUp>` /
     /// `<ScrollWheelDown>` / `<ScrollWheelLeft>` / `<ScrollWheelRight>` (with optional
     /// modifiers). Like [`KeyCode::Mouse`], the server resolves it against the keymaps
@@ -435,6 +448,8 @@ pub fn key_to_notation(key: Key) -> String {
         KeyCode::PageUp => (true, "PageUp".to_string()),
         KeyCode::PageDown => (true, "PageDown".to_string()),
         KeyCode::Function(n) => (true, format!("F{n}")),
+        KeyCode::PasteStart => (true, "PasteStart".to_string()),
+        KeyCode::PasteEnd => (true, "PasteEnd".to_string()),
         KeyCode::Mouse {
             button,
             clicks,
@@ -589,6 +604,8 @@ fn parse_special(inner: &str) -> Option<Key> {
         "end" => KeyCode::End,
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
+        "pastestart" => KeyCode::PasteStart,
+        "pasteend" => KeyCode::PasteEnd,
         "scrollwheelup" => KeyCode::ScrollWheel(WheelDir::Up),
         "scrollwheeldown" => KeyCode::ScrollWheel(WheelDir::Down),
         "scrollwheelleft" => KeyCode::ScrollWheel(WheelDir::Left),

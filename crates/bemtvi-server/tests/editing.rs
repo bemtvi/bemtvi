@@ -77,6 +77,8 @@ mod multicursor;
 mod numbers;
 #[path = "editing/padding.rs"]
 mod padding;
+#[path = "editing/paste.rs"]
+mod paste;
 #[path = "editing/registers.rs"]
 mod registers;
 #[path = "editing/rendering.rs"]

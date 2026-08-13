@@ -120,7 +120,38 @@ pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
 /// goes through the Enter path rather than inserting a stray `\n` char. A
 /// `\r\n` pair collapses to a single `<CR>`. Everything else passes through
 /// verbatim.
+///
+/// The payload is wrapped in `<PasteStart>` / `<PasteEnd>` — the notation form of
+/// the terminal's own bracketed-paste markers. That is what tells the server these
+/// keys are *text the user already had* rather than keys they are typing, so insert
+/// mode puts them in literally: without it every encoded `<CR>` would pick up an
+/// auto-indent that stacks on top of the indentation the pasted line already
+/// carries (each line drifting further right), an encoded `<Tab>` would be rewritten
+/// by `expandtab`/`softtabstop`, and auto-pairs would double the payload's closers.
+/// An empty `text` encodes to the empty string — no brackets, nothing to paste.
+///
+/// Text that is *not* a paste — an IME commit, say — wants the escaping without the
+/// brackets: [`encode_text`].
 pub fn encode_paste(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len());
+    out.push_str(PASTE_START);
+    out.push_str(&encode_text(text));
+    out.push_str(PASTE_END);
+    out
+}
+
+/// Encode a run of literal text as vim key-notation — [`encode_paste`] without the
+/// bracketed-paste markers.
+///
+/// This is the escaping half: `<` → `<lt>`, `\t` → `<Tab>`, a line break → `<CR>`
+/// (a `\r\n` pair collapsing to one), everything else verbatim. Use it for text
+/// that is typed rather than pasted — the GUI's IME commits (dead-key accents,
+/// AltGr, CJK composition), which are the user's own keystrokes arriving as one
+/// string and should still drive auto-pairs and the rest of insert mode.
+pub fn encode_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -140,6 +171,11 @@ pub fn encode_paste(text: &str) -> String {
     }
     out
 }
+
+/// The notation bracket a paste payload opens with — see [`encode_paste`].
+const PASTE_START: &str = "<PasteStart>";
+/// The notation bracket a paste payload closes with — see [`encode_paste`].
+const PASTE_END: &str = "<PasteEnd>";
 
 /// The `btv_input_mouse` modifier string for a mouse event's live modifier state —
 /// e.g. Ctrl+Shift → `"CS"`. The server's parser accepts the chars in any order

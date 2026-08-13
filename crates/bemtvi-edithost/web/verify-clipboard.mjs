@@ -192,6 +192,21 @@ try {
     `lines=${JSON.stringify(gMulti)}`,
   );
 
+  // ── Indented multi-line paste keeps its own indentation ──────────────────────────────────
+  // The browser leg of the bracketed-paste guard: `encodePaste` wraps the payload in
+  // `<PasteStart>`/`<PasteEnd>`, so the pasted `<CR>`s take no auto-indent and each line
+  // lands at the column it carried. Without the brackets, `smartindent` stacks an indent on
+  // top of the payload's own and every line drifts further right.
+  await page.evaluate(() => window.__bemtvi.feed(":set expandtab smartindent<CR>ggdGi"));
+  await pasteGesture(page, "if x {\n    body;\n}");
+  const gIndent = await linesContain(page, "body;");
+  await page.evaluate(() => window.__bemtvi.feed("<Esc>"));
+  check(
+    "paste gesture: an indented payload keeps its own indentation (no auto-indent stacking)",
+    gIndent === "if x {\n    body;\n}",
+    `lines=${JSON.stringify(gIndent)}`,
+  );
+
   await browser.close();
 } finally {
   cleanup();

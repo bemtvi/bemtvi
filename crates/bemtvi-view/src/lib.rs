@@ -11,7 +11,8 @@
 //!   [`TabData`], [`ScrollData`]) plus the redraw decoder
 //!   ([`View::from_redraw`] / [`View::update`]).
 //! - A neutral [`Style`] / [`Border`] each client converts to its own toolkit.
-//! - Input encoding: the [`Key`] enum, [`notation`], and [`encode_paste`].
+//! - Input encoding: the [`Key`] enum, [`notation`], [`encode_text`], and
+//!   [`encode_paste`].
 //! - The scroll-slide state machine ([`ScrollAnim`], [`arm_scroll`]) every
 //!   animating client drives from its own clock.
 
@@ -31,7 +32,7 @@ pub use fit::{
     row_head_col, wrap_chars, CellRect,
 };
 pub use hit_test::{resize_handle_at, Geometry, ResizeCursor};
-pub use keys::{encode_paste, mouse_modifier, notation, Key};
+pub use keys::{encode_paste, encode_text, mouse_modifier, notation, Key};
 pub use parse::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans,
     StatusSegment, VirtChunk, VirtPlacement,

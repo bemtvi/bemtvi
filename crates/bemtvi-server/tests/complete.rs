@@ -2635,3 +2635,42 @@ btv.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'snip' } } }";
     feed(&rpc, "<C-y>");
     assert_eq!(lines(&rpc).await, vec!["ifcount ifvalue", "ifelse"]);
 }
+
+// ===== bracketed paste vs. the popup =========================================
+
+/// A paste is text, not keystrokes aimed at the popup. Under `confirm = "first"` a
+/// bare `<CR>` accepts the top row (the test above), so a *pasted* line break —
+/// which the client encodes as `<CR>` — would silently swap a completion candidate
+/// into the payload and swallow the line break. The `<PasteStart>` bracket closes
+/// the popup and keeps it closed for the payload, so the text lands verbatim.
+#[tokio::test]
+async fn a_pasted_newline_does_not_accept_a_completion_row() {
+    let dir = temp_dir("complete_paste_newline");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "btv.complete.setup { sources = { { 'buffer', min_chars = 2 } }, confirm = 'first' }",
+    )
+    .await;
+
+    // Open a popup the way the user would (`he` matches `hello`), then paste a
+    // payload whose very first character is the line break, so the `<CR>` arrives
+    // with the popup up and a row it could accept.
+    feed(&rpc, "ihello he");
+    poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, &bemtvi_view::encode_paste("\nthere"));
+    assert_eq!(lines(&rpc).await, vec!["hello he", "there"]);
+}
+
+/// The same for the popup's *navigation* keys: `<Tab>` walks the rows, and a paste
+/// carrying a tab character encodes it as `<Tab>`. It must reach the buffer as a
+/// tab, not move the selection.
+#[tokio::test]
+async fn a_pasted_tab_does_not_navigate_the_popup() {
+    let dir = temp_dir("complete_paste_tab");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+
+    feed(&rpc, "ihello he");
+    poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, &bemtvi_view::encode_paste("\tx"));
+    assert_eq!(lines(&rpc).await, vec!["hello he\tx"]);
+}

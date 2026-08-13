@@ -797,11 +797,11 @@
       catch { /* permission denied / not focused / empty — keep the existing mirror */ }
       finally { clipboardRefreshing = false; }
     }
-    // Encode a raw clipboard string as one key-notation feed (the JS twin of
-    // bemtvi-view's `encode_paste`): escape the chars special to the notation parser so
+    // Encode a run of literal text as one key-notation feed (the JS twin of
+    // bemtvi-view's `encode_text`): escape the chars special to the notation parser so
     // the text inserts verbatim — `<`→`<lt>`, tab→`<Tab>`, newline→`<CR>` (CRLF folds to
-    // one). Used to type a paste into Insert/cmdline/terminal mode in a single feed.
-    function encodePaste(text) {
+    // one). Used for IME commits, which are the user's own typing arriving as a string.
+    function encodeText(text) {
       let out = "";
       for (let i = 0; i < text.length; i++) {
         const c = text[i];
@@ -812,6 +812,16 @@
         else out += c;
       }
       return out;
+    }
+    // Encode a clipboard string as one bracketed-paste feed (the JS twin of
+    // bemtvi-view's `encode_paste`): the escaped text wrapped in `<PasteStart>` /
+    // `<PasteEnd>`. The brackets tell the server this is text the user already had, so
+    // insert mode types it in literally — without them every `<CR>` picks up an
+    // auto-indent that stacks on the pasted line's own indentation (each line drifting
+    // further right), `<Tab>` gets rewritten by `expandtab`, and auto-pairs double the
+    // payload's closers. Used to type a paste into Insert/cmdline/terminal mode.
+    function encodePaste(text) {
+      return text ? `<PasteStart>${encodeText(text)}<PasteEnd>` : "";
     }
     // Modes where a paste is "typed in" (insert literally) rather than dropped via the
     // `"+` register paste (`"+p`) that Normal/Visual want.
@@ -3231,13 +3241,13 @@
       editCtx.addEventListener("compositionstart", () => { composing = true; });
       editCtx.addEventListener("textupdate", (e) => {
         if (composing) return; // wait for compositionend (next handler) to feed the commit
-        if (e.text) feedOp(encodePaste(e.text));
+        if (e.text) feedOp(encodeText(e.text));
         resetEditCtx();
       });
       editCtx.addEventListener("compositionend", () => {
         composing = false;
         const text = editCtx.text;
-        if (text) feedOp(encodePaste(text));
+        if (text) feedOp(encodeText(text));
         resetEditCtx();
       });
       // The OS asks for the on-screen rect of each composing character (it can't read our

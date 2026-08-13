@@ -598,6 +598,7 @@ dependencies = [
  "bemtvi-rpc",
  "bemtvi-test-harness",
  "bemtvi-ts",
+ "bemtvi-view",
  "form_urlencoded",
  "getrandom 0.4.3",
  "libc",

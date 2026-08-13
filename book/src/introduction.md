@@ -26,6 +26,6 @@ behavior. There are a few `vim.*` aliases over the native `btv.*` API for conven
 
 This book is itself generated from the repository: the narrative chapters and
 the long-form architecture and plugin-authoring docs come from
-[`docs/`](https://github.com/davidrios/bemtvi/tree/main/docs), and the API
+[`docs/`](https://github.com/bemtvi/bemtvi/tree/main/docs), and the API
 reference is extracted from
-[`crates/bemtvi-lua/src/prelude/`](https://github.com/davidrios/bemtvi/tree/main/crates/bemtvi-lua/src/prelude).
+[`crates/bemtvi-lua/src/prelude/`](https://github.com/bemtvi/bemtvi/tree/main/crates/bemtvi-lua/src/prelude).

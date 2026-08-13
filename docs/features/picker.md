@@ -370,7 +370,7 @@ it, `<C-g>` says so rather than presenting boxes that would filter nothing.
 
 ## Try it
 
-A runnable playground ships in [`examples/ui-picker`](https://github.com/davidrios/bemtvi/tree/main/examples/ui-picker):
+A runnable playground ships in [`examples/ui-picker`](https://github.com/bemtvi/bemtvi/tree/main/examples/ui-picker):
 
 ```sh
 BEMTVI_CONFIG=examples/ui-picker cargo run -p bemtvi -- examples/ui-picker/sample.txt
@@ -380,7 +380,7 @@ It maps the three built-in sources, registers a custom static source, and shows
 the box-size, preview, and debounce overrides.
 
 For the filter boxes there is a second playground,
-[`examples/picker-filters`](https://github.com/davidrios/bemtvi/tree/main/examples/picker-filters):
+[`examples/picker-filters`](https://github.com/bemtvi/bemtvi/tree/main/examples/picker-filters):
 
 ```sh
 BEMTVI_CONFIG=examples/picker-filters \

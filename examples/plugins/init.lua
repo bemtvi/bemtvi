@@ -103,7 +103,7 @@ btv.plugins({
   -- Pin to a tag (or `commit = "<sha>"`): a pinned plugin is cloned at that ref and
   -- never auto-updated by :PluginUpdate.
   {
-    "davidrios/btv-statusline-extras",
+    "bemtvi/btv-statusline-extras",
     tag = "v0.1.0",
     enabled = false, -- illustrative; flip on to actually fetch it
   },

@@ -3,8 +3,8 @@
 ## Install a pre-built binary
 
 Grab a binary from the
-[**latest release**](https://github.com/davidrios/bemtvi/releases/latest) (or the
-rolling [`edge`](https://github.com/davidrios/bemtvi/releases/tag/edge) build from
+[**latest release**](https://github.com/bemtvi/bemtvi/releases/latest) (or the
+rolling [`edge`](https://github.com/bemtvi/bemtvi/releases/tag/edge) build from
 `main`). Binaries are published for Linux (`x86_64`/`aarch64`, glibc), macOS
 (`x86_64`/`aarch64`, signed & notarized `.pkg`/`.dmg`), and Windows (`x86_64`).
 Each release ships both the terminal editor (`bemtvi`) and the native GUI

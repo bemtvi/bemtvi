@@ -347,13 +347,13 @@ Runnable playgrounds ship under `examples/`:
 
 | Example | Shows |
 | --- | --- |
-| [`btvchecklist`](https://github.com/davidrios/bemtvi/tree/main/examples/btvchecklist) | A modal checkbox dialog written with `btv.view.component` (reactive state + pure render). |
-| [`btvview`](https://github.com/davidrios/bemtvi/tree/main/examples/btvview) | A dockable `btv.view` content surface with `<CR>` → open-in-main. |
-| [`which-key`](https://github.com/davidrios/bemtvi/tree/main/examples/which-key) | A real which-key as a `surface = "float"` component over the pending-key oracle. |
-| [`ui-prompt`](https://github.com/davidrios/bemtvi/tree/main/examples/ui-prompt) | `btv.ui.input` and `btv.ui.confirm` prompts. |
-| [`ui-select`](https://github.com/davidrios/bemtvi/tree/main/examples/ui-select) | The floating chooser, including items that carry data. |
-| [`ui-float`](https://github.com/davidrios/bemtvi/tree/main/examples/ui-float) | Popup content (`\f` / `\F`), and LSP hover (`K`) through the popup window. |
-| [`window-geometry`](https://github.com/davidrios/bemtvi/tree/main/examples/window-geometry) | The shared size / align / margin vocabulary across every surface. |
+| [`btvchecklist`](https://github.com/bemtvi/bemtvi/tree/main/examples/btvchecklist) | A modal checkbox dialog written with `btv.view.component` (reactive state + pure render). |
+| [`btvview`](https://github.com/bemtvi/bemtvi/tree/main/examples/btvview) | A dockable `btv.view` content surface with `<CR>` → open-in-main. |
+| [`which-key`](https://github.com/bemtvi/bemtvi/tree/main/examples/which-key) | A real which-key as a `surface = "float"` component over the pending-key oracle. |
+| [`ui-prompt`](https://github.com/bemtvi/bemtvi/tree/main/examples/ui-prompt) | `btv.ui.input` and `btv.ui.confirm` prompts. |
+| [`ui-select`](https://github.com/bemtvi/bemtvi/tree/main/examples/ui-select) | The floating chooser, including items that carry data. |
+| [`ui-float`](https://github.com/bemtvi/bemtvi/tree/main/examples/ui-float) | Popup content (`\f` / `\F`), and LSP hover (`K`) through the popup window. |
+| [`window-geometry`](https://github.com/bemtvi/bemtvi/tree/main/examples/window-geometry) | The shared size / align / margin vocabulary across every surface. |
 
 ```sh
 BEMTVI_CONFIG=examples/btvchecklist cargo run -p bemtvi

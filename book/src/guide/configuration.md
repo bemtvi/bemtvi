@@ -34,7 +34,7 @@ btv.keymap.set("n", "<leader>w", "<cmd>w<cr>", { desc = "Save" })
 ```
 
 The full whitelist lives in
-[ADR 0002](https://github.com/davidrios/bemtvi/blob/main/docs/decisions/0002-native-plugin-system.md).
+[ADR 0002](https://github.com/bemtvi/bemtvi/blob/main/docs/decisions/0002-native-plugin-system.md).
 A neovim colorscheme reaches for a handful of those aliases (notably the
 `nvim_set_hl` highlight helper) and nothing more.
 
@@ -256,7 +256,7 @@ your config promises.
 
 ## Runnable examples
 
-The [`examples/`](https://github.com/davidrios/bemtvi/tree/main/examples)
+The [`examples/`](https://github.com/bemtvi/bemtvi/tree/main/examples)
 directory has ~85 self-contained, end-to-end-verified configs — one per feature
 (treesitter, LSP, floats, registers, tabs, mouse, statusline, completion,
 picker, snippets, decor, docks, quickfix, image previews, …). Each is a config

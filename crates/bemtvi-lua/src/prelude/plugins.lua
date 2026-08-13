@@ -2119,7 +2119,7 @@ end
 -- screen links here (`?`) instead of listing every plugin inline, so the offer stays
 -- short and the detail lives where it can be read properly. Keep in sync with the book
 -- page's path (`docs/recommended-plugins.md` -> `book/src/guide/recommended-plugins.md`).
-M.RECOMMENDED_DOC_URL = "https://davidrios.github.io/bemtvi/guide/recommended-plugins.html"
+M.RECOMMENDED_DOC_URL = "https://bemtvi.github.io/bemtvi/guide/recommended-plugins.html"
 
 -- bemtvi's BUILT-IN default recommended set — the btv.*-native starting point offered on
 -- a brand-new setup when the user's config registers no set of its own.

@@ -48,8 +48,8 @@ REPO_ROOT = os.path.dirname(BOOK_DIR)
 SRC_DIR = os.path.join(BOOK_DIR, "src")
 PRELUDE_DIR = os.path.join(REPO_ROOT, "crates", "bemtvi-lua", "src", "prelude")
 
-GH_BLOB = "https://github.com/davidrios/bemtvi/blob/main"
-GH_RAW = "https://raw.githubusercontent.com/davidrios/bemtvi/main"
+GH_BLOB = "https://github.com/bemtvi/bemtvi/blob/main"
+GH_RAW = "https://raw.githubusercontent.com/bemtvi/bemtvi/main"
 
 
 def die(msg):

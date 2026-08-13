@@ -33,7 +33,7 @@ These are one-time repository settings, done in the GitHub UI. No code.
 
 - [ ] **Step 1: Confirm repo visibility for free attestation**
 
-`actions/attest-build-provenance` is free on **public** repositories. Confirm `davidrios/bemtvi` is public (Settings → General). If private, attestation requires a Team/Enterprise plan — otherwise drop the attest steps later.
+`actions/attest-build-provenance` is free on **public** repositories. Confirm `bemtvi/bemtvi` is public (Settings → General). If private, attestation requires a Team/Enterprise plan — otherwise drop the attest steps later.
 
 - [ ] **Step 2: Allow Actions to create PRs**
 
@@ -368,7 +368,7 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/bemtvi"
+            echo "gh attestation verify <file> --repo bemtvi/bemtvi"
             echo '```'
           } > EDGE_BODY.md
 
@@ -614,7 +614,7 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/bemtvi"
+            echo "gh attestation verify <file> --repo bemtvi/bemtvi"
             echo '```'
           } > RELEASE_NOTES.md
 
@@ -672,7 +672,7 @@ Requires the [GitHub CLI](https://cli.github.com). Verify an archive against the
 attestation GitHub stores for it:
 
 ```sh
-gh attestation verify bemtvi-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/bemtvi
+gh attestation verify bemtvi-0.2.0-x86_64-linux-musl.tar.gz --repo bemtvi/bemtvi
 ```
 
 A successful run confirms the artifact was produced by the `bemtvi` release
@@ -702,8 +702,8 @@ After the merge lands on `main`, open the Actions tab. Expected: the `edge` work
 
 Run (locally, to confirm provenance):
 ```bash
-gh release download edge --repo davidrios/bemtvi --pattern 'bemtvi-edge-x86_64-linux-musl.tar.gz' --dir /tmp
-gh attestation verify /tmp/bemtvi-edge-x86_64-linux-musl.tar.gz --repo davidrios/bemtvi
+gh release download edge --repo bemtvi/bemtvi --pattern 'bemtvi-edge-x86_64-linux-musl.tar.gz' --dir /tmp
+gh attestation verify /tmp/bemtvi-edge-x86_64-linux-musl.tar.gz --repo bemtvi/bemtvi
 ```
 Expected: `✓ Verification succeeded`.
 
@@ -727,8 +727,8 @@ Merge the `release: v0.2.0` PR. Expected:
 - [ ] **Step 6: Final provenance check**
 
 ```bash
-gh release download v0.2.0 --repo davidrios/bemtvi --pattern 'bemtvi-0.2.0-x86_64-linux-musl.tar.gz' --dir /tmp
-gh attestation verify /tmp/bemtvi-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/bemtvi
+gh release download v0.2.0 --repo bemtvi/bemtvi --pattern 'bemtvi-0.2.0-x86_64-linux-musl.tar.gz' --dir /tmp
+gh attestation verify /tmp/bemtvi-0.2.0-x86_64-linux-musl.tar.gz --repo bemtvi/bemtvi
 ```
 Expected: `✓ Verification succeeded`.
 

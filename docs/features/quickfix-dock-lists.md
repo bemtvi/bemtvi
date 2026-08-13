@@ -126,7 +126,7 @@ never destroys a named list: re-show it by name and it re-renders.
 ## Try it
 
 A runnable playground ships in
-[`examples/picker-to-named-list`](https://github.com/davidrios/bemtvi/tree/main/examples/picker-to-named-list):
+[`examples/picker-to-named-list`](https://github.com/bemtvi/bemtvi/tree/main/examples/picker-to-named-list):
 
 ```sh
 BEMTVI_CONFIG=examples/picker-to-named-list \
@@ -134,7 +134,7 @@ BEMTVI_CONFIG=examples/picker-to-named-list \
 ```
 
 Named lists have their own playground in
-[`examples/named-lists`](https://github.com/davidrios/bemtvi/tree/main/examples/named-lists)
+[`examples/named-lists`](https://github.com/bemtvi/bemtvi/tree/main/examples/named-lists)
 (`\tl` collects a TODO/FIXME list, `\ll` a long-lines list beside it, `\td` drops the
 first):
 

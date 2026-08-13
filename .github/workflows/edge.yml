@@ -76,7 +76,7 @@ jobs:
             echo "---"
             echo "Verify a download's provenance:"
             echo '```'
-            echo "gh attestation verify <file> --repo davidrios/bemtvi"
+            echo "gh attestation verify <file> --repo bemtvi/bemtvi"
             echo '```'
           } > EDGE_BODY.md
 

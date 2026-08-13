@@ -47,7 +47,7 @@ port and a Service Worker answers the same routes instead.
 2. `btv.o.httphost` defaults to `127.0.0.1` — loopback only.
 3. Setting either while mounted *rebinds*, and every mount's URL moves with it.
 
-Some ~~struck~~ text, a [link](https://github.com/davidrios/bemtvi), and `inline code`.
+Some ~~struck~~ text, a [link](https://github.com/bemtvi/bemtvi), and `inline code`.
 
 ---
 

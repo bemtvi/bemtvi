@@ -353,7 +353,7 @@ In the Actions tab, open the triggered `edge` run. Expected: `build / x86_64-app
 - [ ] **Step 3: Verify a downloaded binary locally**
 
 ```bash
-gh release download edge --repo davidrios/bemtvi --pattern 'bemtvi-edge-aarch64-macos.tar.gz' --dir /tmp
+gh release download edge --repo bemtvi/bemtvi --pattern 'bemtvi-edge-aarch64-macos.tar.gz' --dir /tmp
 tar -xzf /tmp/bemtvi-edge-aarch64-macos.tar.gz -C /tmp
 codesign -dv --verbose=4 /tmp/bemtvi 2>&1 | grep -E 'Authority=Developer ID Application|flags=.*runtime|Timestamp='
 spctl -a -t exec -vv /tmp/bemtvi
@@ -363,7 +363,7 @@ Expected: `codesign` shows a `Developer ID Application` authority, a `runtime` f
 - [ ] **Step 4: Confirm the attestation still verifies over the signed archive**
 
 ```bash
-gh attestation verify /tmp/bemtvi-edge-aarch64-macos.tar.gz --repo davidrios/bemtvi
+gh attestation verify /tmp/bemtvi-edge-aarch64-macos.tar.gz --repo bemtvi/bemtvi
 ```
 Expected: `✓ Verification succeeded`.
 

@@ -24,8 +24,8 @@ install the highlighter for your chosen language.
 
 ## Quick start
 
-Grab a pre-built binary from the [**latest release**](https://github.com/davidrios/bemtvi/releases/latest)
-(or the rolling [`edge`](https://github.com/davidrios/bemtvi/releases/tag/edge)
+Grab a pre-built binary from the [**latest release**](https://github.com/bemtvi/bemtvi/releases/latest)
+(or the rolling [`edge`](https://github.com/bemtvi/bemtvi/releases/tag/edge)
 prerelease built from `main`). Binaries are published for five targets:
 
 | OS      | Terminal editor (`bemtvi`)       | GUI (`bemtvi-gui`)                |

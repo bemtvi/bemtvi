@@ -15,7 +15,7 @@ language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/davidrios/bemtvi"
+git-repository-url = "https://github.com/bemtvi/bemtvi"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 no-section-label = false

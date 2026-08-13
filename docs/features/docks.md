@@ -111,7 +111,7 @@ tabs within that dock. (Design: the
 
 ## Try it
 
-A runnable playground ships in [`examples/dock`](https://github.com/davidrios/bemtvi/tree/main/examples/dock):
+A runnable playground ships in [`examples/dock`](https://github.com/bemtvi/bemtvi/tree/main/examples/dock):
 
 ```sh
 BEMTVI_CONFIG=examples/dock cargo run -p bemtvi -- examples/dock/sample.txt

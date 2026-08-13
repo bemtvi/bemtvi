@@ -290,7 +290,7 @@ sees what the editor shows and edits are visible to the interpreter.
   of bounds`). The 352 KB plugin bundle hit it; a large user `init.lua` would have too. Bumping
   the stack to 8 MB fixes it for both builds (verified: the full bundle sources + all 6 plugins
   `setup()` cleanly).
-- **`build-plugins.sh`** — clones the recommended set (`davidrios/{bemtvi-keys-helper,bemtvi-tree,
+- **`build-plugins.sh`** — clones the recommended set (`bemtvi/{bemtvi-keys-helper,bemtvi-tree,
   bemtvi-line,bemtvi-lspconfig,bemtvi-diff}`) + `bemtvi/catppuccin-bemtvi` at **pinned commits**
   (full clone + checkout SHA, so an arbitrary pin resolves), then runs `amalgamate-plugins.mjs`
   over all six `lua/` trees → `web/vendor/plugins/plugins-bundle.lua`. Idempotent (`--force`),

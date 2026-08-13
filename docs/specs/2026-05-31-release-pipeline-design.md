@@ -203,7 +203,7 @@ self-triggering CHANGELOG push for `edge.yml` to filter.
   `contents: write` to publish).
 - Free on public repositories; no PATs or external secrets — only the built-in
   `GITHUB_TOKEN`.
-- Consumers verify with: `gh attestation verify <asset> --repo davidrios/bemtvi`.
+- Consumers verify with: `gh attestation verify <asset> --repo bemtvi/bemtvi`.
 - A short note documents verification (in the release-notes footer and a brief `docs/` page).
 
 ## Cargo profile change
@@ -264,7 +264,7 @@ test harness:
    overwrite, stable URLs, edge notes, attestation.
 5. Verify caching: a second no-op `main` push completes substantially faster than the first
    (warm caches).
-6. `gh attestation verify <asset> --repo davidrios/bemtvi` confirms provenance.
+6. `gh attestation verify <asset> --repo bemtvi/bemtvi` confirms provenance.
 
 ## Implementation order (for the plan)
 

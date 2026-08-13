@@ -208,8 +208,8 @@ condition never holds within `tries`.
 
 | Example | Shows |
 | --- | --- |
-| [`async-runtime`](https://github.com/davidrios/bemtvi/tree/main/examples/async-runtime) | The bare loop — `btv.schedule` vs `btv.timer`, and a self-rescheduling timer firing on wall-clock time while the editor stays responsive. |
-| [`ui-picker`](https://github.com/davidrios/bemtvi/tree/main/examples/ui-picker) | `btv.run_stream` + `btv.await_each` streaming `rg` results into a source. |
+| [`async-runtime`](https://github.com/bemtvi/bemtvi/tree/main/examples/async-runtime) | The bare loop — `btv.schedule` vs `btv.timer`, and a self-rescheduling timer firing on wall-clock time while the editor stays responsive. |
+| [`ui-picker`](https://github.com/bemtvi/bemtvi/tree/main/examples/ui-picker) | `btv.run_stream` + `btv.await_each` streaming `rg` results into a source. |
 
 ```sh
 BEMTVI_CONFIG=examples/async-runtime cargo run -p bemtvi -- examples/async-runtime/sample.txt

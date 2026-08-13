@@ -214,7 +214,7 @@ jobs:
           cp "$BIN" "$ROOT/bemtvi"
           mkdir -p dist
           pkgbuild --root "$ROOT" \
-            --identifier com.davidrios.bemtvi \
+            --identifier io.bemtvi.bemtvi \
             --version "$PKG_VERSION" \
             --install-location /usr/local/bin \
             --keychain "$SIGN_KEYCHAIN" \
@@ -275,7 +275,7 @@ jobs:
           <dict>
             <key>CFBundleName</key><string>bemtvi</string>
             <key>CFBundleDisplayName</key><string>bemtvi</string>
-            <key>CFBundleIdentifier</key><string>com.davidrios.bemtvi.gui</string>
+            <key>CFBundleIdentifier</key><string>io.bemtvi.bemtvi_gui</string>
             <key>CFBundleExecutable</key><string>bemtvi-gui</string>
             <key>CFBundleIconFile</key><string>bemtvi</string>
             <key>CFBundlePackageType</key><string>APPL</string>

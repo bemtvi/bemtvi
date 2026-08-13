@@ -31,5 +31,5 @@ inherits the global value, `false` forces this window's scrolls to snap, and
 `true` forces the slide even when the global is off. A synced side-by-side diff
 sets it `false` on its panes so a mirrored scroll doesn't desync.
 
-See [`examples/smooth-scroll/`](https://github.com/davidrios/bemtvi/tree/main/examples/smooth-scroll)
+See [`examples/smooth-scroll/`](https://github.com/bemtvi/bemtvi/tree/main/examples/smooth-scroll)
 for a runnable demo.

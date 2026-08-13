@@ -25,7 +25,11 @@ plugins all run in this tab.
   `cb` (both). After you resolve it, `:DiffGit` diffs your edits against HEAD
 - in a python file, type `def` or `class` and accept the **snippet** row — it expands
   instead of inserting, dropping you on the first tabstop. `<C-j>` moves to the next,
-  `<C-h>` back; retype `class`'s name and watch the `__repr__` below it update with it
+  `<C-h>` back; retype `class`'s name and watch the `__repr__` below it update with it.
+  Eight are registered (in `init.lua`), between them showing off each part of the
+  grammar: `for` mirrors, `log` offers a **choice** of levels, `test` **derives** its
+  docstring from the name you type, and `head` fills in this file's name and the year
+  by itself
 - `:MarkdownPreview` on this file — a rendered, live-updating copy opens in a second
   browser tab and follows your edits with no `:w`. There is no server: a Service Worker
   answers the same routes the native build's HTTP mount would

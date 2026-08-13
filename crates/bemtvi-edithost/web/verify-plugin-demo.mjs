@@ -168,6 +168,28 @@ try {
   check("demo: the editor is back in normal mode after the snippet session",
     /\bn\b/.test(String(mode)), `mode=${mode}`);
 
+  // 5b. The registered set exercises the whole snippet grammar, not just plain tabstops.
+  //     `test` is the one worth guarding: its docstring is DERIVED from tabstop 1 by a
+  //     transform, applied LIVE as the name is typed and run through btv.regex. A
+  //     plain-text expansion would still look right in the buffer, so nothing else here
+  //     would notice if derived text stopped updating.
+  await page.evaluate(() => window.__bemtvi.feed("ggdGitest"));
+  await sleep(1500);
+  const tIdx = await page.evaluate(() =>
+    ((window.__bemtvi.frame() || {}).menu || { kinds: [] }).kinds.indexOf("Snippet"));
+  for (let i = 0; i <= tIdx; i++) { await page.evaluate(() => window.__bemtvi.feed("<C-n>")); await sleep(120); }
+  await page.evaluate(() => window.__bemtvi.feed("<C-y>"));
+  await sleep(600);
+  await page.evaluate(() => window.__bemtvi.feed("parses_utf8"));
+  await sleep(700);
+  const derived = await page.evaluate(() => window.__bemtvi.lines());
+  check("demo: a snippet transform derives text live from the tabstop being typed",
+    /def test_parses_utf8\(\)/.test(String(derived)) && /"""Parses_utf8\."""/.test(String(derived)),
+    `lines=${JSON.stringify(derived)}`);
+  await luaResult('require("bemtvi-snippets").abort() return 1');
+  await page.evaluate(() => window.__bemtvi.feed("<Esc><Esc>"));
+  await sleep(300);
+
   // 6. bemtvi-markdown-preview SERVES. `:MarkdownPreview` mounts the route; fetching it as an
   //    ordinary URL exercises the whole web leg (page fetch -> Service Worker -> edit-host ->
   //    the plugin's Lua on_request), which is the only reason this plugin works in a tab at all.

@@ -71,13 +71,40 @@ snippets.setup({ jump_next = "<C-j>", jump_prev = "<C-h>" })
 
 -- No snippet collection ships with the demo (friendly-snippets is a runtimepath install,
 -- and the browser has no runtimepath), so register a few python ones here — otherwise the
--- source would load and offer nothing. `${1:name}` is a tabstop with a default, `$0` the
--- final caret position, and a repeated `$1` mirrors as you type.
+-- source would load and offer nothing. Between them these cover the whole snippet grammar,
+-- one feature at a time, so there is something to actually try:
+--
+--   ${1:name}          a TABSTOP with a default    (`def`, `try`)
+--   $0                 where the caret finishes    (all of them)
+--   a repeated $1      a MIRROR - retype it and every copy follows (`class`, `for`)
+--   ${1|a,b,c|}        a CHOICE - the jump keys cycle the alternatives (`log`)
+--   ${1/re/fmt/}       a TRANSFORM - derived text, updated live (`test`)
+--   $TM_FILENAME_BASE  a VARIABLE - resolved from context at expand (`head`)
 snippets.add("python", {
   { trigger = "def", description = "function", body = "def ${1:name}(${2:args}) -> ${3:None}:\n    $0" },
   { trigger = "class", description = "dataclass", body = "@dataclass\nclass ${1:Name}:\n    ${2:field}: ${3:int}\n\n    def __repr__(self) -> str:\n        return f\"${1:Name}({self.${2:field}})\"\n$0" },
   { trigger = "main", description = "entry point", body = 'if __name__ == "__main__":\n    ${1:main()}\n$0' },
   { trigger = "try", description = "try/except", body = "try:\n    ${1:pass}\nexcept ${2:Exception} as e:\n    ${3:raise}\n$0" },
+  -- MIRROR: `$1` inside the body follows the loop variable as you rename it.
+  { trigger = "for", description = "for loop", body = "for ${1:item} in ${2:items}:\n    ${3:print($1)}\n$0" },
+  -- CHOICE list. Landing on tabstop 1 offers the alternatives instead of free text; the
+  -- first is the default.
+  { trigger = "log", description = "log a message", body = 'logger.${1|debug,info,warning,error,critical|}("${2:message}")\n$0' },
+  -- TRANSFORM: the docstring is DERIVED from the test name as you type it. `(.)(.*)` splits
+  -- off the first character and `${1:/upcase}` capitalises it, so typing `parses_utf8`
+  -- writes "Parses_utf8." on the line below without you touching it.
+  {
+    trigger = "test",
+    description = "test case",
+    body = 'def test_${1:name}() -> None:\n    """${1/(.)(.*)/${1:/upcase}$2/}."""\n    ${2:assert False}\n$0',
+  },
+  -- VARIABLES, resolved from context at expand time - this file's name and the clock.
+  -- Nothing is typed for either; they arrive already filled in.
+  {
+    trigger = "head",
+    description = "module docstring",
+    body = '"""${TM_FILENAME_BASE} - ${1:what this module does}.\n\nCopyright (c) ${CURRENT_YEAR}.\n"""\n$0',
+  },
 })
 
 -- Autocompletion: the native btv.complete engine, popping up as you type. The `lsp`

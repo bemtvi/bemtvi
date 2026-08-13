@@ -14,7 +14,14 @@ EXTERN buf_T *curbuf INIT( = NULL);
 EXTERN win_T *curwin INIT( = NULL);
 
 /// Set by the host (e.g. on Ctrl-C) to interrupt long-running matches.
-EXTERN volatile int got_int INIT( = false);
+///
+/// `_Atomic` (not plain `volatile`): the host's interrupt path
+/// (`btvre_set_interrupt`) can run on a *different thread* than the one
+/// matching — the whole point is to signal a match currently holding the
+/// engine lock — so a plain `volatile int` read/write is a C11 data race
+/// (undefined behavior). Seq-cst atomics keep the hot `if (got_int)` checks
+/// correct and are a plain load on every architecture bemtvi targets.
+EXTERN _Atomic int got_int INIT( = false);
 
 /// Incremented by emsg(); the engine uses it to detect reported errors.
 EXTERN int called_emsg INIT( = 0);

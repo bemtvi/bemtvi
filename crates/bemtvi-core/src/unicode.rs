@@ -446,6 +446,26 @@ pub fn display_line(line: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Translate a **char offset** into `line` to the equivalent char offset into
+/// [`display_line`]`(line)` — the substituted `^X` / `<xx>` tokens are 2/5 chars
+/// wide, so every offset past a control char shifts. Wire payloads that pair a
+/// display-scrubbed string with a cursor/match offset (the cmdline cursor, pmenu
+/// match spans) must run their offsets through this so the client's index lands
+/// on the same character. Clamps to the display string's end past the last char.
+pub fn display_char_offset(line: &str, char_idx: usize) -> usize {
+    let mut disp_chars = 0;
+    for (raw_chars, c) in line.chars().enumerate() {
+        if raw_chars >= char_idx {
+            break;
+        }
+        disp_chars += match control_repr(c) {
+            Some(rep) => rep.chars().count(),
+            None => 1,
+        };
+    }
+    disp_chars
+}
+
 /// Byte ranges `[start, end)` of each unprintable control char in `line` (the
 /// chars [`display_line`] substitutes), in order. Used to overlay a `SpecialKey`
 /// highlight on the `^X` / `<xx>` tokens. Empty for the common all-printable line.

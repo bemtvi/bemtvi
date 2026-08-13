@@ -42,6 +42,7 @@ use bemtvi_server::{
     env_daemon_command, mint_token, parse_connect_uri, run as run_server,
     run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource, DaemonClient, ReconnectHandle,
     ReconnectPolicy, ReconnectSpec, ReconnectTransport, ServerInit, CONNECT_URI_SCHEME,
+    DAEMON_TOKEN_ENV,
 };
 
 /// The shada-namespace + workspace options derived from the command line. The namespace
@@ -358,9 +359,10 @@ const DAEMON_FLAG: &str = "--daemon";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8765";
 
 // A positional argument with the daemon URI scheme (`bemtvi_server::CONNECT_URI_SCHEME`,
-// `bemtvi://HOST:PORT/TOKEN?cert=HASH`) selects the QUIC connect path over the default
-// stdio-child split; `parse_connect_uri` (also bemtvi-server's, shared with the GUI)
-// splits it into the dial pieces.
+// `bemtvi://HOST:PORT?cert=HASH`, token via `$BEMTVI_DAEMON_TOKEN`; the legacy
+// `bemtvi://HOST:PORT/TOKEN?cert=HASH` form still dials for the browser web client)
+// selects the QUIC connect path over the default stdio-child split; `parse_connect_uri`
+// (also bemtvi-server's, shared with the GUI) splits it into the dial pieces.
 
 /// Internal, debug-only flag that runs this binary as a scripted mock language
 /// server (see `bemtvi_lsp::mock`), used by the LSP test suite as a hermetic
@@ -908,9 +910,9 @@ fn run_daemon() -> Result<()> {
 
 /// Run the daemon as a **QUIC listener** (`--daemon --listen [addr]`): the real native
 /// transport (Open Decision #2). Mints a bearer token + self-signed cert, binds `addr`,
-/// prints the connect URI the edit-host needs, then accepts connections — each running
-/// the full six-leg multiplexer ([`serve_quic`] → `run_daemon_io`) over one QUIC bidi
-/// stream. Like `--daemon`, no editor / Lua / config: pure I/O.
+/// prints the connect strings the edit-host needs, then accepts connections — each
+/// running the full six-leg multiplexer ([`serve_quic`] → `run_daemon_io`) over one
+/// QUIC bidi stream. Like `--daemon`, no editor / Lua / config: pure I/O.
 fn run_daemon_listen(addr: SocketAddr) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -922,9 +924,20 @@ fn run_daemon_listen(addr: SocketAddr) -> Result<()> {
         // human can copy the command; if the bind address is non-loopback, the user
         // substitutes the reachable host for the connecting machine.
         println!("bemtvi daemon listening on {}", info.addr);
+        // Browser form first: a webpage has no shell env, so its paste string keeps
+        // the legacy `/TOKEN` path (the WebTransport CONNECT path *is* the auth
+        // channel). It also carries the full URI first in stdout, which is the form
+        // the browser verifiers grep for.
         println!(
-            "  connect with: bemtvi --connect-daemon '{CONNECT_URI_SCHEME}{}/{}?cert={}'",
+            "  browser: paste '{CONNECT_URI_SCHEME}{}/{}?cert={}' into the web client",
             info.addr, info.token, info.cert_hash
+        );
+        // The native command runs through a shell, so the token rides the env var,
+        // NOT the URI: a `bemtvi://…` URI that lands in shell history, a log, or a
+        // reconnect config no longer carries the daemon's sole auth credential.
+        println!(
+            "  connect with: {DAEMON_TOKEN_ENV}={} bemtvi --connect-daemon '{CONNECT_URI_SCHEME}{}?cert={}'",
+            info.token, info.addr, info.cert_hash
         );
         serve_quic(endpoint, info.token).await
     })
@@ -975,7 +988,9 @@ fn run_with_daemon(
 }
 
 /// Run the **local** edit-host over a QUIC connection to a `--daemon --listen` listener
-/// (a `bemtvi://HOST:PORT/TOKEN?cert=HASH` target). Same editor + TUI as the stdio split;
+/// (a tokenless `bemtvi://HOST:PORT?cert=HASH` target; the bearer token comes from
+/// `$BEMTVI_DAEMON_TOKEN` so the copy-paste-able URI never carries the daemon's auth
+/// credential). Same editor + TUI as the stdio split;
 /// only the transport differs — [`connect_quic_reconnecting`] pins the daemon's cert TOFU and
 /// presents the bearer token, then returns the same seams plus a reconnect handle. The QUIC
 /// endpoint + connection are owned by the link thread (no child to hold), and re-dialed under

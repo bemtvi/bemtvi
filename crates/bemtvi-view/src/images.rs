@@ -18,6 +18,31 @@ use image::{DynamicImage, ImageReader};
 /// only the retained copy is shrunk.)
 pub const MAX_EDGE: u32 = 2560;
 
+/// Strict decode-time edge cap (pixels per side). The `image` crate's default
+/// limits leave the *strict* dimension check off (only a best-effort 512 MiB
+/// alloc cap, which some decoders ignore), so a crafted header — a
+/// "decompression bomb": a tiny file whose dimensions claim a giant bitmap —
+/// would drive a multi-hundred-MiB transient allocation before the downscale.
+/// These caps fail the bomb at decode, before the allocator sees the claimed
+/// size, while staying generous for real photos (8K is 7680×4320).
+const MAX_DECODE_EDGE: u32 = 16384;
+
+/// Strict decode-time allocation budget: the claimed
+/// `width * height * bytes-per-pixel` must fit, or the decode is rejected.
+/// (Non-strict in the crate's own terms — decoders honor it best-effort — so
+/// the dimension check above is the real guarantee; this one bounds the rest.)
+const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// The decode-time [`image::Limits`] applied to every preview decode
+/// (constructed via `Default` because the struct is `#[non_exhaustive]`).
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_EDGE);
+    limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
+
 /// A request to fetch a remote (daemon-session) preview's bytes over the editor
 /// RPC. The client can't read the marker's `path` off its own disk — the file is
 /// on the daemon — so [`RemoteImages::ensure_fetch`] emits one of these; the
@@ -141,12 +166,10 @@ impl RemoteImages {
 /// error. The retained copy is downscaled to `max_edge` (itself capped at
 /// [`MAX_EDGE`]) so it stays bounded regardless of the source resolution.
 pub fn decode_file(path: &str, max_edge: u32) -> Option<DynamicImage> {
-    let img = ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
+    let mut reader = ImageReader::open(path).ok()?;
+    reader = reader.with_guessed_format().ok()?;
+    reader.limits(decode_limits());
+    let img = reader.decode().ok()?;
     Some(downscale(img, cap(max_edge)))
 }
 
@@ -156,11 +179,10 @@ pub fn decode_file(path: &str, max_edge: u32) -> Option<DynamicImage> {
 /// the same `max_edge` downscale. `None` on a decode error (a corrupt /
 /// unsupported file → the placeholder).
 pub fn decode_bytes(bytes: &[u8], max_edge: u32) -> Option<DynamicImage> {
-    let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .decode()
-        .ok()?;
+    let mut reader = ImageReader::new(Cursor::new(bytes));
+    reader = reader.with_guessed_format().ok()?;
+    reader.limits(decode_limits());
+    let img = reader.decode().ok()?;
     Some(downscale(img, cap(max_edge)))
 }
 

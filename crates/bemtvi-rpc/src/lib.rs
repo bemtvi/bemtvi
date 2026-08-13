@@ -55,6 +55,20 @@ type Pending = Arc<Mutex<Option<PendingMap>>>;
 /// keeping the post-cancel drain sub-second.
 const STREAM_CAP: usize = 4;
 
+/// Bounded capacity of the **inbound** frame queue on server legs
+/// ([`connect_bounded`]): how many decoded `Incoming` messages may wait for the
+/// consumer (the event loop / a daemon demuxer) before the reader task stops
+/// reading and backpressure reaches the peer's socket. This is the memory gate
+/// against a connected-but-hostile peer flooding requests faster than the
+/// consumer drains them — without it the queue grows without bound. The cap is
+/// a *frame count*, not bytes; each frame is itself capped by [`MAX_FRAME`], and
+/// the consumer drains a full tick per loop turn, so normal traffic never sees
+/// the bound. Client legs ([`connect`]) stay unbounded: their queue is fed by
+/// the trusted local server, and the harness's `UnboundedReceiver` is a public
+/// test-facing type. `pub` because the daemon's per-group fan-out channels
+/// (bemtvi-server) need the same cap to stay inside one backpressure chain.
+pub const IN_CAP: usize = 256;
+
 /// A cloneable handle for sending requests, notifications and responses.
 #[derive(Clone)]
 pub struct Rpc {
@@ -132,15 +146,68 @@ impl Rpc {
     }
 }
 
-/// Wire up a connection over `reader`/`writer`.
+/// The reader task's delivery side: where decoded [`Incoming`] messages go. The
+/// variant decides whether a full queue blocks the reader ([`Inbound::Bounded`],
+/// the server-leg backpressure gate) or never blocks ([`Inbound::Unbounded`],
+/// client legs).
+enum Inbound {
+    Unbounded(mpsc::UnboundedSender<Incoming>),
+    Bounded(mpsc::Sender<Incoming>),
+}
+
+impl Inbound {
+    /// Deliver one message; `false` when the consumer is gone (receiver dropped).
+    /// A full [`Inbound::Bounded`] queue awaits — the reader stops reading, so
+    /// TCP flow control throttles the peer instead of the queue growing.
+    async fn send(&self, msg: Incoming) -> bool {
+        match self {
+            Inbound::Unbounded(tx) => tx.send(msg).is_ok(),
+            Inbound::Bounded(tx) => tx.send(msg).await.is_ok(),
+        }
+    }
+}
+
+/// Wire up a connection over `reader`/`writer`, with an **unbounded** inbound
+/// queue. For client legs: the queue is fed by the local server, which the
+/// client's own process controls, so no flood gate is needed. Server legs
+/// should use [`connect_bounded`] — there the peer is the attacker.
 pub fn connect<R, W>(reader: R, writer: W) -> (Rpc, mpsc::UnboundedReceiver<Incoming>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
+    let rpc = connect_impl(reader, writer, Inbound::Unbounded(in_tx));
+    (rpc, in_rx)
+}
+
+/// Wire up a connection over `reader`/`writer`, with the **inbound** queue
+/// bounded at [`IN_CAP`] frames. For server legs (the embedded editor's event
+/// loop, every daemon leg, the QUIC accept path): the peer is untrusted, so a
+/// flood of requests must backpressure onto the peer's socket instead of
+/// growing memory without limit. Everything else — outbound, streaming,
+/// teardown — behaves exactly as [`connect`].
+pub fn connect_bounded<R, W>(reader: R, writer: W) -> (Rpc, mpsc::Receiver<Incoming>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (in_tx, in_rx) = mpsc::channel::<Incoming>(IN_CAP);
+    let rpc = connect_impl(reader, writer, Inbound::Bounded(in_tx));
+    (rpc, in_rx)
+}
+
+/// The shared connect machinery: spawn the reader/writer pair and the teardown
+/// coupling, hand back the [`Rpc`]. Each public constructor owns its own
+/// inbound channel pair (the bounded/unbounded kinds can't share a return
+/// type) and hands the sender in as the reader's delivery side.
+fn connect_impl<R, W>(reader: R, writer: W, in_tx: Inbound) -> Rpc
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (stream_tx, stream_rx) = mpsc::channel::<Vec<u8>>(STREAM_CAP);
-    let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
     let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
 
     let mut writer_handle = tokio::spawn(writer_task(writer, out_rx, stream_rx));
@@ -163,13 +230,12 @@ where
         cleanup.lock().unwrap().take();
     });
 
-    let rpc = Rpc {
+    Rpc {
         out: out_tx,
         stream: stream_tx,
         pending,
         next_id: Arc::new(AtomicU64::new(1)),
-    };
-    (rpc, in_rx)
+    }
 }
 
 async fn writer_task<W>(
@@ -431,7 +497,7 @@ fn scan_frame(buf: &[u8]) -> Scan {
     Scan::Complete(pos)
 }
 
-async fn reader_task<R>(mut reader: R, in_tx: mpsc::UnboundedSender<Incoming>, pending: Pending)
+async fn reader_task<R>(mut reader: R, in_tx: Inbound, pending: Pending)
 where
     R: AsyncRead + Unpin,
 {
@@ -469,7 +535,7 @@ where
                 Err(_) => return,
             };
             consumed += n;
-            if dispatch(val, &in_tx, &pending).is_err() {
+            if dispatch(val, &in_tx, &pending).await.is_err() {
                 return;
             }
         }
@@ -492,9 +558,9 @@ where
     }
 }
 
-fn dispatch(
+async fn dispatch(
     val: Value,
-    in_tx: &mpsc::UnboundedSender<Incoming>,
+    in_tx: &Inbound,
     pending: &Pending,
 ) -> std::result::Result<(), ()> {
     let mut arr = match val {
@@ -510,9 +576,9 @@ fn dispatch(
             let id = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
             let method = take_str(&mut arr, 2);
             let params = take_params(&mut arr, 3);
-            in_tx
-                .send(Incoming::Request { id, method, params })
-                .map_err(|_| ())?;
+            if !in_tx.send(Incoming::Request { id, method, params }).await {
+                return Err(());
+            }
         }
         Some(1) => {
             let id = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
@@ -525,9 +591,9 @@ fn dispatch(
         Some(2) => {
             let method = take_str(&mut arr, 1);
             let params = take_params(&mut arr, 2);
-            in_tx
-                .send(Incoming::Notification { method, params })
-                .map_err(|_| ())?;
+            if !in_tx.send(Incoming::Notification { method, params }).await {
+                return Err(());
+            }
         }
         _ => {}
     }

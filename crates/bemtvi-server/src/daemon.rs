@@ -138,7 +138,7 @@ use tokio::sync::watch;
 use bemtvi_core::{DirEntry, FileStat, HostFs};
 use bemtvi_lsp::{LspChannel, LspProcess, LspTransport, ServerSpawn};
 use bemtvi_lua::LuaFs;
-use bemtvi_rpc::{connect, Incoming, Rpc};
+use bemtvi_rpc::{connect_bounded, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
 use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
@@ -671,18 +671,20 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     split_groups(rpc, incoming)
 }
 
 /// Fan one already-connected single-stream link into the four leg-group
 /// [`GroupLink`]s (spawning the [`split_incoming`] demux) — the body shared by
-/// [`split_single_stream`] and the one-shot [`serve_daemon_link`].
-fn split_groups(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> DialedConnection {
-    let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
-    let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
-    let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
-    let (term_tx, term_rx) = unbounded_channel::<Incoming>();
+/// [`split_single_stream`] and the one-shot [`serve_daemon_link`]. The per-group
+/// channels are bounded ([`bemtvi_rpc::IN_CAP`]) so a peer flooding one group's
+/// methods backpressures the split instead of growing that group's queue.
+fn split_groups(rpc: Rpc, incoming: Receiver<Incoming>) -> DialedConnection {
+    let (ctrl_tx, ctrl_rx) = channel::<Incoming>(bemtvi_rpc::IN_CAP);
+    let (proc_tx, proc_rx) = channel::<Incoming>(bemtvi_rpc::IN_CAP);
+    let (lsp_tx, lsp_rx) = channel::<Incoming>(bemtvi_rpc::IN_CAP);
+    let (term_tx, term_rx) = channel::<Incoming>(bemtvi_rpc::IN_CAP);
     tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx, term_tx));
     DialedConnection::from_groups(
         GroupLink {
@@ -939,40 +941,64 @@ async fn maintain_link<D, DFut>(
 }
 
 /// The URI scheme a QUIC daemon prints for clients to dial:
-/// `bemtvi://HOST:PORT/TOKEN?cert=HASH`.
+/// `bemtvi://HOST:PORT?cert=HASH` (the bearer token travels separately — see
+/// [`DAEMON_TOKEN_ENV`]; the legacy `bemtvi://HOST:PORT/TOKEN?cert=HASH` path
+/// form still dials, for the browser which has no shell env).
 pub const CONNECT_URI_SCHEME: &str = "bemtvi://";
 
-/// Parse a `bemtvi://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces a QUIC
-/// dial needs: the `https://HOST:PORT` dial URL (WebTransport requires the `https`
-/// scheme), the bearer `TOKEN` (the path), and the TOFU cert `HASH` (the `cert`
-/// query). Fails loud on a malformed URI rather than dialing a half-specified
-/// target. Shared by every dialing client (the TUI binary and the GUI).
+/// The env var carrying the daemon's bearer token to a QUIC-dialing client
+/// (`BEMTVI_DAEMON_CMD`'s sibling). The daemon prints its connect command with
+/// the token here rather than in the URI: the URI is copy-paste-able text that
+/// lands in shell history, logs, docs, and reconnect configs, and it is the
+/// daemon's sole auth credential (a leaked token is RCE on the daemon's host),
+/// so it must not ride in the string itself. The browser leg is the one
+/// exception — a webpage has no shell env, so its paste string keeps the legacy
+/// `/TOKEN` path form.
+pub const DAEMON_TOKEN_ENV: &str = "BEMTVI_DAEMON_TOKEN";
+
+/// Parse a `bemtvi://HOST:PORT?cert=HASH` connect URI into the pieces a QUIC
+/// dial needs: the `https://HOST:PORT` dial URL (WebTransport requires the
+/// `https` scheme), the bearer token, and the TOFU cert `HASH` (the `cert`
+/// query). The token comes from the legacy `/TOKEN` path when present, else from
+/// [`DAEMON_TOKEN_ENV`] — a URI with neither fails loud rather than dialing
+/// unauthenticated. Fails loud on any malformed URI rather than dialing a
+/// half-specified target. Shared by every dialing client (the TUI binary and
+/// the GUI).
 pub fn parse_connect_uri(uri: &str) -> anyhow::Result<(String, String, String)> {
     use anyhow::anyhow;
     let rest = uri.strip_prefix(CONNECT_URI_SCHEME).ok_or_else(|| {
         anyhow!("daemon connect URI must start with {CONNECT_URI_SCHEME}: {uri:?}")
     })?;
-    let (authority, after) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow!("daemon connect URI is missing the /TOKEN path: {uri:?}"))?;
-    if authority.is_empty() {
-        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
-    }
-    let (token, query) = after
+    // `HOST:PORT[/TOKEN][?cert=HASH]` — the `/TOKEN` path is the legacy form
+    // (the browser needs it: a webpage has no env to read); a tokenless URI
+    // resolves its token from `DAEMON_TOKEN_ENV` below.
+    let (authority_and_path, query) = rest
         .split_once('?')
         .ok_or_else(|| anyhow!("daemon connect URI is missing the ?cert=HASH query: {uri:?}"))?;
-    if token.is_empty() {
-        return Err(anyhow!("daemon connect URI has an empty TOKEN: {uri:?}"));
+    let (authority, path_token) = authority_and_path
+        .split_once('/')
+        .map_or((authority_and_path, None), |(a, t)| (a, Some(t)));
+    if authority.is_empty() {
+        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
     }
     let cert_hash = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("cert="))
         .filter(|h| !h.is_empty())
         .ok_or_else(|| anyhow!("daemon connect URI is missing cert=HASH: {uri:?}"))?;
+    // An explicit path token wins over the ambient env var.
+    let token = match path_token.filter(|t| !t.is_empty()) {
+        Some(t) => t.to_owned(),
+        None => std::env::var(DAEMON_TOKEN_ENV).map_err(|_| {
+            anyhow!(
+                "daemon connect URI has no /TOKEN and {DAEMON_TOKEN_ENV} is unset: {uri:?}"
+            )
+        })?,
+    };
     Ok((
         format!("https://{authority}"),
         cert_hash.to_owned(),
-        token.to_owned(),
+        token,
     ))
 }
 
@@ -1206,7 +1232,7 @@ impl RemoteHostProc {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (rpc, incoming) = connect(reader, writer);
+        let (rpc, incoming) = connect_bounded(reader, writer);
         let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(run_demux(incoming, inflight.clone()));
         RemoteHostProc {
@@ -1299,7 +1325,7 @@ impl HostProc for RemoteHostProc {
 /// to. On connection teardown (`incoming` ends) it clears [`Inflight`], dropping
 /// every pending sender so each waiting [`RemoteHostProc::run`] future observes the
 /// EOF and reports a `-1` exit rather than hanging on a child that will never report.
-async fn run_demux(mut incoming: UnboundedReceiver<Incoming>, inflight: Inflight) {
+async fn run_demux(mut incoming: Receiver<Incoming>, inflight: Inflight) {
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue; // the daemon speaks only notifications; ignore stray requests
@@ -1372,14 +1398,14 @@ impl RemoteHostTerm {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (rpc, incoming) = connect(reader, writer);
+        let (rpc, incoming) = connect_bounded(reader, writer);
         Self::with_link(rpc, incoming)
     }
 
     /// Build the seam over an already-connected Term group link (the
     /// [`serve_daemon_link_inner`] / QUIC multiplexer path): `rpc` sends ops, `incoming`
     /// is the Term group's demuxed inbound stream the term demux drains.
-    pub(crate) fn with_link(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> RemoteHostTerm {
+    pub(crate) fn with_link(rpc: Rpc, incoming: Receiver<Incoming>) -> RemoteHostTerm {
         let (event_tx, event_rx) =
             channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
         tokio::spawn(run_term_demux(incoming, event_tx));
@@ -1453,7 +1479,7 @@ impl RemoteHostTerm {
 /// wire EOFs (the channel sender drops, so the run loop's terminal arm sees no more events) or
 /// the run loop drops its receiver (no consumer left).
 async fn run_term_demux(
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
     event_tx: Sender<crate::terminal::native::TermEvent>,
 ) {
     use crate::terminal::native::TermEvent;
@@ -1509,18 +1535,39 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_proc_daemon_on(rpc, incoming).await
 }
 
 /// The process leg's connection-agnostic core: drives the `proc_*` wire over a
 /// pre-built shared [`Rpc`] + its own demuxed inbound stream. The single-stdio
+/// Any inbound `Incoming` stream a daemon leg core can drain: the bounded
+/// `mpsc::Receiver` the daemon's per-leg queues feed, or the unbounded receiver
+/// a direct caller (the per-leg tests, a standalone leg over its own duplex)
+/// hands over. Generic so one core serves both — the daemon keeps its queues
+/// bounded while the tests keep passing their unbounded receivers.
+pub trait IncomingStream {
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<Incoming>> + Send;
+}
+
+impl IncomingStream for Receiver<Incoming> {
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<Incoming>> + Send {
+        Receiver::recv(self)
+    }
+}
+
+impl IncomingStream for UnboundedReceiver<Incoming> {
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<Incoming>> + Send {
+        UnboundedReceiver::recv(self)
+    }
+}
+
 /// daemon multiplexer ([`run_daemon_io`]) fans one connection across every leg's
 /// `*_on`; [`serve_daemon`] is the standalone wrapper (its own connection) the
 /// per-leg tests drive.
 pub async fn serve_proc_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
 ) -> anyhow::Result<()> {
     // One forwarder turns the children's `LoopEvent`s — the same events the local
     // event-loop actor consumes — into wire notifications back to the edit-host.
@@ -1622,9 +1669,9 @@ pub async fn serve_proc_daemon_on(
 /// [`TermEvent`](crate::terminal::native::TermEvent) output/exit stream back as
 /// `term_data`/`term_exit` pushes the browser feeds to its own vt100 emulator. The buffer
 /// id (`BufferId(u64)`) is the per-terminal key, carried verbatim on the wire.
-pub async fn serve_term_daemon_on(
+pub async fn serve_term_daemon_on<R: IncomingStream>(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: R,
 ) -> anyhow::Result<()> {
     use crate::terminal::native::{TermCommand, TermEvent, TerminalManager};
     use bemtvi_core::BufferId;
@@ -2011,7 +2058,7 @@ impl RemoteHostFs {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (rpc, mut incoming) = connect(reader, writer);
+        let (rpc, mut incoming) = connect_bounded(reader, writer);
         let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
         tokio::spawn(async move {
             while let Some(msg) = incoming.recv().await {
@@ -2254,7 +2301,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_fs_daemon_on(rpc, incoming, fs).await
 }
 
@@ -2263,7 +2310,7 @@ where
 /// shared [`Rpc`] + its demuxed inbound stream.
 pub async fn serve_fs_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
     fs: Box<dyn HostFs + Send>,
 ) -> anyhow::Result<()> {
     // The watch leg (`HostWatch`): watched path → last-seen stat. The daemon *owns*
@@ -2576,7 +2623,7 @@ impl RemoteLspTransport {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (rpc, incoming) = connect(reader, writer);
+        let (rpc, incoming) = connect_bounded(reader, writer);
         let inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(run_lsp_demux(incoming, inflight.clone()));
         RemoteLspTransport {
@@ -2674,7 +2721,7 @@ impl LspProcess for RemoteLspProcess {
 /// server it belongs to. On teardown (`incoming` ends) it clears [`LspInflightMap`],
 /// dropping every sink (EOF the readers) and every `exit_tx` (so each waiting server
 /// reports `(None, None)` rather than hanging).
-async fn run_lsp_demux(mut incoming: UnboundedReceiver<Incoming>, inflight: LspInflightMap) {
+async fn run_lsp_demux(mut incoming: Receiver<Incoming>, inflight: LspInflightMap) {
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue; // the daemon speaks only notifications; ignore stray requests
@@ -2791,7 +2838,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_lsp_daemon_on(rpc, incoming).await
 }
 
@@ -2800,7 +2847,7 @@ where
 /// demuxed inbound stream.
 pub async fn serve_lsp_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
 ) -> anyhow::Result<()> {
     // Per-child stdin channels and kill signals, keyed by the edit-host's spawn id, so
     // `lsp_stdin`/`lsp_kill` can reach the running child (mirrors the process leg's maps).
@@ -3308,7 +3355,7 @@ where
             return;
         };
         rt.block_on(async move {
-            let (rpc, mut incoming) = connect(reader, writer);
+            let (rpc, mut incoming) = connect_bounded(reader, writer);
             tokio::spawn(async move { while incoming.recv().await.is_some() {} });
             serve(LinkRpc::fixed(rpc)).await;
         });
@@ -3422,7 +3469,7 @@ impl RemoteFsWatch {
                 return;
             };
             rt.block_on(async move {
-                let (rpc, mut incoming) = connect(reader, writer);
+                let (rpc, mut incoming) = connect_bounded(reader, writer);
                 if rpc_tx.send(LinkRpc::fixed(rpc)).is_err() {
                     return;
                 }
@@ -3710,7 +3757,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_luafs_daemon_on(rpc, incoming, fs).await
 }
 
@@ -3722,7 +3769,7 @@ where
 /// blocking pool so a slow fs call can't stall the reader.
 pub async fn serve_luafs_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
     fs: Box<dyn LuaFs + Send + Sync>,
 ) -> anyhow::Result<()> {
     let fs: Arc<dyn LuaFs + Send + Sync> = Arc::from(fs);
@@ -3778,7 +3825,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_git_daemon_on(rpc, incoming).await
 }
 
@@ -3789,7 +3836,7 @@ where
 /// connection closes.
 pub async fn serve_git_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
 ) -> anyhow::Result<()> {
     while let Some(msg) = incoming.recv().await {
         if let Incoming::Request { id, method, params } = msg {
@@ -3836,7 +3883,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_http_daemon_on(rpc, incoming).await
 }
 
@@ -3846,7 +3893,7 @@ where
 /// can't stall the reader; the typed reply crosses back on the same `Rpc`.
 pub async fn serve_http_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
 ) -> anyhow::Result<()> {
     while let Some(msg) = incoming.recv().await {
         if let Incoming::Request { id, method, params } = msg {
@@ -3878,7 +3925,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_luafs_watch_daemon_on(rpc, incoming).await
 }
 
@@ -3890,9 +3937,9 @@ where
 /// by notification (`luafs_watch` / `luafs_unwatch`); there is no reply, so a stray request is
 /// answered with an error. Watchers are kept alive in a per-`id` map (dropping one stops its
 /// backend thread); the leg ends when the edit-host hangs up.
-pub async fn serve_luafs_watch_daemon_on(
+pub async fn serve_luafs_watch_daemon_on<R: IncomingStream>(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: R,
 ) -> anyhow::Result<()> {
     // The coalescing watcher emits `LoopEvent::FsEvent` (the native actor's shape); we forward
     // each into RPC pushes. One shared channel for all watches — `id` tags every event.
@@ -3977,7 +4024,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     serve_config_daemon_on(rpc, incoming).await
 }
 
@@ -3987,7 +4034,7 @@ where
 /// state, so it is a plain request loop (unlike the stateful `fs_*`/`proc_*` legs).
 pub async fn serve_config_daemon_on(
     rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
 ) -> anyhow::Result<()> {
     while let Some(msg) = incoming.recv().await {
         if let Incoming::Request {
@@ -4105,7 +4152,7 @@ impl RemoteConfig {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (rpc, mut incoming) = connect(reader, writer);
+        let (rpc, mut incoming) = connect_bounded(reader, writer);
         tokio::spawn(async move { while incoming.recv().await.is_some() {} });
         RemoteConfig {
             rpc: LinkRpc::fixed(rpc),
@@ -4241,7 +4288,7 @@ where
             Err(_) => return,
         };
         rt.block_on(async move {
-            let (rpc, incoming) = connect(reader, writer);
+            let (rpc, incoming) = connect_bounded(reader, writer);
             serve_daemon_link(rpc, incoming, client_tx).await;
         });
     });
@@ -4259,7 +4306,7 @@ where
 /// ([`serve_daemon_link`]). Either way the seams and the per-group demuxes are identical.
 pub(crate) struct GroupLink {
     pub(crate) rpc: Rpc,
-    pub(crate) incoming: UnboundedReceiver<Incoming>,
+    pub(crate) incoming: Receiver<Incoming>,
 }
 
 /// Drive a **single-stream** link (ssh/stdio, the in-process test duplex): every leg group
@@ -4269,7 +4316,7 @@ pub(crate) struct GroupLink {
 /// transport-agnostic seam construction lives in `serve_daemon_link_inner`.
 pub(crate) async fn serve_daemon_link(
     rpc: Rpc,
-    incoming: UnboundedReceiver<Incoming>,
+    incoming: Receiver<Incoming>,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
     serve_daemon_link_inner(split_groups(rpc, incoming), client_tx).await;
@@ -4280,11 +4327,11 @@ pub(crate) async fn serve_daemon_link(
 /// drops (the peer is the same build). On EOF the four senders drop, closing the per-group
 /// demuxes downstream.
 async fn split_incoming(
-    mut incoming: UnboundedReceiver<Incoming>,
-    ctrl_tx: UnboundedSender<Incoming>,
-    proc_tx: UnboundedSender<Incoming>,
-    lsp_tx: UnboundedSender<Incoming>,
-    term_tx: UnboundedSender<Incoming>,
+    mut incoming: Receiver<Incoming>,
+    ctrl_tx: Sender<Incoming>,
+    proc_tx: Sender<Incoming>,
+    lsp_tx: Sender<Incoming>,
+    term_tx: Sender<Incoming>,
 ) {
     while let Some(msg) = incoming.recv().await {
         let method = match &msg {
@@ -4299,7 +4346,9 @@ async fn split_incoming(
             Some(LegGroup::Term) => &term_tx,
             None => continue, // unknown method (same build) — drop
         };
-        let _ = tx.send(msg);
+        if tx.send(msg).await.is_err() {
+            break; // the group's demux is gone — the link is going away
+        }
     }
 }
 
@@ -4358,7 +4407,7 @@ pub(crate) async fn serve_daemon_link_inner(
 /// msgid-routes them internally. `luafs_change`/`luafs_watch_err` have no native consumer
 /// and drop. On EOF, dropping `watch_tx` ends the server's watch arm.
 async fn run_control_demux(
-    mut incoming: UnboundedReceiver<Incoming>,
+    mut incoming: Receiver<Incoming>,
     watch_tx: UnboundedSender<WatchEvent>,
     fs_watch_tx: UnboundedSender<LoopEvent>,
 ) {

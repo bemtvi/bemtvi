@@ -359,7 +359,7 @@ pub mod unix {
             EXIT_SIGNAL.store(sig, Ordering::Release);
             let fd = WAKE_FD.load(Ordering::Acquire);
             if fd >= 0 {
-                write_all(fd, [b'x'].as_ptr(), 1);
+                write_all(fd, b"x".as_ptr(), 1);
                 return;
             }
             // No pipe (its creation failed): nothing will ever drive the graceful

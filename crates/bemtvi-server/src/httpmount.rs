@@ -12,6 +12,13 @@
 //! well as this `TcpListener` does, so the same Lua runs in every world. It also removes
 //! port collisions between two bemtvi instances and plugins hard-coding 8080.
 //!
+//! **The listener is a same-origin surface.** A page on a foreign site must not be able to
+//! drive a plugin's mount — its stateful handlers would be open to CSRF, and a
+//! DNS-rebinding domain would bypass the loopback restriction entirely. The handler
+//! rejects every request whose `Origin` does not name this listener's own address
+//! ([`same_origin`]); cross-site fetches and form posts always carry `Origin`, so the
+//! mutation-capable requests are closed off before any route lookup runs.
+//!
 //! **Nothing starts until a plugin asks.** [`HttpMounts`] holds no listener until the first
 //! `HttpMount` command; a config with no HTTP plugin opens no port and spawns no task.
 //!
@@ -40,14 +47,14 @@
 //! `backstop`, for when the editor never runs that Lua at all.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bemtvi_lua::HttpServerReply;
 use tokio::net::TcpListener;
@@ -112,6 +119,10 @@ struct Shared {
     /// Inbound channel to the server thread — where a parked request sends its
     /// [`LoopEvent::HttpServerRequest`].
     event_tx: UnboundedSender<LoopEvent>,
+    /// The address the listener is bound to, `None` until the first bind. The handler
+    /// checks every request's `Origin` against it ([`same_origin`]); set at each bind so
+    /// a rebind moves the gate with the origin.
+    bound_addr: Mutex<Option<SocketAddr>>,
 }
 
 /// The actor's `btv.http.mount` state: the routes, and the listener once something has
@@ -140,6 +151,7 @@ impl HttpMounts {
                 pending: Mutex::new(HashMap::new()),
                 next_req_id: AtomicU64::new(1),
                 event_tx,
+                bound_addr: Mutex::new(None),
             }),
             bound: None,
         }
@@ -269,6 +281,11 @@ impl HttpMounts {
         let addr = listener.local_addr().map_err(|e| {
             format!("btv.http.mount: bound {host}:{port} but cannot read it back: {e}")
         })?;
+        // Publish the address BEFORE the serve task starts, so no request can arrive at a
+        // listener whose origin gate is still unarmed. A rebind sets the new address
+        // before the old listener stops — its in-flight window (sub-millisecond) checks
+        // the new origin, which is the origin the mounts are moving to anyway.
+        *self.shared.bound_addr.lock().unwrap() = Some(addr);
         let (shutdown, shutdown_rx) = oneshot::channel();
         let app = axum::Router::new()
             // One fallback rather than routes: axum never sees the mount names — the
@@ -304,9 +321,70 @@ fn origin_of(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
+/// Is the request's declared `Origin` this listener's own? A page on a foreign site must
+/// not be able to drive a plugin's mount — its handlers would be open to CSRF, and a
+/// DNS-rebinding domain would defeat the loopback bind. Cross-site fetches and form
+/// posts always carry `Origin`, so an `Origin` that doesn't name this machine is
+/// rejected before any route lookup.
+///
+/// A request with **no** `Origin` passes: curl, a same-origin GET navigation, and the
+/// plugin's own page all send none. That leaves the residual hole of a header-less GET
+/// tag (`<img src>` on a foreign page) — it carries no `Origin` and cannot read the
+/// response, so it can only trigger side effects on GET endpoints; a plugin's
+/// state-changing endpoints should require POST, which always carries `Origin` here.
+/// (`null`, `https://…`, and non-UTF-8 `Origin` values are never this listener's.)
+fn same_origin(bound: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+    // A serving listener always has an address; `None` would be a bug, so fail the gate
+    // loud rather than silently serving without it.
+    let Some(bound) = bound else { return false };
+    let Some(origin) = headers.get("origin") else { return true };
+    let Some(origin) = origin.to_str().ok() else { return false };
+    let Some(authority) = origin.strip_prefix("http://") else { return false };
+
+    // Authority is `host[:port]`; split the port, keeping a bracketed IPv6 host whole
+    // (`[::1]:53124`). A port that won't parse can't be verified — fail closed.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if host.ends_with(']') || port.parse::<u16>().is_ok() => {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    };
+    match port.and_then(|p| p.parse::<u16>().ok()) {
+        // A port-less authority is the default port 80 — never this listener, which
+        // binds a high ephemeral port, so nothing to match.
+        Some(port) if port != bound.port() => return false,
+        None if bound.port() != 80 => return false,
+        _ => {}
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        // Loopback aliases (127.0.0.0/8, `::1`) name pages this listener could have
+        // served; a deliberately off-loopback bind additionally trusts its own exact
+        // address. Any other IP — including an attacker's domain resolving to us — is a
+        // foreign page.
+        ip.is_loopback() || (!bound.ip().is_loopback() && ip == bound.ip())
+    } else {
+        host.eq_ignore_ascii_case("localhost")
+    }
+}
+
 /// The single axum handler behind every mount: route by name, park on the plugin's answer.
 async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
+
+    // The origin gate runs before ANY route work — a foreign page gets a 403 whether the
+    // path is a live mount, a 404, or the root redirect, so a cross-site probe can't even
+    // learn which mount names exist.
+    if !same_origin(*shared.bound_addr.lock().unwrap(), &parts.headers) {
+        return text_response(
+            StatusCode::FORBIDDEN,
+            "bemtvi: request is not same-origin with the mount listener\n",
+        );
+    }
+
     let path = parts.uri.path().to_string();
 
     // Split `/plugin/<name>/<rest>`. Everything outside the reserved prefix, and every

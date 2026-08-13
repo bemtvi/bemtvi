@@ -181,7 +181,7 @@ pub use daemon::{
     serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, DaemonStatus,
     FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs,
     RemoteFsWatch, RemoteGitJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteHttp,
-    RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
+    RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME, DAEMON_TOKEN_ENV,
 };
 /// The parsed `btv_session_reconnect` spec (§B): the client-persistent session-swap request
 /// both native front ends decode and act on. See [`reconnect`].
@@ -236,7 +236,7 @@ use bemtvi_lsp::LspManager;
 use bemtvi_lsp::{CodeActionData, ServerKey, ServerSpawn};
 use bemtvi_lua::LuaRuntime;
 #[cfg(feature = "native")]
-use bemtvi_rpc::{connect, Incoming, Rpc};
+use bemtvi_rpc::{connect_bounded, Incoming, Rpc};
 /// The outbound async-effect seam the synchronous [`EditHost`] tick emits through
 /// (redraws / notifications to the client, off-tick fs, the event-loop / LSP command
 /// sinks). Re-exported so the out-of-crate wasm cdylib ([`bemtvi-edithost`], slice 5b)
@@ -3605,7 +3605,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, mut incoming) = connect(reader, writer);
+    let (rpc, mut incoming) = connect_bounded(reader, writer);
 
     // A `--workspace DIR` launch cds into the workspace root **now**, at boot — before the
     // editor opens the startup file, seeds its `DirState`, or restores the session. Because
@@ -4287,28 +4287,43 @@ where
 /// connection-agnostic `serve_*_daemon_on` core, so a file/process/server behaves
 /// identically however its bytes were carried.
 ///
+/// A leg's sender, handed back by [`DaemonLegs::route`] as the variant matching its
+/// channel kind: bounded senders are the pump's backpressure point (an `await`ed
+/// send blocks the wire reader), unbounded ones are the `dproc`/`sock` exceptions.
+#[cfg(feature = "native")]
+enum Leg<'a> {
+    Bounded(&'a tokio::sync::mpsc::Sender<Incoming>),
+    Unbounded(&'a tokio::sync::mpsc::UnboundedSender<Incoming>),
+}
+
 /// [`spawn`]: DaemonLegs::spawn
 #[cfg(feature = "native")]
 struct DaemonLegs {
-    fs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
-    proc: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    fs: Option<tokio::sync::mpsc::Sender<Incoming>>,
+    proc: Option<tokio::sync::mpsc::Sender<Incoming>>,
     /// The duplex `btv.process` leg (`dproc_*`) — a DAP / framed-protocol transport. Rides
     /// the Proc group's stream alongside `proc`.
+    ///
+    /// **Unbounded by necessity**: `serve_dproc_daemon_on`'s signature is pinned to an
+    /// `UnboundedReceiver` by the per-leg tests (they pass it as a fn value), so the
+    /// daemon cannot feed it a bounded queue without a backpressure-defeating relay.
+    /// The flood gate stays at the wire (`connect_bounded`); a stalled dproc child is
+    /// the one residual growth path.
     dproc: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     /// The `btv.socket` TCP leg (`sock_*`) — a DAP `type="server"` adapter transport, also on
-    /// the Proc stream.
+    /// the Proc stream. Unbounded for the same test-pinned-signature reason as `dproc`.
     sock: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
-    term: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
-    lsp: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
-    luafs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
-    luafs_watch: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    term: Option<tokio::sync::mpsc::Sender<Incoming>>,
+    lsp: Option<tokio::sync::mpsc::Sender<Incoming>>,
+    luafs: Option<tokio::sync::mpsc::Sender<Incoming>>,
+    luafs_watch: Option<tokio::sync::mpsc::Sender<Incoming>>,
     /// The `btv.http` leg (`http_op`) — a request/response per fetch, run daemon-side. Rides
     /// the Control group's stream alongside `luafs`/`fs`/`config`.
-    http: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    http: Option<tokio::sync::mpsc::Sender<Incoming>>,
     /// The `btv.git` leg (`git_op`) — a request/response per op, run daemon-side (git runs
     /// where the files are). Rides the Control group's stream alongside `http`/`luafs`.
-    git: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
-    config: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    git: Option<tokio::sync::mpsc::Sender<Incoming>>,
+    config: Option<tokio::sync::mpsc::Sender<Incoming>>,
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -4320,7 +4335,10 @@ impl DaemonLegs {
     fn spawn(groups: &[daemon::LegGroup], rpc: &Rpc) -> Self {
         use bemtvi_lua::StdLuaFs;
         use daemon::LegGroup;
-        use tokio::sync::mpsc::unbounded_channel;
+        // Per-leg queues bounded at the same cap as the wire's inbound queue
+        // (`bemtvi_rpc::IN_CAP`): the pump drains the (bounded) stream into these,
+        // so an unbounded one would be the flood gate's bypass.
+        use tokio::sync::mpsc::channel;
 
         let mut legs = DaemonLegs {
             fs: None,
@@ -4339,12 +4357,12 @@ impl DaemonLegs {
         for &group in groups {
             match group {
                 LegGroup::Control => {
-                    let (fs_tx, fs_rx) = unbounded_channel();
-                    let (luafs_tx, luafs_rx) = unbounded_channel();
-                    let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
-                    let (http_tx, http_rx) = unbounded_channel();
-                    let (git_tx, git_rx) = unbounded_channel();
-                    let (config_tx, config_rx) = unbounded_channel();
+                    let (fs_tx, fs_rx) = channel(bemtvi_rpc::IN_CAP);
+                    let (luafs_tx, luafs_rx) = channel(bemtvi_rpc::IN_CAP);
+                    let (luafs_watch_tx, luafs_watch_rx) = channel(bemtvi_rpc::IN_CAP);
+                    let (http_tx, http_rx) = channel(bemtvi_rpc::IN_CAP);
+                    let (git_tx, git_rx) = channel(bemtvi_rpc::IN_CAP);
+                    let (config_tx, config_rx) = channel(bemtvi_rpc::IN_CAP);
                     legs.handles.push(tokio::spawn(daemon::serve_fs_daemon_on(
                         rpc.clone(),
                         fs_rx,
@@ -4382,7 +4400,7 @@ impl DaemonLegs {
                     legs.config = Some(config_tx);
                 }
                 LegGroup::Proc => {
-                    let (proc_tx, proc_rx) = unbounded_channel();
+                    let (proc_tx, proc_rx) = channel(bemtvi_rpc::IN_CAP);
                     let (dproc_tx, dproc_rx) = unbounded_channel();
                     let (sock_tx, sock_rx) = unbounded_channel();
                     legs.handles.push(tokio::spawn(daemon::serve_proc_daemon_on(
@@ -4403,7 +4421,7 @@ impl DaemonLegs {
                     legs.sock = Some(sock_tx);
                 }
                 LegGroup::Lsp => {
-                    let (lsp_tx, lsp_rx) = unbounded_channel();
+                    let (lsp_tx, lsp_rx) = channel(bemtvi_rpc::IN_CAP);
                     legs.handles.push(tokio::spawn(daemon::serve_lsp_daemon_on(
                         rpc.clone(),
                         lsp_rx,
@@ -4411,7 +4429,7 @@ impl DaemonLegs {
                     legs.lsp = Some(lsp_tx);
                 }
                 LegGroup::Term => {
-                    let (term_tx, term_rx) = unbounded_channel();
+                    let (term_tx, term_rx) = channel(bemtvi_rpc::IN_CAP);
                     legs.handles.push(tokio::spawn(daemon::serve_term_daemon_on(
                         rpc.clone(),
                         term_rx,
@@ -4427,37 +4445,37 @@ impl DaemonLegs {
     /// doesn't carry it — an unknown method (the peer is the same build, so it's dropped),
     /// a daemon→client-only push (`luafs_change`/`luafs_watch_err` never arrive here), or —
     /// on a multi-stream connection — a method whose group rides a *different* stream.
-    fn route(&self, method: &str) -> Option<&tokio::sync::mpsc::UnboundedSender<Incoming>> {
+    fn route(&self, method: &str) -> Option<Leg<'_>> {
         use daemon::LegGroup;
         match LegGroup::classify(method)? {
             LegGroup::Control => {
                 if method == "luafs_op" {
-                    self.luafs.as_ref()
+                    self.luafs.as_ref().map(Leg::Bounded)
                 } else if method == "luafs_watch" || method == "luafs_unwatch" {
-                    self.luafs_watch.as_ref()
+                    self.luafs_watch.as_ref().map(Leg::Bounded)
                 } else if method == "http_op" {
-                    self.http.as_ref()
+                    self.http.as_ref().map(Leg::Bounded)
                 } else if method == "git_op" {
-                    self.git.as_ref()
+                    self.git.as_ref().map(Leg::Bounded)
                 } else if method.starts_with("fs_") {
-                    self.fs.as_ref()
+                    self.fs.as_ref().map(Leg::Bounded)
                 } else if method.starts_with("config_") {
-                    self.config.as_ref()
+                    self.config.as_ref().map(Leg::Bounded)
                 } else {
                     None
                 }
             }
             LegGroup::Proc => {
                 if method.starts_with("dproc_") {
-                    self.dproc.as_ref()
+                    self.dproc.as_ref().map(Leg::Unbounded)
                 } else if method.starts_with("sock_") {
-                    self.sock.as_ref()
+                    self.sock.as_ref().map(Leg::Unbounded)
                 } else {
-                    self.proc.as_ref()
+                    self.proc.as_ref().map(Leg::Bounded)
                 }
             }
-            LegGroup::Lsp => self.lsp.as_ref(),
-            LegGroup::Term => self.term.as_ref(),
+            LegGroup::Lsp => self.lsp.as_ref().map(Leg::Bounded),
+            LegGroup::Term => self.term.as_ref().map(Leg::Bounded),
         }
     }
 
@@ -4489,7 +4507,7 @@ impl DaemonLegs {
 /// [`run_daemon_group`] (one group over its own stream's `Rpc`).
 #[cfg(feature = "native")]
 async fn pump_daemon_legs(
-    mut incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+    mut incoming: tokio::sync::mpsc::Receiver<Incoming>,
     legs: DaemonLegs,
 ) {
     while let Some(msg) = incoming.recv().await {
@@ -4501,7 +4519,21 @@ async fn pump_daemon_legs(
         // A leg whose task has exited closes its receiver; ignore the send error and keep
         // multiplexing the rest.
         if let Some(tx) = legs.route(method) {
-            let _ = tx.send(msg);
+            match tx {
+                // Await the send: a leg whose queue is full (its task is busy or the
+                // peer is slow) backpressures the pump, which backpressures the wire
+                // reader — the flood gate.
+                Leg::Bounded(tx) => {
+                    if tx.send(msg).await.is_err() {
+                        continue;
+                    }
+                }
+                // The `dproc`/`sock` exceptions — their cores are test-pinned to an
+                // unbounded receiver, so there is no queue to backpressure.
+                Leg::Unbounded(tx) => {
+                    let _ = tx.send(msg);
+                }
+            }
         }
     }
     legs.shutdown().await;
@@ -4524,7 +4556,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     let legs = DaemonLegs::spawn(&[group], &rpc);
     pump_daemon_legs(incoming, legs).await;
     Ok(())
@@ -4559,7 +4591,7 @@ where
     // Single-stream transport (ssh/stdio, the in-process test duplex): all four leg
     // groups share one ordered stream and one `Rpc`, demuxed by method. (The QUIC /
     // WebTransport transports give each group its own stream via [`run_daemon_group`].)
-    let (rpc, incoming) = connect(reader, writer);
+    let (rpc, incoming) = connect_bounded(reader, writer);
     let legs = DaemonLegs::spawn(
         &[
             daemon::LegGroup::Control,

@@ -33,7 +33,7 @@ EXTERN char *p_isp INIT( = "@,161-255");          ///< 'isprint'
 EXTERN char *p_isf INIT( = "@,48-57,/,.,-,_,+,,,#,$,%,~,=");  ///< 'isfname'
 EXTERN char *p_sel INIT( = "inclusive");    ///< 'selection'
 EXTERN OptInt p_re INIT( = 0);              ///< 'regexpengine': 0 = auto
-EXTERN OptInt p_mmp INIT( = 1000000);       ///< 'maxmempattern' (KiB)
+EXTERN OptInt p_mmp INIT( = 2000);       ///< 'maxmempattern' (KiB) — vim's default; bounds NFA state growth (see regexp.c's p_mmp checks)
 EXTERN OptInt p_verbose INIT( = 0);         ///< 'verbose'
 EXTERN unsigned cmp_flags INIT( = kOptCmpFlagInternal | kOptCmpFlagKeepascii);  ///< 'casemap' default
 EXTERN unsigned dy_flags INIT( = kOptDyFlagLastline);  ///< 'display' default

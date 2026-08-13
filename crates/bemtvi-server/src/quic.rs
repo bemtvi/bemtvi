@@ -50,7 +50,7 @@ use wtransport::{
     ClientConfig, Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig,
 };
 
-use bemtvi_rpc::connect;
+use bemtvi_rpc::connect_bounded;
 
 use crate::daemon::{
     connect_reconnecting_thread, DaemonClient, DialedConnection, GroupLink, LegGroup,
@@ -286,7 +286,7 @@ pub fn connect_quic_reconnecting(
             // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp/Term). Each rides its
             // own QUIC stream, so a flood on one group can't head-of-line-block another.
             let [control, proc, lsp, term] = streams.map(|(send, recv)| {
-                let (rpc, incoming) = connect(recv, send);
+                let (rpc, incoming) = connect_bounded(recv, send);
                 GroupLink { rpc, incoming }
             });
             // Keep the new endpoint + connection alive; replacing the slot drops the previous.

@@ -24,6 +24,9 @@ serde = ["dep:serde"]
 
 [dependencies]
 anyhow.workspace = true
+# CSPRNG for the atomic-save temp-name component (an unpredictable temp name is what
+# defeats the symlink pre-creation attack on `.name.bemtvi-tmp.<pid>` — see host.rs).
+getrandom.workspace = true
 ropey.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true

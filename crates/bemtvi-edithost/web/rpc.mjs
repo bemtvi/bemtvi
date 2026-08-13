@@ -165,9 +165,12 @@ export class RpcClient {
 /**
  * Dial a `bemtvi --daemon --listen` listener and return a live {@link RpcClient}.
  *
- * `uri` is the launch-printed connect string `bemtvi://HOST:PORT/TOKEN?cert=HASH`: the bearer
- * TOKEN rides the WebTransport CONNECT path (the daemon reads `request.path()`), and the
- * self-signed cert HASH (dotted-hex SHA-256) is pinned TOFU via `serverCertificateHashes`
+ * `uri` is the launch-printed browser connect string `bemtvi://HOST:PORT/TOKEN?cert=HASH`:
+ * a webpage has no shell env to receive `$BEMTVI_DAEMON_TOKEN`, so this paste string
+ * keeps the bearer TOKEN in the URI — the native connect command uses a tokenless URI
+ * with the token on the env var instead. TOKEN rides the WebTransport CONNECT path (the
+ * daemon reads `request.path()`), and the self-signed cert HASH (dotted-hex SHA-256) is
+ * pinned TOFU via `serverCertificateHashes`
  * — the browser twin of the native `connect_quic` (`crates/bemtvi-server/src/quic.rs`). The
  * edit-host opens one tagged bidi stream per leg group; the daemon serves each group over
  * its own stream (see {@link RpcClient}).

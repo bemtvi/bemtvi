@@ -289,20 +289,36 @@ impl EditHost {
                 Value::from("pending_replace"),
                 Value::from(view.pending_replace),
             ),
-            (Value::from("cmdline"), Value::from(view.cmdline.as_str())),
+            // Every string payload is display-scrubbed (`unicode::display_line`)
+            // before it reaches the wire: the client paints these verbatim into
+            // the terminal, so an ESC / control byte smuggled in via a file name,
+            // an LSP diagnostic, or completion text must not become a terminal
+            // escape sequence (OSC 52 clipboard exfil, keystroke injection).
+            // The window `lines` array is scrubbed at `display_lines_value`;
+            // these are the rest. `cmdline_cursor` is a char offset into the raw
+            // cmdline, so it shifts with the substitution — translate it.
+            (
+                Value::from("cmdline"),
+                Value::from(unicode::display_line(&view.cmdline).as_ref()),
+            ),
             (
                 Value::from("cmdline_prefix"),
                 Value::from(view.cmdline_prefix.to_string().as_str()),
             ),
             (
                 Value::from("cmdline_prompt"),
-                Value::from(view.cmdline_prompt.as_str()),
+                Value::from(unicode::display_line(&view.cmdline_prompt).as_ref()),
             ),
             (
                 Value::from("cmdline_cursor"),
-                Value::from(view.cmdline_cursor as u64),
+                Value::from(
+                    unicode::display_char_offset(&view.cmdline, view.cmdline_cursor) as u64
+                ),
             ),
-            (Value::from("message"), Value::from(message.as_str())),
+            (
+                Value::from("message"),
+                Value::from(unicode::display_line(message.as_str()).as_ref()),
+            ),
             (Value::from("message_error"), Value::from(message_error)),
             (Value::from("guifont"), Value::from(guifont.as_str())),
             (Value::from("timeout"), Value::from(timeout)),
@@ -337,7 +353,7 @@ impl EditHost {
                 Value::Array(
                     view.hidden_docks
                         .iter()
-                        .map(|l| Value::from(l.as_str()))
+                        .map(|l| Value::from(unicode::display_line(l.as_str()).as_ref()))
                         .collect(),
                 ),
             ),
@@ -518,7 +534,10 @@ impl EditHost {
             (Value::from("leftcol"), Value::from(win.leftcol as u64)),
             (
                 Value::from("file_name"),
-                Value::from(win.file_name.as_str()),
+                // A hostile *name* is a first-class injection source (statusline,
+                // tabline, E484 "cannot open" messages) — scrub it like any other
+                // display text.
+                Value::from(unicode::display_line(&win.file_name).as_ref()),
             ),
             // The buffer's effective treesitter filetype (override or extension),
             // so a client that highlights JS-side (the wasm edit-host) can pick the
@@ -532,7 +551,10 @@ impl EditHost {
                 Value::from("image"),
                 match &win.image {
                     Some(img) => Value::Map(vec![
-                        (Value::from("path"), Value::from(img.path.as_str())),
+                        (
+                            Value::from("path"),
+                            Value::from(unicode::display_line(&img.path).as_ref()),
+                        ),
                         // The file's version (size + mtime-ms), so the client
                         // re-decodes when the file changed on disk.
                         (Value::from("size"), Value::from(img.size)),
@@ -1332,10 +1354,16 @@ impl StyleTable {
 
 /// Encode one status-line segment as `{ text, style }` for the `status` array.
 /// `style` is a `u64` index into the frame's style palette, or `Nil` for the
-/// base `StatusLine` look.
+/// base `StatusLine` look. The text is display-scrubbed here — the statusline
+/// renders the file name and LSP/diagnostic-derived text, so a control byte in
+/// either must not reach the terminal as an escape sequence. Segments carry no
+/// char offsets, so the substitution shifts nothing.
 fn segment_value(text: &str, style: Value) -> Value {
     Value::Map(vec![
-        (Value::from("text"), Value::from(text)),
+        (
+            Value::from("text"),
+            Value::from(unicode::display_line(text).as_ref()),
+        ),
         (Value::from("style"), style),
     ])
 }
@@ -1554,7 +1582,12 @@ pub(crate) fn place_docs_beside(
 /// one (carried separately as `current_tab`).
 fn tab_value(tab: &TabView) -> Value {
     Value::Map(vec![
-        (Value::from("label"), Value::from(tab.label.as_str())),
+        // Tab labels carry file names — display-scrub (terminal clients paint
+        // them verbatim; a control byte in a name is an injection source).
+        (
+            Value::from("label"),
+            Value::from(unicode::display_line(&tab.label).as_ref()),
+        ),
         (Value::from("modified"), Value::from(tab.modified)),
         (
             Value::from("window_count"),
@@ -1572,7 +1605,10 @@ fn region_tabline_value(rt: &RegionTabline) -> Value {
             Value::Array(rt.tabs.iter().map(tab_value).collect()),
         ),
         (Value::from("current"), Value::from(rt.current as u64)),
-        (Value::from("title"), Value::from(rt.title.as_str())),
+        (
+            Value::from("title"),
+            Value::from(unicode::display_line(&rt.title).as_ref()),
+        ),
     ])
 }
 
@@ -1862,9 +1898,13 @@ impl EditHost {
             None
         };
 
+        // Items are display-scrubbed like every other payload, so a control byte
+        // in a completion label (an LSP word, a file name) can't escape into the
+        // terminal. The per-row `match`/`layout` offsets below are char offsets
+        // into the RAW labels — translate them through the same substitution.
         let items: Vec<Value> = rows
             .iter()
-            .map(|(label, _)| Value::from(label.as_str()))
+            .map(|(label, _)| Value::from(unicode::display_line(label.as_str()).as_ref()))
             .collect();
         // Per-row **kind** labels (parallel to `items`): the short category the client
         // right-aligns on each completion row (`"Snippet"`, `"Function"`, …). `Nil` for
@@ -1889,12 +1929,19 @@ impl EditHost {
         let layouts = Value::Array(
             row_layouts
                 .into_iter()
-                .map(|l| {
+                .zip(rows.iter())
+                .map(|(l, (label, _))| {
                     l.map_or(Value::Nil, |l| {
                         Value::Array(vec![
-                            Value::from(l.head as u64),
-                            Value::from(l.match_start as u64),
-                            Value::from(l.match_end as u64),
+                            Value::from(
+                                unicode::display_char_offset(label, l.head.into()) as u64
+                            ),
+                            Value::from(
+                                unicode::display_char_offset(label, l.match_start.into()) as u64
+                            ),
+                            Value::from(
+                                unicode::display_char_offset(label, l.match_end.into()) as u64
+                            ),
                         ])
                     })
                 })
@@ -1911,17 +1958,18 @@ impl EditHost {
                 .collect(),
         );
         // Matched-character spans per visible row (parallel to `items`): `[start, end]`
-        // half-open **char** ranges the client bolds.
+        // half-open **char** ranges the client bolds — translated through the
+        // display substitution, like the layouts above.
         let match_spans = Value::Array(
             rows.iter()
-                .map(|(_, spans)| {
+                .map(|(label, spans)| {
                     Value::Array(
                         spans
                             .iter()
                             .map(|r| {
                                 Value::Array(vec![
-                                    Value::from(r.start as u64),
-                                    Value::from(r.end as u64),
+                                    Value::from(unicode::display_char_offset(label, r.start) as u64),
+                                    Value::from(unicode::display_char_offset(label, r.end) as u64),
                                 ])
                             })
                             .collect(),
@@ -2175,7 +2223,9 @@ impl EditHost {
                 Value::from("title"),
                 cf.title
                     .as_deref()
-                    .map_or(Value::Nil, |t| Value::from(t.to_string())),
+                    .map_or(Value::Nil, |t| {
+                        Value::from(unicode::display_line(t).into_owned())
+                    }),
             ),
         ])
     }

@@ -359,6 +359,36 @@ pub fn xtgettcap_advertises_osc52(reply: &[u8]) -> bool {
     value.starts_with(b"\x1b]52")
 }
 
+/// Whether `seq` is a well-formed OSC 52 clipboard write —
+/// `ESC ] 52 ; c ; <base64> ESC \` — the only raw terminal sequence the server is
+/// allowed to hand us to emit verbatim (a `"+` yank, see `clipboard.rs::osc52_sequence`).
+///
+/// This is a **fail-closed whitelist**, not a pass-through: the bytes come from a
+/// server we don't control, and an arbitrary escape sequence written to the
+/// terminal could reprogram keys, dump the screen, or exfiltrate clipboard state.
+/// A payload whose bytes are all base64 alphabet characters can't contain ESC or
+/// any other control byte, so a passing sequence cannot terminate early or smuggle
+/// a second escape in — and anything that isn't exactly this shape is dropped.
+fn is_osc52(seq: &str) -> bool {
+    let Some(payload) = seq
+        .strip_prefix("\x1b]52;")
+        .and_then(|rest| rest.strip_suffix("\x1b\\"))
+    else {
+        return false;
+    };
+    let mut parts = payload.splitn(2, ';');
+    match (parts.next(), parts.next()) {
+        // Selection `c` — the only selection bemtvi writes; `"*`/`"+` share one provider.
+        (Some("c"), Some(b64)) => {
+            !b64.is_empty()
+                && b64
+                    .bytes()
+                    .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='))
+        }
+        _ => false,
+    }
+}
+
 /// Decode an even-length ASCII-hex string, or `None` if it isn't one.
 fn unhex(hex: &[u8]) -> Option<Vec<u8>> {
     if hex.is_empty() || hex.len() % 2 != 0 {
@@ -715,17 +745,18 @@ where
                         }
                     }
                     // Raw bytes for the *terminal* rather than the renderer: today an
-                    // OSC 52 clipboard write behind a `"+` yank. The client is a dumb
-                    // pipe here — the server owns which escape to send (and only sends
-                    // ones this client declared it can take at attach); we write it
-                    // verbatim and flush, since an escape sitting in the buffer until
-                    // the next paint would land the copy late.
+                    // OSC 52 clipboard write behind a `"+` yank. The client writes
+                    // **only** the OSC 52 sequence family and drops anything else —
+                    // fail closed against a server (or compromised wire) shipping an
+                    // arbitrary escape sequence straight at the user's terminal.
                     "btv_ui_send" => {
                         if let Some(seq) = params.first().and_then(|v| v.as_str()) {
                             use std::io::Write as _;
-                            let mut out = std::io::stdout();
-                            let _ = out.write_all(seq.as_bytes());
-                            let _ = out.flush();
+                            if is_osc52(seq) {
+                                let mut out = std::io::stdout();
+                                let _ = out.write_all(seq.as_bytes());
+                                let _ = out.flush();
+                            }
                         }
                     }
                     "bemtvi_exit" => return Ok(Outcome::Exit),

@@ -33,8 +33,10 @@ fn too_deep() -> mlua::Error {
 /// between the widths — each an *identity* on native (which is what the `allow`
 /// silences; the lint only fires there) and a real widen/narrow on the wasm edit-host
 /// build. Use them instead of a bare `i64::from` / `as mlua::Integer` so a 32-bit-VM
-/// build compiles unchanged. (Values crossing here — fds, indices, option numbers —
-/// fit `i32`, so the wasm narrow never loses data.)
+/// build compiles unchanged. (Values crossing here — ids, indices, line numbers,
+/// option numbers — fit `i32`; the narrow is *checked* so a value that doesn't —
+/// e.g. a >2^31 column from a multi-GiB buffer on the web build — fails loud as a
+/// panic surfaced to the Lua caller instead of silently wrapping negative.)
 #[inline]
 #[allow(clippy::useless_conversion)] // identity i64→i64 on native; sign-extend on wasm32
 pub(crate) fn lua_i64(i: mlua::Integer) -> i64 {
@@ -44,7 +46,18 @@ pub(crate) fn lua_i64(i: mlua::Integer) -> i64 {
 #[inline]
 #[allow(clippy::unnecessary_cast)] // no-op i64→i64 on native; narrow to i32 on wasm32
 pub(crate) fn lua_int(n: i64) -> mlua::Integer {
-    n as mlua::Integer
+    #[cfg(target_pointer_width = "32")]
+    {
+        mlua::Integer::try_from(n).unwrap_or_else(|_| {
+            panic!(
+                "lua_int: {n} does not fit wasm32's 32-bit lua_Integer (a value promised to fit i32 crossed the Lua bridge)"
+            )
+        })
+    }
+    #[cfg(not(target_pointer_width = "32"))]
+    {
+        n as mlua::Integer // identity on native (i64)
+    }
 }
 
 /// Read a color field (`fg`/`bg`/`sp`) from an `nvim_set_hl` opts table. A

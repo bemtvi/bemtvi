@@ -308,9 +308,31 @@ fn reset_worktree_to_tree(repo: &gix::Repository, tree_id: gix::ObjectId) -> Res
         .iter()
         .map(|e| e.path(&new_index).to_string())
         .collect();
+    // The on-disk index is attacker-influenced (a malicious repo can carry a
+    // crafted index): validate every path before deleting, so nothing outside the
+    // worktree can be removed. The checks close both escape routes — a `..` /
+    // absolute component, and a symlinked intermediate directory redirecting the
+    // path out of the worktree (canonicalize follows the links, so the resolved
+    // parent must still live under the resolved workdir). A path that fails is
+    // dropped rather than deleting through it; the new tree is still checked out
+    // below, leaving a stale file behind is strictly safer than removing the
+    // wrong one.
+    let canon_workdir = std::fs::canonicalize(&workdir).unwrap_or_else(|_| workdir.clone());
     for gone in old_paths.difference(&new_paths) {
+        if !is_safe_worktree_path(gone) {
+            continue;
+        }
+        let target = workdir.join(gone);
         // Best-effort: a file already absent (or a dir) is fine — the tree is the truth.
-        let _ = std::fs::remove_file(workdir.join(gone));
+        if let Some(parent) = target.parent() {
+            if !std::fs::canonicalize(parent)
+                .map(|p| p.starts_with(&canon_workdir))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(target);
     }
 
     // Write every entry of the new index into the worktree, overwriting what's there.
@@ -853,6 +875,19 @@ fn repo_relative(root: &Path, file: &str) -> Result<String, GitError> {
 /// Join a repo-relative path back onto the worktree root.
 fn join(root: &Path, rel: &str) -> PathBuf {
     root.join(rel)
+}
+
+/// Whether an index path is safe to touch under the worktree: a *relative* path
+/// (`/`-separated) whose every component is a plain name — no empty, `.`, or `..`
+/// component, which could escape the worktree when joined onto it. Index paths
+/// come from the on-disk index, which a crafted repo can put anything into.
+/// (Component-wise, the same rule `gix_validate::path::component` enforces at
+/// checkout time.)
+fn is_safe_worktree_path(path: &str) -> bool {
+    !path.starts_with('/')
+        && !path
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
 }
 
 /// The bytes of `rel` at `HEAD`, or empty when it has no HEAD version (new file /

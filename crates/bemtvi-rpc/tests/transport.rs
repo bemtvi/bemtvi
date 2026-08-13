@@ -587,3 +587,214 @@ async fn a_late_reply_for_a_cancelled_request_is_not_delivered_to_the_next_one()
         "the live request must get its own reply, never the cancelled one's"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Inbound backpressure, and the reason it is opt-in
+// ---------------------------------------------------------------------------
+//
+// `connect`'s inbound queue is unbounded: the reader decodes as fast as the peer
+// sends and never blocks. That is what a request/response leg needs — the reader
+// is also the sole deliverer of a pending `request`'s response, so a reader
+// parked on a full queue strands the very reply its caller is awaiting.
+//
+// It is also, on a notification-only leg, a way for the peer to choose how much
+// memory we spend: a remote terminal child spraying `term_data` accumulates until
+// something dies, and is never told to slow down. `connect_bounded` is that leg's
+// answer — the reader `await`s the push, stops draining the wire, and the peer is
+// backpressured end to end.
+//
+// Both halves of that trade-off are pinned here, because picking the wrong one is
+// silent in each direction: an unbounded flood shows up as memory, and a bounded
+// request/response leg shows up as a hang.
+
+/// Cap used by the bounded rigs below — small, so the flood reaches it quickly.
+const TEST_CAP: usize = 64;
+
+/// A rig over a deliberately *small* duplex, so the pipe's own buffer cannot
+/// stand in for the queue: with a megabyte of slack the peer could park thousands
+/// of frames in the socket and never notice the gate behind it.
+fn rig_bounded() -> (
+    tokio::io::DuplexStream,
+    bemtvi_rpc::Rpc,
+    tokio::io::DuplexStream,
+    tokio::sync::mpsc::Receiver<Incoming>,
+) {
+    let (peer, us_reader) = tokio::io::duplex(512);
+    let (us_writer, peer_reader) = tokio::io::duplex(1 << 16);
+    let (rpc, rx) = bemtvi_rpc::connect_bounded(us_reader, us_writer, TEST_CAP);
+    (peer, rpc, peer_reader, rx)
+}
+
+/// The same, unbounded.
+fn rig_unbounded_small() -> (
+    tokio::io::DuplexStream,
+    bemtvi_rpc::Rpc,
+    tokio::io::DuplexStream,
+    tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+) {
+    let (peer, us_reader) = tokio::io::duplex(512);
+    let (us_writer, peer_reader) = tokio::io::duplex(1 << 16);
+    let (rpc, rx) = connect(us_reader, us_writer);
+    (peer, rpc, peer_reader, rx)
+}
+
+/// One `[2, "ping", []]` notification frame.
+fn ping_frame() -> Vec<u8> {
+    let mut frame = Vec::new();
+    rmpv::encode::write_value(
+        &mut frame,
+        &Value::Array(vec![
+            Value::from(2u64),
+            Value::from("ping"),
+            Value::Array(vec![]),
+        ]),
+    )
+    .unwrap();
+    frame
+}
+
+/// Write frames until one blocks (backpressure reached) or `cap` are through.
+/// Returns how many were accepted.
+async fn flood(peer: &mut tokio::io::DuplexStream, cap: usize) -> usize {
+    let frame = ping_frame();
+    let mut sent = 0;
+    while sent < cap {
+        match tokio::time::timeout(Duration::from_millis(250), peer.write_all(&frame)).await {
+            Ok(Ok(())) => sent += 1,
+            // Blocked: the reader has stopped taking bytes off the socket.
+            _ => break,
+        }
+    }
+    sent
+}
+
+/// The frame budget a flood is measured against — an order of magnitude past the
+/// queue's depth, so "did not stop" is unambiguous.
+const FLOOD_CAP: usize = TEST_CAP * 16;
+
+/// A peer flooding a bounded leg is throttled: once the consumer's queue is full
+/// the reader stops draining the socket, so the peer's writes block. The point is
+/// not the exact number — it is that a bound exists, and that it sits near the
+/// queue's depth rather than near the peer's appetite.
+#[tokio::test]
+async fn a_flood_on_a_bounded_leg_backpressures_the_peer() {
+    let (mut peer, _rpc, _peer_reader, _incoming) = rig_bounded();
+    let sent = flood(&mut peer, FLOOD_CAP).await;
+    assert!(
+        sent < FLOOD_CAP,
+        "the peer pushed {sent} frames with nothing draining them — an unbounded \
+         inbound queue is exactly the memory the flood gate exists to deny"
+    );
+    // The gate should engage near the queue's depth, not thousands of frames
+    // later. The slack covers the socket buffer and the frame in the reader's hand.
+    assert!(
+        sent <= TEST_CAP + 200,
+        "backpressure engaged only after {sent} frames; the queue holds {TEST_CAP} — \
+         something else is buffering without limit"
+    );
+}
+
+/// The contrast, on the same rig: an *unbounded* leg never pushes back. This is
+/// what every request/response leg still is, deliberately — and what makes the
+/// bounded variant a decision rather than a default.
+#[tokio::test]
+async fn an_unbounded_leg_does_not_push_back() {
+    let (mut peer, _rpc, _peer_reader, _incoming) = rig_unbounded_small();
+    let sent = flood(&mut peer, FLOOD_CAP).await;
+    assert_eq!(
+        sent, FLOOD_CAP,
+        "an unbounded queue should have absorbed every frame — if this stops early \
+         the test's own flood is what broke, not the bound"
+    );
+}
+
+/// Backpressure is a pause, not a break: once the consumer drains, the leg keeps
+/// delivering, in order, with nothing lost. (A gate that dropped frames — or
+/// killed the connection — would be a worse bug than the one it replaced.)
+#[tokio::test]
+async fn a_throttled_leg_resumes_once_the_consumer_drains() {
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig_bounded();
+    let sent = flood(&mut peer, FLOOD_CAP).await;
+    assert!(sent < FLOOD_CAP, "expected the flood to be throttled");
+
+    let mut drained = 0;
+    for _ in 0..FLOOD_CAP {
+        // The reader needs turns to refill the queue as we empty it.
+        tokio::task::yield_now().await;
+        while incoming.try_recv().is_ok() {
+            drained += 1;
+        }
+        if drained >= sent {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        drained, sent,
+        "every frame the peer got through must still be delivered — a bounded \
+         queue may delay a message, never drop one"
+    );
+
+    // And the connection is still live: more frames flow.
+    let more = flood(&mut peer, 8).await;
+    assert_eq!(
+        more, 8,
+        "the leg must keep accepting once the consumer catches up"
+    );
+}
+
+/// **Why the bound is opt-in.** The reader is the only thing that delivers a
+/// pending `request`'s response, so on a leg where the queue can fill, a flood of
+/// notifications parks the reader and the reply that is already on the wire is
+/// never decoded — the caller waits forever. An unbounded leg cannot do that,
+/// which is exactly why every request/response leg keeps one.
+///
+/// Here: a request goes out, then the peer floods far past any bounded cap
+/// *without* the consumer draining, and only then answers. On the unbounded leg
+/// the answer still arrives. Run the same shape over a bounded leg and this hangs
+/// — which is the hazard, and the reason `connect_bounded` is documented as
+/// notification-only.
+#[tokio::test]
+async fn a_response_still_arrives_behind_an_undrained_flood_on_an_unbounded_leg() {
+    let (mut peer, rpc, mut peer_reader, _incoming) = rig_unbounded_small();
+
+    let pending = tokio::spawn(async move { rpc.request("slow", vec![]).await });
+
+    // Read the request off the wire so the peer knows its id.
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer_reader.read(&mut buf))
+        .await
+        .expect("the request should reach the peer")
+        .expect("read");
+    let req: Value = rmpv::decode::read_value(&mut &buf[..n]).expect("decode");
+    let id = req.as_array().expect("array")[1].as_u64().expect("id");
+
+    // Flood well past any bounded cap, with nothing draining the inbound queue.
+    let sent = flood(&mut peer, TEST_CAP * 8).await;
+    assert_eq!(
+        sent,
+        TEST_CAP * 8,
+        "the unbounded leg must swallow the flood — that is the property under test"
+    );
+
+    // Now answer. The reply sits *behind* every one of those notifications.
+    let mut reply = Vec::new();
+    rmpv::encode::write_value(
+        &mut reply,
+        &Value::Array(vec![
+            Value::from(1u64),
+            Value::from(id),
+            Value::Nil,
+            Value::from("answered"),
+        ]),
+    )
+    .unwrap();
+    peer.write_all(&reply).await.unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("the response must be delivered from behind the flood")
+        .expect("join")
+        .expect("ok");
+    assert_eq!(got.as_str(), Some("answered"));
+}

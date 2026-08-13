@@ -79,7 +79,13 @@ const RE_STRING: c_int = 2;
 unsafe extern "C" {
     fn vim_regcomp(expr: *const c_char, re_flags: c_int) -> *mut c_void;
     fn vim_regfree(prog: *mut c_void);
-    fn vim_regexec(rmp: *mut RegmatchT, line: *const c_char, col: ColnrT) -> bool;
+    fn vim_regexec_timed(
+        rmp: *mut RegmatchT,
+        line: *const c_char,
+        col: ColnrT,
+        tm: *const u64,
+        timed_out: *mut c_int,
+    ) -> bool;
     fn re_multiline(prog: *const c_void) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn vim_regexec_multi(
@@ -203,6 +209,15 @@ fn take_error(fallback: &str) -> VimRegexError {
 
 // ---------------------------------------------------------------------------
 // public types
+
+/// Default per-call timeout for single-line matching, in milliseconds —
+/// vim's `'redrawtime'` default. A pathological pattern (catastrophic
+/// backtracking) against a long line is bounded to this per `exec_line` call
+/// instead of hanging the editor; on timeout the match aborts (the caller
+/// treats it as "no match", vim's runtime behavior). The NFA engine's own
+/// `'maxmempattern'` bound is restored to vim's default of 2000 KiB on the C
+/// side, so NFA state explosions are bounded too.
+pub const DEFAULT_TIMEOUT_MS: u64 = 2000;
 
 /// An error reported by the engine (vim `E…` numbers preserved) or by this
 /// wrapper's input validation.
@@ -370,11 +385,31 @@ impl VimRegex {
     /// Matches against a single line (no line breaks), starting at byte
     /// column `col`. Returns the first match at-or-after `col`, vim
     /// semantics (leftmost, with vim's greedy/lazy multis).
+    ///
+    /// Each call is bounded by [`DEFAULT_TIMEOUT_MS`]: a pathological pattern
+    /// (catastrophic backtracking) on a long line aborts with an error
+    /// instead of hanging the editor — vim's `'redrawtime'` semantics, and
+    /// the reason a pattern can "stop matching" on a huge line. Use
+    /// [`Self::exec_line_timed`] for a different budget (or unbounded).
     pub fn exec_line(
         &self,
         line: &str,
         col: usize,
         ignore_case: bool,
+    ) -> Result<Option<LineMatch>, VimRegexError> {
+        self.exec_line_timed(line, col, ignore_case, Some(DEFAULT_TIMEOUT_MS))
+    }
+
+    /// [`Self::exec_line`] with an explicit per-call timeout budget;
+    /// `None` runs unbounded. On timeout the match aborts and the call
+    /// fails with a `VimRegexError` naming the timeout (callers that can't
+    /// surface an error treat it as "no match", vim's runtime behavior).
+    pub fn exec_line_timed(
+        &self,
+        line: &str,
+        col: usize,
+        ignore_case: bool,
+        timeout_ms: Option<u64>,
     ) -> Result<Option<LineMatch>, VimRegexError> {
         // The engine needs a NUL-terminated subject. `exec_line` is the
         // hottest path — search/substitute call it once per line (and repeatedly
@@ -420,7 +455,31 @@ impl VimRegex {
                 rm_matchcol: 0,
                 rm_ic: ignore_case,
             };
-            let matched = unsafe { vim_regexec(&mut rm, base, col) };
+            // Same deadline plumbing as VimBuffer::exec: `btvre_profile_setlimit`
+            // computes the monotonic deadline the C engines poll every ~100
+            // states. Clamp huge budgets so the shim's u64 ns multiply/add can't
+            // wrap into a tiny deadline (spurious instant timeouts).
+            let deadline = timeout_ms.map(|ms| {
+                const MAX_MS: u64 = u64::MAX / 1_000_000 / 2;
+                unsafe { btvre_profile_setlimit(ms.min(MAX_MS) as i64) }
+            });
+            let mut timed_out: c_int = 0;
+            let matched = unsafe {
+                vim_regexec_timed(
+                    &mut rm,
+                    base,
+                    col,
+                    deadline
+                        .as_ref()
+                        .map_or(std::ptr::null(), |d| d as *const u64),
+                    &mut timed_out,
+                )
+            };
+            if timed_out != 0 {
+                return Err(VimRegexError(
+                    "vim regex match timed out (pattern too expensive for this line)".into(),
+                ));
+            }
             // The engine may have freed our program and recompiled it (NFA→BT
             // fallback); adopt the pointer it wrote back so we don't keep a
             // dangling one. It can also be left NULL if recompilation failed.

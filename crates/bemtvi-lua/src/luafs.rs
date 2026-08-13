@@ -469,16 +469,27 @@ fn mkdir_with_mode(path: &str, mode: u32, recursive: bool) -> io::Result<()> {
 
 /// Set a file's atime/mtime from fractional-second libuv timestamps.
 fn set_utime(path: &str, atime: f64, mtime: f64) -> io::Result<()> {
-    let to_time = |secs: f64| {
-        if secs >= 0.0 {
+    let to_time = |secs: f64| -> io::Result<std::time::SystemTime> {
+        if !secs.is_finite() {
+            // `Duration::from_secs_f64` panics on NaN/±inf. No `FsJob` reaches
+            // this today (there is no `btv.fs.utime`), so this is a totality
+            // guard on the *public* [`LuaFs`] trait rather than a live hole: an
+            // out-of-crate impl or a future op must get a recoverable error, not
+            // a panic on the thread that called it.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("EINVAL: utime: non-finite timestamp {secs}"),
+            ));
+        }
+        Ok(if secs >= 0.0 {
             UNIX_EPOCH + Duration::from_secs_f64(secs)
         } else {
             UNIX_EPOCH - Duration::from_secs_f64(-secs)
-        }
+        })
     };
     let times = std::fs::FileTimes::new()
-        .set_accessed(to_time(atime))
-        .set_modified(to_time(mtime));
+        .set_accessed(to_time(atime)?)
+        .set_modified(to_time(mtime)?);
     OpenOptions::new().write(true).open(path)?.set_times(times)
 }
 
@@ -775,6 +786,17 @@ fn write_whole(fs: &dyn LuaFs, path: &str, data: &[u8], append: bool) -> io::Res
 /// when `recursive`). Uses `lstat`, so a symlink to a directory is unlinked, not
 /// walked into.
 fn remove_path(fs: &dyn LuaFs, path: &str, recursive: bool) -> io::Result<()> {
+    // Never remove the filesystem root: the recursive walk of `/` — a stray
+    // `btv.fs.remove("/", { recursive = true })`, or an LSP workspace edit
+    // deleting `file:///` — would take the whole disk with it. Everything
+    // *below* the root is the ordinary delete contract; the root itself never
+    // is (no editor feature has a legitimate reason to delete it).
+    if path == "/" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EINVAL: refusing to remove the filesystem root '/'",
+        ));
+    }
     let st = fs.lstat(path)?;
     if st.kind == FileKind::Dir {
         if recursive {

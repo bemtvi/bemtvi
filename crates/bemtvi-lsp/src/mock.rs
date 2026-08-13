@@ -144,6 +144,17 @@
 //!   request *reply* (definition/hover/formatting/…), so a test can edit the
 //!   buffer before the reply lands and prove the editor's stale-drop (e.g. the
 //!   formatting content-version guard). `0`/absent ⇒ no delay.
+//! - `stderr_long_line`: bytes of junk written to stderr as ONE line — no newline
+//!   until the very end — before serving. Models a server that spews a huge
+//!   unterminated line (a stack dump, a serialized blob): a drain that buffers to
+//!   the next `\n` grows its buffer to match. The client caps each read instead,
+//!   so the log carries truncation markers and its memory stays bounded.
+//! - `bogus_content_length`: a `Content-Length` *value* (a raw string, so
+//!   `"+999999999999"` is expressible) the mock announces in a well-formed frame
+//!   header right after the client's `initialized`, then stops serving. Models a
+//!   corrupt / hostile server frame: the announced body never arrives, and a
+//!   client that allocates from the header before reading the body aborts on the
+//!   claimed size.
 //! - `stderr_noise`: bytes of **non-UTF-8** junk (`0xFF` lines) written to stderr
 //!   before the mock starts serving, modeling a server whose stderr is binary /
 //!   invalid UTF-8 (raw panic dumps, binary logging). Sized past the pipe
@@ -181,6 +192,25 @@ pub fn run(script_path: &str) {
                 std::process::exit(1);
             }
             written += line.len() as u64;
+        }
+        let _ = err.flush();
+    }
+
+    // `stderr_long_line`: one enormous *unterminated* line. Same fatality contract
+    // as `stderr_noise` — if the client stops draining, the mock dies.
+    if let Some(n) = script.get("stderr_long_line").and_then(Value::as_u64) {
+        let mut err = std::io::stderr().lock();
+        let chunk = vec![b'x'; 4096];
+        let mut written = 0u64;
+        while written < n {
+            if err.write_all(&chunk).is_err() {
+                std::process::exit(1);
+            }
+            written += chunk.len() as u64;
+        }
+        // Terminate it at last, so the drain's final read isn't waiting on EOF.
+        if err.write_all(b"\n").is_err() {
+            std::process::exit(1);
         }
         let _ = err.flush();
     }
@@ -337,6 +367,19 @@ pub fn run(script_path: &str) {
             // it carries a truthy `hint.enable` we know the editor answered the pull
             // from the config's `settings`.
             "initialized" => {
+                // `bogus_content_length`: announce a frame whose body never comes.
+                // The header itself is well-formed — the *value* is the payload —
+                // so a client is free to believe it and allocate for it.
+                if let Some(len) = script.get("bogus_content_length").and_then(Value::as_str) {
+                    use std::io::Write as _;
+                    let mut out = stdout.lock();
+                    let _ = write!(out, "Content-Length: {len}\r\n\r\n");
+                    let _ = out.flush();
+                    // Stay alive (holding stdin open) so the client's reaction is to
+                    // the frame, not to the pipe closing under it.
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return;
+                }
                 if let Some(sections) = script.get("config_pull").and_then(Value::as_array) {
                     let items: Vec<Value> =
                         sections.iter().map(|s| json!({ "section": s })).collect();

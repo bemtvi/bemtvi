@@ -95,6 +95,17 @@ impl HostFs for StdHostFs {
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>> {
+        // Refuse anything but a regular file, loudly. A FIFO or device would block
+        // the (synchronous, uncancellable) edit thread on read forever — `:e /dev/zero`
+        // or a stray `mkfifo` in a repo would hang the whole editor — or grow memory
+        // without bound. `metadata` follows symlinks, so a symlink to a regular file
+        // still opens.
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
         Ok(Box::new(std::io::BufReader::new(std::fs::File::open(
             path,
         )?)))
@@ -166,37 +177,74 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = real.parent().unwrap_or_else(|| Path::new("."));
     let existing = std::fs::metadata(&real).ok();
 
-    // Temp lives in the target's directory (same filesystem → atomic rename),
-    // hidden and pid-tagged so it neither collides with a concurrent process nor
-    // shows up as a stray visible file if a later step fails.
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(real.file_name().unwrap_or(std::ffi::OsStr::new("bemtvi")));
-    tmp_name.push(format!(".bemtvi-tmp.{}", std::process::id()));
-    let tmp = dir.join(tmp_name);
-
+    // The temp must be created with `O_EXCL` (`create_new`) and an **unpredictable**
+    // name: a predictable `.name.bemtvi-tmp.<pid>` path is a symlink-attack surface
+    // (a local attacker with write access to the save directory can pre-create it
+    // pointing at any file the victim can write, and `File::create` would open —
+    // and truncate — through the link). The random component defeats the
+    // pre-creation; `create_new` makes a collision fail loudly instead of following.
+    // Retry with a fresh random name on the (astronomically unlikely) collision.
     let write = || -> io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(contents)?;
-        // Durability: the bytes (and the file's metadata) must reach disk before
-        // the rename publishes the temp under the target's name.
-        file.sync_all()?;
-        drop(file);
-        // Carry the prior file's mode (and best-effort owner) onto the temp so a
-        // save preserves them; a fresh file keeps `File::create`'s default mode.
-        if let Some(meta) = &existing {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
-            #[cfg(unix)]
-            preserve_owner(&tmp, meta);
+        for _ in 0..8 {
+            let tmp = dir.join(temporary_name(&real)?);
+            let file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            };
+            let result = (|| -> io::Result<()> {
+                let mut file = file;
+                file.write_all(contents)?;
+                // Durability: the bytes (and the file's metadata) must reach disk
+                // before the rename publishes the temp under the target's name.
+                file.sync_all()?;
+                drop(file);
+                // Carry the prior file's mode (and best-effort owner) onto the temp
+                // so a save preserves them; a fresh file keeps `create_new`'s default.
+                if let Some(meta) = &existing {
+                    std::fs::set_permissions(&tmp, meta.permissions())?;
+                    #[cfg(unix)]
+                    preserve_owner(&tmp, meta);
+                }
+                std::fs::rename(&tmp, &real)
+            })();
+            if result.is_err() {
+                // Never leave a partial temp behind on failure.
+                let _ = std::fs::remove_file(&tmp);
+            }
+            return result;
         }
-        std::fs::rename(&tmp, &real)
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "could not create a unique temp file next to {} (8 collisions)",
+                real.display()
+            ),
+        ))
     };
 
-    let result = write();
-    if result.is_err() {
-        // Never leave a partial temp behind on failure.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    write()
+}
+
+/// A unique temp-file name next to `real`: `.{name}.bemtvi-tmp.{pid}-{rand:016x}`.
+/// The random component is what defeats the symlink pre-creation attack — a name
+/// predictable from the pid alone lets a local attacker with write access to the
+/// directory plant a symlink that the save would write through (see [`write_atomic`]).
+fn temporary_name(real: &Path) -> io::Result<std::ffi::OsString> {
+    let mut rand = [0u8; 8];
+    getrandom::fill(&mut rand).map_err(io::Error::other)?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(real.file_name().unwrap_or(std::ffi::OsStr::new("bemtvi")));
+    tmp_name.push(format!(
+        ".bemtvi-tmp.{}-{:016x}",
+        std::process::id(),
+        u64::from_le_bytes(rand)
+    ));
+    Ok(tmp_name)
 }
 
 /// Best-effort: carry `meta`'s owner/group onto `path`. Only the super-user can

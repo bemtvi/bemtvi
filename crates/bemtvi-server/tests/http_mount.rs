@@ -708,6 +708,197 @@ async fn failed_rebind_reverts_the_option() {
     drop(blocker);
 }
 
+// ---------------------------------------------------------------------------
+// The listener is a same-origin surface
+// ---------------------------------------------------------------------------
+//
+// The mount listener binds loopback, but "loopback" is not a security boundary a
+// browser respects: any page the user has open can `fetch()` or POST to
+// `http://127.0.0.1:<port>/plugin/<name>/…`. The port is guessable by scanning,
+// and a DNS-rebinding domain reaches the same socket while looking like an
+// ordinary site. Whatever a plugin's handler does — write a file, run a command,
+// hand back buffer contents — would then be reachable from any tab.
+//
+// A cross-site request always carries `Origin`, so the gate is: an `Origin` that
+// is not this listener's own is refused before any route lookup runs.
+
+/// Like [`http_request`], but with an explicit `Origin` header — what a browser
+/// attaches to every cross-site `fetch` and form post.
+fn http_request_with_origin(url: &str, method: &str, origin: &str, body: Option<&str>) -> String {
+    let (host_port, path) = split_url(url);
+    let addr = host_port
+        .to_socket_addrs()
+        .expect("resolve")
+        .next()
+        .expect("one addr");
+    let mut stream = TcpStream::connect(addr).expect("connect to the mount listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nOrigin: {origin}\r\nConnection: close\r\n"
+    );
+    if let Some(body) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    req.push_str("\r\n");
+    if let Some(body) = body {
+        req.push_str(body);
+    }
+    stream.write_all(req.as_bytes()).expect("write request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+async fn request_with_origin(url: &str, method: &str, origin: &str) -> String {
+    let (url, method, origin) = (url.to_owned(), method.to_owned(), origin.to_owned());
+    tokio::task::spawn_blocking(move || http_request_with_origin(&url, &method, &origin, None))
+        .await
+        .unwrap()
+}
+
+/// A request declaring a foreign `Origin` is refused — and refused *before* the
+/// route lookup, so the response cannot be used to probe which mount names exist.
+#[tokio::test]
+async fn a_cross_origin_request_is_refused() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "csrf",
+        r#"function(req, respond) respond({ body = "SECRET" }) end"#,
+    )
+    .await;
+
+    for origin in [
+        "http://evil.example",
+        "https://evil.example",
+        "http://evil.example:8080",
+        "null",
+        // A domain that resolves to loopback (the DNS-rebinding shape): the
+        // socket is ours, the origin is not.
+        "http://rebind.evil.example:1",
+    ] {
+        let response = request_with_origin(&url, "GET", origin).await;
+        assert_eq!(
+            status_of(&response),
+            403,
+            "Origin {origin:?} must be refused, got: {response}"
+        );
+        assert!(
+            !response.contains("SECRET"),
+            "the handler must not have run for Origin {origin:?}"
+        );
+    }
+
+    // A state-changing method is refused the same way — this is the case CSRF
+    // actually cares about.
+    let response = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || http_request_with_origin(&url, "POST", "http://evil.example", Some("x=1"))
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        status_of(&response),
+        403,
+        "a cross-origin POST must be refused"
+    );
+}
+
+/// A foreign origin gets the same 403 whether the path is a live mount or not, so
+/// a cross-site probe cannot enumerate mount names by their status codes.
+#[tokio::test]
+async fn a_cross_origin_probe_cannot_distinguish_a_live_mount_from_a_missing_one() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "real",
+        r#"function(req, respond) respond({ body = "here" }) end"#,
+    )
+    .await;
+    let (host_port, _) = split_url(&url);
+    let absent = format!("http://{host_port}/plugin/does-not-exist/");
+
+    let live = request_with_origin(&url, "GET", "http://evil.example").await;
+    let missing = request_with_origin(&absent, "GET", "http://evil.example").await;
+    assert_eq!(status_of(&live), 403);
+    assert_eq!(
+        status_of(&missing),
+        403,
+        "a missing mount must look identical to a live one from a foreign origin"
+    );
+}
+
+/// The gate must not break the surface it protects. The listener's own origin —
+/// the exact string `m:url()` hands a plugin — still serves, as does a request
+/// with no `Origin` at all (curl, a same-origin navigation).
+#[tokio::test]
+async fn same_origin_and_origin_less_requests_still_serve() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "friendly",
+        r#"function(req, respond) respond({ body = "served" }) end"#,
+    )
+    .await;
+    let (host_port, _) = split_url(&url);
+
+    // No `Origin` at all.
+    let plain = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || get(&url)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        status_of(&plain),
+        200,
+        "an Origin-less request must still serve"
+    );
+    assert_eq!(body_of(&plain), "served");
+
+    // This listener's own origin, and the loopback aliases naming the same host.
+    let port = host_port.split(':').nth(1).unwrap().to_string();
+    for origin in [
+        format!("http://{host_port}"),
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://[::1]:{port}"),
+    ] {
+        let response = request_with_origin(&url, "GET", &origin).await;
+        assert_eq!(
+            status_of(&response),
+            200,
+            "Origin {origin:?} names this very listener and must serve"
+        );
+        assert_eq!(body_of(&response), "served");
+    }
+}
+
+/// The port is part of the origin: another editor's listener on the same loopback
+/// host is a *different* origin and must not be able to drive this one.
+#[tokio::test]
+async fn a_loopback_origin_on_another_port_is_still_foreign() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "ported",
+        r#"function(req, respond) respond({ body = "mine" }) end"#,
+    )
+    .await;
+    let (host_port, _) = split_url(&url);
+    let mine: u16 = host_port.split(':').nth(1).unwrap().parse().unwrap();
+    let other = if mine == 1 { 2 } else { mine - 1 };
+
+    let response = request_with_origin(&url, "GET", &format!("http://127.0.0.1:{other}")).await;
+    assert_eq!(
+        status_of(&response),
+        403,
+        "a different port on loopback is a different origin"
+    );
+}
+
 /// Ask the OS for a free port and release it. Racy in principle, fine in practice: the
 /// window is microseconds and the alternative (a hard-coded port) flakes for real.
 fn free_port() -> u16 {

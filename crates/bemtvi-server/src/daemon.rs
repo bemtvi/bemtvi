@@ -974,41 +974,59 @@ async fn maintain_link<D, DFut>(
 }
 
 /// The URI scheme a QUIC daemon prints for clients to dial:
-/// `bemtvi://HOST:PORT/TOKEN?cert=HASH`.
+/// `bemtvi://HOST:PORT?cert=HASH` (the bearer token travels separately — see
+/// [`DAEMON_TOKEN_ENV`]; the legacy `bemtvi://HOST:PORT/TOKEN?cert=HASH` path
+/// form still dials, for the browser which has no shell env).
 pub const CONNECT_URI_SCHEME: &str = "bemtvi://";
 
-/// Parse a `bemtvi://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces a QUIC
-/// dial needs: the `https://HOST:PORT` dial URL (WebTransport requires the `https`
-/// scheme), the bearer `TOKEN` (the path), and the TOFU cert `HASH` (the `cert`
-/// query). Fails loud on a malformed URI rather than dialing a half-specified
-/// target. Shared by every dialing client (the TUI binary and the GUI).
+/// The env var carrying the daemon's bearer token to a QUIC-dialing client
+/// (`BEMTVI_DAEMON_CMD`'s sibling). The daemon prints its connect command with
+/// the token here rather than in the URI: the URI is copy-paste-able text that
+/// lands in shell history, logs, docs, and reconnect configs, and it is the
+/// daemon's sole auth credential (a leaked token is RCE on the daemon's host),
+/// so it must not ride in the string itself. The browser leg is the one
+/// exception — a webpage has no shell env, so its paste string keeps the legacy
+/// `/TOKEN` path form.
+pub const DAEMON_TOKEN_ENV: &str = "BEMTVI_DAEMON_TOKEN";
+
+/// Parse a `bemtvi://HOST:PORT?cert=HASH` connect URI into the pieces a QUIC
+/// dial needs: the `https://HOST:PORT` dial URL (WebTransport requires the
+/// `https` scheme), the bearer token, and the TOFU cert `HASH` (the `cert`
+/// query). The token comes from the legacy `/TOKEN` path when present, else from
+/// [`DAEMON_TOKEN_ENV`] — a URI with neither fails loud rather than dialing
+/// unauthenticated. Fails loud on any malformed URI rather than dialing a
+/// half-specified target. Shared by every dialing client (the TUI binary and
+/// the GUI).
 pub fn parse_connect_uri(uri: &str) -> anyhow::Result<(String, String, String)> {
     use anyhow::anyhow;
     let rest = uri.strip_prefix(CONNECT_URI_SCHEME).ok_or_else(|| {
         anyhow!("daemon connect URI must start with {CONNECT_URI_SCHEME}: {uri:?}")
     })?;
-    let (authority, after) = rest
-        .split_once('/')
-        .ok_or_else(|| anyhow!("daemon connect URI is missing the /TOKEN path: {uri:?}"))?;
-    if authority.is_empty() {
-        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
-    }
-    let (token, query) = after
+    // `HOST:PORT[/TOKEN][?cert=HASH]` — the `/TOKEN` path is the legacy form
+    // (the browser needs it: a webpage has no env to read); a tokenless URI
+    // resolves its token from `DAEMON_TOKEN_ENV` below.
+    let (authority_and_path, query) = rest
         .split_once('?')
         .ok_or_else(|| anyhow!("daemon connect URI is missing the ?cert=HASH query: {uri:?}"))?;
-    if token.is_empty() {
-        return Err(anyhow!("daemon connect URI has an empty TOKEN: {uri:?}"));
+    let (authority, path_token) = authority_and_path
+        .split_once('/')
+        .map_or((authority_and_path, None), |(a, t)| (a, Some(t)));
+    if authority.is_empty() {
+        return Err(anyhow!("daemon connect URI is missing HOST:PORT: {uri:?}"));
     }
     let cert_hash = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("cert="))
         .filter(|h| !h.is_empty())
         .ok_or_else(|| anyhow!("daemon connect URI is missing cert=HASH: {uri:?}"))?;
-    Ok((
-        format!("https://{authority}"),
-        cert_hash.to_owned(),
-        token.to_owned(),
-    ))
+    // An explicit path token wins over the ambient env var.
+    let token = match path_token.filter(|t| !t.is_empty()) {
+        Some(t) => t.to_owned(),
+        None => std::env::var(DAEMON_TOKEN_ENV).map_err(|_| {
+            anyhow!("daemon connect URI has no /TOKEN and {DAEMON_TOKEN_ENV} is unset: {uri:?}")
+        })?,
+    };
+    Ok((format!("https://{authority}"), cert_hash.to_owned(), token))
 }
 
 /// Connect to a daemon over a **reconnectable** single-stream transport, driven on the

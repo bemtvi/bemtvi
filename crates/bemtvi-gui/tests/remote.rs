@@ -186,14 +186,35 @@ fn parse_connect_uri_extracts_url_token_and_cert() {
 
 #[test]
 fn parse_connect_uri_rejects_malformed() {
-    // Wrong scheme, missing token path, missing cert query, empty pieces — each fails
-    // loud rather than dialing a half-specified target.
+    // Wrong scheme, missing cert query, empty pieces — each fails loud rather than
+    // dialing a half-specified target.
+    //
+    // A URI with no `/TOKEN` is *not* malformed: that is the form the daemon now
+    // prints for a native connect, with the bearer token on
+    // `$BEMTVI_DAEMON_TOKEN` instead of in a string that lands in argv. So these
+    // run with that variable explicitly cleared — otherwise this test would pass
+    // or fail depending on whether the developer running it happens to have a
+    // daemon token exported, which the daemon's own connect command tells them to
+    // do. (`bemtvi-server/tests/daemon_token.rs` covers the token resolution
+    // itself, both directions.)
+    let restore = std::env::var(bemtvi_server::DAEMON_TOKEN_ENV).ok();
+    // SAFETY: this test binary is single-threaded at this point, and no other test
+    // here reads the environment.
+    std::env::remove_var(bemtvi_server::DAEMON_TOKEN_ENV);
+
     assert!(parse_connect_uri("https://h/t?cert=c").is_err());
-    assert!(parse_connect_uri("bemtvi://h:1").is_err()); // no /TOKEN
+    assert!(parse_connect_uri("bemtvi://h:1").is_err()); // no ?cert=
     assert!(parse_connect_uri("bemtvi://h:1/tok").is_err()); // no ?cert=
     assert!(parse_connect_uri("bemtvi:///tok?cert=c").is_err()); // no HOST:PORT
-    assert!(parse_connect_uri("bemtvi://h:1/?cert=c").is_err()); // empty TOKEN
     assert!(parse_connect_uri("bemtvi://h:1/tok?cert=").is_err()); // empty cert
+                                                                   // No token in the path and none on the environment: refused, rather than
+                                                                   // dialing unauthenticated.
+    assert!(parse_connect_uri("bemtvi://h:1/?cert=c").is_err());
+    assert!(parse_connect_uri("bemtvi://h:1?cert=c").is_err());
+
+    if let Some(v) = restore {
+        std::env::set_var(bemtvi_server::DAEMON_TOKEN_ENV, v);
+    }
 }
 
 // --- SSH askpass prompt classifier ------------------------------------------

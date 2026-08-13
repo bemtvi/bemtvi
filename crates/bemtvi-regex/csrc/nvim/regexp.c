@@ -149,7 +149,7 @@ struct regengine {
   /// bt_regfree or nfa_regfree
   void (*regfree)(regprog_T *);
   /// bt_regexec_nl or nfa_regexec_nl
-  int (*regexec_nl)(regmatch_T *, uint8_t *, colnr_T, bool);
+  int (*regexec_nl)(regmatch_T *, uint8_t *, colnr_T, bool, proftime_T *, int *);
   /// bt_regexec_mult or nfa_regexec_mult
   int (*regexec_multi)(regmmatch_T *, win_T *, buf_T *, linenr_T, colnr_T, proftime_T *, int *);
 #ifdef REGEXP_DEBUG
@@ -342,6 +342,15 @@ static int toggle_Magic(int x)
 #define EMSG_ONE_RET_NULL EMSG2_RET_NULL(_(e_invalid_item_in_str_brackets), reg_magic == MAGIC_ALL)
 
 #define MAX_LIMIT       (32767 << 16)
+
+/// Cap on the NFA engine's `\{m,n}` expansion (see the expansion in nfa_reg()).
+/// The expansion is size-proportional to `maxval`, and the parser caps values at
+/// [`MAX_LIMIT`] (2^31-1) — an exact `a\{2147483647}` would emit billions of
+/// states, a compile-time hang/OOM. Past this bound the engine refuses to
+/// expand: with automatic engine selection the pattern falls back to the
+/// backtracking engine (which compiles the same quantifier as bounded
+/// BRACE_LIMITS), and a pattern that forces the NFA engine fails loud.
+#define NFA_MAX_REPEAT  1000
 
 static const char e_invalid_character_after_str_at[]
   = N_("E59: Invalid character after %s@");
@@ -583,6 +592,17 @@ static void init_class_tab(void)
 // Global work variables for vim_regcomp().
 
 static char *regparse;          ///< Input-scan pointer.
+
+// Parse-nesting depth, incremented around each `\%(` recursion in both
+// engines. `\(` and `\z(` are bounded by NSUBEXP (E51/E50), but `\%(` is
+// deliberately uncounted, so a pattern like `\%(\%(…` repeated thousands of
+// times recurses until the stack overflows — a crash DoS. The guards at the
+// two `\%(` call sites (regatom() and nfa_regatom()) reject past this cap.
+// Each nesting level is a handful of C frames (reg → regbranch → regconcat →
+// regpiece → regatom), so 500 levels stay far within any thread's stack.
+#define REG_PARSE_DEPTH_MAX  500
+static int reg_parse_depth;     ///< current `\%(` nesting depth
+
 static int regnpar;             ///< () count.
 static bool wants_nfa;          ///< regex should use NFA engine
 static int regnzpar;            ///< \z() count.
@@ -4296,7 +4316,15 @@ static uint8_t *regatom(int *flagp)
       if (one_exactly) {
         EMSG_ONE_RET_NULL;
       }
+      // `\%(` isn't counted against NSUBEXP (E51), so it is the one paren that
+      // can nest unboundedly — reject past REG_PARSE_DEPTH_MAX (stack-overflow
+      // guard, see its doc).
+      if (++reg_parse_depth > REG_PARSE_DEPTH_MAX) {
+        --reg_parse_depth;
+        EMSG_RET_NULL(_("E pattern is nested too deeply (\\%()"));
+      }
       ret = reg(REG_NPAREN, &flags);
+      --reg_parse_depth;
       if (ret == NULL) {
         return NULL;
       }
@@ -7569,7 +7597,8 @@ theend:
 /// @param col   column to start looking for match
 ///
 /// @return  0 for failure, number of lines contained in the match otherwise.
-static int bt_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr)
+static int bt_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr,
+                         proftime_T *tm, int *timed_out)
 {
   rex.reg_match = rmp;
   rex.reg_mmatch = NULL;
@@ -7582,7 +7611,7 @@ static int bt_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_
   rex.reg_nobreak = rmp->regprog->re_flags & RE_NOBREAK;
   rex.reg_maxcol = 0;
 
-  int64_t r = bt_regexec_both(line, col, NULL, NULL);
+  int64_t r = bt_regexec_both(line, col, tm, timed_out);
   assert(r <= INT_MAX);
   return (int)r;
 }
@@ -8353,6 +8382,11 @@ static bool wants_nfa;
 static int nstate;  ///< Number of states in the NFA. Also used when executing.
 static int istate;  ///< Index in the state vector, used in alloc_state()
 
+// Set when the postfix representation exceeded 'maxmempattern': EMIT then stops
+// recording (realloc_post_list() no longer grows) and nfa_reg() fails the
+// compile, so a pathological pattern cannot balloon the postfix allocation.
+static bool nfa_post_overflow;
+
 // If not NULL match must end at this position
 static save_se_T *nfa_endp = NULL;
 
@@ -8365,7 +8399,9 @@ static int nfa_ll_index = 0;
     if (post_ptr >= post_end) { \
       realloc_post_list(); \
     } \
-    *post_ptr++ = c; \
+    if (!nfa_post_overflow) { \
+      *post_ptr++ = c; \
+    } \
   } while (0)
 
 /// Initialize internal variables before NFA compilation.
@@ -8378,12 +8414,22 @@ static void nfa_regcomp_start(uint8_t *expr, int re_flags)
 
   nstate = 0;
   istate = 0;
+  nfa_post_overflow = false;
   // A reasonable estimation for maximum size
   nstate_max = (strlen((char *)expr) + 1) * 25;
 
   // Some items blow up in size, such as [A-z].  Add more space for that.
   // When it is still not enough realloc_post_list() will be used.
   nstate_max += 1000;
+
+  // The estimate is 25x the pattern length, so a pathologically long pattern
+  // would allocate gigabytes up front (before realloc_post_list() can bound
+  // growth). Cap the initial allocation at 'maxmempattern' and let
+  // realloc_post_list() grow it from there — also under the same bound.
+  const size_t postfix_cap = (size_t)(p_mmp << 10) / sizeof(int);
+  if (nstate_max > postfix_cap) {
+    nstate_max = postfix_cap;
+  }
 
   // Size for postfix representation of expr.
   postfix_size = sizeof(int) * nstate_max;
@@ -8571,9 +8617,26 @@ static uint8_t *nfa_get_match_text(nfa_state_T *start)
 // running above the estimated number of states.
 static void realloc_post_list(void)
 {
+  // The compiled postfix is bounded by 'maxmempattern' (p_mmp, KiB): a
+  // pattern can amplify its own length enormously while compiling (character
+  // classes, the `\{m,n}` expansion), and an unbounded postfix is an
+  // unbounded allocation — a DoS on a pathological pattern. Past the bound,
+  // set nfa_post_overflow: EMIT stops recording and nfa_reg() fails the
+  // compile (with automatic engine selection the pattern then falls back to
+  // the backtracking engine, whose program is proportional to the pattern).
+  const size_t cur_bytes = (size_t)(post_end - post_start) * sizeof(int);
+  if ((int64_t)(cur_bytes >> 10) >= p_mmp) {
+    nfa_post_overflow = true;
+    return;
+  }
   // For weird patterns the number of states can be very high. Increasing by
-  // 50% seems a reasonable compromise between memory use and speed.
-  const size_t new_max = (size_t)(post_end - post_start) * 3 / 2;
+  // 50% seems a reasonable compromise between memory use and speed. Growth is
+  // also clamped to p_mmp, so it can never sail past the limit.
+  size_t new_max = (size_t)(post_end - post_start) * 3 / 2;
+  const size_t cap = (size_t)(p_mmp << 10) / sizeof(int);
+  if (new_max > cap) {
+    new_max = cap;
+  }
   int *new_start = xrealloc(post_start, new_max * sizeof(int));
   post_ptr = new_start + (post_ptr - post_start);
   post_end = new_start + new_max;
@@ -10042,7 +10105,15 @@ static int nfa_regatom(void)
     switch (c) {
     // () without a back reference
     case '(':
-      if (nfa_reg(REG_NPAREN) == FAIL) {
+      // See the BT engine's guard: `\%(` can nest unboundedly (E872 counts
+      // only `(`), and each level recurses nfa_reg() — stack-overflow guard.
+      if (++reg_parse_depth > REG_PARSE_DEPTH_MAX) {
+        --reg_parse_depth;
+        EMSG_RET_FAIL(_("E pattern is nested too deeply (\\%()"));
+      }
+      int nparen_ok = (nfa_reg(REG_NPAREN) != FAIL);
+      --reg_parse_depth;
+      if (!nparen_ok) {
         return FAIL;
       }
       EMIT(NFA_NOPEN);
@@ -10747,6 +10818,14 @@ static int nfa_regpiece(void)
       return FAIL;
     }
 
+    // The bail above is exempted when maxval == MAX_LIMIT, so an exact huge
+    // quantifier (`a\{2147483647}`) still reaches the expansion loop and would
+    // emit `maxval` states — billions, i.e. a compile-time hang/OOM. Refuse to
+    // expand past NFA_MAX_REPEAT (see the macro's doc).
+    if (maxval > NFA_MAX_REPEAT) {
+      return FAIL;
+    }
+
     // Ignore previous call to nfa_regatom()
     post_ptr = post_start + my_post_start;
     // Save parse state after the repeated atom and the \{}
@@ -10931,6 +11010,13 @@ static int nfa_regbranch(void)
 /// @param paren  REG_NOPAREN, REG_PAREN, REG_NPAREN or REG_ZPAREN
 static int nfa_reg(int paren)
 {
+  // The postfix grew past 'maxmempattern' (realloc_post_list() set the flag
+  // and EMIT stopped recording): fail the whole compile. Checked on entry so
+  // the parser recursion unwinds cleanly.
+  if (nfa_post_overflow) {
+    return FAIL;
+  }
+
   int parno = 0;
 
   if (paren == REG_PAREN) {
@@ -10980,7 +11066,7 @@ static int nfa_reg(int paren)
     EMIT(NFA_ZOPEN + parno);
   }
 
-  return OK;
+  return nfa_post_overflow ? FAIL : OK;
 }
 
 #ifdef REGEXP_DEBUG
@@ -15665,8 +15751,18 @@ static regprog_T *nfa_regcomp(uint8_t *expr, int re_flags)
   // Count number of NFA states in "nstate". Do not build the NFA.
   post2nfa(postfix, post_ptr, true);
 
-  // allocate the regprog with space for the compiled regexp
+  // Bound the compiled program with 'maxmempattern' (p_mmp, KiB), the same
+  // limit the runtime state lists use. "nstate" is a plain int and the postfix
+  // is capped at p_mmp too, but a negative (int-overflowed) or huge count here
+  // would make the size_t multiply below wrap into a giant xmalloc — fail
+  // loud instead of allocating. With automatic engine selection this falls
+  // back to the backtracking engine, whose program is proportional to the
+  // pattern itself.
   size_t prog_size = offsetof(nfa_regprog_T, state) + sizeof(nfa_state_T) * (size_t)nstate;
+  if (nstate < 0 || (int64_t)(prog_size >> 10) >= p_mmp) {
+    emsg(_(e_pattern_uses_more_memory_than_maxmempattern));
+    goto fail;
+  }
   prog = xmalloc(prog_size);
   state_ptr = prog->state;
   prog->re_in_use = false;
@@ -15741,7 +15837,8 @@ static void nfa_regfree(regprog_T *prog)
 /// @param col   column to start looking for match
 ///
 /// @return  <= 0 for failure, number of lines contained in the match otherwise.
-static int nfa_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr)
+static int nfa_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr,
+                          proftime_T *tm, int *timed_out)
 {
   rex.reg_match = rmp;
   rex.reg_mmatch = NULL;
@@ -15753,7 +15850,7 @@ static int nfa_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line
   rex.reg_icombine = false;
   rex.reg_nobreak = rmp->regprog->re_flags & RE_NOBREAK;
   rex.reg_maxcol = 0;
-  return nfa_regexec_both(line, col, NULL, NULL);
+  return nfa_regexec_both(line, col, tm, timed_out);
 }
 
 /// Matches a regexp against multiple lines.
@@ -15955,8 +16052,12 @@ static void report_re_switch(const char *pat)
 /// @param col  the column to start looking for match
 /// @param nl
 ///
+/// @param tm         timeout limit or NULL (unbounded)
+/// @param timed_out  flag is set when the timeout limit was reached
+///
 /// @return true if there is a match, false if not.
-static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, bool nl)
+static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, bool nl,
+                               proftime_T *tm, int *timed_out)
 {
   regexec_T rex_save;
   bool rex_in_use_save = rex_in_use;
@@ -15979,7 +16080,7 @@ static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, b
   rex.reg_startpos = NULL;
   rex.reg_endpos = NULL;
 
-  int result = rmp->regprog->engine->regexec_nl(rmp, (uint8_t *)line, col, nl);
+  int result = rmp->regprog->engine->regexec_nl(rmp, (uint8_t *)line, col, nl, tm, timed_out);
   rmp->regprog->re_in_use = false;
 
   // NFA engine aborted because it's very slow, use backtracking engine instead.
@@ -15995,7 +16096,7 @@ static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, b
     rmp->regprog = vim_regcomp(pat, re_flags);
     if (rmp->regprog != NULL) {
       rmp->regprog->re_in_use = true;
-      result = rmp->regprog->engine->regexec_nl(rmp, (uint8_t *)line, col, nl);
+      result = rmp->regprog->engine->regexec_nl(rmp, (uint8_t *)line, col, nl, tm, timed_out);
       rmp->regprog->re_in_use = false;
     }
 
@@ -16016,7 +16117,7 @@ static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, b
 bool vim_regexec_prog(regprog_T **prog, bool ignore_case, const char *line, colnr_T col)
 {
   regmatch_T regmatch = { .regprog = *prog, .rm_ic = ignore_case };
-  bool r = vim_regexec_string(&regmatch, line, col, false);
+  bool r = vim_regexec_string(&regmatch, line, col, false, NULL, NULL);
   *prog = regmatch.regprog;
   return r;
 }
@@ -16025,7 +16126,20 @@ bool vim_regexec_prog(regprog_T **prog, bool ignore_case, const char *line, coln
 // Return true if there is a match, false if not.
 bool vim_regexec(regmatch_T *rmp, const char *line, colnr_T col)
 {
-  return vim_regexec_string(rmp, line, col, false);
+  return vim_regexec_string(rmp, line, col, false, NULL, NULL);
+}
+
+// Like vim_regexec(), but bounded by a deadline: when `tm` passes (see
+// profile_passed_limit()), the match aborts with no match and `*timed_out` is
+// set. `tm` and `timed_out` may be NULL (unbounded, like vim_regexec()).
+// The host uses this on the single-line path to bound a pathological pattern
+// (vim's 'redrawtime' semantics); see the bemtvi-regex crate docs.
+// Note: "rmp->regprog" may be freed and changed.
+// Return true if there is a match, false if not.
+bool vim_regexec_timed(regmatch_T *rmp, const char *line, colnr_T col,
+                       proftime_T *tm, int *timed_out)
+{
+  return vim_regexec_string(rmp, line, col, false, tm, timed_out);
 }
 
 // Like vim_regexec(), but consider a "\n" in "line" to be a line break.
@@ -16033,7 +16147,7 @@ bool vim_regexec(regmatch_T *rmp, const char *line, colnr_T col)
 // Return true if there is a match, false if not.
 bool vim_regexec_nl(regmatch_T *rmp, const char *line, colnr_T col)
 {
-  return vim_regexec_string(rmp, line, col, true);
+  return vim_regexec_string(rmp, line, col, true, NULL, NULL);
 }
 
 /// Match a regexp against multiple lines.

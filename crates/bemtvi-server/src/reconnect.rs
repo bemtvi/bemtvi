@@ -51,8 +51,8 @@ pub enum ReconnectTransport {
     /// Spawn a daemon child (see [`SpawnCommand`]) and run the daemon over its stdin/stdout.
     /// The client feeds this into the reconnecting dialer so a dropped link re-runs it.
     Spawn { command: SpawnCommand },
-    /// Dial a `--daemon --listen` QUIC endpoint at `addr`
-    /// (`bemtvi://host:port/token?cert=hash`).
+    /// Dial a `--daemon --listen` QUIC endpoint at `addr` (`bemtvi://host:port?cert=hash`;
+    /// the bearer token comes from `$BEMTVI_DAEMON_TOKEN`, not the URI).
     Quic { addr: String },
 }
 

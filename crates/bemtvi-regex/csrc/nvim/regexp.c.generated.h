@@ -82,7 +82,7 @@ static void restore_subexpr(regbehind_T *bp) FUNC_ATTR_NONNULL_ALL;
 static bool regmatch(uint8_t *scan, const proftime_T *tm, int *timed_out);
 static int regtry(bt_regprog_T *prog, colnr_T col, proftime_T *tm, int *timed_out);
 static int bt_regexec_both(uint8_t *line, colnr_T startcol, proftime_T *tm, int *timed_out);
-static int bt_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr);
+static int bt_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr, proftime_T *tm, int *timed_out);
 static int bt_regexec_multi(regmmatch_T *rmp, win_T *win, buf_T *buf, linenr_T lnum, colnr_T col, proftime_T *tm, int *timed_out);
 static int re_num_cmp(uint32_t val, const uint8_t *scan);
 static void regdump(uint8_t *pattern, bt_regprog_T *r);
@@ -149,10 +149,10 @@ static int nfa_regtry(nfa_regprog_T *prog, colnr_T col, proftime_T *tm, int *tim
 static int nfa_regexec_both(uint8_t *line, colnr_T startcol, proftime_T *tm, int *timed_out);
 static regprog_T *nfa_regcomp(uint8_t *expr, int re_flags);
 static void nfa_regfree(regprog_T *prog);
-static int nfa_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr);
+static int nfa_regexec_nl(regmatch_T *rmp, uint8_t *line, colnr_T col, bool line_lbr, proftime_T *tm, int *timed_out);
 static int nfa_regexec_multi(regmmatch_T *rmp, win_T *win, buf_T *buf, linenr_T lnum, colnr_T col, proftime_T *tm, int *timed_out);
 static void report_re_switch(const char *pat);
-static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, bool nl);
+static bool vim_regexec_string(regmatch_T *rmp, const char *line, colnr_T col, bool nl, proftime_T *tm, int *timed_out);
 #define DEFINE_EMPTY_ATTRIBUTES
 #include "nvim/func_attr.h"  // IWYU pragma: export
 

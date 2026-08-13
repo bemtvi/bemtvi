@@ -181,7 +181,7 @@ pub use daemon::{
     serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, DaemonStatus,
     FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs,
     RemoteFsWatch, RemoteGitJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteHttp,
-    RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
+    RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME, DAEMON_TOKEN_ENV,
 };
 /// The parsed `btv_session_reconnect` spec (§B): the client-persistent session-swap request
 /// both native front ends decode and act on. See [`reconnect`].

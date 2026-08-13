@@ -581,7 +581,15 @@ impl EditHost {
                     },
                     None => Value::Nil,
                 };
-                Value::Array(vec![Value::from(c.text.as_str()), style_id])
+                // Display-scrub the chunk text: it reaches a terminal client
+                // verbatim, so a hostile char (an ESC in an LSP diagnostic, a
+                // control byte in a file name) must not escape into the user's
+                // terminal. Chunks are styled per-chunk with no char offsets
+                // inside, so the substitution shifts nothing.
+                Value::Array(vec![
+                    Value::from(bemtvi_core::unicode::display_line(&c.text).as_ref()),
+                    style_id,
+                ])
             })
             .collect();
         Value::Array(chunks)

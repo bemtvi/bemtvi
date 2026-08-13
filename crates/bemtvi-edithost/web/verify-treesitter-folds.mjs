@@ -62,13 +62,26 @@ try {
   await page.evaluate(() => window.__bemtvi.ready);
 
   // A python function whose body is foldable via python's folds.scm.
-  await feed(page, ":e fold.py<CR>");
-  await feed(page, ":set expandtab shiftwidth=4<CR>");
-  await feed(page, "ggdGidef f():<CR>x = 1<CR>y = 2<CR>return x + y<Esc>");
-  // Outdent the body back to one level if autoindent stacked it (keep the buffer the 4
-  // lines we expect regardless of indent drift), then confirm the buffer content.
+  //
+  // SEEDED, not typed. This fixture used to be typed in (`idef f():<CR>x = 1<CR>…`) and
+  // leaned on auto-indent to indent the body — but `'autoindent'`/`'smartindent'` are OFF
+  // by default, so with no config it produced a FLAT buffer:
+  //     def f():\nx = 1\ny = 2\nreturn x + y
+  // Python is indentation-sensitive, so that has no function body at all: the fold query
+  // reports `[[0,0]]`, a one-line span with nothing to collapse, and the test failed while
+  // tree-sitter folding was working perfectly. Writing the bytes removes the dependency on
+  // indent behaviour entirely.
+  await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const fh = await root.getFileHandle("fold.py", { create: true });
+    const w = await fh.createWritable();
+    await w.write("def f():\n    x = 1\n    y = 2\n    return x + y\n");
+    await w.close();
+  });
+  await feed(page, ":e /fold.py<CR>");
+  await sleep(500);
   const buf = await lines(page);
-  check("python: foldable function typed", /def f\(\):/.test(String(buf)) && String(buf).split("\n").length >= 4, buf);
+  check("python: foldable function seeded", /def f\(\):/.test(String(buf)) && String(buf).split("\n").length >= 4, buf);
   const total = String(buf).split("\n").length;
 
   // Give the worker time to load the python grammar + folds.scm (async), then enable the

@@ -524,6 +524,33 @@ impl EditHost {
             // so a client that highlights JS-side (the wasm edit-host) can pick the
             // grammar. Native clients ignore it (they paint server highlight spans).
             (Value::from("filetype"), Value::from(win.filetype.as_str())),
+            // A rendered-markdown doc float's fenced code blocks, as `{ first_line, len,
+            // lang }` row spans into this window's lines. The float's fences are stripped
+            // server-side and its buffer is left untyped, so `filetype` cannot answer
+            // "what language are these rows?" — this can. Native clients ignore it (they
+            // paint server highlight spans); the serverless web build uses it to colour a
+            // hover's signature. Absent (empty) for every ordinary window.
+            (
+                Value::from("code_blocks"),
+                Value::Array(
+                    win.code_blocks
+                        .iter()
+                        .map(|c| {
+                            Value::Map(vec![
+                                (Value::from("first_line"), Value::from(c.first_line as u64)),
+                                (Value::from("len"), Value::from(c.len as u64)),
+                                (
+                                    Value::from("lang"),
+                                    match &c.lang {
+                                        Some(l) => Value::from(l.as_str()),
+                                        None => Value::Nil,
+                                    },
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
             // When this window's buffer is an image opened for preview
             // (`'imagepreview'`), the path to render. A reference, never the bytes —
             // the client reads/decodes once and caches (the bytes must not ride the

@@ -1062,10 +1062,16 @@
       if (w.terminal || w.term_colors) return null;
       const text = w.focused ? bufferText : textByFile.get(w.file_name);
       if (text == null) return null;
-      // A markdown buffer (an LSP hover / signature doc float, or a `.md` file): the
-      // markdown grammar isn't bundled and single-grammar parsing can't reach injected
-      // code, so highlight its ```lang code fences with their own grammars instead — the
-      // code in a hover is the part worth colouring.
+      // A RENDERED markdown doc float (LSP hover / signature help): the server stripped
+      // its fences and left the buffer untyped, so the fences can't be re-found in the
+      // text and `filetype` says nothing — the code blocks ride the frame instead, as
+      // explicit row spans. Checked BEFORE the filetype branch: such a window has no
+      // filetype to match, and this is the more precise signal wherever both exist.
+      if (w.code_blocks && w.code_blocks.length) return ts.spansForCodeBlocks(text, w.code_blocks);
+      // A markdown BUFFER (a `.md` file, or a float built from raw markup): the markdown
+      // grammar isn't bundled and single-grammar parsing can't reach injected code, so
+      // highlight its ```lang code fences with their own grammars instead — the code in a
+      // hover is the part worth colouring.
       if (w.filetype === "markdown") return ts.spansForFencedMarkdown(text);
       const lang =
         ts.langForFiletype(w.filetype) || (w.unnamed ? null : ts.langForName(w.file_name));

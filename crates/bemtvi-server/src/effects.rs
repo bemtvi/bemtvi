@@ -4123,7 +4123,12 @@ impl EditHost {
             if let Some(key) = self.editor.complete_accept_request {
                 self.editor.complete_accept_request.take();
                 if key >= crate::snippet::PLUGIN_ACCEPT_KEY_BASE {
-                    #[cfg(feature = "native")]
+                    // NOT `native`-gated: `complete_plugin_accept` only touches the editor
+                    // and the Lua runtime, both of which the wasm edit-host has. Gating it
+                    // made the browser build take this branch and then do NOTHING — the
+                    // accept was consumed, the popup closed, and the callback never ran, so
+                    // every `btv.complete.source` item carrying an `on_accept` (the whole
+                    // mechanism bemtvi-snippets expands through) silently inserted nothing.
                     self.complete_plugin_accept(key - crate::snippet::PLUGIN_ACCEPT_KEY_BASE);
                 } else if key >= crate::snippet::SNIPPET_COMPLETE_KEY_BASE {
                     self.complete_snippet_accept(key - crate::snippet::SNIPPET_COMPLETE_KEY_BASE);

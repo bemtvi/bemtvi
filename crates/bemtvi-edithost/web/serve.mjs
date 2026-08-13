@@ -74,9 +74,16 @@ const server = createServer(async (req, res) => {
   //    fetched from this path. Without the header the browser rejects the registration.
   //
   // Netlify's `_headers` / netlify.toml carry the same header for the deployed site.
+  //
+  // Two layouts have to work here. In the repo tree the source sits at `web/btv-sw.js`; in an
+  // ASSEMBLED site (package-site.sh, what BEMTVI_SERVE_ROOT points at) it has already been
+  // copied to the publish root, because that is where a static host must find it. Reading only
+  // the repo-tree path 404s the assembled site, which silently kills every `btv.http.mount` —
+  // the registration fails, so no mount route ever resolves.
   if (urlPath === "/btv-sw.js") {
     try {
-      const body = await readFile(join(ROOT, "web/btv-sw.js"));
+      const body = await readFile(join(ROOT, "btv-sw.js")).catch(() =>
+        readFile(join(ROOT, "web/btv-sw.js")));
       res.writeHead(200, {
         "Content-Type": "text/javascript",
         "Service-Worker-Allowed": "/",

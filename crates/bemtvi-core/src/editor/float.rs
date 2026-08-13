@@ -403,6 +403,25 @@ impl Editor {
         self.place_doc_float(name, buf, &lines);
     }
 
+    /// The fenced code blocks of the rendered markdown document currently displayed in
+    /// `buf`, or empty when `buf` is not a rendered doc float. Each block is a row span
+    /// into the float's own display lines plus the fence's language.
+    ///
+    /// This is the CANONICAL "this window's rows N..M are code in language L" signal.
+    /// The styling itself is painted here as `DOC_MD_NS` extmarks, which is the whole
+    /// story on native; a client that highlights front-end instead (the wasm edit-host,
+    /// which has no native tree-sitter engine) needs the block structure to do the same
+    /// job, and this is what [`crate::view::WindowView::code_blocks`] carries to it.
+    /// Without it such a client can only guess from `'filetype'` — and a rendered doc
+    /// float is deliberately UNTYPED (see [`open_markdown_float`](Self::open_markdown_float)),
+    /// so that guess is always wrong and the code renders plain.
+    pub(crate) fn doc_float_code_blocks(&self, buf: BufferId) -> &[crate::markdown::MdCode] {
+        self.doc_float_rendered
+            .iter()
+            .find(|(_, (b, _))| *b == buf)
+            .map_or(&[], |(_, (_, r))| r.code.as_slice())
+    }
+
     /// Repaint the open doc floats holding a fenced block in `language` — the grammar
     /// just became available, and the block was painted plain (its code background
     /// only) when the float was built.

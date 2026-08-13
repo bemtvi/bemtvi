@@ -86,7 +86,8 @@ try {
     page.evaluate((c) => window.__bemtvi.execLua(c).then((r) => r.result), code).then(unwrap);
 
   // 1. Every first-party module loaded from the bundle (package.loaded set by the require()s).
-  const PLUGINS = ["catppuccin", "bemtvi-keys-helper", "bemtvi-tree", "bemtvi-line", "bemtvi-lspconfig", "bemtvi-diff"];
+  const PLUGINS = ["catppuccin", "bemtvi-keys-helper", "bemtvi-tree", "bemtvi-line", "bemtvi-lspconfig", "bemtvi-diff",
+    "bemtvi-snippets", "bemtvi-markdown-preview"];
   const loaded = await luaResult(
     `local r = {} for _, n in ipairs({${PLUGINS.map((p) => `"${p}"`).join(",")}}) do ` +
     `r[#r+1] = n .. "=" .. tostring(package.loaded[n] ~= nil) end return table.concat(r, " ")`);
@@ -118,7 +119,74 @@ try {
   check("demo: python LSP configured + enabled (basedpyright)",
     /^true\|basedpyright-langserver/.test(lsp), `lsp=${lsp}`);
 
-  // 5. The editor is live and edits (the whole config + bundle didn't brick boot).
+  // 5. bemtvi-snippets EXPANDS, rather than merely being registered as a source. Typing the
+  //    trigger and accepting the row must splice the snippet body in and land the caret on the
+  //    first tabstop — a source that offers nothing (no collection ships with the demo, so the
+  //    config registers its own) would still "load" and pass a package.loaded check.
+  await page.evaluate(() => window.__bemtvi.feed(":e /snip.py<CR>"));
+  await sleep(500);
+  await page.evaluate(() => window.__bemtvi.feed("ggdGitry"));
+  await sleep(1500);                                     // let the popup gather its sources
+  // Walk to the row the SNIPPET source contributed, by kind. Two things make a blind <C-y>
+  // useless here: the popup pre-highlights row 0 but leaves it INACTIVE (`selected_active:
+  // false`) so the first <C-n> only activates it, and basedpyright also offers `try` as a
+  // Keyword — accepting that row inserts the same three characters the trigger already spells,
+  // so the buffer looks untouched and a broken snippet source is indistinguishable from a
+  // working one. Selecting on `kinds` is what makes this assert the snippet specifically.
+  const snipIdx = await page.evaluate(() =>
+    ((window.__bemtvi.frame() || {}).menu || { kinds: [] }).kinds.indexOf("Snippet"));
+  check("demo: the snippet source contributes a row to the popup", snipIdx >= 0,
+    await page.evaluate(() => JSON.stringify((window.__bemtvi.frame() || {}).menu || null)));
+  for (let i = 0; i <= snipIdx; i++) {                  // +1: the first <C-n> activates row 0
+    await page.evaluate(() => window.__bemtvi.feed("<C-n>"));
+    await sleep(150);
+  }
+  const sel = await page.evaluate(() => {
+    const m = (window.__bemtvi.frame() || {}).menu || {};
+    return { selected: m.selected, active: m.selected_active, kind: (m.kinds || [])[m.selected] };
+  });
+  check("demo: the snippet row is the active selection before accept",
+    sel.kind === "Snippet" && sel.active === true, JSON.stringify(sel));
+  await page.evaluate(() => window.__bemtvi.feed("<C-y>"));   // accept the selected row
+  await sleep(600);
+  const snipLines = await page.evaluate(() => window.__bemtvi.lines());
+  check("demo: bemtvi-snippets expands a snippet (try/except body spliced in)",
+    /^try:/m.test(String(snipLines)) && /except Exception as e:/.test(String(snipLines)),
+    `lines=${JSON.stringify(snipLines)}`);
+  // The tabstop session is live and the jump key moves through it (the config remapped
+  // jump_next off <C-j>'s default partner <C-k>, which stays signature help here).
+  const tabstop = await luaResult('return tostring(require("bemtvi-snippets").active())');
+  check("demo: the expansion opened a live tabstop session", /true/.test(tabstop), `active=${tabstop}`);
+  // Leave the session before anything else runs. A live expansion parks the caret on a
+  // tabstop in insert (or select, on a placeholder with a default) mode, so a single <Esc>
+  // is not enough to guarantee normal mode — and every following `:` command would be typed
+  // into the buffer as literal text instead of being executed.
+  await luaResult('require("bemtvi-snippets").abort() return 1');
+  await page.evaluate(() => window.__bemtvi.feed("<Esc><Esc>"));
+  await sleep(300);
+  const mode = await page.evaluate(() => window.__bemtvi.execLua('return vim.api.nvim_get_mode().mode').then((r) => r.result));
+  check("demo: the editor is back in normal mode after the snippet session",
+    /\bn\b/.test(String(mode)), `mode=${mode}`);
+
+  // 6. bemtvi-markdown-preview SERVES. `:MarkdownPreview` mounts the route; fetching it as an
+  //    ordinary URL exercises the whole web leg (page fetch -> Service Worker -> edit-host ->
+  //    the plugin's Lua on_request), which is the only reason this plugin works in a tab at all.
+  await page.evaluate(() => window.__bemtvi.feed(":e /TOUR.md<CR>"));
+  await sleep(500);
+  await page.evaluate(() => window.__bemtvi.feed(":MarkdownPreview<CR>"));
+  await sleep(1500);
+  const mount = await page.evaluate(async () => {
+    try {
+      const r = await fetch("/plugin/bemtvi-markdown-preview/", { cache: "no-store" });
+      return { status: r.status, body: (await r.text()).slice(0, 400) };
+    } catch (e) { return { status: -1, body: String(e) }; }
+  });
+  check("demo: bemtvi-markdown-preview serves its page over the Service Worker mount",
+    mount.status === 200 && /<html|<!doctype/i.test(mount.body), JSON.stringify(mount));
+
+  // 7. The editor is live and edits (the whole config + bundle didn't brick boot).
+  await page.evaluate(() => window.__bemtvi.feed(":e /edit.py<CR>"));
+  await sleep(400);
   await page.evaluate(() => window.__bemtvi.feed("ggdGiplugins-ok<Esc>"));
   const edited = await page.evaluate(() => window.__bemtvi.lines());
   check("demo: editor boots + edits with the full plugin config", edited === "plugins-ok", `lines=${JSON.stringify(edited)}`);

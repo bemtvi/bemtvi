@@ -495,6 +495,17 @@ pub struct WindowView {
     /// front-end grammar from it (preferring it over the file extension), which
     /// is how `:set ft=…` highlights a buffer the extension table misses.
     pub filetype: String,
+    /// The fenced code blocks of a rendered-markdown doc float (LSP hover / signature
+    /// help), as row spans into this window's own lines plus the fence's language.
+    /// Empty for every ordinary window.
+    ///
+    /// The float's markdown is rendered server-side into STRIPPED lines — the ```lang
+    /// fences are consumed, and the buffer is left untyped so nothing repaints the
+    /// stripped text — so neither the text nor `filetype` still says "these rows are
+    /// python". Native clients ignore this (they paint the server's highlight spans);
+    /// the serverless web build highlights front-end and needs the structure to colour
+    /// a hover's signature, which is the part of a hover worth colouring.
+    pub code_blocks: Vec<crate::markdown::MdCode>,
     /// Whether this window's buffer has no file path yet (a fresh `[No Name]`
     /// buffer), so a write needs a target. Sent to clients as an explicit flag so
     /// a GUI can route a bare `:w` to its save dialog without matching `file_name`.
@@ -1180,6 +1191,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         secondary_cursors,
         file_name,
         filetype,
+        code_blocks: ed.doc_float_code_blocks(w.buffer).to_vec(),
         unnamed: buf.path.is_none(),
         modified: buf.modified,
         cursor_line: cur_line + 1,

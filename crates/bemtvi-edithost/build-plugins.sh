@@ -26,12 +26,14 @@ BUNDLE="$OUT/plugins-bundle.lua"
 # repo<TAB>pinned-commit — the recommended set (first-recommended-plugin-keys-helper) plus the
 # catppuccin colorscheme (the sole neovim-plugin surface). Keep pins in lock-step with the demo.
 PLUGINS=(
-  "bemtvi/bemtvi-keys-helper	6a467c80a131d5325d13cc3e60d3eff403a7e13e"
-  "bemtvi/bemtvi-tree	aee0b7a6e34418673cccd618fca0f013319fd86f"
-  "bemtvi/bemtvi-line	04c3092eb38a3f09b6da37e31313759f5caca8e7"
-  "bemtvi/bemtvi-lspconfig	e9d13fff6915faecdccb425ffb0ca881c7b0fb8e"
-  "bemtvi/bemtvi-diff	bc1d9fdebb478aee3de25ede3f0830feff556392"
-  "bemtvi/catppuccin-bemtvi	d511af676dba4d96ff8a7aca69853d3d8d3f83a2"
+  "bemtvi/bemtvi-keys-helper	b39ec898e5b89467fd3a378a48198a00fc98c853"
+  "bemtvi/bemtvi-tree	646bd021a0799fd6fd7dfcc1397099c803bd47de"
+  "bemtvi/bemtvi-line	7c5a7d33d303cc5bc0128ccb891172a1db4de279"
+  "bemtvi/bemtvi-lspconfig	8c4282dbb3775acbe6ed11dc6bd8d9a45361e135"
+  "bemtvi/bemtvi-diff	2ef31659a66e4df6e4ea868ccc75a99ca1c86e92"
+  "bemtvi/bemtvi-snippets	23ccb05aa59c312f926859ecf1fb9f048c4e6f78"
+  "bemtvi/bemtvi-markdown-preview	28dc6962b668739f44021a3eafe8a5097c04a0b8"
+  "bemtvi/catppuccin-bemtvi	3c8c29b94a89dd68c3db02bfa421dac9b98098c5"
 )
 
 force=0

@@ -33,7 +33,7 @@ btv.dock.open({ side = "bottom", size = 8, autohide = true, title = "PANEL" })
 -- LSP keymaps (gd / K / grn / gra / grr / gO / <leader>l…); servers configured below.
 require("bemtvi-lspconfig").setup({})
 
--- Diff / merge-conflict visualizer — `:BtvDiffGit` / `:BtvDiffConflict`. `signs = true`
+-- Diff / merge-conflict visualizer — `:DiffGit` / `:DiffConflict`. `signs = true`
 -- shows the per-hunk gutter signs (`+`/`~`/`-`) on changed rows in the diff panes.
 require("bemtvi-diff").setup({ signs = true })
 
@@ -60,15 +60,44 @@ btv.lsp.enable("basedpyright")
 -- summons it manually anywhere.
 btv.lsp.signature_help_autotrigger(true)
 
+-- Snippets. The engine is pure Lua over five core primitives; a snippet is offered as a
+-- completion row that EXPANDS instead of inserting its text, into a live tabstop session.
+-- The jump keys are moved off the defaults (`<C-j>`/`<C-k>`) because this config keeps
+-- `<C-k>` for signature help: the jump map covers insert + select mode and does not fall
+-- through, so the default would shadow it while you type a call's arguments.
+--   <C-j> next tabstop · <C-h> previous · the mirrors of a repeated tabstop update live
+local snippets = require("bemtvi-snippets")
+snippets.setup({ jump_next = "<C-j>", jump_prev = "<C-h>" })
+
+-- No snippet collection ships with the demo (friendly-snippets is a runtimepath install,
+-- and the browser has no runtimepath), so register a few python ones here — otherwise the
+-- source would load and offer nothing. `${1:name}` is a tabstop with a default, `$0` the
+-- final caret position, and a repeated `$1` mirrors as you type.
+snippets.add("python", {
+  { trigger = "def", description = "function", body = "def ${1:name}(${2:args}) -> ${3:None}:\n    $0" },
+  { trigger = "class", description = "dataclass", body = "@dataclass\nclass ${1:Name}:\n    ${2:field}: ${3:int}\n\n    def __repr__(self) -> str:\n        return f\"${1:Name}({self.${2:field}})\"\n$0" },
+  { trigger = "main", description = "entry point", body = 'if __name__ == "__main__":\n    ${1:main()}\n$0' },
+  { trigger = "try", description = "try/except", body = "try:\n    ${1:pass}\nexcept ${2:Exception} as e:\n    ${3:raise}\n$0" },
+})
+
 -- Autocompletion: the native btv.complete engine, popping up as you type. The `lsp`
--- source (basedpyright, above) leads; the `buffer` word-scan is a fallback for
--- prose and comments. `min_chars = 1` opens the popup after a single character;
--- the docs sidebar (on by default) shows the highlighted item's signature/doc.
+-- source (basedpyright, above) leads, then the snippets registered above; the `buffer`
+-- word-scan is a fallback for prose and comments. `min_chars = 1` opens the popup after a
+-- single character; the docs sidebar (on by default) shows the highlighted item's
+-- signature/doc, and a snippet row previews the body it will expand to.
 --   <C-n>/<Tab> next · <C-p>/<S-Tab> prev · <C-y>/<CR> accept · <C-e> dismiss
 btv.complete.setup({
-  sources = { { "lsp" }, { "buffer", min_chars = 2 } },
+  sources = { { "lsp" }, { "bemtvi-snippets" }, { "buffer", min_chars = 2 } },
   min_chars = 1,
 })
+
+-- Live markdown preview — `:MarkdownPreview` on a markdown buffer (TOUR.md is one) opens
+-- a rendered view in a second browser tab, following your edits without a `:w`. It is
+-- served over a `btv.http.mount` (a subroute of this page's own origin) rather than a
+-- bound port, which is exactly why it works here: on the web build a Service Worker
+-- answers the same routes the native HTTP server would. Nothing is mounted until the
+-- command runs.
+require("bemtvi-markdown-preview").setup()
 
 -- Python indentation: 4 spaces, no hard tabs (PEP 8). Buffer-local options, so a
 -- `FileType` autocmd pins them as each python buffer loads.

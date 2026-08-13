@@ -35,7 +35,8 @@ done
 
 # The page's relative imports require web/ and dist/ as siblings (index.html loads
 # ./worker.mjs; worker.mjs loads ../dist/eh.mjs, statically imports ./rpc.mjs, and
-# *dynamically* imports ./ts-indent.js — the optional tree-sitter indenter; highlight.js
+# *dynamically* imports ./ts-indent.js, ./ts-folds.js and ./ts-textobjects.js — the optional
+# tree-sitter indenter / fold runner / text-object runner; highlight.js
 # pulls in ./grammars.js + ./ts-sanitize.js). Copy every runtime file these reach — not
 # the dev tooling, the Playwright verifiers, or package.json. serve.mjs *is* runtime here:
 # it's the turnkey static server that sets the cross-origin-isolation headers (below).
@@ -46,7 +47,8 @@ cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$site/dist/"
 # flags). Without it the Worker fails to load.
 cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/rpc.mjs" \
    "$here/web/build-config.js" "$here/web/highlight.js" "$here/web/grammars.js" \
-   "$here/web/ts-sanitize.js" "$here/web/ts-indent.js" "$here/web/serve.mjs" "$site/web/"
+   "$here/web/ts-sanitize.js" "$here/web/ts-indent.js" "$here/web/ts-folds.js" \
+   "$here/web/ts-textobjects.js" "$here/web/serve.mjs" "$site/web/"
 [ -d "$here/web/vendor" ] && cp -r "$here/web/vendor" "$site/web/vendor"
 # The first-party plugin bundle is demo-only; never ship it in the standard site (build.sh
 # doesn't build it, but a local dev tree may have it vendored from a prior --demo run).

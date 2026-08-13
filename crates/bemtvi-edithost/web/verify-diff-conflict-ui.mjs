@@ -1,5 +1,5 @@
 // End-to-end regression for two bemtvi-diff-on-web bugs, driving the REAL plugin bundle
-// via the demo site exactly as a user would (open shapes.py → :BtvDiffConflict):
+// via the demo site exactly as a user would (open shapes.py → :DiffConflict):
 //   * gutter signs (signs=true) render on a changed row once a hunk is in view; and
 //   * the keys-helper / which-key popup (an `editor_relative` content float) stays
 //     ON-SCREEN when a RIGHT-side diff pane is focused — the bug anchored it to the
@@ -61,7 +61,7 @@ try {
   // The user's flow: open the seeded conflict file, open the 3-way, jump to a hunk.
   await page.evaluate(() => window.__bemtvi.feed(":e /shapes.py<CR>"));
   await sleep(800);
-  await page.evaluate(() => window.__bemtvi.feed(":BtvDiffConflict<CR>"));
+  await page.evaluate(() => window.__bemtvi.feed(":DiffConflict<CR>"));
   await sleep(1500);
   await page.evaluate(() => window.__bemtvi.feed("]czz"));
   await sleep(500);

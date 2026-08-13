@@ -19,16 +19,23 @@ plugins all run in this tab.
 - `<leader>e`                 — toggle the file-tree sidebar
 - `<C-w><C-w>j`               — drop into the bottom panel (it autohides, so it
   collapses to a `▸PANEL` chip when you leave; click the chip to bring it back)
-- open `shapes.py`, then `:BtvDiffConflict` — it carries a real git merge conflict;
+- open `shapes.py`, then `:DiffConflict` — it carries a real git merge conflict;
   see it side-by-side as a 3-way **ours | base | theirs** diff. Step conflicts with
   `]c`/`[c`; resolve the one under the cursor with `co` (ours), `ct` (theirs) or
-  `cb` (both). After you resolve it, `:BtvDiffGit` diffs your edits against HEAD
+  `cb` (both). After you resolve it, `:DiffGit` diffs your edits against HEAD
+- in a python file, type `def` or `class` and accept the **snippet** row — it expands
+  instead of inserting, dropping you on the first tabstop. `<C-j>` moves to the next,
+  `<C-h>` back; retype `class`'s name and watch the `__repr__` below it update with it
+- `:MarkdownPreview` on this file — a rendered, live-updating copy opens in a second
+  browser tab and follows your edits with no `:w`. There is no server: a Service Worker
+  answers the same routes the native build's HTTP mount would
 
 ## What's here
 
 - `main.py`      — the entry point; imports the library below
 - `geometry.py`  — a small typed module (a `Circle` dataclass + helpers)
-- `shapes.py`    — a `Triangle` with an unresolved merge conflict (`:BtvDiffConflict`)
+- `shapes.py`    — a `Triangle` with an unresolved merge conflict (`:DiffConflict`)
+- `TOUR.md`      — this file; `:MarkdownPreview` renders it
 - `init.lua`     — this editor's config (catppuccin, the plugins, the LSP)
 
 Edit anything — your changes persist in the browser across reloads.

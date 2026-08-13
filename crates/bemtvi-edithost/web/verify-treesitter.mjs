@@ -130,6 +130,19 @@ try {
   const fetchedHl = cdnFetches.some((p) => p.endsWith("queries/highlights.scm"));
   check("install: fetched zig grammar + highlights from the CDN", fetchedWasm && fetchedHl, JSON.stringify(cdnFetches));
 
+  // The status line echoes the (honest) outcome. Asserted HERE, before anything else
+  // types: the message line is transient, and the very next keystroke clears it. This
+  // check used to sit after the `#lua-match?` section below, which types a whole new
+  // buffer (`ggdGiconst x = foo + Bar;<Esc>`) first — so it polled a message line that
+  // had been cleared several keystrokes earlier and only ever saw "".
+  let echo = "";
+  for (let i = 0; i < 30; i++) {
+    echo = await page.evaluate(() => window.__bemtvi.message());
+    if (/installed zig/i.test(echo)) break;
+    await sleep(100);
+  }
+  check("install: status echoes 'installed zig'", /installed zig/i.test(echo), echo);
+
   // `#lua-match?` predicate enforcement (highlight.js). zig's query captures every
   // identifier as `@variable`, then *also* as `@type` only when it matches
   // `^[A-Z_]…` (a `#lua-match?` predicate). Without enforcing that predicate the
@@ -160,15 +173,6 @@ try {
     idColors.bar === "#e5c07b" && idColors.foo === "#abb2bf",
     JSON.stringify(idColors),
   );
-
-  // The status line echoes the (honest) outcome.
-  let echo = "";
-  for (let i = 0; i < 30; i++) {
-    echo = await page.evaluate(() => window.__bemtvi.message());
-    if (/installed zig/i.test(echo)) break;
-    await sleep(100);
-  }
-  check("install: status echoes 'installed zig'", /installed zig/i.test(echo), echo);
 
   // ---- 4. The full standard query set is cached in OPFS (indents → worker indenter) ----
   const cached = await page.evaluate(async () => {

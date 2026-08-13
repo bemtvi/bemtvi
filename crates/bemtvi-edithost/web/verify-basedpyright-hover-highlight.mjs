@@ -8,11 +8,22 @@
 // block, so with no fence there was nothing to colour (on web OR native). The client now
 // advertises markdown, so the signature comes back fenced (```python … ```).
 //
+// The fence is guarded ON THE WIRE, not in the float's buffer. When this test was written the
+// hover float WAS a `markdown` buffer holding the raw reply, so asserting ```python over its
+// lines was the same thing. It no longer is: doc floats now render markdown through
+// `bemtvi-core/markdown.rs` (`Editor::open_markdown_float`), which strips the markup to display
+// lines + `@markup.*` extmark spans and deliberately leaves the buffer UNTYPED so its own
+// filetype pass can't repaint the stripped text. So a correct, markdown-fenced hover shows up in
+// the buffer with no fence and with `filetype == ""` — which is why the reply itself is what we
+// assert on.
+//
 // Faithfulness (not a no-op): we open a python file, hover (K) on a function, and assert
-//   1. a `[Hover]` markdown doc-float opens,
-//   2. its content carries a ```python fence around the inferred signature (the capability fix),
-//   3. the rendered float paints more than one foreground colour over that fenced code (the
-//      client-side fence highlighter actually coloured it).
+//   1. the RAW reply is `kind: "markdown"` and carries a ```python fence (the capability fix —
+//      this is the regression the file exists for, checked before any rendering),
+//   2. a `[Hover]` doc-float opens and holds the RENDERED signature: `def add` present, fence
+//      markers consumed (proving the markdown renderer ran rather than dumping raw markup),
+//   3. the float paints more than one foreground colour over that fenced code (the client-side
+//      fence highlighter actually coloured it), scoped to the float's own cells.
 //
 // Runs against the **python-demo** site (build-demo.sh → demo-site/). Prereqs: ./build-demo.sh
 // and a Chromium for Playwright (PW_CHROMIUM on macOS). Run: node verify-basedpyright-hover-highlight.mjs
@@ -84,6 +95,40 @@ try {
   await until(page, () => window.__bemtvi.execLua("return tostring(#btv.lsp.clients())").then((r) => r.result), (v) => /[1-9]/.test(String(v)));
   await sleep(1500);
 
+  // 1. The RAW reply carries the markdown fence. Issued through the real client before `K`,
+  //    while the PYTHON buffer is still current — `btv.lsp.request` routes on bufnr 0, and after
+  //    `K` that is the (client-less) float buffer, where the request would never be sent.
+  await page.evaluate(() => window.__bemtvi.execLua(`
+    _G.HOVER_RAW = nil
+    btv.lsp.request("textDocument/hover",
+      { textDocument = { uri = "file:///hov.py" }, position = { line = 0, character = 5 } },
+      function(err, result)
+        local c = result and result.contents
+        _G.HOVER_RAW = { kind = type(c) == "table" and tostring(c.kind) or "<not-markup-content>",
+                         value = type(c) == "table" and tostring(c.value) or tostring(c) }
+      end, 0)
+    return 1`));
+  // Read the two fields separately and match over each reply as a whole: `execLua` hands
+  // back a DEBUG-FORMATTED wrapper (`ok:String(Utf8String { s: Ok("…") })`), not the bare
+  // Lua string, so splitting it on a separator recovers nothing — every other verifier
+  // here regexes the wrapper, and so does this.
+  // Polled with `luaResult` rather than `until`: `until` serializes its callback to the
+  // page, so a closure over the field name would arrive with nothing bound to it.
+  const rawField = async (f) => {
+    for (let i = 0; i < 200; i++) {
+      const v = await luaResult(page,
+        `if _G.HOVER_RAW == nil then return nil end return _G.HOVER_RAW.${f}`);
+      if (v != null && /Ok\(/.test(String(v))) return v;
+      await sleep(150);
+    }
+    return null;
+  };
+  const rawKind = String(await rawField("kind"));
+  const rawValue = String(await rawField("value"));
+  check("hover: the reply is markdown-fenced ```python (contentFormat advertised)",
+    /markdown/.test(rawKind) && /```python/.test(rawValue) && /def add/.test(rawValue),
+    `kind=${JSON.stringify(rawKind)} value=${JSON.stringify(rawValue)}`);
+
   // Place the cursor on the `add` definition name and hover (K).
   await luaResult(page, `
     local b = vim.api.nvim_get_current_buf()
@@ -96,15 +141,14 @@ try {
   await sleep(200);
   await page.evaluate(() => window.__bemtvi.feed("K"));
 
-  // 1. A markdown doc-float opens.
+  // 2. A `[Hover]` doc-float opens, holding the RENDERED markdown: the signature is there and
+  //    the fence markers are gone (consumed by the renderer, not passed through as text).
   const hov = await until(page, () => {
     const w = ((window.__bemtvi.frame() || {}).windows || []).find((x) => /Hover/.test(String(x.file_name)));
     return w ? { filetype: w.filetype, floating: !!w.floating } : null;
   }, (v) => v != null);
-  check("hover: K opens a [Hover] markdown doc-float", hov != null && hov.filetype === "markdown" && hov.floating, JSON.stringify(hov));
+  check("hover: K opens a [Hover] doc-float", hov != null && hov.floating, JSON.stringify(hov));
 
-  // 2. Its content is a ```python-fenced signature (the contentFormat capability fix). Read it
-  //    straight from the hover buffer's lines.
   const hoverText = await luaResult(page, `
     for _, b in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_get_name(b):find("Hover") then
@@ -113,14 +157,26 @@ try {
     end
     return ""`);
   const ht = String(hoverText);
-  check("hover: the content is markdown-fenced ```python (not plaintext)", /```python/.test(ht) && /def add/.test(ht), `hover=${JSON.stringify(ht)}`);
+  check("hover: the float holds the rendered signature, fence stripped",
+    /def add/.test(ht) && !/```/.test(ht), `hover=${JSON.stringify(ht)}`);
 
-  // 3. The rendered float actually colours the fenced code (more than one fg colour over the
-  //    floating window's cells). The hover float is a non-focused floating window; its cells
-  //    sit in #grid. We scope to spans whose text is part of the signature keywords/types.
+  // 3. The float actually colours the fenced code (more than one fg colour over ITS cells).
+  //    Scoped to the float geometrically: the float's content spans are appended to #grid as
+  //    siblings of its `.float-win` chrome box, not as children of it, so ancestry can't scope
+  //    this — but the chrome box's rect can. Unscoped, this check is a no-op: hov.py itself
+  //    contains `def add(a: int, b: int) -> int`, so the SOURCE buffer's own tree-sitter colours
+  //    would satisfy it even with the float empty or absent.
   await sleep(400);
   const colorInfo = await page.evaluate(() => {
-    const spans = Array.from(document.querySelectorAll("#grid span"));
+    const box = document.querySelector(".float-win");
+    if (!box) return { error: "no .float-win chrome box", distinctColors: 0 };
+    const r = box.getBoundingClientRect();
+    const inside = (el) => {
+      const b = el.getBoundingClientRect();
+      const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+      return cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+    };
+    const spans = Array.from(document.querySelectorAll("#grid span")).filter(inside);
     // Keywords/types of the fenced signature that should each carry their own colour.
     const wanted = ["def", "int", "None", "->"];
     const hits = {};
@@ -129,7 +185,7 @@ try {
       if (wanted.includes(t)) hits[t + "@" + getComputedStyle(el).color] = (hits[t + "@" + getComputedStyle(el).color] || 0) + 1;
     }
     const colors = new Set(Object.keys(hits).map((k) => k.split("@")[1]));
-    return { keys: Object.keys(hits), distinctColors: colors.size };
+    return { floatSpans: spans.length, keys: Object.keys(hits), distinctColors: colors.size };
   });
   check("hover: the fenced signature is syntax-highlighted (keywords/types carry distinct colours)",
     colorInfo.distinctColors >= 2, JSON.stringify(colorInfo));

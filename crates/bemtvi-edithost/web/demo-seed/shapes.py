@@ -4,7 +4,7 @@ Two branches both reworked ``Triangle.area()`` and disagreed, so this file still
 carries its git conflict markers. It does NOT import or run as-is (the markers are
 not valid Python) — that is the point: it's here to be resolved. Open it and run
 
-    :BtvDiffConflict
+    :DiffConflict
 
 to see the conflict laid out as a 3-way diff — ours | base | theirs, the two outer
 panes anchored against the common ancestor in the middle. Step between conflicts
@@ -14,7 +14,7 @@ with ]c / [c and resolve the one under the cursor:
     cp  stage selected line(s) from a pane    ca  apply    cx  clear
 
 (co / ct / cb rewrite the marker block as one undoable edit, then close the diff.)
-Once it's resolved, ``:BtvDiffGit`` diffs your edits against the file on disk.
+Once it's resolved, ``:DiffGit`` diffs your edits against the file on disk.
 """
 
 from dataclasses import dataclass

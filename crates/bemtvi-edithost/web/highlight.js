@@ -424,6 +424,34 @@ export function createHighlighter({ onReady } = {}) {
     return any ? out : null;
   }
 
+  // Spans for a RENDERED markdown document whose fences the server already stripped:
+  // the code blocks arrive as explicit `{ first_line, len, lang }` row spans (a window's
+  // `code_blocks`, from the core's own render) instead of being re-found in the text.
+  //
+  // This is the doc-float twin of `spansForFencedMarkdown`. That one re-parses ```lang
+  // fences out of raw markdown, which is right for a `.md` BUFFER but impossible for a
+  // hover float: its fences are gone from the text and its buffer is deliberately
+  // untyped, so there is nothing left in the buffer to key off. Here the structure comes
+  // from the server, so the text needs no parsing at all — the rows are handed to us.
+  function spansForCodeBlocks(text, blocks) {
+    if (text == null || !runtimeReady || !blocks || !blocks.length) return null;
+    const lines = text.split('\n');
+    const out = Array.from({ length: lines.length }, () => []);
+    let any = false;
+    for (const b of blocks) {
+      const lang = langForFence(b.lang || '');
+      if (!lang) continue;                       // no fence language, or no such grammar
+      const start = b.first_line | 0, len = b.len | 0;
+      if (start < 0 || len <= 0 || start >= lines.length) continue;
+      const sp = spansForBuffer(lang, lines.slice(start, start + len).join('\n'));
+      if (!sp) continue;                         // grammar still loading — leave it plain
+      for (let k = 0; k < sp.length && start + k < out.length; k++) {
+        if (sp[k] && sp[k].length) { out[start + k] = sp[k]; any = true; }
+      }
+    }
+    return any ? out : null;
+  }
+
   // A tree-sitter metadata/control capture (`@spell` / `@nospell` / `@conceal`) —
   // a spellcheck/conceal marker, NOT a visual highlight group. Grammars tag nodes
   // with these alongside a real highlight (`(comment) @comment @spell`); they carry
@@ -706,6 +734,7 @@ export function createHighlighter({ onReady } = {}) {
     langForFiletype,
     spansForBuffer,
     spansForFencedMarkdown,
+    spansForCodeBlocks,
     colorsForLine,
     install,
   };

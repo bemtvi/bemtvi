@@ -8,6 +8,7 @@
     "verify": "node verify.mjs",
     "verify-ui": "node verify-ui.mjs",
     "verify-config": "node verify-config.mjs",
+    "verify-alt-ctrl": "node verify-alt-ctrl.mjs",
     "verify-fs": "node verify-fs.mjs",
     "verify-shada": "node verify-shada.mjs",
     "verify-daemon": "node verify-daemon.mjs",

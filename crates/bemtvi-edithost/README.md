@@ -90,6 +90,17 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `btv.timer`) via
   to vim key-notation and mouse gestures to `eh_input_mouse`, picks the SAB or postMessage
   transport by capability, and exposes `window.__bemtvi` (`feed` / `mouse` / `execLua` /
   `attach` / `lines` / `frame` / `cursor` / `cmdline` / `sab` / …) for automation.
+  Keys the browser reserves for itself are the one thing it can't simply forward:
+  Chrome/Edge on Windows and Linux handle `<C-w>` / `<C-t>` / `<C-n>` / `<C-Tab>` /
+  `<C-1>`..`<C-9>` ahead of the page, so `preventDefault()` has no say and the editor never
+  sees them. macOS puts those on Cmd, leaving Ctrl free — which is why `<C-w>` works there
+  and only there. So on non-Mac platforms **Alt stands in for Ctrl on exactly those chords**
+  (`Alt+w` → `<C-w>`, `Alt+Shift+W` → `<C-W>`); every other Ctrl chord is deliverable and
+  untouched, and on macOS nothing is remapped — Ctrl already arrives there, and Alt is
+  Option, the character-composing key. Two consequences worth knowing: `<A-w>` / `<A-t>` /
+  `<A-n>` / `<A-1>`..`<A-9>` are unreachable in the browser (they now encode as `<C-…>`,
+  while every other `<A-…>` — `<A-c>` for multi-cursor, say — is untouched), and `Alt+Tab`
+  is claimed by the OS on both Windows and Linux, so `<C-Tab>` has no stand-in in practice.
 - `web/highlight.js` — the client-side web-tree-sitter highlighter; its grammars/runtime
   are generated into `web/vendor/` by `build.sh` (gitignored). The import is optional —
   the renderer degrades to plain text if absent.
@@ -107,6 +118,10 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `btv.timer`) via
   `<pre>`), the command-line-below-status-line layout, visual-mode selection painting,
   cursor-shape-by-mode, mouse click / drag-select / wheel-scroll, and tree-sitter
   highlight colors — all in a real headless browser.
+- `web/verify-alt-ctrl.mjs` — the reserved-chord verifier: drives **real** keydown events
+  (not the `feed` hook, which bypasses the encoding under test) and asserts `Alt+w` feeds
+  `<C-w>` on a non-Mac platform, that an unreserved `Alt+c` still reaches the editor as
+  `<A-c>`, and that a spoofed macOS session remaps nothing.
 - `web/verify-config.mjs` — the config verifier: writes an `/init.lua` to OPFS, reloads,
   and asserts the config applied on startup (an option, a global, a keymap that fires,
   and a startup-buffer `BufEnter` autocmd) and that a broken config is non-fatal.

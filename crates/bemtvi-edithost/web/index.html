@@ -2970,7 +2970,46 @@
       ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down",
       Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown",
     };
+
+    // ── Ctrl chords the browser keeps for itself, and the Alt stand-in ────────────
+    // Chrome/Edge on Windows and Linux handle these ahead of the page — close/new tab,
+    // new window, tab cycling — so `preventDefault()` on them is a no-op and the key
+    // never reaches the editor at all. `<C-w>` (every window command) is the painful
+    // one; `<C-n>` (completion), `<C-t>` (tag pop) and `<C-6>` (alternate file) follow.
+    // macOS hangs those same commands off Cmd, which leaves Ctrl free — which is why
+    // `<C-w>` works there and only there.
+    //
+    // So on the platforms where Ctrl is stolen we accept Alt as its stand-in for exactly
+    // these chords: Alt+w feeds `<C-w>`, Alt+Shift+W feeds `<C-W>`. Every other Ctrl
+    // chord is deliverable and is left alone, and on macOS nothing is remapped — Ctrl
+    // already arrives there, and Alt is Option (the character-composing key).
+    //
+    // The cost is that `<A-w>`/`<A-t>`/`<A-n>`/`<A-1>`..`<A-9>` are not reachable in the
+    // browser: those events now encode as `<C-…>`. Every other `<A-…>` is untouched.
+    // Keyed by `e.code` so the physical key is what matters, not the layout's letter.
+    const RESERVED_CTRL = new Set([
+      "KeyW", "KeyT", "KeyN",           // close tab / new tab / new window
+      "Tab", "PageUp", "PageDown",      // tab cycling
+      "Digit1", "Digit2", "Digit3", "Digit4", "Digit5",
+      "Digit6", "Digit7", "Digit8", "Digit9", // jump-to-tab (`<C-6>` is alternate-file)
+    ]);
+    // Case-insensitive on purpose: the two sources spell it differently — `userAgentData`
+    // reports `"macOS"`, the legacy `platform` reports `"MacIntel"`.
+    const IS_MAC = /mac|iphone|ipad|ipod/i.test(
+      navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
+    // Whether this event is Alt standing in for a Ctrl the browser would have eaten.
+    // A real Ctrl press is never a substitute (it needs no stand-in), so a user holding
+    // both still gets a plain `<C-…>` rather than a doubled modifier; Cmd/Super chords
+    // are likewise left to the browser and the window manager.
+    function isCtrlSubstitute(e) {
+      return !IS_MAC && e.altKey && !e.ctrlKey && !e.metaKey && RESERVED_CTRL.has(e.code);
+    }
     function keyToNotation(e) {
+      // Alt-as-Ctrl folds in right here: everything below reads these two flags, so a
+      // substituted chord encodes identically to a real one (`<C-w>`, not `<A-w>`).
+      const sub = isCtrlSubstitute(e);
+      const ctrlKey = e.ctrlKey || sub;
+      const altKey = e.altKey && !sub;
       let base = SPECIAL[e.key];
       let isSpecial = !!base;
       // Function keys: the browser already names them "F1".."F12" — the vim notation
@@ -2982,23 +3021,23 @@
       }
       if (!base) {
         // With a Ctrl/Alt modifier read e.code so the BASE letter survives composition.
-        if ((e.ctrlKey || e.altKey) && /^Key[A-Z]$/.test(e.code)) {
+        if ((ctrlKey || altKey) && /^Key[A-Z]$/.test(e.code)) {
           const m = e.code.slice(3);
           base = e.shiftKey ? m : m.toLowerCase();
-        } else if ((e.ctrlKey || e.altKey) && /^Digit\d$/.test(e.code)) {
+        } else if ((ctrlKey || altKey) && /^Digit\d$/.test(e.code)) {
           base = e.code.slice(5);
         } else if (e.key === " ") base = "Space";
         else if (e.key.length === 1) base = e.key === "<" ? "lt" : e.key;
         else return null; // bare modifier / unhandled key
       }
       const mods = [];
-      if (e.ctrlKey) mods.push("C");
+      if (ctrlKey) mods.push("C");
       // Shift is a standalone modifier only for *special* keys (`<S-Tab>`, `<S-Up>`);
       // for printable keys it's already folded into the character (Shift+a → "A"), and
       // a Ctrl/Alt+letter combo carries it via the capitalized base above — so without
       // this, Shift+Tab collapsed to a plain `<Tab>` and never sent the back-cycle.
       if (e.shiftKey && isSpecial) mods.push("S");
-      if (e.altKey) mods.push("A");
+      if (altKey) mods.push("A");
       if (e.metaKey) mods.push("D");
       if (mods.length === 0) {
         if (isSpecial || base === "Space" || base === "lt") return `<${base}>`;

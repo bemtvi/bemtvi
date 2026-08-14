@@ -7,6 +7,12 @@ plugins all run in this tab.
 
 ## Try it
 
+> **A note on Ctrl.** Your browser keeps a few Ctrl chords for itself — `<C-w>`
+> (close tab), `<C-n>` (new window), `<C-t>` — and never passes them to the page.
+> Press **Alt** in their place: `Alt+w` is `<C-w>`, `Alt+n` is `<C-n>`. Every other
+> Ctrl key below arrives as written. (On a Mac none of this applies — those
+> shortcuts live on Cmd there, so Ctrl reaches the editor untouched.)
+
 - `:terminal`                 — a minimal shell: `ls`, `cat main.py`, `cd`, pipes
   (`cat geometry.py | python -c "import sys; print(len(sys.stdin.read()))"`),
   redirects (`echo hi > note.txt`); run the project with `python main.py`
@@ -17,8 +23,9 @@ plugins all run in this tab.
   `<CR>` to accept, `<C-e>` to dismiss), with LSP suggestions and docs
 - `<space>` (leader), then wait — which-key shows what each key does
 - `<leader>e`                 — toggle the file-tree sidebar
-- `<C-w><C-w>j`               — drop into the bottom panel (it autohides, so it
-  collapses to a `▸PANEL` chip when you leave; click the chip to bring it back)
+- `<C-w><C-w>j`               — drop into the bottom panel (that's `Alt+w Alt+w j`
+  if your browser keeps `<C-w>`). It autohides, so it collapses to a `▸PANEL` chip
+  when you leave; click the chip to bring it back
 - open `shapes.py`, then `:DiffConflict` — it carries a real git merge conflict;
   see it side-by-side as a 3-way **ours | base | theirs** diff. Step conflicts with
   `]c`/`[c`; resolve the one under the cursor with `co` (ours), `ct` (theirs) or

@@ -27,7 +27,8 @@ require("bemtvi-line").setup({ options = { theme = "auto" } })
 
 -- An empty bottom tray (a permanent edge dock on a scratch buffer). `autohide = true`
 -- collapses it the instant focus leaves, and pops it back when you cross in
--- (`<C-w><C-w>j`) or `:DockShow bottom` — out of the way until you want it.
+-- (`<C-w><C-w>j` — `Alt+w Alt+w j` where the browser keeps `<C-w>` for itself) or
+-- `:DockShow bottom` — out of the way until you want it.
 btv.dock.open({ side = "bottom", size = 8, autohide = true, title = "PANEL" })
 
 -- LSP keymaps (gd / K / grn / gra / grr / gO / <leader>l…); servers configured below.
@@ -113,6 +114,7 @@ snippets.add("python", {
 -- single character; the docs sidebar (on by default) shows the highlighted item's
 -- signature/doc, and a snippet row previews the body it will expand to.
 --   <C-n>/<Tab> next · <C-p>/<S-Tab> prev · <C-y>/<CR> accept · <C-e> dismiss
+--   (the browser keeps <C-n> for itself — press Alt+n there; <Tab> always works)
 btv.complete.setup({
   sources = { { "lsp" }, { "bemtvi-snippets" }, { "buffer", min_chars = 2 } },
   min_chars = 1,

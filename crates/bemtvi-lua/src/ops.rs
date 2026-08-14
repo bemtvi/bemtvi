@@ -2454,6 +2454,26 @@ pub struct PickerPush {
     pub hl: Option<String>,
 }
 
+/// One row of an LSP-driven picker (goto/references/symbols), as the server hands it
+/// to `btv.lsp._show_locations`. `text` is the row's display text and `path`/`row`/`col`
+/// (1-based) its jump target — the shape the promise's resolved JSON also carries.
+///
+/// `tag` and `head` are the optional **column** declarations a
+/// [`btv.picker` source](crate::ops::PickerPush) row can make: a symbol row pins its
+/// kind (`"Function"`) as the tag and puts the symbol name in the head, so the names
+/// align down the list and neither the kind nor the name is what a narrow box elides.
+/// A plain location row leaves both `None` and renders as the single-column path row
+/// it always was.
+#[derive(Clone, Debug, Default)]
+pub struct LspPickerItem {
+    pub text: String,
+    pub path: String,
+    pub row: u32,
+    pub col: u32,
+    pub tag: Option<String>,
+    pub head: Option<String>,
+}
+
 /// One mark a `btv.decor` provider published — in **buffer** (not viewport-relative)
 /// 0-based `(row, col)` coordinates, carrying exactly the payload
 /// [`ExtmarkOp::Set`](crate::ops::ExtmarkOp) takes, because a provider's marks ARE

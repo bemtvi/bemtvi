@@ -1410,9 +1410,11 @@ btv.picker.source({
   layer = "main",
   items = function(ctx)
     for i, line in ipairs(btv.buf.lines(btv.buf.current(), 0, -1)) do
-      -- Right-align the line number in a 6-wide field so the text starts at the
-      -- same column for any file up to 999999 lines; past that it just wraps wider.
-      ctx.push({ text = string.format("%6d: %s", i, line), row = i })
+      -- A real two-column row rather than a padded prefix inside one string: the
+      -- widget aligns the line-number column itself (to the widest number actually
+      -- listed) and keeps it when a long line overflows, instead of the whole row
+      -- eliding tail-first and leaving a fragment of text with no line number.
+      ctx.push({ head = string.format("%d: ", i), text = line, row = i })
     end
   end,
   confirm = function(item)
@@ -1556,6 +1558,11 @@ btv.picker.source({
 -- typing the plugin name in the prompt narrows the list to its maps — the prefix is
 -- part of the fuzzy-matched row text.
 --
+-- Each row is `<mode><@> <lhs>  <description>` in real columns: the mode (with the
+-- buffer-local `@` marker) is the pinned `tag`, the `lhs` the aligned `head`, and the
+-- description the body. A mapping with an unusually long `lhs` therefore can't push
+-- every other row's description out of line, which a padded prefix could not prevent.
+--
 -- The displayed `lhs` runs through `btv.keytrans` so special keys read as notation (a
 -- space leader shows `<Space>`, not a hard-to-see literal blank; likewise `<Tab>`,
 -- `<C-x>`, …); the raw `lhs` is kept for the confirm feed. Confirm re-feeds it with
@@ -1567,14 +1574,14 @@ btv.picker.source({
   items = function(ctx)
     local buf = btv._resolve_bufnr(0)
     local function push(mode, k, local_marker)
+      -- The mode (plus the `@` buffer-local marker) is the row's `tag` — pinned, so
+      -- the one thing that says WHEN a mapping applies can't elide — and the `lhs` is
+      -- the head column the widget aligns. The old `%-16s` padded the lhs but never
+      -- truncated it, so one long mapping knocked every description out of line.
       ctx.push({
-        text = string.format(
-          "%s%s %-16s %s",
-          mode,
-          local_marker,
-          btv.keytrans(k.lhs),
-          k.desc or ""
-        ),
+        tag = mode .. local_marker,
+        head = btv.keytrans(k.lhs) .. " ",
+        text = k.desc or "",
         lhs = k.lhs,
       })
     end
@@ -1627,6 +1634,11 @@ btv.picker.source({
 -- `btv.picker.edit` when the mark names a file, or moves the cursor directly for a
 -- mark in an unnamed current buffer (no path to open). Mirror positions are 0-based,
 -- so the pushed item's `row`/`col` add 1.
+--
+-- Each row is `<mark> <line>:<col>  <the line's text>` in real columns: the mark name
+-- is the pinned `tag` (the one character you scan the list by), the position is the
+-- aligned `head`, and the text is the body — so a long line crops the TEXT, never the
+-- mark it belongs to.
 btv.picker.source({
   name = "marks",
   title = "Marks",
@@ -1634,11 +1646,13 @@ btv.picker.source({
   preview = "location",
   items = function(ctx)
     for _, m in ipairs(btv.mark.list()) do
-      -- Fixed-width `name  line:col` prefix so the detail text lines up: the mark
-      -- name is always one char, the line right-aligned to 6 (files up to 999999
-      -- lines, matching `curbuf`), the col left-padded to 4.
+      -- The mark's name is its `tag` — the one character the row is *scanned* by, so
+      -- it is pinned through any elision — and the location is the head the widget
+      -- aligns; the line's text is the body, windowed like any other content column.
       ctx.push({
-        text = string.format("%s  %6d:%-4d %s", m.name, m.line + 1, m.col, m.text),
+        tag = m.name,
+        head = string.format("%d:%d ", m.line + 1, m.col),
+        text = m.text,
         path = m.path,
         row = m.line + 1,
         col = m.col + 1,
@@ -1663,6 +1677,9 @@ btv.picker.source({
 -- jumps via `btv.picker.edit` when the entry names a file, else moves the cursor
 -- directly for a mark in an unnamed current buffer. Mirror entries are 1-based
 -- `lnum` / 0-based `col`, so the pushed item's `col` adds 1.
+--
+-- The `<line>:<col> ` position is a declared `head` column, aligned by the widget and
+-- kept when the detail overflows — not a padded prefix inside one label.
 btv.picker.source({
   name = "jumplist",
   title = "Jumplist",
@@ -1682,10 +1699,11 @@ btv.picker.source({
       else
         detail = path ~= "" and path or "[No Name]"
       end
-      -- Fixed-width `line:col` prefix so the detail text lines up (line right-aligned
-      -- to 6, matching `curbuf`/`marks`; col left-padded to 4).
+      -- The location is a real head column (aligned by the widget, kept when the
+      -- detail overflows), not a padded prefix inside the label.
       ctx.push({
-        text = string.format("%6d:%-4d %s", e.lnum, e.col, detail),
+        head = string.format("%d:%d ", e.lnum, e.col),
+        text = detail,
         path = path,
         row = e.lnum,
         col = e.col + 1,

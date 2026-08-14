@@ -3240,9 +3240,11 @@ async fn builtin_marks_list_and_picker_jump() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    // The mark's name is the row's pinned tag, so it leads the row whatever the
+    // column widths work out to.
     assert!(
         rows.iter()
-            .any(|r| r.starts_with("a  ") && r.contains("zzz middle")),
+            .any(|r| r.starts_with("a ") && r.contains("zzz middle")),
         "the marks picker lists mark a, got {rows:?}"
     );
     feed(&rpc, "<CR>");
@@ -4565,4 +4567,48 @@ async fn severity_colors_fall_back_to_the_palette_without_a_colorscheme() {
         Some(0x123456),
         "the colorscheme's own `DiagnosticError` outranks the derived default"
     );
+}
+
+/// Every built-in source whose rows have COLUMNS declares them, rather than padding
+/// them into one string with `string.format`. The difference only shows when a row
+/// overflows: a padded label is one string, so it elides tail-first and takes the
+/// line number / mark / mapping with it, while a declared head is fitted separately
+/// and kept. Asserted structurally — each source's rows carry a `layouts` entry, and
+/// the ones whose leading column classifies the row pin it as a tag.
+#[tokio::test]
+async fn the_column_shaped_builtin_sources_declare_real_columns() {
+    let dir = temp_dir("picker_column_shapes");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+    // A mark and a jump to list, plus the always-present keymaps.
+    exec_lua(&rpc, "btv.cmd('normal! majj')").await;
+
+    for (source, want_tag) in [
+        ("curbuf", false),
+        ("marks", true),
+        ("jumplist", false),
+        ("keymaps", true),
+    ] {
+        exec_lua(&rpc, &format!("btv.picker.open('{source}')")).await;
+        let map = poll_menu(&rpc, &mut incoming)
+            .await
+            .unwrap_or_else(|| panic!("{source} opens"));
+        let menu = menu_of(&map);
+        let layouts = menu_layouts(&menu);
+        let first = layouts
+            .first()
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| panic!("{source} rows declare a layout, got {layouts:?}"));
+        assert!(
+            first.0 > 0,
+            "{source} declares a head column, got {first:?}"
+        );
+        assert_eq!(
+            first.3 > 0,
+            want_tag,
+            "{source} pins a leading tag iff its first column classifies the row: {first:?}"
+        );
+        feed(&rpc, "<Esc>");
+    }
 }

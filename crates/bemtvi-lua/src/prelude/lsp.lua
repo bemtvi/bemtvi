@@ -2451,7 +2451,9 @@ local function ensure_location_source()
 end
 
 -- `btv.lsp._show_locations(items)`: open the picker over a server-resolved location
--- list. Each item is `{ text, path, row (1-based), col (1-based) }`. Called by the
+-- list. Each item is `{ text, path, row (1-based), col (1-based) }`, optionally with
+-- the `tag` / `head` column declarations a shaped row carries (a symbol row pins its
+-- `[Kind]` and aligns its name); they ride the item straight into `ctx.push`. Called by the
 -- server (runtime.rs `show_lsp_locations`) when a reply carries more than one hit.
 function btv.lsp._show_locations(items)
   btv.lsp._location_items = items or {}

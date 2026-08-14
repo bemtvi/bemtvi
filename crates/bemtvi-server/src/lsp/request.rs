@@ -9,7 +9,7 @@ use bemtvi_lsp::serde_json;
 use bemtvi_lsp::{
     LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken, ServerKey, SymbolData,
 };
-use bemtvi_lua::CallbackArgs;
+use bemtvi_lua::{CallbackArgs, LspPickerItem};
 
 use super::*;
 use crate::EditHost;
@@ -1312,7 +1312,7 @@ impl EditHost {
         // Build the `path:line:col` items once — they feed both the picker and the
         // promise's resolved value. The first surviving location is kept whole so a
         // lone goto result can be jumped to.
-        let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(locations.len());
+        let mut items: Vec<LspPickerItem> = Vec::with_capacity(locations.len());
         let mut seen: std::collections::HashSet<(PathBuf, usize, usize)> =
             std::collections::HashSet::new();
         let mut first: Option<(Location, PositionEncoding)> = None;
@@ -1331,8 +1331,15 @@ impl EditHost {
             }
             let nav = path.to_string_lossy().into_owned();
             let shown = super::display_path(&path);
-            let text = format!("{shown}:{}:{}", row + 1, byte + 1);
-            items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
+            // A pure-location row: one column, which elides keeping its tail (the file
+            // name and line) — there is no second column to split it into.
+            items.push(LspPickerItem {
+                text: format!("{shown}:{}:{}", row + 1, byte + 1),
+                path: nav,
+                row: (row + 1) as u32,
+                col: (byte + 1) as u32,
+                ..LspPickerItem::default()
+            });
         }
         match first {
             // A goto whose result is one place — after dedup, so two servers
@@ -1352,12 +1359,7 @@ impl EditHost {
     /// [`open_locations_panel`](Self::open_locations_panel); `what` ("symbol" /
     /// "location") only names the surface in the error echo. The picker open is a Lua
     /// effect, so this drains it (`apply_lua_effects`) like `fire_lsp_attach` does.
-    fn present_lsp_picker(
-        &mut self,
-        kind: LspReqKind,
-        items: Vec<(String, String, u32, u32)>,
-        what: &str,
-    ) {
+    fn present_lsp_picker(&mut self, kind: LspReqKind, items: Vec<LspPickerItem>, what: &str) {
         if items.is_empty() {
             self.editor.echo(kind.empty_message());
             return;
@@ -1391,7 +1393,7 @@ impl EditHost {
             self.editor.echo(kind.empty_message());
             return serde_json::Value::Null;
         }
-        let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(symbols.len());
+        let mut items: Vec<LspPickerItem> = Vec::with_capacity(symbols.len());
         let mut seen: std::collections::HashSet<(String, PathBuf, usize, usize)> =
             std::collections::HashSet::new();
         for (sym, encoding) in &symbols {
@@ -1408,8 +1410,19 @@ impl EditHost {
             // the full path (reused cwd-aware on jump).
             let nav = path.to_string_lossy().into_owned();
             let shown = super::display_path(&path);
-            let text = format!("{}  [{}]  {shown}:{}", sym.name, sym.kind, row + 1);
-            items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
+            // A symbol row has real columns, so it declares them instead of padding one
+            // string: the KIND is the pinned tag (what the row IS — never elided), the
+            // NAME is the head the widget aligns down the list, and the location is the
+            // body. The promise's `{ text, … }` JSON is composed from the three by
+            // [`location_items_to_json`], so it still reads as the whole row.
+            items.push(LspPickerItem {
+                text: format!("{shown}:{}", row + 1),
+                path: nav,
+                row: (row + 1) as u32,
+                col: (byte + 1) as u32,
+                tag: Some(format!("[{}]", sym.kind)),
+                head: Some(format!("{} ", sym.name)),
+            });
         }
         let json = location_items_to_json(&items);
         self.present_lsp_picker(kind, items, "symbol");
@@ -1530,17 +1543,24 @@ impl EditHost {
     }
 }
 
-/// Marshal a picker item list (`(text, path, 1-based row, 1-based col)`) into the
-/// JSON array an async navigation/symbol verb resolves its promise with: one
-/// `{ text, path, row, col }` object per item. The shape matches the `btv.picker`
-/// location items so a `btv.lsp.references():next(function(items) … end)` handler
-/// sees the same fields the picker rows carry.
-fn location_items_to_json(items: &[(String, String, u32, u32)]) -> serde_json::Value {
+/// Marshal a picker item list into the JSON array an async navigation/symbol verb
+/// resolves its promise with: one `{ text, path, row, col }` object per item. The
+/// shape matches the `btv.picker` location items so a
+/// `btv.lsp.references():next(function(items) … end)` handler sees the same fields the
+/// picker rows carry.
+///
+/// A column-shaped row (a symbol's `[Kind]` tag + name head) is *composed* back into
+/// one `text` here — the same string the picker renders — so a caller reading the
+/// promise gets the whole row rather than only its trailing column.
+fn location_items_to_json(items: &[LspPickerItem]) -> serde_json::Value {
     serde_json::Value::Array(
         items
             .iter()
-            .map(|(text, path, row, col)| {
-                serde_json::json!({ "text": text, "path": path, "row": row, "col": col })
+            .map(|i| {
+                let tag = i.tag.as_ref().map(|t| format!("{t} ")).unwrap_or_default();
+                let head = i.head.clone().unwrap_or_default();
+                let text = format!("{tag}{head}{}", i.text);
+                serde_json::json!({ "text": text, "path": i.path, "row": i.row, "col": i.col })
             })
             .collect(),
     )

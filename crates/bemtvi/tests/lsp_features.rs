@@ -403,11 +403,13 @@ async fn document_symbol_opens_the_symbol_picker() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let items = items.expect("document symbols should open a 2-row picker (struct + nested field)");
+    // The row declares real columns: the `[Kind]` leads as a pinned tag, the name is
+    // the aligned head, the location the body — not one padded string.
     assert!(
         items
             .iter()
-            .any(|r| r.contains("Foo") && r.contains("[Struct]")),
-        "the struct symbol row should carry its name + kind, got {items:?}"
+            .any(|r| r.starts_with("[Struct] Foo ") && r.contains("a.rs:1")),
+        "the struct symbol row should carry its kind, name and location, got {items:?}"
     );
     assert!(
         items

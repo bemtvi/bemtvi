@@ -20,10 +20,10 @@ use crate::ops::{
     BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq,
     DecorInvalidate, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue,
     GitValue, GlobalOptionOp, HlSet, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp,
-    LspClientData, LspOp, LspProgressData, NamedListOp, PanelOp, PickerOpenReq, PickerPush,
-    QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq,
-    StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TextObjectOp, TsOp,
-    UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
+    LspClientData, LspOp, LspPickerItem, LspProgressData, NamedListOp, PanelOp, PickerOpenReq,
+    PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, SnippetAddReq,
+    SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq,
+    TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -1699,16 +1699,24 @@ impl LuaRuntime {
     /// loclist). Each item is `(text, path, 1-based row, 1-based col)`; the picker's
     /// `confirm` jumps via `btv.picker.edit`. The caller drains the queued picker-open
     /// effect (`apply_lua_effects`), exactly as `fire_lsp_attach` does for `on_attach`.
-    pub fn show_lsp_locations(&self, items: &[(String, String, u32, u32)]) -> mlua::Result<()> {
+    pub fn show_lsp_locations(&self, items: &[LspPickerItem]) -> mlua::Result<()> {
         let lsp: Table = self.btv()?.get("lsp")?;
         let show: mlua::Function = lsp.get("_show_locations")?;
         let list = self.lua.create_table()?;
-        for (i, (text, path, row, col)) in items.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             let t = self.lua.create_table()?;
-            t.set("text", text.clone())?;
-            t.set("path", path.clone())?;
-            t.set("row", *row)?;
-            t.set("col", *col)?;
+            t.set("text", item.text.clone())?;
+            t.set("path", item.path.clone())?;
+            t.set("row", item.row)?;
+            t.set("col", item.col)?;
+            // The row's column declarations, when the caller shaped it (symbols).
+            // Absent keys leave a plain single-column row, exactly as before.
+            if let Some(tag) = &item.tag {
+                t.set("tag", tag.clone())?;
+            }
+            if let Some(head) = &item.head {
+                t.set("head", head.clone())?;
+            }
             list.set(i + 1, t)?;
         }
         show.call(list)

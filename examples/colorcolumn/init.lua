@@ -67,6 +67,15 @@ end, {})
 --
 -- 4. `:set cc=+1` — a 'textwidth'-relative entry, which bemtvi skips (no ruler),
 --    since there is no 'textwidth'. `:set cc=100` for an absolute one instead.
+--
+-- 5. The two `wide: …` lines are double-width (CJK) text: one is laid out so the
+--    80-column guide falls on a glyph's RIGHT half, the other so it falls on a
+--    glyph's own cell. A terminal cannot paint half a glyph, so in the TUI the
+--    ruler tints the whole glyph it lands on — two columns wide, but never
+--    missing. (A GUI cell grid has no such limit and keeps the ruler one column
+--    wide.) Type and delete characters in front of the CJK run with `I`: every
+--    glyph slides a column and back, and the background must stay unbroken to the
+--    right of the text.
 --------------------------------------------------------------------------------
 
 vim.notify("colorcolumn demo: guides at 80 and 120 (:CC80, :CC80120, :NoCC, :CCReport)")

@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 
 use crossterm::cursor::SetCursorStyle;
+use ratatui::buffer::{CellDiffOption, CellWidth};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -196,6 +197,24 @@ pub fn paint(view: &View, width: u16, height: u16) -> ratatui::buffer::Buffer {
         .draw(|frame| render(frame, view, None, None))
         .expect("draw");
     terminal.backend().buffer().clone()
+}
+
+/// Render a *sequence* of views through one terminal — the same double-buffered
+/// diff the live client drives — and return the backend's cell grid: the state a
+/// real terminal is left in, un-repainted cells and all. [`paint`] only ever shows
+/// a single frame against a blank terminal, so it can't catch an artifact that
+/// only appears once a second frame diffs against the first (a wide glyph sliding
+/// under an edit, say).
+pub fn paint_frames(views: &[View], width: u16, height: u16) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    let mut terminal =
+        Terminal::new(crate::termmodel::TerminalModel::new(width, height)).expect("test terminal");
+    for view in views {
+        terminal
+            .draw(|frame| render(frame, view, None, None))
+            .expect("draw");
+    }
+    terminal.backend().screen().clone()
 }
 
 /// Like [`paint`], but also returns the terminal cursor position the frame
@@ -513,6 +532,48 @@ pub(crate) fn render(
                     cell.set_style(Style::reset().add_modifier(Modifier::REVERSED));
                 }
             }
+        }
+    }
+
+    blank_columns_under_wide_glyphs(frame.buffer_mut());
+}
+
+/// Blank the column each double-width glyph covers, restoring the invariant
+/// ratatui's frame diff is documented to assume: *no double-width cell is followed
+/// by a non-blank cell*.
+///
+/// The renderer breaks that invariant everywhere, and for a good reason — the
+/// window background, `'cursorline'`, the `line_hl_group` layer and the
+/// `'colorcolumn'` ruler are all painted as blocks across whole rows *before* the
+/// text, so the column a wide glyph covers still carries a background even though
+/// nothing is ever printed into it. The diff then reads that column as unchanged
+/// between two frames whose glyphs sit one column apart, and skips it — while the
+/// terminal is holding the orphaned half of a glyph there, which it blanks in its
+/// *own* default colours. The result is a hole in the background at the end of a
+/// line of CJK text after an edit shifts the glyphs and shifts them back (tmux
+/// makes it plainly visible; a bare terminal may paper over the same missing
+/// repaint). Blanking the covered column makes it differ from any frame that
+/// paints real content there, so the diff emits it and the hole is repainted.
+///
+/// Cells a widget has claimed for its own diffing — `ratatui-image`'s graphics
+/// protocols mark theirs — are left alone; their symbols are escape payloads, not
+/// glyphs, and their widths are declared, not measured.
+fn blank_columns_under_wide_glyphs(buf: &mut ratatui::buffer::Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            let cell = &buf[(x, y)];
+            let width = cell.cell_width().max(1);
+            if width > 1 && cell.diff_option == CellDiffOption::None {
+                for covered in x + 1..(x + width).min(area.right()) {
+                    let cell = &mut buf[(covered, y)];
+                    if cell.diff_option == CellDiffOption::None {
+                        cell.reset();
+                    }
+                }
+            }
+            x += width;
         }
     }
 }
@@ -1168,26 +1229,54 @@ fn render_window(
     // the left under `nowrap`, or past the right edge, is skipped. Painted after the
     // gutter split (so it stays within the text area) and before the text (so glyphs
     // and overlays draw on top — vim's behind-the-text tint, the `'cursorline'` model).
+    //
+    // The ruler is resolved per row rather than as one tall block, because a
+    // double-width glyph owns two screen columns and a terminal can only give it
+    // one background: a ruler landing on such a glyph snaps to the cell the glyph
+    // starts in (see `ruler_cell`), so it stays visible on that row.
     if !win.colorcolumn.is_empty() {
         let style = colorcolumn_style(win, view);
-        for &col in &win.colorcolumn {
-            let text_col = col.saturating_sub(1);
-            if text_col < win.leftcol {
-                continue; // scrolled off the left edge
+        let tabstop = win.tabstop.max(1) as usize;
+        let leftcol = win.leftcol as usize;
+        for row in 0..text_inner.height {
+            // A `virt_lines` row carries extmark chunks, not this line's glyphs, so
+            // there is nothing of the buffer to snap against — the ruler keeps its
+            // own column there, as it does past end-of-text.
+            let expanded = frame_virt_lines
+                .get(row as usize)
+                .is_none_or(Option::is_none)
+                .then(|| {
+                    frame_lines
+                        .get(row as usize)
+                        .map(|l| expand_tabs(l, tabstop))
+                })
+                .flatten();
+            for &col in &win.colorcolumn {
+                let ruler = col.saturating_sub(1) as usize;
+                if ruler < leftcol {
+                    continue; // scrolled off the left edge
+                }
+                // A glyph straddling the `leftcol` boundary is not painted at all
+                // (`highlight_line` drops it), so a snap that lands left of the
+                // boundary has nothing to tint — keep the ruler's own column there.
+                let cell_col = expanded
+                    .as_deref()
+                    .map_or(ruler, |line| ruler_cell(line, ruler))
+                    .max(leftcol);
+                let x = text_inner.x + (cell_col - leftcol) as u16;
+                if x >= text_inner.right() {
+                    continue; // past the right edge of the text area
+                }
+                frame.render_widget(
+                    Block::default().style(style),
+                    Rect {
+                        x,
+                        y: text_inner.y + row,
+                        width: 1,
+                        height: 1,
+                    },
+                );
             }
-            let x = text_inner.x + (text_col - win.leftcol);
-            if x >= text_inner.right() {
-                continue; // past the right edge of the text area
-            }
-            frame.render_widget(
-                Block::default().style(style),
-                Rect {
-                    x,
-                    y: text_inner.y,
-                    width: 1,
-                    height: text_inner.height,
-                },
-            );
         }
     }
 
@@ -2320,6 +2409,32 @@ pub(crate) fn group_style(group: &str) -> Style {
         "SpecialKey" => style.fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
         _ => style,
     }
+}
+
+/// The screen cell a `'colorcolumn'` ruler paints in on one display line
+/// (`line` already tab-expanded, so its chars are screen cells).
+///
+/// A ruler is a *screen* column, so on an all-narrow line it is simply that
+/// column. A double-width glyph, though, owns two columns and a terminal can only
+/// give it one background — so a ruler landing on such a glyph snaps back to the
+/// column the glyph starts in. The ruler then shows as the glyph's own two cells
+/// instead of disappearing on exactly the rows a wide glyph happens to straddle
+/// it. (neovim drops the ruler on those rows; a marker that blinks out line by
+/// line reads as broken, so bemtvi keeps it and lets the glyph widen it.) Past
+/// end-of-text there is no glyph to snap to and the ruler keeps its own column.
+fn ruler_cell(line: &str, ruler: usize) -> usize {
+    let mut col = 0usize;
+    for ch in line.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col <= ruler && ruler < col + width {
+            return col;
+        }
+        col += width;
+        if col > ruler {
+            break;
+        }
+    }
+    ruler
 }
 
 /// Expand tabs to spaces at `tabstop` (the buffer's, mirrored from the server),

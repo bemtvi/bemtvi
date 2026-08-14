@@ -25,10 +25,11 @@ mod images;
 mod keys;
 mod render;
 mod signals;
+mod termmodel;
 mod termquery;
 
 pub use keys::{encode_key, encode_key_with};
-pub use render::{cursor_style, paint, paint_with_cursor, ScrollHarness};
+pub use render::{cursor_style, paint, paint_frames, paint_with_cursor, ScrollHarness};
 pub use signals::{exit_as_signal_if_killed, install as install_signal_restore, ShutdownSignal};
 pub use termquery::{has_status_report, parse_term_caps, term_names_a_multiplexer, TermCaps};
 

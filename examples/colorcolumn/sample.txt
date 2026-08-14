@@ -7,6 +7,9 @@ This paragraph line is intentionally written long enough that it runs comfortabl
 A short line.
 Another line that reaches past eighty columns of text so the first ruler cuts through it, but stops before the second one at column 120.
 
+wide: 日本語テキストの幅は二倍あります日本語テキストの幅は二倍あります日本語テキストの幅は二倍あります日本語テキストの幅は二倍あり
+wide:  日本語テキストの幅は二倍あります日本語テキストの幅は二倍あります日本語テキストの幅は二倍あります日本語テキストの幅は二倍あり
+
 line 01: some text — move down with j and watch the two guides stay put across every row of the window
 line 02: some text — move down with j and watch the two guides stay put across every row of the window
 line 03: some text — move down with j and watch the two guides stay put across every row of the window

@@ -2,7 +2,7 @@
 //! and assert on exactly what a user would see. Synthetic views are the right
 //! input here — this pins the *client's painting contract*, not server logic.
 
-use bemtvi_tui::{cursor_style, paint, paint_with_cursor, ScrollHarness};
+use bemtvi_tui::{cursor_style, paint, paint_frames, paint_with_cursor, ScrollHarness};
 use bemtvi_view::View;
 use crossterm::cursor::SetCursorStyle;
 use ratatui::buffer::Buffer;
@@ -1114,6 +1114,84 @@ fn colorcolumn_offsets_by_the_gutter_and_horizontal_scroll() {
         tint,
         "the column scrolled off the left paints nothing"
     );
+}
+
+#[test]
+fn colorcolumn_under_a_wide_glyph_tints_the_glyph_it_falls_on() {
+    // Rulers at text columns 2 and 4 over a run of double-width glyphs: あ owns
+    // columns 1-2, い 3-4, う 5-6. Both rulers land on a glyph's *right* half, and
+    // a terminal cannot paint half a glyph — the cell that carries a background
+    // there is the one the glyph starts in. So the rulers tint あ (cell 0) and い
+    // (cell 2), staying visible on the row instead of vanishing under the glyphs
+    // straddling them.
+    let v = view(vec![
+        ("lines", lines(&["あいう", "abcdef"])),
+        (
+            "colorcolumn",
+            Value::Array(vec![Value::from(2u64), Value::from(4u64)]),
+        ),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x33, 0x2a, 0x2a))])]),
+        ),
+        ("chrome", chrome(vec![("colorcolumn", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    let tint = Some(Color::Rgb(0x33, 0x2a, 0x2a));
+    assert_eq!(
+        (bg(&buf, 0, 0), buf.cell((0, 0)).map(|c| c.symbol())),
+        (tint, Some("あ")),
+        "the ruler on あ's right half tints あ itself"
+    );
+    assert_eq!(
+        (bg(&buf, 2, 0), buf.cell((2, 0)).map(|c| c.symbol())),
+        (tint, Some("い")),
+        "the ruler on い's right half tints い itself"
+    );
+    assert_ne!(
+        bg(&buf, 4, 0),
+        tint,
+        "う is past both rulers and keeps the plain background"
+    );
+    assert_eq!(
+        (bg(&buf, 1, 1), bg(&buf, 3, 1)),
+        (tint, tint),
+        "a narrow row still tints exactly the two ruler columns"
+    );
+}
+
+#[test]
+fn an_edited_line_of_wide_glyphs_leaves_no_background_holes() {
+    // Type a character in front of a run of double-width glyphs and delete it
+    // again. Every glyph slides one column right and back, so the column just past
+    // the text was covered by a glyph's right half in the middle frame. The client
+    // has to repaint that column on the way back: leave it alone and the terminal
+    // is holding a broken glyph half there, which it blanks to its *default*
+    // attributes — a hole in the window background at the end of the line.
+    let text = |s: &str| {
+        view(vec![
+            ("lines", lines(&[s])),
+            (
+                "styles",
+                Value::Array(vec![style(vec![("bg", rgb(0x1e, 0x1e, 0x2e))])]),
+            ),
+            ("chrome", chrome(vec![("normal", 0)])),
+        ])
+    };
+    let buf = paint_frames(&[text("あいう"), text("xあいう"), text("あいう")], 20, 5);
+    let normal = Some(Color::Rgb(0x1e, 0x1e, 0x2e));
+    assert_eq!(
+        row_text(&buf, 0).trim_end(),
+        "あいう",
+        "the row settles back to its original glyphs"
+    );
+    for x in 6..20 {
+        assert_eq!(
+            bg(&buf, x, 0),
+            normal,
+            "cell {x} past the text keeps the window background"
+        );
+    }
 }
 
 #[test]

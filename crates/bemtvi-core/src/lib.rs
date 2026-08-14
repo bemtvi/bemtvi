@@ -34,18 +34,18 @@ pub use buffer::{dir_listing, Buffer, BufferEdit, BufferKind, DiskChange, EditBa
 pub use clipboard::Clipboard;
 pub use editor::{
     command_pending_after, command_status, known_filetypes, language_of_help_doc, language_of_path,
-    place_aligned, resolve_language, AcceptBehavior, Align, BorderStyle, BufferId, ClickSurface,
-    CmdlineCandidate, CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus,
-    CommitOutcome, CompleteConfig, CompleteKeys, Cursor, DecorScope, DecorViewport, DeferredCmd,
-    Editor, Extent, FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry,
-    FilterSeed, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry,
-    JumpPos, LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick,
-    MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PickerRun,
-    PluginEntry, PluginNamespace, PreWrite, PreviewScroll, PreviewTarget, PromptField, PromptPos,
-    QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry, RowLayout, SessionDock,
-    SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId, TerminalOp,
-    UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId, WriteEvent, WriteScope,
-    SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT,
+    place_aligned, resolve_language, shebang_filetype, AcceptBehavior, Align, BorderStyle,
+    BufferId, ClickSurface, CmdlineCandidate, CmdlineCompleteReq, CommandContinuation,
+    CommandPending, CommandStatus, CommitOutcome, CompleteConfig, CompleteKeys, Cursor, DecorScope,
+    DecorViewport, DeferredCmd, Editor, Extent, FileChangeAction, FileChangeReason, FileChangelist,
+    FileFolds, FileMarkEntry, FilterSeed, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry,
+    InputHistoryEntry, JumpPos, LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics,
+    MenuPlacement, MouseClick, MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave,
+    PersistState, PickerRun, PluginEntry, PluginNamespace, PreWrite, PreviewScroll, PreviewTarget,
+    PromptField, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry, RowLayout,
+    SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId,
+    TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId, WriteEvent,
+    WriteScope, SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT,
 };
 pub use encoding::Encoding;
 pub use extmark::{

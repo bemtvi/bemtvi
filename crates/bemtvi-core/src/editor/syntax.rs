@@ -128,16 +128,26 @@ impl Editor {
 
     /// The buffer's **filetype** — the *language* noun, independent of whether
     /// treesitter paints. An explicit override (`btv.bo.filetype` / `:set ft` /
-    /// `:setf`) wins; otherwise the path's extension decides. `None` when the
-    /// filetype is explicitly empty or the extension has no known grammar. This is
-    /// what LSP / indent / the statusline key off, even with highlighting disabled.
+    /// `:setf`) wins; otherwise the path decides (its filename, then a path pattern,
+    /// then its extension), and failing that the buffer's own `#!` line. `None` when
+    /// the filetype is explicitly empty or nothing claims the buffer. This is what
+    /// LSP / indent / the statusline key off, even with highlighting disabled.
+    ///
+    /// Detection is a *derive*, not a one-shot set at read time: renaming a buffer or
+    /// giving it a shebang retypes it immediately, and a buffer that never went
+    /// through a read chain (a picker preview, a freshly-minted scratch) is typed the
+    /// same way as one that did. The shebang read is the last resort precisely so
+    /// this stays cheap — only a path no rule claims pays for a single line read.
     pub fn buffer_filetype(&self, buf: BufferId) -> Option<String> {
         match self.ts_filetype.get(&buf) {
             Some(ft) if ft.is_empty() => None, // explicit "no filetype"
             Some(ft) => Some(ft.clone()),
             None => {
-                let path = self.buffer_of(buf)?.path.as_deref();
-                language_of_path(path).map(str::to_string)
+                let buffer = self.buffer_of(buf)?;
+                if let Some(ft) = language_of_path(buffer.path.as_deref()) {
+                    return Some(ft.to_string());
+                }
+                shebang_filetype(&buffer.line_cow(0)).map(str::to_string)
             }
         }
     }

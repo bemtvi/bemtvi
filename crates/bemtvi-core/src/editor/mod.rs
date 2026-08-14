@@ -3309,6 +3309,8 @@ const EXT_FILETYPE: &[(&str, &str)] = &[
     ("rockspec", "lua"),
     ("tlu", "lua"),
     ("luau", "luau"),
+    ("mk", "make"),
+    ("mak", "make"),
     ("md", "markdown"),
     ("markdown", "markdown"),
     ("mdown", "markdown"),
@@ -3377,6 +3379,7 @@ const EXT_FILETYPE: &[(&str, &str)] = &[
     ("proto", "proto"),
     ("prql", "prql"),
     ("pug", "pug"),
+    ("jade", "pug"),
     ("purs", "purescript"),
     ("py", "python"),
     ("ipy", "python"),
@@ -3539,16 +3542,291 @@ const EXT_FILETYPE: &[(&str, &str)] = &[
     ("zunit", "zsh"),
 ];
 
-/// Map a file path's extension to a treesitter language / filetype name, or
-/// `None` for an unknown (or absent) extension — in which case the buffer has no
-/// highlighting and no treesitter indentation. The server's `filetype_of` (FileType
-/// autocmd, LSP) delegates here, so the [`EXT_FILETYPE`] table lives in one place.
+/// The exact-**filename** → filetype table: files whose *name* names the language,
+/// which an extension lookup structurally cannot reach. `.bashrc` and `Makefile`
+/// have no extension at all (Rust's `Path::extension` returns `None` for a
+/// leading-dot name with no second dot), and `Cargo.lock` has one that means
+/// nothing on its own. Matched against the path's last component, case-sensitively
+/// — `Makefile` and `makefile` are both real spellings and both listed, but
+/// `MAKEFILE` is not a convention.
+///
+/// This table wins over [`PATTERN_FILETYPE`] and [`EXT_FILETYPE`] (see
+/// [`language_of_path`]): a name is the most specific thing a path can say.
+///
+/// A row's filetype must be a grammar bemtvi can `:TSInstall` — the same rule
+/// [`EXT_FILETYPE`] states, and the reason names whose only filetype has no parser at
+/// the pinned `NVIM_TS_REF` (`git-rebase-todo`, `fstab`) are deliberately absent
+/// rather than typed to something that can never highlight.
+const NAME_FILETYPE: &[(&str, &str)] = &[
+    // Shell startup files. The grammar is `bash` for the POSIX-sh family too — it is
+    // the closest parser bemtvi installs, and what `("sh", "bash")` already decides.
+    (".bashrc", "bash"),
+    ("bashrc", "bash"),
+    (".bash_profile", "bash"),
+    (".bash_login", "bash"),
+    (".bash_logout", "bash"),
+    (".bash_aliases", "bash"),
+    (".profile", "bash"),
+    ("profile", "bash"),
+    (".xinitrc", "bash"),
+    (".xprofile", "bash"),
+    (".env", "bash"),
+    ("PKGBUILD", "bash"),
+    ("APKBUILD", "bash"),
+    (".zshrc", "zsh"),
+    ("zshrc", "zsh"),
+    (".zshenv", "zsh"),
+    ("zshenv", "zsh"),
+    (".zprofile", "zsh"),
+    (".zlogin", "zsh"),
+    (".zlogout", "zsh"),
+    (".zimrc", "zsh"),
+    // Build files.
+    ("Makefile", "make"),
+    ("makefile", "make"),
+    ("GNUmakefile", "make"),
+    ("BSDmakefile", "make"),
+    ("Makefile.am", "make"),
+    ("Makefile.in", "make"),
+    ("CMakeLists.txt", "cmake"),
+    ("justfile", "just"),
+    ("Justfile", "just"),
+    (".justfile", "just"),
+    ("Dockerfile", "dockerfile"),
+    ("dockerfile", "dockerfile"),
+    ("Containerfile", "dockerfile"),
+    ("Jenkinsfile", "groovy"),
+    ("BUILD", "starlark"),
+    ("BUILD.bazel", "starlark"),
+    ("WORKSPACE", "starlark"),
+    ("WORKSPACE.bazel", "starlark"),
+    ("SConstruct", "python"),
+    ("SConscript", "python"),
+    ("Gemfile", "ruby"),
+    ("Rakefile", "ruby"),
+    ("Brewfile", "ruby"),
+    ("Guardfile", "ruby"),
+    ("Podfile", "ruby"),
+    ("Vagrantfile", "ruby"),
+    ("Thorfile", "ruby"),
+    ("Puppetfile", "ruby"),
+    ("go.mod", "gomod"),
+    ("go.sum", "gosum"),
+    ("go.work", "gowork"),
+    ("go.work.sum", "gosum"),
+    // Lockfiles and manifests whose extension is generic or absent.
+    ("Cargo.lock", "toml"),
+    ("poetry.lock", "toml"),
+    ("uv.lock", "toml"),
+    ("Pipfile", "toml"),
+    ("Pipfile.lock", "json"),
+    ("requirements.txt", "requirements"),
+    ("constraints.txt", "requirements"),
+    // Git's own files.
+    (".gitignore", "gitignore"),
+    (".dockerignore", "gitignore"),
+    (".npmignore", "gitignore"),
+    (".eslintignore", "gitignore"),
+    (".prettierignore", "gitignore"),
+    (".stylelintignore", "gitignore"),
+    (".helmignore", "gitignore"),
+    (".gitattributes", "gitattributes"),
+    (".gitconfig", "git_config"),
+    (".gitmodules", "git_config"),
+    ("COMMIT_EDITMSG", "gitcommit"),
+    ("MERGE_MSG", "gitcommit"),
+    ("TAG_EDITMSG", "gitcommit"),
+    // Tool configs: dotfiles whose syntax is a general-purpose format.
+    (".editorconfig", "ini"),
+    (".npmrc", "ini"),
+    (".coveragerc", "ini"),
+    (".pylintrc", "ini"),
+    ("setup.cfg", "ini"),
+    (".babelrc", "json"),
+    (".eslintrc", "json"),
+    (".prettierrc", "json"),
+    (".stylelintrc", "json"),
+    (".jshintrc", "json"),
+    (".swcrc", "json"),
+    (".clang-format", "yaml"),
+    (".clang-tidy", "yaml"),
+    (".yamllint", "yaml"),
+    (".luacheckrc", "lua"),
+    (".vimrc", "vim"),
+    ("_vimrc", "vim"),
+    (".gvimrc", "vim"),
+    (".inputrc", "readline"),
+    ("inputrc", "readline"),
+    (".tmux.conf", "tmux"),
+    ("tmux.conf", "tmux"),
+    ("nginx.conf", "nginx"),
+    ("ssh_config", "ssh_config"),
+    ("sshd_config", "ssh_config"),
+];
+
+/// The **path-pattern** → filetype table, for the files a fixed name can't express:
+/// a suffixed variant (`.env.local`, `Dockerfile.dev`) or a name that only means
+/// something in one directory (`config` is a filetype under `.ssh/`, and nothing at
+/// all elsewhere). Patterns are [`crate::glob`] globs matched against the **whole
+/// path**, so a directory-anchored rule must be spelled with a leading `**/`.
+///
+/// Kept deliberately short: a pattern that guesses (`*.conf`, `*rc`) is worse than
+/// no detection, because a wrong filetype is harder to notice than a missing one.
+/// Order is priority — the first matching pattern wins.
+const PATTERN_FILETYPE: &[(&str, &str)] = &[
+    ("**/.env.*", "bash"),
+    ("**/Dockerfile.*", "dockerfile"),
+    ("**/.git/config", "git_config"),
+    ("**/.config/git/config", "git_config"),
+    ("**/.ssh/config", "ssh_config"),
+    ("**/requirements*.txt", "requirements"),
+    ("**/hypr/*.conf", "hyprlang"),
+];
+
+/// The **interpreter** → filetype table for `#!` lines, keyed by the interpreter's
+/// basename (`/usr/bin/python3` and `env python3` both reduce to `python3`). This is
+/// the last resort in [`Editor::buffer_filetype`], and the only rule that can type the
+/// common extensionless executable script.
+const SHEBANG_FILETYPE: &[(&str, &str)] = &[
+    ("sh", "bash"),
+    ("bash", "bash"),
+    ("dash", "bash"),
+    ("ash", "bash"),
+    ("ksh", "bash"),
+    ("zsh", "zsh"),
+    ("fish", "fish"),
+    ("python", "python"),
+    ("node", "javascript"),
+    ("nodejs", "javascript"),
+    ("bun", "javascript"),
+    ("deno", "typescript"),
+    ("ruby", "ruby"),
+    ("perl", "perl"),
+    ("php", "php"),
+    ("lua", "lua"),
+    ("luajit", "lua"),
+    ("awk", "awk"),
+    ("gawk", "awk"),
+    ("mawk", "awk"),
+    ("julia", "julia"),
+    ("elixir", "elixir"),
+    ("escript", "erlang"),
+    ("groovy", "groovy"),
+    ("nu", "nu"),
+    ("pwsh", "powershell"),
+    ("powershell", "powershell"),
+    ("racket", "racket"),
+    ("guile", "scheme"),
+    ("scheme", "scheme"),
+    ("tclsh", "tcl"),
+    ("wish", "tcl"),
+    ("swift", "swift"),
+];
+
+thread_local! {
+    /// [`PATTERN_FILETYPE`] compiled once per thread. The set is static, so this is
+    /// built on first use and then reused for the lifetime of the thread —
+    /// [`language_of_path`] runs on read *and* on every frame that reports a
+    /// buffer's filetype, so it must never re-parse a glob.
+    static FILETYPE_PATTERNS: std::cell::OnceCell<Rc<crate::glob::GlobSet>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// The filetype [`PATTERN_FILETYPE`] gives `path`, or `None`. Patterns are matched
+/// against the whole path in the host's separator style; the lowest-index match wins,
+/// so the table's order is its priority.
+fn pattern_filetype(path: &Path) -> Option<&'static str> {
+    let idx = FILETYPE_PATTERNS.with(|cell| {
+        let set = cell.get_or_init(|| {
+            let patterns: Vec<String> = PATTERN_FILETYPE
+                .iter()
+                .map(|(p, _)| p.to_string())
+                .collect();
+            // Every pattern here is a literal from the table above, so a compile error
+            // would be a bug in this file rather than anything a user can trigger — but
+            // it must still be loud rather than silently disabling path detection.
+            crate::glob::compile_set(&patterns, &crate::glob::GlobOpts::default())
+                .unwrap_or_else(|e| panic!("PATTERN_FILETYPE is not a valid glob set: {e}"))
+        });
+        set.matches(path.as_os_str().as_encoded_bytes())
+            .into_iter()
+            .next()
+    })?;
+    Some(PATTERN_FILETYPE[idx].1)
+}
+
+/// Map a file **path** to a treesitter language / filetype name, or `None` when no
+/// rule claims it — in which case the buffer has no highlighting and no treesitter
+/// indentation unless something else (a `#!` line, an explicit `:setf`) types it.
+///
+/// The rules run most-specific first, matching vim: the exact filename
+/// ([`NAME_FILETYPE`]), then a path pattern ([`PATTERN_FILETYPE`]), then the
+/// extension ([`EXT_FILETYPE`]). So `Makefile` is `make` rather than nothing,
+/// `.env.local` is `bash` rather than nothing, and `foo.lua` is `lua` as it always
+/// was. The server's `filetype_of` (FileType autocmd, LSP) delegates here, so the
+/// tables live in one place.
+///
+/// This is a pure function of the path — deliberately, because it is also what types
+/// a picker preview or any buffer that never went through a read chain. Content-based
+/// detection is one layer up, in [`Editor::buffer_filetype`].
 pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
-    let ext = path?.extension()?.to_str()?;
+    let path = path?;
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if let Some((_, ft)) = NAME_FILETYPE.iter().find(|(n, _)| *n == name) {
+            return Some(ft);
+        }
+    }
+    if let Some(ft) = pattern_filetype(path) {
+        return Some(ft);
+    }
+    let ext = path.extension()?.to_str()?;
     EXT_FILETYPE
         .iter()
         .find(|(e, _)| *e == ext)
         .map(|(_, ft)| *ft)
+}
+
+/// The filetype a `#!` line declares, or `None` when `line` is not a shebang or names
+/// an interpreter [`SHEBANG_FILETYPE`] doesn't know.
+///
+/// Handles the three spellings that actually occur: a direct interpreter
+/// (`#!/bin/sh`), `env` with the interpreter as its argument (`#!/usr/bin/env
+/// python3`), and `env` carrying flags or `VAR=value` assignments first
+/// (`#!/usr/bin/env -S deno run`). A trailing version is stripped when the exact name
+/// misses, so `python3` and `python3.12` both resolve through the one `python` row.
+/// Arguments after the interpreter are ignored (`#!/bin/bash -eu`).
+pub fn shebang_filetype(line: &str) -> Option<&'static str> {
+    let rest = line.strip_prefix("#!")?;
+    let mut words = rest.split_whitespace();
+    let mut prog = interpreter_name(words.next()?);
+    if prog == "env" {
+        // `env` runs the *next* non-option, non-assignment word. `-S` ("split string")
+        // is the common one, and is what makes a multi-word shebang portable at all.
+        prog = loop {
+            let word = words.next()?;
+            if word.starts_with('-') || word.contains('=') {
+                continue;
+            }
+            break interpreter_name(word);
+        };
+    }
+    if let Some((_, ft)) = SHEBANG_FILETYPE.iter().find(|(p, _)| *p == prog) {
+        return Some(ft);
+    }
+    // `python3`, `python3.12`, `perl5` — the version suffix is not part of the name.
+    let base = prog.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    (base != prog)
+        .then(|| SHEBANG_FILETYPE.iter().find(|(p, _)| *p == base))
+        .flatten()
+        .map(|(_, ft)| *ft)
+}
+
+/// The last path component of a shebang's interpreter word — `/usr/bin/python3` is
+/// the `python3` interpreter. Kept as a plain `&str` split rather than going through
+/// [`Path`] so it behaves identically on a Windows host, where a shebang is still a
+/// Unix path.
+fn interpreter_name(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
 }
 
 /// Language *aliases* that aren't spelled like a file extension — the names a
@@ -3590,7 +3868,7 @@ const LANG_ALIAS: &[(&str, &str)] = &[
 /// grammar the table doesn't list (`vimdoc`, a user-installed parser), and resolution
 /// must never lose one.
 pub fn resolve_language(name: &str) -> &str {
-    if EXT_FILETYPE.iter().any(|(_, ft)| *ft == name) {
+    if is_known_filetype(name) {
         return name;
     }
     if let Some((_, lang)) = LANG_ALIAS.iter().find(|(a, _)| *a == name) {
@@ -3602,12 +3880,33 @@ pub fn resolve_language(name: &str) -> &str {
         .map_or(name, |(_, ft)| *ft)
 }
 
-/// The distinct filetype names bemtvi recognizes (the value set of [`EXT_FILETYPE`]),
-/// sorted. These are the highlighting-capable filetypes `:setfiletype` completion
-/// offers — the same source of truth extension detection uses, so the list is never
-/// stale. A buffer can still be forced to any string; this is just the known set.
+/// Whether `name` is already one of the filetypes detection can produce — the value
+/// set of every table, checked without allocating (unlike [`known_filetypes`], this
+/// runs per markdown fence and per treesitter injection).
+fn is_known_filetype(name: &str) -> bool {
+    EXT_FILETYPE
+        .iter()
+        .chain(NAME_FILETYPE)
+        .chain(PATTERN_FILETYPE)
+        .chain(SHEBANG_FILETYPE)
+        .any(|(_, ft)| *ft == name)
+}
+
+/// The distinct filetype names bemtvi recognizes — the union of every detection
+/// table's values ([`EXT_FILETYPE`], [`NAME_FILETYPE`], [`PATTERN_FILETYPE`],
+/// [`SHEBANG_FILETYPE`]), sorted. These are the filetypes `:setfiletype` completion
+/// offers — the same source of truth detection uses, so the list is never stale. The
+/// union matters: `make` and `git_config` are reachable only by filename, and a
+/// filetype detection can produce must be one a user can also spell by hand. A buffer
+/// can still be forced to any string; this is just the known set.
 pub fn known_filetypes() -> Vec<&'static str> {
-    let mut fts: Vec<&'static str> = EXT_FILETYPE.iter().map(|(_, ft)| *ft).collect();
+    let mut fts: Vec<&'static str> = EXT_FILETYPE
+        .iter()
+        .chain(NAME_FILETYPE)
+        .chain(PATTERN_FILETYPE)
+        .chain(SHEBANG_FILETYPE)
+        .map(|(_, ft)| *ft)
+        .collect();
     fts.sort_unstable();
     fts.dedup();
     fts

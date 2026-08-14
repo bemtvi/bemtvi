@@ -439,9 +439,10 @@ for _, c in ipairs({
 end
 
 -- The candidate set for a `:setfiletype` argument: the filetype names bemtvi recognizes
--- (`btv._filetypes`, injected by the server from core's extension-detection table — the
--- single source of truth). A buffer can still be forced to any string; this is the
--- known/highlighting-capable set offered for convenience.
+-- (`btv._filetypes`, injected by the server from core's detection tables — filename,
+-- path pattern, extension and shebang, unioned, so a filetype detection can produce is
+-- always one you can also spell by hand). A buffer can still be forced to any string;
+-- this is the known/highlighting-capable set offered for convenience.
 local function filetype_candidates()
   local out = {}
   for _, ft in ipairs(btv._filetypes or {}) do

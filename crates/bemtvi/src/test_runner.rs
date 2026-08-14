@@ -116,6 +116,7 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             runtimepath: vec![plugin_dir],
             clipboard: ClipboardProvider::Disabled,
             mouse_clock: None,
+            mono_clock: None,
             host_fs: None,
             host_proc: None,
             host_fs_async: None,

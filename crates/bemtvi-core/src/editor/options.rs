@@ -400,15 +400,18 @@ impl Editor {
                 |o| o.foldminlines as i64,
                 |o, v| o.foldminlines = v as usize,
             )),
+            "undolevels" => Some((|o| o.undolevels, |o, v| o.undolevels = v)),
             _ => None,
         };
         if let Some((get, set)) = buf_num {
             match op {
                 NumOp::Set(v) => {
-                    // `'softtabstop'`'s `-1` sentinel is its only negative;
+                    // `'softtabstop'`'s `-1` sentinel and `'undolevels'`'s `-1`
+                    // ("record no undo at all") are the only negatives;
                     // `'shiftwidth'` / `'foldminlines'` / `'foldnestmax'` accept 0
-                    // (vim allows `foldnestmax=0`, which collapses every fold).
-                    let min = if name == "softtabstop" {
+                    // (vim allows `foldnestmax=0`, which collapses every fold), as
+                    // does `'undolevels'` ("keep one level").
+                    let min = if matches!(name, "softtabstop" | "undolevels") {
                         -1
                     } else if matches!(name, "shiftwidth" | "foldminlines" | "foldnestmax") {
                         0

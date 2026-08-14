@@ -491,9 +491,16 @@ when painting so glyphs line up with that virtual column.
 Undo is a **branching undo tree** of full-rope snapshots (cheap thanks to
 ropey's structural sharing): undoing then making a new edit forks a branch
 rather than discarding the old future, so every past state stays reachable.
-`u` / `<C-r>` walk parent / newest-child, `:undo {N}` jumps to any seq across
-branches, and `vim.fn.undotree()` projects the tree in neovim's dict shape —
-closer to neovim's `undo.c` than the original two-stack model.
+`u` / `<C-r>` walk parent / newest-child, while `g-` / `g+` (and `:earlier` /
+`:later`, by count, by time, or by file write) walk the *states in the order they
+were made*, across branches — reaching states no `u` can. `:undo {N}` jumps to any
+seq, `:undolist` lists the branch tips, and `vim.fn.undotree()` projects the tree in
+neovim's dict shape — closer to neovim's `undo.c` than the original two-stack model.
+Each node holds a full snapshot, so `'undolevels'` (default 1000) bounds the history:
+the oldest states are pruned by re-rooting the tree, which discards the branches that
+forked below them. Node timestamps are **monotonic** seconds since the editor's time
+base, not wall clock, so ages are rendered relative (`"3 minutes ago"`) rather than as
+the clock time vim prints for older entries.
 
 ---
 
@@ -1169,7 +1176,9 @@ screen," and that is exactly the shape of these tests.
   invariant — closer to vim's own byte-column model.
 - A branching undo tree of full-rope snapshots (cheap via ropey's structural
   sharing) rather than neovim's diff-based `undo.c` change records — same
-  branching semantics (`:undo {N}`, `vim.fn.undotree()`), different storage.
+  branching semantics (`:undo {N}`, `g-`/`g+`, `:earlier`/`:later`, `:undolist`,
+  `vim.fn.undotree()`), different storage — with `'undolevels'` bounding what the
+  snapshots retain.
 - **In-process treesitter** with installable grammars and incremental parsing —
   like neovim, but kept off `bemtvi-core` behind a `SyntaxEngine` trait (so the
   pure core never links tree-sitter) and bounded by a parse deadline (see

@@ -39,10 +39,20 @@ impl EditHost {
         }
     }
 
+    /// The editor's monotonic second base, from the injected clock when a test
+    /// provides one ([`ServerInit::mono_clock`]) — so undo timestamps can be driven
+    /// deterministically — else the real elapsed time.
+    fn mono_stamp_secs(&self) -> i64 {
+        match &self.mono_clock {
+            Some(c) => c.load(std::sync::atomic::Ordering::SeqCst) as i64,
+            None => self.start.elapsed().as_secs() as i64,
+        }
+    }
+
     pub(crate) async fn handle(&mut self, message: Incoming) {
         // Stamp the editor's monotonic clock once per message: undo-node commits
         // during this message read it, and `vim.fn.localtime()` mirrors it.
-        let now = self.start.elapsed().as_secs() as i64;
+        let now = self.mono_stamp_secs();
         self.editor.set_now_mono(now);
         let _ = self.lua.set_mono_secs(now);
         // Millisecond clock for sub-second timing (the terminal triple-`<Esc>` chord),

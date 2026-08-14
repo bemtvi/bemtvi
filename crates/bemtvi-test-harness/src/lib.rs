@@ -167,6 +167,26 @@ pub async fn start_clocked() -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
     start_clocked_init(ServerInit::default()).await
 }
 
+/// [`start_attached`] (80×24) editing a fresh temp file seeded with `content`, with a
+/// fake **second** clock injected via [`ServerInit::mono_clock`] — the timeline undo
+/// nodes are stamped on. Advance it with [`TestClock::set_ms`] (the same counter,
+/// read as seconds here) between edits to place undo states at chosen ages, so
+/// `:earlier {N}s` and the `:undolist` age column can be driven without sleeping.
+pub async fn start_mono_clocked(content: &str) -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
+    let clock = TestClock::new();
+    let (rpc, incoming) = start_attached(
+        ServerInit {
+            file: Some(write_temp("mono", "txt", content)),
+            mono_clock: Some(clock.handle()),
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+    (rpc, clock, incoming)
+}
+
 /// Write `init_lua` to `<dir>/init.lua` and return a [`ServerInit`] sourcing it
 /// at startup (`dir` as both `config_dir` and the runtimepath).
 pub fn config_init(dir: &std::path::Path, init_lua: &str) -> ServerInit {
@@ -241,9 +261,19 @@ impl TestClock {
     pub fn set_ms(&self, ms: u64) {
         self.0.store(ms, Ordering::SeqCst);
     }
-    /// The shared handle to put in [`ServerInit::mouse_clock`].
+    /// The shared handle to put in [`ServerInit::mouse_clock`] or
+    /// [`ServerInit::mono_clock`].
     pub fn handle(&self) -> Arc<AtomicU64> {
         self.0.clone()
+    }
+
+    /// Set the monotonic **second** the server will stamp onto the next message —
+    /// the [`ServerInit::mono_clock`] reading. Same counter as [`set_ms`], read in a
+    /// different unit; a server takes one or the other, never both.
+    ///
+    /// [`set_ms`]: TestClock::set_ms
+    pub fn set_secs(&self, secs: u64) {
+        self.0.store(secs, Ordering::SeqCst);
     }
 }
 

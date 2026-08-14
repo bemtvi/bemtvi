@@ -87,10 +87,177 @@ impl UndoTree {
         self.nodes.iter().position(|n| n.seq == seq)
     }
 
-    /// Materialize `snap` (the live, pending state) as a new child of `cur` and
-    /// move onto it, stamped with monotonic time `now`. Caller guarantees
-    /// `dirty` — the live buffer really has diverged from `cur`.
-    fn commit(&mut self, snap: Snapshot, now: i64) {
+    /// The node holding the state **nearest** `target` in seq order, on the `back`
+    /// side of it: the greatest `seq <= target` going back, the smallest `seq >=
+    /// target` going forward.
+    ///
+    /// Seeks rather than requiring an exact hit because seqs are not guaranteed
+    /// dense — `'undolevels'` pruning drops the oldest states without renumbering
+    /// the survivors, so a target can name a state that no longer exists. Falls back
+    /// to the nearest node on the *other* side when nothing lies on the requested one
+    /// (every reachable end of a pruned tree still lands somewhere real).
+    fn node_near_seq(&self, target: u64, back: bool) -> NodeIdx {
+        let on_side = self.nodes.iter().enumerate().filter(|(_, n)| {
+            if back {
+                n.seq <= target
+            } else {
+                n.seq >= target
+            }
+        });
+        let pick = if back {
+            on_side.max_by_key(|(_, n)| n.seq)
+        } else {
+            on_side.min_by_key(|(_, n)| n.seq)
+        };
+        match pick {
+            Some((i, _)) => i,
+            // Nothing on that side (the whole tree lies past `target`): take the
+            // closest state overall rather than refusing to move.
+            None => self
+                .nodes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, n)| n.seq.abs_diff(target))
+                .map(|(i, _)| i)
+                .unwrap_or(self.cur),
+        }
+    }
+
+    /// The node whose `time` is nearest `target` on the `back` side of it — the
+    /// [`node_near_seq`](Self::node_near_seq) rule applied to timestamps, tie-broken
+    /// by seq so states stamped the same second still resolve in the travel's
+    /// direction (the clock is whole seconds, so ties are the common case).
+    fn node_near_time(&self, target: i64, back: bool) -> NodeIdx {
+        let on_side = self.nodes.iter().enumerate().filter(|(_, n)| {
+            if back {
+                n.time <= target
+            } else {
+                n.time >= target
+            }
+        });
+        let pick = if back {
+            on_side.max_by_key(|(_, n)| (n.time, n.seq))
+        } else {
+            on_side.min_by_key(|(_, n)| (n.time, n.seq))
+        };
+        match pick {
+            Some((i, _)) => i,
+            // The whole tree lies past `target`: travel as far as it goes.
+            None => self.end_node(back),
+        }
+    }
+
+    /// The save number of `cur`, else of the nearest **ancestor** that was written —
+    /// "the write this state descends from". An ancestor walk rather than a seq
+    /// comparison, because a write on an abandoned branch is not behind us.
+    fn save_at_or_above_cur(&self) -> Option<u64> {
+        let mut at = self.cur;
+        loop {
+            if let Some(nr) = self.nodes[at].save {
+                return Some(nr);
+            }
+            at = self.nodes[at].parent?;
+        }
+    }
+
+    /// The node stamped with save number `target`, or the nearest write on the `back`
+    /// side of it. A target past either end (including `<= 0`, "before the first
+    /// write") resolves to that end of the tree, so `:earlier 99f` reaches the
+    /// original text instead of refusing.
+    fn node_near_save(&self, target: i64, back: bool) -> NodeIdx {
+        if target <= 0 {
+            return self.end_node(true);
+        }
+        let target = target as u64;
+        let saves = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| n.save.map(|nr| (i, nr)))
+            .filter(|&(_, nr)| if back { nr <= target } else { nr >= target });
+        let pick = if back {
+            saves.max_by_key(|&(_, nr)| nr)
+        } else {
+            saves.min_by_key(|&(_, nr)| nr)
+        };
+        match pick {
+            Some((i, _)) => i,
+            // No write on that side — travel to that end of the history instead.
+            None => self.end_node(back),
+        }
+    }
+
+    /// The oldest (`back`) or newest node by seq — where a travel that overshoots the
+    /// history lands.
+    fn end_node(&self, back: bool) -> NodeIdx {
+        let ends = self.nodes.iter().enumerate();
+        let pick = if back {
+            ends.min_by_key(|(_, n)| n.seq)
+        } else {
+            ends.max_by_key(|(_, n)| n.seq)
+        };
+        pick.map(|(i, _)| i).unwrap_or(self.cur)
+    }
+
+    /// The **leafs** of the tree — the states `:undolist` lists (vim lists the tips of
+    /// each branch, not every state, so a linear history shows one row and each
+    /// abandoned branch adds one). Each is `(seq, changes, time, save)`, where
+    /// `changes` is the leaf's depth from the root: how many changes reach it.
+    ///
+    /// An uncommitted live edit is a leaf too — it is a real reachable state, and the
+    /// seq it *will* take on commit is the one `:undo {N}` accepts for it — so it is
+    /// woven in with the seq/time [`view`](Self::view) shows it under. It hangs off
+    /// `cur`, which stops being a leaf when it had no children of its own.
+    ///
+    /// Ordered oldest-first by seq, matching vim's listing order.
+    fn leaves(&self) -> Vec<UndoLeaf> {
+        let mut out: Vec<UndoLeaf> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.children.is_empty() && !(self.dirty && *i == self.cur))
+            .map(|(i, n)| UndoLeaf {
+                seq: n.seq,
+                changes: self.depth_of(i),
+                time: n.time,
+                save: n.save,
+            })
+            .collect();
+        if self.dirty {
+            out.push(UndoLeaf {
+                seq: self.next_seq,
+                changes: self.depth_of(self.cur) + 1,
+                time: self.dirty_since,
+                save: None,
+            });
+        }
+        out.sort_by_key(|l| l.seq);
+        out
+    }
+
+    /// How many changes reach node `idx` from the root — its depth in the tree.
+    fn depth_of(&self, idx: NodeIdx) -> usize {
+        let mut depth = 0;
+        let mut at = idx;
+        while let Some(parent) = self.nodes[at].parent {
+            depth += 1;
+            at = parent;
+        }
+        depth
+    }
+
+    /// Materialize `snap` (the live, pending state) as a new child of `cur` and move
+    /// onto it. Caller guarantees `dirty` — the live buffer really has diverged from
+    /// `cur`.
+    ///
+    /// Stamped with `dirty_since`, when the change group *began* — not the commit
+    /// instant, which is the (arbitrarily later) moment the next change group starts.
+    /// vim stamps its header the same way, and it is what [`view`](Self::view) already
+    /// reports for the state while it is still pending: without this the same state
+    /// would silently change its `undotree()` timestamp on commit, and `:earlier {N}s`
+    /// would measure from when a change *ended* rather than when it was made.
+    fn commit(&mut self, snap: Snapshot) {
+        let now = self.dirty_since;
         let seq = self.next_seq;
         self.next_seq += 1;
         let idx = self.nodes.len();
@@ -105,6 +272,82 @@ impl UndoTree {
         self.nodes[self.cur].children.push(idx);
         self.cur = idx;
         self.dirty = false;
+    }
+
+    /// Drop the oldest states until at most `keep` remain below the root —
+    /// `'undolevels'`, applied after each commit.
+    ///
+    /// In a *branching* tree "drop the oldest" means **re-rooting**: the root's child
+    /// on the path to `cur` is promoted, and the old root goes with every other
+    /// subtree hanging off it. That is vim's `u_freeheader` + `u_freebranch` — losing
+    /// the oldest history loses the branches that forked from it, because nothing
+    /// below a discarded state is reachable any more.
+    ///
+    /// `cur` is a freshly-committed leaf whenever this runs, so the path always
+    /// exists; the loop still bails rather than spinning if it ever doesn't.
+    fn prune(&mut self, keep: usize) {
+        while self.nodes.len().saturating_sub(1) > keep {
+            let Some(heir) = self.child_toward_cur(0) else {
+                return;
+            };
+            self.reroot(heir);
+        }
+    }
+
+    /// The child of `from` that lies on the path down to `cur`, by walking `cur`'s
+    /// parents back up. `None` when `cur` is `from` itself (nothing below to keep).
+    fn child_toward_cur(&self, from: NodeIdx) -> Option<NodeIdx> {
+        let mut at = self.cur;
+        loop {
+            let parent = self.nodes[at].parent?;
+            if parent == from {
+                return Some(at);
+            }
+            at = parent;
+        }
+    }
+
+    /// Keep only `heir`'s subtree, with `heir` as the new root: compact the node
+    /// vector and remap every `parent` / `children` / `cur` index onto it.
+    ///
+    /// Preserves the invariant that a node's index is greater than its parent's (the
+    /// order `commit` pushes in), so the root stays at index `0` — which [`view`] and
+    /// [`prune`] both rely on. Seqs are *not* renumbered: a state keeps the number
+    /// `:undo {N}` and `undotree()` already published for it, so travel seeks the
+    /// nearest surviving seq rather than assuming density.
+    ///
+    /// [`view`]: Self::view
+    /// [`prune`]: Self::prune
+    fn reroot(&mut self, heir: NodeIdx) {
+        let mut keep: Vec<NodeIdx> = Vec::new();
+        let mut stack = vec![heir];
+        while let Some(i) = stack.pop() {
+            keep.push(i);
+            stack.extend(self.nodes[i].children.iter().copied());
+        }
+        keep.sort_unstable();
+        let mut slot = vec![usize::MAX; self.nodes.len()];
+        for (new, &old) in keep.iter().enumerate() {
+            slot[old] = new;
+        }
+        let remap = |i: NodeIdx| (slot[i] != usize::MAX).then_some(slot[i]);
+        // Move the surviving nodes across rather than cloning — each carries a full
+        // snapshot, which is the whole reason this pruning exists.
+        let mut old: Vec<Option<UndoNode>> = std::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.nodes = keep
+            .iter()
+            .map(|&i| {
+                let mut n = old[i].take().expect("each kept node is moved once");
+                n.parent = n.parent.and_then(remap);
+                n.children.retain(|&c| slot[c] != usize::MAX);
+                n.children.iter_mut().for_each(|c| *c = slot[*c]);
+                n
+            })
+            .collect();
+        self.cur = slot[self.cur];
     }
 
     /// Project the tree into the shape `vim.fn.undotree()` returns. Read-only: an
@@ -203,6 +446,79 @@ enum SibItem {
     Pending { seq: u64, time: i64 },
 }
 
+/// How many undoable states `'undolevels'` keeps below the root.
+///
+/// vim's scale is off by one at the bottom: `-1` records no undo at all, `0` is "Vi
+/// compatible: one level", and any `n > 0` is `n` levels. Zero kept states means each
+/// change re-roots the tree onto itself — the live text is still the tree's current
+/// state, so nothing can rewind, which is what "no undo" has to mean for the snapshot
+/// to stay in sync with the buffer.
+fn undo_levels_to_keep(undolevels: i64) -> usize {
+    if undolevels < 0 {
+        0
+    } else {
+        (undolevels as usize).max(1)
+    }
+}
+
+/// What a `:earlier` / `:later` argument asks for — vim's three units.
+enum TravelArg {
+    /// `{N}` — that many states.
+    States(usize),
+    /// `{N}s|m|h|d`, normalized to seconds.
+    Seconds(i64),
+    /// `{N}f` — that many file writes.
+    Writes(usize),
+}
+
+/// Parse a `:earlier` / `:later` argument: a count, optionally suffixed with a time
+/// unit (`s`/`m`/`h`/`d`) or `f` for file writes. `None` for anything else, which the
+/// caller turns into `E475` — never a silently-ignored argument.
+fn parse_travel_arg(arg: &str) -> Option<TravelArg> {
+    let digits: String = arg.chars().take_while(char::is_ascii_digit).collect();
+    let n: u64 = digits.parse().ok()?;
+    // An absurd count is "as far as it goes", not an error and never a wrapped
+    // negative that would travel the wrong way — every conversion below saturates.
+    let secs = i64::try_from(n).unwrap_or(i64::MAX);
+    let count = usize::try_from(n).unwrap_or(usize::MAX);
+    match &arg[digits.len()..] {
+        "" => Some(TravelArg::States(count)),
+        "s" => Some(TravelArg::Seconds(secs)),
+        "m" => Some(TravelArg::Seconds(secs.saturating_mul(60))),
+        "h" => Some(TravelArg::Seconds(secs.saturating_mul(3_600))),
+        "d" => Some(TravelArg::Seconds(secs.saturating_mul(86_400))),
+        "f" => Some(TravelArg::Writes(count)),
+        _ => None,
+    }
+}
+
+/// One row of `:undolist` — a branch tip, as [`UndoTree::leaves`] finds it.
+struct UndoLeaf {
+    seq: u64,
+    /// Depth from the root: how many changes reach this state.
+    changes: usize,
+    time: i64,
+    save: Option<u64>,
+}
+
+/// Render an age in `secs` seconds as vim's `:undolist` "when" column.
+///
+/// vim prints `"{n} seconds ago"` under 100 seconds and a wall-clock `HH:MM:SS`
+/// above it. bemtvi's undo timeline is deliberately **monotonic** (seconds since
+/// the editor's time base — see [`UndoNode::time`]), so there is no wall clock to
+/// print; every age stays relative, extending vim's own form into larger units
+/// rather than contradicting it.
+fn format_ago(secs: i64) -> String {
+    let (n, unit) = match secs.max(0) {
+        s if s < 60 => (s, "second"),
+        s if s < 3600 => (s / 60, "minute"),
+        s if s < 86_400 => (s / 3600, "hour"),
+        s => (s / 86_400, "day"),
+    };
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{plural} ago")
+}
+
 /// The `vim.fn.undotree()` result for one buffer — neovim's dict, minus the
 /// fields the visualizer ignores. Built by the core; the server serializes it.
 pub struct UndoTreeView {
@@ -256,8 +572,13 @@ impl Editor {
             return;
         }
         let snap = self.snapshot_of(id);
-        let now = self.now_mono;
-        self.buffers.get_mut(id).undo.commit(snap, now);
+        let keep = undo_levels_to_keep(self.buffers.get(id).buffer.options.undolevels);
+        let ob = self.buffers.get_mut(id);
+        ob.undo.commit(snap);
+        // Bound the history to `'undolevels'`. Pruning here (rather than when the
+        // option is set) matches vim: a new limit governs what is kept from the next
+        // change on, it does not retroactively free what is already recorded.
+        ob.undo.prune(keep);
     }
 
     /// Record that buffer `id` was just written to disk: commit any pending edit
@@ -280,6 +601,42 @@ impl Editor {
     /// snapshot before later same-state extmark/mark mutations.
     pub fn undotree_of(&self, id: BufferId) -> UndoTreeView {
         self.buffers.get(id).undo.view()
+    }
+
+    /// `:undol[ist]` — list the **leafs** in the tree of changes into a read-only
+    /// scratch listing (vim lists branch tips, not every state: a linear history is
+    /// one row, and each abandoned branch adds one). Columns are vim's `number`
+    /// (seq), `changes` (depth from the root), `when` (see [`format_ago`]) and
+    /// `saved` (the write number, blank for a state never written).
+    ///
+    /// Read-only, like [`Editor::undotree_of`]: an uncommitted live edit is listed as
+    /// the virtual state it will become rather than committed here, so opening the
+    /// listing never freezes a snapshot mid-change-group.
+    pub(crate) fn ex_undolist(&mut self) {
+        let id = self.cur_buffer();
+        let tree = &self.buffers.get(id).undo;
+        if tree.seq_last() == 0 && !tree.dirty {
+            self.echo("Nothing to undo");
+            return;
+        }
+        let now = self.now_mono;
+        let mut lines = vec!["number changes  when               saved".to_string()];
+        for leaf in tree.leaves() {
+            let mut row = format!(
+                "{:>6} {:>7}  {}",
+                leaf.seq,
+                leaf.changes,
+                format_ago(now - leaf.time)
+            );
+            if let Some(nr) = leaf.save {
+                // vim pads the "when" column out to 33 before the saved number.
+                let pad = 33usize.saturating_sub(row.chars().count());
+                row.push_str(&" ".repeat(pad));
+                row.push_str(&format!("  {nr:>3}"));
+            }
+            lines.push(row);
+        }
+        self.open_scratch_listing("[Undo]", lines, 0);
     }
 
     /// A cheap fingerprint of buffer `id`'s undo projection — `(next_seq, cur,
@@ -399,6 +756,122 @@ impl Editor {
         let snap = tree.nodes[node].snap.clone();
         self.buffers.get_mut(id).undo.cur = node;
         self.restore_snapshot(snap, target);
+    }
+
+    /// `g-` / `g+` / `:earlier {N}` / `:later {N}` — move `count` states along **seq
+    /// order**, across branches, going back when `back`.
+    ///
+    /// This is deliberately not `u`/`<C-r>`: those walk the tree (to the parent, to
+    /// the newest child), while this walks the states in the order they were made.
+    /// On a linear history the two coincide; once a branch exists they do not, which
+    /// is the whole point of the pair — `g-` reaches an abandoned branch's states
+    /// that no amount of `u` can.
+    ///
+    /// The target is clamped to the tree's ends, so a large count travels as far as
+    /// it can rather than refusing; only a step that cannot move at all reports
+    /// vim's boundary message.
+    pub(crate) fn undo_travel(&mut self, count: usize, back: bool) {
+        if count == 0 {
+            return;
+        }
+        let id = self.cur_buffer();
+        // Any pending edit becomes a real state first — otherwise the change just
+        // typed would be skipped over instead of being the thing `g-` steps off.
+        self.commit_undo(id);
+        let tree = &self.buffers.get(id).undo;
+        let cur = tree.cur_seq() as i64;
+        let step = i64::try_from(count).unwrap_or(i64::MAX);
+        let target = if back {
+            cur.saturating_sub(step)
+        } else {
+            cur.saturating_add(step)
+        };
+        let target = target.clamp(0, tree.seq_last() as i64) as u64;
+        let node = tree.node_near_seq(target, back);
+        self.undo_land_on(node, back);
+    }
+
+    /// `:earlier {N}s|m|h|d` / `:later {N}s|m|h|d` — travel to the state as it was
+    /// `secs` seconds either side of **the current state's** timestamp (vim measures
+    /// from `b_u_time_cur`, not from now, so repeated `:earlier 10s` keeps stepping
+    /// back rather than sticking).
+    pub(crate) fn undo_travel_time(&mut self, secs: i64, back: bool) {
+        let id = self.cur_buffer();
+        self.commit_undo(id);
+        let tree = &self.buffers.get(id).undo;
+        let base = tree.nodes[tree.cur].time;
+        let target = if back {
+            base.saturating_sub(secs)
+        } else {
+            base.saturating_add(secs)
+        };
+        let node = tree.node_near_time(target, back);
+        self.undo_land_on(node, back);
+    }
+
+    /// `:earlier {N}f` / `:later {N}f` — travel `count` **file writes**. When the
+    /// current state is not itself a write, going back spends its first step reaching
+    /// the last write (vim's behavior), so `:earlier 1f` from a dirty buffer returns
+    /// to what is on disk.
+    pub(crate) fn undo_travel_file(&mut self, count: usize, back: bool) {
+        if count == 0 {
+            return;
+        }
+        let id = self.cur_buffer();
+        self.commit_undo(id);
+        let tree = &self.buffers.get(id).undo;
+        let at_save = tree.nodes[tree.cur].save.is_some();
+        // The write this state descends from — an *ancestor* walk, not a seq
+        // comparison: a write on an abandoned branch is not behind us.
+        let base = tree.save_at_or_above_cur().unwrap_or(0) as i64;
+        let step = i64::try_from(count).unwrap_or(i64::MAX);
+        let target = if back {
+            // Not at a write? The first step is spent reaching the last one.
+            base.saturating_sub(if at_save { step } else { step - 1 })
+        } else {
+            base.saturating_add(step)
+        };
+        let node = tree.node_near_save(target, back);
+        self.undo_land_on(node, back);
+    }
+
+    /// Land on `node`, or report vim's boundary message when the travel could not
+    /// move at all. Shared by every `g-`/`g+`/`:earlier`/`:later` form.
+    fn undo_land_on(&mut self, node: NodeIdx, back: bool) {
+        let id = self.cur_buffer();
+        let tree = &self.buffers.get(id).undo;
+        if node == tree.cur {
+            self.echo(if back {
+                "Already at oldest change"
+            } else {
+                "Already at newest change"
+            });
+            return;
+        }
+        let snap = tree.nodes[node].snap.clone();
+        let seq = tree.nodes[node].seq;
+        self.buffers.get_mut(id).undo.cur = node;
+        self.restore_snapshot(snap, seq);
+    }
+
+    /// `:ea[rlier] [N][s|m|h|d|f]` / `:lat[er] …` — the ex form of `g-` / `g+`, with
+    /// vim's time and file-write units. A bare command means one state. An argument
+    /// that parses as none of these is `E475`, loud, rather than a silent no-op.
+    pub(crate) fn ex_undo_travel(&mut self, args: &str, back: bool) {
+        let arg = args.trim();
+        if arg.is_empty() {
+            self.undo_travel(1, back);
+            return;
+        }
+        let Some(spec) = parse_travel_arg(arg) else {
+            self.echo(format!("E475: Invalid argument: {arg}"));
+            return;
+        };
+        match spec {
+            TravelArg::States(n) => self.undo_travel(n, back),
+            TravelArg::Seconds(s) => self.undo_travel_time(s, back),
+            TravelArg::Writes(n) => self.undo_travel_file(n, back),
+        }
     }
 
     /// Restore the current buffer to `snap` (the state numbered `seq`): swap in the

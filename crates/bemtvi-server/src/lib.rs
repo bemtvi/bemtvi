@@ -357,6 +357,12 @@ pub struct ServerInit {
     /// and advances it between clicks to drive `'mousetime'` deterministically,
     /// without depending on wall-clock timing. See [`EditHost::mouse_stamp_ms`].
     pub mouse_clock: Option<Arc<AtomicU64>>,
+    /// A fake **second** clock for the editor's monotonic time base — the timeline
+    /// undo nodes are stamped on and `vim.fn.localtime()` mirrors. `None` (the
+    /// default) uses `start.elapsed()`; a test injects a shared counter and advances
+    /// it between edits so `:earlier {N}s` / the `:undolist` age column can be driven
+    /// without sleeping. See [`EditHost::mono_stamp_secs`].
+    pub mono_clock: Option<Arc<AtomicU64>>,
     /// The filesystem backend the editor reads and writes buffers through. `None`
     /// (the default) uses the local disk ([`StdHostFs`]); the edit-host split will
     /// inject a daemon-backed [`HostFs`] here so buffer I/O — including the initial
@@ -1409,6 +1415,9 @@ pub struct EditHost {
     /// Optional fake clock for the mouse multi-click timestamp ([`ServerInit::mouse_clock`]);
     /// when set, [`EditHost::mouse_stamp_ms`] reads it instead of `start.elapsed()`.
     mouse_clock: Option<Arc<AtomicU64>>,
+    /// Optional fake clock for the monotonic second base ([`ServerInit::mono_clock`]);
+    /// when set, [`EditHost::mono_stamp_secs`] reads it instead of `start.elapsed()`.
+    mono_clock: Option<Arc<AtomicU64>>,
     /// The highlight-registry [`generation`](bemtvi_core::highlight::Highlights::generation)
     /// last folded into the `btv._hl_defs` Lua mirror ([`EditHost::push_buf_mirror`]).
     /// The mirror (potentially hundreds of groups) is re-pushed only when this
@@ -1959,6 +1968,7 @@ impl EditHost {
             reg_mirror_specials: Vec::new(),
             start: std::time::Instant::now(),
             mouse_clock: None,
+            mono_clock: None,
             hl_mirror_gen: None,
             scheme_groups: std::collections::HashSet::new(),
             pending_ui_input: None,
@@ -4177,6 +4187,7 @@ where
         _ => None,
     };
     host.mouse_clock = init.mouse_clock;
+    host.mono_clock = init.mono_clock;
     // The `--lua` one-shot routes `print` / echo / error output to the real stdout/stderr
     // (no UI is attached to show the message line). Safe only here: this session's client
     // wire is an in-process duplex, so the process stdout is free.

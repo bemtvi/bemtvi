@@ -1089,6 +1089,9 @@ local BUF_OPT_CANON = {
   fdn = "foldnestmax",
   foldminlines = "foldminlines",
   fml = "foldminlines",
+  -- How many undo states the buffer's history keeps (`:set undolevels=…`).
+  undolevels = "undolevels",
+  ul = "undolevels",
   -- The change flag (`vim.bo.modified` / `:set [no]modified`). Reads return the
   -- server-mirrored buffer state; a write reaches the core to set/clear it — clearing
   -- is how a plugin that fills a buffer as a *read* (a `BufReadCmd` directory listing)
@@ -1122,6 +1125,7 @@ local BUF_OPT_DEFAULT = {
   foldmarker = "{{{,}}}",
   foldnestmax = 20,
   foldminlines = 1,
+  undolevels = 1000,
   modified = false,
 }
 

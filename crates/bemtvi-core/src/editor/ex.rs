@@ -1182,6 +1182,15 @@ impl Editor {
                 },
             },
             "red" | "redo" => self.redo(),
+            // `:undol[ist]` lists the tree's branch tips. Its abbreviations start at
+            // `undol` — `:u`…`:undo` are the undo command above, as in vim.
+            "undol" | "undoli" | "undolis" | "undolist" => self.ex_undolist(),
+            // `:ea[rlier]` / `:lat[er]` — travel the undo states by count (the ex form
+            // of `g-` / `g+`).
+            "ea" | "ear" | "earl" | "earli" | "earlie" | "earlier" => {
+                self.ex_undo_travel(args, true)
+            }
+            "lat" | "late" | "later" => self.ex_undo_travel(args, false),
             "noh" | "nohlsearch" => self.search_active = false,
             name if is_substitute_name(name) => self.ex_substitute(range, args),
             // `:[range]g[!]/pat/cmd` runs `cmd` on every line matching `pat`

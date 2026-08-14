@@ -753,6 +753,7 @@ fn main() -> Result<()> {
         // The real binary uses the monotonic wall clock for mouse multi-click
         // timing; only tests inject a fake clock here.
         mouse_clock: None,
+        mono_clock: None,
         // The local binary reads/writes through the real disk (the default); a
         // daemon-backed fs is injected here by the edit-host split.
         host_fs: None,
@@ -1198,6 +1199,7 @@ where
         runtimepath: resolved.runtimepath,
         clipboard: bemtvi_server::ClipboardProvider::System,
         mouse_clock: None,
+        mono_clock: None,
         // The local disk is unused for buffers in a daemon session — every
         // fs/process/LSP/Lua-fs path is routed to the daemon below.
         host_fs: None,

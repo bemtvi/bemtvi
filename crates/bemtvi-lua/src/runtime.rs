@@ -462,6 +462,9 @@ pub struct BoMirror {
     /// computed folds — mirrored for `vim.bo` read-back.
     pub foldnestmax: usize,
     pub foldminlines: usize,
+    /// The buffer's `'undolevels'` — how many undo states its history keeps —
+    /// mirrored for `vim.bo` read-back.
+    pub undolevels: i64,
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`
@@ -507,6 +510,7 @@ pub struct BoGlobalMirror {
     pub foldmethod: String,
     pub foldnestmax: usize,
     pub foldminlines: usize,
+    pub undolevels: i64,
     /// The three buffer options stored in a per-buffer map rather than an options slot.
     /// Empty ⇒ no global value: `commentstring` then falls through to the filetype
     /// default, `foldexpr` to "no expression", `foldmarker` reads vim's `{{{,}}}`.

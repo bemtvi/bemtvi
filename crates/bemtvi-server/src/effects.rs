@@ -2269,6 +2269,7 @@ impl EditHost {
                         },
                         foldnestmax: o.foldnestmax,
                         foldminlines: o.foldminlines,
+                        undolevels: o.undolevels,
                     });
                     self.bo_mirror_known.insert(id);
                 }
@@ -2560,6 +2561,7 @@ impl EditHost {
             foldmethod: g.foldmethod.to_string(),
             foldnestmax: g.foldnestmax,
             foldminlines: g.foldminlines,
+            undolevels: g.undolevels,
             commentstring: self.editor.commentstring_global().to_string(),
             foldexpr: self.editor.foldexpr_global().to_string(),
             foldmarker: {

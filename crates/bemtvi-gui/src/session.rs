@@ -418,6 +418,7 @@ async fn server_init(
         runtimepath,
         clipboard: ClipboardProvider::System,
         mouse_clock: None,
+        mono_clock: None,
         host_fs,
         host_proc,
         host_fs_async,

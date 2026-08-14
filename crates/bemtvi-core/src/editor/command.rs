@@ -487,6 +487,7 @@ enum NormalCmd {
     PasteBefore,            // P
     Undo,                   // u
     Redo,                   // <C-r>
+    TimeTravel(bool),       // g- (true) / g+
     Join,                   // J
     ToggleCase,             // ~
     EnterVisual,            // v
@@ -1332,6 +1333,10 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             // `g;` / `g,` walk the change list (older / newer change positions).
             Some(';') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeOlder)),
             Some(',') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeNewer)),
+            // `g-` / `g+` walk the undo *states* in the order they were made — the
+            // keyboard form of `:earlier` / `:later`.
+            Some('-') => return Complete(ResolvedCommand::Normal(NormalCmd::TimeTravel(true))),
+            Some('+') => return Complete(ResolvedCommand::Normal(NormalCmd::TimeTravel(false))),
             // `` g` `` / `g'` — like `` ` ``/`'` but they do not record the
             // previous-context mark / jumplist (vim's quiet jump). The name follows;
             // arm the same jump stage with `set_jump = false`.
@@ -2498,6 +2503,13 @@ impl Editor {
             NormalCmd::Redo => {
                 self.change_not_repeatable = true;
                 self.redo();
+            }
+            // Like undo/redo, time travel edits the buffer but is not the dot-repeat
+            // target — the recorder must discard it so `.` keeps replaying the change
+            // that preceded it.
+            NormalCmd::TimeTravel(back) => {
+                self.change_not_repeatable = true;
+                self.undo_travel(count, back);
             }
             NormalCmd::Join => self.edit_each_cursor(|ed| ed.join_lines(count.max(2))),
             NormalCmd::ToggleCase => self.edit_each_cursor(|ed| ed.toggle_case(count)),

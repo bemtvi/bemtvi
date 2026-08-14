@@ -1304,6 +1304,12 @@ pub struct BufferOptions {
     /// two or more lines to collapse). Ignored by `manual` (a hand-made `zf` over a
     /// single line is already rejected).
     pub foldminlines: usize,
+    /// How many undo states the buffer's history keeps (`'undolevels'`). The oldest
+    /// states past this are pruned, taking any branches forked below them with them —
+    /// each state holds a full snapshot, so an unbounded history grows without limit
+    /// over a long session. Default 1000 (vim's default). `0` keeps a single level;
+    /// `-1` records no undo at all.
+    pub undolevels: i64,
     /// Whether the buffer's text may be changed (`'modifiable'`). Default `true`.
     /// When `false`, edits are refused with `E21` at the same chokepoints as a
     /// read-only [`crate::BufferKind`] (via [`crate::Editor::modifiable`]) — vim's
@@ -1354,6 +1360,8 @@ impl Default for BufferOptions {
             // vim's `foldnestmax`/`foldminlines` defaults.
             foldnestmax: 20,
             foldminlines: 1,
+            // vim's `undolevels` default.
+            undolevels: 1000,
             // An ordinary buffer is editable; the read-only scratch listings flip
             // this to false at creation.
             modifiable: true,
@@ -1402,6 +1410,7 @@ impl BufferOptions {
             foldmethod,
             foldnestmax,
             foldminlines,
+            undolevels,
             // ---- read-derived: `self` keeps its own ----
             fileencoding: _,
             bomb: _,
@@ -1422,6 +1431,7 @@ impl BufferOptions {
         self.foldmethod = foldmethod;
         self.foldnestmax = foldnestmax;
         self.foldminlines = foldminlines;
+        self.undolevels = undolevels;
     }
 
     /// `tabstop`, floored at 1 so a degenerate `0` never divides by zero.
@@ -1883,6 +1893,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Buffer,
             doc: "Minimum line span for a fold to display closed.",
+        },
+        OptionInfo {
+            name: "undolevels",
+            abbrev: Some("ul"),
+            kind: Num,
+            scope: Buffer,
+            doc: "How many undo states the history keeps (-1 records none).",
         },
         OptionInfo {
             name: "filetype",

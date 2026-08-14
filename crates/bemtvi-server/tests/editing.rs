@@ -95,5 +95,7 @@ mod shift;
 mod statusline;
 #[path = "editing/text_objects.rs"]
 mod text_objects;
+#[path = "editing/undo.rs"]
+mod undo;
 #[path = "editing/visual_replace.rs"]
 mod visual_replace;

@@ -53,7 +53,9 @@ fn place_docs_beside(
 /// `check_multiclick` — a same-cell repeat within `'mousetime'` escalates the
 /// selected unit) plus the anchor a drag extends from. One value spans a whole
 /// press → drag → release gesture and persists into the gap before the next press
-/// so a quick same-cell repeat is counted as a double-/triple-click.
+/// so a quick same-cell repeat is counted as a double-/triple-click. Which of the
+/// two roles it is playing is [`live`](MouseSelect::live): only an in-flight
+/// gesture can be dragged from, a settled one is history.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MouseSelect {
     /// Screen cell of the press, to detect a same-cell repeat.
@@ -67,6 +69,13 @@ pub(crate) struct MouseSelect {
     /// What the drag pivots around: the press point (single click), or the whole
     /// word / line first selected (so a drag extends by whole units).
     anchor: SelectAnchor,
+    /// Whether the gesture that set this anchor is still in flight — `true` from a
+    /// *text* press until its release. It survives the release only as the
+    /// multi-click history, and a settled anchor must never be dragged from: the
+    /// clients repeat a held drag at the top/bottom edge row to auto-scroll, and
+    /// row 0 is chrome (the tabline), so a press there would otherwise resurrect
+    /// the previous click's anchor and select from the cursor to the screen top.
+    live: bool,
 }
 
 /// In-flight separator / status-line drag (Phase 5): a left-press that landed on
@@ -339,6 +348,14 @@ impl Editor {
         // here rather than in each arm so a new gesture kind can't inherit a stale
         // suspension. See [`Editor::mouse_dragging`].
         self.mouse_dragging = false;
+        // A left release ends the *selection gesture* wherever it is claimed below
+        // (text, a resize, a widget that swallows it): the anchor stays behind only
+        // as the multi-click history, so no later drag can extend from it.
+        if (ev.button, ev.action) == (MouseButton::Left, MouseAction::Release) {
+            if let Some(sel) = self.mouse_select.as_mut() {
+                sel.live = false;
+            }
+        }
         match (ev.button, ev.action) {
             // In multi-cursor placement mode a left-click *toggles* a cursor at the
             // clicked cell — drop one if it's bare, remove it if one is there — the
@@ -629,6 +646,7 @@ impl Editor {
             stamp_ms,
             count,
             anchor: SelectAnchor::Char(self.cursor),
+            live: true,
         });
         // A plain-left click carries its `<C-…>` / `<A-…>` modifiers so a
         // `<C-LeftMouse>` map is distinguished from a bare `<LeftMouse>`; `shift` is
@@ -1387,6 +1405,7 @@ impl Editor {
                 stamp_ms,
                 count: 3,
                 anchor: SelectAnchor::Line(anchor_line),
+                live: true,
             });
             return;
         }
@@ -1404,6 +1423,7 @@ impl Editor {
             stamp_ms,
             count: 1,
             anchor: SelectAnchor::Char(anchor),
+            live: true,
         });
     }
 
@@ -1581,7 +1601,10 @@ impl Editor {
     /// client repeats the drag while the button is held at the edge, turning the
     /// per-event one-line step into a continuous scroll.
     fn mouse_left_drag(&mut self, row: usize, col: usize) {
-        let Some(sel) = self.mouse_select else {
+        // Only an in-flight gesture extends: after its release the anchor lingers
+        // purely as the multi-click history, and a drag arriving on top of a press
+        // that landed on chrome (a tab, the fill strip) must not select from it.
+        let Some(sel) = self.mouse_select.filter(|s| s.live) else {
             return;
         };
         let win = self.current_window_id();

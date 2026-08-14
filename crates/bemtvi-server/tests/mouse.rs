@@ -1529,6 +1529,53 @@ async fn click_past_last_tab_is_noop() {
     assert_eq!(mode(&rpc).await, "n");
 }
 
+/// A press on the tabline must not leave a *text* drag armed. Both clients repeat
+/// the held drag at the edge row while the button is down (the auto-scroll pace),
+/// and row 0 — the tabline — is in that edge band, so a stale selection anchor
+/// left over from an earlier text click used to turn a plain tab click into a
+/// Visual selection running from the cursor up to the top of the screen.
+#[tokio::test]
+async fn tabline_click_then_drag_starts_no_selection() {
+    let dir = temp_dir("mouse_tabline_drag");
+    for (name, body) in [
+        ("aaa.txt", "alpha\nbravo\ncharlie\ndelta\n"),
+        ("bbb.txt", "one\ntwo\nthree\nfour\n"),
+    ] {
+        std::fs::write(dir.join(name), body).expect("write tab file");
+    }
+    let init = ServerInit {
+        file: Some(dir.join("aaa.txt").to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    command(&rpc, &format!("tabnew {}", dir.join("bbb.txt").display())).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // A real text click first: it ends on release, but leaves the multi-click
+    // history (the same cell + stamp a double-click would escalate from) behind.
+    // The tabline eats global row 0, so row 4 is the buffer's 4th line.
+    feed_mouse(&rpc, "left", "press", 4, 2);
+    feed_mouse(&rpc, "left", "release", 4, 2);
+    assert_eq!(
+        cursor(&rpc).await,
+        (4, 2),
+        "the text click placed the cursor"
+    );
+    // Now click a tab and hold — the client repeats the drag at the pressed cell.
+    feed_mouse(&rpc, "left", "press", 0, 3);
+    feed_mouse(&rpc, "left", "drag", 0, 3);
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "bravo", "charlie", "delta"],
+        "the tab click switched tabs"
+    );
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "a click held on the tabline must not start a Visual selection"
+    );
+}
+
 #[tokio::test]
 async fn click_custom_tabline_without_regions_is_noop() {
     let (rpc, _incoming) = start_tabs().await;

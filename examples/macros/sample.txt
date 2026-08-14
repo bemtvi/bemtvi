@@ -1,0 +1,12 @@
+alpha bravo charlie
+delta echo foxtrot
+golf hotel india
+juliett kilo lima
+mike november oscar
+papa quebec romeo
+
+TODO write the release notes
+TODO check the changelog
+TODO tag the version
+
+one two three four five

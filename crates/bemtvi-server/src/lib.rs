@@ -215,6 +215,19 @@ pub use session_spawn::{
 #[cfg(not(feature = "native"))]
 const WASM_REMOTE_CACHE_ROOT: &str = "/bemtvi/remote";
 
+/// One macro playback in flight: the register's keys, how far through them we
+/// are, and how many repeats are left (`{count}<F3>a`). Held on a stack by
+/// [`EditHost::drive_macro_play`], so a macro that plays another suspends its
+/// caller rather than splicing into it.
+struct MacroFrame {
+    /// The register this frame is playing, mirrored to core for
+    /// `btv.macro.executing()` while it is the innermost frame.
+    reg: char,
+    keys: Vec<Key>,
+    pos: usize,
+    repeats: usize,
+}
+
 /// The native daemon transport (Open Decision #2): a WebTransport/QUIC listener that
 /// runs the [`run_daemon_io`] multiplexer over one bidi stream ([`serve_quic`], the
 /// `--daemon --listen` role), and the edit-host-side [`connect_quic_reconnecting`] that pins
@@ -1524,6 +1537,17 @@ pub struct EditHost {
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
     feed_buffer: VecDeque<(Key, bool)>,
+    /// Depth of the "these keys are not typed input" guard around macro recording:
+    /// a mapping's RHS, the `nvim_feedkeys` typeahead drain, and a macro playing
+    /// back all raise it. A macro recording captures only what the user pressed (see
+    /// `EditHost::note_macro_keys` and `bemtvi_core`'s `editor::macros`).
+    macro_suppress: u32,
+    /// The macro playbacks in flight (`{count}<F3>{reg}`), innermost last — a
+    /// stack so a macro can play another. Driven by `EditHost::drive_macro_play`.
+    macro_play: Vec<MacroFrame>,
+    /// The `(recording, executing)` pair last pushed to Lua, so an idle tick skips
+    /// the bridge call (`btv._macro_state`).
+    macro_state_mirror: (Option<char>, Option<char>),
     /// The keys of a bracketed paste being collected — `Some` between the client's
     /// `<PasteStart>` and `<PasteEnd>` markers, `None` the rest of the time. A paste
     /// is one edit, not a burst of typing, so the payload is gathered here (never
@@ -1898,6 +1922,9 @@ impl EditHost {
             preview_hscroll: 0,
             preview_anchor: None,
             feed_buffer: VecDeque::new(),
+            macro_suppress: 0,
+            macro_play: Vec::new(),
+            macro_state_mirror: (None, None),
             paste_payload: None,
             test_mode: false,
             lua_stdio: false,

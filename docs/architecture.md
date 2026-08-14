@@ -1293,8 +1293,11 @@ screen," and that is exactly the shape of these tests.
   Named/numbered/special **registers** (`:registers`, `setreg`/`getreg`, the
   system clipboard `"+`/`"*`) and **marks** (buffer-local `a`–`z`, global file
   marks `A`–`Z`, the automatic special marks, `:marks`, and `'{mark}` ex-ranges)
-  are both done; what remains here is macros and the `:map`-family
-  ex-commands (intentionally postponed — keymaps are set via `vim.keymap.set` /
+  are both done, as are **keyboard macros** — on `<F2>`/`<F3>` rather than
+  vim's `q`/`@` (see `docs/features/macros.md`), recorded as key notation into an
+  ordinary register and replayed *through the keymap matcher*, so a macro over a
+  Lua keymap re-fires it. What remains here is the `:map`-family ex-commands
+  (intentionally postponed — keymaps are set via `vim.keymap.set` /
   `nvim_set_keymap`).
   **Code folding** is done across all four sources — manual (`zf`/the `z` family),
   `foldmethod=indent`, `foldmethod=expr` (the native tree-sitter foldexpr and a

@@ -788,12 +788,17 @@ impl View {
             cmdline_prefix: ed.cmdline_prefix(),
             cmdline_prompt: ed.cmdline_prompt().to_string(),
             cmdline_cursor: ed.cmdline_cursor(),
-            // In terminal-job mode every key goes to the child, so surface the way
-            // out where vim shows `-- INSERT --` (unless a real message is up).
-            message: if ed.mode == Mode::Terminal && ed.message.is_empty() {
-                "-- TERMINAL --  (<C-\\><C-n> or 3×<Esc> to exit)".to_string()
-            } else {
-                ed.message.clone()
+            // Two placeholders ride the idle message line where vim shows
+            // `-- INSERT --`, each only while no real message is up. In terminal-job
+            // mode every key goes to the child, so surface the way out; and a macro
+            // recording announces itself exactly as vim does (`recording @a`), which
+            // is why it needs no field of its own on the wire.
+            message: match (ed.message.is_empty(), ed.mode, ed.recording_register()) {
+                (true, Mode::Terminal, _) => {
+                    "-- TERMINAL --  (<C-\\><C-n> or 3×<Esc> to exit)".to_string()
+                }
+                (true, _, Some(reg)) => format!("recording @{reg}"),
+                _ => ed.message.clone(),
             },
             // The terminal placeholder isn't an error; the flag only rides a real
             // message (`message_error` is stale-but-unseen when `message` is empty).
@@ -1162,6 +1167,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         cursor_screen_col,
         top,
         text_height: height,
+        recording: ed.recording_register(),
     });
 
     // The fold-marker gutter: one string per visible row, each `foldcolumn` cells
@@ -1263,6 +1269,8 @@ struct StatusCtxInputs<'a> {
     /// 0-based first visible buffer line, and visible text rows, for `%P`.
     top: usize,
     text_height: usize,
+    /// The macro register being recorded into, for the `macro` segment.
+    recording: Option<char>,
 }
 
 /// Build the [`StatuslineCtx`] the `%`-format engine expands its built-in fields
@@ -1303,6 +1311,7 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
         // Diagnostics are LSP-sourced and live in the server; core defaults to
         // zero and the server fills the counts in on the segment-render path.
         diag_counts: [0; 4],
+        recording: inp.recording,
     }
 }
 

@@ -221,6 +221,16 @@ function btv._set_go_mirror(t)
   btv._go_mirror = t or {}
 end
 
+-- Rust→Lua mirror of the keyboard-macro state, refreshed by the server each tick:
+-- `recording` is the register `<F2>{reg}` is recording into, `executing` the one a
+-- `<F3>{reg}` playback is running, each `nil` when idle. Backs `btv.macro.recording`
+-- / `btv.macro.executing` (and their `vim.fn.reg_recording` / `reg_executing`
+-- aliases), which is how a statusline or a plugin asks "is a macro in flight".
+btv._macro_state = btv._macro_state or {}
+function btv._set_macro_state(t)
+  btv._macro_state = t or {}
+end
+
 -- Rust→Lua mirror of the core register file, refreshed by the server
 -- (`btv._set_reg_mirror`) before any Lua that can read registers. Keyed by the
 -- single-char register name -> { text, type } where type is `"v"` (charwise) or
@@ -2258,6 +2268,51 @@ function btv.reg.gettype(name)
   return entry and entry.type or "v"
 end
 vim.fn.getregtype = btv.reg.gettype
+
+-- `btv.macro`: the keyboard macros `<F2>{reg}` records and `<F3>{reg}` plays back.
+-- A macro is an ordinary register holding bemtvi key notation (`ciwfoo<Esc>`), so
+-- `btv.reg.get`/`btv.reg.set` read and write one like any other register — these
+-- verbs are for the state the register cannot carry.
+btv.macro = btv.macro or {}
+
+-- `btv.macro.recording`() [alias `vim.fn.reg_recording`]: the name of the register a
+-- macro is being recorded into right now, or `nil` when nothing is recording. The
+-- `vim.fn` alias returns `""` instead of `nil`, matching vim.
+function btv.macro.recording()
+  return btv._macro_state.recording
+end
+
+-- `btv.macro.executing`() [alias `vim.fn.reg_executing`]: the name of the register
+-- whose macro is playing back right now, or `nil` when none is. Useful to skip work
+-- that only matters to a human watching — a plugin can cheaply no-op while a long
+-- `100<F3>a` runs. Nested playback reports the INNERMOST register.
+function btv.macro.executing()
+  return btv._macro_state.executing
+end
+
+-- `btv.macro.play`(name [, count]): play register `name` back as keys, `count` times
+-- (default 1) — the `<F3>{name}` command from Lua. The keys are queued and run after
+-- the current chunk settles, like any other key feed; the call returns immediately.
+function btv.macro.play(name, count)
+  name = tostring(name or "")
+  if #name ~= 1 then
+    error("btv.macro.play: expected a single-character register name, got " .. vim.inspect(name))
+  end
+  local keys = btv.reg.get(name)
+  if keys == "" then
+    return
+  end
+  for _ = 1, math.max(1, tonumber(count) or 1) do
+    btv._feedkeys(keys, true, false)
+  end
+end
+
+vim.fn.reg_recording = function()
+  return btv.macro.recording() or ""
+end
+vim.fn.reg_executing = function()
+  return btv.macro.executing() or ""
+end
 
 -- ---------------------------------------------------------------------------
 -- The option catalog, and the routing tables derived from it.

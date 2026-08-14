@@ -35,6 +35,7 @@ local BUILTIN = {
   modified = true,
   readonly = true,
   diagnostics = true,
+  macro = true,
 }
 
 -- `btv.statusline.segment` { name = `"git"`, events = { `"BufEnter"`, `"DirChanged"` },

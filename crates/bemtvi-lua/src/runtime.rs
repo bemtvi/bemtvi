@@ -3999,6 +3999,28 @@ impl LuaRuntime {
         set.call(entries)
     }
 
+    /// Refresh the `btv._macro_state` mirror the keyboard-macro verbs read:
+    /// `recording` is the register `<F2>` is recording into and `executing` the one
+    /// a `<F3>` playback is running, each absent when idle. Backs
+    /// `btv.macro.recording()` / `btv.macro.executing()` and their `vim.fn`
+    /// aliases.
+    pub fn set_macro_state(
+        &self,
+        recording: Option<char>,
+        executing: Option<char>,
+    ) -> mlua::Result<()> {
+        let btv = self.btv()?;
+        let t = self.lua.create_table()?;
+        if let Some(reg) = recording {
+            t.set("recording", reg.to_string())?;
+        }
+        if let Some(reg) = executing {
+            t.set("executing", reg.to_string())?;
+        }
+        let set: mlua::Function = btv.get("_set_macro_state")?;
+        set.call(t)
+    }
+
     /// Refresh the `btv._marks` mirror that `btv.mark.list` (and the `marks` picker)
     /// read — the current buffer's marks, the globals, and the numbered marks, each
     /// with the fields a jump needs. `line`/`col` are 0-based, matching the core.

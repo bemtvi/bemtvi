@@ -69,6 +69,8 @@ mod jumplist;
 mod listings;
 #[path = "editing/lua_surface.rs"]
 mod lua_surface;
+#[path = "editing/macros.rs"]
+mod macros;
 #[path = "editing/marks.rs"]
 mod marks;
 #[path = "editing/multicursor.rs"]

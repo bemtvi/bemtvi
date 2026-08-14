@@ -43,6 +43,7 @@ mod fold;
 mod helix;
 mod insert;
 mod jumps;
+mod macros;
 mod marks;
 mod menu;
 mod motions;
@@ -81,6 +82,7 @@ pub(crate) use self::command::{
 pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::{DecorScope, DecorViewport};
 pub use self::float::{SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT};
+pub use self::macros::MacroPlay;
 pub use self::menu::{
     CmdlineCandidate, Extent, FilterSeed, MenuGeom, MenuItem, MenuMetrics, MenuPlacement,
     PickerRun, PreviewScroll, PreviewTarget, PromptField, PromptPos, RowLayout,
@@ -1288,6 +1290,25 @@ pub struct Editor {
     /// Per-key: the action just handled requests end-of-line stickiness (`$`).
     eol_request: bool,
     registers: Registers,
+    /// The in-flight keyboard-macro recording as `(register, typed keys)`, or
+    /// `None` when `<F2>` is not recording. Fed by [`Editor::note_macro_key`] from
+    /// the server (typed keys, at execution time — see the `macros` module) and
+    /// committed to its register by [`Editor::stop_recording`].
+    macro_record: Option<(char, Vec<Key>)>,
+    /// A resolved `<F3>{reg}` playback waiting for the server to drive it through
+    /// the keymap matcher (see [`macros::MacroPlay`]). Taken once per request.
+    macro_play: Option<macros::MacroPlay>,
+    /// The register the last `<F3>{reg}` played, replayed by `<F3><F3>`.
+    macro_last_played: Option<char>,
+    /// The register a playback is running right now (the innermost frame), set by
+    /// the server's playback drive. `btv.macro.executing()` / `reg_executing()`.
+    macro_executing: Option<char>,
+    /// Per-key: this keystroke FAILED — vim would have beeped. Set by
+    /// [`Editor::beep`], cleared at the top of every [`Editor::input`], and read by
+    /// the server after each key of a macro playback, which is what makes
+    /// `100<F3>a` stop at the end of the buffer instead of grinding on the last
+    /// line. bemtvi has no bell, so this flag *is* the failure signal.
+    command_failed: bool,
 
     /// The accumulated, not-yet-complete normal/visual command — the count, the
     /// pending operator, and the [`Stage`] of the in-progress sequence. Decided
@@ -2119,6 +2140,11 @@ impl Editor {
             preserve_desired: false,
             eol_request: false,
             registers: Registers::default(),
+            macro_record: None,
+            macro_play: None,
+            macro_last_played: None,
+            macro_executing: None,
+            command_failed: false,
             pending: PendingCommand::default(),
             last_find: None,
             redo_recording: Vec::new(),
@@ -2422,6 +2448,9 @@ impl Editor {
 
         self.preserve_desired = false;
         self.eol_request = false;
+        // Per-key failure flag (vim's beep): this keystroke starts out having
+        // succeeded. A macro playing back reads it after every key.
+        self.command_failed = false;
 
         // The mode before dispatch: a Normal→Insert transition on this key starts
         // a fresh insert session, which resets the `".` last-insert accumulator.
@@ -2704,6 +2733,11 @@ impl Editor {
         // Mirror the panel's inference: a message wearing vim's `E###:` error code
         // lights the cmdline red without each of the 100-plus call sites opting in.
         self.message_error = is_error_line(&msg);
+        // An error is a failed keystroke, so every `E###` aborts a macro playing
+        // back — again without the 100-plus call sites opting in.
+        if self.message_error {
+            self.beep();
+        }
         self.message = msg;
     }
 
@@ -2714,6 +2748,7 @@ impl Editor {
         let msg = msg.into();
         self.record_message(&msg, true);
         self.message_error = true;
+        self.beep();
         self.message = msg;
     }
 

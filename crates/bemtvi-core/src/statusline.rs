@@ -194,6 +194,10 @@ pub struct StatuslineCtx {
     /// [segment](compose_segments); zero on builds without an LSP (the browser
     /// edit-host) and on the `%`-format path (which has no `%`-letter for them).
     pub diag_counts: [usize; 4],
+    /// The register a keyboard macro is recording into (`<F2>{reg}`), or `None`.
+    /// Read by the `macro` built-in [segment](compose_segments) — the statusline's
+    /// half of the `recording @a` announcement the message line makes.
+    pub recording: Option<char>,
 }
 
 /// The output of [`expand`]: resolved text carrying its active highlight group,
@@ -1038,6 +1042,7 @@ pub fn is_builtin_segment(name: &str) -> bool {
             | "modified"
             | "readonly"
             | "diagnostics"
+            | "macro"
     )
 }
 
@@ -1088,6 +1093,13 @@ pub fn builtin_segment(
         "modified" => one(modified_flag(ctx, "[+]", "[-]"), Some("StatusLineModified")),
         "readonly" => one(if ctx.readonly { "[RO]" } else { "" }.to_string(), None),
         "diagnostics" => diagnostics_cells(ctx),
+        "macro" => one(
+            match ctx.recording {
+                Some(reg) => format!("recording @{reg}"),
+                None => String::new(),
+            },
+            Some("StatusLineModified"),
+        ),
         _ => return None,
     })
 }
@@ -1277,6 +1289,7 @@ mod tests {
             top_line: 1,
             text_height: 5,
             diag_counts: [0; 4],
+            recording: None,
         }
     }
 

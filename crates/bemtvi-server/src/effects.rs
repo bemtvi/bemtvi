@@ -2753,6 +2753,16 @@ impl EditHost {
             let _ = self.lua.set_reg_specials(&reg_specials);
             self.reg_mirror_specials = reg_specials;
         }
+        // Keyboard-macro state (`btv.macro.recording()` / `.executing()`): two
+        // optional chars, gated on change so the common idle tick pays one compare.
+        let macro_state = (
+            self.editor.recording_register(),
+            self.editor.executing_register(),
+        );
+        if self.macro_state_mirror != macro_state {
+            let _ = self.lua.set_macro_state(macro_state.0, macro_state.1);
+            self.macro_state_mirror = macro_state;
+        }
         // The set marks (current buffer's locals + globals + numbered), mirrored so
         // `btv.mark.list` / the `marks` picker read the core's live positions — which
         // shift with edits and restore on undo. Small (a few dozen short rows).

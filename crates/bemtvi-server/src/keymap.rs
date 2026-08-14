@@ -226,10 +226,17 @@ pub enum Step {
     /// Fire this mapping's RHS; `silent` carries the `<silent>` flag the server
     /// honors by restoring the message line after the fire, and `expr` the
     /// `<expr>` flag (run the Lua RHS for its returned keys, then feed them).
+    ///
+    /// `lhs` is the key sequence that *matched* — what the user actually typed to
+    /// fire this mapping. It exists for macro recording: a Lua-handler RHS
+    /// produces no keys at all, so a recording that captured only what reaches
+    /// `Editor::input` would silently drop the mapping. Recording the LHS makes
+    /// the replay re-fire the mapping, exactly as vim replays typed keys.
     Fire {
         rhs: MappingRhs,
         silent: bool,
         expr: bool,
+        lhs: Vec<Key>,
     },
 }
 
@@ -636,8 +643,8 @@ impl Keymaps {
         match classify {
             Classify::Prefix => {} // hold: wait for the next key
             Classify::Complete(mapping) => {
-                self.pending.clear();
-                self.fire(scope, mapping, steps);
+                let lhs: Vec<Key> = self.pending.drain(..).collect();
+                self.fire(scope, mapping, &lhs, steps);
             }
             Classify::None => {
                 // This key broke every live prefix. Resolve the previously
@@ -693,7 +700,7 @@ impl Keymaps {
     /// maps they trigger surface with their own flags, matching the fact that the
     /// outer map's effect is just to type those keys. The flag bites on the terminal
     /// fire (Lua / `noremap` string), which is where a message would be produced.
-    fn fire(&mut self, scope: MatchScope, mapping: Mapping, steps: &mut Vec<Step>) {
+    fn fire(&mut self, scope: MatchScope, mapping: Mapping, lhs: &[Key], steps: &mut Vec<Step>) {
         match mapping.rhs {
             MappingRhs::Keys(keys, false) if self.remap_budget > 0 => {
                 self.remap_budget -= 1;
@@ -705,6 +712,7 @@ impl Keymaps {
                 rhs,
                 silent: mapping.silent,
                 expr: mapping.expr,
+                lhs: lhs.to_vec(),
             }),
         }
     }
@@ -730,7 +738,7 @@ impl Keymaps {
     ) -> Option<Vec<Key>> {
         match self.tries[&scope.bucket()].longest_complete(buffered) {
             Some((mapping, used)) => {
-                self.fire(scope, mapping, steps);
+                self.fire(scope, mapping, &buffered[..used], steps);
                 for &key in &buffered[used..] {
                     self.feed_key(scope, key, steps);
                 }

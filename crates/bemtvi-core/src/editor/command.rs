@@ -551,6 +551,12 @@ pub(crate) enum Stage {
     ZPending,
     /// Saw `"`; the next key names the register for the coming yank/delete/paste.
     RegisterPending,
+    /// Saw `<F2>` at a clean boundary with nothing recording; the next key names
+    /// the register to record the macro into (`<F2>a`, `<F2>A` to append).
+    RecordPending,
+    /// Saw `<F3>`; the next key names the register to play back (`<F3>a`), or is
+    /// `<F3>` again for "the last register played" (vim's `@@`).
+    PlayPending,
     /// Saw `m`; the next key names the mark to set at the cursor.
     MarkSetPending,
     /// Saw `` ` `` (`Exact`) or `'` (`Line`); the next key names the mark to jump
@@ -655,6 +661,13 @@ enum ResolvedCommand {
     Replace(char),
     /// `m{mark}` — set a mark at the cursor.
     SetMark(char),
+    /// `<F2>{reg}` — start recording a keyboard macro into `{reg}`. The *stop*
+    /// `<F2>` never reaches the pure grammar: it depends on live recording state,
+    /// so [`Editor::handle_normal`] intercepts it ahead of [`parse_step`].
+    MacroRecord(char),
+    /// `{count}<F3>{reg}` — play a macro back. `None` is `<F3><F3>`: the last
+    /// register played.
+    MacroPlay(Option<char>),
     /// A visual-mode operator on the current selection (`d`/`y`/`c`).
     VisualOperate(char),
     /// A terminal single-key command (insert, paste, scroll, …).
@@ -687,6 +700,26 @@ enum ParseStep {
 /// (last insert), and the system-clipboard `+` / `*`. The remaining specials —
 /// `=` and the alternate-file `#` — are rejected until their phases land, so
 /// selecting one is a loud dead-end, never a silent no-op.
+/// The register names `<F2>{reg}` will record into: the named `a`–`z` (uppercase
+/// appends) and the numbered `0`–`9`. The read-only specials (`%` `/` `:` `.`)
+/// and the black hole are not recordable, so `<F2>%` is a dead-end rather than a
+/// recording that silently discards itself.
+fn is_recordable_register(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+/// The macro-record trigger: bare `<F2>`, no modifiers (`<C-F2>` and friends stay
+/// free to map). bemtvi deliberately does not use vim's `q` — see the arm in
+/// [`parse_step`] that calls this.
+pub(super) fn is_macro_record_key(key: Key) -> bool {
+    key.code == KeyCode::Function(2) && !key.ctrl && !key.alt && !key.shift
+}
+
+/// The macro-playback trigger: bare `<F3>`, bemtvi's spelling of vim's `@`.
+fn is_macro_play_key(key: Key) -> bool {
+    key.code == KeyCode::Function(3) && !key.ctrl && !key.alt && !key.shift
+}
+
 fn is_register_name(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '"' | '%' | '/' | ':' | '.' | '+' | '*')
 }
@@ -1123,6 +1156,33 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
                 _ => Reset,
             };
         }
+        Stage::RecordPending => {
+            // The next key names the macro register. `a`–`z` record, `A`–`Z` append
+            // to the lowercase one, `0`–`9` are vim-writable too; anything else (a
+            // read-only special like `%` or `:`, punctuation) is a loud dead-end,
+            // as at the `"` prompt.
+            return match key.as_char() {
+                Some(name) if is_recordable_register(name) => {
+                    Complete(ResolvedCommand::MacroRecord(name))
+                }
+                _ => Reset,
+            };
+        }
+        Stage::PlayPending => {
+            // `<F3>` again means "the last register played" (vim's `@@`); otherwise
+            // the key names the register — any readable one, including the specials
+            // (`<F3>:` re-runs the last ex command, vim's `@:`). An unknown name is
+            // a loud dead-end, as at the `"` prompt.
+            if is_macro_play_key(key) {
+                return Complete(ResolvedCommand::MacroPlay(None));
+            }
+            return match key.as_char() {
+                Some(name) if is_register_name(name) => {
+                    Complete(ResolvedCommand::MacroPlay(Some(name)))
+                }
+                _ => Reset,
+            };
+        }
         Stage::MarkSetPending => {
             // The next key names the mark. Any printable name resolves to `SetMark`,
             // which `execute` validates: a settable `a`–`z`/`A`–`Z` is set, a
@@ -1179,6 +1239,31 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
     if !gpending && pending.operator.is_none() && key.as_char() == Some('m') {
         let mut next = pending.clone();
         next.stage = Stage::MarkSetPending;
+        return Prefix(next);
+    }
+
+    // `<F2>{reg}` starts recording a macro; the register name follows. bemtvi does
+    // NOT put this on vim's `q` — `q` stays a free key for the user (and for the
+    // `q`-to-close convention the view/dock buffers use); `btv.keymap.set("n", "q",
+    // "<F2>")` restores the vim binding for those who want it. Like `m`/`"`, the
+    // trigger is not a motion and never follows an operator, so it arms only at a
+    // command boundary with no operator pending (and not mid-`g`). The `<F2>` that
+    // *stops* a recording is state-dependent and so cannot be decided by this pure
+    // fold — `handle_normal` intercepts it before we are reached, and the oracle
+    // sees a harmless prefix.
+    if !gpending && pending.operator.is_none() && mode == Mode::Normal && is_macro_record_key(key) {
+        let mut next = pending.clone();
+        next.stage = Stage::RecordPending;
+        return Prefix(next);
+    }
+
+    // `{count}<F3>{reg}` plays a macro back; the register name follows. Same
+    // placement rule as `<F2>` above — a command boundary with no operator pending.
+    // Any leading count is the repeat count, so it is left on `pending` for
+    // `execute` to read.
+    if !gpending && pending.operator.is_none() && mode == Mode::Normal && is_macro_play_key(key) {
+        let mut next = pending.clone();
+        next.stage = Stage::PlayPending;
         return Prefix(next);
     }
 
@@ -1617,6 +1702,8 @@ fn pending_hint(p: &PendingCommand) -> Option<CommandPending> {
         Stage::ZPending => ("z".to_string(), "Scroll / fold", z_continuations()),
         Stage::RegisterPending => ("\"".to_string(), "Register", Vec::new()),
         Stage::MarkSetPending => ("m".to_string(), "Set mark", Vec::new()),
+        Stage::RecordPending => ("<F2>".to_string(), "Record macro", Vec::new()),
+        Stage::PlayPending => ("<F3>".to_string(), "Play macro", Vec::new()),
         Stage::MarkJumpPending(kind, set_jump) => {
             let base = match kind {
                 MarkJumpKind::Exact => "`",
@@ -1683,7 +1770,9 @@ impl Editor {
         // can't see: the registers that actually hold text, and the marks actually
         // set. `m` (set-mark) lists the *existing* marks for reference.
         match self.pending.stage {
-            Stage::RegisterPending => hint.continuations = self.register_continuations(),
+            Stage::RegisterPending | Stage::PlayPending => {
+                hint.continuations = self.register_continuations()
+            }
             Stage::MarkJumpPending(..) | Stage::MarkSetPending => {
                 hint.continuations = self.set_mark_continuations()
             }
@@ -1787,6 +1876,20 @@ impl Editor {
     /// grammar has exactly one home.
     pub(crate) fn handle_normal(&mut self, key: Key) {
         self.message.clear();
+        // The `<F2>` that STOPS a recording, ahead of the grammar. Whether `<F2>`
+        // opens a register prompt or ends the macro depends on live state, which the
+        // pure [`parse_step`] fold (shared with the matcher's `command_status`
+        // oracle) cannot see — so the state-dependent half is decided here and the
+        // pure half stays pure. Normal mode with a clean pending only: an `<F2>`
+        // after an operator / count is that command's business.
+        if self.macro_record.is_some()
+            && self.mode == Mode::Normal
+            && self.pending.is_clean()
+            && is_macro_record_key(key)
+        {
+            self.stop_recording();
+            return;
+        }
         match parse_step(self.mode, &self.pending, key) {
             ParseStep::Prefix(p) => self.pending = p,
             ParseStep::Complete(cmd) => self.execute(cmd),
@@ -1947,6 +2050,7 @@ impl Editor {
                     // count, every other miss resets.
                     None => match m {
                         Motion::Find(..) if self.mode.is_visual() => {
+                            self.beep();
                             self.pending.stage = Stage::Start;
                         }
                         // A jump to a mark that was never set: report it loudly
@@ -1956,7 +2060,15 @@ impl Editor {
                             self.echo("E20: Mark not set");
                             self.reset_pending();
                         }
-                        _ => self.reset_pending(),
+                        // Every other execution miss — an unmatched `f{char}`, a
+                        // `;` with no prior find, a vertical motion already at the
+                        // buffer edge — is silent, and would beep in vim. Flag it,
+                        // so a macro playing back stops here instead of grinding
+                        // out the rest of its repeats against the same line.
+                        _ => {
+                            self.beep();
+                            self.reset_pending();
+                        }
                     },
                 }
             }
@@ -2004,6 +2116,15 @@ impl Editor {
                     self.echo("E191: Argument must be a letter or forward/backward quote");
                 }
                 self.reset_pending();
+            }
+            ResolvedCommand::MacroRecord(reg) => {
+                self.start_recording(reg);
+                self.reset_pending();
+            }
+            ResolvedCommand::MacroPlay(reg) => {
+                let count = self.effective_count();
+                self.reset_pending();
+                self.play_macro(reg, count);
             }
             ResolvedCommand::VisualOperate(op) => self.visual_operate(op),
             ResolvedCommand::Normal(cmd) => self.execute_normal(cmd),

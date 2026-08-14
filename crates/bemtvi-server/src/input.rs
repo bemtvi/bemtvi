@@ -2,8 +2,20 @@
 //! completion-popup key routing, and mapping (RHS) execution.
 
 use crate::keymap::{MappingRhs, MatchScope, Step};
-use crate::EditHost;
+use crate::{EditHost, MacroFrame};
 use bemtvi_core::{parse_keys, parse_keys_raw, Key, KeyCode};
+
+/// How deep macro playback may nest — a macro playing a macro playing a macro.
+/// vim lets a macro call itself and relies on the first failing command to end
+/// the recursion; until failure aborts playback (phase 3 of the macro plan) this
+/// depth is the backstop, and it is loud when it trips.
+const MACRO_MAX_DEPTH: usize = 100;
+
+/// Total keys one `drive_macro_play` call may execute before it gives up, the
+/// analogue of the `nvim_feedkeys` drain's budget. Generous enough that a real
+/// `10000<F3>a` over a big file completes; small enough that a runaway macro
+/// surfaces in a blink rather than hanging the editor.
+const MACRO_KEY_BUDGET: usize = 1_000_000;
 
 impl EditHost {
     /// Whether this session will CAPTURE the window/tab layout on exit — a workspace
@@ -46,6 +58,10 @@ impl EditHost {
         };
         for key in parsed {
             self.process_key(key);
+            // A macro this key started (`<F3>a`) runs BEFORE the rest of the batch —
+            // vim puts a played register ahead of the remaining typeahead, so
+            // `<F3>aj` moves down after the macro ran, not before it.
+            self.drive_macro_play();
         }
         // A paste is by construction one batch — the client has the whole payload
         // before it sends anything — so close the span here even if the `<PasteEnd>`
@@ -60,6 +76,102 @@ impl EditHost {
         // Typeahead queued by `nvim_feedkeys` during this batch (e.g. a keymap RHS
         // that fed keys) is processed now, after the batch's own keys settle.
         self.drain_feedkeys();
+        // …and a macro one of those fed keys asked for.
+        self.drive_macro_play();
+    }
+
+    /// Run every macro playback the editor has queued (`{count}<F3>{reg}`) to
+    /// exhaustion, then return.
+    ///
+    /// Playback re-enters the **keymap matcher**, not `Editor::input`: a recording
+    /// holds the LHS of every mapping the user fired, so replaying it has to give
+    /// those mappings the chance to fire again (see `bemtvi_core`'s
+    /// `editor::macros`). That is also why this lives here rather than in core.
+    ///
+    /// The frames are a stack, so a macro that plays another macro suspends the
+    /// caller and resumes it after — `{count}` is a repeat counter on the frame
+    /// rather than an expanded key list, so `1000<F3>a` costs nothing to set up.
+    /// Two bounds keep a runaway macro from hanging the editor: a nesting cap (a
+    /// self-recursive `<F3>a` is legal in vim and terminates on error, so the depth
+    /// is what stops it here) and a total key budget, both reported loudly.
+    pub(crate) fn drive_macro_play(&mut self) {
+        self.collect_macro_play();
+        if self.macro_play.is_empty() {
+            return;
+        }
+        // Played keys are not typed keys: a recording in flight captured the
+        // `<F3>a` the user pressed, and must not also capture what it expands to.
+        self.macro_suppress += 1;
+        let mut budget = MACRO_KEY_BUDGET;
+        while let Some(frame) = self.macro_play.last_mut() {
+            let Some(&key) = frame.keys.get(frame.pos) else {
+                // The frame ran out: repeat it, or drop it and resume the caller.
+                frame.repeats -= 1;
+                if frame.repeats == 0 {
+                    self.macro_play.pop();
+                    // Resume the caller's register, or report "nothing playing".
+                    let outer = self.macro_play.last().map(|f| f.reg);
+                    self.editor.set_executing_register(outer);
+                } else {
+                    frame.pos = 0;
+                }
+                continue;
+            };
+            frame.pos += 1;
+            if budget == 0 {
+                self.editor
+                    .echo("E132: macro playback exceeded its key budget".to_string());
+                self.macro_play.clear();
+                break;
+            }
+            budget -= 1;
+            self.feed_matcher(key);
+            // Drive what the key set in motion before the next one, exactly as the
+            // typeahead drain does: a Lua mapping's effects, queued ex-commands,
+            // keys it fed, and any macro IT asked to play.
+            self.apply_lua_effects();
+            self.run_pending();
+            self.refresh_keymaps();
+            self.drain_feedkeys();
+            // A failed keystroke ends the playback — every repeat and every
+            // suspended frame, as in vim. This is what makes `100<F3>a` safe to
+            // type: the run stops at the end of the buffer (or at the first `E###`)
+            // instead of grinding the last line 90 more times.
+            if self.editor.take_command_failed() {
+                self.macro_play.clear();
+                break;
+            }
+            self.collect_macro_play();
+        }
+        // Whatever ended the run — exhaustion, a failure, a budget trip — nothing
+        // is playing now.
+        self.editor.set_executing_register(None);
+        self.macro_suppress -= 1;
+    }
+
+    /// Push a playback the editor just resolved onto the frame stack. Refuses
+    /// beyond [`MACRO_MAX_DEPTH`] rather than growing without bound — the loud end
+    /// of a macro that plays itself.
+    fn collect_macro_play(&mut self) {
+        let Some(play) = self.editor.take_macro_play() else {
+            return;
+        };
+        if self.macro_play.len() >= MACRO_MAX_DEPTH {
+            self.editor.echo("E169: Command too recursive".to_string());
+            self.macro_play.clear();
+            self.editor.set_executing_register(None);
+            return;
+        }
+        if play.count == 0 {
+            return;
+        }
+        self.editor.set_executing_register(Some(play.reg));
+        self.macro_play.push(MacroFrame {
+            reg: play.reg,
+            keys: play.keys,
+            pos: 0,
+            repeats: play.count,
+        });
     }
 
     /// Apply one bracketed paste's payload, collected between the client's
@@ -157,6 +269,10 @@ impl EditHost {
         // registry just before feeding (suspending its own triggers so the fed keys
         // hit the real maps); pick that up before feeding.
         self.refresh_keymaps();
+        // Typeahead is not typed input — an in-flight `<F2>` recording must not
+        // capture what a plugin fed (it already recorded whatever the user pressed
+        // to get here).
+        self.macro_suppress += 1;
         let mut budget = 10_000usize;
         while let Some((key, remap)) = self.feed_buffer.pop_front() {
             if budget == 0 {
@@ -180,6 +296,7 @@ impl EditHost {
             self.run_pending();
             self.refresh_keymaps();
         }
+        self.macro_suppress -= 1;
     }
 
     /// Run one key through the general mapping matcher and apply the steps it
@@ -217,8 +334,7 @@ impl EditHost {
         if (self.editor.awaiting_command_continuation() || self.editor.cmdline_reads_raw())
             && self.keymaps.pending_empty()
         {
-            self.editor.input(key);
-            self.emit_lifecycle_events();
+            self.editor_input_typed(key);
             return;
         }
         let mode = self.editor.mode;
@@ -359,14 +475,51 @@ impl EditHost {
     /// RHS.
     pub(crate) fn apply_step(&mut self, step: Step) {
         match step {
-            Step::Editor(key) => {
-                self.editor.input(key);
-                // Per *key*, not per message: a batched `o…<Esc>` must still see
-                // the transition into insert on the `o`, which a once-per-input
-                // diff would miss (it'd see only the settled Normal end-state).
-                self.emit_lifecycle_events();
+            Step::Editor(key) => self.editor_input_typed(key),
+            Step::Fire {
+                rhs,
+                silent,
+                expr,
+                lhs,
+            } => {
+                // A macro records what the user TYPED, so the mapping's LHS goes in
+                // — not its RHS (a Lua handler produces no keys at all, and a
+                // `noremap` string RHS is fed below under the recording suppression
+                // `fire_mapping` holds). The replay re-fires the mapping.
+                self.note_macro_keys(&lhs);
+                self.fire_mapping(rhs, silent, expr);
             }
-            Step::Fire { rhs, silent, expr } => self.fire_mapping(rhs, silent, expr),
+        }
+    }
+
+    /// Feed one **typed** key to the editor: note it against any in-flight macro
+    /// recording, dispatch it, then emit the lifecycle events it triggered.
+    ///
+    /// The single chokepoint for "a key the user pressed is now executing" — the
+    /// matcher's released keys and the literal-argument bypass both come through
+    /// here — which is exactly the granularity `<F2>` records at (see
+    /// `bemtvi_core`'s `editor::macros`). Keys fed from a mapping RHS, from
+    /// `nvim_feedkeys`, or by a macro playing back are *not* typed keys; those
+    /// paths raise [`macro_suppress`](Self::note_macro_keys) so they never record.
+    ///
+    /// The lifecycle emit is per *key*, not per message: a batched `o…<Esc>` must
+    /// still see the transition into insert on the `o`, which a once-per-input
+    /// diff would miss (it'd see only the settled Normal end-state).
+    pub(crate) fn editor_input_typed(&mut self, key: Key) {
+        self.note_macro_keys(std::slice::from_ref(&key));
+        self.editor.input(key);
+        self.emit_lifecycle_events();
+    }
+
+    /// Note typed keys against an in-flight `<F2>` recording, unless recording is
+    /// suppressed — i.e. unless we are inside a mapping RHS, the `nvim_feedkeys`
+    /// typeahead drain, or a macro playback, none of which the user typed.
+    pub(crate) fn note_macro_keys(&mut self, keys: &[Key]) {
+        if self.macro_suppress > 0 {
+            return;
+        }
+        for &key in keys {
+            self.editor.note_macro_key(key);
         }
     }
 
@@ -391,10 +544,15 @@ impl EditHost {
     /// normal path — bemtvi has no expression evaluator for a string RHS.)
     pub(crate) fn fire_mapping(&mut self, rhs: MappingRhs, silent: bool, expr: bool) {
         let restore = silent.then(|| self.editor.message.clone());
+        // Whatever the RHS types, feeds, or executes is not typed input: a macro
+        // recorded the LHS that got us here (`apply_step`), so everything the fire
+        // produces must stay out of the recording.
+        self.macro_suppress += 1;
         match (expr, rhs) {
             (true, MappingRhs::Lua(id)) => self.fire_expr(id),
             (_, rhs) => self.fire_mapping_inner(rhs),
         }
+        self.macro_suppress -= 1;
         if let Some(message) = restore {
             self.editor.message = message;
         }

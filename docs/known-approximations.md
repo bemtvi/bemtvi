@@ -119,7 +119,20 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   `commentstring` backs the `gc`/`gcc` comment operator and defaults from the
   filetype (the ~20 most common languages) when unset. Still, the **bulk** of
   vim's hundreds of options are missing — a write to an unmodeled option is
-  recorded but inert — as are **macros**.
+  recorded but inert.
+- **Keyboard macros are on `<F2>` / `<F3>`, not `q` / `@`, and hold key
+  notation.** Recording and playback are complete (`<F2>{reg}` … `<F2>` records,
+  `{count}<F3>{reg}` plays, `<F3><F3>` repeats the last, `<F3>:` re-runs the last
+  ex command, a failed keystroke aborts the run) — but two deliberate departures.
+  (1) The **keys**: `q` stays free for the user and for the `q`-to-close
+  convention of bemtvi's read-only surfaces; `btv.keymap.set("n", "q", "<F2>")`
+  and the same for `@` → `<F3>` restore the vim spelling, which works because a
+  recording captures a mapping's LHS and replays through the keymap matcher.
+  (2) The **storage**: a macro register holds bemtvi key notation
+  (`ciwfoo<Esc>`), not vim's raw bytes — so it pastes, lists, persists, and can
+  be hand-authored as readable text, at the cost that playing a register that
+  holds ordinary *yanked text* parses any `<...>` in it as a key rather than as
+  literal characters.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written set of helper aliases, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to

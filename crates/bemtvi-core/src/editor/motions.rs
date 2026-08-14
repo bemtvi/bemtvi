@@ -198,6 +198,15 @@ impl Editor {
                 }
             }
             Motion::Down => {
+                // Already on the last line: the motion FAILS (vim's `cursor_down`
+                // returns FAIL there and beeps) rather than resolving to a move that
+                // goes nowhere. The distinction is invisible for a typed `j` — both
+                // leave the cursor put — but it is what lets `100<F3>a` stop at the
+                // end of the buffer instead of replaying against the last line 90
+                // more times. A count that overshoots still clamps, as vim does.
+                if line >= last_line {
+                    return None;
+                }
                 // Fold-aware: each closed fold counts as one line, so `j` steps over
                 // a collapsed range in a single move (and never lands in its hidden
                 // interior). Falls back to plain stepping when no fold is in the way.
@@ -205,6 +214,11 @@ impl Editor {
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
             Motion::Up => {
+                // The mirror of `Down`: on the first line there is nowhere to go, so
+                // the motion fails instead of resolving to a no-op.
+                if line == 0 {
+                    return None;
+                }
                 let l = self.line_above_folds(line, count);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }

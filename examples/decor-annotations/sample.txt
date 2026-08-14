@@ -1,0 +1,46 @@
+release checklist
+=================
+
+! the changelog is still empty
+  drafted -> reviewed -> published
+
+? the version bump has not been tagged
+  see docs/plans -> release pipeline
+
+notes
+-----
+  a plain line carries no decoration at all
+  another plain line -> with a marker span in it
+
+! the signing key expires this month
+  rotate -> re-upload -> verify
+
+? the mirror has not synced today
+
+more lines so the buffer is worth scrolling
+------------------------------------------
+  filler 01
+  filler 02
+  filler 03
+  filler 04
+  filler 05
+  filler 06
+  filler 07
+  filler 08
+  filler 09
+  filler 10
+  filler 11
+  filler 12
+  filler 13
+  filler 14
+  filler 15
+  filler 16
+  filler 17
+  filler 18
+  filler 19
+  filler 20
+
+! a late error, only visible once you scroll
+  reached -> only -> after -> scrolling
+
+? a late warning, same

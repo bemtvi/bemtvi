@@ -2448,20 +2448,29 @@ pub struct PickerPush {
     pub layout: Option<(u16, u16, u16)>,
 }
 
-/// One mark a `btv.decor` provider published — extmark-shaped, in **buffer**
-/// (not viewport-relative) 0-based `(row, col)` coordinates. `end_row`/`end_col`
-/// bound a range mark (both absent ⇒ a point mark, which renders nothing in v1);
-/// `hl` is the highlight group v1 paints (the Lua side rejects a mark that carries
-/// no `hl`, since nothing else is plumbed to render yet); `priority` overrides the
-/// default extmark priority when set. Carried in batch by [`DecorPublish`].
+/// One mark a `btv.decor` provider published — in **buffer** (not viewport-relative)
+/// 0-based `(row, col)` coordinates, carrying exactly the payload
+/// [`ExtmarkOp::Set`](crate::ops::ExtmarkOp) takes, because a provider's marks ARE
+/// extmarks: the Lua side validates and splits them with the same
+/// `btv._extmark_split_opts` the `btv.buf.set_extmark` surface uses, so the two cannot
+/// drift. `end_row`/`end_col` bound a range mark (both absent ⇒ a point mark);
+/// `hl_group` paints a span and [`decor`](Self::decor) carries every other decoration —
+/// virtual text/lines, a gutter sign, a line background. Carried in batch by
+/// [`DecorPublish`].
 #[derive(Clone, Debug)]
 pub struct DecorMark {
     pub row: i64,
     pub col: i64,
     pub end_row: Option<i64>,
     pub end_col: Option<i64>,
-    pub hl: Option<String>,
+    pub hl_group: Option<String>,
     pub priority: Option<u32>,
+    /// The virtual-text / sign / line-background payload, lowered from the published
+    /// mark's option table by the same converter `btv._extmark_set` uses. `None` ⇒ the
+    /// mark carries nothing beyond its `hl_group` span.
+    pub decor: Option<Box<VirtDecorData>>,
+    pub right_gravity: bool,
+    pub end_right_gravity: bool,
 }
 
 /// A batch of marks a `btv.decor` provider published for one window's viewport

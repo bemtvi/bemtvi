@@ -3875,14 +3875,14 @@ impl EditHost {
                 col: mark.col,
                 end_row: mark.end_row,
                 end_col: mark.end_col,
-                hl_group: mark.hl,
+                hl_group: mark.hl_group,
                 priority: mark.priority.unwrap_or(bemtvi_core::DEFAULT_PRIORITY),
-                // btv.decor providers publish hl-only marks; virtual text on a
-                // provider mark is a separate, not-yet-wired surface.
-                decor: None,
-                // Default gravity — a decoration span, not a growing tabstop.
-                right_gravity: true,
-                end_right_gravity: false,
+                // A provider's marks ARE extmarks: the whole decoration payload —
+                // virtual text/lines, a gutter sign, a line background — rides through
+                // exactly as it would from `btv.buf.set_extmark`.
+                decor: mark.decor,
+                right_gravity: mark.right_gravity,
+                end_right_gravity: mark.end_right_gravity,
             });
         }
     }

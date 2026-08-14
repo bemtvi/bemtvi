@@ -208,45 +208,18 @@ async fn publish_records_normalized_marks() {
     let path = write_big_lua(&dir, 50);
     feed(&rpc, &format!(":e {}<CR>", path.display()));
 
-    // The probe publishes one mark per dispatch — recorded Lua-side for inspection. It
-    // is normalized into the canonical positional→named form the extmark layer takes.
+    // The probe publishes one mark per dispatch — recorded Lua-side for inspection.
+    // It is normalized into `{ row, col, opts }`, where `opts` is exactly the option
+    // table `btv.buf.set_extmark` takes (so `hl` resolves to its `hl_group` spelling).
     let row = lua_u64(&rpc, "return btv._decor.last.marks[1].row").await;
     assert_eq!(row, Some(0), "positional row survives normalization");
-    let end_col = lua_u64(&rpc, "return btv._decor.last.marks[1].end_col").await;
+    let end_col = lua_u64(&rpc, "return btv._decor.last.marks[1].opts.end_col").await;
     assert_eq!(end_col, Some(1), "named end_col is carried through");
-    let hl = exec_lua(&rpc, "return btv._decor.last.marks[1].hl").await;
+    let hl = exec_lua(&rpc, "return btv._decor.last.marks[1].opts.hl_group").await;
     assert_eq!(
         hl.as_str(),
         Some("Comment"),
-        "the hl group is carried through"
-    );
-}
-
-#[tokio::test]
-async fn a_mark_without_an_hl_fails_loud() {
-    // v1 renders `hl` only; a mark carrying no `hl` can render nothing, so rather than
-    // silently no-op it routes through the provider-error path (Decision 6). The
-    // provider is isolated (the dispatch survives), and the error is surfaced.
-    let dir = temp_dir("decor_no_hl");
-    let init = r#"
-_G.err = nil
-btv.notify = function(msg, _level) _G.err = msg end
-btv.decor.provider {
-  name = "no_hl",
-  bufs = { filetype = { "lua" } },
-  on_range = function(ctx, publish)
-    publish({ { ctx.top, 0, end_col = 1 } })   -- no hl
-  end,
-}
-"#;
-    let (rpc, _incoming) = start(&dir, init).await;
-    let path = write_big_lua(&dir, 20);
-    feed(&rpc, &format!(":e {}<CR>", path.display()));
-
-    let err = exec_lua(&rpc, "return _G.err").await;
-    assert!(
-        err.as_str().is_some_and(|m| m.contains("hl")),
-        "a hl-less mark is reported loud, not dropped: {err:?}"
+        "the `hl` shorthand normalizes to the extmark `hl_group` key"
     );
 }
 
@@ -420,9 +393,13 @@ async fn a_stale_publish_paints_nothing() {
         .unwrap();
 
     // A publish carrying a generation that is *ahead* of the live one — as if a newer
-    // scroll had already superseded it. The server drops it: nothing paints.
+    // scroll had already superseded it. The server drops it: nothing paints. Issued
+    // against the raw bridge (a list of extmark-shaped marks) so the generation is
+    // controlled exactly, rather than whatever a live dispatch happens to stamp.
     let stale = format!(
-        "btv._decor_publish({ns}, {g}, {win}, {buf}, {{0}}, {{0}}, {{0}}, {{1}}, {{'StaleMark'}}, {{-1}})",
+        "btv._decor_publish({ns}, {g}, {win}, {buf}, {{ {{ row = 0, col = 0, end_row = 0, \
+         end_col = 1, hl_group = 'StaleMark', priority = 4096, right_gravity = true, \
+         end_right_gravity = false }} }})",
         g = gen + 50
     );
     // `nvim_exec_lua` itself repaints (the RPC handler emits a frame after draining the
@@ -439,7 +416,9 @@ async fn a_stale_publish_paints_nothing() {
     // The same publish with the *live* generation paints — proving the drop above was
     // the gen-gate, not a broken publish path. It shows on the next frame with no input.
     let live = format!(
-        "btv._decor_publish({ns}, {gen}, {win}, {buf}, {{0}}, {{0}}, {{0}}, {{1}}, {{'StaleMark'}}, {{-1}})"
+        "btv._decor_publish({ns}, {gen}, {win}, {buf}, {{ {{ row = 0, col = 0, end_row = 0, \
+         end_col = 1, hl_group = 'StaleMark', priority = 4096, right_gravity = true, \
+         end_right_gravity = false }} }})"
     );
     exec_lua(&rpc, &live).await;
     let after_live = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "StaleMark")).await;
@@ -1268,5 +1247,210 @@ btv.decor.provider {
     assert!(
         after_edit > idle,
         "a real viewport change still dispatches ({idle} -> {after_edit})"
+    );
+}
+
+// ===== Phase 4: a provider publishes the full extmark decoration vocabulary =====
+//
+// `publish` takes the same option table `btv.buf.set_extmark` takes and lowers it
+// through the same path, so a provider is no longer restricted to `hl` spans. These
+// pin the three payloads a viewport-scoped provider actually wants and could not
+// draw before: a gutter sign, end-of-line virtual text, and a line background.
+
+/// The window's sign glyph for each visible row.
+async fn decor_signs(rpc: &Rpc, inc: &mut UnboundedReceiver<Incoming>) -> Vec<Option<String>> {
+    let _ = exec_lua(rpc, "return 1").await;
+    let map = wait_redraw(inc, |m| window0_field(m, "diagnostics_signs").is_some()).await;
+    window0_field(&map, "diagnostics_signs")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    r.as_array()
+                        .and_then(|a| a.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_provider_publishes_a_gutter_sign() {
+    // A sign is the flagship decoration a viewport provider could not draw: every
+    // plugin wanting one (dap breakpoints, diff hunks) had to route around `publish`
+    // and hand-roll its own extmark clearing.
+    let dir = temp_dir("decor_sign");
+    let init = r#"
+btv.decor.provider {
+  name = "signs",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    publish({ { ctx.top, 0, sign_text = ">>", sign_hl_group = "Comment" } })
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let signs = decor_signs(&rpc, &mut incoming).await;
+    assert_eq!(
+        signs.first().cloned().flatten().as_deref(),
+        Some(">>"),
+        "the published sign paints in the gutter: {signs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_publishes_virtual_text() {
+    // Inline blame / lens text: an eol virt_text chunk from a provider.
+    let dir = temp_dir("decor_virt");
+    let init = r#"
+btv.decor.provider {
+  name = "virt",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    publish({ { ctx.top, 0, virt_text = { { "  BLAME", "Comment" } }, virt_text_pos = "eol" } })
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let map = wait_redraw(&mut incoming, |m| {
+        window0_field(m, "virt_text").is_some_and(|v| format!("{v:?}").contains("BLAME"))
+    })
+    .await;
+    let virt = window0_field(&map, "virt_text").expect("a virt_text payload is projected");
+    assert!(
+        format!("{virt:?}").contains("BLAME"),
+        "the published virtual text is projected to the client: {virt:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_publishes_a_line_background() {
+    // `line_hl_group` from a provider — the full-width line tint, e.g. backing the
+    // hunk a diff provider is drawing.
+    let dir = temp_dir("decor_line_bg");
+    let init = r#"
+vim.cmd('colorscheme bemtvi')
+btv.decor.provider {
+  name = "linebg",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    publish({ { ctx.top + 1, 0, line_hl_group = "@markup.raw.block" } })
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let map = wait_redraw(&mut incoming, |m| {
+        window0_line_bg(m).iter().any(|(r, _)| *r == 1)
+    })
+    .await;
+    let line_bg = window0_line_bg(&map);
+    assert!(
+        matches!(line_bg.iter().find(|(r, _)| *r == 1), Some((_, Some(_)))),
+        "the published line_hl_group backs its row: {line_bg:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_mark_that_draws_nothing_fails_loud() {
+    // The `hl`-required check becomes "carries at least one renderable key": a mark
+    // with only a position still draws nothing, so it must fail loud rather than
+    // silently no-op (CLAUDE.md: no silent stubs). A sign-only mark is now legal, so
+    // the check can no longer be spelled as "has hl".
+    let dir = temp_dir("decor_draws_nothing");
+    let init = r#"
+_G.err = nil
+btv.notify = function(msg, _level) _G.err = msg end
+btv.decor.provider {
+  name = "empty",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    publish({ { ctx.top, 0, end_col = 1 } })   -- a position and nothing to draw
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let err = exec_lua(&rpc, "return _G.err").await;
+    assert!(
+        err.as_str().is_some_and(|m| m.contains("draw")),
+        "a mark carrying nothing renderable is reported loud: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_mark_key_fails_loud() {
+    // The vocabulary is the extmark one — an unknown key is a typo and must not be
+    // silently ignored (the `set_extmark` policy, now shared).
+    let dir = temp_dir("decor_unknown_key");
+    let init = r#"
+_G.err = nil
+btv.notify = function(msg, _level) _G.err = msg end
+btv.decor.provider {
+  name = "typo",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    publish({ { ctx.top, 0, sign_txt = ">>" } })   -- typo for sign_text
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 20);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    let err = exec_lua(&rpc, "return _G.err").await;
+    assert!(
+        err.as_str().is_some_and(|m| m.contains("sign_txt")),
+        "an unknown decoration key names itself in the error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_publish_paints_no_sign() {
+    // The generation gate covers the new payload too — a sign published against a
+    // viewport the window has scrolled past must not paint.
+    let dir = temp_dir("decor_stale_sign");
+    let init = r#"
+_G.saved = nil
+btv.decor.provider {
+  name = "stale_sign",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    -- Hold the FIRST dispatch's publish closure (and so its now-superseded `ctx.gen`);
+    -- fire it later, after scrolling. It targets row 99 — a row that IS on screen once
+    -- we have scrolled there, so the ONLY thing that can stop the sign painting is the
+    -- generation gate, not the viewport pruning.
+    if not _G.saved then
+      _G.saved = function() publish({ { 99, 0, sign_text = "XX" } }) end
+    end
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = write_big_lua(&dir, 200);
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let _ = exec_lua(&rpc, "return 1").await;
+
+    // Scroll well past the captured viewport, then fire the stale publish.
+    feed(&rpc, "100G");
+    let _ = exec_lua(&rpc, "return 1").await;
+    exec_lua(&rpc, "_G.saved()").await;
+
+    let signs = decor_signs(&rpc, &mut incoming).await;
+    assert!(
+        signs.iter().all(|s| s.as_deref() != Some("XX")),
+        "a sign from a superseded viewport paints nothing: {signs:?}"
     );
 }

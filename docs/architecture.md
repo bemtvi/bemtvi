@@ -1196,8 +1196,11 @@ screen," and that is exactly the shape of these tests.
   paint it unchanged; see
   [the segment plan](plans/2026-06-15-btv-statusline-segments.md)), **viewport
   decorations** (`btv.decor` — off-tick providers woken once per visible-range
-  change that publish generation-gated extmarks; v1 renders highlight (`hl`) marks
-  only — `virt_text`/`sign`/`conceal` are not yet exposed in the provider API;
+  change that publish generation-gated extmarks; a published mark takes the **same
+  option vocabulary** `btv.buf.set_extmark` takes and is validated + lowered by the
+  same code, so a provider draws highlights, gutter signs, virtual text/lines and
+  line backgrounds alike — what `publish` adds is the *lifecycle* (the generation
+  gate and the wholesale namespace republish), not a mark shape of its own;
   see [the decor plan](plans/2026-06-15-btv-decor-viewport-decorations.md)), the
   **floating-widget UI layer** (`btv.ui.input`/`select`/`confirm`/`float`,
   promise-based; see

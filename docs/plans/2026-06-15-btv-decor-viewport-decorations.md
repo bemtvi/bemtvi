@@ -374,3 +374,63 @@ Original plan for this phase:
   follow-up (Decision 6); `btv.decor` consumes it for free when it lands.
 - **`on_line` / per-frame providers** — deliberately absent (the whole point).
 - **RPC-twin out-of-process providers** — build-order step 6, later.
+
+
+---
+
+## Follow-up (2026-08-14): the mark vocabulary is the extmark vocabulary
+
+Decision 6 above shipped `publish` as an **hl-only** mark shape, with everything else
+"accepted but unrendered". That narrowing was the wrong seam, and the evidence was in
+the plugin tree: of the plugins that paint signs or virtual text — `bemtvi-dap`,
+`bemtvi-diff`, `bemtvi-tree` — **none** used a decor provider. Each called
+`btv.buf.set_extmark` directly and hand-rolled its own clearing. The only provider in
+the wild (`bemtvi-colored-pairs`) was the rainbow-parens case v1 was designed around.
+
+The extmark layer had rendered `virt_text` / `virt_lines` / `sign_text` /
+`line_hl_group` / `line_fill` end to end for some time; only `publish` refused them.
+Worse, `normalize_mark` enforced the refusal *loud*, so the narrowing was maximally
+visible to the one surface that most wanted the payloads — a viewport-scoped provider
+is exactly where an inline blame or a per-hunk sign belongs.
+
+What `publish` legitimately adds over placing marks yourself is **lifecycle**, not
+vocabulary: the generation gate that drops a publish from a scrolled-past viewport, the
+wholesale clear-and-reset of the provider's namespace, one bridge crossing per publish,
+and the ephemeral-namespace marking that keeps undo from flashing decorations. None of
+that has anything to do with which fields a mark carries.
+
+So the second vocabulary was deleted rather than grown:
+
+* `btv._extmark_split_opts` (in `prelude/api.lua`) now holds the key partitioning,
+  validation and defaulting that `btv.buf.set_extmark` used to inline. Both surfaces
+  call it, so an option one accepts the other accepts, and a decoration added to the
+  extmark layer reaches viewport providers the same day.
+* `normalize_mark` splits a published mark into `{ row, col, opts }` and validates
+  `opts` through that shared splitter. `hl` stays as the decor-native shorthand for
+  `hl_group`. The old "needs an `hl`" error becomes "would draw nothing" — a mark
+  carrying no `hl_group` / `virt_text` / `virt_lines` / `sign_text` / `line_hl_group` /
+  `line_fill` still fails loud, so a sign-only mark is legal and an empty one is not.
+  The splitter runs *first*, so a typo'd key names itself instead of reporting as
+  "draws nothing".
+* `btv._decor_publish(ns, gen, win, buf, marks)` takes a list of per-mark tables
+  carrying the same split payload `btv._extmark_set` takes (the parallel arrays are
+  gone — `virt_text` is a ragged chunk list and never fit them). `DecorMark` grew
+  `decor` / gravity, and `apply_decor_publish` forwards the payload instead of
+  hardcoding `decor: None`.
+
+Note this changed the **internal** bridge signature, so `a_stale_publish_paints_nothing`
+— which hand-issues `btv._decor_publish` to control the generation exactly — was updated
+to the new shape. The public `publish` contract is backward compatible: `hl` still works,
+positional `{ row, col }` still works.
+
+**Plugin follow-through.** The three plugins above were examined and deliberately *not*
+converted: their decorations are persistent, edit-tracked buffer state (breakpoints, diff
+hunks, a fully re-rendered tree), not viewport-recomputed, so extmark lifecycle is the
+right one and a decor provider would be a regression. What the audit did surface was a
+real bug in `bemtvi-dap`, caused by a *false* belief this narrowing helped spread: its
+`signs.lua` recorded that "a whole-line `line_hl_group` is stored-but-unpainted" and drew
+the stopped line as a ranged `hl_group` spanning the line's text instead. That form had to
+read the line to compute `end_col`, stopped at the end of the text rather than the window
+edge, and — being a char-range span — joined the winner-takes-cell resolution and lost
+every cell a syntax span covered, so the stopped line was tinted only in its uncoloured
+gaps. It now uses `line_hl_group`, with an e2e assertion pinning the shape.

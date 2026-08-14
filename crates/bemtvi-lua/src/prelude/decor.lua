@@ -13,6 +13,13 @@
 -- provider's `on_range(ctx, publish)` runs. `publish` normalizes the marks and lowers
 -- them into the provider's extmark namespace via `btv._decor_publish`, so they RENDER
 -- (gen-gated — a publish from a viewport the user already scrolled past is dropped).
+--
+-- A published mark carries the SAME option vocabulary as `btv.buf.set_extmark` and is
+-- validated + lowered by the same code (`btv._extmark_split_opts`), so the two surfaces
+-- cannot drift: highlights, gutter signs, virtual text/lines and line backgrounds all
+-- draw from a provider. What `publish` adds over placing marks yourself is the
+-- LIFECYCLE — the generation gate that drops a publish from a scrolled-past viewport,
+-- and the wholesale clear-and-reset of the provider's namespace on every republish.
 
 btv.decor = btv.decor or {}
 
@@ -30,10 +37,22 @@ btv._decor = btv._decor or { providers = {} }
 -- `bufs.buftype = { "quickfix" }` only in those buffer kinds, `bufs.buf = id` only in a
 -- specific buffer (constraints AND together); omitted ⇒ every buffer (the engine skips
 -- non-matching windows). The provider calls
--- `publish(marks)` with a list of marks shaped like an extmark —
--- `{ row, col, end_row?, end_col?, hl?, priority? }` (row/col may be positional
--- `{ row, col, ... }` or named). v1 renders `hl`; other fields fold into the extmark
--- layer where they are accepted-but-unrendered until that layer grows them.
+-- `publish(marks)` with a list of marks shaped like an extmark: `row`/`col` (positional
+-- `{ row, col, ... }` or named) plus **any option `btv.buf.set_extmark` takes** — they
+-- are validated and lowered by the same code, so a provider draws the full decoration
+-- vocabulary, not just highlights:
+-- ```lua
+-- publish {
+--   { row, 0, end_col = 4, hl = "Comment" },                   -- a highlight span
+--   { row, 0, sign_text = ">>", sign_hl_group = "DiffAdd" },   -- a gutter sign
+--   { row, 0, virt_text = { { "  3 days ago", "Comment" } } }, -- inline blame
+--   { row, 0, line_hl_group = "DiffChange" },                  -- a line background
+-- }
+-- ```
+-- `hl` is the decor-native shorthand for `hl_group`. A mark that would draw nothing —
+-- carrying no `hl_group`, `virt_text`, `virt_lines`, `sign_text`, `line_hl_group` or
+-- `line_fill` — fails loud rather than silently painting nothing, and so does a mark
+-- with an unknown key.
 function btv.decor.provider(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("btv.decor.provider: requires a { name = <string>, on_range = <fn> } table", 2)
@@ -224,43 +243,100 @@ local function decor_matches(p, ctx)
   return true
 end
 
--- Normalize one published mark into the canonical form the extmark layer takes:
--- `row`/`col` may be positional (`{ row, col, ... }`) or named
--- (`{ row = R, col = C }`). A mark without numeric row/col fails loud (no silent skip).
--- v1 renders `hl` only (the spec's hl-only rainbow example); `virt_text`/`sign`/
--- `conceal` are not plumbed yet, so a mark with no `hl` can render nothing — rather
--- than silently no-op (CLAUDE.md: no silent stubs) that mark fails loud here, routing
--- through the provider-error path (Decision 6).
+-- The keys that carry a mark's POSITION rather than its decoration — stripped before
+-- the rest is handed to the shared extmark opt-splitter.
+local MARK_POSITION_KEYS = { [1] = true, [2] = true, row = true, col = true }
+
+-- The decoration keys that actually PAINT. A mark carrying none of them draws
+-- nothing, which — rather than silently no-op (CLAUDE.md: no silent stubs) — fails
+-- loud through the provider-error path (Decision 6). Kept as an explicit list so a
+-- key that is accepted-and-stored but not yet painted (`conceal`, `spell`, …) can't
+-- masquerade as a drawn decoration.
+local MARK_RENDERS = {
+  hl_group = true,
+  virt_text = true,
+  virt_lines = true,
+  sign_text = true,
+  line_hl_group = true,
+  line_fill = true,
+}
+
+-- Normalize one published mark into `{ row, col, opts }`, where `opts` is exactly the
+-- option table `btv.buf.set_extmark` takes: `row`/`col` may be positional
+-- (`{ row, col, ... }`) or named, and every other key is an extmark decoration option,
+-- validated by the SAME splitter the extmark surface uses (`btv._extmark_split_opts`) —
+-- so the two surfaces share one vocabulary and an unknown key fails loud here too.
+-- `hl` is accepted as the decor-native shorthand for `hl_group`.
 local function normalize_mark(m, name)
   local row = m[1] or m.row
   local col = m[2] or m.col
   if type(row) ~= "number" or type(col) ~= "number" then
     error("btv.decor provider '" .. name .. "': each mark needs a numeric row and col", 0)
   end
-  if type(m.hl) ~= "string" then
+  -- Everything that isn't the position is an extmark option. `hl` is the established
+  -- decor spelling of `hl_group`; carry it over so existing providers keep working.
+  local opts = {}
+  for k, v in pairs(m) do
+    if not MARK_POSITION_KEYS[k] then
+      opts[k] = v
+    end
+  end
+  if opts.hl ~= nil then
+    if opts.hl_group ~= nil then
+      error("btv.decor provider '" .. name .. "': pass `hl` OR `hl_group`, not both", 0)
+    end
+    opts.hl_group, opts.hl = opts.hl, nil
+  end
+  -- A decoration range needs both end coordinates to render (the extmark layer skips a
+  -- point mark), and the splitter rejects one without the other. The flagship shape
+  -- gives only `end_col` for a same-line span — the spec's rainbow example does — so
+  -- default the missing end coordinate to the start: `end_col` alone ⇒ the range
+  -- `[col, end_col)` on `row`; `end_row` alone ⇒ `[col, col)` across rows.
+  if opts.end_col ~= nil and opts.end_row == nil and opts.end_line == nil then
+    opts.end_row = row
+  elseif (opts.end_row ~= nil or opts.end_line ~= nil) and opts.end_col == nil then
+    opts.end_col = col
+  end
+  -- Validate + split with the extmark surface's own rules. Level 0: inside a provider
+  -- there is no useful source position to blame, and the message routes through the
+  -- provider-error path anyway.
+  local hl_group, end_row, end_col, priority, decoration, right_gravity, end_right_gravity =
+    btv._extmark_split_opts(opts, "btv.decor provider '" .. name .. "'", 0)
+  -- Only now — with the vocabulary validated, so a typo names ITSELF rather than
+  -- reporting as "draws nothing" — reject a mark with nothing to paint.
+  local renders = false
+  for k in pairs(opts) do
+    if MARK_RENDERS[k] then
+      renders = true
+      break
+    end
+  end
+  if not renders then
     error(
-      "btv.decor provider '" .. name .. "': each mark needs an `hl` group (v1 renders hl only)",
+      "btv.decor provider '"
+        .. name
+        .. "': this mark would draw nothing — give it one of "
+        .. "hl_group (or hl), virt_text, virt_lines, sign_text, line_hl_group, line_fill",
       0
     )
-  end
-  -- A decoration range needs both end coordinates to render (the extmark layer skips
-  -- a point mark). The flagship shape gives only `end_col` for a same-line span — the
-  -- spec's rainbow example does — so default the missing end coordinate to the start:
-  -- `end_col` alone ⇒ the range `[col, end_col)` on `row`; `end_row` alone ⇒ `[col, col)`
-  -- across rows. A mark with neither stays a point mark (accepted, renders nothing).
-  local end_row, end_col = m.end_row, m.end_col
-  if end_col ~= nil and end_row == nil then
-    end_row = row
-  elseif end_row ~= nil and end_col == nil then
-    end_col = col
   end
   return {
     row = row,
     col = col,
-    end_row = end_row,
-    end_col = end_col,
-    hl = m.hl,
-    priority = m.priority,
+    opts = opts,
+    -- The split payload the bridge takes, per mark — the same shape `btv._extmark_set`
+    -- is handed for a directly-placed mark.
+    wire = {
+      row = row,
+      col = col,
+      end_row = end_row,
+      end_col = end_col,
+      hl_group = hl_group,
+      priority = priority,
+      decoration = decoration,
+      right_gravity = right_gravity,
+      end_right_gravity = end_right_gravity,
+    },
   }
 end
 
@@ -282,24 +358,18 @@ local function run_provider(p, ctx)
     if type(marks) ~= "table" then
       error("btv.decor provider '" .. p.name .. "': publish expects a list of marks", 0)
     end
-    -- Normalize into the extmark-shaped form, then split into the parallel arrays
-    -- the funnel takes (one bridge crossing per publish, not one per mark). The
-    -- optional fields ride sentinels the Rust side reads back: -1 ⇒ unset for
-    -- end_row/end_col/priority, "" ⇒ no hl.
-    local out = {}
-    local rows, cols, end_rows, end_cols, hls, prios = {}, {}, {}, {}, {}, {}
+    -- Normalize each mark into the extmark-shaped form, then hand the whole batch over
+    -- in ONE bridge crossing (not one per mark). Each entry carries the same split
+    -- payload `btv._extmark_set` takes for a directly-placed mark, so the decoration
+    -- vocabulary is shared rather than re-encoded.
+    local out, wire = {}, {}
     for i = 1, #marks do
       local m = normalize_mark(marks[i], p.name)
       out[i] = m
-      rows[i] = m.row
-      cols[i] = m.col
-      end_rows[i] = m.end_row or -1
-      end_cols[i] = m.end_col or -1
-      hls[i] = m.hl or ""
-      prios[i] = m.priority or -1
+      wire[i] = m.wire
     end
     btv._decor.last = { name = p.name, gen = gen, marks = out }
-    btv._decor_publish(p.ns, gen, ctx.win, ctx.buf, rows, cols, end_rows, end_cols, hls, prios)
+    btv._decor_publish(p.ns, gen, ctx.win, ctx.buf, wire)
   end
   local ok, err = pcall(p.on_range, ctx, publish)
   if ok then

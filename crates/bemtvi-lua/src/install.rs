@@ -3919,55 +3919,53 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `btv._decor_publish(ns, gen, win, buf, rows, cols, end_rows, end_cols, hls,
-    // priorities)`: queue the marks a provider published for one window's viewport
-    // ([`DecorPublish`]) — parallel arrays in **buffer** 0-based coordinates, stamped
-    // with the viewport `gen`. Sentinels in the optional arrays mark an unset field:
-    // `end_row`/`end_col`/`priority` of `-1` ⇒ absent, `hl` of `""` ⇒ none. The server
-    // gen-gates the batch (drops it if the window scrolled past since the dispatch),
-    // then clears the provider's `ns` on `buf` and re-sets these marks into the extmark
-    // layer (a republish replaces the prior viewport's marks wholesale). Phase 3 of
-    // `btv.decor`.
-    type DecorPublishArgs = (
-        u32,
-        u64,
-        u64,
-        u64,
-        Vec<i64>,
-        Vec<i64>,
-        Vec<i64>,
-        Vec<i64>,
-        Vec<String>,
-        Vec<i64>,
-    );
+    // `btv._decor_publish(ns, gen, win, buf, marks)`: queue the marks a provider
+    // published for one window's viewport ([`DecorPublish`]), stamped with the viewport
+    // `gen`. `marks` is a list of per-mark tables in **buffer** 0-based coordinates,
+    // each carrying the same split payload `btv._extmark_set` takes for a directly
+    // placed mark — `{ row, col, end_row?, end_col?, hl_group?, priority,
+    // decoration?, right_gravity, end_right_gravity }` — because a provider's marks ARE
+    // extmarks (the Lua side validated them with the shared `btv._extmark_split_opts`,
+    // so `decoration` lowers through the very same [`virt_decor_from_table`]). The
+    // server gen-gates the batch (drops it if the window scrolled past since the
+    // dispatch), then clears the provider's `ns` on `buf` and re-sets these marks into
+    // the extmark layer (a republish replaces the prior viewport's marks wholesale).
+    type DecorPublishArgs = (u32, u64, u64, u64, Vec<Table>);
     let sh = shared.clone();
     btv.set(
         "_decor_publish",
-        lua.create_function(
-            move |_,
-                  (ns, gen, win, buf, rows, cols, end_rows, end_cols, hls, priorities): DecorPublishArgs| {
-                let marks = rows
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &row)| DecorMark {
-                        row,
-                        col: cols.get(i).copied().unwrap_or(0),
-                        end_row: end_rows.get(i).copied().filter(|&r| r >= 0),
-                        end_col: end_cols.get(i).copied().filter(|&c| c >= 0),
-                        hl: hls.get(i).filter(|h| !h.is_empty()).cloned(),
-                        priority: priorities.get(i).copied().filter(|&p| p >= 0).map(|p| p as u32),
+        lua.create_function(move |_, (ns, gen, win, buf, marks): DecorPublishArgs| {
+            let marks = marks
+                .into_iter()
+                .map(|m| {
+                    let decor = match m.get::<Option<Table>>("decoration")? {
+                        Some(t) => virt_decor_from_table(&t)?.map(Box::new),
+                        None => None,
+                    };
+                    Ok(DecorMark {
+                        row: m.get("row")?,
+                        col: m.get("col")?,
+                        end_row: m.get("end_row")?,
+                        end_col: m.get("end_col")?,
+                        hl_group: m.get("hl_group")?,
+                        priority: m.get::<Option<u32>>("priority")?,
+                        decor,
+                        right_gravity: m.get::<Option<bool>>("right_gravity")?.unwrap_or(true),
+                        end_right_gravity: m
+                            .get::<Option<bool>>("end_right_gravity")?
+                            .unwrap_or(false),
                     })
-                    .collect();
-                sh.borrow_mut().decor_publishes.push(DecorPublish {
-                    ns,
-                    gen,
-                    win,
-                    buf,
-                    marks,
-                });
-                Ok(())
-            },
-        )?,
+                })
+                .collect::<mlua::Result<Vec<_>>>()?;
+            sh.borrow_mut().decor_publishes.push(DecorPublish {
+                ns,
+                gen,
+                win,
+                buf,
+                marks,
+            });
+            Ok(())
+        })?,
     )?;
 
     // `btv._decor_invalidate(win, buf)`: `btv.decor.invalidate` — "the data my provider

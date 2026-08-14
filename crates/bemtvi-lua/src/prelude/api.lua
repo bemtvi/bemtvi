@@ -823,6 +823,64 @@ local EXTMARK_OPT_DECORATION = {
   invalidate = true,
 }
 
+-- Split a `set_extmark`-shaped option table into the positional payload the
+-- `btv._extmark_set` bridge takes, validating as it goes: an unknown key fails loud,
+-- an accepted-but-not-position key is collected into the `decoration` payload, and the
+-- `end_line` alias / gravity defaults are resolved. `prefix` names the calling surface
+-- in an error and `level` is the `error()` level to blame (`0` where there is no useful
+-- source position, as inside a decor provider).
+--
+-- Shared by `btv.buf.set_extmark` and `btv.decor`'s `publish` so the two carry ONE
+-- decoration vocabulary that cannot drift — a key either surface accepts, the other
+-- accepts too, and a decoration added to the extmark layer reaches a viewport provider
+-- the same day.
+--
+-- Returns `hl_group, end_row, end_col, priority, decoration, right_gravity,
+-- end_right_gravity`.
+function btv._extmark_split_opts(opts, prefix, level)
+  -- Collect any decoration payload so a details read can return it; reject only a key
+  -- from neither set (a true unknown).
+  local decoration = nil
+  for k in pairs(opts) do
+    if not EXTMARK_OPT_OK[k] then
+      if EXTMARK_OPT_DECORATION[k] then
+        decoration = decoration or {}
+        decoration[k] = opts[k]
+      else
+        error(prefix .. ": option '" .. tostring(k) .. "' is not supported yet", level)
+      end
+    end
+  end
+  local hl_group = opts.hl_group
+  if hl_group ~= nil and type(hl_group) ~= "string" then
+    error(prefix .. ": hl_group must be a string (group lists not supported yet)", level)
+  end
+  -- `end_line` is the deprecated alias for `end_row`; honor either.
+  local end_row = opts.end_row
+  if end_row == nil then
+    end_row = opts.end_line
+  end
+  if (end_row == nil) ~= (opts.end_col == nil) then
+    error(prefix .. ": end_row/end_line and end_col must be given together", level)
+  end
+  local priority = opts.priority or 4096
+  -- Anchor gravity — neovim's defaults (start right-gravity, end left-gravity) unless
+  -- the caller opts into a growing range.
+  local right_gravity = opts.right_gravity
+  if right_gravity == nil then
+    right_gravity = true
+  elseif type(right_gravity) ~= "boolean" then
+    error(prefix .. ": right_gravity must be a boolean", level)
+  end
+  local end_right_gravity = opts.end_right_gravity
+  if end_right_gravity == nil then
+    end_right_gravity = false
+  elseif type(end_right_gravity) ~= "boolean" then
+    error(prefix .. ": end_right_gravity must be a boolean", level)
+  end
+  return hl_group, end_row, opts.end_col, priority, decoration, right_gravity, end_right_gravity
+end
+
 -- `btv.buf.set_extmark(buffer, ns, line, col[, opts])` -> id [alias
 -- `nvim_buf_set_extmark`]: place (or update, via `opts.id`) an extmark in `buffer`
 -- under namespace `ns` (see `btv.ns.create`) at 0-based `line` / `col` (col a byte
@@ -840,47 +898,9 @@ local EXTMARK_OPT_DECORATION = {
 function btv.buf.set_extmark(buffer, ns, line, col, opts)
   local b = btv._resolve_bufnr(buffer)
   opts = opts or {}
-  -- Collect any accepted-but-unrendered decoration payload so a details read can
-  -- return it; reject only a key from neither set (a true unknown).
-  local decoration = nil
-  for k in pairs(opts) do
-    if not EXTMARK_OPT_OK[k] then
-      if EXTMARK_OPT_DECORATION[k] then
-        decoration = decoration or {}
-        decoration[k] = opts[k]
-      else
-        error("nvim_buf_set_extmark: option '" .. tostring(k) .. "' is not supported yet", 2)
-      end
-    end
-  end
-  local hl_group = opts.hl_group
-  if hl_group ~= nil and type(hl_group) ~= "string" then
-    error("nvim_buf_set_extmark: hl_group must be a string (group lists not supported yet)", 2)
-  end
-  -- `end_line` is the deprecated alias for `end_row`; honor either.
-  local end_row = opts.end_row
-  if end_row == nil then
-    end_row = opts.end_line
-  end
-  if (end_row == nil) ~= (opts.end_col == nil) then
-    error("nvim_buf_set_extmark: end_row/end_line and end_col must be given together", 2)
-  end
-  local priority = opts.priority or 4096
-  -- Anchor gravity — neovim's defaults (start right-gravity, end left-gravity) unless
-  -- the caller opts into a growing range. `false` / `true` makes an empty range grow
-  -- to swallow text typed at its edges (a live snippet tabstop).
-  local right_gravity = opts.right_gravity
-  if right_gravity == nil then
-    right_gravity = true
-  elseif type(right_gravity) ~= "boolean" then
-    error("nvim_buf_set_extmark: right_gravity must be a boolean", 2)
-  end
-  local end_right_gravity = opts.end_right_gravity
-  if end_right_gravity == nil then
-    end_right_gravity = false
-  elseif type(end_right_gravity) ~= "boolean" then
-    error("nvim_buf_set_extmark: end_right_gravity must be a boolean", 2)
-  end
+  -- Level 3 blames THIS function's caller: 1 is the splitter, 2 is here.
+  local hl_group, end_row, end_col, priority, decoration, right_gravity, end_right_gravity =
+    btv._extmark_split_opts(opts, "nvim_buf_set_extmark", 3)
 
   btv._extmark_next[b] = btv._extmark_next[b] or {}
   local mark_id = opts.id or btv._extmark_next[b][ns] or 1
@@ -894,7 +914,7 @@ function btv.buf.set_extmark(buffer, ns, line, col, opts)
     row = line,
     col = col,
     end_row = end_row,
-    end_col = opts.end_col,
+    end_col = end_col,
     hl_group = hl_group,
     priority = priority,
     decoration = decoration,
@@ -908,7 +928,7 @@ function btv.buf.set_extmark(buffer, ns, line, col, opts)
     line,
     col,
     end_row,
-    opts.end_col,
+    end_col,
     hl_group,
     priority,
     decoration,

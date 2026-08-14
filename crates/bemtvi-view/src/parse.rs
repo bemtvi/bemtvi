@@ -191,13 +191,14 @@ pub(crate) fn parse_pair(value: Option<&Value>) -> Option<(u16, u16)> {
 /// Parse an `[a, b, c]` triple (the picker row's `layouts` entry — head length
 /// plus the match's char range) into `Some((a, b, c))`, or `None` when the value is
 /// `Nil` / absent / malformed.
-pub(crate) fn parse_triple(value: &Value) -> Option<(u16, u16, u16)> {
+pub(crate) fn parse_triple(value: &Value) -> Option<(u16, u16, u16, u16)> {
     let a = value.as_array()?;
-    if a.len() != 3 {
+    // 3 elements is the pre-`tag` shape (an older server): no pinned tag.
+    if a.len() != 3 && a.len() != 4 {
         return None;
     }
-    let cell = |i: usize| a[i].as_u64().unwrap_or(0) as u16;
-    Some((cell(0), cell(1), cell(2)))
+    let cell = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0) as u16;
+    Some((cell(0), cell(1), cell(2), cell(3)))
 }
 
 /// Parse the redraw `padding` field — a `[top, right, bottom, left]` array of

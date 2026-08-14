@@ -1,0 +1,18 @@
+local function summarize(items)
+  local total = 0
+  local label = 1
+  for _, item in ipairs(items) do
+    local total = total + item.count
+  end
+  for _, item in ipairs(items) do
+    print(item.name)
+  end
+  return label
+end
+
+local function main()
+  local rows = {}
+  summarize(rows)
+end
+
+return { summarize = summarize, main = main }

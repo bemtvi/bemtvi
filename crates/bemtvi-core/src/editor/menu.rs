@@ -167,6 +167,13 @@ pub struct RowLayout {
     /// content begins — the body still windows around it, nothing is highlighted.
     pub match_start: u16,
     pub match_end: u16,
+    /// Char length of a **pinned tag** at the head's start (`"E "` on a diagnostics
+    /// row): the part that *classifies* the row, which survives the elision the rest
+    /// of the head takes when the column is too narrow for it. Without it the head
+    /// elides tail-first and the classification — the very thing the row is scanned
+    /// by — would be the first thing to go. `0` for a head that is pure location
+    /// (live_grep's `path:line:col: `), where the tail is what matters.
+    pub tag: u16,
 }
 
 /// One candidate row: its display `label` and the **opaque source key** that
@@ -235,6 +242,18 @@ pub struct MenuItem {
     /// the matched line). `None` for every plain single-column row, which truncates
     /// path-tail-first as before.
     pub layout: Option<RowLayout>,
+    /// The **highlight group** the source painted this row with (`ctx.push { hl = … }`)
+    /// — `"DiagnosticError"` on an error row of the diagnostics picker, a git-status
+    /// group on a status row. The server resolves the name against the live
+    /// colorscheme and ships the resolved style per row; a group the scheme leaves
+    /// undefined simply doesn't paint (the row keeps the list's own look), never an
+    /// error.
+    ///
+    /// It colors the row's **head column** when the row declares a [`RowLayout`] — the
+    /// location/tag column is the part that classifies the row, and leaving the body
+    /// alone keeps the fuzzy-match highlight readable — and the whole label when it
+    /// doesn't. `None` for every plain row (`select` / completion / cmdline included).
+    pub hl: Option<String>,
     /// The **source's own stated order** for this row (`Complete` menus only): the
     /// opaque string the merged view compares two *equally-good* matches by, before
     /// falling back to the order they streamed in. The `lsp` source fills it from the
@@ -273,6 +292,7 @@ impl MenuItem {
             resolve: None,
             replace: None,
             layout: None,
+            hl: None,
             sort_key: None,
         }
     }
@@ -2321,6 +2341,22 @@ impl Editor {
         let end = start.saturating_add(count).min(m.view_len());
         (start..end)
             .map(|i| m.all_items[m.item_at(i)].layout)
+            .collect()
+    }
+
+    /// The per-row **highlight group** for the visible window `[start, start + count)`,
+    /// parallel to [`Editor::menu_rows`] — the group name the source painted the row
+    /// with (`ctx.push { hl = … }`), which the server resolves against the live
+    /// colorscheme. `None` for a row that declared none (every non-classified row);
+    /// empty when no menu is open. Borrows from the live menu like
+    /// [`Editor::menu_rows`].
+    pub fn menu_hl_window(&self, start: usize, count: usize) -> Vec<Option<&str>> {
+        let Some(m) = self.menu.as_ref() else {
+            return Vec::new();
+        };
+        let end = start.saturating_add(count).min(m.view_len());
+        (start..end)
+            .map(|i| m.all_items[m.item_at(i)].hl.as_deref())
             .collect()
     }
 

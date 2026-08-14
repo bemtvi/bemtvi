@@ -29,9 +29,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bemtvi_view::{
-    doc_box, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col, wrap_chars,
-    Border, CellRect, DiagSign, DiagSpan, DiagVirt, Geometry, InlayHint, MenuField, ResizeCursor,
-    StatusSegment, Style, TabData, View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    doc_box, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col,
+    row_hl_extent, wrap_chars, Border, CellRect, DiagSign, DiagSpan, DiagVirt, Geometry, InlayHint,
+    MenuField, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk, VirtPlacement,
+    WindowRegion, WindowView,
 };
 use glyphon::cosmic_text::{CacheKeyFlags, Fallback, PlatformFallback};
 use glyphon::{
@@ -2866,7 +2867,7 @@ impl Renderer {
             menu.layouts
                 .iter()
                 .flatten()
-                .map(|&(h, _, _)| h as usize)
+                .map(|&(h, _, _, _)| h as usize)
                 .max()
                 .unwrap_or(0),
             list_w as usize,
@@ -2917,10 +2918,37 @@ impl Renderer {
                 .get(idx)
                 .copied()
                 .flatten()
-                .map(|(h, s, e)| (h as usize, s as usize, e as usize));
+                .map(|(h, s, e, t)| (h as usize, s as usize, e as usize, t as usize));
             let (label, spans) = fit_row(label, spans, label_w as usize, layout, head_col);
             let text = pmenu_row(&label, "", label_w as usize);
-            self.push_plain(items, &text, self.cell_px(cx, row), row_fg, full);
+            // The row's own color (a diagnostic's severity), resolved server-side: it
+            // paints the head column of a two-column row and the whole label of a plain
+            // one, so the label is drawn in two pieces when a row carries one. An
+            // unpainted row (every ordinary list) draws as the single push it always did.
+            let painted = menu
+                .row_hls
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|h| {
+                    (
+                        style_fg(&Some(h)).unwrap_or(row_fg),
+                        row_hl_extent(layout, head_col, label_w as usize),
+                    )
+                })
+                .filter(|&(_, end)| end > 0);
+            match painted {
+                Some((hl_fg, end)) => {
+                    let head: String = text.chars().take(end).collect();
+                    let tail: String = text.chars().skip(end).collect();
+                    self.push_plain(items, &head, self.cell_px(cx, row), hl_fg, full);
+                    if !tail.is_empty() {
+                        let at = cx + head.chars().count() as u16;
+                        self.push_plain(items, &tail, self.cell_px(at, row), row_fg, full);
+                    }
+                }
+                None => self.push_plain(items, &text, self.cell_px(cx, row), row_fg, full),
+            }
             if let (Some(k), Some(kc)) = (kind, menu.kind_col) {
                 if kc < list_w {
                     let kind_fg = if sel == Some(idx) {

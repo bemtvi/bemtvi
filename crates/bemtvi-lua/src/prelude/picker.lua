@@ -391,8 +391,33 @@ end
 -- row (a long line can never squeeze the file name off), and the body is windowed
 -- around `match` so the hit stays on screen instead of scrolling off the right edge.
 -- `match` also highlights, which is what a `dynamic` source wants — it bypasses the
--- fuzzy matcher, so its own match is the only one to show. Both fields are optional:
+-- fuzzy matcher, so its own match is the only one to show. Every field is optional:
 -- a plain `text`-only item is a single-column row that truncates path-tail-first.
+--
+-- A row may also lead with a short **tag** — a classification the head must never lose
+-- — and declare its own **color**, the highlight group it is painted with:
+--
+-- ```lua
+-- ctx.push({
+--   tag = "E",                     -- pinned: the elision happens after it
+--   head = "src/main.rs:12 ",      -- the location column
+--   text = "unused variable",      -- the body
+--   hl = "DiagnosticError",        -- the group the row paints with
+-- })
+-- ```
+--
+-- The tag is prepended to the head (`"E src/main.rs:12 "`) and *pinned*: a head too
+-- narrow for its path elides around the tag rather than dropping it, so the letter that
+-- says what the row IS survives at any width. Without it the head elides tail-first,
+-- which is right for a pure location (live_grep keeps `file:line`) and wrong for a
+-- classified one.
+--
+-- `hl` is an ordinary highlight-group name, resolved against the live colorscheme each
+-- frame (a group the scheme leaves undefined simply doesn't paint — never an error, so
+-- a source may name groups a minimal theme lacks). It colors the row's **head** column
+-- when the row declares one, and the whole label when it doesn't: the head is the part
+-- that classifies the row, and leaving the body alone keeps the fuzzy-match highlight
+-- readable over it. The selected row keeps its selection background either way.
 --
 -- `filter = true` gives the picker the include/exclude glob boxes (`<C-g>`), and is
 -- what every candidate's `path` is then tested against — declare it on any source
@@ -742,10 +767,13 @@ function btv._picker_run(gen, query, include, exclude)
     -- item — head length, match start, match end. nil until a row declares one, so a
     -- plain source's batch is exactly as before.
     local layouts = nil
+    -- Per-row highlight groups (`push { hl = … }`): one name per item, `""` for an
+    -- unpainted row. nil until a row declares one, exactly like `layouts`.
+    local hls = nil
     local pushed = 0 -- this run's result count, for the cap (p.items is session-wide)
     local function flush()
       if batched > 0 then
-        btv._picker_push(gen, labels, keys, paths, rows, cols, layouts)
+        btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls)
         labels, keys, batched = {}, {}, 0
         if paths then
           paths = {}
@@ -754,6 +782,7 @@ function btv._picker_run(gen, query, include, exclude)
           rows, cols = {}, {}
         end
         layouts = nil
+        hls = nil
       end
     end
     local function push(item)
@@ -805,12 +834,16 @@ function btv._picker_run(gen, query, include, exclude)
       -- highlight the hit. A plain row ships the all-zero sentinel when some *other* row
       -- in this batch declared a layout — the array stays dense and parallel.
       if entry.head then
-        local h = charlen(entry.head)
-        labels[batched] = entry.head .. text
+        -- A `tag` leads the head, separated by one space, and its width travels so the
+        -- widget can pin it through an elision (see `btv.picker.source`).
+        local tagw = entry.tag and (charlen(entry.tag) + 1) or 0
+        local head = tagw > 0 and (entry.tag .. " " .. entry.head) or entry.head
+        local h = charlen(head)
+        labels[batched] = head .. text
         if not layouts then
-          -- Backfill the plain rows already batched, so entry `i` stays at `i*3`.
+          -- Backfill the plain rows already batched, so entry `i` stays at `i*4`.
           layouts = {}
-          for _ = 1, (batched - 1) * 3 do
+          for _ = 1, (batched - 1) * 4 do
             layouts[#layouts + 1] = 0
           end
         end
@@ -818,11 +851,27 @@ function btv._picker_run(gen, query, include, exclude)
         layouts[#layouts + 1] = h
         layouts[#layouts + 1] = h + (m and math.max(0, m[1] - 1) or 0)
         layouts[#layouts + 1] = h + (m and math.max(0, m[2]) or 0)
+        layouts[#layouts + 1] = tagw
       else
         labels[batched] = text
         if layouts then
-          layouts[#layouts + 1], layouts[#layouts + 2], layouts[#layouts + 3] = 0, 0, 0
+          layouts[#layouts + 1], layouts[#layouts + 2] = 0, 0
+          layouts[#layouts + 1], layouts[#layouts + 2] = 0, 0
         end
+      end
+      -- The row's own highlight group. Like `layouts`, the array materializes only
+      -- once some row declares one, and backfills the plain rows already batched so
+      -- entry `i` stays at index `i`.
+      if entry.hl then
+        if not hls then
+          hls = {}
+          for j = 1, batched - 1 do
+            hls[j] = ""
+          end
+        end
+        hls[batched] = tostring(entry.hl)
+      elseif hls then
+        hls[batched] = ""
       end
       keys[batched] = p.nitems
       if paths then
@@ -1379,27 +1428,113 @@ local function relpath(path)
   return (path or ""):gsub("^" .. anchor .. "/", "")
 end
 
+-- The one-letter tag, the standard highlight group, and the private fallback group
+-- each severity renders with, indexed by the numeric severity (1=ERROR … 4=HINT). The
+-- letter keeps the classification in a fixed-width column so the paths below it line
+-- up.
+--
+-- Two group names because the standard `Diagnostic*` ones are a *colorscheme's* to
+-- define: a theme that styles them wins (as it should), but a bare session with no
+-- colorscheme defines none of them, and a severity column that paints nothing is the
+-- one thing this row must not be. So each severity also has a picker-private group
+-- filled from `btv.hl.palette()` — the active theme's own hues, whatever it is — used
+-- only when the standard name is undefined.
+local SEVERITY_ROW = {
+  [1] = { "E", "DiagnosticError", "BtvPickerDiagError", "red" },
+  [2] = { "W", "DiagnosticWarn", "BtvPickerDiagWarn", "yellow" },
+  [3] = { "I", "DiagnosticInfo", "BtvPickerDiagInfo", "blue" },
+  [4] = { "H", "DiagnosticHint", "BtvPickerDiagHint", "cyan" },
+}
+
+-- (Re)derive the private severity colors from the running colorscheme. Called once per
+-- picker run rather than wired to `ColorScheme` — the source re-runs on every open, so
+-- a re-derivation there always reflects the theme in force, with no subscription to
+-- keep in step (and no `btv.on` at prelude-load time, which this chunk predates).
+-- `btv.hl.fallback` yields to any theme or user definition of these names, and the
+-- private names are deliberately absent from `btv.hl.palette`'s own lookup chains —
+-- deriving a default from a group the palette reads back would feed the previous
+-- theme's color into the next one.
+local function paint_severity_fallbacks()
+  local p = btv.hl.palette()
+  for _, sev in ipairs(SEVERITY_ROW) do
+    btv.hl.fallback(sev[3], { fg = p[sev[4]] })
+  end
+end
+
+-- The group a severity's row paints with: the colorscheme's `Diagnostic*` when it
+-- defines one, else this picker's theme-derived stand-in.
+local function severity_hl(sev)
+  if next(btv.hl.get(0, { name = sev[2] })) ~= nil then
+    return sev[2]
+  end
+  return sev[3]
+end
+
+-- Collapse a diagnostic message onto ONE line: a compiler's message is routinely
+-- multi-line (rustc's "expected X, found Y" continuations) and a row is one line, so
+-- an embedded newline would otherwise render as a stray glyph mid-row and push the
+-- rest of the text off. Runs of whitespace collapse to a single space, ends trimmed.
+local function one_line(msg)
+  return (tostring(msg or ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", ""))
+end
+
 -- diagnostics: every diagnostic across all buffers (telescope's `diagnostics`), the
 -- merged `btv.diagnostic.get()` set — LSP-pushed plus every client namespace. Static
 -- and in-memory; `location` preview scrolls to and highlights the match, confirm
 -- jumps via `btv.picker.edit`. Diagnostic records are 0-based (`lnum`/`col`), so the
 -- pushed item's `row`/`col` add 1 to reach the picker's 1-based convention.
+--
+-- Rows are **two-column** and severity-colored: the head is the classification (a
+-- pinned `tag`) plus the location (`E src/main.rs:12:5 `), and the body is the message,
+-- prefixed with the diagnostic's `source` (`ty`, `rustc`, `eslint`) when there is one. The
+-- head is what a client keeps and aligns when the row overflows, so a long message can
+-- no longer crop the row down to a floating fragment of text with no severity, file or
+-- line in front of it; `hl` paints that head in the severity's color.
+--
+-- The list is ordered errors-first, then by file and line. `btv.diagnostic.get()`
+-- walks a bufnr-keyed table, so without this the rows arrive in an arbitrary (and
+-- run-to-run unstable) order — and the diagnostics worth jumping to first are the
+-- errors.
 btv.picker.source({
   name = "diagnostics",
   title = "Diagnostics",
   layer = "main",
   preview = "location",
   items = function(ctx)
-    for _, d in ipairs(btv.diagnostic.get()) do
-      local name = btv.buf.name(d.bufnr)
-      local sev = btv.diagnostic.severity[d.severity] or "?"
-      -- Lead with the severity left-padded to 5 (the widest, `ERROR`) so the
-      -- `file:line` column lines up; the message trails the (variable-width) path.
+    paint_severity_fallbacks()
+    local all = btv.diagnostic.get()
+    for _, d in ipairs(all) do
+      d._name = btv.buf.name(d.bufnr) or ""
+    end
+    table.sort(all, function(a, b)
+      if a.severity ~= b.severity then
+        return (a.severity or 9) < (b.severity or 9)
+      end
+      if a._name ~= b._name then
+        return a._name < b._name
+      end
+      if a.lnum ~= b.lnum then
+        return (a.lnum or 0) < (b.lnum or 0)
+      end
+      return (a.col or 0) < (b.col or 0)
+    end)
+    for _, d in ipairs(all) do
+      local sev = SEVERITY_ROW[d.severity]
+      -- An unnamed buffer (a plugin's scratch surface carrying client-set
+      -- diagnostics) has no path to relativize — name it by its number rather than
+      -- leaving the location column blank.
+      local where = d._name ~= "" and relpath(d._name) or ("[buf " .. d.bufnr .. "]")
+      local msg = one_line(d.message)
+      -- 0-based on the record, 1-based in the row and in what `confirm` jumps to.
+      local row, col = (d.lnum or 0) + 1, (d.col or 0) + 1
       ctx.push({
-        text = string.format("%-5s %s:%d  %s", sev, relpath(name), d.lnum + 1, d.message),
-        path = name,
-        row = d.lnum + 1,
-        col = d.col + 1,
+        tag = sev and sev[1] or "?",
+        head = string.format("%s:%d:%d ", where, row, col),
+        text = d.source and (d.source .. ": " .. msg) or msg,
+        hl = sev and severity_hl(sev) or nil,
+        path = d._name,
+        row = row,
+        col = col,
       })
     end
   end,

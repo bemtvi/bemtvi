@@ -3087,7 +3087,7 @@ async fn builtin_native_sources_drive_without_config() {
     assert!(
         items
             .iter()
-            .any(|r| r.contains("boom") && r.contains("ERROR")),
+            .any(|r| r.contains("boom") && r.starts_with("E ")),
         "the set diagnostic appears in the picker, got {items:?}"
     );
     feed(&rpc, "<Esc>");
@@ -3391,17 +3391,19 @@ async fn builtin_live_grep_searches_ignored_and_hidden_files() {
 }
 
 /// The per-row two-column `layouts` the picker projects: `(head, match start, match
-/// end)` char offsets, `None` for a plain row. Empty when no row declares one.
-fn menu_layouts(menu: &[(Value, Value)]) -> Vec<Option<(usize, usize, usize)>> {
+/// end, pinned tag)` char offsets, `None` for a plain row. Empty when no row declares
+/// one.
+fn menu_layouts(menu: &[(Value, Value)]) -> Vec<Option<(usize, usize, usize, usize)>> {
     let Some(Value::Array(a)) = map_get(menu, "layouts") else {
         return Vec::new();
     };
     a.iter()
         .map(|v| match v {
-            Value::Array(t) if t.len() == 3 => Some((
+            Value::Array(t) if t.len() == 4 => Some((
                 t[0].as_u64()? as usize,
                 t[1].as_u64()? as usize,
                 t[2].as_u64()? as usize,
+                t[3].as_u64()? as usize,
             )),
             _ => None,
         })
@@ -3456,7 +3458,8 @@ async fn live_grep_rows_carry_the_location_head_and_the_hit() {
         .copied()
         .flatten()
         .unwrap_or_else(|| panic!("the row carries a two-column layout; got {layouts:?}"));
-    let (head, mstart, mend) = layout;
+    let (head, mstart, mend, tag) = layout;
+    assert_eq!(tag, 0, "a pure-location head pins nothing");
 
     let chars: Vec<char> = row.chars().collect();
     let head_str: String = chars[..head].iter().collect();
@@ -4383,5 +4386,183 @@ btv.picker.source {
         menu_items(&menu).get(2).map(String::as_str),
         Some("row-03"),
         "and that row is the one under the pointer"
+    );
+}
+
+/// The per-row highlight ids the picker projects (`row_hls`), resolved against the
+/// frame's top-level `styles` palette to each row's `fg` as `0xRRGGBB`. `None` for an
+/// unpainted row; empty when the frame carries no `row_hls` key at all.
+fn menu_row_colors(map: &[(Value, Value)]) -> Vec<Option<u32>> {
+    let Some(Value::Map(menu)) = map_get(map, "menu") else {
+        return Vec::new();
+    };
+    let Some(Value::Array(ids)) = map_get(menu, "row_hls") else {
+        return Vec::new();
+    };
+    let palette = match map_get(map, "styles") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+    ids.iter()
+        .map(|v| {
+            let id = v.as_u64()? as usize;
+            match palette.get(id)? {
+                Value::Map(style) => map_get(style, "fg")?.as_u64().map(|n| n as u32),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A diagnostics row is a TWO-COLUMN, severity-painted row, not one long string: the
+/// head classifies and locates it (`E path:line:col `) and the body carries the
+/// message. That head is the part a client keeps and aligns when the row overflows —
+/// before, a long message left the row cropped down to a fragment of text with no
+/// severity, file or line in front of it.
+///
+/// The three facts asserted here are the ones a client renders by: the head's char
+/// length travels in `layouts` (so the columns fit separately), the row's severity
+/// group travels resolved in `row_hls` (so `E` paints red and `W` yellow — asserted
+/// against colors this init.lua defines, so the test pins the *mapping*, not a theme),
+/// and errors sort ahead of warnings.
+#[tokio::test]
+async fn diagnostic_rows_are_two_column_and_severity_painted() {
+    let dir = temp_dir("picker_diag_rows");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "vim.api.nvim_set_hl(0, 'DiagnosticError', { fg = '#ff0000' })\n\
+         vim.api.nvim_set_hl(0, 'DiagnosticWarn',  { fg = '#00ff00' })\n",
+    )
+    .await;
+
+    // A warning FIRST and an error second, so ordering can't pass by luck. The
+    // messages are long and multi-line — the shape that used to crop.
+    exec_lua(
+        &rpc,
+        "btv.diagnostic.set(1, 0, {\n\
+           { lnum = 8, col = 2, severity = btv.diagnostic.severity.WARN,\n\
+             message = 'unused import', source = 'ty' },\n\
+           { lnum = 1, col = 0, severity = btv.diagnostic.severity.ERROR,\n\
+             message = 'expected `String`,\\n   found `&str`', source = 'ty' },\n\
+         })",
+    )
+    .await;
+    exec_lua(&rpc, "btv.picker.open('diagnostics')").await;
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("diagnostics opens");
+    let menu = menu_of(&map);
+    let rows = menu_items(&menu);
+    assert_eq!(rows.len(), 2, "both diagnostics are listed, got {rows:?}");
+
+    // Errors lead, whatever order they were set in.
+    let layouts = menu_layouts(&menu);
+    let split = |i: usize| -> (String, String) {
+        let l = layouts
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| panic!("row {i} carries a two-column layout: {layouts:?}"));
+        // The severity letter is PINNED (`"E "` — 2 chars): a head too narrow for its
+        // path elides around it, so the classification survives at any width.
+        assert_eq!(l.3, 2, "row {i} pins its severity tag: {layouts:?}");
+        let head = l.0;
+        let chars: Vec<char> = rows[i].chars().collect();
+        (
+            chars[..head].iter().collect(),
+            chars[head..].iter().collect(),
+        )
+    };
+    let (err_head, err_body) = split(0);
+    let (warn_head, warn_body) = split(1);
+    assert_eq!(
+        err_head, "E [buf 1]:2:1 ",
+        "the error's head is its severity + location (1-based); got {err_head:?}"
+    );
+    assert_eq!(
+        warn_head, "W [buf 1]:9:3 ",
+        "the warning sorts after the error; got {warn_head:?}"
+    );
+    // The body is the source-tagged message, folded onto one line: a multi-line
+    // compiler message would otherwise render its newline as a stray glyph mid-row.
+    assert_eq!(
+        err_body, "ty: expected `String`, found `&str`",
+        "the body is `source: message`, on one line"
+    );
+    assert_eq!(warn_body, "ty: unused import");
+
+    // And each row carries its severity's color, resolved server-side.
+    assert_eq!(
+        menu_row_colors(&map),
+        vec![Some(0xff0000), Some(0x00ff00)],
+        "the error row paints `DiagnosticError`, the warning `DiagnosticWarn`"
+    );
+}
+
+/// A source that paints no rows must ship no `row_hls` key at all — the per-row
+/// highlight is a strictly additive channel, so every other menu (`select`, the
+/// completion popup, a plain picker) keeps a byte-identical map.
+#[tokio::test]
+async fn an_unpainted_source_ships_no_row_highlights() {
+    let dir = temp_dir("picker_no_row_hls");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    exec_lua(&rpc, "btv.picker.open('fruits')").await;
+    let map = poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    let menu = menu_of(&map);
+    assert!(
+        !menu_items(&menu).is_empty(),
+        "the picker has rows to (not) paint"
+    );
+    assert!(
+        map_get(&menu, "row_hls").is_none(),
+        "an unpainted source omits the key entirely"
+    );
+}
+
+/// A severity column that paints nothing is the one thing the diagnostics row must
+/// not be — and the standard `Diagnostic*` groups are a *colorscheme's* to define, so
+/// a bare session (no colorscheme, the built-in look) leaves them undefined. The rows
+/// then fall back to picker-private groups derived from `btv.hl.palette()`, and a
+/// theme that does define the standard name takes it straight back.
+#[tokio::test]
+async fn severity_colors_fall_back_to_the_palette_without_a_colorscheme() {
+    let dir = temp_dir("picker_diag_fallback");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    exec_lua(
+        &rpc,
+        "btv.diagnostic.set(1, 0, {\n\
+           { lnum = 0, col = 0, severity = btv.diagnostic.severity.ERROR, message = 'err' },\n\
+           { lnum = 1, col = 0, severity = btv.diagnostic.severity.WARN, message = 'warn' },\n\
+         })",
+    )
+    .await;
+
+    exec_lua(&rpc, "btv.picker.open('diagnostics')").await;
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("diagnostics opens");
+    let bare = menu_row_colors(&map);
+    assert_eq!(bare.len(), 2, "both rows carry a color: {bare:?}");
+    assert!(
+        bare[0].is_some() && bare[1].is_some() && bare[0] != bare[1],
+        "each severity paints, and they differ, with no colorscheme loaded: {bare:?}"
+    );
+    feed(&rpc, "<Esc>");
+
+    // A theme defining the standard group wins it back.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_hl(0, 'DiagnosticError', { fg = '#123456' })",
+    )
+    .await;
+    exec_lua(&rpc, "btv.picker.open('diagnostics')").await;
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("diagnostics reopens");
+    assert_eq!(
+        menu_row_colors(&map).first().copied().flatten(),
+        Some(0x123456),
+        "the colorscheme's own `DiagnosticError` outranks the derived default"
     );
 }

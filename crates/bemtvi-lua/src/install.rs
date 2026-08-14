@@ -3738,20 +3738,22 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `btv._picker_push(gen, labels, keys, paths, rows, cols, layouts)`: queue a BATCH
+    // `btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls)`: queue a BATCH
     // of streamed picker candidates ([`PickerPush`]) — parallel arrays, stamped with
     // the run `gen`eration. Batching keeps a 100k-result stream to ~one bridge
     // crossing per source chunk instead of one per item. `paths` (and, for the
     // `"location"` kind, `rows` / `cols` — all 0-based) are present only when the
     // picker carries a preview pane; an empty `paths[i]` means that row has no
     // target. `layouts` is present only for a source pushing two-column rows
-    // (live_grep): a flat run of three ints per row — head length, match start, match
-    // end, all char offsets into the label. The server drops a batch whose `gen` is
-    // behind the live query and feeds the rest into the open picker.
+    // (live_grep): a flat run of four ints per row — head length, match start, match
+    // end and pinned-tag length, all char offsets into the label. `hls` is present only for a source painting
+    // its rows: one highlight-group name per row, `""` for an unpainted one. The server
+    // drops a batch whose `gen` is behind the live query and feeds the rest into the
+    // open picker.
     let sh = shared.clone();
-    // `(gen, labels, keys, paths, rows, cols, layouts)` — the parallel-array push
-    // batch; `paths`/`rows`/`cols` are `Some` only for a preview-carrying picker and
-    // `layouts` only for a two-column source.
+    // `(gen, labels, keys, paths, rows, cols, layouts, hls)` — the parallel-array push
+    // batch; `paths`/`rows`/`cols` are `Some` only for a preview-carrying picker,
+    // `layouts` only for a two-column source and `hls` only for a painting one.
     type PushArgs = (
         u64,
         Vec<String>,
@@ -3760,11 +3762,12 @@ pub(crate) fn install_runtime_api(
         Option<Vec<usize>>,
         Option<Vec<usize>>,
         Option<Vec<u16>>,
+        Option<Vec<String>>,
     );
     btv.set(
         "_picker_push",
         lua.create_function(
-            move |_, (gen, labels, keys, paths, rows, cols, layouts): PushArgs| {
+            move |_, (gen, labels, keys, paths, rows, cols, layouts, hls): PushArgs| {
                 let mut sh = sh.borrow_mut();
                 sh.picker_pushes.reserve(labels.len());
                 for (i, (label, key)) in labels.into_iter().zip(keys).enumerate() {
@@ -3782,22 +3785,35 @@ pub(crate) fn install_runtime_api(
                             loc,
                         })
                     });
-                    // Three ints per row, flat. An all-zero triple is the "plain row"
+                    // Four ints per row, flat. An all-zero quad is the "plain row"
                     // sentinel — a source mixing shaped and unshaped rows still ships a
                     // dense array, and a zero head with a zero-length match says nothing.
                     let layout = layouts
                         .as_ref()
                         .and_then(|ls| {
-                            let at = i * 3;
-                            Some((*ls.get(at)?, *ls.get(at + 1)?, *ls.get(at + 2)?))
+                            let at = i * 4;
+                            Some((
+                                *ls.get(at)?,
+                                *ls.get(at + 1)?,
+                                *ls.get(at + 2)?,
+                                *ls.get(at + 3)?,
+                            ))
                         })
-                        .filter(|&(h, s, e)| h != 0 || s != 0 || e != 0);
+                        .filter(|&(h, s, e, t)| h != 0 || s != 0 || e != 0 || t != 0);
+                    // One group name per row; `""` is the "unpainted" sentinel that keeps
+                    // the array dense when only some rows carry a group.
+                    let hl = hls
+                        .as_ref()
+                        .and_then(|hs| hs.get(i))
+                        .filter(|h| !h.is_empty())
+                        .cloned();
                     sh.picker_pushes.push(PickerPush {
                         gen,
                         label,
                         key,
                         preview,
                         layout,
+                        hl,
                     });
                 }
                 Ok(())

@@ -1,6 +1,6 @@
 //! Tier-1 tests for the picker row fitter — the pure text layout every client runs
 //! per visible row. Black-box, no server: a label plus the two-column `layout` the
-//! server projects (`[head, match start, match end]`), asserted on the fitted string
+//! server projects (`[head, match start, match end, tag]`), asserted on the fitted string
 //! and the remapped highlight spans.
 //!
 //! The shape under test is live_grep's: a `path:line:col: ` head followed by the
@@ -22,13 +22,23 @@ fn highlighted(out: &str, spans: &[(u16, u16)]) -> String {
 
 /// A live_grep-shaped row: `(label, layout)` for `path`, 1-based `line`, and a body
 /// whose `needle` is at char offset `at`.
-fn grep_row(path: &str, line: usize, body: &str, needle: &str) -> (String, (usize, usize, usize)) {
+fn grep_row(
+    path: &str,
+    line: usize,
+    body: &str,
+    needle: &str,
+) -> (String, (usize, usize, usize, usize)) {
     let head = format!("{path}:{line}:1: ");
     let at = body.find(needle).expect("needle in body");
     let start = head.chars().count() + body[..at].chars().count();
     (
         format!("{head}{body}"),
-        (head.chars().count(), start, start + needle.chars().count()),
+        (
+            head.chars().count(),
+            start,
+            start + needle.chars().count(),
+            0, // a pure-location head: nothing pinned
+        ),
     )
 }
 
@@ -274,4 +284,79 @@ fn a_one_cell_column_still_returns_something() {
     // The boundary the other way: 1 is a real width, so the guard must not swallow it.
     let (out, _) = elide_keep_tail("src/main.rs", &[], 1);
     assert_eq!(out.chars().count(), 1, "one cell holds one char");
+}
+
+/// A row whose head leads with a **tag** — the diagnostics picker's severity letter —
+/// keeps that tag at any width. The head still elides tail-first for its path (the
+/// live_grep rule), but the elision happens *after* the tag, so the letter that says
+/// what the row is can never be the thing that gets cut.
+#[test]
+fn a_pinned_tag_survives_a_head_too_narrow_for_its_path() {
+    let head = "E crates/bemtvi-core/src/editor/menu.rs:1764:5 ";
+    let label = format!("{head}ty: expected `String`, found `&str`");
+    let hlen = head.chars().count();
+    let layout = (hlen, 0, 0, 2); // `"E "` is pinned
+
+    // Wide enough for the whole head: nothing elides, tag or not.
+    let wide = 200;
+    let (out, _) = fit_row(&label, &[], wide, Some(layout), row_head_col(hlen, wide));
+    assert!(
+        out.starts_with(head),
+        "a head that fits is shown whole: {out:?}"
+    );
+
+    // Narrow: the head no longer fits, so it elides — behind the pinned tag.
+    let width = 60;
+    let head_col = row_head_col(hlen, width);
+    assert!(head_col < hlen, "the column is too narrow for this head");
+    let (out, _) = fit_row(&label, &[], width, Some(layout), head_col);
+    assert!(
+        out.starts_with("E …"),
+        "the tag leads and the path elides after it: {out:?}"
+    );
+    assert!(
+        out.contains("menu.rs:1764:5"),
+        "the head still keeps its tail — the file and line: {out:?}"
+    );
+    // And the body is still there, starting in the shared column.
+    assert!(out.contains("ty: expected"), "the message follows: {out:?}");
+
+    // Without the pin, the severity letter is exactly what the elision eats — the
+    // behavior a pure-location head (live_grep) wants, and this row does not.
+    let (unpinned, _) = fit_row(&label, &[], width, Some((hlen, 0, 0, 0)), head_col);
+    assert!(
+        unpinned.starts_with('…'),
+        "an unpinned head elides from its start: {unpinned:?}"
+    );
+}
+
+/// The pinned tag can't grow past its column: in a head column with no room for both
+/// the tag and the `…`, the tag is what the row keeps — it never overruns the column
+/// and pushes the body out of alignment.
+#[test]
+fn a_pinned_tag_is_clamped_to_its_column() {
+    let head = "WARN some/very/long/path.rs:12 ";
+    let label = format!("{head}message");
+    let hlen = head.chars().count();
+    let layout = (hlen, 0, 0, 5); // `"WARN "`
+    for head_col in 1..=6 {
+        let (out, _) = fit_row(&label, &[], 40, Some(layout), head_col);
+        let shown: Vec<char> = out.chars().take(head_col).collect();
+        assert_eq!(
+            shown.len(),
+            head_col,
+            "the head fills exactly its column: {out:?}"
+        );
+        assert_eq!(
+            shown[head_col - 1],
+            '…',
+            "a column this narrow always elides: {out:?}"
+        );
+        // Everything before the `…` is the tag, truncated to what fits — never the path.
+        let kept: String = shown[..head_col - 1].iter().collect();
+        assert!(
+            "WARN ".starts_with(&kept),
+            "head column {head_col} keeps the tag's start and nothing else: {out:?}"
+        );
+    }
 }

@@ -143,6 +143,37 @@ btv.picker.source({
 })
 ```
 
+### Row shape: heads, tags and colors
+
+A row can be more than one string. A source that knows its row has *structure* —
+a location, a classification, a matched fragment — declares it, and the widget
+fits the parts separately instead of truncating one long label:
+
+```lua
+ctx.push({
+  tag = "E",                       -- pinned classification, never elided
+  head = "src/main.rs:12:5 ",      -- the location column, aligned down the list
+  text = "unused variable `x`",    -- the body
+  match = { 17, 17 },              -- 1-based INCLUSIVE char range of a hit in `text`
+  hl = "DiagnosticError",          -- the group the row is painted with
+})
+```
+
+- **`head`** makes the row two-column. The head keeps at least 40% of the row (a
+  long body can never squeeze the file name off), and the body is windowed around
+  `match` so a hit 200 columns into a line still shows. A head that doesn't fit
+  elides *tail*-first, keeping `file:line` — the part you scan for.
+- **`tag`** is a short classification prepended to the head and **pinned**: the
+  elision happens after it, so `E` survives however narrow the column gets. Use it
+  whenever the head's leading characters say what the row *is*.
+- **`hl`** is an ordinary highlight group, resolved against the live colorscheme
+  each frame (an undefined group simply doesn't paint). It colors the head of a
+  two-column row — leaving the body's match highlight readable — and the whole
+  label of a plain one.
+
+The shipped `diagnostics` source is exactly this shape: `E src/main.rs:12:5 ` in
+the severity's color, then `source: message` folded onto one line.
+
 Declaring `filter = true` gives the source the
 [include/exclude boxes](#include--exclude-filters). Every candidate carrying a
 `path` is then tested against them at the single point they all cross, so a source

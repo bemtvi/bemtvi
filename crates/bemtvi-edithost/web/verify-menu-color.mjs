@@ -10,9 +10,27 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import { globSync } from "node:fs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const PORT = 8097;
+
+// The browser Playwright downloaded, wherever this machine keeps it (`PW_CHROMIUM`
+// overrides) — the same resolution the other verifiers use, so a cache holding a
+// different build number than the pinned package still runs.
+function chromiumPath() {
+  if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
+  const home = process.env.HOME || "";
+  const pats = [
+    `${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`,
+    `${home}/Library/Caches/ms-playwright/chromium-*/chrome-mac*/*.app/Contents/MacOS/*`,
+  ];
+  for (const p of pats) {
+    const found = globSync(p).sort();
+    if (found.length) return found[found.length - 1];
+  }
+  return undefined;
+}
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -33,7 +51,7 @@ try {
   for (let i = 0; i < 50; i++) {
     try { await fetch(`http://localhost:${PORT}/web/index.html`); break; } catch { await sleep(100); }
   }
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ executablePath: chromiumPath() });
   const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
   page.on("pageerror", (e) => console.log("  [pageerror]", e.message));
 
@@ -59,7 +77,9 @@ try {
     const rows = [...box.querySelectorAll(".row")];
     // The selected (first) row carries the selection background.
     const selRow = rows.find((r) => getComputedStyle(r).backgroundColor === "rgb(49, 50, 68)") || rows[0];
-    const match = box.querySelector(".row span");
+    // A span inside a LIST row — not `.row span`, which finds the prompt's caret span
+    // first (the prompt is a `.row` too) and reads the cursor's color instead.
+    const match = rows.map((r) => r.querySelector("span")).find((sp, i) => sp && i > 0);
     return {
       selBg: selRow ? getComputedStyle(selRow).backgroundColor : null,
       matchFg: match ? getComputedStyle(match).color : null,
@@ -72,6 +92,46 @@ try {
   }
 
   // Close the picker.
+  await page.evaluate(() => window.__bemtvi.feed("<Esc>"));
+  await sleep(150);
+
+  // ---- Painted rows (the diagnostics picker's severity color) ----
+  // A source may paint each row with a highlight group (`ctx.push { hl = … }`); the
+  // server resolves it per frame and the client colors the row's HEAD column with it,
+  // leaving the body in the list's own foreground.
+  await page.evaluate(() => window.__bemtvi.execLua(
+    "vim.api.nvim_set_hl(0, 'DiagnosticError', { fg = '#ff0000' })\n" +
+    "btv.diagnostic.set(1, 0, { { lnum = 0, col = 0, message = 'boom',\n" +
+    "  severity = btv.diagnostic.severity.ERROR } })\n" +
+    "btv.picker.open('diagnostics')"));
+  await sleep(250);
+
+  const painted = await page.evaluate(() => {
+    const box = document.querySelector("#grid .pmenu");
+    if (!box) return null;
+    const row = [...box.querySelectorAll(".row")].find((r) => r.textContent.includes("boom"));
+    if (!row) return null;
+    // Every colored piece of the row, in order, with its text.
+    const spans = [...row.querySelectorAll("span")].map((sp) => ({
+      text: sp.textContent,
+      fg: getComputedStyle(sp).color,
+    }));
+    return { text: row.textContent, spans };
+  });
+  check("painted: the diagnostics row paints", painted !== null, JSON.stringify(painted));
+  if (painted) {
+    const red = painted.spans.filter((sp) => sp.fg === "rgb(255, 0, 0)");
+    check("painted: the severity head is DiagnosticError red", red.length > 0, JSON.stringify(painted));
+    // The head is the classification + location; the message body stays uncolored.
+    const redText = red.map((sp) => sp.text).join("");
+    check(
+      "painted: the head, not the message, carries the color",
+      red.length > 0 && !redText.includes("boom"),
+      JSON.stringify(painted),
+    );
+    check("painted: the row leads with the severity tag", /^E /.test(painted.text), JSON.stringify(painted));
+  }
+
   await page.evaluate(() => window.__bemtvi.feed("<Esc>"));
   await sleep(150);
 

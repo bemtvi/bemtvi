@@ -131,12 +131,35 @@ pub fn row_head_col(max_head: usize, width: usize) -> usize {
     max_head.min(cap).max(1)
 }
 
+/// How far a row's own highlight (`MenuData::row_hls` — the group its source painted
+/// it with) reaches across the **fitted** label, in output columns.
+///
+/// A two-column row is painted over its HEAD only: the location/tag column is the part
+/// that classifies the row (the severity + file of a diagnostic), and leaving the body
+/// in the list's own color keeps the fuzzy-match highlight readable over it. A
+/// single-column row has no such column, so its whole label paints. `head_col` and
+/// `label_w` are the same values the caller passes [`fit_row`], so the extent lines up
+/// with the columns it produced.
+pub fn row_hl_extent(
+    layout: Option<(usize, usize, usize, usize)>,
+    head_col: usize,
+    label_w: usize,
+) -> usize {
+    match layout {
+        // `.max(1).min(..)` rather than `clamp`, which panics when a zero-width label
+        // makes the lower bound exceed the upper.
+        Some(_) => head_col.max(1).min(label_w),
+        None => label_w,
+    }
+}
+
 /// Fit one picker row `label` into `width` columns, honoring an optional
-/// two-column `layout` — `(head, match_start, match_end)`, all **char** offsets
+/// two-column `layout` — `(head, match_start, match_end, tag)`, all **char** offsets
 /// into `label`: `head` is the length of the leading location column
-/// (`src/foo.rs:12:5: `) and `[match_start, match_end)` is the source's own match
+/// (`src/foo.rs:12:5: `), `[match_start, match_end)` is the source's own match
 /// within the body (the text `rg` hit), empty when the source knows only where the
-/// interesting content starts.
+/// interesting content starts, and `tag` is the pinned classification at the head's
+/// start (`"E "`), which survives when the head has to elide.
 ///
 /// Without a layout this is [`elide_keep_tail`] — a plain path row keeps its file
 /// name, everything else head-cuts. With one, the row becomes two columns:
@@ -156,10 +179,10 @@ pub fn fit_row(
     label: &str,
     spans: &[(u16, u16)],
     width: usize,
-    layout: Option<(usize, usize, usize)>,
+    layout: Option<(usize, usize, usize, usize)>,
     head_col: usize,
 ) -> (String, Vec<(u16, u16)>) {
-    let Some((head, match_start, match_end)) = layout else {
+    let Some((head, match_start, match_end, tag)) = layout else {
         return elide_keep_tail(label, spans, width);
     };
     if width == 0 {
@@ -185,9 +208,16 @@ pub fn fit_row(
     if head <= hc {
         take(&mut out, &mut used, 0, head);
     } else {
+        // The pinned tag leads, always: it classifies the row (a diagnostic's
+        // severity), so a head too narrow to fit elides *around* it rather than
+        // dropping it — one column is still reserved for the `…`.
+        let tag = tag.min(head).min(hc.saturating_sub(1));
+        if tag > 0 {
+            take(&mut out, &mut used, 0, tag);
+        }
         // Reserve one column for the `…`, then prefer a clean cut just past a path
         // separator — the same tail-priority rule `elide_keep_tail` applies.
-        let drop = head - (hc - 1);
+        let drop = head - (hc - used - 1);
         let cut = (drop..head).find(|&i| chars[i - 1] == '/').unwrap_or(drop);
         out.push('…');
         used += 1;

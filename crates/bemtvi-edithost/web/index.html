@@ -275,11 +275,21 @@
       return Math.max(1, Math.min(maxHead, Math.max(1, Math.floor((width * 2) / 5))));
     }
 
+    // How far a row's own highlight (`menu.row_hls` — the group its source painted it
+    // with) reaches across the FITTED label, in cells: the head column of a two-column
+    // row (the part that classifies it, leaving the body's match highlight readable),
+    // the whole label of a plain one. Mirrors the native clients' `row_hl_extent`.
+    function rowHlExtent(layout, headCol, labelW) {
+      return layout ? Math.max(1, Math.min(headCol, labelW)) : labelW;
+    }
+
     // Fit one picker row into `width` cells honoring an optional two-column `layout`
-    // — `[head, matchStart, matchEnd]` char offsets into the label: the length of the
-    // location column (`src/foo.rs:12:5: `) and the source's own match. The head is
-    // padded (or `…`-elided keeping its tail) to `headCol` so bodies align, and the
-    // body is windowed around the match so a hit far into a long line stays on screen;
+    // — `[head, matchStart, matchEnd, tag]` char offsets into the label: the length of
+    // the location column (`src/foo.rs:12:5: `), the source's own match, and the pinned
+    // classification at the head's start (`E `) that survives an elision. The head is
+    // padded (or `…`-elided keeping its tail, after that tag) to `headCol` so bodies
+    // align, and the body is windowed around the match so a hit far into a long line
+    // stays on screen;
     // the match joins `spans` so it highlights like a fuzzy hit. No layout ⇒ plain
     // `elideKeepTail`. Mirrors the native clients' `fit_row`.
     function fitRow(label, spans, width, layout, headCol) {
@@ -305,7 +315,12 @@
       if (head <= hc) {
         take(0, head);
       } else {
-        const drop = head - (hc - 1);
+        // The pinned tag leads, always: it classifies the row (a diagnostic's
+        // severity), so a head too narrow to fit elides *around* it rather than
+        // dropping it — one column is still reserved for the `…`.
+        const tag = Math.min(layout[3] || 0, head, Math.max(0, hc - 1));
+        if (tag > 0) take(0, tag);
+        const drop = head - (hc - used - 1);
         let cut = drop;
         for (let i = drop; i < head; i++) {
           if (chars[i - 1] === "/") { cut = i; break; }
@@ -2628,7 +2643,13 @@
         const layout = (menu.layouts && menu.layouts[idx]) || null;
         const [elidedLabel, spans] = fitRow(label, rawSpans, labelW, layout, headCol);
         const chars = [...elidedLabel].slice(0, labelW);
-        if (spans.length === 0) {
+        // The row's own color (a diagnostic's severity), resolved server-side into a
+        // palette id: it paints the head column of a two-column row and the whole label
+        // of a plain one. Null for an unpainted row (every ordinary list).
+        const sRow = paletteStyle((menu.row_hls && menu.row_hls[idx]) ?? null);
+        const rowCss = sRow ? styleToCss(sRow, "fg") : "";
+        const hlEnd = rowCss ? rowHlExtent(layout, headCol, labelW) : 0;
+        if (spans.length === 0 && !hlEnd) {
           rowEl.textContent = chars.join("").padEnd(labelW);
         } else {
           chars.forEach((chr, ci) => {
@@ -2639,6 +2660,11 @@
               else m.className = "pmenu-match";
               m.textContent = chr;
               rowEl.appendChild(m);
+            } else if (ci < hlEnd) {
+              const h = document.createElement("span");
+              h.setAttribute("style", rowCss);
+              h.textContent = chr;
+              rowEl.appendChild(h);
             } else {
               rowEl.appendChild(document.createTextNode(chr));
             }

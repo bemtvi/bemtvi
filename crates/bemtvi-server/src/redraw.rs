@@ -1967,7 +1967,8 @@ impl EditHost {
                 .collect(),
         );
         // Per-row two-column **layout** (parallel to `items`): the `[head, match start,
-        // match end]` char offsets of a `path:line:col: <line>` row (live_grep), so the
+        // match end, tag]` char offsets of a `path:line:col: <line>` row (live_grep) —
+        // `tag` being the pinned classification a narrow head keeps — so the
         // client can fit the head and the body as separate columns — and highlight the
         // source's own match — instead of head-cutting one string. `Nil` for a plain
         // row; the key is omitted entirely when no row declares one, so every other
@@ -1988,11 +1989,28 @@ impl EditHost {
                             Value::from(
                                 unicode::display_char_offset(label, l.match_end.into()) as u64
                             ),
+                            Value::from(unicode::display_char_offset(label, l.tag.into()) as u64),
                         ])
                     })
                 })
                 .collect(),
         );
+        // Per-row **highlight** (parallel to `items`): the style id the source's group
+        // (`ctx.push { hl = … }`) resolves to under the live colorscheme — the severity
+        // color of a diagnostics row. `Nil` for an unpainted row AND for a group the
+        // colorscheme leaves undefined (the row then keeps the list's own look, which
+        // is why an unknown group is not an error); the key is omitted entirely when no
+        // visible row paints, so every other menu's map is byte-for-byte unchanged.
+        let row_hls: Vec<Value> = self
+            .editor
+            .menu_hl_window(start, rows.len())
+            .into_iter()
+            .map(|g| g.and_then(|g| self.editor.highlights.resolve(g)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|st| st.map_or(Value::Nil, |st| Value::from(styles.intern(st) as u64)))
+            .collect();
+        let any_hl = row_hls.iter().any(|v| !matches!(v, Value::Nil));
         // Multi-select: a bool per visible row (parallel to `items`) flagging the
         // user-marked rows (`<Tab>`), so the client can mark them. Always present;
         // all-false when nothing is marked.
@@ -2044,6 +2062,10 @@ impl EditHost {
         // Only grep-shaped picker rows carry a layout; omit the key otherwise.
         if any_layout {
             map.push((Value::from("layouts"), layouts));
+        }
+        // Only a painting source's rows carry a highlight; omit the key otherwise.
+        if any_hl {
+            map.push((Value::from("row_hls"), Value::Array(row_hls)));
         }
         // Only completion popups carry kinds; omit the key when every row is kind-less
         // so `select` / picker / cmdline maps are byte-for-byte unchanged.

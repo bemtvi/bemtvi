@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::images::ImageStore;
 use bemtvi_view::{
     arm_scroll, doc_box, elide_middle, fit_row, gutter_cell, lerp, pmenu_row, pmenu_start,
-    row_head_col, CellRect, ScrollAnim,
+    row_head_col, row_hl_extent, CellRect, ScrollAnim,
 };
 use bemtvi_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuField,
@@ -2781,7 +2781,7 @@ fn render_menu(
         menu.layouts
             .iter()
             .flatten()
-            .map(|&(h, _, _)| h as usize)
+            .map(|&(h, _, _, _)| h as usize)
             .max()
             .unwrap_or(0),
         width,
@@ -2800,7 +2800,10 @@ fn render_menu(
                     .get(idx)
                     .copied()
                     .flatten()
-                    .map(|(h, s, e)| (h as usize, s as usize, e as usize));
+                    .map(|(h, s, e, t)| (h as usize, s as usize, e as usize, t as usize));
+                // The row's own color (a diagnostic's severity), already resolved
+                // server-side; `None` for an unpainted row.
+                let row_hl = menu.row_hls.get(idx).copied().flatten();
                 menu_row_line(
                     label,
                     spans,
@@ -2813,6 +2816,7 @@ fn render_menu(
                     match_style,
                     layout,
                     head_col,
+                    row_hl,
                 )
             }
             None => Line::from(" ".repeat(width)),
@@ -3166,8 +3170,9 @@ fn menu_row_line(
     kind_col: Option<usize>,
     sel_style: Option<Style>,
     match_style: Option<Style>,
-    layout: Option<(usize, usize, usize)>,
+    layout: Option<(usize, usize, usize, usize)>,
     head_col: usize,
+    row_hl: Option<bemtvi_view::Style>,
 ) -> Line<'static> {
     // The selected row uses the theme's selection group when defined, else
     // reverse-video. A non-selected row is transparent so the box background shows.
@@ -3222,28 +3227,45 @@ fn menu_row_line(
         head_col.saturating_sub(used),
     );
     let (label, spans) = (label.as_str(), spans.as_slice());
+    // The row's own color (the severity of a diagnostics row), patched onto the row
+    // base so a selected row keeps its selection background. It reaches across the
+    // head column of a two-column row and the whole label of a plain one.
+    let painted = row_hl.map(|h| base.patch(rt(h)));
+    let hl_end = if painted.is_some() {
+        row_hl_extent(
+            layout,
+            head_col.saturating_sub(used),
+            label_end.saturating_sub(used),
+        )
+    } else {
+        0
+    };
     // Coalesce runs of identically-styled chars into one span (the same walk
     // `preview_line` does) instead of a per-char span — a picker frame renders
     // dozens of rows, and per-char `Span`/`String` allocations add up.
     let mut run = String::new();
-    let mut run_matched = false;
+    let mut run_style = base;
     for (i, ch) in label.chars().enumerate() {
         if used >= label_end {
             break;
         }
-        let i = i as u16;
-        let is_match = spans.iter().any(|(s, e)| i >= *s && i < *e);
-        if is_match != run_matched && !run.is_empty() {
-            let style = if run_matched { matched } else { base };
-            out.push(Span::styled(std::mem::take(&mut run), style));
+        let ci = i as u16;
+        let style = if spans.iter().any(|(s, e)| ci >= *s && ci < *e) {
+            matched
+        } else if i < hl_end {
+            painted.unwrap_or(base)
+        } else {
+            base
+        };
+        if style != run_style && !run.is_empty() {
+            out.push(Span::styled(std::mem::take(&mut run), run_style));
         }
-        run_matched = is_match;
+        run_style = style;
         run.push(ch);
         used += 1;
     }
     if !run.is_empty() {
-        let style = if run_matched { matched } else { base };
-        out.push(Span::styled(run, style));
+        out.push(Span::styled(run, run_style));
     }
     // The kind right-aligned to the box's right edge (dim, so it recedes behind the
     // label): pad the gap after the label out to where the kind starts (`width - kind

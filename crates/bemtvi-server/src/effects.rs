@@ -1402,13 +1402,18 @@ impl EditHost {
                     }),
                     // The source's two-column row shape (live_grep's location head +
                     // matched line), which the client fits as two columns.
-                    layout: p
-                        .layout
-                        .map(|(head, match_start, match_end)| bemtvi_core::RowLayout {
+                    layout: p.layout.map(|(head, match_start, match_end, tag)| {
+                        bemtvi_core::RowLayout {
                             head,
                             match_start,
                             match_end,
-                        }),
+                            tag,
+                        }
+                    }),
+                    // The group the source painted the row with (severity on a
+                    // diagnostics row); resolved against the live colorscheme at
+                    // projection time, not here.
+                    hl: p.hl,
                     ..bemtvi_core::MenuItem::new(p.label, p.key)
                 })
                 .collect();

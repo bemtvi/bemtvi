@@ -671,12 +671,21 @@ pub struct MenuData {
     pub match_spans: Vec<Vec<(u16, u16)>>,
     /// Per visible row (parallel to `items`), the two-column layout the source
     /// declared for a `path:line:col: <line>` row (live_grep): the
-    /// `(head, match start, match end)` char offsets into the label — the length of
-    /// the location column, and the source's own match, which the body column keeps
-    /// on screen and the client highlights. `None` for a plain row (which truncates
+    /// `(head, match start, match end, tag)` char offsets into the label — the length
+    /// of the location column, the source's own match (which the body column keeps on
+    /// screen and the client highlights), and the pinned classification at the head's
+    /// start that survives a head too narrow to fit. `None` for a plain row (which truncates
     /// path-tail-first); empty when no row declares one — the server omits the
     /// `layouts` key entirely then. Fed to [`fit_row`](crate::fit_row).
-    pub layouts: Vec<Option<(u16, u16, u16)>>,
+    pub layouts: Vec<Option<(u16, u16, u16, u16)>>,
+    /// Per visible row (parallel to `items`), the **highlight** the source painted the
+    /// row with (`ctx.push { hl = … }`), already resolved against the colorscheme
+    /// server-side — the severity color of a diagnostics row. It paints the row's HEAD
+    /// column when the row declares a [`layout`](Self::layouts), else the whole label;
+    /// matched chars keep the match style over it. `None` for an unpainted row (or a
+    /// group this colorscheme doesn't define); empty when no row paints — the server
+    /// omits the `row_hls` key entirely then.
+    pub row_hls: Vec<Option<Style>>,
     /// Per visible row (parallel to `items`), whether the row is **marked** by the
     /// picker's multi-select (`<Tab>`). All-false (or empty) when nothing is marked.
     pub marked: Vec<bool>,
@@ -1022,6 +1031,16 @@ impl View {
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
                 layouts: match map_get(m, "layouts") {
                     Some(Value::Array(a)) => a.iter().map(parse_triple).collect(),
+                    _ => Vec::new(),
+                },
+                row_hls: match map_get(m, "row_hls") {
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .map(|v| {
+                            v.as_u64()
+                                .and_then(|id| self.styles.get(id as usize).copied())
+                        })
+                        .collect(),
                     _ => Vec::new(),
                 },
                 marked: match map_get(m, "marked") {

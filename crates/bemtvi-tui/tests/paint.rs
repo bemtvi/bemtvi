@@ -1809,6 +1809,73 @@ fn a_picker_row_keeps_the_file_name_when_the_path_overflows() {
     }
 }
 
+/// A source that paints its rows (`ctx.push { hl = … }` — the diagnostics picker's
+/// severity color) colors the row's HEAD column only: the classification and location
+/// carry the color, the message body keeps the list's own foreground so the match
+/// highlight stays readable over it.
+#[test]
+fn a_painted_picker_row_colors_its_head_column_only() {
+    // Two rows, both two-column (`head` = 14 chars, no match range) and both painted
+    // from the frame's style palette: entry 0 red (an error), entry 1 yellow (a warning).
+    let head = "E src/a.rs:12 ";
+    let label = format!("{head}ty: bad type");
+    let menu = match menu_value(&[&label, &label], &[&[], &[]], 40, Some("")) {
+        Value::Map(mut m) => {
+            let triple =
+                |h: u16| Value::Array(vec![Value::from(h), Value::from(0u16), Value::from(0u16)]);
+            m.push((
+                Value::from("layouts"),
+                Value::Array(vec![triple(head.len() as u16), triple(head.len() as u16)]),
+            ));
+            m.push((
+                Value::from("row_hls"),
+                Value::Array(vec![Value::from(0u64), Value::from(1u64)]),
+            ));
+            Value::Map(m)
+        }
+        other => other,
+    };
+    let v = view(vec![
+        ("lines", lines(&["x"])),
+        (
+            "styles",
+            Value::Array(vec![
+                style(vec![("fg", rgb(0xff, 0, 0))]),
+                style(vec![("fg", rgb(0xff, 0xff, 0))]),
+            ]),
+        ),
+        ("menu", menu),
+    ]);
+    let buf = paint(&v, 60, 12);
+
+    // Find the second row (unselected, so the selection style can't be what we read).
+    let y = (0..buf.area.height)
+        .filter(|&y| row_text(&buf, y).contains("ty: bad type"))
+        .nth(1)
+        .expect("both painted rows render");
+    // A char position, not `find`'s byte index — the box border `│` is 3 bytes.
+    let x0 = row_text(&buf, y)
+        .chars()
+        .position(|c| c == 'E')
+        .expect("the row leads with its severity tag") as u16;
+    // The head is yellow (row 1 -> palette entry 1) end to end...
+    for x in x0..x0 + head.len() as u16 {
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Color::Rgb(0xff, 0xff, 0)),
+            "head char at col {x} carries the row's color: {:?}",
+            row_text(&buf, y)
+        );
+    }
+    // ...and the body past it is NOT — it keeps the list's own foreground.
+    assert_ne!(
+        buf.cell((x0 + head.len() as u16, y)).unwrap().style().fg,
+        Some(Color::Rgb(0xff, 0xff, 0)),
+        "the message body is left in the list's own color: {:?}",
+        row_text(&buf, y)
+    );
+}
+
 #[test]
 fn picker_prompt_caret_lands_past_a_wide_query() {
     // The picker prompt caret follows `query_cursor` — a *char* offset (the

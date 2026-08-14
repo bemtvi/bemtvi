@@ -2442,10 +2442,16 @@ pub struct PickerPush {
     /// picker, or a row with no path — e.g. an unnamed buffer).
     pub preview: Option<PreviewPush>,
     /// The row's two-column layout when the source declared one (`push { head = … }`):
-    /// `(head length, match start, match end)` as **char** offsets into `label` — the
-    /// live_grep shape, `path:line:col: ` followed by the matched line. `None` for a
+    /// `(head length, match start, match end, pinned tag length)` as **char** offsets
+    /// into `label` — the live_grep shape, `path:line:col: ` followed by the matched
+    /// line, plus the leading classification a narrow head must keep. `None` for a
     /// plain single-column row.
-    pub layout: Option<(u16, u16, u16)>,
+    pub layout: Option<(u16, u16, u16, u16)>,
+    /// The **highlight group** the source painted this row with (`push { hl = … }`):
+    /// `"DiagnosticError"` on the diagnostics picker's error rows, and so on. The
+    /// server resolves it against the live colorscheme per frame; `None` (an empty
+    /// string on the wire) for an unpainted row.
+    pub hl: Option<String>,
 }
 
 /// One mark a `btv.decor` provider published — in **buffer** (not viewport-relative)

@@ -2604,7 +2604,10 @@
         // A full-width rule between the prompt and the list, themed off the border
         // group (`TelescopeBorder` &c.) when set, else the built-in chrome color.
         sepEl = document.createElement("div");
-        sepEl.className = "row" + (borderCss ? "" : " float-border");
+        // `pmenu-sep` is a stable hook for this rule the way `pmenu-prompt` is for the
+        // prompt: the theming class below is conditional (it swaps to an inline color when
+        // a border group is set), so it cannot identify the row on its own.
+        sepEl.className = "row pmenu-sep" + (borderCss ? "" : " float-border");
         if (borderCss) sepEl.style.color = borderCss;
         sepEl.style.width = listW * cw + "px";
         sepEl.textContent = "─".repeat(listW);
@@ -2656,8 +2659,13 @@
             const matched = spans.some(([s, e]) => ci >= s && ci < e);
             if (matched) {
               const m = document.createElement("span");
+              // `pmenu-match` always, as a stable hook; the themed inline style layers on
+              // top of it (inline wins over the stylesheet, so the paint is unchanged).
+              // Setting the class only in the UNTHEMED branch left a themed match span
+              // with no way to identify it — the same conditional-class trap `pmenu-sep`
+              // had, and it is why the themed-colour check could not find one.
+              m.className = "pmenu-match";
               if (sMatch) m.setAttribute("style", styleToCss(sMatch));
-              else m.className = "pmenu-match";
               m.textContent = chr;
               rowEl.appendChild(m);
             } else if (ci < hlEnd) {

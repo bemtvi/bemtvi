@@ -1033,6 +1033,42 @@ impl EditHost {
         self.sync_buffer_watches();
     }
 
+    /// Rebuild the layout held back in `pending_session` — the LAST startup step before
+    /// the lifecycle seed, run **after** `init.lua` and the package `plugin/` scripts have
+    /// been sourced. Filled by `shada_load` natively and by `import_persist` on wasm, and
+    /// called from `run_io` and [`boot_finish`](EditHost::boot_finish) respectively; it
+    /// lives here, ungated, rather than in the native shada glue, because rebuilding a
+    /// layout is startup lifecycle, not redb.
+    ///
+    /// The ordering is load-bearing, not incidental. A restored window/buffer is minted
+    /// by the restore itself, and a window-local option (`'scrolloff'`, `'signcolumn'`,
+    /// `'number'`, …) is set on the *current* window — so restoring before the config ran
+    /// gave every restored window the built-in defaults, and the config's `vim.opt`
+    /// settings applied only to a startup window the restore had already replaced. Worse,
+    /// the Lua mirrors still described the pre-restore ids, so a config-time write was
+    /// addressed to a window/buffer that no longer existed and was dropped on the floor.
+    /// Sourcing first and restoring after fixes both: the config configures the startup
+    /// window, and every window the restore mints inherits it (the `template` in
+    /// [`Editor::restore_session`](bemtvi_core::Editor::restore_session)) exactly as a
+    /// `:split` does. It is also neovim's own order — a session is sourced *after* config.
+    ///
+    /// The session stores buffer paths **relative to the workspace root** (a portable
+    /// shada). A `--workspace` launch has already cd'd into that root at boot (see
+    /// `run_io`), so the restore's synchronous local file reads resolve correctly and the
+    /// buffers keep their relative names (so `:ls` reads relative in the workspace) — no
+    /// path reconciliation here. A no-op outside a `--restore-session` boot.
+    pub(crate) fn apply_pending_session_restore(&mut self) {
+        let Some(session) = self.pending_session.take() else {
+            return;
+        };
+        self.editor.restore_session(session);
+        // The restore reminted window ids and swapped the current buffer, so refresh the
+        // Rust→Lua mirrors before anything Lua-facing (the lifecycle events fired next,
+        // and the persisted-view `on_restore` dispatch) reads them.
+        self.refresh_cur_buf_snapshot();
+        self.push_buf_mirror();
+    }
+
     /// Dispatch the persisted `btv.view` slots a session restore reserved. The layout came
     /// back at `shada_load` (before plugins) with each persisted view's slot held by a
     /// placeholder window and recorded in the editor's pending list; now that the config and

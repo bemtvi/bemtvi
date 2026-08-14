@@ -166,15 +166,21 @@ function btv.terminal.open(opts)
   return btv._terminal.open(opts)
 end
 
--- `btv.workspace.dir()` -> the absolute workspace root (a string), or nil when this is not
--- a `--workspace` launch. Read-only — bemtvi chooses the workspace from the command
--- line, not from Lua. For a daemon session this is the daemon's directory.
+-- `btv.workspace.dir()` -> the absolute workspace root (a string), or nil when this
+-- session has no workspace. Read-only — bemtvi chooses the workspace, not Lua. Natively
+-- that means a `--workspace` launch; for a daemon session it is the daemon's directory.
+-- In the browser every session is a workspace (see `btv.workspace.active()`) and this is
+-- the session root — the OPFS root serverless, the daemon's directory in a daemon session.
 function btv.workspace.dir()
   return btv._workspace.dir()
 end
 
--- `btv.workspace.active()` -> true if this launch is a `--workspace` directory session,
--- false otherwise.
+-- `btv.workspace.active()` -> true when this session is workspace-scoped, false otherwise.
+-- Natively that means a `--workspace` directory launch. In the browser it is always true:
+-- the page's ORIGIN is the workspace, since the shada blob lives in that origin's OPFS and
+-- there is exactly one session per origin — which is what `--workspace` names natively. So
+-- a plugin keying per-workspace state off this gets a real workspace in every build rather
+-- than silently skipping persistence in a browser.
 function btv.workspace.active()
   return btv._workspace.active()
 end

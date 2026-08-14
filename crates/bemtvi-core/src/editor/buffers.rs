@@ -140,6 +140,29 @@ pub struct PendingQuitAll {
     pub seqs: Vec<u64>,
 }
 
+/// The position a buffer's still-in-flight open is expected to land on: a located jump's
+/// target ([`Editor::land_cursor`]), or the view a window is waiting to get back (a session
+/// restore, a focus change onto a not-yet-fetched buffer).
+///
+/// It exists because a deferred open hands out an EMPTY buffer first: clamping a position
+/// against it snaps to the top, and the content then arrives and looks correctly placed
+/// while the position is gone. Recording it here lets the read landing
+/// (`settle_loaded_cursor`) apply the real thing.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingOpenCursor {
+    /// The buffer being fetched — the target only applies when *this* buffer's read lands
+    /// (and it is still the current one).
+    pub buffer: BufferId,
+    /// 0-based line to land on.
+    pub line: usize,
+    /// 0-based byte column to land on.
+    pub col: usize,
+    /// The window's saved first visible line, when the waiting thing is a whole *view*
+    /// (a restored or re-entered window) rather than a jump. `None` for a jump, which
+    /// scrolls minimally around its landing like any other navigation.
+    pub top: Option<usize>,
+}
+
 /// A buffer open the editor **deferred** off the keystroke tick — `:edit` over the
 /// daemon wire (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3f). In a
 /// daemon session core does *not* read through the synchronous [`HostFs`](crate::HostFs)
@@ -2425,11 +2448,43 @@ impl Editor {
         // now so a synchronous reader sees something sane in the meantime.
         let buf = self.cur_buffer();
         if self.has_pending_open(buf) {
-            self.pending_open_cursor = Some((buf, line, col));
+            self.pending_open_cursor = Some(PendingOpenCursor {
+                buffer: buf,
+                line,
+                col,
+                top: None,
+            });
         }
         let line = line.min(self.last_line());
         let byte = self.buffer().line_start(line) + col.min(self.buffer().line(line).len());
         self.settle_cursor_byte(byte);
+    }
+
+    /// Remember `cursor` as the position `buffer` is waiting for, when its content is
+    /// still an in-flight off-tick read ([`has_pending_open`](Self::has_pending_open)).
+    /// The read landing applies it through
+    /// [`settle_loaded_cursor`](Self::settle_loaded_cursor); until then the caller's own
+    /// clamp against the empty replica stands as a best-effort placeholder.
+    ///
+    /// The rule this expresses: a window whose buffer has not arrived yet carries the
+    /// position it is *waiting for*, not the placeholder the clamp produced — otherwise
+    /// the clamp destroys it silently, and the window looks correctly restored a tick
+    /// later with its cursor on line 1. A no-op when the content is already there (every
+    /// synchronous local session), so callers need no `host_fs_offtick` branch.
+    pub(crate) fn note_pending_open_cursor(
+        &mut self,
+        buffer: BufferId,
+        cursor: Cursor,
+        top: usize,
+    ) {
+        if self.has_pending_open(buffer) {
+            self.pending_open_cursor = Some(PendingOpenCursor {
+                buffer,
+                line: cursor.line,
+                col: cursor.col,
+                top: Some(top),
+            });
+        }
     }
 
     /// Settle the cursor after a deferred open's content lands in `buffer`: if a located
@@ -2440,13 +2495,22 @@ impl Editor {
         if buffer != self.cur_buffer() {
             return;
         }
-        if let Some((b, line, col)) = self.pending_open_cursor {
-            if b == buffer {
+        if let Some(pending) = self.pending_open_cursor {
+            if pending.buffer == buffer {
                 self.pending_open_cursor = None;
                 self.cursor = Cursor::default();
                 self.top = 0;
                 self.leftcol = 0;
-                self.land_cursor(line, col);
+                self.land_cursor(pending.line, pending.col);
+                // A whole view was waiting (a restored / re-entered window), not just a
+                // jump: put the scroll back where it was too, or the landing re-derives it
+                // from the top of the file and the cursor comes back pinned to the last
+                // screen row instead of sitting where it did. `ensure_visible` still has
+                // the final say, so a `top` that no longer holds the cursor is corrected.
+                if let Some(top) = pending.top {
+                    self.top = top.min(self.last_line());
+                    self.ensure_visible();
+                }
                 return;
             }
         }

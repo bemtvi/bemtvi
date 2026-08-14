@@ -1754,14 +1754,16 @@ pub struct Editor {
     /// [`load_pending_open`](Editor::load_pending_open) can restore it. `None` for every
     /// ordinary read (autoreload, workspace edits, initial open).
     forced_read_encoding: Option<String>,
-    /// A jump target `(buffer, line, byte-col)` waiting for a **deferred** open to land
-    /// — a located navigation (LSP go-to, a picker `<C-t>`/`<C-x>`, `:e +N`) onto a
-    /// buffer whose content hasn't been read yet (every local open now defers behind the
-    /// explorer's `BufReadCmd` handler; an off-tick open always does). [`land_cursor`]
-    /// records it instead of clamping the cursor onto the still-empty buffer; the read
-    /// landing ([`load_str_into`] / [`load_pending_open`]) applies it once the lines are
-    /// there, so the cursor lands on the located line rather than snapping to the top.
-    pending_open_cursor: Option<(BufferId, usize, usize)>,
+    /// The position waiting for a **deferred** open to land — either a located navigation
+    /// (LSP go-to, a picker `<C-t>`/`<C-x>`, `:e +N`, a mark jump) or a whole window
+    /// *view* (a session restore, a focus change) onto a buffer whose content hasn't been
+    /// read yet (every local open now defers behind the explorer's `BufReadCmd` handler;
+    /// an off-tick open always does). [`land_cursor`] /
+    /// [`note_pending_open_cursor`](Editor::note_pending_open_cursor) record it instead of
+    /// letting the clamp onto the still-empty buffer stand as the answer; the read landing
+    /// ([`load_str_into`] / [`load_pending_open`]) applies it once the lines are there, so
+    /// the position comes back rather than snapping to the top.
+    pending_open_cursor: Option<buffers::PendingOpenCursor>,
     /// Buffers whose content was read from a file *in place* this tick — a local
     /// (synchronous) `:edit` that reused the throwaway `[No Name]` or re-read the
     /// current file (`:e` / `:e!`), keeping the same bufnr. Drained by the server

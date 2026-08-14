@@ -72,7 +72,11 @@ try {
 
   // (a) The view buffer actually carries the sign extmark in core.
   const exts = await luaResult(`return #vim.api.nvim_buf_get_extmarks(vw:bufnr(), ns, 0, -1, {})`);
-  check("the view buffer carries the sign extmark", Number(exts) >= 1, `count=${JSON.stringify(exts)}`);
+  // `execLua` renders its result as `ok:<value>`, so `Number("ok:1")` is NaN and the bare
+  // numeric compare could never pass. Strip the prefix before comparing, as the other
+  // verifiers do by matching on content.
+  const extCount = Number(String(exts).replace(/^ok:/, ""));
+  check("the view buffer carries the sign extmark", extCount >= 1, `count=${JSON.stringify(exts)}`);
 
   // (b) The redraw frame for the view window carries sign_width + the glyph.
   const frame = await page.evaluate(() => {

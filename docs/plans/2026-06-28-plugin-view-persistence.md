@@ -179,6 +179,12 @@ Per the big-feature cadence: commit + pause for review between phases.
   `SessionWindow`, so it round-trips harmlessly anywhere `SessionState` is ever serialized.
   If/when web gains session restore, plugin views come along for free (the dispatch is in
   `lifecycle.rs`, shared) provided that path also calls `restore_persisted_views`.
+
+  **SUPERSEDED 2026-08-14** — web *did* gain session restore
+  (docs/plans/2026-08-14-web-session-restore.md), and the prediction above held exactly:
+  the shared `lifecycle.rs` dispatch needed no changes, and wiring
+  `restore_persisted_views` into the wasm `boot_finish` was the whole of it. Plugin-view
+  persistence is no longer native-only.
 - **GC.** Document the `on_close` → `shada:delete` convention; consider an
   orphan-namespace sweep on flush for uninstalled plugins (keep minimal / optional).
 - **Docs.** Update the `btv.view` section of the native plugin API spec

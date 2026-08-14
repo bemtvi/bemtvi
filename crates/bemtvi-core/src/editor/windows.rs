@@ -2862,6 +2862,10 @@ impl Editor {
         let resume = w.resume.take();
         let restore = std::mem::take(&mut self.restore_mode_on_enter);
         self.set_cur_buffer(buffer);
+        // Entering a window whose buffer has not arrived yet (an off-tick read still in
+        // flight): the `clamp_cursor` below would snap its saved position to the top of an
+        // empty replica, so record what it is waiting for and let the read landing apply it.
+        self.note_pending_open_cursor(buffer, cursor, top);
         self.cursor = cursor;
         self.top = top;
         self.leftcol = leftcol;

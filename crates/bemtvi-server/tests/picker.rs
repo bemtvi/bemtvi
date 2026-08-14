@@ -18,7 +18,7 @@ use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
     attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_mod,
-    lines, map_get, menu_items, menu_of, poll_menu, spawn, temp_dir,
+    lines, map_get, menu_items, menu_of, poll_menu, serial_lock, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -3310,6 +3310,12 @@ async fn builtin_jumplist_picker_lists_and_jumps() {
 /// the assertion holds whichever one the machine lands on.
 #[tokio::test]
 async fn builtin_files_picker_lists_ignored_and_hidden_files() {
+    // `:cd` below is `std::env::set_current_dir` — process-wide, and this binary runs its
+    // tests concurrently — so a `files` / `live_grep` child spawned here would otherwise
+    // search whatever directory another test had just cd'd into (observed: this test
+    // matching `picker_grep_nomatch`'s `a.txt`). Hold the lock for the whole body.
+    let _serial = serial_lock().lock().await;
+
     let dir = temp_dir("picker_files_unrestricted_cfg");
     let proj = temp_dir("picker_files_unrestricted");
     // A git repo (rg honors .gitignore only inside one) with one ignored file, one
@@ -3353,6 +3359,8 @@ async fn builtin_files_picker_lists_ignored_and_hidden_files() {
 /// `grep -rnI --exclude-dir=.git` and the `btv.fs` walk all search this set.
 #[tokio::test]
 async fn builtin_live_grep_searches_ignored_and_hidden_files() {
+    let _serial = serial_lock().lock().await;
+
     let dir = temp_dir("picker_grep_unrestricted_cfg");
     let proj = temp_dir("picker_grep_unrestricted");
     std::fs::create_dir(proj.join(".git")).expect("mkdir .git");
@@ -3424,6 +3432,8 @@ fn menu_layouts(menu: &[(Value, Value)]) -> Vec<Option<(usize, usize, usize, usi
 /// asserted by *shape* since only `rg` reports a real column.
 #[tokio::test]
 async fn live_grep_rows_carry_the_location_head_and_the_hit() {
+    let _serial = serial_lock().lock().await;
+
     let dir = temp_dir("picker_grep_layout_cfg");
     let proj = temp_dir("picker_grep_layout");
     // A hit far into a long, deeply indented line — the case that used to render as
@@ -3497,6 +3507,8 @@ async fn live_grep_rows_carry_the_location_head_and_the_hit() {
 /// commands as a matching one, whichever leg the machine lands on.
 #[tokio::test]
 async fn live_grep_stops_at_the_first_working_tool_even_with_no_matches() {
+    let _serial = serial_lock().lock().await;
+
     let dir = temp_dir("picker_grep_nomatch_cfg");
     let proj = temp_dir("picker_grep_nomatch");
     std::fs::write(proj.join("a.txt"), "zqxneedle here\n").expect("write a.txt");
@@ -3573,6 +3585,8 @@ end
 /// accepts a registration from a dead generation.
 #[tokio::test]
 async fn a_reaped_live_grep_leg_does_not_start_the_next_one() {
+    let _serial = serial_lock().lock().await;
+
     let dir = temp_dir("picker_grep_reap_cfg");
     let proj = temp_dir("picker_grep_reap");
     std::fs::write(proj.join("a.txt"), "zqxneedle here\n").expect("write a.txt");
@@ -3846,6 +3860,8 @@ async fn the_exclude_box_drops_matching_paths_and_the_include_box_keeps_only_its
 
 #[tokio::test]
 async fn editing_a_filter_box_re_runs_a_static_source() {
+    let _serial = serial_lock().lock().await;
+
     // A query edit on a static source only re-ranks what it already holds. A FILTER
     // edit changes which paths exist, which no re-ranking can produce — so it must
     // re-run the source. Asserted through the shipped `files` source over a real
@@ -3885,6 +3901,8 @@ async fn editing_a_filter_box_re_runs_a_static_source() {
 
 #[tokio::test]
 async fn the_filter_boxes_narrow_live_grep_too() {
+    let _serial = serial_lock().lock().await;
+
     let cfg = temp_dir("picker_filter_grep_cfg");
     let proj = filter_project("picker_filter_grep");
     let (rpc, mut incoming) = start(&cfg, "").await;

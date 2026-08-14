@@ -2052,3 +2052,211 @@ async fn session_restores_an_inactive_tab_unscrolled_too() {
         );
     }
 }
+
+/// The same restore over an **off-tick** filesystem (a daemon session — and the web build,
+/// which shares this path): the cursor must come back where it was left, not at line 1.
+///
+/// Natively the restore's leaf reads are synchronous, so by the time
+/// `install_restored_tree` clamps the focused window's cursor the buffer already holds the
+/// file. Off-tick, `open_buffer_for_restore` only *enqueues* a replica open, so the buffer
+/// is empty at that moment and the clamp snaps the saved line to the top — silently, since
+/// the text then arrives a tick later and looks perfectly restored. The core already models
+/// this exactly (`Editor::pending_open_cursor` / `settle_loaded_cursor`, what a jump into a
+/// not-yet-fetched buffer uses); the restore just wasn't using it.
+///
+/// The daemon fs is the same seam the browser uses (`host_fs_offtick`), so this covers the
+/// web session-restore path too — a tier-1 feature must behave identically over the wire.
+#[tokio::test]
+async fn session_restores_the_cursor_over_off_tick_fs() {
+    use bemtvi_test_harness::{await_lines, spawn_with_daemon_fs_init, DaemonFs};
+
+    let dir = temp_dir("session_store_offtick");
+    // A fresh daemon fs per session (the fake is consumed by the daemon task), same content.
+    let seed = || {
+        let fake = DaemonFs::default();
+        fake.set("/virtual/notes.txt", "n1\nn2\nn3\nn4\nn5\n");
+        fake
+    };
+    let session_init = |file: Option<&str>| ServerInit {
+        file: file.map(str::to_string),
+        shada: Some(Box::new(RedbFileStore::new(dir.to_path_buf()))),
+        workspace_session: true,
+        restore_session: true,
+        ..Default::default()
+    };
+
+    // Session 1: the file lives only on the daemon, so the open crosses the wire. Park the
+    // cursor on line 4 and quit — the exit flush captures the layout with that cursor.
+    {
+        let (rpc, incoming) =
+            spawn_with_daemon_fs_init(seed(), session_init(Some("/virtual/notes.txt"))).await;
+        await_lines(&rpc, &["n1", "n2", "n3", "n4", "n5"]).await;
+        exec_lua(&rpc, "btv.shada.save_layout(true)").await;
+        feed(&rpc, "4G");
+        assert_eq!(
+            cursor(&rpc).await,
+            (4, 0),
+            "cursor parked on line 4 before quit"
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the restore rebuilds the window immediately and fills it over the wire a
+    // tick or two later. Wait for the text, then the cursor must be back on line 4.
+    {
+        let (rpc, _incoming) = spawn_with_daemon_fs_init(seed(), session_init(None)).await;
+        assert_eq!(
+            await_lines(&rpc, &["n1", "n2", "n3", "n4", "n5"]).await,
+            vec!["n1", "n2", "n3", "n4", "n5"],
+            "the restored buffer fills in from the daemon"
+        );
+        assert_eq!(
+            cursor(&rpc).await,
+            (4, 0),
+            "the cursor is restored once the off-tick read lands, not left clamped at line 1"
+        );
+    }
+}
+
+/// The off-tick cursor restore across **tabs**, where the clamp against a not-yet-arrived
+/// buffer can bite twice more: the restore leaves each tab in turn (stashing the live
+/// view into the outgoing window), and entering a tab restores its focused window's saved
+/// position — both against a buffer whose bytes are still in flight.
+#[tokio::test]
+async fn session_restores_the_cursor_in_every_tab_over_off_tick_fs() {
+    use bemtvi_test_harness::{await_lines, spawn_with_daemon_fs_init, DaemonFs};
+
+    let dir = temp_dir("session_store_offtick_tabs");
+    let seed = || {
+        let fake = DaemonFs::default();
+        fake.set("/virtual/one.txt", "1a\n1b\n1c\n1d\n1e\n")
+            .set("/virtual/two.txt", "2a\n2b\n2c\n2d\n2e\n");
+        fake
+    };
+    let session_init = |file: Option<&str>| ServerInit {
+        file: file.map(str::to_string),
+        shada: Some(Box::new(RedbFileStore::new(dir.to_path_buf()))),
+        workspace_session: true,
+        restore_session: true,
+        ..Default::default()
+    };
+
+    // Session 1: tab 1 on line 4 of one.txt, tab 2 on line 2 of two.txt, quit from tab 1.
+    {
+        let (rpc, incoming) =
+            spawn_with_daemon_fs_init(seed(), session_init(Some("/virtual/one.txt"))).await;
+        await_lines(&rpc, &["1a", "1b", "1c", "1d", "1e"]).await;
+        exec_lua(&rpc, "btv.shada.save_layout(true)").await;
+        feed(&rpc, "4G");
+        feed(&rpc, ":tabnew /virtual/two.txt<CR>");
+        await_lines(&rpc, &["2a", "2b", "2c", "2d", "2e"]).await;
+        feed(&rpc, "2G");
+        assert_eq!(cursor(&rpc).await, (2, 0), "tab 2 parked on line 2");
+        feed(&rpc, "gT"); // back to tab 1, so that is the tab the session is quit from
+        assert_eq!(cursor(&rpc).await, (4, 0), "tab 1 still on line 4");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: both tabs come back, each with its own cursor — the active one once its
+    // read lands, the other when it is switched to.
+    {
+        let (rpc, _incoming) = spawn_with_daemon_fs_init(seed(), session_init(None)).await;
+        assert_eq!(tab_count(&rpc).await, 2, "both tabs restored");
+        assert_eq!(
+            await_lines(&rpc, &["1a", "1b", "1c", "1d", "1e"]).await,
+            vec!["1a", "1b", "1c", "1d", "1e"],
+            "the active tab's buffer fills in from the daemon"
+        );
+        assert_eq!(
+            cursor(&rpc).await,
+            (4, 0),
+            "the active tab's cursor survives the restore"
+        );
+        feed(&rpc, "gt");
+        assert_eq!(
+            await_lines(&rpc, &["2a", "2b", "2c", "2d", "2e"]).await,
+            vec!["2a", "2b", "2c", "2d", "2e"],
+            "the background tab's buffer is there once it is switched to"
+        );
+        assert_eq!(
+            cursor(&rpc).await,
+            (2, 0),
+            "the background tab kept its own cursor through the restore"
+        );
+    }
+}
+
+/// The scroll position rides along with the cursor over an off-tick fs. Same family as
+/// the cursor: the restore sets the window's saved `top`, then `ensure_visible` runs
+/// against an EMPTY replica and the read landing resets the scroll to the top of the
+/// file — so a session left deep in a long file came back with the cursor right but the
+/// viewport re-derived (the cursor pinned to the last screen row instead of where it sat).
+#[tokio::test]
+async fn session_restores_the_scroll_position_over_off_tick_fs() {
+    use bemtvi_test_harness::{await_lines, spawn_with_daemon_fs_init, DaemonFs};
+
+    let dir = temp_dir("session_store_offtick_scroll");
+    let body: String = (1..=80).map(|n| format!("line{n}\n")).collect();
+    let first: Vec<String> = (1..=5).map(|n| format!("line{n}")).collect();
+    let seed = {
+        let body = body.clone();
+        move || {
+            let fake = DaemonFs::default();
+            fake.set("/virtual/long.txt", &body);
+            fake
+        }
+    };
+    let session_init = |file: Option<&str>| ServerInit {
+        file: file.map(str::to_string),
+        shada: Some(Box::new(RedbFileStore::new(dir.to_path_buf()))),
+        workspace_session: true,
+        restore_session: true,
+        ..Default::default()
+    };
+    // The cursor's SCREEN row is the viewport made visible: `zt` puts it near the top,
+    // while a re-derived scroll (`ensure_visible` from the top of the file) pins it to the
+    // last row. The frame carries no topline, and this is the difference a user sees.
+    let cursor_row = |map: &[(rmpv::Value, rmpv::Value)]| {
+        bemtvi_test_harness::window0_field(map, "cursor_row").and_then(rmpv::Value::as_u64)
+    };
+
+    // Session 1: scroll deep into the file with the cursor parked at the top of the
+    // viewport (`zt`), so the saved scroll is not something `ensure_visible` would
+    // re-derive on its own.
+    let saved_top = {
+        let (rpc, mut incoming) =
+            spawn_with_daemon_fs_init(seed(), session_init(Some("/virtual/long.txt"))).await;
+        await_lines(&rpc, &first.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        exec_lua(&rpc, "btv.shada.save_layout(true)").await;
+        feed(&rpc, "60G");
+        let map = bemtvi_test_harness::redraw_after(&rpc, &mut incoming, "zt").await;
+        let top = cursor_row(&map).expect("a cursor_row in the frame");
+        assert!(
+            top < 5,
+            "`zt` really did park the cursor near the top of the viewport: row {top}"
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+        top
+    };
+
+    // Session 2: the same viewport comes back once the off-tick read lands.
+    {
+        let (rpc, mut incoming) = spawn_with_daemon_fs_init(seed(), session_init(None)).await;
+        await_lines(&rpc, &first.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        assert_eq!(
+            cursor(&rpc).await,
+            (60, 0),
+            "the cursor came back on line 60"
+        );
+        let map = bemtvi_test_harness::redraw_after(&rpc, &mut incoming, "").await;
+        assert_eq!(
+            cursor_row(&map),
+            Some(saved_top),
+            "the restored window shows the same viewport it was left showing (the cursor \
+             sits where it did, not pinned to the bottom row by a re-derived scroll)"
+        );
+    }
+}

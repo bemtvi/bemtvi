@@ -275,7 +275,12 @@ impl Editor {
         // before the lines exist — a negligible nuance for an as-yet-unloaded file).
         if self.has_pending_open(loc.buf) {
             let col = if line_anchor { 0 } else { loc.cursor.col };
-            self.pending_open_cursor = Some((loc.buf, loc.cursor.line, col));
+            self.pending_open_cursor = Some(super::buffers::PendingOpenCursor {
+                buffer: loc.buf,
+                line: loc.cursor.line,
+                col,
+                top: None,
+            });
             return;
         }
         let line = loc.cursor.line.min(self.last_line());

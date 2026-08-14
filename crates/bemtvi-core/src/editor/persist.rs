@@ -1047,6 +1047,15 @@ impl Editor {
         };
         self.windows = tree;
         self.set_cur_buffer(buf);
+        // An off-tick session (a daemon or the browser): the leaf's bytes are still in
+        // flight, so `buf` is an EMPTY replica right now and the `clamp_cursor` below
+        // would snap the saved line to the top — silently, since the text lands a tick
+        // later and the window then looks perfectly restored while the cursor sits on
+        // line 1. Record the position the window is waiting for so the read landing
+        // applies it (`settle_loaded_cursor`), exactly as a jump into a not-yet-fetched
+        // buffer does (`land_cursor`). Natively the read already happened, so there is
+        // no pending open and this is a no-op.
+        self.note_pending_open_cursor(buf, sc, st);
         self.cursor = sc;
         self.top = st;
         self.leftcol = sl;

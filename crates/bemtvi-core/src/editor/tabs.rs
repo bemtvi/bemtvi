@@ -252,6 +252,20 @@ impl Editor {
         // stash below must capture.
         self.stash_secondary_cursors();
         let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        // A window whose buffer is still an in-flight off-tick read (a daemon / browser
+        // session) is showing an EMPTY replica, so its live cursor is the placeholder the
+        // clamp produced — stash the position it is waiting for instead, or leaving the
+        // window overwrites the real one and the read landing has nothing to come back to.
+        let (cursor, top) = match self.pending_open_cursor {
+            Some(p) if p.buffer == self.cur_buffer() => (
+                crate::Cursor {
+                    line: p.line,
+                    col: p.col,
+                },
+                p.top.unwrap_or(top),
+            ),
+            _ => (cursor, top),
+        };
         let w = self.windows.cur_mut();
         w.saved_cursor = cursor;
         w.saved_top = top;

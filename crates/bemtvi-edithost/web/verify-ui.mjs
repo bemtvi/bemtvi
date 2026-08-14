@@ -241,7 +241,10 @@ try {
     menuRows.length >= 3 && menuRows[0] === "alpha" && menuRows[1] === "beta" && menuRows[2] === "gamma",
     JSON.stringify(menuRows));
 
-  await page.evaluate(() => window.__bemtvi.feed("j")); // alpha -> beta
+  // The menu opens NOSELECT: the first `j` reveals the highlight at row 0 (alpha), the
+  // second moves it to row 1 (beta) — same as the native `select_default_keys_navigate_
+  // and_confirm` test, which feeds "jj" for this reason. One `j` confirms alpha.
+  await page.evaluate(() => window.__bemtvi.feed("jj")); // reveal at alpha, then -> beta
   await page.evaluate(() => window.__bemtvi.feed("<CR>"));
   await sleep(100);
   // execLua returns a rendered `ok:<value>` string, so match on content (as the
@@ -266,7 +269,10 @@ try {
     "btv.picker.open('demo')"));
   await sleep(120);
   const pickerOpen = await page.evaluate(() => {
-    const all = [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt)")].map((e) => e.textContent.trim());
+    // `:not(.pmenu-sep)` drops the rule a picker draws between the prompt and the list
+    // (chrome the core reserves a row for), leaving only candidate rows.
+    const all = [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt):not(.pmenu-sep)")]
+      .map((e) => e.textContent.trim());
     return {
       rows: all.filter((t) => t !== ""),          // non-empty (fixed box pads empties)
       total: all.length,                          // the fixed box height (> item count)
@@ -283,7 +289,7 @@ try {
   await sleep(120);
   const filtered = await page.evaluate(() => ({
     query: window.__bemtvi.frame().menu?.query,
-    rows: [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt)")]
+    rows: [...document.querySelectorAll("#grid .pmenu .row:not(.pmenu-prompt):not(.pmenu-sep)")]
       .map((e) => e.textContent.trim()).filter((t) => t !== ""),
     matched: [...document.querySelectorAll("#grid .pmenu .pmenu-match")].length,
   }));

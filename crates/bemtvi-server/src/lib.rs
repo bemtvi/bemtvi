@@ -968,12 +968,13 @@ pub struct EditHost {
     /// (which only governs capture). From [`ServerInit::restore_session`].
     #[cfg(feature = "native")]
     restore_session: bool,
-    /// The captured session [`shada_load`](Self::shada_load) pulled out of the store,
-    /// held until the config has been sourced — see
-    /// [`apply_pending_session_restore`](Self::apply_pending_session_restore) for why the
-    /// layout must NOT come back before `init.lua` runs. `None` outside a
-    /// `--restore-session` boot, and taken (once) at the restore point.
-    #[cfg(feature = "native")]
+    /// The captured session pulled out of the store and held until the config has been
+    /// sourced — see [`apply_pending_session_restore`](Self::apply_pending_session_restore)
+    /// for why the layout must NOT come back before `init.lua` runs. Filled by
+    /// [`shada_load`](Self::shada_load) natively and by
+    /// [`import_persist`](Self::import_persist) on wasm; `None` when no layout was stored
+    /// (or, natively, outside a `--restore-session` boot), and taken (once) at the restore
+    /// point. Ungated: both legs carry a layout, so neither drops one on the floor.
     pending_session: Option<bemtvi_core::SessionState>,
     /// The on-daemon shada sync for a `Remote`-config session (Approach A): a handle to
     /// the daemon fs plus the remote file path. `None` for a local-shada session. When
@@ -1871,7 +1872,6 @@ impl EditHost {
             workspace_session: false,
             #[cfg(feature = "native")]
             restore_session: false,
-            #[cfg(feature = "native")]
             pending_session: None,
             #[cfg(feature = "native")]
             remote_shada: None,
@@ -2098,9 +2098,52 @@ impl EditHost {
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
         self.push_buf_mirror();
-        // Seeded from the same cross-tab enumeration the diff uses
-        // (`emit_lifecycle_events`), or a restore's background-tab windows would all
-        // read as new on the first diff.
+        self.publish_workspace_identity();
+        self.seed_startup_baselines();
+    }
+
+    /// Report this session as a workspace rooted at its current directory, so
+    /// `btv.workspace.active()` / `btv.workspace.dir()` tell the truth on the web build.
+    ///
+    /// On the web the ORIGIN is the workspace: the shada blob lives in that origin's OPFS
+    /// and there is exactly one session per origin, which is what `--workspace` names
+    /// natively (see docs/plans/2026-08-14-web-session-restore.md). Reporting `false` /
+    /// `nil` — what these did — is not a neutral default: a plugin that gates its
+    /// persistence on `btv.workspace.active()` (bemtvi-dap keys its store that way) simply
+    /// skipped it in a browser, with nothing said.
+    ///
+    /// `btv.shada.namespace()` is deliberately left `nil`. Natively it is the `ns/<id>/`
+    /// token that isolates one launch's store from another's; on the web the browser's
+    /// origin does that job and there is no second token to report. Reporting a fake one
+    /// would be worse than reporting none.
+    ///
+    /// Seeded from the *effective* dir, so the serverless build reports the OPFS root and a
+    /// daemon session reports the daemon's directory — re-published wherever that root
+    /// arrives ([`seed_remote_cwd`](Self::seed_remote_cwd) and `apply_remote_config`), both
+    /// of which run before any config line can read it.
+    fn publish_workspace_identity(&mut self) {
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let (_, dir) = self.dirs.effective(win, tab);
+        let root = dir.to_string_lossy().into_owned();
+        self.lua.set_workspace_identity(None, Some(root));
+    }
+
+    /// Baseline the window / tab / buffer sets the lifecycle diff reads, so the startup
+    /// layout fires no `WinNew` / `TabNew` / `BufAdd` (neovim skips them for the initial
+    /// window and tab). Enumerated cross-tab, like the diff itself, or a restore's
+    /// background-tab windows would all read as new on the first diff.
+    ///
+    /// Run twice on EVERY boot: once in [`boot_begin`](Self::boot_begin) so the config sees
+    /// a seeded editor, and again in [`boot_finish`](Self::boot_finish). The second pass
+    /// matters most on a restoring boot — every window, tab and buffer the restore minted is
+    /// startup state, not something that "appeared", and without it each one fires a spurious
+    /// event at a config's autocmds — but it is unconditional on purpose, because that is
+    /// where it lands `run_io`'s semantics: natively the one and only seed runs *after* the
+    /// config phase, so anything the config itself opened is baseline there too. Seeding
+    /// twice rather than moving the seed keeps `startup_bufs_seeded` true while the config
+    /// runs, which is the state `boot_begin` was already establishing.
+    fn seed_startup_baselines(&mut self) {
         self.known_windows = self.editor.all_window_ids();
         self.last_window_rects = Some(self.window_rects_snapshot());
         self.known_tabs = self.editor.tab_ids();
@@ -2112,10 +2155,37 @@ impl EditHost {
     /// `v:vim_did_enter`. Run after [`boot_begin`](Self::boot_begin) and the optional
     /// `init.lua` sourcing ([`source_config`](Self::source_config)).
     pub fn boot_finish(&mut self) {
+        // Rebuild the layout `import_persist` held back, in `run_io`'s order: after the
+        // config (so restored windows inherit its window-local options — the whole reason
+        // the layout is held back) and before the lifecycle seed below. A no-op when the
+        // config never opted into capture, or when nothing was stored.
+        //
+        // Each restored leaf is an ASYNC open here: the web fs is off-tick, so
+        // `open_buffer_for_restore` enqueues a replica open the Worker fulfills over OPFS.
+        // The window tree is therefore correct immediately and the text arrives a tick or
+        // two later, exactly as a `:e` behaves on this build.
+        self.apply_pending_session_restore();
+        // Hand each persisted `btv.view` slot the restore reserved to its owning plugin,
+        // now that the config (and, in a daemon session, the remote plugin surface) has
+        // registered its `btv.view.on_restore` handlers. Unclaimed slots collapse rather
+        // than lingering as empty placeholder windows. Done BEFORE the baseline below so
+        // the placeholder churn fires no spurious `WinNew` / `WinClosed` — the same order
+        // `run_io` uses.
+        self.restore_persisted_views();
+        // Re-baseline over the restored layout, or every window/tab/buffer it minted
+        // reads as new and fires a spurious `WinNew` / `TabNew` / `BufAdd`.
+        self.seed_startup_baselines();
         self.emit_lifecycle_events();
         self.run_pending();
         let _ = self.lua.set_vim_did_enter(true);
         self.fire_vim_enter();
+        // Last word on focus: re-assert the layer the restored session was quit from, so a
+        // session left in a dock reopens there rather than on the main layer. A no-op
+        // unless a focus layer was captured.
+        if self.editor.finalize_session_focus() {
+            self.apply_lua_effects();
+            self.run_pending();
+        }
         // Then `UIEnter`, in the native order (startup first, the client second). The
         // browser's UI is already attached — `eh_new` did it before the config was
         // sourced — so firing it here is what gives a config or plugin the same chance
@@ -2178,6 +2248,7 @@ impl EditHost {
         if let Some(cwd) = remote_cwd {
             self.dirs = cwd::DirState::new(cwd);
             self.publish_cwd_mirror();
+            self.publish_workspace_identity();
             // A `?daemon=` web session: `btv.fs` routes to the daemon (stateless cwd), so
             // mark it for the `apply_loop_op` relative-path rebase. A serverless session
             // has `remote_cwd == None` and stays `false` (OPFS is root-relative, cwd-less).
@@ -2240,6 +2311,8 @@ impl EditHost {
     pub fn seed_remote_cwd(&mut self, cwd: std::path::PathBuf) {
         self.dirs = cwd::DirState::new(cwd);
         self.publish_cwd_mirror();
+        // The daemon's directory is this session's workspace root, not the local `/`.
+        self.publish_workspace_identity();
         self.remote_cwd_seeded = true;
     }
 
@@ -2248,6 +2321,13 @@ impl EditHost {
     /// then `redraw` pushes a frame through the [`HostEffects`] seam to the UI. Mirrors
     /// one turn of the native [`run`] loop's input arm.
     pub fn feed(&mut self, keys: &str) {
+        // The user is driving now — release any restored-session focus hold so their own
+        // navigation wins from here, exactly as the native `btv_input` dispatch arm does.
+        // Without this the hold has no release point on the web build at all: `settle_events`
+        // re-asserts the captured layer on EVERY settle (an fs completion, an LSP reply, a
+        // watch, a proc line — `fire_due_timers` is the one wake that does not settle), so
+        // a restored session would keep yanking focus back out of wherever you moved it.
+        self.editor.clear_session_focus_hold();
         self.input(keys);
         // Arm the `timeoutlen` idle flush, the wasm analogue of the native clients'
         // flush timer: when this keystroke left an ambiguous mapped prefix withheld
@@ -2271,6 +2351,9 @@ impl EditHost {
     /// which the Worker sets before this call) so `'mousetime'` multi-click detection
     /// works. A malformed gesture surfaces a loud message rather than a silent no-op.
     pub fn mouse(&mut self, button: &str, action: &str, modifier: &str, row: usize, col: usize) {
+        // A click is the user taking over too — release the restored-focus hold so a click
+        // into (or away from) a sidebar sticks, matching `btv_input_mouse` natively.
+        self.editor.clear_session_focus_hold();
         match bemtvi_core::MouseEvent::parse(button, action, modifier, row, col) {
             Ok(mut ev) => {
                 ev.stamp_ms = self.clock_ms;
@@ -2361,11 +2444,26 @@ impl EditHost {
     /// serializes this into its redb store ([`shada`]); the wasm Worker serializes it to
     /// a JSON blob in OPFS. Folds in the opt-in **plugin** data, which lives in the Lua
     /// runtime (not the editor model), so both fronts persist it through this one seam —
-    /// the native flush sites and the wasm `eh_export_shada` alike. The session /
-    /// `exit_cursor` are layered on by the caller (only the native flush carries them).
+    /// the native flush sites and the wasm `eh_export_shada` alike. `exit_cursor` is
+    /// layered on by the caller.
+    ///
+    /// The window/tab layout rides along under the same
+    /// [`session_captures_layout`](Self::session_captures_layout) gate the three native
+    /// flush sites use — default off, so a browser session that never opted in stores no
+    /// layout, exactly as a plain native launch does.
     pub fn export_persist(&self) -> bemtvi_core::PersistState {
         let mut state = self.editor.export_persist();
         state.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
+        if self.session_captures_layout() {
+            state.session = self.editor.export_session();
+        }
+        // The `btv.wso` overlay rides along unconditionally: natively it is gated on
+        // `workspace_session` because a global store must never carry per-workspace
+        // overrides, but on the web every session IS workspace-scoped (one blob per
+        // origin), so there is no global store to keep clean. `Editor::apply_persist`
+        // already seeds it back on load — only this half was missing, which made a
+        // `btv.wso` write look like it persisted and then quietly not.
+        state.workspace_options = self.editor.workspace_options().clone();
         state
     }
 
@@ -2378,6 +2476,12 @@ impl EditHost {
     /// `shada_load` calls it after pulling the session out.
     pub fn import_persist(&mut self, mut state: bemtvi_core::PersistState) {
         let plugin_data = std::mem::take(&mut state.plugin_data);
+        // The layout is held back, not applied here: `Editor::apply_persist` ignores the
+        // field entirely, and a layout must not be rebuilt until the config has been
+        // sourced (see `apply_pending_session_restore`). Taking it into `pending_session`
+        // is what the native `shada_load` does with it; the restore point itself is
+        // Phase 2 of docs/plans/2026-08-14-web-session-restore.md.
+        self.pending_session = state.session.take();
         self.editor.import_persist(state);
         self.lua
             .plugin_shada_seed(plugin_shada_to_tuples(plugin_data));
@@ -3326,39 +3430,6 @@ impl EditHost {
                 self.shada = None;
             }
         }
-    }
-
-    /// Rebuild the layout of the session [`shada_load`](Self::shada_load) held back —
-    /// the LAST startup step before the lifecycle seed, run **after** `init.lua` and the
-    /// package `plugin/` scripts have been sourced.
-    ///
-    /// The ordering is load-bearing, not incidental. A restored window/buffer is minted
-    /// by the restore itself, and a window-local option (`'scrolloff'`, `'signcolumn'`,
-    /// `'number'`, …) is set on the *current* window — so restoring before the config ran
-    /// gave every restored window the built-in defaults, and the config's `vim.opt`
-    /// settings applied only to a startup window the restore had already replaced. Worse,
-    /// the Lua mirrors still described the pre-restore ids, so a config-time write was
-    /// addressed to a window/buffer that no longer existed and was dropped on the floor.
-    /// Sourcing first and restoring after fixes both: the config configures the startup
-    /// window, and every window the restore mints inherits it (the `template` in
-    /// [`Editor::restore_session`](bemtvi_core::Editor::restore_session)) exactly as a
-    /// `:split` does. It is also neovim's own order — a session is sourced *after* config.
-    ///
-    /// The session stores buffer paths **relative to the workspace root** (a portable
-    /// shada). A `--workspace` launch has already cd'd into that root at boot (see
-    /// `run_io`), so the restore's synchronous local file reads resolve correctly and the
-    /// buffers keep their relative names (so `:ls` reads relative in the workspace) — no
-    /// path reconciliation here. A no-op outside a `--restore-session` boot.
-    pub(crate) fn apply_pending_session_restore(&mut self) {
-        let Some(session) = self.pending_session.take() else {
-            return;
-        };
-        self.editor.restore_session(session);
-        // The restore reminted window ids and swapped the current buffer, so refresh the
-        // Rust→Lua mirrors before anything Lua-facing (the lifecycle events fired next,
-        // and the persisted-view `on_restore` dispatch) reads them.
-        self.refresh_cur_buf_snapshot();
-        self.push_buf_mirror();
     }
 
     /// Arm (re-arm) the one-shot debounce timer through the [`HostEffects`] timer

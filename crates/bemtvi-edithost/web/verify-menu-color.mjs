@@ -47,6 +47,16 @@ const SEL = "rgb(49, 50, 68)";      // #313244  TelescopeSelection / PmenuSel bg
 const MATCH = "rgb(249, 226, 175)"; // #f9e2af  TelescopeMatching / CmpItemAbbrMatch fg
 const PBG = "rgb(30, 30, 46)";      // #1e1e2e  Pmenu bg
 
+// Resolve the installed Chromium the way every other verifier here does: this checkout's
+// Playwright is in the npx cache, so its default headless-shell path does not exist and a
+// bare `chromium.launch()` throws "Executable doesn't exist".
+function chromiumPath() {
+  if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
+  const home = process.env.HOME || "";
+  const found = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`).sort();
+  return found.length ? found[found.length - 1] : undefined;
+}
+
 try {
   for (let i = 0; i < 50; i++) {
     try { await fetch(`http://localhost:${PORT}/web/index.html`); break; } catch { await sleep(100); }
@@ -77,9 +87,11 @@ try {
     const rows = [...box.querySelectorAll(".row")];
     // The selected (first) row carries the selection background.
     const selRow = rows.find((r) => getComputedStyle(r).backgroundColor === "rgb(49, 50, 68)") || rows[0];
-    // A span inside a LIST row — not `.row span`, which finds the prompt's caret span
-    // first (the prompt is a `.row` too) and reads the cursor's color instead.
-    const match = rows.map((r) => r.querySelector("span")).find((sp, i) => sp && i > 0);
+    // The MATCH span specifically. Not `.row span`: a picker's first row is the prompt,
+    // which is a `.row` too, so that finds the prompt's caret span first and reads the
+    // cursor's color instead. `pmenu-match` is on every match span unconditionally (see
+    // index.html) precisely so it can be identified whether or not a theme styled it.
+    const match = box.querySelector(".pmenu-match");
     return {
       selBg: selRow ? getComputedStyle(selRow).backgroundColor : null,
       matchFg: match ? getComputedStyle(match).color : null,
@@ -149,7 +161,9 @@ try {
   const comp = await page.evaluate(() => {
     const box = document.querySelector("#grid .pmenu");
     if (!box) return null;
-    const match = box.querySelector(".row span");
+    // Same explicit match-span selector as the picker above. A completion popup has no
+    // prompt row, so `.row span` happened to land on the match — but say what we mean.
+    const match = box.querySelector(".pmenu-match");
     return {
       bg: getComputedStyle(box).backgroundColor,
       matchFg: match ? getComputedStyle(match).color : null,

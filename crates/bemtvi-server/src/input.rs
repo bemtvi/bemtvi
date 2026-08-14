@@ -29,9 +29,16 @@ impl EditHost {
         {
             self.workspace_session && self.lua.session_save_layout()
         }
+        // On the web build the *origin* is the workspace: the shada blob lives in that
+        // origin's OPFS and there is exactly one session per origin, which is what
+        // `--workspace` names natively. So there is no second `workspace_session` axis to
+        // gate on — the config's `btv.shada.save_layout(true)` is the whole opt-in, and it
+        // is still default-off. Returning a hardcoded `false` here (what this did) made
+        // that public API a silent no-op in the browser.
+        // See docs/plans/2026-08-14-web-session-restore.md.
         #[cfg(not(feature = "native"))]
         {
-            false
+            self.lua.session_save_layout()
         }
     }
 

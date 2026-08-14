@@ -2,7 +2,10 @@
 // ./vendor/ — the BUNDLED subset of the grammar registry, for use with no network.
 //
 // For each bundled language this copies (1) the prebuilt grammar `.wasm` that ships
-// inside its pinned npm package and (2) a *sanitized* `highlights.scm`. The runtime
+// inside its pinned npm package — or, for a language that ships none, the committed one
+// under ./prebuilt/ (see prebuilt/README.md) — and (2) a *sanitized* `highlights.scm`
+// plus its `injections.scm`, the query that lets the highlighter parse embedded content
+// with its own grammar (markdown's inline half and its fenced code). The runtime
 // (web-tree-sitter.js + .wasm) is copied once. Everything is regenerated from the
 // pinned devDependencies, so ./vendor/ is gitignored — the parent crate's build.sh
 // runs this generator and copies its output into web/vendor/.
@@ -16,7 +19,7 @@ import { Parser, Language, Query } from 'web-tree-sitter';
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { REGISTRY, BUNDLED, highlightSources, fetchQueryMerged } from '../../web/grammars.js';
+import { REGISTRY, BUNDLED, highlightSources, fetchQueryMerged, queriesFromNvimTs } from '../../web/grammars.js';
 import { sanitize } from '../../web/ts-sanitize.js';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // tooling dir
@@ -31,6 +34,7 @@ async function main() {
   mkdirSync(join(OUT, 'web-tree-sitter'), { recursive: true });
   mkdirSync(join(OUT, 'grammars'), { recursive: true });
   mkdirSync(join(OUT, 'queries'), { recursive: true });
+  mkdirSync(join(OUT, 'injections'), { recursive: true });
   mkdirSync(join(OUT, 'indents'), { recursive: true });
   mkdirSync(join(OUT, 'folds'), { recursive: true });
   mkdirSync(join(OUT, 'textobjects'), { recursive: true });
@@ -52,19 +56,27 @@ async function main() {
   }
 
   const manifest = [];
+  const injected = [];
   const indented = [];
   const folded = [];
   const textobjected = [];
   for (const name of BUNDLED) {
     const cfg = REGISTRY[name];
     if (!cfg) throw new Error(`BUNDLED lists '${name}', which is not in the registry`);
-    const wasmPath = g(join(cfg.pkg, cfg.wasm));
+    // A language whose npm package ships no wasm (markdown) carries a COMMITTED one
+    // under ./prebuilt/, built from that package's C sources by scripts/build-prebuilt-wasm.sh.
+    const wasmPath = cfg.prebuilt ? join(ROOT, 'prebuilt', cfg.prebuilt) : g(join(cfg.pkg, cfg.wasm));
     const lang = await Language.load(wasmPath);
     const parser = new Parser();
     parser.setLanguage(lang);
     const tree = parser.parse(cfg.sample);
 
-    const raw = highlightSources(name).map(([pkg, file]) => readFileSync(g(join(pkg, file)), 'utf8')).join('\n');
+    // Highlights come from the grammar package, except for a `queriesFrom` language
+    // (markdown), whose package queries use retired capture names — those come from
+    // nvim-treesitter at the pinned ref, exactly like the native install.
+    const raw = queriesFromNvimTs(name)
+      ? await fetchQueryMerged(name, 'highlights', fetchText)
+      : highlightSources(name).map(([pkg, file]) => readFileSync(g(join(pkg, file)), 'utf8')).join('\n');
     const res = sanitize(raw, Query, lang, tree.rootNode);
 
     // Fail loud if the assembled query won't even compile / produces no captures — a
@@ -78,6 +90,27 @@ async function main() {
     const dropped = res.droppedCompile + res.droppedRun;
     const note = dropped ? `  (dropped ${dropped}: ${res.droppedCompile} compile / ${res.droppedRun} run)` : '';
     console.log(`  ${name.padEnd(11)} ${res.kept}/${res.total} patterns, ${caps} sample captures${note}`);
+
+    // Injections — the query the highlighter runs to parse EMBEDDED content with its own
+    // grammar (markdown's `(inline)` → markdown_inline, a ```lang fence → that language).
+    // Same source rule as highlights: nvim-treesitter for a `queriesFrom` language, else
+    // the grammar package's own. Best-effort: a language that ships none simply has no
+    // injections (its own grammar still highlights it end to end).
+    try {
+      const rawInj = queriesFromNvimTs(name)
+        ? await fetchQueryMerged(name, 'injections', fetchText)
+        : readFileSync(g(join(cfg.pkg, 'queries/injections.scm')), 'utf8');
+      const ij = sanitize(rawInj, Query, lang, tree.rootNode);
+      if (ij.kept > 0) {
+        writeFileSync(join(OUT, 'injections', `${name}.scm`), ij.text);
+        injected.push(name);
+        console.log(`  ${''.padEnd(11)} inject:  ${ij.kept}/${ij.total} patterns`);
+      } else {
+        console.log(`  ${''.padEnd(11)} inject:  none kept — skipped`);
+      }
+    } catch (e) {
+      console.log(`  ${''.padEnd(11)} inject:  unavailable (${e.message || e}) — skipped`);
+    }
 
     // Indents — best-effort, from nvim-treesitter (with its `; inherits:` chain merged,
     // so `javascript` picks up `ecma`/`jsx`), sanitized against this grammar.
@@ -136,11 +169,14 @@ async function main() {
   // The set of bundled languages that ship an indents.scm, so the worker indenter knows
   // which to load offline without probing for a 404.
   writeFileSync(join(OUT, 'indents.json'), JSON.stringify(indented, null, 2) + '\n');
+  // The set of bundled languages that ship an injections.scm, so the highlighter loads one
+  // only where it exists (no 404 probing) — its twin of indents.json.
+  writeFileSync(join(OUT, 'injections.json'), JSON.stringify(injected, null, 2) + '\n');
   // The set of bundled languages that ship a folds.scm, the fold runner's twin of the above.
   writeFileSync(join(OUT, 'folds.json'), JSON.stringify(folded, null, 2) + '\n');
   // The set of bundled languages that ship a textobjects.scm, the text-object runner's twin.
   writeFileSync(join(OUT, 'textobjects.json'), JSON.stringify(textobjected, null, 2) + '\n');
-  console.log(`vendored ${manifest.length} bundled languages (${indented.length} with indents, ${folded.length} with folds, ${textobjected.length} with textobjects) + runtime into ./vendor/`);
+  console.log(`vendored ${manifest.length} bundled languages (${injected.length} with injections, ${indented.length} with indents, ${folded.length} with folds, ${textobjected.length} with textobjects) + runtime into ./vendor/`);
 }
 
 main().catch((e) => {

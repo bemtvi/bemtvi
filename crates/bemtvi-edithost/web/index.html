@@ -1130,15 +1130,25 @@
       // explicit row spans. Checked BEFORE the filetype branch: such a window has no
       // filetype to match, and this is the more precise signal wherever both exist.
       if (w.code_blocks && w.code_blocks.length) return ts.spansForCodeBlocks(text, w.code_blocks);
-      // A markdown BUFFER (a `.md` file, or a float built from raw markup): the markdown
-      // grammar isn't bundled and single-grammar parsing can't reach injected code, so
-      // highlight its ```lang code fences with their own grammars instead — the code in a
-      // hover is the part worth colouring.
-      if (w.filetype === "markdown") return ts.spansForFencedMarkdown(text);
       const lang =
         ts.langForFiletype(w.filetype) || (w.unnamed ? null : ts.langForName(w.file_name));
-      if (!lang) return null;
-      return ts.spansForBuffer(lang, text);
+      // Which buffer lines this window shows — the number column already carries them, one
+      // per rendered row (null on a filler / virtual row). Handed to the highlighter so the
+      // cost of parsing EMBEDDED content (a markdown paragraph, a fenced block: one parse
+      // each, thousands in a long document) stays proportional to the viewport rather than
+      // to the file; it widens this to a coarse band, so scrolling doesn't re-parse.
+      const nums = (w.numbers || []).filter((n) => n != null);
+      const visible = nums.length ? { from: Math.min(...nums) - 1, to: Math.max(...nums) - 1 } : null;
+      const spans = lang ? ts.spansForBuffer(lang, text, visible) : null;
+      if (spans) return spans;
+      // A markdown BUFFER (a `.md` file, or a float built from raw markup) whose grammars
+      // aren't compiled yet: `spansForBuffer` returns null on its first sight of a language
+      // and repaints when the async load lands, and markdown needs TWO (block + inline).
+      // Until then, scan the text for ```lang fences and colour those with their own
+      // grammars — the code in a hover is the part worth colouring first.
+      if (w.filetype === "markdown" || (!w.unnamed && /\.(md|markdown)$/i.test(String(w.file_name || ""))))
+        return ts.spansForFencedMarkdown(text);
+      return null;
     }
 
     // ============================================================================
@@ -2696,11 +2706,11 @@
         if (!serverStyled && ts && ts.isReady() && pv.title) {
           const text = lines.join("\n");
           const lang = ts.langForName(String(pv.title));
-          // A markdown preview highlights its ```lang fences (the markdown grammar isn't
-          // bundled), matching the hover doc-float path; everything else parses whole.
-          const sp = lang
-            ? ts.spansForBuffer(lang, text)
-            : (/\.(md|markdown)$/i.test(String(pv.title)) ? ts.spansForFencedMarkdown(text) : null);
+          // A `.md` preview takes the markdown grammar like any other language (prose +
+          // its ```lang fences, through the grammar's injections); the fence-only scan is
+          // the fallback while those grammars are still loading, as in `spansForWindow`.
+          const sp = (lang ? ts.spansForBuffer(lang, text) : null)
+            || (/\.(md|markdown)$/i.test(String(pv.title)) ? ts.spansForFencedMarkdown(text) : null);
           if (sp) pvColors = lines.map((ln, i) => ts.colorsForLine(sp[i] || [], String(ln ?? "").length));
         }
         for (let i = 0; i < menu.height - 1; i++) {
@@ -3567,6 +3577,16 @@
       // IME caret tracking, for the verifier: which path is live (Chrome EditContext vs the
       // Firefox textarea) and the last cursor-cell rect handed to the OS. The OS-drawn popup
       // itself isn't observable from the page, so the test asserts on the reported bounds.
+      // Test-only: the tree-sitter capture NAMES this page's highlighter puts on each line of
+      // `text` (per-line lists, `spansForBuffer`'s groups without their offsets), or null while
+      // a grammar is still loading. Asserting on names rather than rendered colours is what
+      // lets a verifier tell WHICH grammar painted a span — the markdown_inline injection vs
+      // the markdown block grammar — and see a capture that carries no colour at all. Must be
+      // this page's highlighter: a second `createHighlighter` never finishes loading a grammar.
+      tsSpans: (lang, text) => {
+        const s = ts && ts.spansForBuffer(lang, text);
+        return s && s.map((r) => r.map((x) => x[2]));
+      },
       ime: () => ({ editContext: !!editCtx, rect: lastImeRect }),
       cmdline: () => (latest.frame?.command_mode ? promptStr(latest.frame) + latest.frame.cmdline : ""),
       message: () => latest.frame?.message ?? "",

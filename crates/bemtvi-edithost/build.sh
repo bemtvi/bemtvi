@@ -72,8 +72,22 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
 #    packages. treesitter/vendor/ and web/vendor/ are gitignored like dist/. The
 #    highlighter is optional — index.html degrades to plain rendering if this is skipped.
 TS="treesitter"
-if [ ! -d "$TS/vendor" ]; then
-  echo "generating tree-sitter assets in $TS (one-time)…"
+# Regenerate when the vendored set is absent OR stale — a registry change (a language added
+# to BUNDLED) must reach a tree that already has treesitter/vendor, or the new grammar would
+# silently never ship. Compare the vendored manifest against BUNDLED rather than trusting the
+# directory's existence.
+ts_vendor_fresh() {
+  [ -f "$TS/vendor/manifest.json" ] || return 1
+  node --input-type=module -e '
+    import { BUNDLED } from "./web/grammars.js";
+    import { readFileSync } from "node:fs";
+    const have = JSON.parse(readFileSync("treesitter/vendor/manifest.json", "utf8")).languages || [];
+    const missing = BUNDLED.filter((l) => !have.includes(l));
+    if (missing.length) { console.error(`stale: missing ${missing.join(", ")}`); process.exit(1); }
+  ' 2>/dev/null
+}
+if ! ts_vendor_fresh; then
+  echo "generating tree-sitter assets in $TS (absent or stale)…"
   ( cd "$TS" && { [ -f package-lock.json ] && npm ci || npm install; } && npm run build:treesitter ) \
     || echo "warn: tree-sitter asset generation failed — highlighting will be off (plain rendering)"
 fi

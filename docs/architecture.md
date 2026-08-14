@@ -1096,8 +1096,11 @@ fs/process half is OPFS or a remote daemon over WebTransport.
   (the sync `SyncLspClient` replaces the async manager on wasm — `web/verify-lsp.mjs`);
   only the *native* treesitter engine is off the wasm build: syntax
   **highlighting** is done JS-side via web-tree-sitter
-  (`web/highlight.js` + the generated `web/vendor/` grammars), and `:TSInstall`
-  fetches a prebuilt `.wasm` grammar.
+  (`web/highlight.js` + the generated `web/vendor/` grammars, including injections — a
+  markdown buffer reaches the `markdown_inline` grammar and its fences' languages), and
+  `:TSInstall` fetches a prebuilt `.wasm` grammar. The one exception to "generated": no
+  markdown `.wasm` is published anywhere, so its two parsers are compiled from the pinned
+  npm sources and **committed** under `treesitter/prebuilt/`.
 - **Excluded from the workspace.** It targets `wasm32-unknown-emscripten` and links C
   via `emcc`, so it is in the root Cargo.toml's `[workspace] exclude` (the host
   `cargo build/test/clippy --workspace` never touches it) and pins its own

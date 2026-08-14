@@ -100,6 +100,10 @@ export async function fetchQueryMerged(lang, kind, fetchText, base, seen = new S
 
 // Pinned package versions — MUST stay in lockstep with treesitter/package.json (the
 // build installs those exact versions; the runtime builds jsDelivr URLs from these).
+// The exception is a `prebuilt` language's package: it is NOT an npm dependency of the
+// build (nothing unpacks it — its wasm is committed), so its pin here is the single
+// record of which upstream version treesitter/prebuilt/ was compiled from, and what
+// scripts/build-prebuilt-wasm.sh fetches when rebuilding it.
 export const VERSIONS = {
   'web-tree-sitter': '0.26.9',
   'tree-sitter-rust': '0.24.0',
@@ -120,6 +124,7 @@ export const VERSIONS = {
   '@tree-sitter-grammars/tree-sitter-zig': '1.1.2',
   '@tree-sitter-grammars/tree-sitter-lua': '0.4.1',
   '@tree-sitter-grammars/tree-sitter-toml': '0.7.0',
+  '@tree-sitter-grammars/tree-sitter-markdown': '0.3.2',
 };
 
 // Per language:
@@ -132,6 +137,19 @@ export const VERSIONS = {
 //   extensions  file extensions that select this grammar.
 //   sample      a representative source, used to run-validate query patterns during
 //               sanitize (drop patterns that throw against this grammar).
+// Plus, for the languages whose npm package ships no usable wasm or queries:
+//   prebuilt    file under `treesitter/prebuilt/` holding a *committed* parser wasm,
+//               compiled from the package's C sources (see prebuilt/README.md), used
+//               INSTEAD of `wasm`. Such a language is bundle-only: there is no
+//               prebuilt wasm on the CDN, so `:TSInstall` can't fetch it either.
+//   grammarDir  subdirectory of a multi-grammar package holding this parser's sources
+//               (markdown ships two: block + inline). Only used to rebuild `prebuilt`.
+//   queriesFrom `'nvim-treesitter'` when the queries come from nvim-treesitter at the
+//               pinned ref instead of the grammar package — how NATIVE installs every
+//               language (`bemtvi-ts/src/install.rs`). Needed wherever the package's
+//               own queries are unusable: markdown's still use the retired `@text.*`
+//               capture names, which no colorscheme (and neither the core's highlight
+//               registry nor `FG`) styles, so they'd parse and paint nothing.
 export const REGISTRY = {
   rust: {
     pkg: 'tree-sitter-rust',
@@ -187,6 +205,29 @@ export const REGISTRY = {
     wasm: 'tree-sitter-lua.wasm',
     extensions: ['lua'],
     sample: 'local M = {}\nlocal function f(a, ...)\n  if a == nil then return "s" .. a end\n  for i = 1, 10 do print(i) end\nend\nfunction M.g() return true end\nreturn M',
+  },
+  // Markdown is TWO grammars. `markdown` parses block structure (headings, lists,
+  // fences, tables) and injects `markdown_inline` for every `(inline)` node — that
+  // second parser is what colours emphasis, links and code spans — while a fenced
+  // block injects its info-string language. Both parsers are bundled (a `.md` buffer
+  // is a first-class thing to open, and hover docs are markdown), and both come from
+  // committed wasm because the npm package ships none.
+  markdown: {
+    pkg: '@tree-sitter-grammars/tree-sitter-markdown',
+    prebuilt: 'markdown.wasm',
+    grammarDir: 'tree-sitter-markdown',
+    queriesFrom: 'nvim-treesitter',
+    extensions: ['md', 'markdown'],
+    sample: '# Title\n\nsome *emph*, **strong** and `code`, plus a [link](http://x).\n\n- item\n- [ ] task\n\n> quote\n\n```rust\nfn f() -> u32 { 1 }\n```\n\n| a | b |\n| - | - |\n| 1 | 2 |\n',
+  },
+  // The inline half: reached only as `markdown`'s injection (no `extensions`), so a
+  // `:TSInstall markdown_inline` is possible but pointless on its own.
+  markdown_inline: {
+    pkg: '@tree-sitter-grammars/tree-sitter-markdown',
+    prebuilt: 'markdown_inline.wasm',
+    grammarDir: 'tree-sitter-markdown-inline',
+    queriesFrom: 'nvim-treesitter',
+    sample: 'some *emph*, **strong**, ~~struck~~ and `code`, plus a [link](http://x) and <http://y>.',
   },
   zig: {
     pkg: '@tree-sitter-grammars/tree-sitter-zig',
@@ -278,10 +319,11 @@ export const REGISTRY = {
 };
 
 // The languages bundled into web/vendor/ for offline use. Kept small: rust (the repo's
-// own language; verify-ui.mjs asserts it), lua (bemtvi config), and the common
-// json/javascript/typescript/python. Everything else is fetched on demand via
-// `:TSInstall` and cached in OPFS.
-export const BUNDLED = ['rust', 'lua', 'json', 'javascript', 'typescript', 'python'];
+// own language; verify-ui.mjs asserts it), lua (bemtvi config), the common
+// json/javascript/typescript/python, and markdown + its inline half (docs, READMEs and
+// every hover float are markdown, and it CAN'T be `:TSInstall`ed — no wasm upstream).
+// Everything else is fetched on demand via `:TSInstall` and cached in OPFS.
+export const BUNDLED = ['rust', 'lua', 'json', 'javascript', 'typescript', 'python', 'markdown', 'markdown_inline'];
 
 // The standard query kinds a `:TSInstall` fetches + caches (faithful to the native
 // install). `highlights` feeds the UI highlighter and `indents` the worker's tree-sitter
@@ -292,11 +334,25 @@ export const BUNDLED = ['rust', 'lua', 'json', 'javascript', 'typescript', 'pyth
 // `queries/` dir, all best-effort (a missing file is skipped, not an error).
 export const QUERY_KINDS = ['highlights', 'injections', 'indents', 'folds', 'locals', 'textobjects'];
 
+// Whether `name`'s queries come from nvim-treesitter at the pinned ref (highlights AND
+// injections) rather than from its grammar npm package — see `queriesFrom`. Callers
+// must check this BEFORE `highlightSources`, which has no URL to return for such a
+// language; both the generator and the runtime installer branch on it.
+export function queriesFromNvimTs(name) {
+  return REGISTRY[name]?.queriesFrom === 'nvim-treesitter';
+}
+
 // Resolve the [pkg, file] query sources for a language's highlights.scm. Defaults to
 // the grammar package's own queries/highlights.scm when no override list is given.
+// Throws (rather than returning an empty list, which would silently ship a language
+// with no highlighting) for an nvim-treesitter-sourced language — fetch those with
+// `fetchQueryMerged(name, 'highlights', …)` instead.
 export function highlightSources(name) {
   const cfg = REGISTRY[name];
   if (!cfg) return [];
+  if (queriesFromNvimTs(name)) {
+    throw new Error(`grammars.js: '${name}' takes its queries from nvim-treesitter — check queriesFromNvimTs() first`);
+  }
   return cfg.highlights || [[cfg.pkg, 'queries/highlights.scm']];
 }
 
@@ -333,6 +389,7 @@ export const ALIASES = {
   sh: 'bash',
   shell: 'bash',
   htm: 'html',
+  md: 'markdown',
 };
 
 // Canonicalize a `:TSInstall` language argument (lower-cased, alias-resolved). Unknown

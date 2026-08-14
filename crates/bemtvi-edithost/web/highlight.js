@@ -12,6 +12,9 @@
 //   * a small OFFLINE bundle vendored under ./vendor/ (build.sh → gen-treesitter), and
 //   * anything else, fetched on demand by `:TSInstall <lang>` from a CDN, sanitized,
 //     and cached in OPFS so it survives reloads.
+// Embedded content is highlighted too: a grammar that vendors an `injections.scm` has it
+// run here, so a markdown buffer's prose reaches the markdown_inline grammar and the code
+// in its ```` ```lang ```` fences reaches that language's (see `paintLang`).
 // The runtime knows the *names* of every registry language (so it maps file → grammar),
 // but only highlights one whose grammar is actually available (bundled or installed) —
 // opening a file of an un-installed language renders plain until you `:TSInstall` it.
@@ -41,6 +44,32 @@ const CDN_BASE = (typeof globalThis !== 'undefined' && globalThis.__BEMTVI_TS_BA
 // Overridable for a hermetic test.
 const GH_BASE = (typeof globalThis !== 'undefined' && globalThis.__BEMTVI_TS_GH_BASE) || 'https://cdn.jsdelivr.net/gh';
 
+// How deep an injection chain is followed: a buffer's own language is depth 0, the
+// content it injects depth 1, and so on. Markdown needs 2 (block → inline → the html /
+// latex that inline injects); the cap is what stops a grammar pair that injects each
+// other from recursing forever.
+const MAX_INJECTION_DEPTH = 3;
+
+// Injected content is highlighted only around the VISIBLE lines, and this is the band the
+// visible range is rounded out to. Why bound it at all: an injection costs one small parse
+// per region, and a region is a paragraph or a fence — a 6600-line markdown file has ~3000
+// of them, ~200ms of parsing, which would land on every repaint that changed the text. The
+// native engine runs its queries over the visible byte range for the same reason. Why round
+// to a band instead of using the viewport exactly: the painted range is part of the memo
+// key, so an exact range would invalidate the memo — and re-parse the whole buffer — on
+// every single line scrolled. Quantized, that happens only when the viewport crosses a band
+// edge, and the band's own injections are ~1ms.
+const INJECTION_BAND = 200;
+
+// Capture groups whose highlight is a full-line BACKGROUND, not a foreground — markdown's
+// fenced and indented code blocks (`(fenced_code_block) @markup.raw.block`). The native
+// engine keeps these as spans and additionally reports the lines they touch, so the server
+// can paint them as its separate `line_bg` layer *under* the text (`LINE_BACKGROUND_GROUPS`
+// in bemtvi-ts). This build has no such layer — a span here is only ever a foreground
+// color — so painting one would recolor the whole code block instead of tinting behind it,
+// hiding the injected syntax. Drop them at the source and let the injected language paint.
+const LINE_BACKGROUND_CAPTURES = new Set(['markup.raw.block']);
+
 // OPFS path (under the same `.bemtvi` dir the worker keeps shada in) where installed
 // grammars are cached: `/.bemtvi/treesitter/<lang>/{parser.wasm,highlights.scm,…}` plus
 // a `manifest.json` listing what's installed.
@@ -66,6 +95,24 @@ const FG = {
   attribute: '#e5c07b', annotation: '#e5c07b',
   namespace: '#e5c07b', module: '#e5c07b',
   tag: '#e06c75', 'tag.attribute': '#d19a66', 'tag.delimiter': '#abb2bf',
+  'keyword.directive': '#c678dd',
+  // Markup captures — a markdown buffer (the block grammar plus everything the
+  // markdown_inline injection adds), mirroring the built-in colorscheme's `@markup.*`
+  // (crates/bemtvi-server/runtime/colors/bemtvi.lua) in the One Dark family above.
+  // Heading levels are spelled out rather than left to the `markup.heading` fallback so
+  // they step blue → cyan → green the way the real theme does. Emphasis is a *color*
+  // here: these spans carry a foreground and nothing else, so the bold/italic the theme
+  // uses for `@markup.strong` / `@markup.italic` can't render — they get distinct hues
+  // instead. `markup.raw.block` is deliberately ABSENT (see LINE_BACKGROUND_CAPTURES).
+  'markup.heading': '#61afef',
+  'markup.heading.1': '#61afef', 'markup.heading.2': '#61afef',
+  'markup.heading.3': '#56b6c2', 'markup.heading.4': '#56b6c2',
+  'markup.heading.5': '#98c379', 'markup.heading.6': '#98c379',
+  'markup.strong': '#e5c07b', 'markup.italic': '#c678dd', 'markup.strikethrough': '#5c6370',
+  'markup.raw': '#98c379',
+  'markup.link': '#56b6c2', 'markup.link.label': '#61afef', 'markup.link.url': '#56b6c2',
+  'markup.list': '#d19a66', 'markup.list.checked': '#98c379', 'markup.list.unchecked': '#5c6370',
+  'markup.quote': '#5c6370',
 };
 
 // The active colorscheme's syntax palette (`capture-name → CSS color`), bridged from
@@ -138,12 +185,14 @@ export function createHighlighter({ onReady } = {}) {
   let runtimeReady = false;
   const bundled = new Set(); // languages vendored offline in ./vendor/
   const bundledIndents = new Set(); // bundled languages that ALSO vendor an indents.scm
+  const bundledInjections = new Set(); // bundled languages that ALSO vendor an injections.scm
   const installed = new Set(); // languages cached in OPFS by `:TSInstall`
-  const langs = new Map(); // name → { parser, query } once loaded, or null if it failed
+  const langs = new Map(); // name → { parser, query, inj } once loaded, or null if it failed
   const loading = new Set();
   // One-entry memo: re-highlighting the same buffer text (e.g. on a cursor move that
-  // didn't edit) reuses the spans instead of re-parsing.
-  let memo = { lang: null, text: null, spans: null };
+  // didn't edit) reuses the spans instead of re-parsing. Keyed by the painted injection
+  // band too (`from`/`to`), since spans outside it lack their injected content.
+  let memo = { lang: null, text: null, from: 0, to: 0, spans: null };
 
   const notify = () => { if (onReady) onReady(); };
   const isAvail = (name) => bundled.has(name) || installed.has(name);
@@ -169,6 +218,13 @@ export function createHighlighter({ onReady } = {}) {
       const res = await fetch(new URL('indents.json', V));
       if (res.ok) for (const l of await res.json()) bundledIndents.add(l);
     } catch { /* no bundled indents manifest */ }
+    // Which bundled grammars vendor an injections.scm — the query that sends embedded
+    // content (a markdown `(inline)` node, a ```lang fence) to its own grammar. Listed so
+    // `load` fetches one only where it exists instead of probing for a 404.
+    try {
+      const res = await fetch(new URL('injections.json', V));
+      if (res.ok) for (const l of await res.json()) bundledInjections.add(l);
+    } catch { /* no bundled injections manifest */ }
     // The OPFS install cache's manifest (absent until the first `:TSInstall`).
     try {
       for (const l of JSON.parse(await opfsReadText([...TS_DIR, 'manifest.json']))) installed.add(l);
@@ -181,23 +237,46 @@ export function createHighlighter({ onReady } = {}) {
   // Load a grammar into memory from its cache — OPFS first (an installed grammar wins,
   // so a `:TSInstall` of a name that's also bundled uses the freshly fetched copy), else
   // the offline bundle. Both stores hold an already-sanitized highlights.scm, so this
-  // just compiles it. Fails loud in the console, silent (uncolored) in the UI.
+  // just compiles it, plus the injections.scm where the grammar has one. Fails loud in
+  // the console, silent (uncolored) in the UI.
   async function load(name) {
     if (loading.has(name) || langs.has(name)) return;
     loading.add(name);
     try {
-      let language, src;
+      let language, src, injSrc;
       if (installed.has(name)) {
         language = await Language.load(await opfsReadBytes([...TS_DIR, name, 'parser.wasm']));
         src = await opfsReadText([...TS_DIR, name, 'highlights.scm']);
+        // `:TSInstall` caches the whole standard query set, but an older install (or a
+        // grammar that ships none) may have no injections.scm — absent is not an error.
+        try { injSrc = await opfsReadText([...TS_DIR, name, 'injections.scm']); } catch { injSrc = null; }
       } else {
         language = await Language.load(new URL('grammars/' + name + '.wasm', V).href);
         src = await fetchText(new URL('queries/' + name + '.scm', V).href);
+        injSrc = bundledInjections.has(name)
+          ? await fetchText(new URL('injections/' + name + '.scm', V).href)
+          : null;
       }
       const query = new Query(language, src);
+      // The injections query is optional: a grammar without one simply highlights its own
+      // text end to end. It's already sanitized against this grammar (build time for the
+      // bundle, install time for OPFS), so a compile failure here is a broken asset — loud
+      // in the console, and only injections are lost.
+      let inj = null;
+      if (injSrc && injSrc.trim()) {
+        try { inj = new Query(language, injSrc); }
+        catch (e) { console.error('[bemtvi] injections query failed to compile for', name, e); }
+      }
       const parser = new Parser();
       parser.setLanguage(language);
-      langs.set(name, { parser, query });
+      langs.set(name, { parser, query, inj });
+      // A newly available grammar changes what an ALREADY-highlighted buffer's spans should
+      // be, not just an unhighlighted one: a markdown buffer paints block-only while the
+      // markdown_inline it injects is still loading, and its fenced code stays plain until
+      // that fence's language lands. Each arrives on its own async `load`, so the memo has
+      // to be dropped here — kept, it would hand the repaint below the very spans that are
+      // now stale, and the buffer would never colour beyond its first grammar.
+      memo = { lang: null, text: null, from: 0, to: 0, spans: null };
       notify(); // repaint with this language now available
     } catch (e) {
       console.error('[bemtvi] failed to load grammar', name, e);
@@ -282,6 +361,22 @@ export function createHighlighter({ onReady } = {}) {
     if (!cfg) return { ok: false, name, msg: `unknown language '${rawName}'` };
     const enc = (s) => new TextEncoder().encode(s);
 
+    // A bundle-only language: its npm package ships no `.wasm`, so ours is compiled from
+    // source and committed (`prebuilt` — markdown's two parsers), which also means jsDelivr
+    // has no wasm to fetch. There is genuinely nothing to install, so say so instead of
+    // 404ing on a URL that cannot exist — and if the vendored copy is missing, fail loud
+    // rather than pretending an install could fix it.
+    if (cfg.prebuilt) {
+      if (!isAvail(name)) {
+        return { ok: false, name, msg: `no upstream wasm for '${name}' — it ships in the offline bundle (rebuild web/vendor)` };
+      }
+      langs.delete(name);
+      await load(name);
+      return langs.get(name)
+        ? { ok: true, name, msg: 'bundled (offline only — upstream ships no wasm)' }
+        : { ok: false, name, msg: 'bundled grammar failed to load' };
+    }
+
     // Already available WITH indents — re-register from cache, no network (also the
     // `:TSUpdate` of a complete bundled lang).
     if (isAvail(name) && await hasIndents(name)) {
@@ -306,7 +401,7 @@ export function createHighlighter({ onReady } = {}) {
         }
         // Keep the in-memory highlighter as-is (highlights are unchanged); the indenter
         // reloads off OPFS. memo is cleared so any pending repaint re-runs cleanly.
-        memo = { lang: null, text: null, spans: null };
+        memo = { lang: null, text: null, from: 0, to: 0, spans: null };
         notify();
         return { ok: true, name, msg: `queries: ${Object.keys(extras).join('+')}` };
       } catch (e) {
@@ -331,11 +426,25 @@ export function createHighlighter({ onReady } = {}) {
       const res = sanitize(rawHl, Query, language, tree.rootNode);
       const query = new Query(language, res.text);
       const caps = query.captures(tree.rootNode).length;
-      tree.delete();
-      if (caps === 0) return { ok: false, name, msg: 'grammar/query mismatch (0 captures)' };
+      if (caps === 0) { tree.delete(); return { ok: false, name, msg: 'grammar/query mismatch (0 captures)' }; }
 
-      // The rest of the standard query set (indents/injections/folds/locals).
+      // The rest of the standard query set (indents/injections/folds/locals). Fetched
+      // BEFORE the sample tree is released: injections.scm is sanitized against it, the
+      // same way highlights just were.
       const extras = await fetchQuerySet(name, cfg);
+
+      // Register with the injections query too (compiled from what we just fetched), so a
+      // freshly installed grammar reaches its embedded languages immediately rather than
+      // only after a reload re-`load`s it from OPFS.
+      let inj = null;
+      if (extras.injections && extras.injections.trim()) {
+        const ijRes = sanitize(extras.injections, Query, language, tree.rootNode);
+        if (ijRes.kept > 0) {
+          try { inj = new Query(language, ijRes.text); }
+          catch (e) { console.error('[bemtvi] injections query failed to compile for', name, e); }
+        }
+      }
+      tree.delete();
 
       // Persist to OPFS, then register in memory + the installed manifest.
       await opfsWriteBytes([...TS_DIR, name, 'parser.wasm'], wasmBytes);
@@ -346,8 +455,8 @@ export function createHighlighter({ onReady } = {}) {
       installed.add(name);
       await opfsWriteBytes([...TS_DIR, 'manifest.json'], enc(JSON.stringify([...installed])));
 
-      langs.set(name, { parser, query });
-      memo = { lang: null, text: null, spans: null }; // a now-installed buffer must re-highlight
+      langs.set(name, { parser, query, inj });
+      memo = { lang: null, text: null, from: 0, to: 0, spans: null }; // a now-installed buffer must re-highlight
       notify();
       const kinds = ['highlights', ...Object.keys(extras)].join('+');
       return { ok: true, name, msg: `${cfg.pkg}@${ver}, queries: ${kinds}` };
@@ -392,13 +501,17 @@ export function createHighlighter({ onReady } = {}) {
     return null;
   }
 
-  // Per-line highlight spans for a markdown buffer's fenced code blocks — the LSP hover /
-  // doc-float case (and any `.md` buffer). The markdown grammar isn't bundled and
-  // web-tree-sitter doesn't run tree-sitter injections, so prose / headings stay plain;
-  // but the code INSIDE a ```` ```lang ```` fence — a hover's signature, the part that
-  // matters — is parsed with that language's OWN grammar (when available, bundled or
-  // `:TSInstall`'d) and its spans rebased onto the buffer's lines. Returns per-line spans
-  // (same shape as `spansForBuffer`) or null when nothing highlighted.
+  // Per-line highlight spans for the fenced code blocks in a markdown buffer, found by
+  // scanning the text for ```` ```lang ```` fences and parsing each block with that
+  // language's OWN grammar (when available, bundled or `:TSInstall`'d).
+  //
+  // This is the FALLBACK for markdown, not the main path: the markdown grammar is bundled,
+  // so `spansForBuffer('markdown', …)` highlights prose, headings and lists *and* reaches
+  // the same fenced code through the grammar's own injections. This stays for the window
+  // between a markdown buffer appearing and its grammars finishing their async load — the
+  // code in a hover is the part worth colouring first — and for a caller with raw markdown
+  // and no filetype to key off. Returns per-line spans (same shape as `spansForBuffer`) or
+  // null when nothing highlighted.
   function spansForFencedMarkdown(text) {
     if (text == null || !runtimeReady) return null;
     const lines = text.split('\n');
@@ -668,47 +781,115 @@ export function createHighlighter({ onReady } = {}) {
     return true;
   }
 
+  // The `{ lang, start, end }` ranges a grammar's injections.scm hands to OTHER grammars
+  // inside `src` — a markdown `(inline)` node to markdown_inline, a ```` ```rust ```` fence
+  // to rust. The injected language is named either by an `@injection.language` capture
+  // (the fence's info string) or by a `(#set! injection.language "…")` directive, which
+  // web-tree-sitter exposes per pattern as `query.setProperties`. Resolution goes through
+  // `langForFence`, so an injected name is alias-mapped and — like every other path here —
+  // only accepted when its grammar is actually available: an injection into an
+  // un-`:TSInstall`ed language yields nothing and that region stays plain.
+  //
+  // A match with several `@injection.content` captures becomes several ranges, each parsed
+  // on its own. That is right for markdown (every `(inline)` node is its own island) but is
+  // an approximation of `(#set! injection.combined)`, which asks for ONE parse over the
+  // union of the ranges — an html_block split across a markdown list, say, is parsed
+  // per-piece here. `(#offset! …)` is not applied either (web-tree-sitter doesn't report
+  // it), so a `---` metadata fence is handed to yaml/toml along with its delimiter lines.
+  function injectionRanges(query, root, src) {
+    const out = [];
+    for (const m of query.matches(root)) {
+      const props = query.setProperties[m.patternIndex] || {};
+      const named = m.captures.find((c) => c.name === 'injection.language');
+      const raw = named ? src.slice(named.node.startIndex, named.node.endIndex) : props['injection.language'];
+      const lang = langForFence(raw);
+      if (!lang) continue;
+      for (const c of m.captures) {
+        if (c.name !== 'injection.content') continue;
+        const start = c.node.startIndex, end = c.node.endIndex;
+        if (end > start) out.push({ lang, start, end });
+      }
+    }
+    return out;
+  }
+
+  // Parse `src` with `name`'s grammar and push its captures into `ctx.spans`, shifting
+  // every index by `base` — the offset of `src` within the buffer (0 for the buffer's own
+  // language, the injected range's start for embedded content), so an injected token lands
+  // on the buffer line it actually occupies. Then recurse through this grammar's
+  // injections, which is what colours a markdown buffer's prose (via markdown_inline) and
+  // the code inside its fences (via that fence's own grammar).
+  function paintLang(name, src, base, ctx, depth) {
+    const entry = langs.get(name);
+    if (!entry) return;
+    const tree = entry.parser.parse(src);
+    for (const c of entry.query.captures(tree.rootNode)) {
+      // Drop metadata captures (`@spell`/…), full-line-background groups, and captures
+      // whose `#lua-match?` predicate fails, at the source — so they never become spans
+      // that shadow a real highlight (this mirrors the server engine's `extract_spans`).
+      if (isMetadataCapture(c.name) || LINE_BACKGROUND_CAPTURES.has(c.name)) continue;
+      if (!captureSatisfiesLuaPredicates(entry.query, c)) continue;
+      const s = c.node.startIndex + base, e = c.node.endIndex + base;
+      if (e <= s) continue;
+      const endLn = ctx.lineAt(e - 1);
+      for (let ln = ctx.lineAt(s); ln <= endLn; ln++) {
+        const lb = ctx.lineStart[ln], le = lb + ctx.lines[ln].length;
+        const a = Math.max(s, lb) - lb, b = Math.min(e, le) - lb;
+        if (b > a) ctx.spans[ln].push([a, b, c.name]);
+      }
+    }
+    if (entry.inj && depth < MAX_INJECTION_DEPTH) {
+      for (const r of injectionRanges(entry.inj, tree.rootNode, src)) {
+        // Outside the band being painted (see INJECTION_BAND): nothing would be rendered
+        // from it, so don't pay for the parse.
+        if (ctx.lineAt(base + r.end - 1) < ctx.from || ctx.lineAt(base + r.start) > ctx.to) continue;
+        // Its grammar is available but may not be compiled in memory yet; `load` is async,
+        // so this region paints on the repaint its `onReady` triggers — exactly how the
+        // buffer's own language behaves on first sight.
+        if (!langs.has(r.lang)) { load(r.lang); continue; }
+        paintLang(r.lang, src.slice(r.start, r.end), base + r.start, ctx, depth + 1);
+      }
+    }
+    tree.delete();
+  }
+
   // Per-buffer-line capture spans for `text` in `lang`: an array indexed by 0-based
   // buffer line, each entry a list of `[startU16, endU16, group]`. Returns null when
   // the grammar isn't loaded yet — and kicks off the async load, after which onReady
   // fires a repaint. Multi-line captures (block comments, here-docs) are split at
   // line boundaries so each line carries only its own slice.
-  function spansForBuffer(lang, text) {
+  //
+  // Embedded content is included: `paintLang` follows the grammar's injections into the
+  // buffer's own lines. `visible` — `{ from, to }` in 0-based buffer lines, the caller's
+  // viewport — bounds THAT work to a band around those lines (see `INJECTION_BAND`); the
+  // language's own captures always cover the whole buffer. Omit it (a small buffer: a
+  // preview, a float) to inject everywhere.
+  function spansForBuffer(lang, text, visible) {
     if (!lang) return null;
     if (!langs.has(lang)) { load(lang); return null; }
-    const entry = langs.get(lang);
-    if (!entry) return null; // load failed earlier
-    if (memo.lang === lang && memo.text === text) return memo.spans;
+    if (!langs.get(lang)) return null; // load failed earlier
+    const from = visible ? Math.max(0, Math.floor(visible.from / INJECTION_BAND - 1) * INJECTION_BAND) : 0;
+    const to = visible ? Math.ceil(visible.to / INJECTION_BAND + 1) * INJECTION_BAND : Infinity;
+    if (memo.lang === lang && memo.text === text && memo.from === from && memo.to === to) return memo.spans;
 
-    const tree = entry.parser.parse(text);
-    const caps = entry.query.captures(tree.rootNode);
     const lines = text.split('\n');
     const lineStart = new Array(lines.length);
     for (let i = 0, off = 0; i < lines.length; i++) { lineStart[i] = off; off += lines[i].length + 1; }
-    const spans = Array.from({ length: lines.length }, () => []);
-    const lineAt = (idx) => {
-      let lo = 0, hi = lines.length - 1;
-      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStart[mid] <= idx) lo = mid; else hi = mid - 1; }
-      return lo;
+    const ctx = {
+      spans: Array.from({ length: lines.length }, () => []),
+      lines,
+      lineStart,
+      from,
+      to,
+      lineAt: (idx) => {
+        let lo = 0, hi = lines.length - 1;
+        while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStart[mid] <= idx) lo = mid; else hi = mid - 1; }
+        return lo;
+      },
     };
-    for (const c of caps) {
-      // Drop metadata captures (`@spell`/…) and captures whose `#lua-match?`
-      // predicate fails, at the source — so they never become spans that shadow a
-      // real highlight (this mirrors the server engine's `extract_spans`).
-      if (isMetadataCapture(c.name)) continue;
-      if (!captureSatisfiesLuaPredicates(entry.query, c)) continue;
-      const s = c.node.startIndex, e = c.node.endIndex;
-      if (e <= s) continue;
-      const endLn = lineAt(e - 1);
-      for (let ln = lineAt(s); ln <= endLn; ln++) {
-        const lb = lineStart[ln], le = lb + lines[ln].length;
-        const a = Math.max(s, lb) - lb, b = Math.min(e, le) - lb;
-        if (b > a) spans[ln].push([a, b, c.name]);
-      }
-    }
-    tree.delete();
-    memo = { lang, text, spans };
-    return spans;
+    paintLang(lang, text, 0, ctx, 0);
+    memo = { lang, text, from, to, spans: ctx.spans };
+    return ctx.spans;
   }
 
   // Flatten one line's spans into a per-UTF-16-column color array (length `len`),

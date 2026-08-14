@@ -1,7 +1,7 @@
 {
   "name": "bemtvi-edithost-treesitter",
   "private": true,
-  "description": "Build-time tooling for the wasm edit-host's syntax highlighter: vendors the tree-sitter runtime + per-language grammar .wasm + sanitized queries from the pinned devDependencies into ./vendor/ (scripts/gen-treesitter.mjs). The parent crate's build.sh runs `npm run build:treesitter` here and copies ./vendor/ into web/vendor/. Build-time only — the edit-host ships static assets and loads no runtime CDN.",
+  "description": "Build-time tooling for the wasm edit-host's syntax highlighter: vendors the tree-sitter runtime + per-language grammar .wasm + sanitized highlights/injections queries from the pinned devDependencies into ./vendor/ (scripts/gen-treesitter.mjs). The parent crate's build.sh runs `npm run build:treesitter` here and copies ./vendor/ into web/vendor/. Build-time only — the edit-host ships static assets and loads no runtime CDN. ./prebuilt/ holds the committed parser .wasm for grammars npm publishes none for (markdown's block + inline), rebuilt by scripts/build-prebuilt-wasm.sh — that script's grammar sources are fetched with `npm pack`, deliberately NOT a dependency here.",
   "scripts": {
     "build:treesitter": "node scripts/gen-treesitter.mjs"
   },

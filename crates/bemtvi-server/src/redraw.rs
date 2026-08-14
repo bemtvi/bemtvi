@@ -1354,6 +1354,32 @@ const SYNTAX_CAPTURES: &[&str] = &[
     "tag",
     "tag.attribute",
     "tag.delimiter",
+    "keyword.directive",
+    // Markup captures — a markdown buffer highlighted by the browser's bundled markdown
+    // grammar (block) plus the markdown_inline it injects. Only a colorscheme's *fg*
+    // crosses the wire (the client paints per-column colors), so the bold/italic the
+    // built-in scheme gives `@markup.strong` / `@markup.italic` doesn't come through and
+    // the client falls back to its own hue for those. `markup.raw.block` is deliberately
+    // absent: it is a full-line background, which this build has no layer for, and the
+    // client drops the capture rather than repaint the code block's foreground.
+    "markup.heading",
+    "markup.heading.1",
+    "markup.heading.2",
+    "markup.heading.3",
+    "markup.heading.4",
+    "markup.heading.5",
+    "markup.heading.6",
+    "markup.strong",
+    "markup.italic",
+    "markup.strikethrough",
+    "markup.raw",
+    "markup.link",
+    "markup.link.label",
+    "markup.link.url",
+    "markup.list",
+    "markup.list.checked",
+    "markup.list.unchecked",
+    "markup.quote",
 ];
 
 /// A per-redraw palette of distinct resolved [`Style`]s, deduped so identical

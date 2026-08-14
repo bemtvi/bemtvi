@@ -5,3 +5,10 @@ crates/bemtvi-lua/src/vendor/
 examples/
 crates/bemtvi/tests/
 vendor/
+# Out of the pre-commit's chosen scope (prelude only), and deliberately formatted:
+# the colorscheme's palette is column-aligned (`bg          = "#282c34"`), which is how
+# a palette stays readable and which stylua cannot express, and the demo seed defines
+# one snippet PER ROW — stylua would explode each into a five-line block while still
+# not fixing the only over-width lines there (embedded `body` strings, which can't wrap).
+crates/bemtvi-server/runtime/colors/
+crates/bemtvi-edithost/web/demo-seed/

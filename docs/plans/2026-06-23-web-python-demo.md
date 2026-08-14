@@ -209,16 +209,21 @@ sees what the editor shows and edits are visible to the interpreter.
   pushes newline-stripped stdout lines through `proc-stdout` as they're produced and returns
   empty stdout with the exit (already streamed); a plain spawn returns the whole capture.
 - Invocation forms: `python -c CODE`, a script `FILE` (path rebased onto the `/project` OPFS
-  mount), and source-from-stdin (`python -`). Only `python` is available — any other binary is
-  command-not-found (exit 127, stderr names it), exactly as a shell reports a missing binary (a
-  localized failure, not a host crash). Kill = SIGINT via the shared interrupt buffer (best-effort
-  — one buffer, single-threaded interpreter).
+  mount), and source-from-stdin (`python -`). Only `python` is available — any other binary is a
+  **spawn failure** (`code = -1`, stderr names it), the status `btv.run`'s contract documents for
+  a binary that could not run, and `local-host.mjs` answers it itself so a missing tool never
+  boots CPython to say so. (It first reported a shell's command-not-found `127`; that reads as
+  "the tool RAN and answered nothing", which settled the `files`/`live_grep` picker fallback
+  chains on their first step and left both pickers permanently empty on the demo —
+  `verify-picker-demo.mjs` guards it.) A localized failure, not a host crash. Kill = SIGINT via
+  the shared interrupt buffer (best-effort — one buffer, single-threaded interpreter).
 - **Verified:** `verify-pyodide-proc.mjs` — serverless `btv.run{python -c …}` computes
   `sum(0..100)=5050` on stdout with a distinct line on stderr (captured separately), `sys.exit(3)`
-  → code 3, an uncaught exception → code 1 + traceback on stderr, a non-python binary → 127,
+  → code 3, an uncaught exception → code 1 + traceback on stderr, a non-python binary → `-1`,
   piped stdin read back, and `btv.run_stream` delivers all five streamed lines. No regressions:
   `verify-pyodide-terminal.mjs` (script) + `verify-pyodide-repl.mjs` (REPL) — the shared Pyodide
-  Worker is unaffected.
+  Worker is unaffected. `verify-picker-demo.mjs` covers the fallback the status drives: the demo's
+  `files` / `live_grep` pickers reach their `btv.fs` legs and list the seeded project.
 
 ### Phase 4 — basedpyright LSP in a Worker — *large; has its own build pipeline* — ✅ DONE
 - **Key discovery (much easier than the spike feared):** basedpyright's monorepo ships an

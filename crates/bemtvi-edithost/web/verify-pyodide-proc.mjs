@@ -7,7 +7,7 @@
 //
 // Faithfulness (not a no-op): every result here is one only a real interpreter could produce —
 // `btv.run{python -c "…"}` computes a sum and prints it to stdout while writing a distinct line to
-// stderr, a `sys.exit(3)` surfaces as code 3, a missing binary is command-not-found (127), stdin
+// stderr, a `sys.exit(3)` surfaces as code 3, an unavailable binary reports a spawn failure, stdin
 // is piped into the child and echoed back, and a streaming run delivers its lines through
 // `btv.run_stream`. No wire, no daemon: a static page running CPython for `vim.system`.
 //
@@ -144,10 +144,13 @@ try {
   check("btv.run: an uncaught exception exits 1 with the traceback on stderr",
     !!r3 && r3.code === 1 && /ValueError: boom/.test(r3.stderr), `r3=${JSON.stringify(r3)}`);
 
-  // ── 4) a missing binary is command-not-found (127), like a shell — not a host crash. ─────────
+  // ── 4) a binary this host cannot run is a SPAWN FAILURE (`code = -1`) — the same status a
+  // missing binary yields natively, and the one `btv.run`'s contract documents. Not a shell's
+  // command-not-found (127): 127 would read as "it ran and answered", which is what silently
+  // emptied the `files` / `live_grep` pickers on the demo (see verify-picker-demo.mjs). ────────
   const r4 = await runOneShot(page, "P4", `btv.run({ cmd = "git", args = { "status" } })`);
-  check("btv.run: a non-python binary is command-not-found (exit 127)",
-    !!r4 && r4.code === 127 && /command not found: git/.test(r4.stderr), `r4=${JSON.stringify(r4)}`);
+  check("btv.run: a non-python binary reports a spawn failure (exit -1), not a fake 127",
+    !!r4 && r4.code === -1 && /only `python` runs/.test(r4.stderr), `r4=${JSON.stringify(r4)}`);
 
   // ── 5) stdin is piped into the child and read back (uppercased). ─────────────────────────────
   const code5 = "import sys; print(sys.stdin.read().strip().upper())";

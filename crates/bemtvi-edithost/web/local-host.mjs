@@ -232,9 +232,34 @@ export function installLocalHost(ctx) {
     // exit, or streaming stdout lines for `btv.run_stream`); the Pyodide Worker answers with
     // `proc-spawned`/`proc-stdout`/`proc-exited` → the daemon leg's `proc_*` landings. `liveProcs`
     // keeps the run loop on its non-blocking park so those pushes are received off the event loop.
+    //
+    // `python` is the ONLY program this host can run, and a spawn it cannot perform is reported
+    // the way every other leg reports one: pid `-1` and exit `code = -1` (see host.rs — "`code =
+    // -1` on a spawn failure or a kill"). That code is the canonical "this tool could not RUN"
+    // signal callers fall back on, and getting it wrong is not cosmetic: the `files` /
+    // `live_grep` picker sources walk `rg` → `find`/`grep` → an `btv.fs` walk, stepping on only
+    // when the previous tool could not run — so a fabricated "ran and found nothing" status
+    // (a shell's 127) settles the chain on `rg` and the picker comes up permanently empty.
+    // Answered here rather than in the Worker, so a missing binary never boots CPython to say so.
     proc(reqs) {
-      const w = ensureWorker();
+      const runnable = [];
       for (const s of reqs.spawn) {
+        if (Array.isArray(s.argv) && s.argv[0] === "python") {
+          runnable.push(s);
+          continue;
+        }
+        const cmd = (s.argv && s.argv[0]) || "";
+        ctx.landHostPush("proc_spawned", [s.id, -1]);
+        ctx.landHostPush("proc_exited", [
+          s.id,
+          -1,
+          ctx.toU8([]),
+          ctx.toU8(`bemtvi web demo: only \`python\` runs in the browser process host (no "${cmd}")\n`),
+        ]);
+      }
+      if (runnable.length === 0 && reqs.kill.length === 0) return; // nothing for the interpreter
+      const w = ensureWorker();
+      for (const s of runnable) {
         ctx.liveProcs.add(s.id);
         w.postMessage({ type: "proc-open", id: s.id, argv: s.argv, cwd: s.cwd ?? null, env: s.env, stdin: s.stdin, stream: s.stream === true });
       }

@@ -1007,14 +1007,23 @@ async function open(buf, argv) {
 // ── async-proc leg: `vim.system` / `jobstart` ────────────────────────────────────────────────
 // Run one off-tick process spawn against the Pyodide interpreter (the proc twin of `runScript`,
 // but with stdout/stderr captured separately and an exit code, per the daemon `host.rs` contract).
-// Only `python` is available in this single-interpreter demo; any other argv is command-not-found
-// (exit 127), exactly as a shell reports a missing binary — a localized failure, not a host crash.
+// Only `python` is available in this single-interpreter demo; any other argv could not be spawned
+// at all, so it reports the canonical spawn failure (`code = -1`, per the daemon contract) rather
+// than a shell's command-not-found status — `-1` is what tells a caller the tool never RAN, which
+// is how the picker sources know to fall back. Normally unreachable: local-host.mjs answers such a
+// spawn itself so a missing binary never boots CPython (this is the same answer, one layer in).
 // A streaming spawn (`stream: true`) pushes `proc-stdout` line batches as the run produces them
 // and reports empty stdout with the exit; a plain spawn returns the whole captured stdout.
 async function runProc(req) {
   const { id, argv, stream } = req;
   // Synthetic pid (there is no OS process) — a positive value so `vim.system().pid` looks spawned.
   postMessage({ type: "proc-spawned", id, pid: 100000 + (Number(id) & 0xffff) });
+  if (!Array.isArray(argv) || argv.length === 0 || argv[0] !== "python") {
+    const cmd = (argv && argv[0]) || "";
+    postMessage({ type: "proc-exited", id, code: -1, stdout: new Uint8Array(0),
+      stderr: enc.encode(`bemtvi web demo: only \`python\` runs in the browser process host (no "${cmd}")\n`) });
+    return;
+  }
   let py;
   try {
     py = await ensurePyodide();
@@ -1025,12 +1034,6 @@ async function runProc(req) {
   }
   if (procKills.delete(id)) { // killed before its run could begin (-1 = killed, per the leg)
     postMessage({ type: "proc-exited", id, code: -1, stdout: new Uint8Array(0), stderr: new Uint8Array(0) });
-    return;
-  }
-  if (!Array.isArray(argv) || argv.length === 0 || argv[0] !== "python") {
-    const cmd = (argv && argv[0]) || "";
-    postMessage({ type: "proc-exited", id, code: 127, stdout: new Uint8Array(0),
-      stderr: enc.encode(`bemtvi web demo: command not found: ${cmd}\n`) });
     return;
   }
   // Interpret the python invocation: `-c CODE`, a script `FILE`, or source-from-stdin (`python -`).

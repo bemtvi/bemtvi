@@ -101,6 +101,12 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `btv.timer`) via
   `<A-n>` / `<A-1>`..`<A-9>` are unreachable in the browser (they now encode as `<C-…>`,
   while every other `<A-…>` — `<A-c>` for multi-cursor, say — is untouched), and `Alt+Tab`
   is claimed by the OS on both Windows and Linux, so `<C-Tab>` has no stand-in in practice.
+  The substitution is also **declared** to the editor, on the Worker's script URL and from
+  there through `eh_set_key_labels` into `btv.ui.caps().key_labels` (`{"<C-w>": "<A-w>"}`).
+  Input never consults it — the page has already substituted by the time a key is sent — but
+  anything that *displays* keys must, or it spends its time naming chords this browser eats:
+  the which-key popup titles the window prefix `<A-w>` and offers `<A-w>` for the doubled
+  chord, while a terminal (and a Mac, which substitutes nothing) still reads `<C-w>`.
 - `web/highlight.js` — the client-side web-tree-sitter highlighter; its grammars/runtime
   are generated into `web/vendor/` by `build.sh` (gitignored). The import is optional —
   the renderer degrades to plain text if absent.
@@ -121,7 +127,8 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `btv.timer`) via
 - `web/verify-alt-ctrl.mjs` — the reserved-chord verifier: drives **real** keydown events
   (not the `feed` hook, which bypasses the encoding under test) and asserts `Alt+w` feeds
   `<C-w>` on a non-Mac platform, that an unreserved `Alt+c` still reaches the editor as
-  `<A-c>`, and that a spoofed macOS session remaps nothing.
+  `<A-c>`, that the substitutions are declared in `btv.ui.caps().key_labels`, and that a
+  spoofed macOS session remaps — and declares — nothing.
 - `web/verify-config.mjs` — the config verifier: writes an `/init.lua` to OPFS, reloads,
   and asserts the config applied on startup (an option, a global, a keymap that fires,
   and a startup-buffer `BufEnter` autocmd) and that a broken config is non-fatal.

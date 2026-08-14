@@ -26,7 +26,7 @@ BUNDLE="$OUT/plugins-bundle.lua"
 # repo<TAB>pinned-commit — the recommended set (first-recommended-plugin-keys-helper) plus the
 # catppuccin colorscheme (the sole neovim-plugin surface). Keep pins in lock-step with the demo.
 PLUGINS=(
-  "bemtvi/bemtvi-keys-helper	b39ec898e5b89467fd3a378a48198a00fc98c853"
+  "bemtvi/bemtvi-keys-helper	22f53cb5cb958131e7c30157370e4ee9bf0bd6f1"
   "bemtvi/bemtvi-tree	646bd021a0799fd6fd7dfcc1397099c803bd47de"
   "bemtvi/bemtvi-line	7c5a7d33d303cc5bc0128ccb891172a1db4de279"
   "bemtvi/bemtvi-lspconfig	8c4282dbb3775acbe6ed11dc6bd8d9a45361e135"

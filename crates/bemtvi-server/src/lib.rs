@@ -1784,6 +1784,15 @@ pub struct EditHost {
     /// like native's [`bemtvi_ts::installed_parsers`] — this set is that listing. Wasm only.
     #[cfg(not(feature = "native"))]
     ts_installed: std::collections::BTreeSet<String>,
+    /// The browser client's chord substitutions (`<C-w>` → `<A-w>`), mirrored into
+    /// `btv.ui.caps().key_labels` so a which-key popup names the chord the visitor can
+    /// actually press. The page computes them — only it knows the platform and which
+    /// shortcuts this browser keeps for itself — and hands them in via
+    /// [`set_key_labels`](EditHost::set_key_labels) after [`attach_ui`], so they are
+    /// held here to survive a re-attach (a resize re-runs `attach_ui`). Natively the
+    /// same pairs ride the `btv_ui_attach` capabilities map instead. Wasm only.
+    #[cfg(not(feature = "native"))]
+    key_labels: Vec<(String, String)>,
 }
 
 impl EditHost {
@@ -1966,6 +1975,8 @@ impl EditHost {
             flush_due_ms: None,
             #[cfg(not(feature = "native"))]
             ts_installed: std::collections::BTreeSet::new(),
+            #[cfg(not(feature = "native"))]
+            key_labels: Vec::new(),
         }
     }
 }
@@ -1996,8 +2007,21 @@ impl EditHost {
         // attach runs at `eh_new`, before the Worker sources `init.lua`, so a config
         // subscribing to it wouldn't exist yet; `boot_finish` fires it once startup is
         // done, which is the native order (config, `VimEnter`, then the UI is known).
-        let _ = self.lua.set_ui_caps(true, true, false);
+        let _ = self.lua.set_ui_caps(true, true, false, &self.key_labels);
         self.redraw();
+    }
+
+    /// Declare the chord substitutions this page performs — `("<C-w>", "<A-w>")` says
+    /// a keypress of `Alt+w` is what arrives here as `<C-w>`, because the browser keeps
+    /// the real chord for itself. Mirrored into `btv.ui.caps().key_labels` for whatever
+    /// *displays* keys (a which-key popup, a cheat sheet); nothing about input changes,
+    /// since the page already substituted before sending. Only the page can compute
+    /// this — the platform and the browser's own reserved list are its to know — so it
+    /// is pushed in rather than inferred. Call after [`attach_ui`](Self::attach_ui) and
+    /// before [`boot_finish`](Self::boot_finish), so `UIEnter` handlers see them.
+    pub fn set_key_labels(&mut self, labels: Vec<(String, String)>) {
+        self.key_labels = labels;
+        let _ = self.lua.set_ui_caps(true, true, false, &self.key_labels);
     }
 
     /// Run the serverless startup seed: snapshot the initial buffer for Lua, seed the

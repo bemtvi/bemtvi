@@ -1196,6 +1196,30 @@ pub unsafe extern "C" fn eh_source_lua(h: *mut WasmEditHost, code: *const c_char
     }
 }
 
+/// Declare the chord substitutions this page performs, from a JSON
+/// `{"<C-w>": "<A-w>", …}` object mapping the notation the editor receives onto the
+/// chord the visitor must actually press. Chrome and Edge keep `<C-w>` / `<C-t>` /
+/// `<C-n>` / `<C-1>`..`<C-9>` for themselves on Windows and Linux, so the page sends
+/// them on Alt instead; this is how a which-key popup gets to say `<A-w>` rather than
+/// naming a chord the browser would swallow. Display only — input already arrived
+/// substituted. Call after [`eh_new`] (which attaches the UI) and before
+/// [`eh_boot_finish`], so `UIEnter` handlers read them. See
+/// [`EditHost::set_key_labels`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `json` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_set_key_labels(h: *mut WasmEditHost, json: *const c_char) {
+    let handle = host_or!(h);
+    let raw = as_str(json);
+    // Loud on malformed input rather than silently unlabelled: a typo here would
+    // otherwise show up only as a popup quietly naming unpressable chords.
+    match serde_json::from_str::<std::collections::BTreeMap<String, String>>(raw) {
+        Ok(map) => handle.host.set_key_labels(map.into_iter().collect()),
+        Err(e) => eprintln!("bemtvi-edithost: eh_set_key_labels got malformed JSON ({e}): {raw}"),
+    }
+}
+
 /// Apply a fetched remote-config bundle in a daemon session — the browser twin of the
 /// native edit-host's fetch→materialize→source path. The Worker dials the daemon, fetches
 /// `config_bundle` over WebTransport, re-encodes the reply to msgpack, and hands the bytes

@@ -149,6 +149,8 @@ const eh_sock_closed = M.cwrap("eh_sock_closed", null, ["number", "number", "str
 const eh_take_ts_requests = M.cwrap("eh_take_ts_requests", "number", ["number"]);
 const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number", "string", "number", "string"]);
 const eh_ts_seed_installed = M.cwrap("eh_ts_seed_installed", null, ["number", "string"]);
+// The page's chord substitutions (`{"<C-w>": "<A-w>"}`), for `btv.ui.caps().key_labels`.
+const eh_set_key_labels = M.cwrap("eh_set_key_labels", null, ["number", "string"]);
 // Clipboard (`"+`/`"*`) leg: the editor enqueues each `"+`/`"*` yank/delete off-tick; the
 // Worker drains it and forwards to the UI thread (only the UI thread can reach
 // `navigator.clipboard`) to write out. The UI pushes the OS clipboard back in via
@@ -362,6 +364,13 @@ async function applyRemoteConfigFromDaemon() {
 // (shada) and the treesitter availability seed then load in BOTH modes, before the startup
 // lifecycle fires (`eh_boot_finish`).
 async function bootWithConfig() {
+  // The chords this page can only deliver via a stand-in — Chrome keeps `<C-w>` and
+  // friends for itself, so the page sends them on Alt (see `KEY_LABELS` in index.html).
+  // Declared BEFORE the config is sourced, so a plugin reading `btv.ui.caps()` from
+  // `UIEnter` (fired by `eh_boot_finish` below) sees them. Absent param ⇒ nothing to
+  // substitute (a Mac, or a host page that doesn't do this), and the map stays empty.
+  const keyLabels = new URL(self.location.href).searchParams.get("key_labels");
+  if (keyLabels) eh_set_key_labels(h, keyLabels);
   if (daemon) {
     await applyRemoteConfigFromDaemon();
   } else {

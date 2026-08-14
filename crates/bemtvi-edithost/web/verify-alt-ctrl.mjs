@@ -54,6 +54,18 @@ process.on("exit", cleanup);
 const windowCount = (page) =>
   page.evaluate(() => (window.__bemtvi.frame()?.windows || []).length);
 
+// Run a Lua chunk and return the string it returned. `execLua` resolves to the whole
+// reply envelope, whose `result` is a Rust-Debug rendering of the rmpv value
+// (`ok:String(Utf8String { s: Ok("…") })`) — so unwrap to the bare string, or null on
+// an error / non-string result.
+async function luaStr(page, code) {
+  const rendered = await page.evaluate(
+    (c) => window.__bemtvi.execLua(c).then((r) => String(r.result)), code);
+  if (!rendered.startsWith("ok:")) return null;
+  const m = rendered.match(/Ok\("((?:[^"\\]|\\.)*)"\)/);
+  return m ? m[1] : null;
+}
+
 // The first frame lands a tick after `ready` resolves, so a bare `windowCount` right
 // after boot can legitimately read 0. Poll for the expected layout and return whatever
 // count we ended on — deliberately no throw, so a run where the remap is broken still
@@ -124,6 +136,18 @@ try {
     check("Alt+w c closes the split (fed as `<C-w>c`)",
       (await windowCount(page)) === 1, `windows=${await windowCount(page)}`);
 
+    // The same substitutions the page performs are DECLARED to the editor, so anything
+    // that names keys — the which-key popup above all — can offer the chord a visitor
+    // can actually press instead of the `<C-w>` this browser would swallow.
+    const labels = await luaStr(page,
+      "local l = btv.ui.caps().key_labels\n" +
+      "return (l['<C-w>'] or '?') .. '|' .. (l['<C-6>'] or '?') .. '|' .. tostring(l['<C-Tab>'])");
+    check("the page declares its substitutions in `btv.ui.caps().key_labels`",
+      labels === "<A-w>|<A-6>|nil",
+      // `<C-Tab>` is deliberately unlabelled: Alt+Tab belongs to the window manager, so
+      // it has no reachable stand-in and naming one would be a second dead end.
+      `key_labels = ${JSON.stringify(labels)}`);
+
     // An Alt chord OUTSIDE the reserved set still encodes as Alt. `<A-c>` is the
     // multi-cursor placement mode, so this asserts a real effect rather than the absence
     // of one — a widened substitution would send `<C-c>` and never reach MULTICURSOR.
@@ -160,6 +184,13 @@ try {
     await sleep(300);
     check("Alt+w v does NOT split on mac (Alt stays Option)",
       (await windowCount(page)) === 1, `windows=${await windowCount(page)}`);
+
+    // Nothing is substituted here, so nothing is declared either — a Mac popup must
+    // name the real `<C-w>`, which is exactly what arrives.
+    const macLabels = await luaStr(page,
+      "return tostring(next(btv.ui.caps().key_labels) == nil)");
+    check("a mac session declares no substitutions", macLabels === "true",
+      `next(key_labels) == nil → ${JSON.stringify(macLabels)}`);
 
     // Ctrl+w is free on macOS, so the real chord splits with no remap involved.
     await page.keyboard.press("Escape");

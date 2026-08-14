@@ -4139,14 +4139,25 @@ impl LuaRuntime {
     /// a `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` mapping on `keyboard_protocol`: without
     /// it the terminal can't tell those from `<BS>` / `<Tab>` / `<CR>` / `<Esc>`, so
     /// the mapping would shadow the named key.
+    ///
+    /// `key_labels` are the client's chord substitutions — `("<C-w>", "<A-w>")` says
+    /// this client only delivers `<C-w>` when the user presses `Alt+w`, so anything
+    /// that *displays* that key should name the pressable one. Passed as pairs and
+    /// folded into a map Lua-side.
     pub fn set_ui_caps(
         &self,
         keyboard_protocol: bool,
         truecolor: bool,
         osc52: bool,
+        key_labels: &[(String, String)],
     ) -> mlua::Result<()> {
         let set: mlua::Function = self.btv()?.get("_set_ui_caps")?;
-        set.call((keyboard_protocol, truecolor, osc52))
+        let flat = self.lua.create_table()?;
+        for (chord, label) in key_labels {
+            flat.push(chord.as_str())?;
+            flat.push(label.as_str())?;
+        }
+        set.call((keyboard_protocol, truecolor, osc52, flat))
     }
 
     /// Mirror the focused window cursor's screen position (1-based row/col, the

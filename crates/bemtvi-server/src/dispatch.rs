@@ -147,13 +147,41 @@ impl EditHost {
                             .set_clipboard(Box::new(crate::clipboard::Osc52Clipboard::new(state)));
                     }
                 }
+                // `key_labels` is the odd one out: a map, not a flag. A client that can
+                // only deliver a chord *via another chord* declares the substitution here
+                // (`{"<C-w>": "<A-w>"}` — the browser, where Chrome keeps the real `<C-w>`
+                // for itself), so anything that DISPLAYS keys can name the pressable one.
+                // Input is unaffected: the client substitutes before sending, so the
+                // editor still sees canonical notation. Absent ⇒ no substitutions.
+                let key_labels: Vec<(String, String)> = params
+                    .get(2)
+                    .and_then(|v| match v {
+                        Value::Map(m) => m
+                            .iter()
+                            .find(|(k, _)| k.as_str() == Some("key_labels"))
+                            .map(|(_, val)| val),
+                        _ => None,
+                    })
+                    .and_then(|v| match v {
+                        Value::Map(m) => Some(
+                            m.iter()
+                                .filter_map(|(k, v)| {
+                                    Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 // Mirror what this client reported into `btv.ui.caps()` and fire
                 // `UIEnter`. This is the first (and only) point a plugin can learn what
                 // the terminal can do — the config and `VimEnter` both ran before any
                 // client attached — so a keymap that needs `keyboard_protocol` (a
                 // `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` chord, which a legacy terminal
                 // folds onto `<BS>` / `<Tab>` / `<CR>` / `<Esc>`) installs itself here.
-                let _ = self.lua.set_ui_caps(kbd, cap("truecolor"), cap("osc52"));
+                let _ = self
+                    .lua
+                    .set_ui_caps(kbd, cap("truecolor"), cap("osc52"), &key_labels);
                 self.fire_ui_enter();
                 // The resize assigns the window its first rect, so a `btv.decor`
                 // provider's viewport is only now known. Drive `run_pending` to

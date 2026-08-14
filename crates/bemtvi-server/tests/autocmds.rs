@@ -3776,6 +3776,77 @@ async fn ui_enter_reports_truecolor_and_osc52_from_the_attach_map() {
     );
 }
 
+/// A client that can only deliver a chord *via another chord* declares the
+/// substitution in the attach map, and it reaches `btv.ui.caps().key_labels` as a
+/// map. The browser is the case that needs it: Chrome and Edge keep `<C-w>` for
+/// themselves, so the web client sends `Alt+w` in its place — and a which-key popup
+/// that names `<C-w>` would be telling the visitor to press a chord that never
+/// arrives. Input is unaffected (the client substitutes before sending); this is
+/// purely what gets *displayed*.
+#[tokio::test]
+async fn ui_enter_reports_the_clients_key_substitutions() {
+    let dir = temp_dir("au_uienter_labels");
+    let (rpc, _incoming) = bemtvi_test_harness::spawn(bemtvi_test_harness::config_init(
+        &dir,
+        "btv.on('UIEnter', {}, function()\n\
+        \x20 _G.at_uienter = btv.ui.caps().key_labels['<C-w>']\n\
+         end)\n",
+    ));
+    bemtvi_test_harness::attach_with_caps(
+        &rpc,
+        80,
+        24,
+        vec![(
+            Value::from("key_labels"),
+            Value::Map(vec![
+                (Value::from("<C-w>"), Value::from("<A-w>")),
+                (Value::from("<C-n>"), Value::from("<A-n>")),
+            ]),
+        )],
+    )
+    .await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local l = btv.ui.caps().key_labels\n\
+             return (l['<C-w>'] or '?') .. '|' .. (l['<C-n>'] or '?')\n\
+               .. '|' .. tostring(l['<C-t>'])"
+        )
+        .await
+        .as_str(),
+        Some("<A-w>|<A-n>|nil"),
+        "the declared substitutions mirror through, and nothing else is invented"
+    );
+    // And they are readable from `UIEnter`, the point a plugin first learns them.
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(_G.at_uienter)")
+            .await
+            .as_str(),
+        Some("<A-w>"),
+        "the caps mirror is refreshed before UIEnter fires"
+    );
+}
+
+/// A client with nothing to substitute — every terminal, and a browser on macOS,
+/// where those shortcuts hang off Cmd — sends no `key_labels`, and the table is
+/// empty rather than absent, so a consumer can index it without a nil guard.
+#[tokio::test]
+async fn caps_key_labels_are_an_empty_table_when_the_client_declares_none() {
+    let dir = temp_dir("au_uienter_no_labels");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local l = btv.ui.caps().key_labels\n\
+             return type(l) .. '|' .. tostring(next(l) == nil)"
+        )
+        .await
+        .as_str(),
+        Some("table|true"),
+        "an empty table, not nil"
+    );
+}
+
 // --------------------------------------------------------- deletion is not a wipe
 //
 // `nvim_del_autocmd(id)` filters the registry with `au.id ~= id`. A `nil` id makes

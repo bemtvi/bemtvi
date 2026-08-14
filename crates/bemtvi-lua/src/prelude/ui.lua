@@ -502,13 +502,23 @@ end
 -- capabilities map it sent at attach. All false until a UI attaches (a headless
 -- server has no client to ask), so read it from a `UIEnter` handler — the event
 -- fires right after this mirror is refreshed.
-btv._ui_caps = btv._ui_caps or { keyboard_protocol = false, truecolor = false, osc52 = false }
+btv._ui_caps = btv._ui_caps
+  or { keyboard_protocol = false, truecolor = false, osc52 = false, key_labels = {} }
 
 -- Server-called: refresh the mirror from the attaching client's capabilities map.
-function btv._set_ui_caps(keyboard_protocol, truecolor, osc52)
+-- `key_labels` arrives as a flat `{ chord, label, chord, label, … }` list (the wire
+-- carries pairs, not a map) and is folded back into a table here.
+function btv._set_ui_caps(keyboard_protocol, truecolor, osc52, key_labels)
   btv._ui_caps.keyboard_protocol = keyboard_protocol and true or false
   btv._ui_caps.truecolor = truecolor and true or false
   btv._ui_caps.osc52 = osc52 and true or false
+  local labels = {}
+  if type(key_labels) == "table" then
+    for i = 1, #key_labels - 1, 2 do
+      labels[key_labels[i]] = key_labels[i + 1]
+    end
+  end
+  btv._ui_caps.key_labels = labels
 end
 
 -- `btv.ui.caps()` -> a fresh table of the attached client's terminal capabilities:
@@ -518,6 +528,7 @@ end
 --   keyboard_protocol = false, -- the kitty keyboard protocol is on
 --   truecolor         = false, -- the terminal can show 24-bit color
 --   osc52             = false, -- the terminal accepts OSC 52 clipboard writes
+--   key_labels        = {},    -- chords this client can only deliver via another chord
 -- }
 -- ```
 --
@@ -535,13 +546,35 @@ end
 -- end)
 -- ```
 --
--- Every field is false before a client attaches, so check it from `UIEnter` rather
--- than at config time: the config is sourced (and `VimEnter` fires) before the
--- first client attaches.
+-- `key_labels` maps a chord the editor sees onto the chord the user must actually
+-- PRESS to send it, for the clients that cannot deliver it directly. The browser is
+-- the case that forced it: Chrome and Edge handle `<C-w>` / `<C-t>` / `<C-n>` /
+-- `<C-1>`..`<C-9>` themselves on Windows and Linux, so the page never sees them and
+-- the web client substitutes Alt — a keypress of `Alt+w` arrives as `<C-w>`. Anything
+-- that DISPLAYS a key (a which-key popup, a cheat sheet, a `desc` listing) should
+-- render through this so it names a chord the user can press; anything that MATCHES
+-- on keys must not, since the editor still sees the canonical notation:
+--
+-- ```lua
+-- local labels = btv.ui.caps().key_labels
+-- local shown = labels["<C-w>"] or "<C-w>" -- "<A-w>" in a browser, "<C-w>" elsewhere
+-- ```
+--
+-- It is empty on a client with nothing to substitute (every terminal, and a browser
+-- on macOS, where those shortcuts hang off Cmd and Ctrl arrives untouched).
+--
+-- Every field is false/empty before a client attaches, so check it from `UIEnter`
+-- rather than at config time: the config is sourced (and `VimEnter` fires) before
+-- the first client attaches.
 function btv.ui.caps()
+  local labels = {}
+  for chord, label in pairs(btv._ui_caps.key_labels) do
+    labels[chord] = label
+  end
   return {
     keyboard_protocol = btv._ui_caps.keyboard_protocol,
     truecolor = btv._ui_caps.truecolor,
     osc52 = btv._ui_caps.osc52,
+    key_labels = labels,
   }
 end

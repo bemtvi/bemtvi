@@ -41,11 +41,12 @@ pub use editor::{
     FileFolds, FileMarkEntry, FilterSeed, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry,
     InputHistoryEntry, JumpPos, LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics,
     MenuPlacement, MouseClick, MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave,
-    PersistState, PickerRun, PluginEntry, PluginNamespace, PreWrite, PreviewScroll, PreviewTarget,
-    PromptField, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry, RowLayout,
-    SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId,
-    TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId, WriteEvent,
-    WriteScope, SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT,
+    PendingSnapshot, PersistState, PickerRun, PluginEntry, PluginNamespace, PreWrite,
+    PreviewScroll, PreviewTarget, PromptField, PromptPos, QfAction, QfEntry, QfList, QfStack,
+    QfWhich, RegisterEntry, RowLayout, SessionDock, SessionState, SessionTab, SessionWindow,
+    ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture,
+    WindowConfigSpec, WindowId, WriteEvent, WriteScope, SIGNATURE_MARKER, SIGNATURE_MARKER_COL,
+    SIGNATURE_PARAM_INDENT,
 };
 pub use encoding::Encoding;
 pub use extmark::{

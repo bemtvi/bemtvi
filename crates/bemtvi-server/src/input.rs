@@ -544,6 +544,10 @@ impl EditHost {
     /// normal path — bemtvi has no expression evaluator for a string RHS.)
     pub(crate) fn fire_mapping(&mut self, rhs: MappingRhs, silent: bool, expr: bool) {
         let restore = silent.then(|| self.editor.message.clone());
+        // The pending command as it stood *before* the RHS ran — the count/register
+        // typed ahead of the mapping. Compared against the post-fire state below to
+        // tell those apart from a command stage the RHS itself armed.
+        let pending_before = self.editor.pending_snapshot();
         // Whatever the RHS types, feeds, or executes is not typed input: a macro
         // recorded the LHS that got us here (`apply_step`), so everything the fire
         // produces must stay out of the recording.
@@ -562,7 +566,14 @@ impl EditHost {
         // outside `Editor::input`, so the editor never resets this itself, and it
         // would otherwise leak into the next command (`3<leader>x` then `j` would
         // move 3 lines).
-        self.editor.clear_pending_command();
+        //
+        // …*unless* the RHS moved that state, in which case it belongs to the RHS
+        // and the next key completes it: a string RHS is fed key by key and may end
+        // mid-command on purpose (`X` mapped to `d`, or the browser's `<A-w>` mapped
+        // to the `<C-w>` prefix Chrome eats). Clearing those unconditionally
+        // swallowed the RHS whole.
+        self.editor
+            .clear_pending_command_unless_advanced(&pending_before);
     }
 
     /// Run an `<expr>` Lua RHS and feed the keys it returns. The function computes

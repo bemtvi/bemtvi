@@ -74,6 +74,7 @@ pub use self::cmdcomplete::CmdlineCompleteReq;
 // out, core paints the marker over them, so both read the same constants.
 pub use self::command::{
     command_pending_after, command_status, CommandContinuation, CommandPending, CommandStatus,
+    PendingSnapshot,
 };
 pub(crate) use self::command::{
     DockChord, FindKind, FoldCmd, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind,
@@ -3041,6 +3042,31 @@ impl Editor {
     /// reaches the chokepoint that normally resets pending state.
     pub fn clear_pending_command(&mut self) {
         self.reset_pending();
+    }
+
+    /// Snapshot the pending command, to hand back to
+    /// [`clear_pending_command_unless_advanced`](Self::clear_pending_command_unless_advanced)
+    /// once a mapping's RHS has run.
+    pub fn pending_snapshot(&self) -> PendingSnapshot {
+        PendingSnapshot(self.pending.clone())
+    }
+
+    /// The mapping-fire spelling of [`clear_pending_command`](Self::clear_pending_command):
+    /// consume the count/register the mapping took as its arguments, but **keep any
+    /// pending state its RHS just built**.
+    ///
+    /// A string RHS is fed key by key, so it may legitimately end mid-command —
+    /// `nnoremap X d` arms an operator, `<A-w>` mapped to `<C-w>` arms the window
+    /// prefix — and the next key the user types is that command's argument, as it
+    /// would be had they typed the RHS themselves. Clearing unconditionally after
+    /// the fire swallowed exactly those RHSs. Comparing against `before` separates
+    /// the two: state the RHS moved is the RHS's and stands; state that survived
+    /// the fire untouched is the pre-mapping count/register, and would otherwise
+    /// leak into the next command (`3<leader>x` then `j` moving three lines).
+    pub fn clear_pending_command_unless_advanced(&mut self, before: &PendingSnapshot) {
+        if self.pending == before.0 {
+            self.reset_pending();
+        }
     }
 
     // ----- pending-state bookkeeping ---------------------------------------

@@ -613,7 +613,7 @@ pub struct CommandContinuation {
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
 /// of the old scattered `count`/`op_count`/`operator`/`gpending`/… fields.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PendingCommand {
     /// Count typed after any operator (`d`**2**`w`), or the sole count (`3j`).
     pub(crate) count: Option<usize>,
@@ -628,6 +628,15 @@ pub(crate) struct PendingCommand {
     /// What the next key continues; see [`Stage`].
     pub(crate) stage: Stage,
 }
+
+/// An opaque snapshot of the accumulated command state (the crate-private
+/// `PendingCommand`),
+/// taken *before* a user mapping's RHS runs so the fire path can tell state the
+/// RHS itself built from the count/register that was already there. Paired with
+/// [`Editor::pending_snapshot`](crate::Editor::pending_snapshot) and
+/// [`Editor::clear_pending_command_unless_advanced`](crate::Editor::clear_pending_command_unless_advanced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSnapshot(pub(crate) PendingCommand);
 
 impl PendingCommand {
     /// At a clean command boundary: no count, operator, register, or argument

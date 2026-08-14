@@ -1790,3 +1790,94 @@ async fn fed_ctrl_h_folds_onto_bs_without_the_protocol() {
         "a legacy terminal cannot tell them apart, so the fed <C-h> IS <BS>"
     );
 }
+
+// ===== a string RHS that ends mid-command ==================================
+
+/// A `noremap` string RHS whose keys stop at a **prefix** leaves the editor
+/// mid-command, exactly as typing those keys would: the next key completes it.
+/// Vim's `nnoremap X d` makes `Xj` a two-line delete.
+///
+/// Regression: the fire path cleared the pending command *unconditionally* once
+/// the RHS had run — to consume the count/register typed ahead of the mapping —
+/// which also wiped the operator/prefix stage the RHS had just built. `X` then
+/// `j` deleted nothing at all, and the following key ran as a fresh command.
+#[tokio::test]
+async fn a_string_rhs_ending_in_an_operator_stays_pending() {
+    let dir = temp_dir("keymap_rhs_operator_pending");
+    let (rpc, _incoming) =
+        start_with_config(&dir, "vim.keymap.set('n', 'X', 'd', { remap = false })\n").await;
+
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<Esc>gg");
+    feed(&rpc, "X");
+    feed(&rpc, "j");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["c", "d"],
+        "the operator the RHS armed took the next key as its motion"
+    );
+}
+
+/// The same for a built-in *prefix* rather than an operator — and the case the
+/// browser needs, where `<A-w>` stands in for a `<C-w>` the browser keeps for
+/// itself. `<A-w>` must leave the window-command prefix pending so the next key
+/// completes the split.
+#[tokio::test]
+async fn a_string_rhs_ending_in_the_window_prefix_stays_pending() {
+    let dir = temp_dir("keymap_rhs_window_pending");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', '<A-w>', '<C-w>', { remap = false })\n",
+    )
+    .await;
+
+    assert_eq!(lua_u64(&rpc, "return #btv.win.list()").await, Some(1));
+    feed(&rpc, "<A-w>");
+    feed(&rpc, "s");
+    assert_eq!(
+        lua_u64(&rpc, "return #btv.win.list()").await,
+        Some(2),
+        "<A-w> left <C-w> pending, so the following s split the window"
+    );
+}
+
+/// …and the count typed ahead of such a mapping still prefixes the RHS's keys
+/// rather than being consumed: `3X` with `X` mapped to `d` is `3d`, so the
+/// following `j` deletes four lines.
+#[tokio::test]
+async fn a_count_ahead_of_a_prefix_rhs_prefixes_it() {
+    let dir = temp_dir("keymap_rhs_operator_count");
+    let (rpc, _incoming) =
+        start_with_config(&dir, "vim.keymap.set('n', 'X', 'd', { remap = false })\n").await;
+
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<CR>f<Esc>gg");
+    feed(&rpc, "3X");
+    feed(&rpc, "j");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["e", "f"],
+        "3X armed `3d`, and j completed it over four lines"
+    );
+}
+
+/// The counterpart the unconditional clear existed for: a string RHS that
+/// consumes nothing must not let the count typed ahead of it leak into the next
+/// command. `:noh<CR>` takes no count, so the `j` after `3X` moves one line.
+#[tokio::test]
+async fn a_count_ahead_of_a_complete_rhs_does_not_leak() {
+    let dir = temp_dir("keymap_rhs_count_no_leak");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'X', ':noh<CR>', { remap = false })\n",
+    )
+    .await;
+
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<CR>f<Esc>gg");
+    assert_eq!(cursor(&rpc).await.0, 1);
+    feed(&rpc, "3X");
+    feed(&rpc, "j");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "the consumed count did not prefix the following j"
+    );
+}

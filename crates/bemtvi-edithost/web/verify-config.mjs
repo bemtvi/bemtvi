@@ -58,7 +58,8 @@ try {
   await page.evaluate(() => window.__bemtvi.ready);
 
   const INIT_LUA = [
-    "vim.o.tabstop = 7",                                  // an option
+    "vim.o.tabstop = 7",                                  // a BUFFER-scoped option
+    "vim.o.scrolloff = 8",                                // a WINDOW-scoped option
     "vim.g.__cfg = 'loaded'",                             // a global marker
     "vim.keymap.set('n', 'Q', 'ihi-from-config<Esc>')",  // a normal-mode keymap
     // A BufEnter autocmd: it fires for the STARTUP buffer (emitted by boot_finish), so
@@ -78,9 +79,22 @@ try {
 
   const luaResult = (code) => page.evaluate((c) => window.__bemtvi.execLua(c).then((r) => r.result), code);
 
-  // 1. The option set in init.lua is in effect.
-  const ts = await luaResult("return vim.o.tabstop");
-  check("config: vim.o.tabstop set by init.lua", /\b7\b/.test(String(ts)), `tabstop=${JSON.stringify(ts)}`);
+  // 1. The options set in init.lua are in effect — asserted through the REAL
+  //    buffer/window option (`btv.bo` / `btv.wo`), not `vim.o`. Reading back through
+  //    `vim.o` proves nothing on its own: a name the prelude fails to route falls into
+  //    the lenient `btv._o_store` catch-all, which `vim.o` then reads back happily
+  //    while the core never saw the write. That is exactly how the web build silently
+  //    dropped every buffer/window option — `EditHost::new` now installs core's option
+  //    catalog (the routing table) on both legs, so this asserts the routing too.
+  const route = await luaResult('return tostring(btv._o_route("tabstop")) .. "/" .. tostring(btv._o_route("scrolloff"))');
+  check("config: the option catalog reached Lua (vim.o routes by scope, not the catch-all)",
+    /buffer\/window/.test(String(route)), `route=${JSON.stringify(route)}`);
+  const ts = await luaResult("return btv.bo[0].tabstop");
+  check("config: a buffer-scoped option (tabstop) set by init.lua reaches the core",
+    /\b7\b/.test(String(ts)), `tabstop=${JSON.stringify(ts)}`);
+  const so = await luaResult("return btv.wo[0].scrolloff");
+  check("config: a window-scoped option (scrolloff) set by init.lua reaches the core",
+    /\b8\b/.test(String(so)), `scrolloff=${JSON.stringify(so)}`);
 
   // 2. The config actually ran (its global marker is set).
   const marker = await luaResult("return vim.g.__cfg or 'nil'");

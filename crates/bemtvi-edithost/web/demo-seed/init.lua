@@ -8,6 +8,21 @@
 
 vim.g.mapleader = " "
 
+-- Editor options. `vim.opt` is `:set`, so a buffer/window-local option moves its GLOBAL
+-- tier too — every file the demo opens later is born with these, not just the first one.
+--   smartindent    carry the previous line's indent and add a level after `:` / `{`
+--   scrolloff      keep 8 lines of context above and below the cursor while scrolling
+--   signcolumn     reserve two gutter columns, so a diagnostic and a sign sit side by side
+--   colorcolumn    rulers at column 80 and 120 to show the line-length budget
+--   autopairs      typing `(` writes `()`; typing the closer steps over it instead of doubling
+--   numberwidth    a wider line-number gutter
+vim.opt.smartindent = true
+vim.opt.scrolloff = 8
+vim.opt.signcolumn = "yes:2"
+vim.opt.colorcolumn = "80,120"
+vim.opt.autopairs = true
+vim.opt.numberwidth = 6
+
 -- Colorscheme: catppuccin mocha. `load()` applies it directly — the runtimepath
 -- `colors/catppuccin.lua` a browser can't source is itself just `require("catppuccin").load()`.
 require("catppuccin").setup({ flavour = "mocha" })

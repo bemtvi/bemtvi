@@ -1796,6 +1796,56 @@ pub struct EditHost {
 }
 
 impl EditHost {
+    /// Hand Lua the catalogs core owns: the option catalog (each name's scope, global
+    /// tier and doc), the bundled colorscheme names, and the recognized filetypes. The
+    /// server is the integrator — bemtvi-lua stays decoupled from editor-core types, so
+    /// they cross as plain data.
+    ///
+    /// This runs at construction, before anything can source a config, because the
+    /// prelude *derives* its `vim.o` scope routing (`O_WIN` / `O_BUF`) from the option
+    /// rows. Without them every buffer- and window-scoped write falls through to the
+    /// lenient `btv._o_store` catch-all and never reaches the core — and because `vim.o`
+    /// reads that same store back, the write still *looks* applied. That is not
+    /// hypothetical: while this was wired only into [`run_io`], the web edit-host (which
+    /// does not go through `run_io`) silently dropped every buffer/window option a
+    /// browser config set, `vim.opt.scrolloff = 8` included. Doing it here, in the one
+    /// construction site both legs share, is what keeps them from drifting again.
+    ///
+    /// A failure here is a broken prelude, not a runtime condition — it fails loud
+    /// rather than leaving a half-wired VM that mis-routes options.
+    fn install_core_catalogs(lua: &LuaRuntime) {
+        let option_rows: Vec<bemtvi_lua::OptionCatalogRow> =
+            bemtvi_core::options::options_catalog()
+                .iter()
+                .map(|o| bemtvi_lua::OptionCatalogRow {
+                    name: o.name.to_string(),
+                    abbrev: o.abbrev.map(str::to_string),
+                    kind: o.kind.as_str().to_string(),
+                    scope: o.scope.as_str().to_string(),
+                    global_tier: bemtvi_core::options::has_global_tier(o.name),
+                    doc: o.doc.to_string(),
+                })
+                .collect();
+        lua.set_options_catalog(&option_rows)
+            .expect("option catalog init failed");
+        // `:colorscheme <Tab>` offers the binary's bundled schemes: the embedded
+        // `runtime/colors/` tree is not on the runtimepath, so the completer's
+        // `colors/*.lua` glob cannot discover them.
+        let builtin_schemes: Vec<String> = crate::excmd::BUILTIN_COLORSCHEMES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        lua.set_builtin_colorschemes(&builtin_schemes)
+            .expect("colorscheme catalog init failed");
+        // `:setfiletype <Tab>`; core's extension-detection table is the single source.
+        let filetypes: Vec<String> = bemtvi_core::known_filetypes()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        lua.set_filetypes(&filetypes)
+            .expect("filetype catalog init failed");
+    }
+
     /// Construct an edit-host over the given outbound-effect seam, every field at its
     /// startup default. The single construction site for the struct, shared by the
     /// native [`run_io`] (which then seeds `shada` / `mouse_clock` / the LSP keymap
@@ -1804,6 +1854,7 @@ impl EditHost {
     /// UI — [`attach_ui`](Self::attach_ui) on wasm, the `btv_ui_attach` RPC natively —
     /// before the first [`redraw`](Self::redraw).
     pub fn new(editor: Editor, lua: LuaRuntime, fx: Box<dyn HostEffects>) -> EditHost {
+        Self::install_core_catalogs(&lua);
         EditHost {
             editor,
             lua,
@@ -3851,43 +3902,9 @@ where
     }
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
-    // Inject the documented option catalog from core (the single source of truth)
-    // into the Lua runtime: the bundled `btv.cmdline_complete` source offers option
-    // names with their docs after `:set`, and the prelude derives its `vim.o` scope
-    // routing + `vim.go` tier tables from the same rows, so neither can drift from
-    // what `:set` accepts. The server is the integrator here —
-    // bemtvi-lua stays decoupled from editor-core types, so the catalog crosses as
-    // plain `OptionCatalogRow` data. Done before any `init.lua` runs.
-    let option_rows: Vec<bemtvi_lua::OptionCatalogRow> = bemtvi_core::options::options_catalog()
-        .iter()
-        .map(|o| bemtvi_lua::OptionCatalogRow {
-            name: o.name.to_string(),
-            abbrev: o.abbrev.map(str::to_string),
-            kind: o.kind.as_str().to_string(),
-            scope: o.scope.as_str().to_string(),
-            global_tier: bemtvi_core::options::has_global_tier(o.name),
-            doc: o.doc.to_string(),
-        })
-        .collect();
-    lua.set_options_catalog(&option_rows)
-        .map_err(|e| anyhow::anyhow!("option catalog init failed: {e}"))?;
-    // Hand the binary's bundled color-scheme names to Lua so `:colorscheme <Tab>` can
-    // offer them (the embedded `runtime/colors/` tree is not on the runtimepath, so the
-    // completer's `colors/*.lua` glob can't discover them). The builtins are static.
-    let builtin_schemes: Vec<String> = crate::excmd::BUILTIN_COLORSCHEMES
-        .iter()
-        .map(|(name, _)| name.to_string())
-        .collect();
-    lua.set_builtin_colorschemes(&builtin_schemes)
-        .map_err(|e| anyhow::anyhow!("colorscheme catalog init failed: {e}"))?;
-    // Hand the recognized filetype names to Lua so `:setfiletype <Tab>` can offer them
-    // (core's extension-detection table is the single source of truth).
-    let filetypes: Vec<String> = bemtvi_core::known_filetypes()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    lua.set_filetypes(&filetypes)
-        .map_err(|e| anyhow::anyhow!("filetype catalog init failed: {e}"))?;
+    // The option / colorscheme / filetype catalogs core owns are installed by
+    // `EditHost::new` below — the one construction site the native server and the wasm
+    // edit-host share — so the two legs cannot drift on them again.
     // Seed the layout-capture opt-in before any config runs. `--workspace` turns it on so
     // a directory session captures its window/tab layout without needing a plugin to call
     // `btv.shada.save_layout`; a plain `--shada-namespace` launch leaves it off (the config

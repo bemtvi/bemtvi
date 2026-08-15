@@ -523,6 +523,13 @@ pub struct View {
     /// Resolved editor-chrome styles (`None` when the theme leaves the group
     /// undefined — the client then keeps its built-in look for that region).
     pub normal: Option<Style>,
+    /// The `Cursor` look — what the text cursor itself is painted with. Its `bg` is
+    /// the block's colour and its `fg` the colour the covered glyph is re-drawn in;
+    /// `None` (or either half unset) falls back to reverse video against `Normal`,
+    /// which is what a theme that writes `hi Cursor gui=reverse` means anyway. Only a
+    /// client that draws its own cursor uses it — the TUI hands the job to the
+    /// terminal.
+    pub cursor: Option<Style>,
     pub line_nr: Option<Style>,
     pub cursor_line_nr: Option<Style>,
     /// The `CursorLine` background, painted behind the cursor's screen row when a
@@ -920,6 +927,7 @@ impl View {
         let chrome_map = map_get(map, "chrome");
         let chrome = |key| chrome_style(chrome_map, key, &self.styles);
         self.normal = chrome("normal");
+        self.cursor = chrome("cursor");
         self.line_nr = chrome("line_nr");
         self.cursor_line_nr = chrome("cursor_line_nr");
         self.cursor_line = chrome("cursorline");

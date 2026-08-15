@@ -1209,6 +1209,30 @@ impl Renderer {
         // Text-area height in cells (the window minus its status row).
         let text_rows = wrows.saturating_sub(u16::from(win.status_visible));
 
+        // The block cursor is an opaque quad, so the glyph it covers is
+        // re-drawn inverted on top of it (all quads render under all glyphs) —
+        // `Some(inverted fg)` on the window and mode that paint one. The gate
+        // matches the cursor paint at the end of this window's pass exactly:
+        // only the focused window, and not while the command line, a picker, or
+        // a thin (insert bar / replace underline) cursor owns the cell — those
+        // leave the glyph fully visible and must not recolor it.
+        let block_cursor_fg = {
+            let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
+            let block = win.focused
+                && !view.command_mode
+                && !picker_open
+                && !view.is_insert()
+                && !view.is_replace();
+            block.then(|| {
+                let (_, glyph) = block_cursor_colors(
+                    style_fg(&view.cursor),
+                    style_bg(&view.cursor),
+                    style_fg(&win.normal(view)).unwrap_or(DEFAULT_FG),
+                    style_bg(&win.normal(view)).unwrap_or(DEFAULT_BG),
+                );
+                glyph
+            })
+        };
         match scroll {
             // Sliding: paint the gesture's band at the fractional offset, clipped
             // to the text area so a partially-scrolled line cuts off at the edge.
@@ -1382,6 +1406,20 @@ impl Renderer {
                     };
                     let mut segments =
                         row_segments(&display, hl, s.styles, row_fg, slide_bg, win.leftcol);
+                    // The cursor rides the band mid-slide (see `paint_cursor`), so its
+                    // glyph inverts on the band row it sits on — otherwise the opaque
+                    // block would swallow the character for the length of the slide.
+                    if let Some(cfg) =
+                        block_cursor_fg.filter(|_| k == s.cursor_row.round() as usize)
+                    {
+                        segments = apply_cursor_fg(
+                            segments,
+                            win.leftcol,
+                            win.cursor_screen_col,
+                            win.cursor_width,
+                            cfg,
+                        );
+                    }
                     // Splice the band row's inlay hints and inline/overlay virt_text in,
                     // like the settled path, so they slide with the text instead of
                     // flashing out and back when the slide settles. (eol / right_align /
@@ -1692,6 +1730,18 @@ impl Renderer {
                         style_fg(&view.search_style),
                         style_fg(&view.incsearch_style),
                     );
+                    // The glyph under the block cursor, inverted so it reads against
+                    // the opaque quad. Last of the base-space recolors, so it wins over
+                    // a search match on the same cell — the cursor is on top of it.
+                    if let Some(cfg) = block_cursor_fg.filter(|_| i as u16 == win.cursor_row) {
+                        segments = apply_cursor_fg(
+                            segments,
+                            win.leftcol,
+                            win.cursor_screen_col,
+                            win.cursor_width,
+                            cfg,
+                        );
+                    }
                     // Inline + overlay extmark `virt_text` transform the base segments
                     // (shift / overwrite); inlay hints splice in too. The common no-virt
                     // row keeps the cheaper inlay-only splice (tested path, untouched).
@@ -1930,7 +1980,16 @@ impl Renderer {
             let cursor_color = if view.is_multicursor() {
                 MULTICURSOR_ACCENT
             } else {
-                style_fg(&view.normal).unwrap_or(DEFAULT_FG)
+                // The theme's `Cursor` background, else `Normal`'s foreground — the
+                // block half of the reverse-video pair whose glyph half the row paint
+                // applied (see `block_cursor_colors`).
+                block_cursor_colors(
+                    style_fg(&view.cursor),
+                    style_bg(&view.cursor),
+                    style_fg(&win.normal(view)).unwrap_or(DEFAULT_FG),
+                    style_bg(&win.normal(view)).unwrap_or(DEFAULT_BG),
+                )
+                .0
             };
             // A block cursor envelops the full display width of the grapheme it
             // sits on — a wide CJK/emoji glyph, or a `^X` / `<xx>` control token —
@@ -1942,7 +2001,11 @@ impl Renderer {
             let (w, alpha) = if view.is_insert() {
                 (self.cell_w * 0.15, 0.9)
             } else {
-                (self.cell_w * block_cells, 0.5) // block, translucent so glyphs show
+                // Opaque: the covered glyph was re-drawn inverted on top of it by the
+                // row paint, so it reads as a reverse-video cell the way a terminal's
+                // block cursor does. A translucent block instead — which is what this
+                // was — leaves both the cursor and the glyph under it washed out.
+                (self.cell_w * block_cells, 1.0)
             };
             let c = srgb_to_color_rgba(cursor_color, alpha);
             // Replace mode → underline-ish thin block at the bottom.
@@ -4142,6 +4205,101 @@ pub fn row_segments(
         col += w;
     }
     segments
+}
+
+/// The two colours a **block** cursor paints with, given the theme's `Cursor` group
+/// (`theme_fg` / `theme_bg`, either half `None` when it leaves it unset) and the
+/// editor's `Normal`: the opaque quad's colour, and the colour the glyph it covers is
+/// re-drawn in.
+///
+/// A block cursor is a *reverse-video* cell — that is what a terminal draws, and what
+/// this client's own web twin has always drawn (`.cur-block`). The GUI used to lay a
+/// half-transparent foreground-coloured quad over the glyph instead, on the theory
+/// that the glyph should show through it. It doesn't read: on a dark theme that is a
+/// washed-out light block over light text, and the glyph under the cursor is the one
+/// the reader most needs. So the block is opaque and the glyph is inverted onto it.
+///
+/// Unthemed, that inversion is `Normal` swapped — which is also exactly what a theme
+/// spelling `hi Cursor gui=reverse` means, so the fallback and the common themed case
+/// agree. A theme that sets only one half gets the other from `Normal`. The one
+/// outcome ruled out is a glyph the same colour as the block: a `Cursor` written
+/// fg == bg would paint an unreadable cell, so the glyph falls back to whichever of
+/// `Normal`'s colours the block is not.
+///
+/// Pure, so it's tested in `tests/cursor.rs`.
+pub fn block_cursor_colors(
+    theme_fg: Option<u32>,
+    theme_bg: Option<u32>,
+    normal_fg: u32,
+    normal_bg: u32,
+) -> (u32, u32) {
+    let block = theme_bg.unwrap_or(normal_fg);
+    let glyph = theme_fg.unwrap_or(normal_bg);
+    if glyph != block {
+        return (block, glyph);
+    }
+    (
+        block,
+        if block == normal_bg {
+            normal_fg
+        } else {
+            normal_bg
+        },
+    )
+}
+
+/// Recolor the grapheme the block cursor covers to `fg` — the inverted colour from
+/// [`block_cursor_colors`] — so it stays readable under an opaque block. The GUI's
+/// analogue of the reverse-video cell a terminal paints, and the same shape as
+/// [`apply_search_fg`]: the quad is pushed separately (all quads render under all
+/// glyphs), this is the glyph half.
+///
+/// `cursor_col` is the cursor's screen column and `width` the display width of the
+/// grapheme under it (`cursor_width` — 2 over a CJK char or an emoji, so the whole
+/// cluster inverts rather than half of it). Both are in `segments`' pre-splice column
+/// space, which starts at `leftcol`, so a later inlay / `virt_text` splice shifts
+/// glyph and recolor together. A cursor past the end of the line covers no grapheme
+/// and returns the row untouched.
+///
+/// Pure, so it's tested in `tests/cursor.rs`.
+pub fn apply_cursor_fg(
+    segments: Vec<Seg>,
+    leftcol: u16,
+    cursor_col: u16,
+    width: u16,
+    fg: u32,
+) -> Vec<Seg> {
+    let end = cursor_col.saturating_add(width.max(1));
+    let mut out: Vec<Seg> = Vec::with_capacity(segments.len());
+    let mut col = leftcol;
+    for seg in &segments {
+        for g in seg.text.graphemes(true) {
+            let fg = if col >= cursor_col && col < end {
+                fg
+            } else {
+                seg.fg
+            };
+            match out.last_mut() {
+                Some(last)
+                    if last.fg == fg
+                        && last.bg == seg.bg
+                        && last.bold == seg.bold
+                        && last.italic == seg.italic =>
+                {
+                    last.text.push_str(g);
+                }
+                _ => out.push(Seg {
+                    text: g.to_string(),
+                    fg,
+                    bg: seg.bg,
+                    bold: seg.bold,
+                    italic: seg.italic,
+                }),
+            }
+            col += cells(g) as u16;
+        }
+    }
+    out
 }
 
 /// Recolor the glyphs under `hlsearch` / `incsearch` matches to the theme's

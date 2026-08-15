@@ -68,6 +68,10 @@ pub use render::{
 // The pure caret-cell math for the command line and the picker prompt (char-offset
 // wire fields → display-width cells), exported for the Tier-1 `caret` test.
 pub use render::{cmdline_caret_col, query_caret_col};
+// The block cursor's reverse-video pair — the opaque quad's colour and the inverted
+// colour its covered glyph is re-drawn in — plus that recolor, exported for the
+// Tier-1 `cursor` test.
+pub use render::{apply_cursor_fg, block_cursor_colors};
 // The sRGB→linear color conversions feeding the quad pipeline, exported so the Tier-1
 // `color` test can pin the channel order without a GPU.
 pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};

@@ -121,6 +121,8 @@ local O_GLOBAL = {
   pummaxwidth = "pummaxwidth",
   pmw = "pummaxwidth",
   report = "report",
+  showcmd = "showcmd",
+  sc = "showcmd",
   statusline = "statusline",
   stl = "statusline",
   tabline = "tabline",
@@ -188,6 +190,7 @@ local O_GLOBAL_DEFAULT = {
   laststatus = 2,
   pummaxwidth = 50,
   report = 2,
+  showcmd = true,
   statusline = "",
   tabline = "",
   guifont = "",
@@ -308,10 +311,9 @@ btv._o_store = btv._o_store
     -- Read-mostly editor options plugins read to lay out
     -- floats and gate behavior. Observable defaults matching neovim's; not yet
     -- honored by the core (the client owns the cmdline / message regions), but a
-    -- read returns a sane value instead of nil (which a `- cmdheight` arithmetic or
-    -- a `.. report` concat would choke on).
+    -- read returns a sane value instead of nil (which a `- cmdheight` arithmetic
+    -- would choke on).
     cmdheight = 1,
-    report = 2,
     eventignore = "",
     ambiwidth = "single",
     helplang = "en",

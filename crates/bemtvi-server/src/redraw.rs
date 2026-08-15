@@ -15,6 +15,10 @@ use bemtvi_core::{BorderStyle, ContentFloatView, MenuPlacement, VirtChunk, WinHl
 use rmpv::Value;
 use std::collections::HashMap;
 
+/// Vim's `SHOWCMD_COLS`: the width of the `'showcmd'` corner. A longer run keeps
+/// its tail, so the newest keys stay visible.
+const SHOWCMD_COLS: usize = 10;
+
 impl EditHost {
     /// Push the current view to the client as a single `redraw` notification
     /// carrying an bemtvi-native view map (no neovim grid protocol). The map holds
@@ -89,6 +93,23 @@ impl EditHost {
         #[cfg(not(feature = "native"))]
         let theme = self.syntax_theme(&mut styles);
 
+        // `'showcmd'`: the corner display is the editor's own pending run (count,
+        // operator, register, the key waiting for its argument) **plus** whatever the
+        // keymap matcher is still withholding — a half-typed mapped prefix
+        // (`<Space>f`) never reaches the editor, so only the matcher knows about it.
+        // Truncated to vim's 10 columns, keeping the tail: the keys you typed most
+        // recently are the ones worth seeing.
+        let showcmd = if self.editor.global_options().showcmd {
+            let mut sc = view.showcmd.clone();
+            sc.push_str(&self.keymaps.pending_notation());
+            let over = sc.chars().count().saturating_sub(SHOWCMD_COLS);
+            if over > 0 {
+                sc = sc.chars().skip(over).collect();
+            }
+            sc
+        } else {
+            String::new()
+        };
         // The message line shows the diagnostic under the cursor, but only when
         // nothing more important (an error, command output) already holds it —
         // and never via `echo`, so the under-cursor text doesn't flood
@@ -322,6 +343,10 @@ impl EditHost {
                 Value::from(unicode::display_line(message.as_str()).as_ref()),
             ),
             (Value::from("message_error"), Value::from(message_error)),
+            (
+                Value::from("showcmd"),
+                Value::from(unicode::display_line(showcmd.as_str()).as_ref()),
+            ),
             (Value::from("guifont"), Value::from(guifont.as_str())),
             (
                 Value::from("guiglyphoverflow"),

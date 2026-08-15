@@ -491,6 +491,13 @@ impl Keymaps {
         self.pending.is_empty()
     }
 
+    /// The withheld prefix as re-parseable vim notation (`"g"`, `"<Space>w"`), or
+    /// empty when nothing is withheld — the cheap half of [`Self::pending_context`]
+    /// (no trie walk), for the per-frame `'showcmd'` projection.
+    pub fn pending_notation(&self) -> String {
+        self.pending.iter().copied().map(key_to_notation).collect()
+    }
+
     /// The live pending key-context for `scope` (the **`KeyPending`** oracle), or
     /// `None` when nothing is withheld — the withheld prefix plus its continuations
     /// from the current buffer's mapped-prefix trie. A `None` (empty `pending`) tells
@@ -510,7 +517,7 @@ impl Keymaps {
             .continuations(&self.pending)?;
         Some(KeyPending {
             mode: scope.mode_code().to_string(),
-            keys: self.pending.iter().copied().map(key_to_notation).collect(),
+            keys: self.pending_notation(),
             continuations,
             // Sources A/C enumerate continuations; the label is the source-B channel.
             label: None,

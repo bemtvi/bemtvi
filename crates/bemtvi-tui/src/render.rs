@@ -2597,6 +2597,29 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
         }
         frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
     }
+    render_showcmd(frame, area, view, base);
+}
+
+/// Paint the `'showcmd'` corner: the partly-typed command (or the size of the live
+/// selection) right-aligned on the command-line row, as vim does. It shares the row
+/// with the message / cmdline but has its own column band at the right edge, so both
+/// can be up at once. Nothing to paint when the string is empty (`'noshowcmd'`, or
+/// no command pending).
+fn render_showcmd(frame: &mut Frame, area: Rect, view: &View, base: Style) {
+    if view.showcmd.is_empty() {
+        return;
+    }
+    let width = view.showcmd.width() as u16;
+    if width >= area.width {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + area.width - width,
+        y: area.y,
+        width,
+        height: area.height,
+    };
+    frame.render_widget(Paragraph::new(view.showcmd.as_str()).style(base), rect);
 }
 
 /// Render the tabline across the top row. With a custom `'tabline'` set, the

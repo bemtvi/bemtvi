@@ -493,6 +493,11 @@ pub struct View {
     /// the terminal cursor mid-line after `<Left>`/`<Right>` edits.
     pub cmdline_cursor: usize,
     pub message: String,
+    /// The `'showcmd'` corner: the partly-typed command (`2`, `d`, `"a3d`, a
+    /// half-typed mapped prefix) or, while a selection is up, its size. Painted
+    /// right-aligned on the command-line row. Empty when nothing is pending or
+    /// `'showcmd'` is off.
+    pub showcmd: String,
     /// Whether `message` is an error — the client paints the message line with the
     /// theme's red `ErrorMsg` highlight rather than the default foreground.
     pub message_error: bool,
@@ -906,6 +911,7 @@ impl View {
         self.cmdline_prompt = map_str(map, "cmdline_prompt");
         self.cmdline_cursor = map_u64(map, "cmdline_cursor") as usize;
         self.message = map_str(map, "message");
+        self.showcmd = map_str(map, "showcmd");
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
         self.guiglyphoverflow = map_str(map, "guiglyphoverflow");

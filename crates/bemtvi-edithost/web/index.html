@@ -3039,6 +3039,20 @@
         el.textContent = "";
       }
       gridEl.appendChild(el);
+      renderShowcmd(cmdRow);
+    }
+    // The `'showcmd'` corner: the partly-typed command (or the live selection's
+    // size), right-aligned on the command-line row as vim paints it. Its own
+    // element, so a message and a pending command can share the row.
+    function renderShowcmd(cmdRow) {
+      if (!view.showcmd) return;
+      const el = document.createElement("div");
+      el.className = "cmdline showcmd";
+      el.style.top = cmdRow * ch + "px";
+      el.style.left = "auto";
+      el.style.right = "0";
+      el.textContent = view.showcmd;
+      gridEl.appendChild(el);
     }
     function focusedWindow() { return (view.windows || []).find((w) => w.focused) || view.windows?.[0]; }
     function promptStr(frame) {

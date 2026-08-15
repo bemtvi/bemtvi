@@ -570,6 +570,9 @@ pub struct GoMirror {
     /// `'report'` — how many changed lines a command must exceed before it says so
     /// on the message line. Backs `vim.o.report` / `btv.o.report`.
     pub report: u64,
+    /// `'showcmd'` — whether the partly-typed command shows in the last line's
+    /// corner. Backs `vim.o.showcmd` / `btv.o.showcmd`.
+    pub showcmd: bool,
     pub statusline: String,
     pub tabline: String,
     pub guifont: String,

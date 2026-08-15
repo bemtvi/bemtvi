@@ -118,3 +118,25 @@ Black-box through the harness, as always.
 - `crates/bemtvi-server/tests/editing/showcmd.rs` — the redraw `showcmd` field
   through a count, an operator, a register, a find-char, a mapped prefix, each
   Visual shape, and `:set noshowcmd`.
+
+## Outcome
+
+Both phases shipped as described. Three notes where reality differed from the
+sketch:
+
+- **No blockwise Visual.** bemtvi has no `Mode::VisualBlock`, so vim's
+  `{lines}x{cols}` size form has nothing to describe and is not implemented.
+- **`:global`'s report is gated on silence.** The whole `:g` run reports its net
+  line change once, but only when its commands left no message of their own —
+  vim's `do_sub_msg()`-first precedence. bemtvi does not yet *accumulate* the
+  substitutions of a `:g/…/s/…`, so today nothing reaches that gate; it is there
+  so an accumulated substitute report keeps priority when one lands.
+- **A charwise selection end needed a grapheme snap.** `visual_range_lw` ends a
+  charwise range at `cursor + 1` byte, which can land mid-cluster; every operator
+  path snapped it via `snap_range`, so nothing had noticed. The showcmd size
+  slices the range directly, so it snaps too.
+
+Verified in all three clients: the TUI (a real PTY paints `2d` in the corner and
+`3 lines yanked` on the message line), the web edit-host (headless Chromium: the
+corner element is right-aligned and the report messages land), and the GUI by
+construction — the same projection, painted with the shared `push_plain` path.

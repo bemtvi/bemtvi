@@ -2689,6 +2689,7 @@ impl EditHost {
             laststatus: go.laststatus,
             pummaxwidth: go.pummaxwidth as u64,
             report: go.report as u64,
+            showcmd: go.showcmd,
             statusline: go.statusline.clone(),
             tabline: go.tabline.clone(),
             guifont: go.guifont.clone(),

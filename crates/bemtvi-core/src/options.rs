@@ -54,6 +54,12 @@ pub struct Options {
     /// `N lines yanked`. `0` reports every change. See
     /// [`crate::Editor::report_line_delta`].
     pub report: usize,
+    /// Whether the partly-typed command shows in the last line's right corner
+    /// (`'showcmd'`; default `true`, as in vim) — the `2`, the `d`, the `"a3d` you
+    /// have typed but not completed, and, while a selection is up, its size. Read
+    /// by [`crate::Editor::showcmd`], which the [`crate::View`] carries to the
+    /// client.
+    pub showcmd: bool,
     /// The `'statusline'` format string (neovim's `%`-format mini-language).
     /// Empty means the built-in default look; a non-empty value is parsed and
     /// rendered by the statusline engine. Global-only for now (no per-window
@@ -313,6 +319,7 @@ impl Options {
             ("relativesplits", Bool(b)) => self.relative_splits = *b,
             ("relativedocks", Bool(b)) => self.relative_docks = *b,
             ("equalalways", Bool(b)) => self.equalalways = *b,
+            ("showcmd", Bool(b)) => self.showcmd = *b,
             ("workspacepersistunnamed", Bool(b)) => self.workspace_persist_unnamed = *b,
             // Clamped rather than wrapped as a last line of defense — an out-of-range
             // value is rejected loud (E487/E474) by `Editor::set_global_option_num`
@@ -374,6 +381,7 @@ impl Options {
             "relativesplits" => Bool(self.relative_splits),
             "relativedocks" => Bool(self.relative_docks),
             "equalalways" => Bool(self.equalalways),
+            "showcmd" => Bool(self.showcmd),
             "workspacepersistunnamed" => Bool(self.workspace_persist_unnamed),
             "showtabline" => Num(self.showtabline as i64),
             "laststatus" => Num(self.laststatus as i64),
@@ -525,6 +533,8 @@ impl Default for Options {
             // Report a command's line-count change only past two lines, so the
             // everyday `dd` / `p` stay quiet (vim's default).
             report: 2,
+            // Show the partly-typed command in the corner (vim's default).
+            showcmd: true,
             // No custom statusline by default — the built-in look is used.
             statusline: String::new(),
             // No custom tabline by default — the built-in tab cells are used.
@@ -2039,6 +2049,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Global,
             doc: "Report a message when a command changes more than this many lines.",
+        },
+        OptionInfo {
+            name: "showcmd",
+            abbrev: Some("sc"),
+            kind: Bool,
+            scope: Global,
+            doc: "Show the partly-typed command (or the selection size) in the last line.",
         },
         OptionInfo {
             name: "statusline",

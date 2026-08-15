@@ -727,6 +727,11 @@ pub struct View {
     /// the client can place the command cursor mid-line after `<Left>`/`<Right>`
     /// edits. Only meaningful while `command_mode`.
     pub cmdline_cursor: usize,
+    /// The `'showcmd'` display — the partly-typed command (`2`, `d`, `"a3d`), or
+    /// the size of the live selection — which the client paints right-aligned on
+    /// the command-line row. Empty when there is nothing pending, or when
+    /// `'showcmd'` is off. See [`Editor::showcmd`].
+    pub showcmd: String,
     /// Transient status message (shown on the command line when not typing one).
     pub message: String,
     /// Whether [`message`](View::message) is an error — the client paints it with
@@ -788,6 +793,7 @@ impl View {
             cmdline_prefix: ed.cmdline_prefix(),
             cmdline_prompt: ed.cmdline_prompt().to_string(),
             cmdline_cursor: ed.cmdline_cursor(),
+            showcmd: ed.showcmd(),
             // Two placeholders ride the idle message line where vim shows
             // `-- INSERT --`, each only while no real message is up. In terminal-job
             // mode every key goes to the child, so surface the way out; and a macro

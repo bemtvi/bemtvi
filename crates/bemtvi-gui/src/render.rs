@@ -2156,6 +2156,22 @@ impl Renderer {
         let full = self.full_bounds();
         self.push_plain(items, &text, pos, fg, full);
 
+        // The `'showcmd'` corner — the partly-typed command, or the size of the live
+        // selection — right-aligned on this same row, as vim does. It owns its own
+        // column band at the right edge, so a message and a pending command can both
+        // be up at once.
+        if !view.showcmd.is_empty() {
+            let (cols, _) = self.grid_size();
+            let width = view.showcmd.width() as u16;
+            if width < cols {
+                let sc_pos = self.cell_px(cols - width, cmd_row);
+                let sc_fg = style_fg(&view.msg_area)
+                    .or_else(|| style_fg(&view.normal))
+                    .unwrap_or(DEFAULT_FG);
+                self.push_plain(items, &view.showcmd, sc_pos, sc_fg, full);
+            }
+        }
+
         // The command-line cursor: a semi-transparent block past the leading prompt
         // (a single prefix char, or the multi-char `vim.ui.input` label). The caret
         // cell is display-width based — `cmdline_cursor` is a char offset, and a

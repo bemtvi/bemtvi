@@ -93,6 +93,8 @@ mod scrolloff;
 mod search;
 #[path = "editing/shift.rs"]
 mod shift;
+#[path = "editing/showcmd.rs"]
+mod showcmd;
 #[path = "editing/statusline.rs"]
 mod statusline;
 #[path = "editing/text_objects.rs"]

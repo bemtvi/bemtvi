@@ -1705,27 +1705,17 @@ fn pending_hint(p: &PendingCommand) -> Option<CommandPending> {
     // list here and are enriched from live editor state in `Editor::command_pending`
     // (this pure projection has no editor to read them from). Find-char / replace
     // take *any* character, so they stay label-only.
-    let (trigger, label, continuations): (String, &'static str, Vec<CommandContinuation>) = match p
-        .stage
-    {
+    let (label, continuations): (&'static str, Vec<CommandContinuation>) = match p.stage {
         // `Stage::Start` carries one of two armed states (the clean case returned
         // above): an operator (`d`/`c`/`y`/`=`) awaiting its motion, or a selected
         // register (`"a`) awaiting the yank / delete / paste that will use it. The
         // armed key (operator / register) is emitted by the keys builder, so the
         // trigger is empty.
         Stage::Start => match p.operator {
-            Some(op) => (
-                String::new(),
-                operator_name(op),
-                operator_motion_continuations(op),
-            ),
+            Some(op) => (operator_name(op), operator_motion_continuations(op)),
             // A register is selected (operator None, else the arm above): show the
             // register-consuming actions. The `"a` in `keys` says *which* register.
-            None => (
-                String::new(),
-                "Use register",
-                register_action_continuations(),
-            ),
+            None => ("Use register", register_action_continuations()),
         },
         Stage::FindPending(k) => {
             let label = match k {
@@ -1734,36 +1724,37 @@ fn pending_hint(p: &PendingCommand) -> Option<CommandPending> {
                 FindKind::FindBack => "Find character backward",
                 FindKind::TillBack => "Till character backward",
             };
-            (k.as_char().to_string(), label, Vec::new())
+            (label, Vec::new())
         }
-        Stage::ReplacePending => ("r".to_string(), "Replace character", Vec::new()),
-        Stage::TextObjectPending(c) => (c.to_string(), "Text object", text_object_continuations()),
-        Stage::GPending => ("g".to_string(), "Go", g_continuations()),
-        Stage::ZPending => ("z".to_string(), "Scroll / fold", z_continuations()),
-        Stage::RegisterPending => ("\"".to_string(), "Register", Vec::new()),
-        Stage::MarkSetPending => ("m".to_string(), "Set mark", Vec::new()),
-        Stage::RecordPending => ("<F2>".to_string(), "Record macro", Vec::new()),
-        Stage::PlayPending => ("<F3>".to_string(), "Play macro", Vec::new()),
-        Stage::MarkJumpPending(kind, set_jump) => {
-            let base = match kind {
-                MarkJumpKind::Exact => "`",
-                MarkJumpKind::Line => "'",
-            };
-            // The jumplist-skipping spellings are `g`/`g'`; plain `` ` ``/`'` set it.
-            let keys = if set_jump {
-                base.to_string()
-            } else {
-                format!("g{base}")
-            };
-            (keys, "Jump to mark", Vec::new())
-        }
-        Stage::WindowPending => ("<C-w>".to_string(), "Window", window_continuations()),
-        Stage::WindowLayerPending => (
-            "<C-w><C-w>".to_string(),
-            "Dock layer",
-            window_layer_continuations(),
-        ),
+        Stage::ReplacePending => ("Replace character", Vec::new()),
+        Stage::TextObjectPending(_) => ("Text object", text_object_continuations()),
+        Stage::GPending => ("Go", g_continuations()),
+        Stage::ZPending => ("Scroll / fold", z_continuations()),
+        Stage::RegisterPending => ("Register", Vec::new()),
+        Stage::MarkSetPending => ("Set mark", Vec::new()),
+        Stage::RecordPending => ("Record macro", Vec::new()),
+        Stage::PlayPending => ("Play macro", Vec::new()),
+        Stage::MarkJumpPending(..) => ("Jump to mark", Vec::new()),
+        Stage::WindowPending => ("Window", window_continuations()),
+        Stage::WindowLayerPending => ("Dock layer", window_layer_continuations()),
     };
+    Some(CommandPending {
+        label,
+        keys: pending_keys(p),
+        continuations,
+    })
+}
+
+/// The key run the user has typed for the pending command, in vim's showcmd
+/// order: the register (`"a`), the pre-operator count, the operator, the
+/// post-operator count, then the key that armed the current argument stage
+/// (`f`, `z`, `<C-w>`, …). Empty at a clean boundary — nothing typed, nothing
+/// armed.
+///
+/// One spelling shared by the which-key hint's `keys` ([`pending_hint`]) and the
+/// `'showcmd'` display ([`Editor::showcmd`]), so the corner and the popup can
+/// never disagree about what has been typed.
+pub(crate) fn pending_keys(p: &PendingCommand) -> String {
     let mut keys = String::new();
     if let Some(r) = p.register {
         keys.push('"');
@@ -1778,15 +1769,106 @@ fn pending_hint(p: &PendingCommand) -> Option<CommandPending> {
     if let Some(n) = p.count {
         keys.push_str(&n.to_string());
     }
-    keys.push_str(&trigger);
-    Some(CommandPending {
-        label,
-        keys,
-        continuations,
-    })
+    keys.push_str(&stage_trigger(p.stage));
+    keys
+}
+
+/// The key that armed `stage` — what the user typed to reach this argument
+/// stage, as it should read back to them. Empty for [`Stage::Start`], whose
+/// armed state (an operator, a register) is already in the run ahead of it.
+fn stage_trigger(stage: Stage) -> String {
+    match stage {
+        Stage::Start => String::new(),
+        Stage::FindPending(k) => k.as_char().to_string(),
+        Stage::ReplacePending => "r".to_string(),
+        Stage::TextObjectPending(c) => c.to_string(),
+        Stage::GPending => "g".to_string(),
+        Stage::ZPending => "z".to_string(),
+        Stage::RegisterPending => "\"".to_string(),
+        Stage::MarkSetPending => "m".to_string(),
+        Stage::RecordPending => "<F2>".to_string(),
+        Stage::PlayPending => "<F3>".to_string(),
+        // The jumplist-skipping spellings are `g\``/`g'`; plain `` ` ``/`'` set it.
+        Stage::MarkJumpPending(kind, set_jump) => {
+            let base = match kind {
+                MarkJumpKind::Exact => "`",
+                MarkJumpKind::Line => "'",
+            };
+            if set_jump {
+                base.to_string()
+            } else {
+                format!("g{base}")
+            }
+        }
+        Stage::WindowPending => "<C-w>".to_string(),
+        Stage::WindowLayerPending => "<C-w><C-w>".to_string(),
+    }
 }
 
 impl Editor {
+    /// The `'showcmd'` display: what the last screen line shows in its right
+    /// corner, or empty when there is nothing to show (or the option is off).
+    ///
+    /// Two things share that corner, exactly as in vim:
+    ///
+    /// - While a selection is up, its **size** — the number of selected lines, or
+    ///   the number of characters when a charwise selection stays inside one line
+    ///   (as `chars-bytes` when those differ, vim's spelling for multi-byte text).
+    /// - Otherwise, the **partly-typed command** ([`pending_keys`]): the count you
+    ///   typed, the operator waiting for its motion, the register you armed, the
+    ///   `f`/`z`/`<C-w>` that is waiting for its argument.
+    ///
+    /// This covers only what the *editor* holds. A half-typed **mapped** prefix
+    /// (`<Space>f` under a `<Space>fs` map) is withheld by the server's keymap
+    /// matcher and never reaches the editor, so the server appends that to this
+    /// string when it projects the view.
+    pub fn showcmd(&self) -> String {
+        if !self.options.showcmd {
+            return String::new();
+        }
+        match self.visual_showcmd_size() {
+            Some(size) => size,
+            None => pending_keys(&self.pending),
+        }
+    }
+
+    /// The selection-size half of [`showcmd`](Self::showcmd), or `None` when no
+    /// selection is up. Vim's `clear_showcmd`: lines for a linewise or multi-line
+    /// selection, characters for a charwise one inside a single line. (bemtvi has no
+    /// blockwise Visual, so vim's `{lines}x{cols}` form has nothing to describe.)
+    fn visual_showcmd_size(&self) -> Option<String> {
+        let linewise = match self.mode {
+            Mode::VisualLine => true,
+            Mode::Visual => false,
+            // Select mode highlights its range like a Visual selection, so it reads
+            // its size the same way.
+            Mode::Select => self.select_linewise,
+            _ => return None,
+        };
+        let (lo, hi, _) = self.visual_range_lw(linewise);
+        // The charwise end is the cursor byte + 1, which can land mid-cluster; snap
+        // it out to the cluster boundary the way the operators do before slicing.
+        let hi = self.grapheme_ceil_abs(hi);
+        let first = self.buffer().byte_to_line(lo);
+        let last = self.buffer().byte_to_line(hi.saturating_sub(1).max(lo));
+        if linewise || last > first {
+            return Some((last - first + 1).to_string());
+        }
+        let text = self.buffer().text.slice(lo..hi).to_string();
+        let mut chars = 0;
+        let mut at = 0;
+        while at < text.len() {
+            at = crate::unicode::next_grapheme(&text, at);
+            chars += 1;
+        }
+        Some(if chars == text.len() {
+            chars.to_string()
+        } else {
+            // vim shows both counts when a character is more than one byte.
+            format!("{chars}-{}", text.len())
+        })
+    }
+
     /// The built-in command grammar's current pending state for the
     /// `btv.on_key_pending` (which-key / showcmd) signal — **source B** of the
     /// oracle. `Some` whenever a key has armed an argument stage (`f`/`t`/`F`/`T`,

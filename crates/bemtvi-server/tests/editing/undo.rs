@@ -794,3 +794,131 @@ async fn undotree_save_cur_is_the_write_the_state_descends_from() {
         "the original text is before write 1"
     );
 }
+
+// ----- `g-` / `g+` are Normal-mode only -------------------------------------
+//
+// vim guards the pair with `checkclearopq`: with an operator armed or a selection up
+// it clears the pending command and beeps rather than travelling. Rewinding there
+// would move the text out from under the very thing the next key operates on.
+
+#[tokio::test]
+async fn time_travel_is_refused_under_a_selection() {
+    let (rpc, _incoming) = start_with_file("alpha\nbravo\n").await;
+    feed_sync(&rpc, "ix<Esc>").await;
+    feed_sync(&rpc, "iy<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["yxalpha", "bravo"]));
+
+    feed_sync(&rpc, "vl").await;
+    feed_sync(&rpc, "g-").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["yxalpha", "bravo"]),
+        "`g-` under a selection is a dead-end key, not a rewind of the selected text"
+    );
+    feed_sync(&rpc, "g+").await;
+    assert_eq!(lines(&rpc).await, v(&["yxalpha", "bravo"]), "`g+` likewise");
+
+    // The selection itself survives — vim clears the pending *command*, not Visual —
+    // so the operator that follows still applies to what was selected.
+    assert_eq!(mode(&rpc).await, "v", "still in Visual mode");
+    feed_sync(&rpc, "d").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["alpha", "bravo"]),
+        "the two selected characters go: the selection was never dropped"
+    );
+}
+
+#[tokio::test]
+async fn time_travel_is_refused_with_an_operator_pending() {
+    let (rpc, _incoming) = start_with_file("alpha bravo\n").await;
+    feed_sync(&rpc, "ix<Esc>").await;
+    feed_sync(&rpc, "iy<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["yxalpha bravo"]));
+
+    feed_sync(&rpc, "dg-").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["yxalpha bravo"]),
+        "`g-` under a pending operator neither travels nor deletes"
+    );
+
+    // …and the operator went with it, so the next motion only moves the cursor.
+    feed_sync(&rpc, "w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["yxalpha bravo"]),
+        "the pending `d` was cleared, so `w` is a plain motion"
+    );
+    assert_eq!(cursor(&rpc).await, (1, 8), "`w` moved to the next word");
+}
+
+#[tokio::test]
+async fn a_refused_time_travel_stops_a_macro() {
+    // The refusal is vim's `clearopbeep`, and bemtvi's beep is what ends a macro
+    // playback — so a recorded `g-`-under-a-selection stops the run rather than
+    // silently falling through to the rest of the register.
+    let (rpc, _incoming) = start_with_file("alpha\n").await;
+    feed_sync(&rpc, "ix<Esc>").await;
+
+    // Recording executes live: the `g-` is refused, then `<Esc>` and `x` still run,
+    // so one character goes here.
+    feed_sync(&rpc, "<F2>avg-<Esc>x<F2>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["alpha"]),
+        "the recording pass deleted the `x`"
+    );
+
+    feed_sync(&rpc, "<F3>a").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["alpha"]),
+        "replaying stops at the refused `g-`, so its trailing `x` never runs"
+    );
+    assert_eq!(
+        mode(&rpc).await,
+        "v",
+        "the playback died inside the selection the macro had just made"
+    );
+}
+
+#[tokio::test]
+async fn undo_and_redo_are_refused_under_a_selection() {
+    // The same guard, for the rest of the family. vim reaches it two ways: `<C-r>` is
+    // `checkclearopq`-guarded outright (`nv_redo_or_register`), and `u` is redirected
+    // to the `gu` lowercase *operator* (`nv_undo`), so neither ever rewinds from a
+    // selection. bemtvi has no case operator to redirect to, so `u` is a loud dead end
+    // — which is the half that matters: a silent rewind leaves the selection anchored
+    // at offsets belonging to a state that no longer exists.
+    let (rpc, _incoming) = start_with_file("alpha\nbravo\n").await;
+    feed_sync(&rpc, "ix<Esc>").await;
+    feed_sync(&rpc, "iy<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["yxalpha", "bravo"]));
+
+    feed_sync(&rpc, "vl").await;
+    feed_sync(&rpc, "u").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["yxalpha", "bravo"]),
+        "`u` under a selection does not rewind"
+    );
+    feed_sync(&rpc, "<C-r>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["yxalpha", "bravo"]),
+        "`<C-r>` under a selection does not redo"
+    );
+
+    assert_eq!(mode(&rpc).await, "v", "still in Visual mode");
+    feed_sync(&rpc, "d").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["alpha", "bravo"]),
+        "the selection survived both refusals"
+    );
+
+    // And Normal mode is untouched: `u` still walks the tree.
+    feed_sync(&rpc, "u").await;
+    assert_eq!(lines(&rpc).await, v(&["yxalpha", "bravo"]));
+}

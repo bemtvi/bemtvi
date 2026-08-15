@@ -702,6 +702,11 @@ enum ParseStep {
     /// An object/find key with no match: in visual keep the selection (and any
     /// count), else reset — mirroring the old find / text-object abort paths.
     AbortObject,
+    /// The key is a real command, but not from *this* state: vim's `clearopbeep`.
+    /// Drops the whole pending command (operator included) and beeps, leaving the
+    /// mode alone — a refusal under a selection keeps the selection up, as vim's
+    /// `clearop` does.
+    Refuse,
 }
 
 /// Valid `"x` register names so far: the named `a`–`z`/`A`–`Z`, the numbered
@@ -1334,9 +1339,17 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             Some(';') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeOlder)),
             Some(',') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeNewer)),
             // `g-` / `g+` walk the undo *states* in the order they were made — the
-            // keyboard form of `:earlier` / `:later`.
-            Some('-') => return Complete(ResolvedCommand::Normal(NormalCmd::TimeTravel(true))),
-            Some('+') => return Complete(ResolvedCommand::Normal(NormalCmd::TimeTravel(false))),
+            // keyboard form of `:earlier` / `:later`. Normal mode only: vim guards the
+            // pair with `checkclearopq`, so an armed operator or a live selection makes
+            // them a dead-end key. Travelling from there would rewind the text out from
+            // under the very thing the next key is about to operate on — the selection
+            // would still be anchored at offsets belonging to a state that is gone.
+            Some(c @ ('-' | '+')) => {
+                if pending.operator.is_some() || mode.is_visual() {
+                    return Refuse;
+                }
+                return Complete(ResolvedCommand::Normal(NormalCmd::TimeTravel(c == '-')));
+            }
             // `` g` `` / `g'` — like `` ` ``/`'` but they do not record the
             // previous-context mark / jumplist (vim's quiet jump). The name follows;
             // arm the same jump stage with `set_jump = false`.
@@ -1458,6 +1471,12 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             KeyCode::Char('b') => Complete(RC::Normal(N::ScrollPage(false))),
             KeyCode::Char('e') => Complete(RC::Normal(N::ScrollLine(true))),
             KeyCode::Char('y') => Complete(RC::Normal(N::ScrollLine(false))),
+            // `<C-r>` redoes — Normal mode only. vim guards it with `checkclearopq`
+            // (`nv_redo_or_register`), so a live selection makes it a dead-end key
+            // rather than a redo that moves the text out from under the selection.
+            // (An armed operator never reaches here: the operator block above already
+            // resets on anything that is not a doubling or a search hand-off.)
+            KeyCode::Char('r') if mode.is_visual() => Refuse,
             KeyCode::Char('r') => Complete(RC::Normal(N::Redo)),
             // `<C-o>`/`<C-i>` walk the jump list (normal mode only — in visual,
             // vim leaves them unbound). `<C-i>` and `<Tab>` are the same key in a
@@ -1512,6 +1531,12 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             // extend the side you started from.
             'o' | 'O' => return Complete(RC::Normal(N::VisualSwapEnds)),
             ':' => return Complete(RC::Normal(N::EnterCommand)),
+            // `u` never rewinds from a selection. vim redirects it to the `gu`
+            // lowercase *operator* (`nv_undo`), which bemtvi does not have yet — so
+            // until it does, this is a loud dead end rather than a silent undo that
+            // would leave the selection anchored into a state that no longer exists.
+            // Point it at the operator, not at `N::Undo`, when `gu`/`gU` land.
+            'u' => return Refuse,
             _ => {}
         }
     }
@@ -1613,7 +1638,7 @@ pub fn command_status(mode: Mode, keys: &[Key]) -> CommandStatus {
                 pending = PendingCommand::default();
                 at_boundary = true;
             }
-            ParseStep::Cancel | ParseStep::Reset | ParseStep::AbortObject => {
+            ParseStep::Cancel | ParseStep::Reset | ParseStep::AbortObject | ParseStep::Refuse => {
                 return CommandStatus::Invalid;
             }
         }
@@ -1651,7 +1676,8 @@ pub fn command_pending_after(mode: Mode, keys: &[Key]) -> Option<CommandPending>
             ParseStep::Complete(_)
             | ParseStep::Cancel
             | ParseStep::Reset
-            | ParseStep::AbortObject => return None,
+            | ParseStep::AbortObject
+            | ParseStep::Refuse => return None,
         }
     }
     pending_hint(&pending)
@@ -1939,6 +1965,14 @@ impl Editor {
                 }
             }
             ParseStep::Reset => self.reset_pending(),
+            // vim's `clearopbeep`: the whole pending command goes (operator included)
+            // and the keystroke fails. `beep` is what ends a macro playback, so a
+            // register that hits a refusal stops there instead of running on. The mode
+            // is deliberately untouched — a refusal under a selection leaves it up.
+            ParseStep::Refuse => {
+                self.reset_pending();
+                self.beep();
+            }
             ParseStep::AbortObject => {
                 // A find/text-object miss: in visual the selection (and count)
                 // survive — only the half-typed object is dropped; otherwise the

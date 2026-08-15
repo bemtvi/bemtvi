@@ -220,3 +220,32 @@ fn splice_preserves_the_weight_and_slant_of_the_run_it_splits() {
         }
     }
 }
+
+// --- wide glyphs: the splice walks SCREEN COLUMNS, not chars -----------------
+
+#[test]
+fn shift_counts_a_wide_hint_by_its_cells_not_its_chars() {
+    // A hint whose text holds CJK is wider than its char count: "型日本" is 3 chars
+    // but 6 cells, and the glyphs it pushes right move by cells.
+    assert_eq!(inlay_shift(&[hint(0, "型日本")], 0, 9, true), 6);
+    // And an emoji cluster counts once: `🤴🏼` is 2 chars of per-char width 2, 2 cells.
+    assert_eq!(inlay_shift(&[hint(0, "\u{1f934}\u{1f3fc}")], 0, 9, true), 2);
+}
+
+#[test]
+fn splice_anchors_a_hint_at_its_column_past_wide_glyphs() {
+    // "日本ab": 日 owns cols 0–1, 本 cols 2–3, a=4, b=5. A hint at column 4 belongs
+    // right before the `a` — anchored by char index it would land before the `本`.
+    let base = vec![Seg::plain("日本ab".to_string(), 0xff_ff_ff)];
+    let out = splice_inlay(base, &[hint(4, "«h»")], 0, &[]);
+    assert_eq!(text(&out), "日本«h»ab");
+}
+
+#[test]
+fn splice_keeps_a_cluster_whole_when_a_hint_lands_mid_glyph() {
+    // A hint anchored on the *second* cell of a wide glyph still cannot cut the
+    // glyph: the splice only breaks on cluster boundaries, so the hint lands after it.
+    let base = vec![Seg::plain("日ab".to_string(), 0xff_ff_ff)];
+    let out = splice_inlay(base, &[hint(1, "«h»")], 0, &[]);
+    assert_eq!(text(&out), "日«h»ab");
+}

@@ -40,7 +40,8 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use unicode_script::Script;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use winit::window::Window;
 
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
@@ -1418,13 +1419,12 @@ impl Renderer {
                     if !matches!(s.numbers.get(k), Some(None)) {
                         if let Some(Some((text, severity, id))) = s.diagnostics_virt.get(k) {
                             let inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
-                            let painted =
-                                display.chars().count().saturating_sub(win.leftcol as usize)
-                                    + inserted as usize;
+                            let painted = cells(&display).saturating_sub(win.leftcol as usize)
+                                + inserted as usize;
                             let start = text_x0 + painted as u16 + 1;
                             let limit = (ox + wcols).saturating_sub(start);
                             if limit > 0 {
-                                let shown: String = text.chars().take(limit as usize).collect();
+                                let shown = take_cells(text, limit as usize);
                                 let color = diag_color(s.styles, *id, *severity, false);
                                 self.push_plain(
                                     items,
@@ -1522,8 +1522,8 @@ impl Renderer {
                         continue;
                     }
 
-                    // Tab-expand so a char index equals a screen column (ASCII
-                    // path); the highlight spans on the wire are screen-column based.
+                    // Tab-expand onto the display-column grid the wire's highlight /
+                    // selection / search spans are all measured in (see `cells`).
                     let display = expand_tabs(raw, win.tabstop.max(1) as usize);
 
                     // Inline LSP inlay hints on this row, spliced into the text below
@@ -1735,13 +1735,12 @@ impl Renderer {
                             // The line's painted width includes the spliced inlay
                             // cells, so the virtual text sits past them too.
                             let inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
-                            let painted =
-                                display.chars().count().saturating_sub(win.leftcol as usize)
-                                    + inserted as usize;
+                            let painted = cells(&display).saturating_sub(win.leftcol as usize)
+                                + inserted as usize;
                             let start = text_x0 + painted as u16 + 1;
                             let limit = (ox + wcols).saturating_sub(start);
                             if limit > 0 {
-                                let shown: String = text.chars().take(limit as usize).collect();
+                                let shown = take_cells(text, limit as usize);
                                 let color = diag_color(&view.styles, *id, *severity, false);
                                 self.push_plain(
                                     items,
@@ -1764,11 +1763,10 @@ impl Renderer {
                             let inlay_inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
                             let virt_inserted =
                                 virt_inline_shift(vtext, win.leftcol, u16::MAX, true);
-                            let painted =
-                                (display.chars().count().saturating_sub(win.leftcol as usize)
-                                    + inlay_inserted as usize
-                                    + virt_inserted as usize)
-                                    as u16;
+                            let painted = (cells(&display).saturating_sub(win.leftcol as usize)
+                                + inlay_inserted as usize
+                                + virt_inserted as usize)
+                                as u16;
                             // eol: one gap, then each placement's chunks in order.
                             let mut x = text_x0 + painted + 1;
                             for p in vtext.iter().filter(|p| p.pos == VIRT_POS_EOL) {
@@ -1777,7 +1775,7 @@ impl Renderer {
                                     if limit == 0 {
                                         break;
                                     }
-                                    let shown: String = t.chars().take(limit as usize).collect();
+                                    let shown = take_cells(t, limit as usize);
                                     if shown.is_empty() {
                                         break;
                                     }
@@ -1796,7 +1794,7 @@ impl Renderer {
                                         fg,
                                         full,
                                     );
-                                    x += shown.chars().count() as u16;
+                                    x += cells(&shown) as u16;
                                 }
                             }
                             // right_align: stacked chunks flushed to the right edge.
@@ -1806,8 +1804,7 @@ impl Renderer {
                                 .flat_map(|p| p.chunks.iter())
                                 .collect();
                             if !ra.is_empty() {
-                                let total: u16 =
-                                    ra.iter().map(|(t, _)| t.chars().count() as u16).sum();
+                                let total: u16 = ra.iter().map(|(t, _)| cells(t) as u16).sum();
                                 // Start no earlier than the painted text (left-justify +
                                 // truncate if the row is already full), no later than the
                                 // right edge.
@@ -1819,7 +1816,7 @@ impl Renderer {
                                     if limit == 0 {
                                         break;
                                     }
-                                    let shown: String = t.chars().take(limit as usize).collect();
+                                    let shown = take_cells(t, limit as usize);
                                     if shown.is_empty() {
                                         break;
                                     }
@@ -1838,7 +1835,7 @@ impl Renderer {
                                         fg,
                                         full,
                                     );
-                                    rx += shown.chars().count() as u16;
+                                    rx += cells(&shown) as u16;
                                 }
                             }
                         }
@@ -3026,7 +3023,7 @@ impl Renderer {
                 if pv.loc.is_some_and(|(r, _)| r as usize == i) {
                     self.fill_cells(quads, px0, row, preview_w, sel_bg);
                 }
-                // Colour each run by its tree-sitter span (char columns, no leftcol),
+                // Colour each run by its tree-sitter span (screen columns, no leftcol),
                 // clamped to the pane width; a span with no theme id falls back to its
                 // capture group's built-in colour (`row_segments`).
                 let hl = pv.highlights.get(i).map(Vec::as_slice).unwrap_or(&empty);
@@ -3036,11 +3033,11 @@ impl Renderer {
                         break;
                     }
                     let room = (preview_w - col) as usize;
-                    let shown: String = seg.text.chars().take(room).collect();
+                    let shown = take_cells(&seg.text, room);
                     if shown.is_empty() {
                         continue;
                     }
-                    let n = shown.chars().count() as u16;
+                    let n = cells(&shown) as u16;
                     self.push_plain(items, &shown, self.cell_px(px0 + col, row), seg.fg, full);
                     col += n;
                 }
@@ -3150,11 +3147,11 @@ impl Renderer {
                 if chars >= w {
                     break;
                 }
-                let shown: String = text.chars().take(w - chars).collect();
+                let shown = take_cells(text, w - chars);
                 if shown.is_empty() {
                     continue;
                 }
-                chars += shown.chars().count();
+                chars += cells(&shown);
                 let st = id.and_then(|id| view.styles.get(id));
                 segs.push(Seg {
                     fg: st.and_then(|s| s.fg).unwrap_or(fg),
@@ -3582,7 +3579,6 @@ impl Renderer {
         default_fg: u32,
         bounds: TextBounds,
     ) {
-        use unicode_segmentation::UnicodeSegmentation;
         if segments.iter().all(|s| s.text.is_empty()) {
             return;
         }
@@ -3962,15 +3958,45 @@ pub fn query_caret_col(query: &str, cursor_chars: usize) -> u16 {
     2 + cells_before(query, cursor_chars)
 }
 
+/// Display width of `s` in screen cells — the ONE column metric the row pipeline
+/// walks, and the one the server measures every wire column in.
+///
+/// It is per grapheme *cluster*, not per char, because a cluster's width is not the
+/// sum of its chars': `\u{1f934}\u{1f3fc}` (an emoji plus its skin-tone modifier) is 2
+/// cells though each char alone reports 2, `\u{2764}\u{fe0f}` (a heart plus VS16) is 2
+/// though its chars report 1 and 0, and a ZWJ family emoji is 2 across five chars.
+/// `UnicodeWidthStr` applies those emoji rules over the whole string, which is
+/// exactly what the server's `unicode::virtcol` does — and what [`push_text`] already
+/// used to place glyphs, while the segment layer counted chars. Walking chars put the
+/// colours out of step with the glyphs they were meant to paint.
+pub fn cells(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// `s` truncated to at most `max` screen cells, cut on a grapheme-cluster boundary
+/// (never between a base char and its combining marks / VS16). Used wherever the
+/// row pipeline fits text into a remaining cell budget — end-of-line diagnostics,
+/// `virt_text` chunks — so `cells(&out) <= max` really holds.
+fn take_cells(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for g in s.graphemes(true) {
+        let gw = cells(g);
+        if w + gw > max {
+            break;
+        }
+        out.push_str(g);
+        w += gw;
+    }
+    out
+}
+
 /// The display-width cells of the first `chars` chars of `s` — how a char-offset
-/// wire field maps onto the shaped run's cell grid, where a wide CJK/emoji char
-/// takes two cells and a zero-width combining mark takes none. An offset past the
-/// end clamps to the string's full width (`take` saturates).
+/// wire field maps onto the shaped run's cell grid. Measured through [`cells`], so a
+/// cluster counts once; an offset past the end clamps to the string's full width
+/// (`take` saturates), and one landing inside a cluster measures its leading part.
 fn cells_before(s: &str, chars: usize) -> u16 {
-    s.chars()
-        .take(chars)
-        .map(|c| c.width().unwrap_or(0))
-        .sum::<usize>() as u16
+    cells(&s.chars().take(chars).collect::<String>()) as u16
 }
 
 /// Map a buffer screen-column to its absolute screen cell in a window whose text
@@ -3995,9 +4021,13 @@ pub fn text_run_origin(text_x0: u16, leftcol: u16) -> u16 {
 }
 
 /// Split a tab-expanded row into `(text, color)` segments from its highlight
-/// spans; uncovered runs take the default `fg`. Columns are screen columns, so we
-/// slice by char index (== screen column for ASCII/tab text; wide-char fidelity
-/// is deferred). Pure, so it can run before the cache lookup keys off the result.
+/// spans; uncovered runs take the default `fg`.
+///
+/// The walk steps by grapheme cluster and keys each one on the **screen column its
+/// first cell sits in** — the same grid the server measured the spans in ([`cells`])
+/// and the same rule the TUI uses, so a cluster is always styled as one unit and the
+/// two clients agree glyph for glyph. Clusters wholly left of `leftcol` are dropped
+/// (scrolled off). Pure, so it can run before the cache lookup keys off the result.
 pub fn row_segments(
     display: &str,
     hl: &[bemtvi_view::HlSpan],
@@ -4006,32 +4036,35 @@ pub fn row_segments(
     normal_bg: u32,
     leftcol: u16,
 ) -> Vec<Seg> {
-    let chars: Vec<char> = display.chars().collect();
-    let mut segments: Vec<Seg> = Vec::new();
-    let mut col = leftcol as usize;
-    let n = chars.len();
     // Sort spans by start so the walk is monotonic. `HlSpan` is the tuple
-    // `(start, end, group, style_id)`.
+    // `(start, end, group, style_id)`; the server emits them non-overlapping.
     let mut spans: Vec<&bemtvi_view::HlSpan> = hl.iter().collect();
     spans.sort_by_key(|s| s.0);
-    for s in spans {
-        let start = (s.0 as usize).max(col);
-        let end = (s.1 as usize).min(n);
-        if end <= start {
-            continue;
+    let mut segments: Vec<Seg> = Vec::new();
+    let mut col = 0usize;
+    let mut si = 0usize; // first span that may still cover `col`
+    for g in display.graphemes(true) {
+        let w = cells(g);
+        if col < leftcol as usize {
+            col += w;
+            continue; // scrolled off the left edge
         }
-        if start > col {
-            segments.push(Seg::plain(chars[col..start].iter().collect(), fg));
+        while si < spans.len() && (spans[si].1 as usize) <= col {
+            si += 1;
         }
-        let text: String = chars[start..end].iter().collect();
-        // The span's style: the one the server interned for it, or — when no
-        // colorscheme resolved it — the built-in fallback for its capture group, so
-        // a buffer still highlights with no theme loaded. Both are a `Style`, so the
-        // run is painted by one body either way.
-        let st =
-            s.3.and_then(|id| styles.get(id))
-                .copied()
-                .unwrap_or_else(|| group_fallback(&s.2));
+        // The span covering this cluster's first cell, if any: its style is the one
+        // the server interned, or — when no colorscheme resolved it — the built-in
+        // fallback for its capture group, so a buffer still highlights with no theme
+        // loaded. Both are a `Style`, so the run is painted by one body either way.
+        let st = spans
+            .get(si)
+            .filter(|s| (s.0 as usize) <= col)
+            .map(|s| {
+                s.3.and_then(|id| styles.get(id))
+                    .copied()
+                    .unwrap_or_else(|| group_fallback(&s.2))
+            })
+            .unwrap_or_default();
         // Reverse swaps fg/bg: the glyph takes the style's background (or the
         // editor's `Normal` bg) and a foreground-colored quad behind it is
         // painted by `push_reverse_fills`, so the run reads inverted — its own
@@ -4044,17 +4077,24 @@ pub fn row_segments(
         } else {
             (st.fg.unwrap_or(fg), st.bg)
         };
-        segments.push(Seg {
-            text,
-            fg: color,
-            bg,
-            bold: st.bold,
-            italic: st.italic,
-        });
-        col = end;
-    }
-    if col < n {
-        segments.push(Seg::plain(chars[col..n].iter().collect(), fg));
+        match segments.last_mut() {
+            Some(last)
+                if last.fg == color
+                    && last.bg == bg
+                    && last.bold == st.bold
+                    && last.italic == st.italic =>
+            {
+                last.text.push_str(g);
+            }
+            _ => segments.push(Seg {
+                text: g.to_string(),
+                fg: color,
+                bg,
+                bold: st.bold,
+                italic: st.italic,
+            }),
+        }
+        col += w;
     }
     segments
 }
@@ -4069,8 +4109,8 @@ pub fn row_segments(
 /// match) wins over `hlsearch` on a shared cell. Operates in `base`'s column space —
 /// the pre-inlay/virt-splice space the search spans share — so a later splice shifts
 /// glyph and recolor together. Returns `segments` untouched when there's nothing to
-/// recolor. The renderer's one-column-per-char convention (see [`inlay_shift`]) keys
-/// the walk.
+/// recolor. Steps by grapheme cluster on the [`cells`] column grid, exactly as
+/// [`row_segments`] does, so a match's columns land on the same glyphs it coloured.
 pub fn apply_search_fg(
     segments: Vec<Seg>,
     search: &[(u16, u16)],
@@ -4088,7 +4128,7 @@ pub fn apply_search_fg(
     let mut out: Vec<Seg> = Vec::with_capacity(segments.len());
     let mut col = leftcol;
     for seg in &segments {
-        for ch in seg.text.chars() {
+        for g in seg.text.graphemes(true) {
             let fg = if does_inc && in_span(col, incsearch.unwrap()) {
                 inc_fg.unwrap()
             } else if does_search && search.iter().any(|&sp| in_span(col, sp)) {
@@ -4103,17 +4143,17 @@ pub fn apply_search_fg(
                         && last.bold == seg.bold
                         && last.italic == seg.italic =>
                 {
-                    last.text.push(ch);
+                    last.text.push_str(g);
                 }
                 _ => out.push(Seg {
-                    text: ch.to_string(),
+                    text: g.to_string(),
                     fg,
                     bg: seg.bg,
                     bold: seg.bold,
                     italic: seg.italic,
                 }),
             }
-            col += 1;
+            col += cells(g) as u16;
         }
     }
     out
@@ -4174,8 +4214,8 @@ pub fn group_fallback(group: &str) -> Style {
 /// hints scrolled off the left (`hcol < leftcol`) excluded. This is how far the
 /// inline splice pushes a glyph/overlay at `col` to the right: a left edge / the
 /// cursor uses `inclusive` (a hint *at* the column sits before it); a right edge
-/// uses `!inclusive` (a hint *at* the column is past it). Hint width is char count,
-/// matching the renderer's ASCII-column convention. Mirrors the TUI's
+/// uses `!inclusive` (a hint *at* the column is past it). Hint width is its display
+/// width in [`cells`] — what the shaper actually lays down. Mirrors the TUI's
 /// `inlay_cursor_shift` / the per-glyph shift its inline splice accumulates.
 pub fn inlay_shift(inlay: &[InlayHint], leftcol: u16, col: u16, inclusive: bool) -> u16 {
     inlay
@@ -4183,7 +4223,7 @@ pub fn inlay_shift(inlay: &[InlayHint], leftcol: u16, col: u16, inclusive: bool)
         .filter(|(hcol, _, _)| {
             *hcol >= leftcol && (if inclusive { *hcol <= col } else { *hcol < col })
         })
-        .map(|(_, text, _)| text.chars().count() as u16)
+        .map(|(_, text, _)| cells(text) as u16)
         .sum()
 }
 
@@ -4210,34 +4250,33 @@ pub fn splice_inlay(
     let mut col = leftcol as usize;
     let mut hi = 0usize;
     for seg in base {
-        let seg_chars: Vec<char> = seg.text.chars().collect();
-        let mut start = 0usize; // first char of the current pending run within this seg
-        for k in 0..seg_chars.len() {
-            let c = col + k;
-            if hi < inlay.len() && (inlay[hi].0 as usize) <= c {
+        // Byte offset of the first cluster of the current pending run within this seg.
+        let mut start = 0usize;
+        for (k, g) in seg.text.grapheme_indices(true) {
+            if hi < inlay.len() && (inlay[hi].0 as usize) <= col {
                 if k > start {
                     out.push(Seg {
-                        text: seg_chars[start..k].iter().collect(),
+                        text: seg.text[start..k].to_string(),
                         fg: seg.fg,
                         bg: seg.bg,
                         bold: seg.bold,
                         italic: seg.italic,
                     });
                 }
-                push_hint_segs(&mut out, inlay, &mut hi, c, leftcol, styles);
+                push_hint_segs(&mut out, inlay, &mut hi, col, leftcol, styles);
                 start = k;
             }
+            col += cells(g);
         }
-        if start < seg_chars.len() {
+        if start < seg.text.len() {
             out.push(Seg {
-                text: seg_chars[start..].iter().collect(),
+                text: seg.text[start..].to_string(),
                 fg: seg.fg,
                 bg: seg.bg,
                 bold: seg.bold,
                 italic: seg.italic,
             });
         }
-        col += seg_chars.len();
     }
     // Hints anchored at or past end-of-text (e.g. an end-of-line type annotation).
     push_hint_segs(&mut out, inlay, &mut hi, usize::MAX, leftcol, styles);
@@ -4340,7 +4379,7 @@ pub fn virt_inline_shift(vtext: &[VirtPlacement], leftcol: u16, col: u16, inclus
                 && (if inclusive { p.col <= col } else { p.col < col })
         })
         .flat_map(|p| p.chunks.iter())
-        .map(|(t, _)| t.chars().count() as u16)
+        .map(|(t, _)| cells(t) as u16)
         .sum()
 }
 
@@ -4366,34 +4405,33 @@ fn splice_insertions(base: Vec<Seg>, insertions: &[(u16, Vec<Seg>)], leftcol: u1
         }
     };
     for seg in base {
-        let seg_chars: Vec<char> = seg.text.chars().collect();
+        // Byte offset of the first cluster of the current pending run within this seg.
         let mut start = 0usize;
-        for k in 0..seg_chars.len() {
-            let c = col + k;
-            if ii < insertions.len() && (insertions[ii].0 as usize) <= c {
+        for (k, g) in seg.text.grapheme_indices(true) {
+            if ii < insertions.len() && (insertions[ii].0 as usize) <= col {
                 if k > start {
                     out.push(Seg {
-                        text: seg_chars[start..k].iter().collect(),
+                        text: seg.text[start..k].to_string(),
                         fg: seg.fg,
                         bg: seg.bg,
                         bold: seg.bold,
                         italic: seg.italic,
                     });
                 }
-                emit_at(&mut out, &mut ii, c);
+                emit_at(&mut out, &mut ii, col);
                 start = k;
             }
+            col += cells(g);
         }
-        if start < seg_chars.len() {
+        if start < seg.text.len() {
             out.push(Seg {
-                text: seg_chars[start..].iter().collect(),
+                text: seg.text[start..].to_string(),
                 fg: seg.fg,
                 bg: seg.bg,
                 bold: seg.bold,
                 italic: seg.italic,
             });
         }
-        col += seg_chars.len();
     }
     // Insertions anchored at or past end-of-text.
     while ii < insertions.len() {
@@ -4417,13 +4455,19 @@ fn apply_row_virt(
     styles: &[Style],
     fg: u32,
 ) -> Vec<Seg> {
-    // Expand `base` to a per-cell grid (its first cell is at absolute column
-    // `leftcol`), so overlay/win_col can overwrite individual columns. Each cell
-    // carries `(char, fg, bg, bold, italic)` so an overlay's background rides through.
-    let mut cells: Vec<(char, u32, Option<u32>, bool, bool)> = Vec::new();
+    // Expand `base` to a per-**column** grid (its first entry is at absolute column
+    // `leftcol`), so overlay/win_col can overwrite individual columns. Each entry
+    // carries `(text, fg, bg, bold, italic)` so an overlay's background rides through.
+    // The text is a whole grapheme cluster, and a cluster wider than one cell is
+    // followed by empty *continuation* entries — one per extra column it owns — so an
+    // index into the grid really is a screen column even on a row of CJK or emoji.
+    let mut grid: Vec<(String, u32, Option<u32>, bool, bool)> = Vec::new();
     for seg in &base {
-        for ch in seg.text.chars() {
-            cells.push((ch, seg.fg, seg.bg, seg.bold, seg.italic));
+        for g in seg.text.graphemes(true) {
+            grid.push((g.to_string(), seg.fg, seg.bg, seg.bold, seg.italic));
+            for _ in 1..cells(g) {
+                grid.push((String::new(), seg.fg, seg.bg, seg.bold, seg.italic));
+            }
         }
     }
     for p in vtext
@@ -4433,38 +4477,56 @@ fn apply_row_virt(
         let mut abs = p.col as usize; // absolute screen column the overlay starts on
         for (text, id) in &p.chunks {
             let seg = virt_chunk_seg(text, *id, styles, fg);
-            for ch in text.chars() {
+            for g in text.graphemes(true) {
+                let w = cells(g).max(1);
                 if abs < leftcol as usize {
-                    abs += 1; // scrolled off the left edge
+                    abs += w; // scrolled off the left edge
                     continue;
                 }
                 let k = abs - leftcol as usize;
-                let under_fg = cells.get(k).map(|c| c.1).unwrap_or(fg);
+                let under_fg = grid.get(k).map(|c| c.1).unwrap_or(fg);
                 let ofg = virt_overlay_fg(seg.fg, under_fg, p.hl_mode);
-                let cell = (ch, ofg, seg.bg, seg.bold, seg.italic);
-                if k < cells.len() {
-                    cells[k] = cell;
-                } else {
-                    // Past end-of-text (a fixed-column guide on a short line): pad with
-                    // blanks up to the column, then place the glyph.
-                    while cells.len() < k {
-                        cells.push((' ', fg, None, false, false));
-                    }
-                    cells.push(cell);
+                // Past end-of-text (a fixed-column guide on a short line): pad with
+                // blanks up to the column, then place the glyph.
+                while grid.len() < k + w {
+                    grid.push((" ".to_string(), fg, None, false, false));
                 }
-                abs += 1;
+                grid[k] = (g.to_string(), ofg, seg.bg, seg.bold, seg.italic);
+                for slot in &mut grid[k + 1..k + w] {
+                    *slot = (String::new(), ofg, seg.bg, seg.bold, seg.italic);
+                }
+                abs += w;
             }
         }
     }
-    // Recompress the grid into coalesced runs of identical style.
+    // An overlay can land on top of a wide glyph, leaving a continuation entry whose
+    // head is gone (or a head whose continuation was overwritten). Re-derive the
+    // continuations from the heads actually present: an orphaned continuation becomes
+    // a real blank, so the row keeps exactly one column per grid entry.
+    let mut covered = 0usize;
+    for e in &mut grid {
+        if covered > 0 {
+            covered -= 1;
+            e.0.clear();
+        } else if e.0.is_empty() {
+            e.0.push(' ');
+        } else {
+            covered = cells(&e.0).saturating_sub(1);
+        }
+    }
+    // Recompress the grid into coalesced runs of identical style. Continuation
+    // entries carry no text — the head's own glyph already spans their columns.
     let mut segs: Vec<Seg> = Vec::new();
-    for (ch, f, bg, b, it) in cells {
+    for (text, f, bg, b, it) in grid {
+        if text.is_empty() {
+            continue;
+        }
         match segs.last_mut() {
             Some(last) if last.fg == f && last.bg == bg && last.bold == b && last.italic == it => {
-                last.text.push(ch)
+                last.text.push_str(&text)
             }
             _ => segs.push(Seg {
-                text: ch.to_string(),
+                text,
                 fg: f,
                 bg,
                 bold: b,
@@ -4713,7 +4775,6 @@ pub fn is_letterform(cluster: &str) -> bool {
 /// is one unit — splitting `é` between its `e` and its accent would hand shaping two
 /// runs that can no longer compose. Pure, so it's tested in `tests/wide.rs`.
 pub fn italic_runs<'a>(text: &'a str, slants: &dyn Fn(&str) -> bool) -> Vec<(&'a str, bool)> {
-    use unicode_segmentation::UnicodeSegmentation;
     let mut runs: Vec<(&str, bool)> = Vec::new();
     let mut start = 0;
     let mut current: Option<bool> = None;
@@ -4753,7 +4814,6 @@ const GRID_TOL: f32 = 0.15;
 /// double-wide. Touching off-grid clusters merge. Pure, so it's unit-tested in
 /// `tests/wide.rs`.
 pub fn offgrid_clusters(text: &str, glyphs: &[(usize, f32)]) -> Vec<(usize, usize)> {
-    use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
     let clusters: Vec<(usize, usize, usize)> = text
         .grapheme_indices(true)
@@ -4856,35 +4916,36 @@ pub fn mask_segments(segments: &[Seg], bad: &[(usize, usize)]) -> Vec<Seg> {
 
 /// A sign glyph fitted to exactly `width` cells: truncated if too wide, then
 /// right-padded with spaces (so a 1-cell `E` fills the 2-cell column as `E `).
-/// Char count stands in for display width here, matching the renderer's
-/// ASCII-column simplification elsewhere (wide-char fidelity is deferred) — which
-/// is why this and `expand_tabs` are deliberately NOT shared with the TUI's
-/// display-width-based variants.
+/// Measured in [`cells`] — a sign is very often exactly the kind of glyph whose
+/// cluster width and char count disagree (a wide pictograph, a Nerd-Font icon, an
+/// emoji carrying its VS16), and over-filling the column shoves the text body right.
 fn pad_to_width(s: &str, width: usize) -> String {
-    let mut out: String = s.chars().take(width).collect();
-    let painted = out.chars().count();
+    let mut out = take_cells(s, width);
+    let painted = cells(&out);
     out.push_str(&" ".repeat(width.saturating_sub(painted)));
     out
 }
 
-/// Expand `\t` to spaces up to the next `tabstop` multiple, so a char index in
-/// the result equals a screen column for ASCII/tab text.
+/// Expand `\t` to spaces up to the next `tabstop` multiple, tracking the row's
+/// **display** column ([`cells`]) so a tab after a wide glyph lands on the same stop
+/// the server's `unicode::virtcol` put it on. (A tab never joins a cluster, so it is
+/// always its own one-char grapheme here.)
 fn expand_tabs(line: &str, tabstop: usize) -> String {
     if !line.contains('\t') {
-        return line.to_string(); // hot path: one memcpy, no per-char walk
+        return line.to_string(); // hot path: one memcpy, no per-cluster walk
     }
     let mut out = String::with_capacity(line.len());
     let mut col = 0;
-    for ch in line.chars() {
-        if ch == '\t' {
+    for g in line.graphemes(true) {
+        if g == "\t" {
             let n = tabstop - (col % tabstop);
             for _ in 0..n {
                 out.push(' ');
             }
             col += n;
         } else {
-            out.push(ch);
-            col += 1;
+            out.push_str(g);
+            col += cells(g);
         }
     }
     out

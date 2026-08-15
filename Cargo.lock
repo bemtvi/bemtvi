@@ -665,6 +665,7 @@ dependencies = [
  "ratatui-image",
  "rmpv",
  "tokio",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

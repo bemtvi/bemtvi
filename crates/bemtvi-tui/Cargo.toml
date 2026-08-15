@@ -19,6 +19,9 @@ ratatui.workspace = true
 ratatui-image.workspace = true
 image.workspace = true
 unicode-width.workspace = true
+# Column math walks grapheme *clusters*, not chars: a cluster's display width is not
+# the sum of its chars' (see `cells` in render.rs).
+unicode-segmentation.workspace = true
 bemtvi-rpc.workspace = true
 bemtvi-view.workspace = true
 

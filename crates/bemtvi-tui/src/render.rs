@@ -11,7 +11,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rmpv::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::images::ImageStore;
 use bemtvi_view::{
@@ -469,16 +470,13 @@ pub(crate) fn render(
         // `cmdline_cursor` so it sits mid-line after edits.
         let prompt_width = cmdline_prompt_width(view);
         // `cmdline_cursor` is a server-supplied *char* offset, but the terminal
-        // cursor needs a *display column* — a wide (CJK) char occupies two cells —
-        // so measure the painted width of the chars before the caret. Saturate the
-        // cast and the adds so a bogus value can't overflow the column coordinate
-        // (a debug-build panic, a release-build wrap) — ratatui clamps the result.
-        let caret: usize = view
-            .cmdline
-            .chars()
-            .take(view.cmdline_cursor)
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum();
+        // cursor needs a *display column* — a wide (CJK) char occupies two cells,
+        // and an emoji cluster's cells are not its chars' widths summed — so
+        // measure the painted width of the text before the caret ([`cells_before`]).
+        // Saturate the cast and the adds so a bogus value can't overflow the column
+        // coordinate (a debug-build panic, a release-build wrap) — ratatui clamps
+        // the result.
+        let caret = cells_before(&view.cmdline, view.cmdline_cursor);
         let col = cmd_area
             .x
             .saturating_add(prompt_width)
@@ -1557,10 +1555,7 @@ fn render_fold_column(
 /// char-based throughout.
 fn pad_to_width(s: &str, width: usize) -> String {
     let mut out = truncate_to_width(s, width);
-    let painted: usize = out
-        .chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum();
+    let painted = str_width(&out);
     out.push_str(&" ".repeat(width.saturating_sub(painted)));
     out
 }
@@ -1745,7 +1740,13 @@ fn highlight_line(
     let mut oi = 0usize; // next overlay placement to emit
     let mut overlay_end = 0usize; // absolute col real glyphs are suppressed up to
     let mut inserted = 0usize; // visible hint / inline-virt cells spliced in so far
-    for ch in expanded.chars() {
+
+    // Stepping by grapheme *cluster* (not char) keeps `col` on the same grid the
+    // server's spans and ratatui's painter use, and keeps a cluster whole inside one
+    // styled run — a `\u{2764}\u{fe0f}` split across two spans would lose its emoji
+    // presentation (a lone VS16 is zero-width, so the terminal drops it and the
+    // heart reverts to its narrow text form). See [`cells`].
+    for g in expanded.graphemes(true) {
         while hi < inlay.len() && (inlay[hi].0 as usize) <= col {
             emit_inlay_hint(
                 &inlay[hi],
@@ -1809,9 +1810,9 @@ fn highlight_line(
                 spans.push(Span::styled(std::mem::take(&mut run), run_style));
             }
             run_style = style;
-            run.push(ch);
+            run.push_str(g);
         }
-        col += UnicodeWidthChar::width(ch).unwrap_or(0);
+        col += cells(g);
     }
     if !run.is_empty() {
         spans.push(Span::styled(std::mem::take(&mut run), run_style));
@@ -1976,17 +1977,19 @@ fn highlight_line(
     Line::from(spans)
 }
 
-/// Truncate `s` to at most `max` screen cells (wide chars counted by their
-/// display width), dropping any trailing char that would straddle the boundary.
+/// Truncate `s` to at most `max` screen cells, dropping any trailing grapheme
+/// cluster that would straddle the boundary. Cuts on cluster boundaries (never
+/// between a base char and its combining marks / VS16) and measures each cluster
+/// with [`cells`], so the result's painted width really is `<= max`.
 fn truncate_to_width(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for g in s.graphemes(true) {
+        let cw = cells(g);
         if w + cw > max {
             break;
         }
-        out.push(ch);
+        out.push_str(g);
         w += cw;
     }
     out
@@ -2068,11 +2071,34 @@ fn blend_color(under: Option<Color>, chunk: Option<Color>) -> Option<Color> {
     }
 }
 
-/// Total display width of `s` in screen cells (wide chars by their width).
+/// Display width in screen cells of ONE grapheme cluster — the unit every column
+/// walk in this file steps by.
+///
+/// A cluster's width is **not** the sum of its chars': `UnicodeWidthStr` applies
+/// the emoji rules over the whole cluster, so `\u{1f934}\u{1f3fc}` (an emoji plus its
+/// skin-tone modifier) is 2 cells though each char alone reports 2, and
+/// `\u{2764}\u{fe0f}` (a heart plus VS16) is 2 though its chars report 1 and 0. Summing
+/// per char drifts the column grid in both directions, and the server's
+/// `unicode::virtcol` — which spans, the cursor and `cursor_screen_col` are all
+/// measured against — steps by cluster. So does ratatui's painter, which lays each
+/// cluster into `symbol().width()` cells. Walking per char puts this client's column
+/// accounting out of step with both.
+fn cells(cluster: &str) -> usize {
+    UnicodeWidthStr::width(cluster)
+}
+
+/// Total display width of `s` in screen cells, summed over its grapheme clusters
+/// (see [`cells`] for why clusters and not chars).
 fn str_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum()
+    s.graphemes(true).map(cells).sum()
+}
+
+/// Display width of the first `chars` chars of `s`, measured on the grapheme grid —
+/// how a **char-offset** wire field (a cmdline / picker-query caret) maps onto the
+/// painted cell grid. A `chars` landing inside a cluster measures the cluster's own
+/// leading part, and one past the end clamps to the whole string (`take` saturates).
+fn cells_before(s: &str, chars: usize) -> usize {
+    str_width(&s.chars().take(chars).collect::<String>())
 }
 
 /// Splice one inlay hint into the row's span stream at its anchor column: flush
@@ -2105,7 +2131,7 @@ fn emit_inlay_hint(
     if !run.is_empty() {
         spans.push(Span::styled(std::mem::take(run), *run_style));
     }
-    *inserted += UnicodeWidthStr::width(shown.as_str());
+    *inserted += str_width(&shown);
     spans.push(Span::styled(shown, inlay_hint_style(*id, theme)));
 }
 
@@ -2221,7 +2247,7 @@ fn emit_inline_virt(
             spans.push(Span::styled(std::mem::take(run), *run_style));
             flushed = true;
         }
-        *inserted += UnicodeWidthStr::width(shown.as_str());
+        *inserted += str_width(&shown);
         spans.push(Span::styled(shown, virt_chunk_style(*id, theme)));
     }
 }
@@ -2246,7 +2272,7 @@ fn inlay_cursor_shift(
         // Saturate the width sum: a malicious/buggy server can place arbitrarily wide
         // hints, and a bare `sum()` would overflow `u16` (a debug-build panic).
         .fold(0u16, |acc, (_, text, _)| {
-            acc.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16)
+            acc.saturating_add(str_width(text) as u16)
         })
 }
 
@@ -2269,7 +2295,7 @@ fn virt_cursor_shift(
         // Saturate the width sum (see `inlay_cursor_shift`): a `u16` `sum()` over
         // server-supplied chunk widths would overflow on absurd input.
         .fold(0u16, |acc, (text, _)| {
-            acc.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16)
+            acc.saturating_add(str_width(text) as u16)
         })
 }
 
@@ -2424,8 +2450,8 @@ pub(crate) fn group_style(group: &str) -> Style {
 /// end-of-text there is no glyph to snap to and the ruler keeps its own column.
 fn ruler_cell(line: &str, ruler: usize) -> usize {
     let mut col = 0usize;
-    for ch in line.chars() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for g in line.graphemes(true) {
+        let width = cells(g);
         if col <= ruler && ruler < col + width {
             return col;
         }
@@ -2438,13 +2464,14 @@ fn ruler_cell(line: &str, ruler: usize) -> usize {
 }
 
 /// Expand tabs to spaces at `tabstop` (the buffer's, mirrored from the server),
-/// tracking display width so wide characters before a tab advance the column
+/// tracking display width so wide glyphs before a tab advance the column
 /// correctly. No-op for tab-free lines; the result never contains a `\t`.
 ///
-/// Per-`char` `UnicodeWidthChar` width matches the server's per-grapheme
-/// `unicode::virtcol` (`UnicodeWidthStr`) because str width is just the sum of
-/// its chars' widths — so the cursor's `cursor_screen_col` lines up with the
-/// glyphs painted here.
+/// The walk steps by grapheme cluster so its column matches the server's
+/// per-cluster `unicode::virtcol` — the metric `cursor_screen_col` and every
+/// highlight span are measured in — and a tab after an emoji lands on the same
+/// stop the server computed. (A tab never joins a cluster, so it is always its
+/// own one-char grapheme here.)
 fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
     if !line.contains('\t') {
         // The overwhelmingly common (tab-free) case borrows the line untouched, so
@@ -2454,16 +2481,16 @@ fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
     let tabstop = tabstop.max(1);
     let mut out = String::with_capacity(line.len() + tabstop);
     let mut col = 0;
-    for ch in line.chars() {
-        if ch == '\t' {
+    for g in line.graphemes(true) {
+        if g == "\t" {
             let spaces = tabstop - (col % tabstop);
             for _ in 0..spaces {
                 out.push(' ');
             }
             col += spaces;
         } else {
-            out.push(ch);
-            col += UnicodeWidthChar::width(ch).unwrap_or(0);
+            out.push_str(g);
+            col += cells(g);
         }
     }
     Cow::Owned(out)
@@ -2963,7 +2990,7 @@ fn render_menu(
                 ),
             ]);
         }
-        let badge_w = UnicodeWidthStr::width(badge);
+        let badge_w = str_width(badge);
         Line::from(vec![
             Span::styled("> ", prompt_style),
             Span::styled(
@@ -3073,19 +3100,16 @@ fn render_menu(
     // The terminal caret sits on the focused line (in the list column), past that
     // line's prefix at its text-cursor column (clamped inside the column).
     // `query_cursor` is a *char* offset (the server's `cursor_chars()`); the caret
-    // column is display cells, so measure the painted width of the chars before it
-    // (a wide CJK char in the query occupies two cells).
+    // column is display cells, so measure the painted width of the text before it
+    // (a wide CJK char in the query occupies two cells, and an emoji cluster's
+    // cells are not its chars' widths summed).
     caret_row.map(|row| {
         let (text, prefix_w) = match (focus, &menu.filters) {
             (MenuField::Include, Some(f)) => (f.include.as_str(), FILTER_LABEL_W),
             (MenuField::Exclude, Some(f)) => (f.exclude.as_str(), FILTER_LABEL_W),
             _ => (menu.query.as_deref().unwrap_or(""), 2),
         };
-        let qw: usize = text
-            .chars()
-            .take(menu.query_cursor as usize)
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum();
+        let qw = cells_before(text, menu.query_cursor as usize);
         let caret = u16::try_from(prefix_w + qw)
             .unwrap_or(u16::MAX)
             .min(list_area.width.saturating_sub(1));

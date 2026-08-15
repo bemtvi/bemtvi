@@ -606,6 +606,100 @@ fn wide_chars_occupy_two_cells_each() {
     assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "本");
 }
 
+/// A view of one `line` with a single highlight span over `[start, end)` screen
+/// columns, resolved to palette entry 0 (mauve).
+fn spanned(line: &str, start: u64, end: u64) -> View {
+    view(vec![
+        ("lines", lines(&[line])),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("fg", rgb(0xcb, 0xa6, 0xf7))])]),
+        ),
+        (
+            "highlights",
+            Value::Array(vec![hl_row(&[(start, end, "comment", Some(0))])]),
+        ),
+    ])
+}
+
+/// The palette foreground the `spanned` helper's span paints.
+const SPAN_FG: Option<Color> = Some(Color::Rgb(0xcb, 0xa6, 0xf7));
+
+#[test]
+fn an_emoji_modifier_cluster_does_not_shift_the_spans_after_it() {
+    // `\u{1f934}\u{1f3fc}` (PRINCE + a Fitzpatrick skin-tone modifier) is ONE grapheme
+    // cluster painting in 2 cells, but its two chars report width 2 *each*. A
+    // per-char column walk therefore credits it 4 cells and every span past it
+    // lands two columns short of its glyphs.
+    let buf = paint(&spanned("\u{1f934}\u{1f3fc}ab", 0, 4), 20, 5);
+    assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{1f934}\u{1f3fc}");
+    assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "a");
+    assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "b");
+    assert_eq!(
+        (fg(&buf, 0, 0), fg(&buf, 2, 0), fg(&buf, 3, 0)),
+        (SPAN_FG, SPAN_FG, SPAN_FG),
+        "the span covers the cluster and both letters after it"
+    );
+}
+
+#[test]
+fn a_variation_selector_emoji_does_not_shift_the_spans_after_it() {
+    // `\u{2764}\u{fe0f}` (HEAVY BLACK HEART + VS16) is one cluster painting in 2
+    // cells — emoji presentation makes it wide — but its chars report 1 and 0. A
+    // per-char walk credits it 1 cell, so every span past it lands one column late.
+    let buf = paint(&spanned("\u{2764}\u{fe0f}ab", 2, 4), 20, 5);
+    assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{2764}\u{fe0f}");
+    assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "a");
+    assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "b");
+    assert_eq!(
+        (fg(&buf, 0, 0), fg(&buf, 2, 0), fg(&buf, 3, 0)),
+        (Some(Color::Reset), SPAN_FG, SPAN_FG),
+        "the span starts at the letters, not one cell into them"
+    );
+}
+
+#[test]
+fn a_span_boundary_inside_a_cluster_does_not_split_it() {
+    // A span edge can land on the *second* cell of a wide cluster (a selection, a
+    // search match, an `:s` preview). Painting per char would then cut `\u{2764}\u{fe0f}`
+    // between the heart and its VS16 and push them into two differently-styled
+    // runs — and a lone VS16 is zero-width, so the terminal drops it, the heart
+    // reverts to its narrow text presentation, and the rest of the row slides a
+    // cell left. Walking clusters keeps the pair in one run.
+    let buf = paint(&spanned("\u{2764}\u{fe0f}ab", 1, 3), 20, 5);
+    assert_eq!(
+        buf.cell((0, 0)).unwrap().symbol(),
+        "\u{2764}\u{fe0f}",
+        "the heart keeps its VS16 — the cluster is never split across two spans"
+    );
+    assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "a");
+    assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "b");
+}
+
+#[test]
+fn a_comment_span_covers_a_whole_line_of_emoji_and_cjk() {
+    // The reported bug, verbatim: a lua comment mixing an emoji-modifier cluster,
+    // a VS16 emoji, a private-use icon and CJK. The server projects the comment as
+    // one span over the line's full 37 display cells (per-*grapheme* widths); a
+    // client walking per char drifts +2 on the skin-tone cluster and -1 on the
+    // heart, so the span runs out one cell early and the last `n` paints
+    // un-commented.
+    let line = "-- \u{251c} \u{e60b} \u{1f934}\u{1f3fc}b\u{2764}\u{fe0f}emtvi-lo縄県（おきck.json";
+    let buf = paint(&spanned(line, 0, 37), 60, 5);
+    assert_eq!(
+        buf.cell((36, 0)).unwrap().symbol(),
+        "n",
+        "the line's last cell"
+    );
+    for x in [0, 7, 9, 10, 20, 30, 36] {
+        assert_eq!(
+            fg(&buf, x, 0),
+            SPAN_FG,
+            "cell {x} is inside the comment span"
+        );
+    }
+}
+
 fn numbers(vals: &[Option<u64>]) -> Value {
     Value::Array(
         vals.iter()
@@ -719,6 +813,26 @@ fn command_cursor_lands_past_wide_chars() {
         cursor,
         Some((7, 4)),
         "caret past the wide chars' display width, not at the char count"
+    );
+}
+
+#[test]
+fn command_cursor_lands_past_an_emoji_cluster() {
+    // `cmdline_cursor` is a char offset, and a grapheme *cluster* is several chars
+    // whose individual widths do not sum to the cluster's own: `\u{1f934}\u{1f3fc}`
+    // (an emoji + its skin-tone modifier) is 2 chars of per-char width 2 each, but
+    // the cluster paints in 2 cells — summing per char double-counts it.
+    let v = view(vec![
+        ("command_mode", Value::from(true)),
+        ("cmdline", Value::from("e \u{1f934}\u{1f3fc}")),
+        ("cmdline_cursor", Value::from(4u64)), // char offset: end of the line
+    ]);
+    let (_buf, cursor) = paint_with_cursor(&v, 20, 5);
+    // ':' col 0, 'e' 1, ' ' 2, the emoji cluster 3–4 — the caret lands at col 5.
+    assert_eq!(
+        cursor,
+        Some((5, 4)),
+        "caret past the cluster's own display width, not the sum of its chars'"
     );
 }
 

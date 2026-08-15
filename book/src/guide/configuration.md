@@ -39,6 +39,38 @@ A neovim colorscheme reaches for a handful of those aliases (notably the
 `nvim_set_hl` highlight helper) and nothing more.
 
 
+## Built-in clipboard chords — Ctrl+C / Ctrl+V
+
+bemtvi ships the desktop copy/paste keys bound to the **system clipboard** (the `"+`
+register), so they work without any config:
+
+| Key | Mode | Does |
+| --- | --- | --- |
+| `<C-c>` / `<C-S-c>` | visual | copy the selection to the system clipboard (`"+y`) |
+| `<C-v>` / `<C-S-v>` | normal | paste it at the cursor (`"+P`) |
+| `<C-v>` / `<C-S-v>` | insert | insert it at the caret and keep typing (`<C-r>+`) |
+| `<C-v>` / `<C-S-v>` | command line | insert it into the line being typed (`<C-r>+`) |
+
+Paste is `P`, not `p`: the text lands *at* the cursor (charwise) or above the line
+(linewise), where a non-modal editor puts it. Nothing vim-ish is displaced — bemtvi
+has no blockwise visual mode for `<C-v>` to open and no `i_CTRL-V` literal insert,
+and `<Esc>` is how you leave visual mode. The shifted twins exist because a GUI, a
+browser tab, or a terminal speaking the kitty keyboard protocol reports Ctrl+Shift+C
+as its own chord; a plain terminal folds it onto `<C-c>`, which is mapped anyway.
+
+They are **overridable defaults**, so your own map wins, and mapping one to an empty
+function turns it off:
+
+```lua
+btv.keymap.set("n", "<C-v>", function() end)  -- disable the normal-mode paste
+btv.keymap.set("v", "<C-x>", '"+d')           -- add a cut to match the copy
+```
+
+Copying needs a clipboard to copy *to*: a host tool (`wl-copy` / `pbcopy` / `xclip`),
+a terminal that speaks OSC 52 (the ssh case), or the browser's `navigator.clipboard`.
+With none of them a copy says so rather than quietly going nowhere.
+
+
 ## Option scopes — which buffers a setting reaches
 
 A buffer-local option (`tabstop`, `expandtab`, `foldmethod`, …) has two values: the

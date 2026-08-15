@@ -1,0 +1,26 @@
+Ctrl+C and Ctrl+V, on the system clipboard.
+
+1. Charwise: put the cursor on `copy me` below, press v e e <C-c>, then go
+   somewhere else and press <C-v>.
+
+   copy me please
+   paste target ->
+
+2. Linewise: press V j <C-c> on these two lines, then <C-v> anywhere.
+
+   first line of the pair
+   second line of the pair
+
+3. Insert mode: put the cursor here, press A, then space <C-v>, then keep typing.
+
+   append after me:
+
+4. Command line: copy the path below charwise with 0 v $ <C-c>, then type
+   `:e ` and press <C-v> — the path lands in the command line (<Esc> to bail).
+
+examples/clipboard-chords/sample.txt
+
+5. Round trip: copy this line with V <C-c>, then paste it into another
+   application — it is on the real clipboard, not just a register.
+
+   #!/usr/bin/env bash

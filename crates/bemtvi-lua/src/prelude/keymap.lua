@@ -655,6 +655,51 @@ for _, m in ipairs({
   btv.keymap.set("cmdline", m[1], btv.cmdline.actions[m[2]], { default = true, desc = m[3] })
 end
 
+-- ----- the built-in clipboard chords (Ctrl+C / Ctrl+V) ---------------------
+-- The desktop copy/paste keys, on the SYSTEM clipboard (`"+`) rather than the
+-- unnamed register: `<C-c>` copies the visual selection, `<C-v>` pastes — at the
+-- cursor in normal mode, at the caret in insert mode, and into the line being typed
+-- on the command line. Paste is `P`, not `p` — the text lands at the
+-- cursor (charwise) / above the line (linewise), which is where a non-modal editor
+-- puts it; vim's own mswin.vim maps the same chord to `"+gP` for that reason.
+--
+-- Each has a `<C-S-…>` twin. A terminal without the kitty keyboard protocol
+-- collapses Ctrl+Shift+C onto the same control byte as Ctrl+C, so the twin costs
+-- nothing there — but a GUI, a browser client, or a kitty-protocol terminal reports
+-- it as its own chord, and without the map it would do nothing on exactly the
+-- clients that can tell the two apart.
+--
+-- None of these shadows a vim binding bemtvi has: there is no blockwise visual mode
+-- for `<C-v>` to open and no `i_CTRL-V` literal insert, and `<C-c>` reaches no
+-- handler at all (`<Esc>` is how you leave visual). The picker's own `<C-v>` (open
+-- in a vertical split) lives in the widget bucket and is untouched.
+--
+-- One chord never gets here: the GUI claims Ctrl+Shift+V (with Cmd+V and
+-- Shift+Insert) client-side as a paste gesture — it reads the OS clipboard itself
+-- and feeds it as a bracketed paste (`bemtvi-gui`'s `is_paste`), which is strictly
+-- better in insert mode. Same outcome, so the map below is simply what every other
+-- client does with the chord.
+--
+-- `default = true`, so a config that maps any of them wins, and an empty function
+-- turns one off:  `btv.keymap.set("n", "<C-v>", function() end)`.
+for _, m in ipairs({
+  { "v", "<C-c>", '"+y', "Copy the selection to the system clipboard" },
+  { "v", "<C-S-c>", '"+y', "Copy the selection to the system clipboard" },
+  { "n", "<C-v>", '"+P', "Paste the system clipboard at the cursor" },
+  { "n", "<C-S-v>", '"+P', "Paste the system clipboard at the cursor" },
+  -- Insert mode inserts the register at the caret (`i_CTRL-R`) and stays in insert,
+  -- so typing continues after the pasted text.
+  { "i", "<C-v>", "<C-r>+", "Paste the system clipboard" },
+  { "i", "<C-S-v>", "<C-r>+", "Paste the system clipboard" },
+  -- The command line takes the same RHS: `<C-r>` is a cmdline default of its own
+  -- (insert-register), and a `noremap` RHS still reaches the built-ins, so the fed
+  -- `<C-r>` fires it and `+` is read as the register name (a raw grammar, not a map).
+  { "cmdline", "<C-v>", "<C-r>+", "Paste the system clipboard" },
+  { "cmdline", "<C-S-v>", "<C-r>+", "Paste the system clipboard" },
+}) do
+  btv.keymap.set(m[1], m[2], m[3], { default = true, desc = m[4] })
+end
+
 -- ----- the pending-key event (which-key / showcmd) -------------------------
 btv._on_key_pending = btv._on_key_pending or {}
 -- `btv.on_key_pending`(fn): subscribe to the engine-computed pending-key signal. The

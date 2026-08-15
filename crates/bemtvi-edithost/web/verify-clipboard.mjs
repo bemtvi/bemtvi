@@ -207,6 +207,43 @@ try {
     `lines=${JSON.stringify(gIndent)}`,
   );
 
+  // ── The built-in Ctrl+C / Ctrl+V chords, as REAL key presses ─────────────────────────────
+  // The prelude ships `<C-c>` (copy the selection) and `<C-v>` (paste at the cursor) as
+  // default keymaps. Driven here through `page.keyboard`, not the `feed` hook, because the
+  // browser is the one client where the chord has to get past the page at all: the keydown
+  // handler encodes and `preventDefault()`s it, so the browser's own copy/paste never runs
+  // and the editor's keymap is what fires.
+  await page.evaluate(() => window.__bemtvi.feed("ggdGiCHORD-COPY<Esc>"));
+  await page.evaluate(() => navigator.clipboard.writeText("stale")); // must be overwritten
+  await page.evaluate(() => window.__bemtvi.feed("0v$"));            // select the line
+  await page.keyboard.press("Control+c");
+  const chordCopied = await clipboardEquals(page, "CHORD-COPY");
+  check(
+    "chord: Ctrl+C copies the visual selection to the OS clipboard",
+    chordCopied === "CHORD-COPY",
+    `clipboard=${JSON.stringify(chordCopied)}`,
+  );
+
+  await page.evaluate(() => window.__bemtvi.feed("<Esc>ggdGianchor<Esc>0"));
+  await page.keyboard.press("Control+v");
+  const chordPasted = await linesContain(page, "CHORD-COPY");
+  check(
+    "chord: Ctrl+V pastes the clipboard at the cursor (P semantics, before the cursor)",
+    chordPasted === "CHORD-COPYanchor",
+    `lines=${JSON.stringify(chordPasted)}`,
+  );
+
+  // Insert mode inserts at the caret and stays in insert, so typing continues after it.
+  await page.evaluate(() => window.__bemtvi.feed("ggdGi["));
+  await page.keyboard.press("Control+v");
+  await page.evaluate(() => window.__bemtvi.feed("]<Esc>"));
+  const chordInsert = await linesContain(page, "CHORD-COPY");
+  check(
+    "chord: Ctrl+V in insert mode types the clipboard in at the caret",
+    chordInsert === "[CHORD-COPY]",
+    `lines=${JSON.stringify(chordInsert)}`,
+  );
+
   await browser.close();
 } finally {
   cleanup();

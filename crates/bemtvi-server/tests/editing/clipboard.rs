@@ -106,6 +106,121 @@ async fn clipboard_delete_without_a_provider_aborts() {
     assert_eq!(lines(&rpc).await, vec!["one", "two"]);
 }
 
+// ===== the built-in Ctrl+C / Ctrl+V bindings =================================
+// The desktop copy/paste chords, shipped as overridable defaults (prelude
+// `keymap.lua`) on the system clipboard rather than the unnamed register.
+
+#[tokio::test]
+async fn ctrl_c_copies_the_visual_selection_to_the_clipboard() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello world<Esc>");
+    // Select `hello` (`v` + `e` to the word's last char) and copy it: charwise, so
+    // it reaches the provider charwise.
+    feed(&rpc, "0ve<C-c>");
+    let _ = lines(&rpc).await; // barrier: the yank has been processed
+    assert_eq!(clip.peek(), Some(("hello".to_string(), false)));
+    // A copy leaves the text alone.
+    assert_eq!(lines(&rpc).await, vec!["hello world"]);
+}
+
+#[tokio::test]
+async fn ctrl_c_copies_a_linewise_selection() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ione<Esc>otwo<Esc>");
+    // `V` selects the line; the clipboard gets it linewise (trailing newline).
+    feed(&rpc, "ggVj<C-c>");
+    let _ = lines(&rpc).await;
+    assert_eq!(clip.peek(), Some(("one\ntwo\n".to_string(), true)));
+}
+
+#[tokio::test]
+async fn ctrl_v_pastes_the_clipboard_in_normal_mode() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    // Something external is on the clipboard — the whole point of the chord.
+    clip.seed("X", false);
+    // At the cursor, not after it: the cursor sits on `a` (`<Esc>` left it there),
+    // so the paste lands before it, where a non-modal editor would put it.
+    feed(&rpc, "0<C-v>");
+    assert_eq!(lines(&rpc).await, vec!["Xalpha"]);
+}
+
+#[tokio::test]
+async fn ctrl_v_pastes_the_clipboard_in_insert_mode() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    clip.seed("BETA", false);
+    // Mid-word, still in insert mode afterwards — the text goes in at the caret and
+    // typing continues.
+    feed(&rpc, "A <C-v> done<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["alpha BETA done"]);
+}
+
+#[tokio::test]
+async fn the_shift_twins_are_bound_to_the_same_thing() {
+    // A terminal without the kitty keyboard protocol collapses Ctrl+Shift+C onto
+    // `<C-c>`, but a GUI / browser client — and a kitty-protocol terminal — reports
+    // it as its own chord, so both spellings have to be mapped or the shifted one
+    // does nothing on exactly the clients that can tell them apart.
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello<Esc>");
+    feed(&rpc, "0vll<C-S-c>");
+    let _ = lines(&rpc).await;
+    assert_eq!(clip.peek(), Some(("hel".to_string(), false)));
+    clip.seed("Y", false);
+    feed(&rpc, "0<C-S-v>");
+    assert_eq!(lines(&rpc).await, vec!["Yhello"]);
+}
+
+#[tokio::test]
+async fn ctrl_v_pastes_into_the_command_line() {
+    let (rpc, mut incoming, clip) = start_with_clipboard().await;
+    clip.seed("pasted/path.txt", false);
+    // `:e ` then the chord: the clipboard lands in the line being typed, so a path
+    // copied from a terminal can be pasted into `:e` instead of retyped.
+    let map = latest_after(&rpc, &mut incoming, ":e <C-v>").await;
+    assert_eq!(view_str(&map, "cmdline"), "e pasted/path.txt");
+    // The shifted twin is bound here too — a terminal that can tell them apart (and
+    // every GUI / browser client) reports Ctrl+Shift+V as its own chord.
+    let map = latest_after(&rpc, &mut incoming, "<Esc>:e <C-S-v>").await;
+    assert_eq!(view_str(&map, "cmdline"), "e pasted/path.txt");
+}
+
+/// The chords are `default` maps, which is what lets a `noremap` RHS reach them: a
+/// fed key consults the *built-in* maps and skips the user ones, exactly as vim's
+/// built-ins fire for a `noremap` mapping. So a config that maps its own key to
+/// `<C-v>` gets the clipboard paste — the flag, not just the binding, is load-bearing.
+#[tokio::test]
+async fn a_noremap_rhs_still_reaches_the_built_in_chord() {
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    clip.seed("CLIP", false);
+    exec_lua(
+        &rpc,
+        "vim.g.mapleader = ',' btv.keymap.set('n', '<leader>p', '<C-v>')",
+    )
+    .await;
+    feed(&rpc, "0,p");
+    assert_eq!(lines(&rpc).await, vec!["CLIPalpha"]);
+}
+
+#[tokio::test]
+async fn a_config_map_overrides_the_built_in_chord() {
+    // A user's own map on the same key wins over the built-in, and mapping it to an
+    // empty function turns the chord off. Without that a config could never take
+    // `<C-v>` back.
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    clip.seed("CLIP", false);
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('n', '<C-v>', function() btv.cmd('normal! ihijacked') end)",
+    )
+    .await;
+    feed(&rpc, "0<C-v>");
+    assert_eq!(lines(&rpc).await, vec!["hijackedalpha"]);
+}
+
 // ===== OSC 52 (the ssh / no-host-tool fallback) ==============================
 
 /// The reported bug: over ssh there is no `pbcopy`/`wl-copy`/`xclip` on the

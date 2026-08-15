@@ -1728,13 +1728,15 @@ impl Editor {
         // so handle it before the bounded block. `pummaxwidth` joins them: a column
         // count with no upper bound to check (`menu_geom` clamps it to the room the
         // window actually has) and nothing on screen to re-lay out — the popup box is
-        // recomputed from scratch every frame.
+        // recomputed from scratch every frame. `'report'` is the same shape: a plain
+        // line-count threshold, read only when a command decides whether to echo.
         if name == "mousetime"
             || name == "timeoutlen"
             || name == "scrollanimduration"
             || name == "scrollback"
             || name == "history"
             || name == "pummaxwidth"
+            || name == "report"
         {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));

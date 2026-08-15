@@ -128,6 +128,9 @@ impl Editor {
                 self.clamp_cursor();
             }
             'd' => {
+                // `'report'` counts what the *buffer* lost, so a charwise delete
+                // that merely joins two lines reports one line, not two.
+                let before = self.buffer().line_count();
                 self.delete_yank_range(lo, hi, linewise);
                 self.delete_range(lo, hi);
                 if linewise {
@@ -136,6 +139,7 @@ impl Editor {
                     self.set_cursor_char(lo);
                 }
                 self.clamp_cursor();
+                self.report_line_delta(before);
             }
             'c' => {
                 self.delete_yank_range(lo, hi, linewise);
@@ -261,6 +265,16 @@ impl Editor {
         self.cursor.line = first.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
+        // `'report'`: vim counts the lines the shift *spanned* (blank lines it
+        // skipped included) and names the operator and how many shiftwidths it
+        // moved — `5 lines >ed 1 time`.
+        let spanned = last.saturating_sub(first) + 1;
+        if spanned > self.options.report && !self.in_global && !self.report_suspended {
+            let op = if right { '>' } else { '<' };
+            let lines = if spanned == 1 { "line" } else { "lines" };
+            let times = if count == 1 { "time" } else { "times" };
+            self.echo(format!("{spanned} {lines} {op}ed {count} {times}"));
+        }
     }
 
     /// Settle the cursor after a linewise delete: first non-blank of the line that
@@ -375,6 +389,7 @@ impl Editor {
         }
         match op {
             'd' => {
+                let before = self.buffer().line_count();
                 self.delete_range(lo, hi);
                 if linewise {
                     self.settle_after_linewise_delete(first_line);
@@ -383,6 +398,7 @@ impl Editor {
                 }
                 self.mode = Mode::Normal;
                 self.clamp_cursor();
+                self.report_line_delta(before);
             }
             'y' => {
                 if linewise {
@@ -649,6 +665,59 @@ impl Editor {
         self.clamp_cursor();
     }
 
+    // ----- `'report'` feedback (vim's `msgmore` / yank message) ---------------
+
+    /// Vim's `msgmore()`: report on the message line how the buffer's line count
+    /// changed, given it held `before` lines when the command started. Silent
+    /// unless the change *exceeds* `'report'` (default 2, so an everyday `dd` /
+    /// `p` says nothing) and silent inside a `:global` pass or a multi-cursor
+    /// sweep — both report their total once, at the end, rather than per step.
+    ///
+    /// The wording is vim's, asymmetric singular included: `1 more line` /
+    /// `N more lines`, `1 line less` / `N fewer lines`.
+    pub(crate) fn report_line_delta(&mut self, before: usize) {
+        if self.in_global || self.report_suspended {
+            return;
+        }
+        let after = self.buffer().line_count();
+        let n = after.abs_diff(before);
+        if n <= self.options.report {
+            return;
+        }
+        self.echo(match (after > before, n) {
+            (true, 1) => "1 more line".to_string(),
+            (true, n) => format!("{n} more lines"),
+            (false, 1) => "1 line less".to_string(),
+            (false, n) => format!("{n} fewer lines"),
+        });
+    }
+
+    /// The yank half of `'report'` — vim's `op_yank` message: `N lines yanked`,
+    /// naming the target register when the yank chose one (`6 lines yanked into
+    /// "a`). `text`/`linewise` are the slice that just reached the register.
+    ///
+    /// The count is the number of lines the yanked text *spans*, and a charwise
+    /// yank that stays inside one line counts as **zero** — vim's rule, which is
+    /// why `y$` never reports even at `report=0`.
+    fn report_yank(&mut self, text: &str, linewise: bool) {
+        if self.in_global || self.report_suspended {
+            return;
+        }
+        let newlines = text.matches('\n').count();
+        let lines = if linewise { newlines } else { newlines + 1 };
+        // A single-line charwise yank is not worth a message at any `'report'`.
+        let lines = if !linewise && lines == 1 { 0 } else { lines };
+        if lines <= self.options.report {
+            return;
+        }
+        let into = match self.pending.register {
+            Some(r) => format!(" into \"{r}"),
+            None => String::new(),
+        };
+        let plural = if lines == 1 { "line" } else { "lines" };
+        self.echo(format!("{lines} {plural} yanked{into}"));
+    }
+
     /// Snap `[lo, hi)` and extract it as register-bound text + its kind, or
     /// `None` when the range is empty.
     fn slice_for_register(
@@ -676,6 +745,7 @@ impl Editor {
         if let Some((text, kind)) = self.slice_for_register(lo, hi, linewise) {
             self.collect_cursor_register(lo, &text, kind);
             let reg = self.pending.register;
+            self.report_yank(&text, linewise);
             if is_clipboard_register(reg) {
                 self.clipboard_write(text, kind);
             } else {
@@ -1358,6 +1428,7 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        let before = self.buffer().line_count();
         self.push_undo();
         if linewise {
             let at = if after {
@@ -1398,6 +1469,7 @@ impl Editor {
         self.buffer_mut().normalize();
         self.buffer_mut().modified = true;
         self.clamp_cursor();
+        self.report_line_delta(before);
     }
 
     /// `p`/`P` with a multi-cursor set active. When the per-cursor register set

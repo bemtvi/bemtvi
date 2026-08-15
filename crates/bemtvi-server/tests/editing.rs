@@ -85,6 +85,8 @@ mod paste;
 mod registers;
 #[path = "editing/rendering.rs"]
 mod rendering;
+#[path = "editing/report.rs"]
+mod report;
 #[path = "editing/scrolloff.rs"]
 mod scrolloff;
 #[path = "editing/search.rs"]

@@ -48,6 +48,12 @@ pub struct Options {
     /// all short is unaffected. Unlike neovim it defaults non-zero: unbounded is the
     /// behavior that reads as broken the first time a server offers a 200-column label.
     pub pummaxwidth: usize,
+    /// How many changed lines one command must exceed before it reports itself on
+    /// the message line (`'report'`; default `2`, as in vim). A `dd` is quiet, a
+    /// `5dd` says `5 fewer lines`; a paste says `N more lines` and a yank
+    /// `N lines yanked`. `0` reports every change. See
+    /// [`crate::Editor::report_line_delta`].
+    pub report: usize,
     /// The `'statusline'` format string (neovim's `%`-format mini-language).
     /// Empty means the built-in default look; a non-empty value is parsed and
     /// rendered by the statusline engine. Global-only for now (no per-window
@@ -318,6 +324,7 @@ impl Options {
             ("showtabline", Num(n)) => self.showtabline = (*n).clamp(0, 2) as u8,
             ("laststatus", Num(n)) => self.laststatus = (*n).clamp(0, 3) as u8,
             ("pummaxwidth", Num(n)) => self.pummaxwidth = (*n).clamp(0, i64::MAX) as usize,
+            ("report", Num(n)) => self.report = (*n).clamp(0, i64::MAX) as usize,
             ("mousetime", Num(n)) => self.mousetime = (*n).clamp(0, i64::MAX) as usize,
             ("timeoutlen", Num(n)) => self.timeoutlen = (*n).clamp(0, i64::MAX) as usize,
             ("scrollanimduration", Num(n)) => {
@@ -371,6 +378,7 @@ impl Options {
             "showtabline" => Num(self.showtabline as i64),
             "laststatus" => Num(self.laststatus as i64),
             "pummaxwidth" => Num(self.pummaxwidth as i64),
+            "report" => Num(self.report as i64),
             "mousetime" => Num(self.mousetime as i64),
             "timeoutlen" => Num(self.timeoutlen as i64),
             "scrollanimduration" => Num(self.scrollanimduration as i64),
@@ -514,6 +522,9 @@ impl Default for Options {
             // Wide enough for any ordinary identifier plus its kind, narrow enough
             // that one outlier candidate can't stretch the popup across the window.
             pummaxwidth: 50,
+            // Report a command's line-count change only past two lines, so the
+            // everyday `dd` / `p` stay quiet (vim's default).
+            report: 2,
             // No custom statusline by default — the built-in look is used.
             statusline: String::new(),
             // No custom tabline by default — the built-in tab cells are used.
@@ -2021,6 +2032,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Global,
             doc: "Maximum width of the popup menu in columns; 0 is no maximum.",
+        },
+        OptionInfo {
+            name: "report",
+            abbrev: None,
+            kind: Num,
+            scope: Global,
+            doc: "Report a message when a command changes more than this many lines.",
         },
         OptionInfo {
             name: "statusline",

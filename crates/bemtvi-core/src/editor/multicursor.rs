@@ -630,7 +630,14 @@ impl Editor {
         // can give every cursor back its *own* text. A non-yanking edit (`~`, `J`)
         // collects nothing and leaves the previous per-cursor set intact.
         self.cursor_register_collect = Some(Vec::new());
+        // One `'report'` message for the whole sweep, not one per cursor: each
+        // cursor's own edit stays quiet and the total line change is reported below
+        // (the rule vim applies to a `:global` pass).
+        let before = self.buffer().line_count();
+        let outer_quiet = std::mem::replace(&mut self.report_suspended, true);
         self.for_each_cursor(f);
+        self.report_suspended = outer_quiet;
+        self.report_line_delta(before);
         if let Some(mut collected) = self.cursor_register_collect.take() {
             if !collected.is_empty() {
                 collected.sort_by_key(|(at, _)| *at);

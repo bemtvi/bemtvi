@@ -870,6 +870,13 @@ pub struct Editor {
     /// so a nested `:g` / `:v` in that command fails loud (`E147`) instead of
     /// recursing. Set around the second pass in [`Editor::ex_global`].
     in_global: bool,
+    /// True while a multi-cursor sweep is editing cursor-by-cursor, so the
+    /// `'report'` messages ([`Editor::report_line_delta`]) stay quiet for each
+    /// individual cursor and the sweep reports its **total** line change once, at
+    /// the end. Vim has no multi-cursor to imitate here; this is the same rule it
+    /// applies to `:global`, whose per-line commands are silent and whose whole run
+    /// reports once. Set around the sweep in [`Editor::edit_each_cursor`].
+    report_suspended: bool,
     /// Current `:normal` nesting depth — bounds a `:normal` whose keys run
     /// another `:normal` so a runaway chain can't overflow the stack (vim caps
     /// this too). Incremented around [`Editor::ex_normal`].
@@ -2063,6 +2070,7 @@ impl Editor {
             last_substitute: None,
             subst_confirm: None,
             in_global: false,
+            report_suspended: false,
             normal_depth: 0,
             search_operator: None,
             pending_search_count: 1,

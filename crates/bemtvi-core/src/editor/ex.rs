@@ -2005,6 +2005,10 @@ impl Editor {
         self.push_undo();
         self.snapshot_taken = true;
         self.in_global = true;
+        // `'report'`: the per-line commands run silent (`in_global` gates
+        // `report_line_delta`) and the whole run reports its total below — vim's
+        // rule, so `:g/x/d` says `7 fewer lines` once instead of seven times.
+        let lines_before_run = self.buffer().line_count();
         // Second pass: run `cmd` on each target. A running `offset` keeps the
         // remaining (later) targets aligned as the command adds or removes lines.
         let mut offset: i64 = 0;
@@ -2023,6 +2027,12 @@ impl Editor {
         self.snapshot_taken = false;
         self.buffer_mut().normalize();
         self.clamp_cursor();
+        // Only when the run left no message of its own: a `:g/x/s/…` already
+        // reported its substitutions, and vim doesn't overwrite that with the line
+        // count.
+        if self.message.is_empty() {
+            self.report_line_delta(lines_before_run);
+        }
     }
 
     /// `:[range]normal[!] {keys}` — execute `keys` as if typed in Normal mode.
@@ -2093,6 +2103,7 @@ impl Editor {
             self.refuse_edit();
             return;
         }
+        let before = self.buffer().line_count();
         self.push_undo();
         let span = self.linewise_byte_span(range);
         self.buffer_mut().remove(span);
@@ -2100,6 +2111,7 @@ impl Editor {
         self.cursor.line = range.lo.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
+        self.report_line_delta(before);
     }
 
     /// Parse the destination address of `:move` / `:copy` — the whole argument,
@@ -2230,9 +2242,11 @@ impl Editor {
             Ok(dest) => dest,
             Err(e) => return self.echo_err(e),
         };
+        let before = self.buffer().line_count();
         self.push_undo();
         let (chunk, _) = self.linewise_span(range);
         self.splice_lines_below(dest, &chunk);
+        self.report_line_delta(before);
     }
 
     /// `:[line]pu[t] [x]` — insert register `x` (default the unnamed register) as
@@ -2254,6 +2268,7 @@ impl Editor {
                 return;
             }
         };
+        let before = self.buffer().line_count();
         self.push_undo();
         // Force linewise: ensure the chunk is a whole number of lines so the
         // insert can't splice into an existing line.
@@ -2280,6 +2295,7 @@ impl Editor {
         };
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
+        self.report_line_delta(before);
     }
 
     /// `:[range]p[rint]` — echo the range's lines (default: the current line). The

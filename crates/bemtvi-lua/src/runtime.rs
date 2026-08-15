@@ -567,6 +567,9 @@ pub struct GoMirror {
     /// `'pummaxwidth'` — the popup menu's width cap in columns (`0` = no maximum).
     /// Backs `vim.o.pummaxwidth` / `btv.o.pummaxwidth`.
     pub pummaxwidth: u64,
+    /// `'report'` — how many changed lines a command must exceed before it says so
+    /// on the message line. Backs `vim.o.report` / `btv.o.report`.
+    pub report: u64,
     pub statusline: String,
     pub tabline: String,
     pub guifont: String,

@@ -12,6 +12,7 @@ members = [
     "crates/bemtvi-git",
     "crates/bemtvi-lsp",
     "crates/bemtvi-view",
+    "crates/bemtvi-width",
     "crates/bemtvi-regex",
     "crates/bemtvi-test-harness",
 ]

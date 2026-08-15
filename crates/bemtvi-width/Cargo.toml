@@ -1,0 +1,23 @@
+[package]
+name = "bemtvi-width"
+description = "The editor's grapheme/column math compiled to wasm, so the web client's DOM renderer measures cells with the same Rust crates the server does."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# A `cdylib` so `wasm32-unknown-unknown` emits a bare `.wasm` with plain exports (no
+# emscripten glue, no JS runtime — the module is ~64 KB and instantiates synchronously
+# from bytes). Building it on the host as part of the workspace is harmless (an unused
+# `.so`) and is what keeps it linted and its deps pinned with everything else.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# THE point of this crate: the exact same pinned versions the server measures columns
+# with, via `[workspace.dependencies]`. A mirror of these tables in JS could drift on a
+# dependency bump; linking them cannot.
+unicode-width.workspace = true
+unicode-segmentation.workspace = true

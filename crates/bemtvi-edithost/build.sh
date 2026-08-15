@@ -63,6 +63,27 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,HEAPU8 \
   -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_input_mouse,_eh_source_lua,_eh_apply_remote_config,_eh_seed_remote_cwd,_eh_boot_finish,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_take_watch_requests,_eh_remote_file_changed,_eh_daemon_status,_eh_set_proc_host,_eh_take_proc_requests,_eh_proc_spawned,_eh_proc_stdout,_eh_proc_exited,_eh_take_fs_op_requests,_eh_fs_op_result,_eh_take_git_op_requests,_eh_git_op_result,_eh_take_http_requests,_eh_http_result,_eh_take_http_mounts,_eh_take_http_unmounts,_eh_http_mount_result,_eh_http_server_request,_eh_take_http_server_replies,_eh_take_fs_watch_requests,_eh_fs_watch_change,_eh_fs_watch_err,_eh_take_terminal_requests,_eh_terminal_data,_eh_terminal_flush,_eh_terminal_exit,_eh_take_lsp_requests,_eh_lsp_stdout,_eh_lsp_stderr,_eh_lsp_exited,_eh_take_dproc_requests,_eh_dproc_out,_eh_dproc_exit,_eh_take_sock_requests,_eh_sock_connected,_eh_sock_data,_eh_sock_closed,_eh_take_clipboard_writes,_eh_clipboard_push,_eh_take_ts_requests,_eh_ts_install_complete,_eh_ts_seed_installed,_eh_set_key_labels,_eh_export_shada,_eh_load_shada,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_aux_lines,_eh_free_string,_eh_free,_malloc,_free
 
+# 2b. The column-math module: `unicode-segmentation` + `unicode-width` — the exact
+#     crates (and pinned versions) the server measures every wire column with — as a
+#     bare ~70 KB wasm the page instantiates on the main thread and calls synchronously
+#     (web/width.js). The DOM renderer can't ask the edit-host: it lives in the Worker,
+#     and a synchronous round-trip would park the UI thread on a busy tick. This is NOT
+#     optional like the highlighter — index.html awaits it before the first paint,
+#     because a renderer guessing widths paints onto the wrong glyphs.
+#
+#     `wasm32-unknown-unknown`, so no emscripten and no JS glue; `-C panic=abort` drops
+#     the unwinding tables a library with no panics doesn't need. It's a workspace
+#     member, so its unicode deps come from the same `[workspace.dependencies]` pins as
+#     the server's — which is the whole point.
+echo "building the column-math module (bemtvi-width → wasm)…"
+rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown || {
+  echo "error: rustup target add wasm32-unknown-unknown  (needed for dist/bemtvi_width.wasm)" >&2
+  exit 1
+}
+( cd ../.. && RUSTFLAGS="-C panic=abort" \
+    cargo build -p bemtvi-width --release --target wasm32-unknown-unknown )
+cp ../../target/wasm32-unknown-unknown/release/bemtvi_width.wasm dist/
+
 # 3. Tree-sitter highlighter assets → web/vendor/ (the web-tree-sitter runtime + the
 #    per-language grammar .wasm + sanitized queries) for the in-page syntax highlighter
 #    (web/highlight.js). The pinned grammar devDeps + generator live in the local

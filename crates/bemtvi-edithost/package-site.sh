@@ -32,9 +32,16 @@ done
   echo "error: dist/eh.{mjs,wasm} missing — run build.sh before package-site.sh" >&2
   exit 1
 }
+# The column-math module is load-bearing, not optional: index.html awaits it before the
+# first paint (web/width.js), so a site shipped without it renders nothing at all.
+[ -f "$here/dist/bemtvi_width.wasm" ] || {
+  echo "error: dist/bemtvi_width.wasm missing — run build.sh before package-site.sh" >&2
+  exit 1
+}
 
 # The page's relative imports require web/ and dist/ as siblings (index.html loads
-# ./worker.mjs; worker.mjs loads ../dist/eh.mjs, statically imports ./rpc.mjs, and
+# ./worker.mjs and ./width.js — which loads ../dist/bemtvi_width.wasm; worker.mjs loads
+# ../dist/eh.mjs, statically imports ./rpc.mjs, and
 # *dynamically* imports ./ts-indent.js, ./ts-folds.js and ./ts-textobjects.js — the optional
 # tree-sitter indenter / fold runner / text-object runner; highlight.js
 # pulls in ./grammars.js + ./ts-sanitize.js). Copy every runtime file these reach — not
@@ -42,13 +49,13 @@ done
 # it's the turnkey static server that sets the cross-origin-isolation headers (below).
 rm -rf "$site"
 mkdir -p "$site/web" "$site/dist"
-cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$site/dist/"
+cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$here/dist/bemtvi_width.wasm" "$site/dist/"
 # build-config.js is required: worker.mjs statically imports it (the build-time feature
 # flags). Without it the Worker fails to load.
 cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/rpc.mjs" \
-   "$here/web/build-config.js" "$here/web/highlight.js" "$here/web/grammars.js" \
-   "$here/web/ts-sanitize.js" "$here/web/ts-indent.js" "$here/web/ts-folds.js" \
-   "$here/web/ts-textobjects.js" "$here/web/serve.mjs" "$site/web/"
+   "$here/web/build-config.js" "$here/web/width.js" "$here/web/highlight.js" \
+   "$here/web/grammars.js" "$here/web/ts-sanitize.js" "$here/web/ts-indent.js" \
+   "$here/web/ts-folds.js" "$here/web/ts-textobjects.js" "$here/web/serve.mjs" "$site/web/"
 [ -d "$here/web/vendor" ] && cp -r "$here/web/vendor" "$site/web/vendor"
 # The first-party plugin bundle is demo-only; never ship it in the standard site (build.sh
 # doesn't build it, but a local dev tree may have it vendored from a prior --demo run).

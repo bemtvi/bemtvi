@@ -15,6 +15,8 @@
     { "text": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 \ud83c\udff3\ufe0f\u200d\ud83c\udf08", "width": 5 },
     { "text": "\ud83c\udde7\ud83c\uddf7 \ud83c\uddfa\ud83c\uddf8 1\ufe0f\u20e3", "width": 8 },
     { "text": "\u00a9\ufe0f \u2122\ufe0f \u2194\ufe0f \u23f0", "width": 11 },
+    { "text": "\u0644\u0627 \u05d0\u200d\u05dc \ua4f8\ua4fc", "width": 8 },
+    { "text": "\u0915\u094d\u0937 \u0e01\u0e31\u0e49", "width": 4 },
     { "text": "-- \u251c \ue60b \ud83e\udd34\ud83c\udffcb\u2764\ufe0femtvi-lo\u7e04\u770c\uff08\u304a\u304dck.json", "width": 37 }
   ],
   "clusters": [
@@ -93,6 +95,14 @@
     { "cluster": "\u2122\ufe0f", "width": 2 },
     { "cluster": "\u2194\ufe0f", "width": 2 },
     { "cluster": "\u23f0", "width": 2 },
+    { "cluster": "\u0644", "width": 1 },
+    { "cluster": "\u0627", "width": 1 },
+    { "cluster": "\u05d0\u200d", "width": 1 },
+    { "cluster": "\u05dc", "width": 1 },
+    { "cluster": "\ua4f8", "width": 1 },
+    { "cluster": "\ua4fc", "width": 1 },
+    { "cluster": "\u0915\u094d\u0937", "width": 2 },
+    { "cluster": "\u0e01\u0e31\u0e49", "width": 1 },
     { "cluster": "-", "width": 1 },
     { "cluster": "b", "width": 1 },
     { "cluster": "m", "width": 1 },

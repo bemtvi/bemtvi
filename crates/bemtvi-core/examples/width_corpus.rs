@@ -4,8 +4,11 @@
 //! model, the grid every wire column is measured in — see `server_width`). Run:
 //! `cargo run -p bemtvi-core --example width_corpus > crates/bemtvi-edithost/web/width-corpus.json`.
 //!
-//! The client mirrors those widths from generated tables (see `dump_width.rs`); this
-//! corpus is what proves the mirror still holds after either side changes.
+//! The client gets those widths from the same two crates, compiled to wasm
+//! (`crates/bemtvi-width`, loaded by `web/width.js`) — so this corpus is not checking a
+//! mirror for drift any more, it is checking the WIRING: that the module is built, is
+//! actually loaded, and is what the renderer's cell grid is built from. A page that
+//! silently fell back to guessing widths would fail here.
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -28,6 +31,13 @@ const SAMPLES: &[&str] = &[
     "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{1f3f3}\u{fe0f}\u{200d}\u{1f308}",
     "\u{1f1e7}\u{1f1f7} \u{1f1fa}\u{1f1f8} \u{0031}\u{fe0f}\u{20e3}",
     "\u{00a9}\u{fe0f} \u{2122}\u{fe0f} \u{2194}\u{fe0f} \u{23f0}",
+    // Sequences `unicode-width` ligatures ACROSS grapheme clusters — Arabic lam-alef,
+    // Hebrew alef-lamed, a Lisu tone pair. `virtcol` measures each cluster separately
+    // and so counts them 2 columns, not the crate's 1; pinning them here keeps the
+    // client on the editor's grid rather than the crate's whole-string answer.
+    "\u{644}\u{627} \u{5d0}\u{200d}\u{5dc} \u{a4f8}\u{a4fc}",
+    // Devanagari and Thai: clusters that are several codepoints and ONE cell.
+    "\u{915}\u{94d}\u{937} \u{e01}\u{e31}\u{e49}",
     "-- \u{251c} \u{e60b} \u{1f934}\u{1f3fc}b\u{2764}\u{fe0f}emtvi-lo\u{7e04}\u{770c}\u{ff08}\u{304a}\u{304d}ck.json",
 ];
 

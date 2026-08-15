@@ -287,6 +287,48 @@ impl Default for Buffer {
     }
 }
 
+/// How many times [`read_consistent`] re-reads a file that moved under it before
+/// settling for the conservative baseline. Three covers a writer's truncate window
+/// with room to spare; a file being rewritten in a tight loop is not something a
+/// single read can win against, and the stale stat it falls back to means the next
+/// change check simply tries again.
+const TORN_READ_RETRIES: usize = 3;
+
+/// Read `path`'s bytes together with the on-disk snapshot they actually belong to:
+/// stat, read, stat again, and retry while the two stats disagree.
+///
+/// A writer that truncates in place rather than renaming — a shell `>` redirect, a
+/// build step, most things that are not another editor — leaves a window where the
+/// bytes on disk match neither the file before nor the file after. Reading in that
+/// window yields truncated text, and the trap is what gets recorded alongside it: pair
+/// truncated text with the *finished* write's mtime and size and every later change
+/// check answers "unchanged", so the buffer keeps the truncation for good — and a `:w`
+/// from there puts that truncation back over the real file.
+///
+/// On an exhausted budget it returns the **pre-read** stat, so the baseline errs stale
+/// rather than too-new: stale re-detects and reloads, too-new can never notice
+/// anything again. `None` bytes means the file does not exist.
+fn read_consistent(path: &Path, fs: &dyn HostFs) -> Result<(Option<Vec<u8>>, Option<FileStat>)> {
+    use std::io::Read;
+    let mut before = fs.stat(path);
+    for attempt in 1..=TORN_READ_RETRIES {
+        let bytes = if fs.exists(path) {
+            let mut bytes = Vec::new();
+            fs.open_read(path)?.read_to_end(&mut bytes)?;
+            Some(bytes)
+        } else {
+            None
+        };
+        let after = fs.stat(path);
+        if after == before || attempt == TORN_READ_RETRIES {
+            return Ok((bytes, before));
+        }
+        // The file moved while we were reading it; try again against what it is now.
+        before = after;
+    }
+    unreachable!("the loop returns on its final attempt")
+}
+
 impl Buffer {
     pub fn empty() -> Self {
         Buffer {
@@ -393,17 +435,18 @@ impl Buffer {
     /// `fileencodings` fallback chain, opens, and carries the detected
     /// `'fileencoding'` / `'bomb'` so `:w` reproduces its original bytes.
     pub fn from_file(path: impl AsRef<Path>, fs: &dyn HostFs, fileencodings: &str) -> Result<Self> {
-        use std::io::Read;
         let path = path.as_ref();
         let mut options = crate::options::BufferOptions::default();
-        let mut text = if fs.exists(path) {
-            // Read the raw bytes, then decode through the shared seam — the same
-            // decoder every read path (local, daemon, wasm) funnels through, so a
-            // file opens identically however it's reached. (This forfeits the old
-            // `from_reader` 1x-memory streaming open for ~2x peak at open; correct
-            // multi-encoding decoding needs the whole byte stream in hand.)
-            let mut bytes = Vec::new();
-            fs.open_read(path)?.read_to_end(&mut bytes)?;
+        // The bytes and the on-disk snapshot (mtime + size) they belong to, read
+        // together so they cannot disagree — see `read_consistent`. `disk` is what
+        // every later `:w` / `:checktime` compares against.
+        let (bytes, disk) = read_consistent(path, fs)?;
+        let mut text = if let Some(bytes) = bytes {
+            // Decode through the shared seam — the same decoder every read path
+            // (local, daemon, wasm) funnels through, so a file opens identically
+            // however it's reached. (This forfeits the old `from_reader` 1x-memory
+            // streaming open for ~2x peak at open; correct multi-encoding decoding
+            // needs the whole byte stream in hand.)
             let (decoded, fileencoding, bomb) =
                 crate::encoding::decode_to_rope(&bytes, fileencodings);
             options.fileencoding = fileencoding;
@@ -423,9 +466,6 @@ impl Buffer {
             Rope::new()
         };
         ensure_trailing_newline(&mut text);
-        // Record what's on disk right now (mtime + size), so a later `:w` can tell
-        // if the file changed underneath us. `None` for a not-yet-existing file.
-        let disk = fs.stat(path);
         // Only `text`/`options`/`disk` differ from a freshly-`named` buffer; every
         // other field keeps its default, so spread rather than re-list them all.
         Ok(Buffer {

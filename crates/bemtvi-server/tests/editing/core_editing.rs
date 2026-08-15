@@ -443,6 +443,108 @@ async fn an_external_change_autoreloads_via_the_buffer_watch() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A [`bemtvi_core::host::HostFs`] that models a file caught **mid-write**: while
+/// armed, `path` looks truncated (0 bytes, no content) to everyone; the first
+/// `open_read` to observe that disarms it, so every access from then on sees the
+/// finished write. Every other path goes straight to the real disk.
+///
+/// That is the shape of the real hazard — a writer that truncates in place and
+/// completes an instant later — and it deliberately models the *file*, not a call
+/// count, so the test does not have to know how many times a reload stats. Which
+/// accesses land on which side of the disarm is exactly what is under test.
+struct TornWriteFs {
+    real: bemtvi_core::host::StdHostFs,
+    path: PathBuf,
+    /// Set by the test to put the file mid-write; cleared by the first read.
+    torn: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TornWriteFs {
+    fn mid_write(&self, p: &std::path::Path) -> bool {
+        p == self.path && self.torn.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl bemtvi_core::host::HostFs for TornWriteFs {
+    fn exists(&self, p: &std::path::Path) -> bool {
+        // A truncated file still exists.
+        self.real.exists(p)
+    }
+    fn open_read(&self, p: &std::path::Path) -> std::io::Result<Box<dyn std::io::Read>> {
+        if self.mid_write(p) {
+            // Observing the truncation is what "completes" the write behind us.
+            self.torn.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Ok(Box::new(std::io::empty()));
+        }
+        self.real.open_read(p)
+    }
+    fn stat(&self, p: &std::path::Path) -> Option<bemtvi_core::host::FileStat> {
+        let stat = self.real.stat(p);
+        if self.mid_write(p) {
+            // A just-truncated file: the write's mtime has landed, the bytes have not.
+            return stat.map(|s| bemtvi_core::host::FileStat { size: 0, ..s });
+        }
+        stat
+    }
+    fn write_atomic(&self, p: &std::path::Path, c: &[u8]) -> std::io::Result<()> {
+        self.real.write_atomic(p, c)
+    }
+    fn read_dir(&self, d: &std::path::Path) -> std::io::Result<Vec<bemtvi_core::host::DirEntry>> {
+        self.real.read_dir(d)
+    }
+    fn canonicalize(&self, p: &std::path::Path) -> std::io::Result<PathBuf> {
+        self.real.canonicalize(p)
+    }
+}
+
+/// A reload that catches an external writer mid-write must not strand the buffer on
+/// the truncated content.
+///
+/// Two things have to hold. The bytes and the on-disk snapshot recorded beside them
+/// must describe the *same* file — pair truncated text with the finished write's
+/// mtime and size and every later change check answers "unchanged", so the buffer
+/// keeps the truncation for good and a `:w` from there puts it back over the real
+/// file. And the reload has to notice and re-read, because nothing is guaranteed to
+/// come along and try again: the watch that usually would is being re-armed across
+/// exactly this window.
+///
+/// In the wild the tear is the truncate window of a non-atomic writer — a shell `>`
+/// redirect, a build step. It is what made
+/// `an_external_change_autoreloads_via_the_buffer_watch` flake: the watch fired on the
+/// truncate, the reload read an empty file, and nothing ever revisited it.
+#[tokio::test]
+async fn a_reload_that_catches_a_torn_write_still_converges() {
+    let path = temp_path("torn-write");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+
+    let torn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let init = ServerInit {
+        file: Some(path.to_string_lossy().into_owned()),
+        host_fs: Some(Box::new(TornWriteFs {
+            real: bemtvi_core::host::StdHostFs,
+            path: path.clone(),
+            torn: torn.clone(),
+        })),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    // The external write completes on the real disk, but the reload below is made to
+    // catch the file mid-write.
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    torn.store(true, std::sync::atomic::Ordering::SeqCst);
+    feed_sync(&rpc, ":checktime<CR>").await;
+
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three"],
+        "a reload that caught the writer mid-write must re-read rather than strand \
+         the buffer on the truncated text"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 // --- `FileChangedShell` / `v:fcs_reason` / `v:fcs_choice` ----------------------
 //
 // When a changed file is *not* silently autoreloaded, the reconcile fires the

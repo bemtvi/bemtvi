@@ -1327,6 +1327,26 @@ impl EditHost {
                     recursive: false,
                 });
                 self.buf_watches.insert(*id, key.clone());
+                // Check the file once now that a watch is going up. A watch can never
+                // be armed atomically with respect to a file that is already being
+                // written: the actor drops the old watcher before creating the new one
+                // (`LoopCommand::FsEventStart`), and the very first arm happens some
+                // way into the session. Anything that lands in that window fires no
+                // event and would otherwise be invisible forever.
+                //
+                // It bites hardest right after a *reload*, which is what re-stamps the
+                // watch key and brings us here: a writer that truncates in place gets
+                // its truncate caught by the watch, and the write that follows lands in
+                // the re-arm gap — leaving the buffer showing an empty file that no
+                // later check ever revisits. The daemon leg already compensates for its
+                // own version of this (it hands the baseline over so a re-dialed daemon
+                // spots a change made while the link was down); this is the local twin.
+                //
+                // Cheap and self-limiting: `sync_buffer_watches` only arms on a key
+                // *change* (open, reload, save), the check is one stat, and it queues a
+                // reload only when the file really did move — after which the key
+                // matches and the next pass arms nothing.
+                self.editor.checktime_buffer(*id);
             }
         }
         // Disarm watches for buffers that are gone (or lost their file).

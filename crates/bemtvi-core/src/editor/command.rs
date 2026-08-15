@@ -2459,7 +2459,13 @@ impl Editor {
             NormalCmd::InsertLineStart => {
                 self.enter_insert_each(|ed| ed.first_non_blank(ed.cursor.line))
             }
-            NormalCmd::InsertAfter => self.enter_insert_each(|ed| ed.cursor.col + 1),
+            // One *grapheme* forward, not one byte: on a multi-byte character a
+            // `col + 1` insert column lands mid-character, and the first key typed
+            // there splits it (the rope panics on a non-boundary offset).
+            NormalCmd::InsertAfter => self.enter_insert_each(|ed| {
+                let s = ed.buffer().line_cow(ed.cursor.line);
+                crate::unicode::next_grapheme(&s, ed.cursor.col)
+            }),
             NormalCmd::InsertLineEnd => self.enter_insert_each(|ed| ed.line_len()),
             NormalCmd::OpenBelow => self.edit_each_cursor(|ed| ed.open_line(true)),
             NormalCmd::OpenAbove => self.edit_each_cursor(|ed| ed.open_line(false)),

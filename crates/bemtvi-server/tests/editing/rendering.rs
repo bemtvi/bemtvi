@@ -320,6 +320,27 @@ async fn x_deletes_a_wide_char_and_leaves_the_rest() {
 }
 
 #[tokio::test]
+async fn a_appends_after_a_whole_multibyte_grapheme() {
+    // `a` steps a whole grapheme, not one byte. A byte-wide step lands the insert
+    // column *inside* a multi-byte character, so the next typed key tries to split
+    // it — the rope's insert panics on an offset that is not a char boundary.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "i日本<Esc>");
+    feed(&rpc, "0ax<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["日x本"]);
+}
+
+#[tokio::test]
+async fn a_appends_after_a_whole_combining_grapheme() {
+    // Same step, over a cluster whose second codepoint is a combining mark: the
+    // appended text must land after the mark, never between it and its base.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ie\u{0301}x<Esc>"); // "éx" as e + combining acute + x
+    feed(&rpc, "0ay<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["e\u{0301}yx"]);
+}
+
+#[tokio::test]
 async fn charwise_paste_keeps_a_combining_grapheme_intact() {
     // "éx" is e + combining acute, then x. Yank the é cluster, then paste it
     // after the cursor: it must land whole after é, never split between the

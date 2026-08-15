@@ -87,6 +87,28 @@ impl UndoTree {
         self.nodes.iter().position(|n| n.seq == seq)
     }
 
+    /// Whether the state at `idx` lies on the `back` side of the current one in
+    /// **seq** order — at or before `cur` going back, strictly after it going
+    /// forward. Every travel filters its candidates through this before looking at
+    /// the field it actually seeks by; vim wraps its own closest-match search in the
+    /// same test (`uh_seq <= b_u_seq_cur` going back, `uh_seq > b_u_seq_cur` going
+    /// forward).
+    ///
+    /// It is what keeps a travel monotonic when the sought field is *not*. A save
+    /// number is stamped onto whichever state is current when `:w` runs, so it does
+    /// not grow with seq: write, undo, write again, and write 1 sits on a *later*
+    /// state than write 2 — seeking "one write back" by number alone would walk
+    /// forward into the abandoned branch. Node times can tie the same way (the
+    /// timeline is whole seconds).
+    fn on_travel_side(&self, idx: NodeIdx, back: bool) -> bool {
+        let cur = self.cur_seq();
+        if back {
+            self.nodes[idx].seq <= cur
+        } else {
+            self.nodes[idx].seq > cur
+        }
+    }
+
     /// The node holding the state **nearest** `target` in seq order, on the `back`
     /// side of it: the greatest `seq <= target` going back, the smallest `seq >=
     /// target` going forward.
@@ -97,12 +119,13 @@ impl UndoTree {
     /// to the nearest node on the *other* side when nothing lies on the requested one
     /// (every reachable end of a pruned tree still lands somewhere real).
     fn node_near_seq(&self, target: u64, back: bool) -> NodeIdx {
-        let on_side = self.nodes.iter().enumerate().filter(|(_, n)| {
-            if back {
-                n.seq <= target
-            } else {
-                n.seq >= target
-            }
+        let on_side = self.nodes.iter().enumerate().filter(|&(i, n)| {
+            self.on_travel_side(i, back)
+                && if back {
+                    n.seq <= target
+                } else {
+                    n.seq >= target
+                }
         });
         let pick = if back {
             on_side.max_by_key(|(_, n)| n.seq)
@@ -111,12 +134,13 @@ impl UndoTree {
         };
         match pick {
             Some((i, _)) => i,
-            // Nothing on that side (the whole tree lies past `target`): take the
-            // closest state overall rather than refusing to move.
+            // Nothing that far (a pruned-away stretch of seqs): take the closest
+            // state still in the travel's direction rather than refusing to move.
             None => self
                 .nodes
                 .iter()
                 .enumerate()
+                .filter(|&(i, _)| self.on_travel_side(i, back))
                 .min_by_key(|(_, n)| n.seq.abs_diff(target))
                 .map(|(i, _)| i)
                 .unwrap_or(self.cur),
@@ -124,16 +148,17 @@ impl UndoTree {
     }
 
     /// The node whose `time` is nearest `target` on the `back` side of it — the
-    /// [`node_near_seq`](Self::node_near_seq) rule applied to timestamps, tie-broken
-    /// by seq so states stamped the same second still resolve in the travel's
-    /// direction (the clock is whole seconds, so ties are the common case).
+    /// [`node_near_seq`](Self::node_near_seq) rule applied to timestamps, over the
+    /// candidates [`on_travel_side`](Self::on_travel_side) admits, and tie-broken by
+    /// seq (the timeline is whole seconds, so ties are the common case).
     fn node_near_time(&self, target: i64, back: bool) -> NodeIdx {
-        let on_side = self.nodes.iter().enumerate().filter(|(_, n)| {
-            if back {
-                n.time <= target
-            } else {
-                n.time >= target
-            }
+        let on_side = self.nodes.iter().enumerate().filter(|&(i, n)| {
+            self.on_travel_side(i, back)
+                && if back {
+                    n.time <= target
+                } else {
+                    n.time >= target
+                }
         });
         let pick = if back {
             on_side.max_by_key(|(_, n)| (n.time, n.seq))
@@ -161,9 +186,11 @@ impl UndoTree {
     }
 
     /// The node stamped with save number `target`, or the nearest write on the `back`
-    /// side of it. A target past either end (including `<= 0`, "before the first
-    /// write") resolves to that end of the tree, so `:earlier 99f` reaches the
-    /// original text instead of refusing.
+    /// side of it — among the candidates [`on_travel_side`](Self::on_travel_side)
+    /// admits, without which a write stamped on a *newer* state could be sought
+    /// backwards. A target past either end (including `<= 0`, "before the first
+    /// write"), or no write left in the travel's direction, resolves to that end of
+    /// the tree, so `:earlier 99f` reaches the original text instead of refusing.
     fn node_near_save(&self, target: i64, back: bool) -> NodeIdx {
         if target <= 0 {
             return self.end_node(true);
@@ -173,6 +200,7 @@ impl UndoTree {
             .nodes
             .iter()
             .enumerate()
+            .filter(|&(i, _)| self.on_travel_side(i, back))
             .filter_map(|(i, n)| n.save.map(|nr| (i, nr)))
             .filter(|&(_, nr)| if back { nr <= target } else { nr >= target });
         let pick = if back {
@@ -366,11 +394,18 @@ impl UndoTree {
         let pending = self
             .dirty
             .then_some((self.cur, self.next_seq, self.dirty_since));
-        let (seq_cur, seq_last, time_cur, save_cur) = match pending {
-            Some((_, seq, time)) => (seq, seq, time, 0),
+        // `save_cur` is vim's `b_u_save_nr_cur` — "the file write we are now after",
+        // the base `:earlier 1f` counts back from — so it is the *ancestor* walk, not
+        // this node's own `save`. Editing on top of a write keeps reporting it; only
+        // stepping past the write drops it. Reporting the node's own `save` made the
+        // number a visualizer reads disagree with the one
+        // [`Editor::undo_travel_file`] counts from.
+        let save_cur = self.save_at_or_above_cur().unwrap_or(0);
+        let (seq_cur, seq_last, time_cur) = match pending {
+            Some((_, seq, time)) => (seq, seq, time),
             None => {
                 let c = &self.nodes[self.cur];
-                (c.seq, self.seq_last(), c.time, c.save.unwrap_or(0))
+                (c.seq, self.seq_last(), c.time)
             }
         };
         UndoTreeView {

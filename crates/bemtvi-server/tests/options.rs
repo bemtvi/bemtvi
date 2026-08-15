@@ -1083,6 +1083,73 @@ async fn every_scoped_option_is_routed_by_vim_opt() {
     );
 }
 
+/// Routing a name is only half of it: the value has to land in the **core**. Every
+/// buffer-scoped number/boolean option must come back changed after a `btv.bo` write —
+/// the per-buffer Lua bridge (`Editor::set_buffer_option_num` / `_bool`) matches on the
+/// name and silently `return`s on anything it does not know, so a catalog entry with no
+/// arm there reads back its default forever.
+///
+/// This is `every_known_option_is_wired_not_silent`'s hole: that guard covers the `:set`
+/// ex path, where an unwired name is a loud `E518`. The Lua bridge has no such error to
+/// assert on, so the write-then-read-back *is* the assertion. It caught `'undolevels'`,
+/// which routed fine and set nothing.
+///
+/// The probe value is "the current one, moved": `n + 1` for a number, the flipped
+/// boolean. That is in range for every buffer option today (`softtabstop` -1 → 0 is the
+/// tightest); an option with a narrower range needs its own value here rather than a
+/// silent skip.
+///
+/// String options are deliberately out: "a different *valid* value" is not derivable
+/// from the catalog (`foldmethod` takes an enum, `regexsyntax` two spellings), so they
+/// are covered by name in the tests around this one.
+#[tokio::test]
+async fn every_buffer_option_write_from_lua_reaches_the_core() {
+    let (rpc, _incoming) = start().await;
+    let rows = exec_lua(
+        &rpc,
+        "local o = {} \
+         for _, r in ipairs(btv._options_catalog) do \
+           if r.scope == 'buffer' and r.kind ~= 'string' then \
+             o[#o + 1] = r.name .. '|' .. r.kind \
+           end \
+         end \
+         return table.concat(o, ',')",
+    )
+    .await;
+    let rows = rows.as_str().expect("catalog rows join").to_string();
+    assert!(
+        rows.split(',').count() >= 10,
+        "the catalog should enumerate the buffer options, got {rows:?}"
+    );
+
+    let mut dropped = Vec::new();
+    for row in rows.split(',') {
+        let (name, kind) = row.split_once('|').expect("name|kind");
+        let before = exec_lua(&rpc, &format!("return btv.bo[0].{name}")).await;
+        let want = if kind == "bool" {
+            format!("{}", before.as_bool() != Some(true))
+        } else {
+            format!("{}", before.as_i64().expect("a number reads back") + 1)
+        };
+        exec_lua(&rpc, &format!("btv.bo[0].{name} = {want}")).await;
+        // A separate round trip: the write echoes into the Lua mirror for
+        // read-after-write, so only the server's next push shows what the core took.
+        let after = exec_lua(&rpc, &format!("return btv.bo[0].{name}")).await;
+        let got = if kind == "bool" {
+            format!("{}", after.as_bool() == Some(true))
+        } else {
+            format!("{}", after.as_i64().unwrap_or(i64::MIN))
+        };
+        if got != want {
+            dropped.push(format!("{name}: wrote {want}, read back {got}"));
+        }
+    }
+    assert!(
+        dropped.is_empty(),
+        "a `btv.bo` write on these buffer options never reached the core: {dropped:?}"
+    );
+}
+
 /// The exact config pattern the global-local plan set out to close: `vim.opt.foldmethod`
 /// next to `vim.opt.foldexpr` has to fold every buffer, this one and the next. Both
 /// halves used to land in `btv._o_store` — the core honored `:set foldmethod=expr`, but

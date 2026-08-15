@@ -2500,8 +2500,21 @@ impl EditHost {
     /// Set the Worker's current JS clock (ms) so a [`WasmTimer`] armed during the next
     /// tick computes its `due_ms` relative to *now*. The Worker calls this before
     /// feeding input; [`fire_due_timers`](Self::fire_due_timers) sets it too.
+    ///
+    /// It also advances the editor's **monotonic second base** — the wasm twin of the
+    /// per-message stamp the native `handle()` does. That base is the undo timeline:
+    /// every node commits with the second its change group began, and `:undolist`'s age
+    /// column and `:earlier`/`:later {N}s|m|h|d` read the deltas. Unstamped it stays 0
+    /// forever, so on the web every state would be the same age and every timed travel
+    /// would run off the end of the history. `performance.now()` is milliseconds since
+    /// page load, so `/ 1000` is the same seconds-since-start basis native uses (the
+    /// root node's `time: 0` included). `vim.fn.localtime()` mirrors it, as it does
+    /// natively.
     pub fn set_clock(&mut self, now_ms: u64) {
         self.clock_ms = now_ms;
+        let secs = (now_ms / 1000) as i64;
+        self.editor.set_now_mono(secs);
+        let _ = self.lua.set_mono_secs(secs);
     }
 
     /// The soonest pending timer deadline (ms on the JS clock), or `None` when no timer
@@ -2529,7 +2542,9 @@ impl EditHost {
     /// repeating timer (`repeat_ms > 0`) re-arms to `now + repeat_ms` *before* its
     /// callback runs, so the callback sees the next deadline already set.
     pub fn fire_due_timers(&mut self, now_ms: u64) -> bool {
-        self.clock_ms = now_ms;
+        // Through `set_clock` so a callback that edits commits its undo node on this
+        // wake's timestamp, not the last keystroke's.
+        self.set_clock(now_ms);
         let mut due: Vec<WasmTimer> = self
             .wasm_timers
             .iter()

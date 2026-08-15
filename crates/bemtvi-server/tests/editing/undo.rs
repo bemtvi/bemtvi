@@ -449,6 +449,61 @@ async fn earlier_f_past_the_first_write_reaches_the_original_text() {
 }
 
 #[tokio::test]
+async fn earlier_by_write_never_travels_forward() {
+    // A save number is stamped onto whichever state is current when `:w` runs, so it
+    // does not increase with seq: writing, undoing and writing again leaves write 1 on
+    // a *later* state than write 2. Seeking "one write back" by number alone would
+    // then walk straight forward into the abandoned branch — `:earlier` must never
+    // move the buffer to a newer state.
+    let path = write_temp("earlier_f_dir", "txt", "alpha\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+
+    feed_sync(&rpc, "ia<Esc>").await; // state 1: "aalpha"
+    feed_sync(&rpc, "ib<Esc>").await; // state 2: "baalpha"
+    feed_sync(&rpc, ":w<CR>").await; // write 1 == state 2
+    feed_sync(&rpc, "u").await; // back to state 1
+    feed_sync(&rpc, ":w<CR>").await; // write 2 == state 1
+
+    feed_sync(&rpc, ":earlier 1f<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["alpha"]),
+        "no write lies behind state 1, so `:earlier 1f` travels as far back as it \
+         goes — never forward onto write 1's abandoned branch"
+    );
+}
+
+#[tokio::test]
+async fn later_by_write_never_travels_backward() {
+    // The mirror of `earlier_by_write_never_travels_forward`: from a branch with no
+    // write behind it, the only write in the tree is *older*, and seeking it by number
+    // alone would rewind the buffer under a `:later`.
+    let path = write_temp("later_f_dir", "txt", "alpha\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+
+    feed_sync(&rpc, "ia<Esc>").await; // state 1
+    feed_sync(&rpc, "ib<Esc>").await; // state 2: "baalpha"
+    feed_sync(&rpc, ":w<CR>").await; // write 1 == state 2
+    feed_sync(&rpc, ":undo 0<CR>").await; // back to the original text
+    feed_sync(&rpc, "ic<Esc>").await; // state 3: "calpha", a branch off the root
+    feed_sync(&rpc, "id<Esc>").await; // state 4: "dcalpha"
+    feed_sync(&rpc, "u").await; // land on state 3
+
+    feed_sync(&rpc, ":later 1f<CR>").await;
+    let after = lines(&rpc).await;
+    assert_ne!(
+        after,
+        v(&["baalpha"]),
+        "`:later 1f` must not rewind onto write 1, which is an older state"
+    );
+    assert_eq!(
+        after,
+        v(&["dcalpha"]),
+        "no write lies ahead of state 3, so it travels as far forward as it goes"
+    );
+}
+
+#[tokio::test]
 async fn an_absurd_travel_count_saturates_instead_of_wrapping() {
     let (rpc, _incoming) = start_with_file("alpha\nbravo\n").await;
 
@@ -656,5 +711,86 @@ async fn undolevels_is_settable_per_buffer_and_globally() {
         exec_lua(&rpc, "return btv.bo[0].undolevels").await.as_i64(),
         Some(7),
         "a new buffer is born from the global tier"
+    );
+}
+
+#[tokio::test]
+async fn undolevels_is_settable_from_lua() {
+    let (rpc, _incoming) = start_with_file("alpha\n").await;
+
+    // `vim.bo` / `btv.bo` reach the *core*, not just the mirror the write echoes into
+    // for read-after-write — so the read-back has to be a separate round trip, after
+    // the server has pushed the core's own value back.
+    exec_lua(&rpc, "vim.bo[0].undolevels = 3").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.bo[0].undolevels").await.as_i64(),
+        Some(3),
+        "a `vim.bo` write reaches the core rather than being silently dropped"
+    );
+
+    // And it is the history that moves, not only the readout: `-1` records nothing,
+    // so `u` has nowhere to go.
+    exec_lua(&rpc, "btv.bo[0].undolevels = -1").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.bo[0].undolevels").await.as_i64(),
+        Some(-1)
+    );
+    feed_sync(&rpc, "ix<Esc>").await;
+    feed_sync(&rpc, "iy<Esc>").await;
+    feed_sync(&rpc, "u").await;
+    assert_eq!(
+        lines(&rpc).await,
+        v(&["yxalpha"]),
+        "`btv.bo.undolevels = -1` bounds the real history: nothing was recorded to undo"
+    );
+}
+
+/// vim's `undotree().save_cur` is `b_u_save_nr_cur` — "the file write nr after which we
+/// are now", the base `:earlier 1f` counts back from — not "a write stamped on exactly
+/// this state". Editing on top of a write keeps it; undoing back past one drops it.
+///
+/// bemtvi's `:earlier {N}f` already resolves it that way (an ancestor walk, so a write
+/// on an abandoned branch is not behind us); the projection reported only the current
+/// node's own `save`, so the number a visualizer read disagreed with the number the
+/// command it drives actually counts from.
+#[tokio::test]
+async fn undotree_save_cur_is_the_write_the_state_descends_from() {
+    let path = write_temp("save_cur", "txt", "alpha\nbravo\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+
+    async fn save_cur(rpc: &Rpc) -> i64 {
+        exec_lua(rpc, "return btv.undotree.get(0).save_cur")
+            .await
+            .as_i64()
+            .expect("save_cur is a number")
+    }
+
+    feed_sync(&rpc, "x").await;
+    feed_sync(&rpc, ":w<CR>").await;
+    assert_eq!(save_cur(&rpc).await, 1, "the written state is write 1");
+
+    // An uncommitted edit on top of the write still descends from it…
+    feed_sync(&rpc, "jx").await;
+    assert_eq!(
+        save_cur(&rpc).await,
+        1,
+        "a pending edit is still after write 1"
+    );
+    // …and so does the next one, once the first has committed.
+    feed_sync(&rpc, "kx").await;
+    assert_eq!(save_cur(&rpc).await, 1);
+
+    // Undoing back down the spine keeps reporting it, right up to the write itself.
+    feed_sync(&rpc, "u").await;
+    assert_eq!(save_cur(&rpc).await, 1);
+    feed_sync(&rpc, "u").await;
+    assert_eq!(save_cur(&rpc).await, 1, "back on the written state itself");
+
+    // Only stepping past the write drops it to "before any write".
+    feed_sync(&rpc, "u").await;
+    assert_eq!(
+        save_cur(&rpc).await,
+        0,
+        "the original text is before write 1"
     );
 }

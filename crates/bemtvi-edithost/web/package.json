@@ -24,6 +24,7 @@
     "verify-lsp": "node verify-lsp.mjs",
     "verify-terminal": "node verify-terminal.mjs",
     "verify-luafile": "node verify-luafile.mjs",
+    "verify-undo-time": "node verify-undo-time.mjs",
     "verify-pyodide-terminal": "node verify-pyodide-terminal.mjs",
     "verify-pyodide-repl": "node verify-pyodide-repl.mjs",
     "verify-pyodide-proc": "node verify-pyodide-proc.mjs",

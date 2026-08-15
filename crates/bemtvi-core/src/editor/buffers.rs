@@ -231,9 +231,10 @@ pub enum FileChangeAction {
 impl Editor {
     /// Set a buffer-local option on buffer `id` from outside the editor (the Lua
     /// `vim.bo` / `nvim_set_option_value` bridge). `value` is the option's scalar:
-    /// a number for `tabstop`/`shiftwidth`/`softtabstop` (booleans arrive through
-    /// [`Editor::set_buffer_option_bool`]). It is clamped to each option's valid
-    /// range (`tabstop ≥ 1`, `shiftwidth ≥ 0`, `softtabstop ≥ -1`). Unknown options
+    /// a number for `tabstop`/`shiftwidth`/`softtabstop`/the `fold*` knobs/
+    /// `undolevels` (booleans arrive through [`Editor::set_buffer_option_bool`]). It
+    /// is clamped to each option's valid range (`tabstop ≥ 1`, `shiftwidth ≥ 0`,
+    /// `softtabstop ≥ -1`, `undolevels ≥ -1`). Unknown options
     /// and unknown buffers are ignored (the Lua side only forwards the wired set,
     /// and the buffer is mirror-guarded).
     pub fn set_buffer_option_num(&mut self, id: BufferId, name: &str, value: i64) {
@@ -262,6 +263,14 @@ impl Editor {
             }
             "foldnestmax" => ob.buffer.options.foldnestmax = value.max(1) as usize,
             "foldminlines" => ob.buffer.options.foldminlines = value.max(0) as usize,
+            // `'undolevels'` bounds the undo history rather than any computed
+            // structure, so it returns before the re-fold below. `-1` ("record no
+            // undo") is its floor, as on the `:set` path — which rejects anything
+            // lower loud; this bridge clamps, per the convention above.
+            "undolevels" => {
+                ob.buffer.options.undolevels = value.max(-1);
+                return;
+            }
             _ => return,
         }
         // `shiftwidth`/`tabstop` change the indent scale and the two `fold*` knobs the

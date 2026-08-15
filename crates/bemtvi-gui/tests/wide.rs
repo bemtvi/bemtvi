@@ -5,7 +5,8 @@
 //! the grid by substituting cell-width spaces.)
 
 use bemtvi_gui::{
-    cluster_scale, is_letterform, italic_runs, mask_segments, offgrid_clusters, Ink, Seg,
+    cluster_scale, is_letterform, italic_runs, mask_segments, offgrid_clusters, overflow_ceiling,
+    overflow_cells, GlyphOverflow, Ink, Seg,
 };
 
 fn seg(text: &str, fg: u32) -> Seg {
@@ -207,6 +208,178 @@ fn keeps_the_ceiling_for_an_unrasterised_glyph() {
     // No ink box (a blank or missing glyph): nothing to fit, so the configured ceiling
     // stands rather than some invented default.
     assert!((cluster_scale(1.2, CELL_W, CELL_H, None) - 1.2).abs() < 1e-4);
+}
+
+// ---------------------------------------------------------------------------
+// `overflow_cells(mode, span, measured, cell_w, next_blank)` decides whether a one-cell
+// glyph may borrow the cell to its right and render at its natural size instead of being
+// shrunk into its own — wezterm's `allow_square_glyphs_to_overflow_width`. It returns the
+// EXTRA cells (0 or 1) the caller adds to the reserved span before fitting.
+// `\u{e620}` (Symbols Nerd Font Mono) is the worked example throughout: a square full-em
+// glyph, 15px of advance and ink, in one 9px cell.
+// ---------------------------------------------------------------------------
+
+/// The Nerd Font icon's measurement: 15px advance, 15×15 of ink — square, and half again
+/// wider than the 9px cell the editor reserves for a Private Use codepoint.
+fn nerd_icon() -> Option<(f32, Ink)> {
+    Some((15.0, ink(0.0, 15.0, 15.0)))
+}
+
+#[test]
+fn grows_an_icon_into_the_blank_cell_on_its_right() {
+    let extra = overflow_cells(
+        GlyphOverflow::WhenFollowedBySpace,
+        1.0,
+        nerd_icon(),
+        CELL_W,
+        true,
+    );
+    assert_eq!(extra, 1.0);
+    // And that extra cell is the whole point: fitted to one cell the icon renders at 0.6,
+    // fitted to two it comes back to its natural size — the "put a space after the icon
+    // and it gets bigger" behaviour.
+    let cramped = cluster_scale(1.2, CELL_W, CELL_H, nerd_icon());
+    let roomy = cluster_scale(
+        overflow_ceiling(1.2, extra),
+        (1.0 + extra) * CELL_W,
+        CELL_H,
+        nerd_icon(),
+    );
+    assert!((cramped - 0.6).abs() < 1e-4, "expected 0.6, got {cramped}");
+    assert!(
+        (roomy - 1.0).abs() < 1e-4,
+        "expected natural size 1.0, got {roomy}"
+    );
+}
+
+#[test]
+fn an_overflowing_icon_stops_at_its_natural_size() {
+    // The borrowed cell exists to stop the icon being shrunk, not to magnify it: the
+    // `emoji_scale` ceiling — which is there to scale a colour-emoji font UP to its cells
+    // — must not inflate an icon already at its design size to fill both cells. Even a
+    // generous 2.0 stops at 1.0 once a cell has been borrowed.
+    assert!((overflow_ceiling(1.2, 1.0) - 1.0).abs() < 1e-4);
+    assert!((overflow_ceiling(2.0, 1.0) - 1.0).abs() < 1e-4);
+    // A ceiling configured below 1 still wins — `--emoji-scale` remains the way to tune
+    // the icons down further.
+    assert!((overflow_ceiling(0.9, 1.0) - 0.9).abs() < 1e-4);
+    // And a glyph that borrowed nothing is untouched: colour emoji still scale UP to
+    // their two cells at the full ceiling.
+    assert!((overflow_ceiling(1.2, 0.0) - 1.2).abs() < 1e-4);
+}
+
+#[test]
+fn keeps_an_icon_in_its_cell_when_a_glyph_follows() {
+    // Nothing blank to spill into — the icon is shrunk to its own cell as before, rather
+    // than painting over the character next to it.
+    assert_eq!(
+        overflow_cells(
+            GlyphOverflow::WhenFollowedBySpace,
+            1.0,
+            nerd_icon(),
+            CELL_W,
+            false
+        ),
+        0.0
+    );
+}
+
+#[test]
+fn always_grows_the_icon_whatever_follows() {
+    // The opt-in mode: full-size icons at the cost of overpainting the next cell.
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, nerd_icon(), CELL_W, false),
+        1.0
+    );
+}
+
+#[test]
+fn never_grows_the_icon_even_with_a_blank_to_its_right() {
+    // The opt-out mode: back to fit-to-cell everywhere.
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Never, 1.0, nerd_icon(), CELL_W, true),
+        0.0
+    );
+}
+
+#[test]
+fn leaves_a_powerline_separator_in_its_cell() {
+    // `\u{e0b0}` is tall and narrow (6px of ink across a 20px line), not square: it is
+    // *meant* to fill exactly its one cell and tile seamlessly with the segment beside
+    // it, so growing it would break the join this feature has no business touching.
+    let sep = Some((15.0, ink(0.0, 6.0, 20.0)));
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, sep, CELL_W, true),
+        0.0
+    );
+}
+
+#[test]
+fn leaves_a_box_drawing_rule_in_its_cell() {
+    // The mirror case: `─` inks the full cell width and barely any height. Also not
+    // square, also tiles with its neighbours.
+    let rule = Some((9.0, ink(0.0, 9.0, 2.0)));
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, rule, CELL_W, true),
+        0.0
+    );
+}
+
+#[test]
+fn leaves_a_two_cell_emoji_alone() {
+    // A wide glyph already has the room its design wants; a third cell would put its ink
+    // over a column nothing checked was blank.
+    let emoji = Some((18.6, ink(0.0, 18.0, 17.0)));
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 2.0, emoji, CELL_W, true),
+        0.0
+    );
+}
+
+#[test]
+fn leaves_a_glyph_that_already_fits_its_cell() {
+    // 8px of square ink inside the 9px cell: it is not being shrunk, so it has nothing
+    // to gain — and a borrowed cell would let `emoji_scale` inflate it past the size it
+    // renders at today.
+    let small = Some((8.0, ink(0.0, 8.0, 8.0)));
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, small, CELL_W, true),
+        0.0
+    );
+}
+
+#[test]
+fn keeps_an_unrasterised_glyph_in_its_cell() {
+    // No ink box (a blank or missing glyph): there is nothing to grow, and no ink to
+    // judge square.
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, None, CELL_W, true),
+        0.0
+    );
+}
+
+#[test]
+fn parses_every_spelling_of_the_mode() {
+    // The flag, the env var and the short alias all reach the same three modes; an
+    // unknown spelling is rejected (the CLI turns that into a usage error) rather than
+    // silently falling back to a default.
+    assert_eq!(GlyphOverflow::parse("never"), Some(GlyphOverflow::Never));
+    assert_eq!(GlyphOverflow::parse("Always"), Some(GlyphOverflow::Always));
+    assert_eq!(
+        GlyphOverflow::parse("when-followed-by-space"),
+        Some(GlyphOverflow::WhenFollowedBySpace)
+    );
+    assert_eq!(
+        GlyphOverflow::parse(" WhenFollowedBySpace "),
+        Some(GlyphOverflow::WhenFollowedBySpace)
+    );
+    assert_eq!(
+        GlyphOverflow::parse("space"),
+        Some(GlyphOverflow::WhenFollowedBySpace)
+    );
+    assert_eq!(GlyphOverflow::parse("sometimes"), None);
+    // The default is the interesting mode, matching wezterm's.
+    assert_eq!(GlyphOverflow::default(), GlyphOverflow::WhenFollowedBySpace);
 }
 
 // ---------------------------------------------------------------------------

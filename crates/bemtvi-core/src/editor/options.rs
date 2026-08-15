@@ -655,6 +655,40 @@ impl Editor {
             }
             return;
         }
+        // `guiglyphoverflow` is a global enumerated string, and a client-side one: the
+        // core never reads it, it relays it (like `guifont`) to whichever client paints
+        // the glyphs. Validated here all the same — a typo in an enumerated value must
+        // fail loud (E474) rather than leaving the rendering silently on the previous
+        // mode. The accepted spellings are the client's `GlyphOverflow::parse`
+        // (`bemtvi-gui/src/lib.rs`, mirrored by the web client's `glyphOverflowMode`);
+        // keep the three lists in step. `&` resets to empty — "the client's own setting".
+        if name == "guiglyphoverflow" {
+            match op {
+                StrOp::Set(value) => {
+                    let canon = value.trim().to_ascii_lowercase().replace('_', "-");
+                    if !matches!(
+                        canon.as_str(),
+                        "never"
+                            | "always"
+                            | "when-followed-by-space"
+                            | "whenfollowedbyspace"
+                            | "space"
+                    ) {
+                        self.echo(format!("E474: Invalid argument: guiglyphoverflow={value}"));
+                        return;
+                    }
+                    self.set_global_option_str(name, &value);
+                }
+                StrOp::Reset => {
+                    self.set_global_option_str(name, "");
+                }
+                StrOp::Query => {
+                    let v = self.options.guiglyphoverflow.clone();
+                    self.echo(format!("guiglyphoverflow={v}"));
+                }
+            }
+            return;
+        }
         // `fileencoding` is buffer-local and enumerated: only a real encoding
         // label (or empty, meaning UTF-8) is valid, and a bad value must fail
         // loud (E474) rather than silently sticking the buffer on the wrong

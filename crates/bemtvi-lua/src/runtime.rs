@@ -570,6 +570,9 @@ pub struct GoMirror {
     pub statusline: String,
     pub tabline: String,
     pub guifont: String,
+    /// `'guiglyphoverflow'` — when a square one-cell glyph may render over the cell to
+    /// its right. Backs `vim.o.guiglyphoverflow` / `btv.o.guiglyphoverflow`.
+    pub guiglyphoverflow: String,
     /// The `'regexsyntax'` dialect (`"pcre"`/`"vim"`) backing `vim.o.regexsyntax`.
     pub regexsyntax: String,
     /// The `'fileencodings'` read-detection list (comma-separated) backing

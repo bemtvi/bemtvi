@@ -1,0 +1,28 @@
+1. The same icon, with and without a blank cell after it
+
+    init.lua          <- a space follows: it may take that cell
+   init.lua           <- a letter follows: it is shrunk to fit
+    plugins/           <- a space follows
+   plugins/            <- a letter follows
+
+2. A file-tree row, which is where you actually meet this
+
+    crates/
+      init.lua
+      options.lua
+
+3. Powerline separators — never grown, never shrunk (not square)
+
+    NORMAL  init.lua  lua 
+    12:4  utf-8 
+
+4. Box drawing — same: it tiles with its neighbours, so it is left alone
+
+   ┌────────────┬────────────┐
+   │ one cell   │ each       │
+   └────────────┴────────────┘
+
+5. Two-cell glyphs already have the room they want
+
+   沖縄県  🤴🏼  ❤️  <- unchanged in every mode
+

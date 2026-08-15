@@ -156,6 +156,35 @@
       });
 
     const FONT_PX = 15, LINE = 1.4;
+    // When a *square* one-cell glyph (a Nerd Font icon) may be drawn at its natural size,
+    // overflowing into the cell to its right, instead of being shrunk to fit the one cell
+    // the editor reserved for it: `'guiglyphoverflow'`, wezterm's
+    // `allow_square_glyphs_to_overflow_width`, same three modes and same default. The
+    // column model never changes — the glyph still *occupies* one cell — only its ink.
+    //
+    // The page has no CLI, so `?glyph-overflow=…` is this client's equivalent of the
+    // GUI's `--glyph-overflow` startup default; the option relayed on each frame (set
+    // from `init.lua`, which is the configuration users actually reach for) wins over it.
+    const GLYPH_OVERFLOW_NAMES = "never | always | when-followed-by-space";
+    function parseGlyphOverflow(spec) {
+      switch (String(spec ?? "").trim().toLowerCase().replace(/_/g, "-")) {
+        case "never": return "never";
+        case "always": return "always";
+        case "space": case "when-followed-by-space": case "whenfollowedbyspace":
+          return "space";
+        default: return null;
+      }
+    }
+    const GLYPH_OVERFLOW_DEFAULT =
+      parseGlyphOverflow(new URL(location.href).searchParams.get("glyph-overflow")) || "space";
+    let glyphOverflow = GLYPH_OVERFLOW_DEFAULT;
+    // Warn once per bad value rather than on every repaint.
+    let warnedGlyphOverflow = "";
+    // Whether a square over-wide glyph may spill, given what sits in the cell to its
+    // right. "Blank" is an actual space in the same run, exactly as the GUI reads it.
+    function glyphMayOverflow(nextBlank) {
+      return glyphOverflow === "always" || (glyphOverflow === "space" && nextBlank);
+    }
     const gridEl = document.getElementById("grid");
     // The element that owns keyboard + clipboard focus. Focus it — never the grid — so
     // Firefox delivers `paste` events and every browser routes keydown here. It's invisible
@@ -399,92 +428,126 @@
       // base alone measures 1, and it needs the box just as much as a kanji does.
       return clusterWidth(ch) === 2 || cp >= 0x2190;
     }
+    // The rasterised ink of one glyph, measured once per codepoint with Canvas
+    // `measureText` — the DOM analogue of the swash ink placement the GUI reads. With the
+    // pen at x=0 the ink spans `[left, right]`, the advance ends at `adv`, and `height` is
+    // the ink's own vertical extent. Every glyph decision below is arithmetic on these
+    // four numbers, so the measurement (the expensive part) is memoised on the codepoint
+    // while the decisions — which depend on the box, the mode and the neighbour — are not.
+    // The boxed-glyph set is small and bounded, so the cache is too.
+    const inkCache = new Map();
+    let measureCtx = null;
+    function inkMetrics(cp) {
+      const hit = inkCache.get(cp);
+      if (hit !== undefined) return hit;
+      let m = null;
+      try {
+        if (!measureCtx) {
+          measureCtx = document.createElement("canvas").getContext("2d");
+          measureCtx.textAlign = "left";
+          measureCtx.textBaseline = "alphabetic";
+        }
+        measureCtx.font = `${FONT_PX}px ${getComputedStyle(gridEl).fontFamily}`;
+        const t = measureCtx.measureText(String.fromCodePoint(cp));
+        m = {
+          left: -t.actualBoundingBoxLeft,
+          right: t.actualBoundingBoxRight,
+          adv: t.width,
+          height: t.actualBoundingBoxAscent + t.actualBoundingBoxDescent,
+        };
+      } catch { /* measureText unavailable → no measurement, every decision no-ops */ }
+      inkCache.set(cp, m);
+      return m;
+    }
     // Some Nerd / powerline separators are shaped by a fallback font inside an advance
     // box wider than their reserved cell, with the *ink* parked at one side: a right-
     // pointing `` hugs the box's left, a left-pointing `` hugs its right. Even centred in
     // its cell a right-hugging separator sits a touch left of where the seamless powerline
     // join wants it (the same statusline-separator bug the GUI hit). Mirror the GUI fix:
-    // measure the rasterised ink via Canvas `measureText` (the DOM analogue of swash's ink
-    // placement); when the ink hugs the *right* of its advance, nudge it to the box's right
-    // edge with a text-indent ON TOP of the centring `cellBoxSpan` applies. Left-/centre-
-    // biased glyphs get no nudge (shift 0). Detection is by measured ink position, not a
-    // codepoint list, so every right-hugging separator is covered with no maintenance. The
-    // per-codepoint result is memoised — the boxed-glyph set is small and bounded. Applied
-    // ONLY to single-column glyphs (see cellBoxSpan): separators are width 1, and a true wide
-    // glyph (kanji / emoji) sits naturally in its two-cell box and must never be re-anchored —
-    // a font that shapes a kanji right-biased would otherwise get a spurious shift off-grid.
-    const inkShiftCache = new Map();
-    let measureCtx = null;
+    // when the ink hugs the *right* of its advance, nudge it to the box's right edge with
+    // a text-indent ON TOP of the centring `cellBoxSpan` applies. Left-/centre-biased
+    // glyphs get no nudge (shift 0). Detection is by measured ink position, not a codepoint
+    // list, so every right-hugging separator is covered with no maintenance. Applied ONLY
+    // to single-column glyphs (see cellBoxSpan): separators are width 1, and a true wide
+    // glyph (kanji / emoji) sits naturally in its two-cell box and must never be
+    // re-anchored — a font that shapes a kanji right-biased would otherwise get a spurious
+    // shift off-grid.
     function inkRightShift(cp, boxW) {
-      const hit = inkShiftCache.get(cp);
-      if (hit !== undefined) return hit;
-      let shift = 0;
-      try {
-        if (!measureCtx) {
-          measureCtx = document.createElement("canvas").getContext("2d");
-          measureCtx.textAlign = "left";
-          measureCtx.textBaseline = "alphabetic";
-        }
-        measureCtx.font = `${FONT_PX}px ${getComputedStyle(gridEl).fontFamily}`;
-        const m = measureCtx.measureText(String.fromCodePoint(cp));
-        // Pen at x=0: ink spans [inkLeft, inkRight]; the advance ends at `adv`. The gaps
-        // are the padding on each side of the ink within its advance; the smaller gap is
-        // the side the ink hugs (matches the GUI's left_gap / right_gap comparison).
-        const inkLeft = -m.actualBoundingBoxLeft;
-        const inkRight = m.actualBoundingBoxRight;
-        const adv = m.width;
-        const leftGap = inkLeft, rightGap = adv - inkRight;
-        if (inkRight > inkLeft && rightGap < leftGap) shift = boxW - inkRight;
-      } catch { /* measureText unavailable → keep the natural left anchor */ }
-      inkShiftCache.set(cp, shift);
-      return shift;
+      const m = inkMetrics(cp);
+      if (!m) return 0;                     // unmeasurable → keep the natural left anchor
+      // The gaps are the padding on each side of the ink within its advance; the smaller
+      // gap is the side the ink hugs (matches the GUI's left_gap / right_gap comparison).
+      const leftGap = m.left, rightGap = m.adv - m.right;
+      return (m.right > m.left && rightGap < leftGap) ? boxW - m.right : 0;
     }
-    // A two-column glyph (CJK / emoji / wide pictograph) whose rasterised ink is wider
-    // than its `cells*cw` box overflows on the right; in a status / tabline bar the next
-    // segment's opaque background then paints over that overflow, clipping the glyph's
-    // right edge ("wide glyphs partially covered on the right"). Measure the ink and,
-    // when it exceeds the box, return the uniform scale that shrinks it to fit — applied
-    // as a (layout-free) `transform`, so the column model is untouched and the glyph just
-    // sits inside its two cells. Width-1 symbols (powerline separators, box-drawing) are
-    // excluded by the caller: they are meant to fill / tile their cell, not shrink.
-    const wideFitCache = new Map();
-    function wideFitScale(cp, boxW) {
-      const hit = wideFitCache.get(cp);
-      if (hit !== undefined) return hit;
-      let scale = 1;
-      try {
-        if (!measureCtx) {
-          measureCtx = document.createElement("canvas").getContext("2d");
-          measureCtx.textAlign = "left";
-          measureCtx.textBaseline = "alphabetic";
-        }
-        measureCtx.font = `${FONT_PX}px ${getComputedStyle(gridEl).fontFamily}`;
-        const m = measureCtx.measureText(String.fromCodePoint(cp));
-        const inkW = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
-        if (inkW > boxW) scale = boxW / inkW;
-      } catch { /* measureText unavailable → no scaling */ }
-      wideFitCache.set(cp, scale);
-      return scale;
+    // A glyph whose rasterised ink is wider than its `cells*cw` box overflows on the
+    // right; in a status / tabline bar the next segment's opaque background then paints
+    // over that overflow, clipping the glyph's right edge ("wide glyphs partially covered
+    // on the right"). When the ink exceeds the box, return the uniform scale that shrinks
+    // it to fit — applied as a (layout-free) `transform`, so the column model is untouched
+    // and the glyph just sits inside its cells. This is the GUI's `cluster_scale`
+    // fit-to-box, in CSS.
+    function inkFitScale(cp, boxW) {
+      const m = inkMetrics(cp);
+      if (!m) return 1;
+      const inkW = m.right - m.left;
+      return inkW > boxW ? boxW / inkW : 1;
     }
-    function cellBoxSpan(ch, cls, css, id) {
+    // Whether a glyph's ink is roughly square — the icons `'guiglyphoverflow'` is for,
+    // and not the glyphs it would break. A Nerd Font icon is drawn on a square em box and
+    // lands near 1.0; a powerline separator (~0.5) or a box-drawing rule (several times
+    // wider than tall) does not, and must not: those are meant to fill exactly their one
+    // cell and tile with their neighbours. Same band as the GUI's `SQUARE_INK_BAND`.
+    function inkIsSquare(m) {
+      if (!m || m.height <= 0 || m.right <= m.left) return false;
+      const ratio = (m.right - m.left) / m.height;
+      return ratio >= 0.7 && ratio <= 1.4;
+    }
+    // `nextBlank` says whether the cell to the right holds a space — the neighbour
+    // `'guiglyphoverflow'`'s default mode asks about. Callers that don't know (or don't
+    // care) leave it out, which reads as "something is there", the safe answer.
+    function cellBoxSpan(ch, cls, css, id, nextBlank) {
       const cp = ch.codePointAt(0);
       // The box spans the CLUSTER's columns (an emoji-presentation or ZWJ sequence owns
       // two however many codepoints it holds); the ink measurements below key off the
       // base codepoint, which is what the font actually shapes the cluster from.
       const cells = clusterWidth(ch) || 1;
       const boxW = cells * cw;
-      // Every boxed glyph is centred in its box, so a glyph whose advance is narrower
-      // than its cells (wide CJK / emoji, arrows, box-drawing) sits balanced rather than
-      // hugging the left. ON TOP of that, a right-hugging single-column separator gets the
-      // ink-measured text-indent so its ink lands on the box's right edge (centring alone
-      // leaves it a touch left); the indent only ever applies to width-1 glyphs.
-      const shift = cells === 1 ? inkRightShift(cp, boxW) : 0;
-      const indent = shift ? `text-indent:${shift.toFixed(3)}px;` : "";
-      // A wide glyph drawn wider than its two cells is scaled down to fit so it can't
-      // bleed into — and be overpainted by — the following segment's background.
-      const scale = cells === 2 ? wideFitScale(cp, boxW) : 1;
+      const m = inkMetrics(cp);
+      // A square one-cell glyph — a Nerd Font icon — is drawn by a fallback font at its
+      // own design size: a full em where the coding font's cell is ~0.6em, so it spills
+      // over whatever sits beside it. `'guiglyphoverflow'` decides what happens.
+      //
+      // Granted (the default, when the next cell is blank), it keeps its natural size and
+      // is pinned so it grows into the blank on its RIGHT — the direction the permission
+      // was granted for — instead of straddling both neighbours the way plain centring
+      // would. Denied, it shrinks into its cell like the GUI's fit-to-box, so it can't
+      // paint over the character next to it.
+      const overflowing =
+        cells === 1 && inkIsSquare(m) && (m.right - m.left) > boxW && glyphMayOverflow(nextBlank);
+      let align = "center", indent = 0, scale = 1;
+      if (overflowing) {
+        // Pin the ink's left edge to the box's left edge and let the rest hang right.
+        align = "left";
+        indent = -m.left;
+      } else if (cells === 1 && inkIsSquare(m)) {
+        scale = inkFitScale(cp, boxW);
+      } else if (cells === 1) {
+        // Every boxed glyph is centred in its box, so a glyph whose advance is narrower
+        // than its cells (arrows, box-drawing) sits balanced rather than hugging the left.
+        // ON TOP of that, a right-hugging separator gets the ink-measured text-indent so
+        // its ink lands on the box's right edge (centring alone leaves it a touch left).
+        // Non-square width-1 glyphs are never shrunk: a separator or a box-drawing rule is
+        // *meant* to fill its cell and tile with its neighbours.
+        indent = inkRightShift(cp, boxW);
+      } else {
+        // A wide glyph drawn wider than its two cells is scaled down to fit so it can't
+        // bleed into — and be overpainted by — the following segment's background.
+        scale = inkFitScale(cp, boxW);
+      }
+      const indentCss = indent ? `text-indent:${indent.toFixed(3)}px;` : "";
       const tf = scale < 1 ? `transform:scale(${scale.toFixed(3)});` : "";
-      return `<span${id ? ` id="${id}"` : ""} class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:center;${indent}${tf}${css || ""}">${escapeHtml(ch)}</span>`;
+      return `<span${id ? ` id="${id}"` : ""} class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:${align};${indentCss}${tf}${css || ""}">${escapeHtml(ch)}</span>`;
     }
 
     // ── Ctrl chords the browser keeps for itself, and the Alt stand-in ────────────
@@ -978,6 +1041,25 @@
       frame.mode = frame.mode_label;
       for (const w of frame.windows || []) w.secondary_cursors = w.cursors || [];
       view = frame;
+      // `'guiglyphoverflow'`, relayed like `'guifont'`. Empty (its default) leaves this
+      // client on its own setting; an unparseable value can only come from a raw `btv.o`
+      // write (the `:set` path rejects it with E474) and says so rather than silently
+      // rendering in some other mode.
+      const relayed = frame.guiglyphoverflow;
+      if (relayed == null || relayed.trim() === "") {
+        glyphOverflow = GLYPH_OVERFLOW_DEFAULT;
+      } else {
+        const parsed = parseGlyphOverflow(relayed);
+        if (parsed) glyphOverflow = parsed;
+        else {
+          glyphOverflow = GLYPH_OVERFLOW_DEFAULT;
+          if (warnedGlyphOverflow !== relayed) {
+            warnedGlyphOverflow = relayed;
+            console.warn(`bemtvi: ignoring guiglyphoverflow=${JSON.stringify(relayed)} `
+              + `(expected ${GLYPH_OVERFLOW_NAMES})`);
+          }
+        }
+      }
       if (lines != null) {
         bufferText = lines;
         // Remember the (just-shipped) focused buffer's text by file name, so a later
@@ -1763,7 +1845,7 @@
         // A wide glyph or boxed symbol breaks the run and renders in its own fixed-width
         // box; a wide glyph's empty continuation cell (next column) then adds nothing.
         const isCursorCell = isFocused && row === cursorRow && c === cursorCol;
-        if (cellNeedsBox(cells[c].ch)) { flush(); out += cellBoxSpan(cells[c].ch, cls, css, isCursorCell ? CURSOR_ID : null); continue; }
+        if (cellNeedsBox(cells[c].ch)) { flush(); out += cellBoxSpan(cells[c].ch, cls, css, isCursorCell ? CURSOR_ID : null, cells[c + 1]?.ch === " "); continue; }
         // The cursor cell is emitted as its own id-tagged span so the off-screen IME
         // proxy can be parked over it (see positionImeProxy).
         if (isCursorCell) { flush(); out += `<span id="${CURSOR_ID}" class="${cls}">${escapeHtml(cells[c].ch)}</span>`; continue; }
@@ -2071,7 +2153,8 @@
         run = "";
       };
       let painted = leftcol;
-      for (const cell of cells) {
+      for (let ci = 0; ci < cells.length; ci++) {
+        const cell = cells[ci];
         const a = cell.abs;
         let cls = "";
         if (a >= 0) {
@@ -2088,7 +2171,7 @@
         const style = (a < 0) ? cell.base : (COLOR_OWNED.has(cls) ? "" : cell.base);
         // A wide glyph or boxed symbol renders in its own fixed-width box (see
         // cellBoxSpan); a wide glyph's empty continuation cell then adds nothing.
-        if (cellNeedsBox(cell.ch)) { flush(); out += cellBoxSpan(cell.ch, cls, style, isCursorCell ? CURSOR_ID : null); painted += 1; continue; }
+        if (cellNeedsBox(cell.ch)) { flush(); out += cellBoxSpan(cell.ch, cls, style, isCursorCell ? CURSOR_ID : null, cells[ci + 1]?.ch === " "); painted += 1; continue; }
         // The cursor cell is id-tagged so the off-screen IME proxy can follow it.
         if (isCursorCell) { flush(); out += `<span id="${CURSOR_ID}" class="${cls}"${style ? ` style="${style}"` : ""}>${escapeHtml(cell.ch)}</span>`; painted += 1; continue; }
         if (cls !== runCls || style !== runStyle) { flush(); runCls = cls; runStyle = style; }
@@ -2177,9 +2260,10 @@
         out += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(run)}</span>`;
         run = "";
       };
-      for (const ch of cells) {
+      for (let i = 0; i < cells.length; i++) {
+        const ch = cells[i];
         if (ch === "") continue;                                       // wide continuation: nothing
-        if (cellNeedsBox(ch)) { flush(); out += cellBoxSpan(ch, "", css); continue; }
+        if (cellNeedsBox(ch)) { flush(); out += cellBoxSpan(ch, "", css, null, cells[i + 1] === " "); continue; }
         run += ch;
       }
       flush();
@@ -3501,6 +3585,11 @@
       // Cell size in CSS px, so a test can drive *real* DOM mouse events (the
       // mousedown/mousemove/mouseup path, not the `mouse` hook) at sub-cell precision.
       cellMetrics: () => ({ cw, ch }),
+      // Test-only: the `'guiglyphoverflow'` mode this client is rendering with — the
+      // relayed option, or its own `?glyph-overflow=` default when the option is unset
+      // (or unparseable). `verify-glyph-overflow.mjs` asserts the option actually reaches
+      // the renderer, which no DOM readout can show for a font whose icons already fit.
+      glyphOverflow: () => glyphOverflow,
       // Test-only: the display width this renderer assigns each grapheme cluster, and
       // how it splits a string into them — both straight off the `bemtvi-width` wasm
       // module. `verify-width.mjs` diffs them against a Rust-generated corpus, which is

@@ -45,7 +45,7 @@ use unicode_width::UnicodeWidthStr;
 use winit::window::Window;
 
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
-use crate::GuiConfig;
+use crate::{GlyphOverflow, GuiConfig};
 
 /// Fallback colors when no colorscheme resolved a style — a light grey on a
 /// near-black ground, the GUI's equivalent of the TUI's built-in default theme.
@@ -353,6 +353,10 @@ pub struct Renderer {
     /// Ceiling on the render scale for an emoji / wide fallback glyph (see
     /// [`cluster_scale`] and [`Renderer::push_text`]), from [`GuiConfig::emoji_scale`].
     emoji_scale: f32,
+    /// Whether a square one-cell glyph may borrow the cell to its right and render at
+    /// its natural size instead of shrinking (see [`overflow_cells`]), from
+    /// [`GuiConfig::glyph_overflow`].
+    glyph_overflow: GlyphOverflow,
     /// Which characters italic may be applied to, and how — see [`ItalicFace`] and
     /// [`Renderer::shape_segments`]. Re-derived whenever the font changes.
     italic_face: ItalicFace,
@@ -484,6 +488,7 @@ impl Renderer {
             image_store,
             fonts,
             emoji_scale: cfg.emoji_scale,
+            glyph_overflow: cfg.glyph_overflow,
             italic_face,
             cache: HashMap::new(),
             gen: 0,
@@ -533,6 +538,15 @@ impl Renderer {
         // The primary face — and so which characters have a real italic — changed with it.
         self.italic_face = ItalicFace::resolve(&mut self.font_system, &self.fonts);
         self.cache.clear();
+    }
+
+    /// Set which glyphs may overflow their cell, backing `'guiglyphoverflow'` (and the
+    /// `--glyph-overflow` startup default). Only placement reads it — the shaped-line
+    /// cache holds buffers, not positions, and every cluster is placed afresh each frame
+    /// — so unlike [`Self::set_font`] this doesn't invalidate anything. The caller
+    /// repaints.
+    pub fn set_glyph_overflow(&mut self, mode: GlyphOverflow) {
+        self.glyph_overflow = mode;
     }
 
     /// Update the window's scale factor (device pixels per logical pixel) after a
@@ -3619,6 +3633,7 @@ impl Renderer {
         });
 
         let (cell_w, cell_h, max_scale) = (self.cell_w, self.cell_h, self.emoji_scale);
+        let overflow = self.glyph_overflow;
         // `nonsnapped` merges *adjacent* off-grid clusters into one range (a run of CJK,
         // an icon against a kanji) because that is what the mask wants — one contiguous
         // gap. Placement wants the opposite: each cluster reserves its own cell count and
@@ -3690,7 +3705,33 @@ impl Renderer {
             // one cell the editor reserved — the icon overlapping the next character.
             // Shrink it to its reserved box instead, keeping `emoji_scale` as the
             // *ceiling* so the glyphs that already fit (colour emoji, CJK) are untouched.
-            let scale = cluster_scale(max_scale, span * cell_w, cell_h, measured);
+            //
+            // Unless it is allowed to spill: whether the glyph may take the cell on its
+            // right, and so keep its natural size instead of shrinking, is
+            // `'guiglyphoverflow'` ([`overflow_cells`]). "Blank" is an actual space *in
+            // this run*, deliberately not "the run ends here": a row is painted as
+            // several runs (gutter, text, virtual text), and what follows the last one
+            // is the next run, not empty background.
+            let next_blank = full[start + cluster.len()..].starts_with(' ');
+            // Right-hugging glyphs are pinned to the *right* edge of their reserved cell
+            // below, so a wider box would grow them leftwards over the previous cell —
+            // the opposite of borrowing the blank on the right. They are excluded here,
+            // not only by [`overflow_cells`]'s squareness test (a powerline separator is
+            // tall and narrow, so that test already rejects it) — the anchor and the box
+            // have to agree whatever the ink turns out to look like.
+            let right_hug =
+                matches!(measured, Some((adv, ink)) if (adv - (ink.left + ink.width)) < ink.left);
+            let extra = if right_hug {
+                0.0
+            } else {
+                overflow_cells(overflow, span, measured, cell_w, next_blank)
+            };
+            let scale = cluster_scale(
+                overflow_ceiling(max_scale, extra),
+                (span + extra) * cell_w,
+                cell_h,
+                measured,
+            );
             // Scaling anchors the glyph at the cell top, so it grows downward (or, when
             // shrunk, rides high). Shift by half the height change — `(scale − 1) / 2` of
             // a cell — to keep it centered in the line either way.
@@ -3707,9 +3748,9 @@ impl Renderer {
             // `left_gap`/`right_gap`: padding between the ink and each edge of the glyph's
             // advance box. The smaller gap is the side the ink hugs.
             let x = match measured {
-                Some((adv, ink)) if (adv - (ink.left + ink.width)) < ink.left => {
-                    // Ink hugs the right of its box: pin the ink's right edge to the
-                    // cell's right edge.
+                // Ink hugs the right of its box: pin the ink's right edge to the cell's
+                // right edge.
+                Some((_, ink)) if right_hug => {
                     cell_left + span * cell_w - scale * (ink.left + ink.width)
                 }
                 _ => cell_left,
@@ -4637,6 +4678,84 @@ pub struct Ink {
     pub left: f32,
     pub width: f32,
     pub height: f32,
+}
+
+/// How far from square a glyph's ink may be and still count as an *icon* for
+/// [`overflow_cells`] — the width/height ratio band it has to land in.
+///
+/// The band is what separates the glyphs the feature is for from the ones it would
+/// break. A Nerd Font icon is drawn on a roughly square em box and lands near 1.0. A
+/// powerline separator (~0.5) or a box-drawing rule (several times wider than its ink is
+/// tall) does not, and must not: those are *meant* to fill exactly their one cell and
+/// tile with their neighbours, so growing one past its cell would break the seam it
+/// exists to hide.
+const SQUARE_INK_BAND: (f32, f32) = (0.7, 1.4);
+
+/// Extra cells a one-cell cluster may borrow from its right for rendering only — `1.0`
+/// when it may overflow, `0.0` otherwise. The caller adds this to the cluster's reserved
+/// span before fitting it ([`cluster_scale`]), so a borrowed cell shows up purely as a
+/// bigger box to fit into; the column model is untouched (see [`GlyphOverflow`]).
+///
+/// Four things have to hold. The mode has to permit it, and for the default
+/// [`GlyphOverflow::WhenFollowedBySpace`] that means `next_blank` — the next cell holds a
+/// space, so the ink spills over background instead of over a glyph. The cluster has to
+/// be one cell wide: a two-cell CJK char or emoji already has the room its design wants,
+/// and widening it would push its ink over a third cell no one checked. The ink has to be
+/// roughly square ([`SQUARE_INK_BAND`]) — the icons this is for, not the separators it
+/// would break. And it has to actually *need* the room: a glyph that already fits its one
+/// cell is left exactly where it is, because the borrowed cell would otherwise let
+/// `emoji_scale` inflate it past the size it renders at today.
+///
+/// Pure, so it's tested in `tests/wide.rs`.
+pub fn overflow_cells(
+    mode: GlyphOverflow,
+    span: f32,
+    measured: Option<(f32, Ink)>,
+    cell_w: f32,
+    next_blank: bool,
+) -> f32 {
+    let permitted = match mode {
+        GlyphOverflow::Never => false,
+        GlyphOverflow::WhenFollowedBySpace => next_blank,
+        GlyphOverflow::Always => true,
+    };
+    if !permitted || span != 1.0 {
+        return 0.0;
+    }
+    let Some((adv, ink)) = measured else {
+        return 0.0; // unrasterised — no ink to size, nothing to grow
+    };
+    if ink.height <= 0.0 || ink.width <= 0.0 {
+        return 0.0;
+    }
+    let ratio = ink.width / ink.height;
+    let square = (SQUARE_INK_BAND.0..=SQUARE_INK_BAND.1).contains(&ratio);
+    // The same extent `cluster_scale` fits: the advance the font intends, or the ink
+    // when it paints outside that.
+    let overflows = adv.max(ink.left + ink.width) > cell_w;
+    if square && overflows {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// The scale ceiling for a cluster that borrowed a cell ([`overflow_cells`] returned
+/// `extra > 0`), given the configured `emoji_scale`.
+///
+/// A borrowed cell is there to stop a glyph being *shrunk*, not to magnify it. Left at
+/// `emoji_scale` the ceiling does the second thing: that constant exists because a colour
+/// emoji font draws *smaller* than its cells and has to be scaled up to them, and applied
+/// to an icon already at its design size it inflates it to fill both cells — bigger than
+/// the font ever intended, and bigger than the same icon looks in a terminal that allows
+/// the same overflow. So an overflowing glyph is capped at its natural size. A ceiling
+/// configured *below* 1 still wins, so `--emoji-scale` remains the way to tune it down.
+pub fn overflow_ceiling(max_scale: f32, extra: f32) -> f32 {
+    if extra > 0.0 {
+        max_scale.min(1.0)
+    } else {
+        max_scale
+    }
 }
 
 /// Floor on the fitted scale, so a pathologically wide fallback glyph shrinks to

@@ -66,6 +66,17 @@ pub struct Options {
     /// value is relayed to a GUI client (which parses and applies it). Empty means
     /// the client's own default font.
     pub guifont: String,
+    /// The `'guiglyphoverflow'` mode: when a *square* one-cell glyph (a Nerd Font icon)
+    /// may be drawn at its natural size, overflowing into the cell to its right, instead
+    /// of being shrunk to fit the one cell the editor reserved for it. One of `"never"`,
+    /// `"always"`, `"when-followed-by-space"` (wezterm's
+    /// `allow_square_glyphs_to_overflow_width`, same three modes). Like `'guifont'` the
+    /// core doesn't use it — pixels are the client's concern — it stores it so
+    /// `:set`/`btv.o` accept it and relays it to whichever client renders glyphs (the
+    /// GUI and the web client both honor it; the TUI can't — the terminal draws the
+    /// glyphs). Empty (the default) means the client's own setting, i.e. its
+    /// `--glyph-overflow` flag.
+    pub guiglyphoverflow: String,
     /// Which modes mouse input is acted on (`'mouse'`): a set of mode chars —
     /// `n`ormal, `v`isual, `i`nsert, `c`mdline, `a`ll, plus `r`/`h` (unused yet).
     /// A gesture is honored only if the current mode's char (or `a`) is present;
@@ -319,6 +330,7 @@ impl Options {
             ("statusline", Str(s)) => self.statusline = s.clone(),
             ("tabline", Str(s)) => self.tabline = s.clone(),
             ("guifont", Str(s)) => self.guifont = s.clone(),
+            ("guiglyphoverflow", Str(s)) => self.guiglyphoverflow = s.clone(),
             ("mouse", Str(s)) => self.mouse = s.clone(),
             ("httphost", Str(s)) => self.httphost = s.clone(),
             ("mousemodel", Str(s)) => self.mousemodel = s.clone(),
@@ -369,6 +381,7 @@ impl Options {
             "statusline" => Str(self.statusline.clone()),
             "tabline" => Str(self.tabline.clone()),
             "guifont" => Str(self.guifont.clone()),
+            "guiglyphoverflow" => Str(self.guiglyphoverflow.clone()),
             "mouse" => Str(self.mouse.clone()),
             "httphost" => Str(self.httphost.clone()),
             "mousemodel" => Str(self.mousemodel.clone()),
@@ -507,6 +520,7 @@ impl Default for Options {
             tabline: String::new(),
             // No custom GUI font by default — the client uses its own.
             guifont: String::new(),
+            guiglyphoverflow: String::new(),
             // Mouse defaults match neovim exactly. `mouse` is `"nvi"` (not `"a"`):
             // cmdline-mode mouse is off by default. `mousemodel` is `popup_setpos`,
             // so right-click pops a menu and `<S-LeftMouse>` is the extend gesture.
@@ -2028,6 +2042,14 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Global,
             doc: "Font and size used by GUI clients (e.g. \"Iosevka:h14\").",
+        },
+        OptionInfo {
+            name: "guiglyphoverflow",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "When a square one-cell glyph (a Nerd Font icon) may render at full \
+                  size over the next cell: never, always, when-followed-by-space.",
         },
         OptionInfo {
             name: "mouse",

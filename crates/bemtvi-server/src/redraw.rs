@@ -124,6 +124,10 @@ impl EditHost {
         // The `'guifont'` value, relayed verbatim for a GUI client to parse and
         // apply; empty (the default) leaves the client on its own font.
         let guifont = global_opts.guifont;
+        // The `'guiglyphoverflow'` mode, relayed the same way: the GUI and the web
+        // client size their off-grid glyphs with it (the TUI has no say — the terminal
+        // draws them). Empty (the default) leaves the client on its own setting.
+        let guiglyphoverflow = global_opts.guiglyphoverflow;
         // The `'timeout'` / `'timeoutlen'` mapping-timeout config, relayed so each
         // client runs its own idle-flush timer to match: skip arming when `timeout`
         // is off (`notimeout` → a withheld mapped prefix waits forever, which is how
@@ -319,6 +323,10 @@ impl EditHost {
             ),
             (Value::from("message_error"), Value::from(message_error)),
             (Value::from("guifont"), Value::from(guifont.as_str())),
+            (
+                Value::from("guiglyphoverflow"),
+                Value::from(guiglyphoverflow.as_str()),
+            ),
             (Value::from("timeout"), Value::from(timeout)),
             (Value::from("timeoutlen"), Value::from(timeoutlen)),
             // The current buffer's identity + edit version, so the browser Worker ships

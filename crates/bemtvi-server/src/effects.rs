@@ -2691,6 +2691,7 @@ impl EditHost {
             statusline: go.statusline.clone(),
             tabline: go.tabline.clone(),
             guifont: go.guifont.clone(),
+            guiglyphoverflow: go.guiglyphoverflow.clone(),
             regexsyntax: go.regexsyntax.clone(),
             fileencodings: go.fileencodings.clone(),
             autoread: go.autoread,

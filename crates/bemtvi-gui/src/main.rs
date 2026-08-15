@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bemtvi_gui::remote::{self, ConnectTarget};
-use bemtvi_gui::{spawn_session, spawn_stdio_daemon_session, GuiConfig};
+use bemtvi_gui::{spawn_session, spawn_stdio_daemon_session, GlyphOverflow, GuiConfig};
 use bemtvi_server::ConfigSource;
 use clap::Parser;
 
@@ -73,6 +73,20 @@ struct Cli {
     /// cells is shrunk below this), overriding BEMTVI_GUI_EMOJI_SCALE
     #[arg(long, value_name = "FACTOR")]
     emoji_scale: Option<f32>,
+
+    /// When a square one-cell glyph (a Nerd Font icon) may render at full size,
+    /// overflowing into the next cell instead of being shrunk to fit its own:
+    /// never | always | when-followed-by-space (default). Overrides
+    /// BEMTVI_GUI_GLYPH_OVERFLOW
+    #[arg(long, value_name = "MODE", value_parser = parse_glyph_overflow)]
+    glyph_overflow: Option<GlyphOverflow>,
+}
+
+/// clap value parser for `--glyph-overflow`, so a misspelt mode is a usage error
+/// naming the alternatives rather than a silently-ignored flag.
+fn parse_glyph_overflow(spec: &str) -> Result<GlyphOverflow, String> {
+    GlyphOverflow::parse(spec)
+        .ok_or_else(|| format!("expected {}, got `{spec}`", GlyphOverflow::NAMES))
 }
 
 fn main() -> Result<()> {
@@ -100,6 +114,9 @@ fn main() -> Result<()> {
     }
     if let Some(scale) = cli.emoji_scale {
         config.set_emoji_scale(scale);
+    }
+    if let Some(mode) = cli.glyph_overflow {
+        config.glyph_overflow = mode;
     }
 
     // Which config (+ shada) a daemon session runs: the local machine's by default, or

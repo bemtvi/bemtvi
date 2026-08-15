@@ -500,6 +500,12 @@ pub struct View {
     /// from the server. A GUI client parses it for the font family and `:h` size;
     /// empty means the client's own default. Frontend-agnostic — the TUI ignores it.
     pub guifont: String,
+    /// The `'guiglyphoverflow'` value (`"never"` / `"always"` /
+    /// `"when-followed-by-space"`), relayed from the server: whether a square one-cell
+    /// glyph — a Nerd Font icon — may be drawn at its natural size over the cell to its
+    /// right instead of being shrunk into its own. Empty means the client's own setting.
+    /// Frontend-agnostic — the TUI ignores it (the terminal draws its own glyphs).
+    pub guiglyphoverflow: String,
     /// `'timeout'` — whether an ambiguous mapped prefix resolves on idle (the
     /// client arms its `timeoutlen` flush timer) or waits forever for the next key
     /// (`notimeout` → the client never arms it, so a which-key popup stays up).
@@ -895,6 +901,7 @@ impl View {
         self.message = map_str(map, "message");
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
+        self.guiglyphoverflow = map_str(map, "guiglyphoverflow");
         // The mapping-timeout config drives the client's idle-flush timer (below).
         // An older server omits these — fall back to vim's defaults (timeout on,
         // 1000ms) so the flush still fires; `notimeout` (false) disarms it entirely.

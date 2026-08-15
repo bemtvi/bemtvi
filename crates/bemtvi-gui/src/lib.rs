@@ -61,7 +61,10 @@ pub use render::{
 // The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces) and
 // the shrink-to-fit sizing of the cluster that mask reserved room for, so the Tier-1
 // `wide` test can exercise both without shaping / a GPU.
-pub use render::{cluster_scale, is_letterform, italic_runs, mask_segments, offgrid_clusters, Ink};
+pub use render::{
+    cluster_scale, is_letterform, italic_runs, mask_segments, offgrid_clusters, overflow_ceiling,
+    overflow_cells, Ink,
+};
 // The pure caret-cell math for the command line and the picker prompt (char-offset
 // wire fields → display-width cells), exported for the Tier-1 `caret` test.
 pub use render::{cmdline_caret_col, query_caret_col};
@@ -105,6 +108,58 @@ fn in_scroll_zone(row: u16, rows: u16) -> bool {
     row == 0 || row + 2 >= rows
 }
 
+/// When a single-cell glyph may be drawn bigger than the one cell the editor reserved
+/// for it, spilling its ink into the cell to its right.
+///
+/// A Nerd Font / symbol glyph is designed square — a full em wide — where a coding
+/// font's cell is only ~0.6 em, so fitting it to its reserved cell (what the renderer
+/// does by default; see [`crate::cluster_scale`]) shrinks it to about 60% and an icon
+/// beside a filename looks undersized. But drawing it at its natural size paints over
+/// whatever is in the next cell. The resolution is the neighbour: when the next cell is
+/// blank there is nothing to paint over, so the glyph can have that space and render at
+/// full size. This is wezterm's `allow_square_glyphs_to_overflow_width`, same three
+/// modes and same default.
+///
+/// The column model never changes — the glyph still *occupies* one cell, so the cursor,
+/// selections, and every column the server computes are untouched. Only the ink grows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GlyphOverflow {
+    /// Never: every glyph is shrunk to the cells the editor reserved for it.
+    Never,
+    /// Only when the character to the right is a space, so the ink spills over blank
+    /// background and can't collide with a neighbouring glyph. The default.
+    #[default]
+    WhenFollowedBySpace,
+    /// Always, whatever follows — a glyph in the next cell is overpainted.
+    Always,
+}
+
+impl GlyphOverflow {
+    /// Parse a mode name, however it was spelled: the `--glyph-overflow` flag, the
+    /// `BEMTVI_GUI_GLYPH_OVERFLOW` environment variable, or the `'guiglyphoverflow'`
+    /// option relayed off the redraw. `never`, `always`, or `when-followed-by-space`
+    /// (`space` for short), case- and separator-insensitive (`WhenFollowedBySpace` and
+    /// `when_followed_by_space` both parse). `None` for anything else, which the caller
+    /// reports rather than silently ignoring.
+    ///
+    /// The core validates `:set guiglyphoverflow=…` against this same set
+    /// (`bemtvi-core/src/editor/options.rs`), and the web client re-spells it in
+    /// `glyphOverflowMode`; keep the three in step.
+    pub fn parse(spec: &str) -> Option<Self> {
+        match spec.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "never" => Some(Self::Never),
+            "always" => Some(Self::Always),
+            "space" | "when-followed-by-space" | "whenfollowedbyspace" => {
+                Some(Self::WhenFollowedBySpace)
+            }
+            _ => None,
+        }
+    }
+
+    /// The accepted spellings, for a CLI/env error message.
+    pub const NAMES: &'static str = "never | always | when-followed-by-space";
+}
+
 /// Client-side rendering configuration. The font family and point size are a
 /// purely client concern — the server works in cells, not pixels — so they're set
 /// here (CLI flags / environment), not through a server option. An unavailable
@@ -124,6 +179,11 @@ pub struct GuiConfig {
     /// ~0.6 em) is shrunk to fit instead, so it can't collide with the next character.
     /// Set from `--emoji-scale` / `BEMTVI_GUI_EMOJI_SCALE`.
     pub emoji_scale: f32,
+    /// Whether a square single-cell glyph (a Nerd Font icon) may be drawn at its natural
+    /// size, overflowing into the cell to its right, instead of being shrunk to fit its
+    /// own. See [`GlyphOverflow`]. Set from `--glyph-overflow` /
+    /// `BEMTVI_GUI_GLYPH_OVERFLOW`.
+    pub glyph_overflow: GlyphOverflow,
 }
 
 impl Default for GuiConfig {
@@ -132,6 +192,7 @@ impl Default for GuiConfig {
             fonts: Vec::new(),
             font_size: 15.0,
             emoji_scale: 1.2,
+            glyph_overflow: GlyphOverflow::default(),
         }
     }
 }
@@ -153,6 +214,19 @@ impl GuiConfig {
         if let Ok(scale) = std::env::var("BEMTVI_GUI_EMOJI_SCALE") {
             if let Ok(s) = scale.trim().parse::<f32>() {
                 c.set_emoji_scale(s);
+            }
+        }
+        if let Ok(mode) = std::env::var("BEMTVI_GUI_GLYPH_OVERFLOW") {
+            // A mode name is all-or-nothing — unlike a size, there is nothing sensible to
+            // clamp a typo to — so an unrecognised one says so rather than quietly
+            // rendering in a mode the user didn't ask for.
+            match GlyphOverflow::parse(&mode) {
+                Some(m) => c.glyph_overflow = m,
+                None => eprintln!(
+                    "bemtvi-gui: ignoring BEMTVI_GUI_GLYPH_OVERFLOW={mode:?} \
+                     (expected {})",
+                    GlyphOverflow::NAMES
+                ),
             }
         }
         c
@@ -656,6 +730,11 @@ struct App {
     /// The last `view.guifont` applied to the renderer, so a redraw only re-shapes
     /// when it actually changed (`:set guifont=…` / the init-time value).
     applied_guifont: String,
+    /// The last `view.guiglyphoverflow` applied to the renderer, so a redraw only
+    /// re-applies when it actually changed (`:set guiglyphoverflow=…` / the init-time
+    /// value). Empty is both the initial state and the option's default — which means
+    /// "keep what `--glyph-overflow` / the env set".
+    applied_glyph_overflow: String,
     /// A directory passed on the command line (`bemtvi-gui somedir`), if any. Popped
     /// as the native file picker (anchored there) once the window exists, instead of
     /// the server's in-window listing — see [`Self::resumed`]. Taken on first use so
@@ -709,6 +788,7 @@ impl App {
             ime_area: None,
             config,
             applied_guifont: String::new(),
+            applied_glyph_overflow: String::new(),
             open_dir,
             remote,
             reconnect,
@@ -812,6 +892,38 @@ impl App {
         // The cell size changed, so the grid in cells did too — re-report it (the
         // server re-lays out for the new dimensions) and repaint.
         self.report_size(false);
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+    }
+
+    /// Apply the relayed `'guiglyphoverflow'` to the renderer — whether a square
+    /// one-cell glyph may render over the cell to its right (see [`GlyphOverflow`]).
+    /// Empty (the option's default) means the client keeps what `--glyph-overflow` /
+    /// `BEMTVI_GUI_GLYPH_OVERFLOW` set, so a config that never mentions the option
+    /// leaves the CLI in charge. An unparseable value can only come from a raw
+    /// `btv.o` write (the `:set` path rejects it with E474), and says so on stderr
+    /// rather than silently rendering in some other mode.
+    ///
+    /// Cheap — no re-shape, no grid change — so it just repaints.
+    fn apply_glyph_overflow(&mut self) {
+        let relayed = self.view.guiglyphoverflow.clone();
+        let mode = if relayed.trim().is_empty() {
+            self.config.glyph_overflow
+        } else {
+            GlyphOverflow::parse(&relayed).unwrap_or_else(|| {
+                eprintln!(
+                    "bemtvi-gui: ignoring guiglyphoverflow={relayed:?} (expected {})",
+                    GlyphOverflow::NAMES
+                );
+                self.config.glyph_overflow
+            })
+        };
+        self.applied_glyph_overflow = relayed;
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        renderer.set_glyph_overflow(mode);
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -1212,6 +1324,9 @@ impl ApplicationHandler<UserEvent> for App {
         // Apply any `guifont` already received before the renderer existed (a
         // redraw can beat `resumed`); a no-op for the default empty value.
         self.apply_guifont();
+        // Same for `'guiglyphoverflow'`, which an `init.lua` will have set before the
+        // first frame; empty leaves the renderer on the CLI/env mode it was built with.
+        self.apply_glyph_overflow();
         // A directory given on the command line opens the native file picker there
         // (taken so it fires once — `resumed` early-returns on later wake-ups).
         if let Some(dir) = self.open_dir.take() {
@@ -1227,6 +1342,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // grid) before this frame paints.
                 if self.view.guifont != self.applied_guifont {
                     self.apply_guifont();
+                }
+                // A changed `'guiglyphoverflow'` re-sizes off-grid glyphs from this
+                // frame on (placement only — nothing to re-shape).
+                if self.view.guiglyphoverflow != self.applied_glyph_overflow {
+                    self.apply_glyph_overflow();
                 }
                 // (Re)arm or clear the scroll slide from this frame's gesture.
                 self.scroll = arm_scroll(&self.view, self.scroll.take());
@@ -1282,6 +1402,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.reported = (0, 0);
                 self.report_size(true);
                 self.apply_guifont();
+                // The reset view carries no `'guiglyphoverflow'` either: back to the
+                // CLI/env mode until the new server's first redraw says otherwise.
+                self.apply_glyph_overflow();
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
                 }

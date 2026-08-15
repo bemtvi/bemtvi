@@ -122,6 +122,71 @@ async fn guifont_defaults_empty() {
 }
 
 #[tokio::test]
+async fn guiglyphoverflow_round_trips_and_reaches_the_redraw() {
+    let (rpc, mut incoming) = start().await;
+
+    // Unset, both the read-back and the redraw field are empty — each client then keeps
+    // its own setting (`--glyph-overflow` / its built-in default).
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guiglyphoverflow")
+            .await
+            .as_str(),
+        Some("")
+    );
+
+    // `btv.o.guiglyphoverflow = …` (the init.lua form, wezterm's config knob) reaches
+    // the core, reads back, and is relayed so the GUI / web client can size icons by it.
+    exec_lua(&rpc, "btv.o.guiglyphoverflow = 'always'").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.guiglyphoverflow")
+            .await
+            .as_str(),
+        Some("always"),
+        "the option reads back through vim.o too"
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "guiglyphoverflow"), "always");
+
+    // The ex path writes the same state, and the query echoes it.
+    let msg = set_message(
+        &rpc,
+        &mut incoming,
+        "guiglyphoverflow=when-followed-by-space",
+    )
+    .await;
+    assert!(msg.is_empty(), "a valid set is silent, got {msg:?}");
+    let msg = set_message(&rpc, &mut incoming, "guiglyphoverflow?").await;
+    assert_eq!(msg, "guiglyphoverflow=when-followed-by-space");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(
+        field_str(&frame, "guiglyphoverflow"),
+        "when-followed-by-space"
+    );
+}
+
+#[tokio::test]
+async fn guiglyphoverflow_rejects_an_unknown_mode() {
+    // An enumerated value: a typo fails loud (E474) and leaves the previous mode in
+    // place, rather than silently rendering in a mode nobody asked for.
+    let (rpc, mut incoming) = start().await;
+    set_message(&rpc, &mut incoming, "guiglyphoverflow=always").await;
+    let msg = set_message(&rpc, &mut incoming, "guiglyphoverflow=alway").await;
+    assert!(
+        msg.contains("E474") && msg.contains("alway"),
+        "a bad mode must fail loud naming it, got {msg:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guiglyphoverflow")
+            .await
+            .as_str(),
+        Some("always"),
+        "the rejected write left the previous mode alone"
+    );
+}
+
+#[tokio::test]
 async fn timeout_and_timeoutlen_default_and_reach_the_redraw() {
     // The mapping-timeout config is on with a 1000ms wait by default (vim's), reads
     // back through `vim.o`, and is relayed to the client in every `redraw` so each

@@ -69,7 +69,8 @@ struct Cli {
     #[arg(long, value_name = "PT")]
     font_size: Option<f32>,
 
-    /// Emoji / wide-glyph size relative to the cell, overriding BEMTVI_GUI_EMOJI_SCALE
+    /// Max emoji / wide-glyph size relative to the cell (a glyph too wide for its
+    /// cells is shrunk below this), overriding BEMTVI_GUI_EMOJI_SCALE
     #[arg(long, value_name = "FACTOR")]
     emoji_scale: Option<f32>,
 }

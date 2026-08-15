@@ -24,7 +24,7 @@
 //! of `bemtvi-tui`'s `render`, projecting the same `redraw` model.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ use bemtvi_view::{
     MenuField, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk, VirtPlacement,
     WindowRegion, WindowView,
 };
-use glyphon::cosmic_text::{CacheKeyFlags, Fallback, PlatformFallback};
+use glyphon::cosmic_text::{Fallback, PlatformFallback};
 use glyphon::{
     fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -349,9 +349,12 @@ pub struct Renderer {
     /// and measured for the cell); the rest are the fallback chain, baked into
     /// `font_system`'s [`UserFallback`]. Empty means the system monospace.
     fonts: Vec<String>,
-    /// Render scale for an emoji / wide fallback glyph (see [`Renderer::push_text`]),
-    /// from [`GuiConfig::emoji_scale`].
+    /// Ceiling on the render scale for an emoji / wide fallback glyph (see
+    /// [`cluster_scale`] and [`Renderer::push_text`]), from [`GuiConfig::emoji_scale`].
     emoji_scale: f32,
+    /// Which characters italic may be applied to, and how — see [`ItalicFace`] and
+    /// [`Renderer::shape_segments`]. Re-derived whenever the font changes.
+    italic_face: ItalicFace,
 
     /// Device-pixel cell size, measured from the configured font once at startup.
     cell_w: f32,
@@ -459,6 +462,7 @@ impl Renderer {
             .map(|s| Family::Name(s))
             .unwrap_or(Family::Monospace);
         let (cell_w, cell_h) = measure_cell(&mut font_system, family, font_size, line_height);
+        let italic_face = ItalicFace::resolve(&mut font_system, &fonts);
 
         let rects = RectPipeline::new(&device, format);
         let image_store = ImageStore::new(&device, format, fetch_tx, decode_tx);
@@ -479,6 +483,7 @@ impl Renderer {
             image_store,
             fonts,
             emoji_scale: cfg.emoji_scale,
+            italic_face,
             cache: HashMap::new(),
             gen: 0,
             max_dim,
@@ -524,6 +529,8 @@ impl Renderer {
         );
         self.cell_w = cell_w;
         self.cell_h = cell_h;
+        // The primary face — and so which characters have a real italic — changed with it.
+        self.italic_face = ItalicFace::resolve(&mut self.font_system, &self.fonts);
         self.cache.clear();
     }
 
@@ -3575,6 +3582,7 @@ impl Renderer {
         default_fg: u32,
         bounds: TextBounds,
     ) {
+        use unicode_segmentation::UnicodeSegmentation;
         if segments.iter().all(|s| s.text.is_empty()) {
             return;
         }
@@ -3614,13 +3622,22 @@ impl Renderer {
             scale: 1.0,
         });
 
-        let (cell_w, cell_h, scale) = (self.cell_w, self.cell_h, self.emoji_scale);
-        // Scaling up anchors the glyph at the cell top, so it grows downward and sits
-        // low. Lift it by half the height growth — `(scale − 1) / 2` of a cell — to
-        // re-center it vertically in the line.
-        let y = pos.1 - (scale - 1.0) / 2.0 * cell_h;
-        for &(start, end) in &nonsnapped {
-            let cluster = &full[start..end];
+        let (cell_w, cell_h, max_scale) = (self.cell_w, self.cell_h, self.emoji_scale);
+        // `nonsnapped` merges *adjacent* off-grid clusters into one range (a run of CJK,
+        // an icon against a kanji) because that is what the mask wants — one contiguous
+        // gap. Placement wants the opposite: each cluster reserves its own cell count and
+        // may come from its own fallback font, so a range drawn as a single run puts every
+        // glyph after the first wherever that font's internal advance lands, not on the
+        // cell grid. It only *looks* right when every glyph in the run happens to share
+        // one advance, and drifts the moment a run mixes designs — a 1-cell icon beside a
+        // 2-cell kanji can't be placed by one shared advance at all. So split each range
+        // back into graphemes and give every one its own column, scale, and style.
+        let clusters = nonsnapped.iter().flat_map(|&(rs, re)| {
+            full[rs..re]
+                .grapheme_indices(true)
+                .map(move |(off, g)| (rs + off, g))
+        });
+        for (start, cluster) in clusters {
             let col = full[..start].width() as f32; // cells before the cluster
                                                     // Carry the cluster's own segment style — its colour (so a symbol/kanji in
                                                     // a comment is tinted like the comment), and bold/italic. A color-emoji
@@ -3637,42 +3654,70 @@ impl Renderer {
                 }],
                 cfg,
             );
-            // A fallback font shapes a Nerd glyph inside a box wider than its reserved
-            // cell, with the *ink* parked at one side of that box: a right-pointing ``
-            // hugs the box's left, a left-pointing `` hugs its right (visible in Font
-            // Book). Left-anchoring the box at the cell edge then lands a right-hugging
-            // glyph a cell to the right — the misaligned right-hand separators. Measure
-            // the rasterised ink box: a glyph whose ink hugs the *right* of its advance
-            // is right-aligned to the reserved cell, preserving the seamless powerline
-            // join; a left- or centre-biased glyph keeps the natural left anchor. The
-            // size (`emoji_scale`) is untouched either way.
+            // Measure the cluster: its shaped advance and its *rasterised* ink box, both
+            // at scale 1. Two decisions ride on them — how big to draw it (below) and
+            // which edge of the reserved cell to anchor it to. The advance is summed over
+            // the cluster's glyphs, since one grapheme can shape to several (a flag, a
+            // ZWJ sequence) and all of them are painted inside the one reserved box.
             let span = cluster.width().max(1) as f32;
             let cell_left = pos.0 + col * cell_w;
             let phys = self
                 .cache
                 .get(&ekey)
                 .and_then(|e| e.buffer.layout_runs().next())
-                .and_then(|r| r.glyphs.first())
-                .map(|g| (g.w, g.physical((0.0, 0.0), 1.0)));
-            let ink = phys.and_then(|(adv, p)| {
+                .and_then(|r| {
+                    let adv: f32 = r.glyphs.iter().map(|g| g.w).sum();
+                    // The ink box is the *first* glyph's: it carries the left bearing the
+                    // anchor test needs, and a multi-glyph grapheme is a base plus marks
+                    // drawn over it, so the base stands in for the cluster's height.
+                    r.glyphs.first().map(|g| (adv, g.physical((0.0, 0.0), 1.0)))
+                });
+            let measured = phys.and_then(|(adv, p)| {
                 self.swash_cache
                     .get_image(&mut self.font_system, p.cache_key)
                     .as_ref()
                     .filter(|img| img.placement.width > 0)
-                    .map(|img| (adv, img.placement.left as f32, img.placement.width as f32))
+                    .map(|img| {
+                        (
+                            adv,
+                            Ink {
+                                left: img.placement.left as f32,
+                                width: img.placement.width as f32,
+                                height: img.placement.height as f32,
+                            },
+                        )
+                    })
             });
+            // A fallback font draws these at its *own* design size, not the cell's: a
+            // Nerd Font icon is a full em wide where the coding font's cell is 0.6 em,
+            // so painting it at `emoji_scale` spills roughly two cells of ink into the
+            // one cell the editor reserved — the icon overlapping the next character.
+            // Shrink it to its reserved box instead, keeping `emoji_scale` as the
+            // *ceiling* so the glyphs that already fit (colour emoji, CJK) are untouched.
+            let scale = cluster_scale(max_scale, span * cell_w, cell_h, measured);
+            // Scaling anchors the glyph at the cell top, so it grows downward (or, when
+            // shrunk, rides high). Shift by half the height change — `(scale − 1) / 2` of
+            // a cell — to keep it centered in the line either way.
+            let y = pos.1 - (scale - 1.0) / 2.0 * cell_h;
+            // A fallback font shapes a Nerd glyph inside a box wider than its reserved
+            // cell, with the *ink* parked at one side of that box: a right-pointing ``
+            // hugs the box's left, a left-pointing `` hugs its right (visible in Font
+            // Book). Left-anchoring the box at the cell edge then lands a right-hugging
+            // glyph a cell to the right — the misaligned right-hand separators. So a
+            // glyph whose ink hugs the *right* of its advance is right-aligned to the
+            // reserved cell, preserving the seamless powerline join; a left- or
+            // centre-biased glyph keeps the natural left anchor.
+            //
             // `left_gap`/`right_gap`: padding between the ink and each edge of the glyph's
             // advance box. The smaller gap is the side the ink hugs.
-            let x = match ink {
-                Some((adv, ink_left, ink_w)) if (adv - (ink_left + ink_w)) < ink_left => {
+            let x = match measured {
+                Some((adv, ink)) if (adv - (ink.left + ink.width)) < ink.left => {
                     // Ink hugs the right of its box: pin the ink's right edge to the
                     // cell's right edge.
-                    cell_left + span * cell_w - scale * (ink_left + ink_w)
+                    cell_left + span * cell_w - scale * (ink.left + ink.width)
                 }
                 _ => cell_left,
             };
-            // A color-emoji font renders smaller than its reserved cells, so draw the
-            // glyph at the configured `emoji_scale` (`--emoji-scale`) at its column.
             items.push(TextItem {
                 key: ekey,
                 x,
@@ -3713,41 +3758,53 @@ impl Renderer {
 
     /// Shape `segments` into a fresh glyphon buffer (the expensive op the cache
     /// exists to avoid repeating). Each run carries its own color, a `bold` weight
-    /// (cosmic-text picks the closest weight, synthesizing if needed), and a *synthetic*
-    /// `italic` skew — see the `FAKE_ITALIC` note below for why italic is not a real
-    /// face here.
+    /// (cosmic-text picks the closest weight, synthesizing if needed), and an `italic`
+    /// that is scoped to the characters the primary font provides — see [`ItalicFace`].
     fn shape_segments(&mut self, segments: &[Seg]) -> Buffer {
-        // Family borrows `fonts`; the buffer borrows `font_system` — disjoint fields,
-        // so the two borrows coexist. (The fallback chain lives in `font_system`'s
-        // `UserFallback`, so only the primary family is named here.)
+        // Family borrows `fonts`, the italic face borrows its own field, the buffer
+        // borrows `font_system` — disjoint fields, so the borrows coexist. (The fallback
+        // chain lives in `font_system`'s `UserFallback`, so only the primary family is
+        // named here.)
         let family = self
             .fonts
             .first()
             .map(|s| Family::Name(s))
             .unwrap_or(Family::Monospace);
+        let italic_face = &self.italic_face;
         let mut buf = Buffer::new(
             &mut self.font_system,
             Metrics::new(self.font_size, self.line_height),
         );
         let default = Attrs::new().family(family);
-        let rich = segments.iter().map(|s| {
+        // One entry per run, which is per segment except where an italic segment has to
+        // be split around the characters italic must not touch.
+        let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(segments.len());
+        for s in segments {
             let mut attrs = default.clone().color(srgb_to_color(s.fg));
             if s.bold {
                 attrs = attrs.weight(glyphon::Weight::BOLD);
             }
-            if s.italic {
-                // Synthetic (skewed) italic, not a real italic *face*. Requesting
-                // `Style::Italic` makes cosmic-text's matcher demand an italic face for
-                // every glyph (`Attrs::matches` gates on exact style) — so a CJK/symbol
-                // glyph in an italic comment, which has no italic fallback font, falls
-                // through the entire font set (slow), renders as tofu, and skips
-                // cell-snapping (dragging the rest of the line off-grid). `FAKE_ITALIC`
-                // keeps the regular face — found fast, and snapped by `monospace_width`
-                // since its advance is unchanged — and skews it at raster instead.
-                attrs = attrs.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
+            if !s.italic {
+                rich.push((s.text.as_str(), attrs));
+                continue;
             }
-            (s.text.as_str(), attrs)
-        });
+            // Italic applies only where the primary face can draw the character. An icon
+            // or a kanji resolves to a fallback font that has no italic of its own, so
+            // slanting it — really or synthetically — only skews a glyph that was never
+            // meant to lean. Those runs keep the plain attrs and stay upright.
+            for (run, slanted) in italic_runs(&s.text, &|g| italic_face.slants(g)) {
+                // A real italic *face* — the designer's letterforms. Never a synthetic
+                // skew: a font without an italic simply renders upright.
+                rich.push((
+                    run,
+                    if slanted {
+                        attrs.clone().style(fontdb::Style::Italic)
+                    } else {
+                        attrs.clone()
+                    },
+                ));
+            }
+        }
         buf.set_rich_text(
             &mut self.font_system,
             rich,
@@ -4503,6 +4560,179 @@ fn nonsnapped_clusters(buf: &Buffer, cell_w: f32, text: &str) -> Vec<(usize, usi
         })
         .collect();
     offgrid_clusters(text, &glyphs)
+}
+
+/// The rasterised ink box of an off-grid cluster's first glyph, at scale 1: the
+/// painted extent, which is what has to fit the reserved cells — the glyph's *advance*
+/// alone misses a glyph whose ink overflows it (`❤️` inks 10px in a 9px advance).
+/// `left` is the bearing from the glyph origin to the ink's left edge.
+#[derive(Clone, Copy, Debug)]
+pub struct Ink {
+    pub left: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Floor on the fitted scale, so a pathologically wide fallback glyph shrinks to
+/// something still legible rather than vanishing.
+const MIN_CLUSTER_SCALE: f32 = 0.25;
+
+/// The render scale for one off-grid cluster: `max_scale` (the configured
+/// `emoji_scale`), reduced until the glyph fits the `box_w` × `box_h` pixel box of the
+/// cells the editor reserved for it.
+///
+/// The ceiling is what a colour-emoji font needs — it draws *smaller* than its cells,
+/// so it is scaled up to them. But the same constant applied to a fallback drawn at its
+/// own design size does the opposite of the intent: a Nerd Font icon is a full em wide
+/// where a coding font's cell is ~0.6 em, so it already overflows its single reserved
+/// cell before any scaling, and multiplying makes it ~2 cells of ink over one — the
+/// icon visibly colliding with the next character. Fitting first and capping second
+/// leaves the already-fitting glyphs at `max_scale` and only pulls in the ones that
+/// would spill.
+///
+/// The extent measured horizontally is `max(advance, ink right edge)`: the advance is
+/// the box the font intends, and the ink guards the glyphs that paint outside it.
+/// Vertically only the ink matters — the line box is the limit. Pure, so it's tested in
+/// `tests/wide.rs`.
+pub fn cluster_scale(max_scale: f32, box_w: f32, box_h: f32, measured: Option<(f32, Ink)>) -> f32 {
+    let Some((adv, ink)) = measured else {
+        return max_scale; // unrasterised (blank/missing glyph) — nothing to fit
+    };
+    let extent_w = adv.max(ink.left + ink.width);
+    let mut scale = max_scale;
+    if extent_w > 0.0 {
+        scale = scale.min(box_w / extent_w);
+    }
+    if ink.height > 0.0 {
+        scale = scale.min(box_h / ink.height);
+    }
+    scale.max(MIN_CLUSTER_SCALE)
+}
+
+/// How italic is applied, given what the primary font actually provides.
+///
+/// Italic is a property of the *primary* family: a coding font ships an italic face (or
+/// doesn't), and the fallback fonts a line reaches for — Symbols Nerd Font for an icon,
+/// a CJK font for a kanji, an emoji font — essentially never do. Slanting those anyway
+/// is what made icons in a comment look wrong, so italic is asked for only where the
+/// primary italic face can actually draw the character; everything that will fall back
+/// stays upright. Coverage is necessary but not sufficient — see [`ItalicFace::slants`],
+/// since a coding font also covers box-drawing and other glyphs that must not lean.
+///
+/// Italic here always means a real italic **face**. A family that ships none renders
+/// upright, and the fix is to configure a font that has one (`--font "Adwaita Mono"`) —
+/// not to synthesize a skew, which would slant every glyph indiscriminately.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ItalicFace {
+    /// Codepoints the primary family's **italic face** can draw. Empty when the family
+    /// ships no italic — then nothing is slanted, which is the honest result: a font
+    /// without an italic renders upright, and the fix is to choose a font that has one.
+    coverage: HashSet<u32>,
+}
+
+impl ItalicFace {
+    /// Read the primary family's italic support out of the font database. `fonts` is the
+    /// configured family list; only its first entry is the primary (the rest are the
+    /// fallback chain, which italic deliberately never touches).
+    fn resolve(font_system: &mut FontSystem, fonts: &[String]) -> Self {
+        let family = fonts
+            .first()
+            .map(|s| Family::Name(s))
+            .unwrap_or(Family::Monospace);
+        // Face records carry concrete family names, so resolve the generic first:
+        // `Family::Monospace` is whatever the database calls the system monospace.
+        let name = font_system.db().family_name(&family).to_string();
+        // Coverage is the *italic* face's, deliberately — not the regular face's. Asking
+        // for italic on a character the italic face lacks sends cosmic-text off to some
+        // other family entirely, which is worse than leaving it upright.
+        // Resolve the face id before touching `get_font`, which needs the system mutably.
+        let italic = font_system
+            .db()
+            .faces()
+            .filter(|f: &&fontdb::FaceInfo| f.families.iter().any(|(n, _)| *n == name))
+            .find(|f| f.style != fontdb::Style::Normal)
+            .map(|f| f.id);
+        let coverage = italic
+            .and_then(|id| font_system.get_font(id, fontdb::Weight::NORMAL))
+            .map(|font| font.unicode_codepoints().iter().copied().collect())
+            .unwrap_or_default();
+        Self { coverage }
+    }
+
+    /// Whether `cluster` should be slanted: it must be a letterform ([`is_letterform`] —
+    /// so a box-drawing character the font happens to cover still stays upright) *and*
+    /// every character in it must be one the italic face can draw, since anything else
+    /// resolves to a fallback font with no italic of its own.
+    fn slants(&self, cluster: &str) -> bool {
+        is_letterform(cluster)
+            && cluster
+                .chars()
+                .all(|ch| self.coverage.contains(&(ch as u32)))
+    }
+}
+
+/// Whether `cluster` is a **letterform** — the kind of glyph an italic face genuinely
+/// redraws — rather than a drawing that has to stay axis-aligned.
+///
+/// Font coverage alone is not enough to decide what may lean. A coding font typically
+/// *does* ship box-drawing, block elements, arrows and geometric shapes, so coverage
+/// waves them through — but those are diagrams, not letters: they tile edge to edge, and
+/// a skewed `├` no longer meets the `─` beside it. Same for a powerline separator or a
+/// Nerd icon out of a patched primary font.
+///
+/// The rule is ASCII, or a Unicode letter/digit, at a single cell:
+/// * **ASCII always leans.** `+ = < > | ~ $ ^` are Unicode *symbols* by category, but
+///   they are ordinary code punctuation and an italic face draws them slanted like
+///   everything else; excluding them would leave gaps in a leaning comment.
+/// * **Beyond ASCII, only letters and digits lean** — so `á ß λ д` do, while `├ █ → ❤`
+///   and the private-use icon range do not.
+/// * **A wide cluster never leans.** A double-width glyph comes from a CJK or emoji
+///   fallback that has no italic anyway, and slanting one breaks the cell grid.
+///
+/// Pure, so it's tested in `tests/wide.rs`.
+pub fn is_letterform(cluster: &str) -> bool {
+    if cluster.width() > 1 {
+        return false;
+    }
+    cluster
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii() || ch.is_alphanumeric())
+}
+
+/// Split `text` into maximal runs that agree on whether italic applies, pairing each
+/// with that verdict. `slants` answers whether one grapheme cluster may lean — in the
+/// renderer, [`is_letterform`] plus "the primary font can draw it".
+///
+/// A comment mixing words with a Nerd Font icon is one styled segment but two kinds of
+/// character: the words, which the primary font draws and italic belongs on, and the
+/// icon, which resolves to Symbols Nerd Font and must stay upright. Splitting here means
+/// shaping sees the two as separate runs with separate attrs.
+///
+/// The walk is over grapheme *clusters*, not chars, so a base plus its combining marks
+/// is one unit — splitting `é` between its `e` and its accent would hand shaping two
+/// runs that can no longer compose. Pure, so it's tested in `tests/wide.rs`.
+pub fn italic_runs<'a>(text: &'a str, slants: &dyn Fn(&str) -> bool) -> Vec<(&'a str, bool)> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut runs: Vec<(&str, bool)> = Vec::new();
+    let mut start = 0;
+    let mut current: Option<bool> = None;
+    for (i, cluster) in text.grapheme_indices(true) {
+        let want = slants(cluster);
+        match current {
+            Some(w) if w == want => {}
+            Some(w) => {
+                runs.push((&text[start..i], w));
+                start = i;
+                current = Some(want);
+            }
+            None => current = Some(want),
+        }
+    }
+    if let Some(w) = current {
+        runs.push((&text[start..], w));
+    }
+    runs
 }
 
 /// Grid tolerance: how far a cluster's summed glyph advance may sit from its display

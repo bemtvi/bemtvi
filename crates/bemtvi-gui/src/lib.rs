@@ -58,9 +58,10 @@ pub use render::{inlay_shift, splice_inlay, virt_inline_shift, Seg, DEFAULT_INLA
 pub use render::{
     apply_search_fg, col_to_screen, group_fallback, rect_subtract, row_segments, text_run_origin,
 };
-// The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces), so
-// the Tier-1 `wide` test can exercise it without shaping / a GPU.
-pub use render::{mask_segments, offgrid_clusters};
+// The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces) and
+// the shrink-to-fit sizing of the cluster that mask reserved room for, so the Tier-1
+// `wide` test can exercise both without shaping / a GPU.
+pub use render::{cluster_scale, is_letterform, italic_runs, mask_segments, offgrid_clusters, Ink};
 // The pure caret-cell math for the command line and the picker prompt (char-offset
 // wire fields → display-width cells), exported for the Tier-1 `caret` test.
 pub use render::{cmdline_caret_col, query_caret_col};
@@ -116,8 +117,11 @@ pub struct GuiConfig {
     pub fonts: Vec<String>,
     /// Font point size, before the display's scale factor is applied.
     pub font_size: f32,
-    /// Render scale for an emoji / wide fallback glyph relative to the text cell — a
-    /// color-emoji font draws smaller than its reserved cells, so this sizes it up.
+    /// *Maximum* render scale for an emoji / wide fallback glyph relative to the text
+    /// cell — a color-emoji font draws smaller than its reserved cells, so this sizes it
+    /// up. It is a ceiling, not a constant: a glyph whose ink is *wider* than the cells
+    /// the editor reserved (a Nerd Font icon is a full em where a coding font's cell is
+    /// ~0.6 em) is shrunk to fit instead, so it can't collide with the next character.
     /// Set from `--emoji-scale` / `BEMTVI_GUI_EMOJI_SCALE`.
     pub emoji_scale: f32,
 }
@@ -174,9 +178,9 @@ impl GuiConfig {
         }
     }
 
-    /// Set the emoji render scale, clamped to `[0.25, 4.0]` so a typo can't blow a
-    /// glyph up across the screen or vanish it. A non-finite or non-positive value is
-    /// ignored (keeps the current scale).
+    /// Set the emoji render scale *ceiling*, clamped to `[0.25, 4.0]` so a typo can't
+    /// blow a glyph up across the screen or vanish it. A non-finite or non-positive
+    /// value is ignored (keeps the current scale).
     pub fn set_emoji_scale(&mut self, scale: f32) {
         if scale.is_finite() && scale > 0.0 {
             self.emoji_scale = scale.clamp(0.25, 4.0);

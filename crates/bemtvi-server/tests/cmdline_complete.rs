@@ -2067,16 +2067,73 @@ async fn prompt_wildmenu_anchors_past_a_multichar_prompt_label() {
     .await;
 
     // Type a token at the very start of the line (anchor offset 0 within the line) and
-    // open the wildmenu. Its `col` is the prompt width (5), proving it anchored past the
-    // label rather than at column 0.
+    // open the wildmenu. The token therefore sits at column 5 — the prompt's width — and
+    // the box's left edge one cell before it, so its first list character (drawn at
+    // `col + 1`, past the border) lands *on* the token. Anchoring at the origin instead
+    // would put the box five cells left of the word it completes.
     feed(&rpc, "pr");
     feed(&rpc, "<Tab>");
     let map = poll_menu(&rpc, &mut incoming)
         .await
         .expect("the prompt wildmenu opens");
+    let col = menu_field_u64(&map, "col");
     assert_eq!(
-        menu_field_u64(&map, "col"),
+        col + 1,
         5,
-        "the wildmenu anchors under the token, past the `dap> ` prompt label"
+        "the wildmenu's candidates line up under the token, past the `dap> ` prompt label"
+    );
+}
+
+/// The box's left edge is its BORDER, one cell before the token, so the candidates
+/// themselves line up with the text being completed — the same alignment the
+/// cursor-anchored completion popup gets from its client-side one-cell shift. Every
+/// client draws the border at `col` and the first list character at `col + 1`, so this
+/// one column governs all three.
+#[tokio::test]
+async fn the_wildmenu_lines_its_candidates_up_under_the_token() {
+    let dir = temp_dir("cmdcomplete_token_align");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:ed` — the `:` prompt is one cell, so the token starts at column 1.
+    feed(&rpc, ":ed<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("wildmenu opens");
+    assert_eq!(
+        menu_field_u64(&map, "col") + 1,
+        1,
+        "the first candidate character sits on the token's own column"
+    );
+}
+
+/// The docs sidebar is placed server-side from the same box geometry the clients draw
+/// (`cmdline_menu_box`), so it travels with the box rather than being anchored
+/// independently — the two can't drift apart.
+#[tokio::test]
+async fn the_docs_float_tracks_the_wildmenu_box() {
+    let dir = temp_dir("cmdcomplete_docs_track");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    feed(&rpc, ":ed<Tab>");
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("wildmenu opens");
+    // Selecting a row arms the docs float.
+    feed(&rpc, "<C-n>");
+    let map = wait_redraw(&mut incoming, |m| cmdline_docs_window(m).is_some()).await;
+    let win = cmdline_docs_window(&map).expect("a docs float");
+    let rect = match map_get(&win, "rect") {
+        Some(Value::Map(r)) => r,
+        other => panic!("expected a rect map, got {other:?}"),
+    };
+    let x = map_get(rect, "x").and_then(Value::as_u64).expect("rect.x") as usize;
+    let (col, width) = (menu_field_u64(&map, "col"), menu_field_u64(&map, "width"));
+    // Flush to the right of the box: the float's own left border shares the column of
+    // the box's right border (`col + width + 1`), which is what "beside it" looks like
+    // with two bordered boxes.
+    assert_eq!(
+        x,
+        col + width + 1,
+        "the docs float sits flush against the box's right border"
     );
 }

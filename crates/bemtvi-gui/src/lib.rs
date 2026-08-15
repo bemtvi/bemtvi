@@ -72,6 +72,9 @@ pub use render::{cmdline_caret_col, query_caret_col};
 // colour its covered glyph is re-drawn in — plus that recolor, exported for the
 // Tier-1 `cursor` test.
 pub use render::{apply_cursor_fg, block_cursor_colors};
+// Where a floating menu box anchors — window-relative for a completion popup, but
+// screen-relative for the command-line wildmenu. Exported for the Tier-1 `menu` test.
+pub use render::menu_box_origin;
 // The sRGB→linear color conversions feeding the quad pipeline, exported so the Tier-1
 // `color` test can pin the channel order without a GPU.
 pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};

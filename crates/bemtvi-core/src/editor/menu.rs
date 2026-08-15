@@ -2598,8 +2598,15 @@ impl Editor {
                     .max()
                     .unwrap_or(1)
                     .max(1);
+                // `col` is the BOX's left edge (its border), not the token's column:
+                // every client draws the border at `col` and the first list character at
+                // `col + 1`. So sit one cell before the token — then the candidates line
+                // up *under* the text they complete instead of one cell right of it,
+                // which is the same alignment the cursor-anchored completion popup gets
+                // from its client-side one-cell shift. A token at column 0 (a promptless
+                // line) has nowhere to go and keeps the edge, exactly as that popup does.
                 let anchor = m.anchor_offset + self.cmdline_prompt_width();
-                let col = anchor.min(text_width.saturating_sub(1));
+                let col = anchor.min(text_width.saturating_sub(1)).saturating_sub(1);
                 let max_w = text_width.saturating_sub(col).max(1);
                 let width = content_w.min(max_w);
                 // A full bordered box (2 rows of chrome) sitting on the last text rows,

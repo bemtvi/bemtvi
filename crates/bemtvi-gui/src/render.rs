@@ -2789,14 +2789,15 @@ impl Renderer {
         // Borders counted into the box height: a top edge for a bordered / cmdline box,
         // a bottom edge for everything except the cmdline wildmenu (flush to the input).
         let box_h = menu.height + top_pad + u16::from(!menu.cmdline);
-        let (bx, by) = if menu.cmdline {
-            (origin.0 + menu.col, cmd_row.saturating_sub(box_h))
-        } else {
-            (
-                (text_x0 + menu.col).saturating_sub(left_shift),
-                wy + menu.row,
-            )
-        };
+        let (bx, by) = menu_box_origin(
+            menu.cmdline,
+            (text_x0, wy),
+            menu.col,
+            menu.row,
+            left_shift,
+            cmd_row,
+            box_h,
+        );
         // Opaque backing + a single-line glyph border (the shared popup border path):
         // the cmdline wildmenu drops its bottom edge (flush to the input below), a
         // completion-style popup (`!border_top`) its top edge, a bordered select/picker
@@ -4825,6 +4826,44 @@ fn nonsnapped_clusters(buf: &Buffer, cell_w: f32, text: &str) -> Vec<(usize, usi
         })
         .collect();
     offgrid_clusters(text, &glyphs)
+}
+
+/// Where a floating menu box's top-left cell goes, in screen cells.
+///
+/// Two anchors, and the whole point is that they are different. A completion popup or
+/// a `btv.ui.select` list belongs *inside the focused window*, so it anchors at
+/// `win_anchor` — the window's text-inner origin, region origin already folded in —
+/// plus the menu's own `col`/`row`, shifted one cell left (`left_shift`) when the box
+/// has no top border, so its left edge doesn't push the list off the word.
+///
+/// The **command-line wildmenu** does not. The command line is a screen row spanning
+/// the full width at column 0 — outside every window's region — and `menu.col` is a
+/// column *within it* (the start of the token being completed). Anchoring it at the
+/// focused window's region origin (which is what it used to share with the branch
+/// above) slid it right by the width of any left dock, so completing `:e src/` with a
+/// file tree open floated the list a dock's width away from the token, while the
+/// command line it belongs to stayed at column 0. It grows *upward* from `cmd_row`,
+/// flush against the input, and clamps at the top of the grid when the list is taller
+/// than the room above.
+///
+/// Pure, so it's tested in `tests/menu.rs`.
+pub fn menu_box_origin(
+    cmdline: bool,
+    win_anchor: (u16, u16),
+    menu_col: u16,
+    menu_row: u16,
+    left_shift: u16,
+    cmd_row: u16,
+    box_h: u16,
+) -> (u16, u16) {
+    if cmdline {
+        (menu_col, cmd_row.saturating_sub(box_h))
+    } else {
+        (
+            (win_anchor.0 + menu_col).saturating_sub(left_shift),
+            win_anchor.1 + menu_row,
+        )
+    }
 }
 
 /// The rasterised ink box of an off-grid cluster's first glyph, at scale 1: the

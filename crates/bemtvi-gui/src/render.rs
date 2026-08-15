@@ -3961,16 +3961,20 @@ pub fn query_caret_col(query: &str, cursor_chars: usize) -> u16 {
 /// Display width of `s` in screen cells — the ONE column metric the row pipeline
 /// walks, and the one the server measures every wire column in.
 ///
-/// It is per grapheme *cluster*, not per char, because a cluster's width is not the
-/// sum of its chars': `\u{1f934}\u{1f3fc}` (an emoji plus its skin-tone modifier) is 2
-/// cells though each char alone reports 2, `\u{2764}\u{fe0f}` (a heart plus VS16) is 2
-/// though its chars report 1 and 0, and a ZWJ family emoji is 2 across five chars.
-/// `UnicodeWidthStr` applies those emoji rules over the whole string, which is
-/// exactly what the server's `unicode::virtcol` does — and what [`push_text`] already
-/// used to place glyphs, while the segment layer counted chars. Walking chars put the
-/// colours out of step with the glyphs they were meant to paint.
+/// It is a **sum over grapheme clusters**, because a cluster's width is not the sum of
+/// its chars': `\u{1f934}\u{1f3fc}` (an emoji plus its skin-tone modifier) is 2 cells
+/// though each char alone reports 2, `\u{2764}\u{fe0f}` (a heart plus VS16) is 2 though
+/// its chars report 1 and 0, and a ZWJ family emoji is 2 across five chars.
+/// [`push_text`] already placed glyphs on this grid while the segment layer counted
+/// chars, which is what put the colours out of step with the glyphs they paint.
+///
+/// Summing per cluster — rather than handing the whole string to `UnicodeWidthStr` —
+/// is what makes this identical to the server's `unicode::virtcol`, which walks
+/// graphemes and measures each one. The two differ: `UnicodeWidthStr` also ligatures
+/// across cluster boundaries (Arabic lam-alef is 1 to it, 2 to `virtcol`), and a cell
+/// grid has to follow the server, not the crate.
 pub fn cells(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    s.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 /// `s` truncated to at most `max` screen cells, cut on a grapheme-cluster boundary

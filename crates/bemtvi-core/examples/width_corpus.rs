@@ -1,7 +1,7 @@
 //! Throwaway generator: emits the differential corpus `verify-width.mjs` checks the web
 //! client's `clusterWidth` against — every grapheme cluster from a realistic sample of
-//! text and emoji, paired with the width the SERVER assigns it (`unicode-width`, the
-//! authority every wire column is measured in). Run:
+//! text and emoji, paired with the width the SERVER assigns it (`unicode::virtcol`'s
+//! model, the grid every wire column is measured in — see `server_width`). Run:
 //! `cargo run -p bemtvi-core --example width_corpus > crates/bemtvi-edithost/web/width-corpus.json`.
 //!
 //! The client mirrors those widths from generated tables (see `dump_width.rs`); this
@@ -52,6 +52,14 @@ fn json(s: &str) -> String {
     out
 }
 
+/// The width the SERVER assigns `s` — `unicode::virtcol`'s model, which walks grapheme
+/// clusters and measures each one. NOT `UnicodeWidthStr::width(s)` on the whole string:
+/// that additionally ligatures across cluster boundaries (Arabic lam-alef is 1 cell to
+/// it, 2 to `virtcol`), and it is the server's grid the client has to match.
+fn server_width(s: &str) -> usize {
+    s.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
 fn main() {
     let mut seen: Vec<(String, usize)> = Vec::new();
     for s in SAMPLES {
@@ -59,7 +67,7 @@ fn main() {
             if seen.iter().any(|(t, _)| t == g) {
                 continue;
             }
-            seen.push((g.to_string(), UnicodeWidthStr::width(g)));
+            seen.push((g.to_string(), server_width(g)));
         }
     }
     println!("{{");
@@ -70,7 +78,7 @@ fn main() {
         println!(
             "    {{ \"text\": {}, \"width\": {} }}{comma}",
             json(s),
-            UnicodeWidthStr::width(*s)
+            server_width(s)
         );
     }
     println!("  ],");

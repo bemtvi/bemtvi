@@ -603,9 +603,11 @@
     // (which already covers CJK, combining marks and the rest). `dump_width.rs`
     // self-checks this exact rule against the real thing over every single-cluster
     // emoji sequence — the only divergences are malformed clusters, described there.
-    // NOT covered (they span clusters, so no per-cluster rule can see them): the
-    // script ligatures `unicode-width` also models — Arabic lam-alef, Lisu tone pairs,
-    // Khmer coeng — which stay at their summed width here, exactly as before.
+    //
+    // Cluster-LOCAL is the right target, not a limitation: `unicode-width` also
+    // ligatures ACROSS cluster boundaries (Arabic lam-alef is 1 cell to it), but the
+    // server's `unicode::virtcol` walks graphemes and measures each one, so lam-alef
+    // is 2 columns in bemtvi's own model. A cell grid follows the server.
     function clusterWidth(cluster) {
       // Printable ASCII is one cell and is most of every line — answer it before the
       // spread allocates, since this runs per cell per repaint.

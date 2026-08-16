@@ -1,5 +1,8 @@
 # Undo navigation: `:undolist`, `g-`/`g+`, `:earlier`/`:later`, `'undolevels'`
 
+Status: **done** — 2026-08-14. All four phases landed in `d8c8b0ea`; two review
+follow-ups landed after it (below).
+
 Close the gap between bemtvi's undo **data model** (complete) and its undo **command
 surface** (four entry points). The branching `UndoTree` already stores everything vim's
 undo features need; almost nothing reads it.
@@ -163,3 +166,65 @@ Testing the time forms needed a deterministic clock, so `ServerInit` gained a
 `mono_clock` test seam mirroring the existing `mouse_clock` — same shape, same
 `TestClock` type (`set_secs` alongside `set_ms`), read by `EditHost::mono_stamp_secs`.
 Without it a `{N}s` test would have to sleep for real seconds.
+
+## Follow-up fix — a travel that walked the wrong way, and a clock the browser never wound
+
+Four defects from reviewing the shipped feature (`a018ec4b`), each landed with a
+test that fails against the code as it shipped:
+
+- **`:earlier {N}f` could travel *forward*.** A save number is stamped onto
+  whichever state is current when `:w` runs, so it does **not** grow with `seq`:
+  write, undo, write again, and write 1 sits on a *later* state than write 2.
+  Seeking "one write back" by number alone walked into the abandoned branch, and
+  the mirror (`:later 1f` from an unwritten branch) rewound the buffer. vim wraps
+  its closest-match search in a seq test (`uh_seq <= b_u_seq_cur` going back,
+  `>` going forward) precisely because the field being sought is not monotonic.
+  `on_travel_side` is that test, and **every** seek — by seq, by time, by write —
+  now filters through it before consulting its own field. Node times tie the same
+  way, so it guards those too.
+- **`btv.bo.undolevels = 3` set nothing.** The option reached `:set`, the catalog
+  and the Lua mirror, but `set_buffer_option_num` never grew an arm for it, so a
+  write fell through the match's `_ => return` and read back 1000 forever — a
+  silent no-op behind a surface that looked wired. The `:set` path has a guard for
+  exactly this (`every_known_option_is_wired_not_silent`); the Lua bridge has no
+  error to assert on, so the new guard writes every buffer number/boolean option
+  in the catalog and reads it back.
+- **The undo timeline was never wound on the web build.** `set_now_mono` is
+  stamped once per RPC message in `EditHost::handle`, and the wasm leg never calls
+  it (input arrives through the FFI exports), so every node was stamped 0:
+  `:undolist` read "0 seconds ago" for every state and `:earlier {N}s` ran off the
+  end of the history every time. The general form is worth remembering: any
+  per-message state `EditHost::handle` stamps is silently zero on the web, because
+  the wasm leg never routes through it.
+
+## Follow-up fix — travel out from under a selection
+
+`71d15321`. vim never travels the undo history from a live selection or an armed
+operator: `<C-r>` and `g-`/`g+` are wrapped in `checkclearopq`, and `u` is
+redirected outright to the `gu` operator (`nv_undo`) — three routes to one rule,
+because a rewind there moves the text out from under the very thing the next key
+is about to operate on. The selection survives the rewind as a pair of offsets
+into a state that no longer exists, so `vjl` then `g-` then `d` deleted a span the
+user never selected.
+
+bemtvi honored none of it — `g-`/`g+` reached the `g` submap before
+`parse_command`'s operator guard could see them, so even `dg-` travelled.
+`ParseStep::Refuse` is vim's `clearopbeep` as a parse outcome: drop the whole
+pending command, operator included, and beep — deliberately *not* touching the
+mode, so a refusal under a selection leaves the selection up and the next operator
+still applies to it. The beep is load-bearing beyond the bell: it is what ends a
+macro playback, so a register that hits a refusal stops there instead of running
+on into keys that assume the travel happened. (`u` in Visual is a loud dead end
+rather than vim's lowercase operator only because bemtvi has no `gu`/`gU` yet; the
+comment says to point it at the operator when that lands.)
+
+## Outcome
+
+Shipped as planned, with the one unplanned model change recorded above. The suite
+is now **38** black-box tests in `crates/bemtvi-server/tests/editing/undo.rs`
+(30 with the feature, the rest with the two follow-ups), each mutation-tested
+against a broken implementation.
+
+Deliberately still absent, each a feature rather than a read of this tree: `U`
+(undo-line), `:undojoin`, `'undoreload'`, and persistent undo (`'undofile'` /
+`'undodir'` / `:wundo` / `:rundo`).

@@ -20,6 +20,11 @@ command to open a local file or `:luao` to load a local lua file as config.
 Use `:setf LANG` to activate treesitter if not auto detected or `:TSInstall` to
 install the highlighter for your chosen language.
 
+📖 **[The bemtvi Book](https://bemtvi.github.io/bemtvi/)** is the full
+documentation — the user guide, the "beyond vim" feature guides, the plugin
+development chapters, and the complete `btv.*` API reference, generated straight
+from the Lua prelude so it can't drift from the running editor.
+
 ---
 
 ## Quick start
@@ -75,6 +80,14 @@ Downloads ship with checksums and SLSA build provenance — see
 > paste (`Ctrl+Shift+V`, middle-click) — reading the clipboard back over OSC 52 is
 > a round trip most terminals refuse, so `"+p` pastes what this session copied.
 
+> **`Ctrl+C` / `Ctrl+V` work out of the box**, on the **system** clipboard. They
+> ship as built-in keymaps: `<C-c>` copies the visual selection, `<C-v>` pastes —
+> at the cursor in normal mode, at the caret in insert mode, and into the line
+> being typed on the command line. Nothing vim-ish is displaced (bemtvi has no
+> blockwise visual mode for `<C-v>` to open and no `i_CTRL-V` literal insert), and
+> each has a `<C-S-…>` twin for the clients that can tell the two apart. They are
+> registered as defaults, so your own map wins and an empty function turns one off.
+
 The terminal editor is the whole thing in one binary: it embeds the server on
 its own thread and runs the client on the main thread, joined over the same
 msgpack-RPC the UI clients speak.
@@ -107,7 +120,9 @@ go through the browser's **File System Access API** (`:eo` / `:wo`, the in-brows
 analogue of the GUI's dialogs) or persist to **OPFS** — so you **really edit local
 files** (no upload, no backend), and a static host is enough to put it online. It
 can also reach a real `bemtvi --daemon` over **WebTransport** for remote access,
-vscode server style.
+vscode server style. Opt into `btv.shada.save_layout(true)` and a browser session
+**comes back the way you left it** — windows, tabs, buffers, and plugin views
+restored from the origin's OPFS.
 
 It's a separate, wasm-targeted crate, deliberately **excluded from the Cargo
 workspace** (so `cargo build/test --workspace` never touches it). Build it with
@@ -129,8 +144,12 @@ client-side tree-sitter highlighter).
 
 - **Modal editing** — normal / insert / visual / visual-line,
   motions, operators, counts, dot-repeat, and a basic ex-command surface.
-- **A branching undo tree** — `u` / `<C-r>`, `:undo {N}` to jump across branches,
-  and `vim.fn.undotree()`, backed by cheap full-rope snapshots.
+- **A branching undo tree** — `u` / `<C-r>` walk the tree, `:undo {N}` jumps
+  across branches, and `g-` / `g+` / `:earlier` / `:later` walk the states in the
+  order they were *made* — by count, by time (`:earlier 10m`) or by file write
+  (`:earlier 1f` returns to what is on disk). `:undolist` lists the branches and
+  `vim.fn.undotree()` exposes the whole thing; `'undolevels'` bounds what the
+  (cheap, full-rope) snapshots retain.
 - **Multiple buffers, windows, tabs, and floats** — `:e`/`:b`/`:ls`, the
   `<C-w>` split family (`:split`/`:vsplit`, focus, resize, close), tab pages
   (`gt`/`:tabnew`/`<C-w>T`), and floating windows (`nvim_open_win` with borders
@@ -161,7 +180,17 @@ client-side tree-sitter highlighter).
 - **Treesitter highlighting, in-process** — incremental parsing per buffer,
   installable grammars, and `:TSInstall <lang>` to fetch + compile a grammar on
   demand. A full tree-scripting Lua API (parsers, queries, predicates,
-  injections) runs on bemtvi's primitives.
+  injections) runs on bemtvi's primitives. Grammars load *off* the editor thread,
+  so opening a file in a language you haven't used yet never stalls a keystroke.
+- **Filetype detection from the whole path, not just the extension** — the exact
+  basename (`Makefile`, `.bashrc`, `go.mod`, `.editorconfig`), a small set of
+  globs (`.env.*`, `Dockerfile.*`, `config` under `.ssh/`), and finally the
+  interpreter named by a `#!` line for an extensionless script. Detection is a
+  *derive*, so a rename retypes the buffer immediately.
+- **Feedback while you type** — `'showcmd'` paints the partly-typed command
+  (register, counts, operator, a withheld mapping prefix) or the selection size in
+  the corner, and `'report'` echoes vim's line-count messages once a delete, yank,
+  paste or shift passes the threshold.
 - **A real Lua config runtime** — vendored PUC Lua 5.4 running *inside*
   the server: a config dir + runtimepath, `require`/`init.lua`, keymaps, user
   commands, autocmds, an async event loop (timers, process spawn, scheduling),
@@ -169,8 +198,13 @@ client-side tree-sitter highlighter).
   the highlight registry (see [Intentional deviations](#intentional-deviations-these-will-not-change)).
 - **LSP & diagnostics** — servers are configured and started from user Lua
   config; completion, hover, go-to, references,
-  rename, diagnostics (underline / virtual text / signs / float), semantic
-  tokens, and inlay hints are wired.
+  rename, code actions, formatting, diagnostics (underline / virtual text /
+  signs / float), semantic tokens, inlay hints, `$/progress`, and
+  `didChangeWatchedFiles` are wired. Every cursor verb merges across the servers
+  attached to a buffer, in a stated priority order. Ready-made configs for **407
+  language servers** — nvim-lspconfig reimplemented natively, nothing blocking —
+  ship as the
+  [bemtvi-lspconfig](https://github.com/bemtvi/bemtvi-lspconfig) plugin.
 - **Mouse support** — click, drag-select, multi-click, wheel scroll, divider
   drag, `'mousemodel'` menus, and middle-click paste, in both clients.
 - **The `btv.*` native plugin surfaces** — the server-owned extensibility API is
@@ -231,21 +265,29 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
 - **Insert mode** — `<C-r>` register insert (`<C-r><C-w>` for the word under the
   cursor), auto-indent, native completion (`<C-n>`/`<C-p>`/`<C-y>`), and
   snippets with tabstop navigation.
+- **Macros** — record with `<F2>{reg}`, replay with `{count}<F3>{reg}`
+  ([why not `q`/`@`](docs/features/macros.md)). A recording captures the keys you
+  *typed*, mappings included, and replays through the keymap matcher, so a macro
+  over a Lua keymap re-fires it.
 - **Ex commands** — `:e :w :q` (and the split/tab variants), `:s` (with the
   `g i I n c` flags), `:g`/`:v`, `:d :m :t`, `:normal`, `:put`, `:undo`/`:redo`,
-  `:set`/`:setlocal`, the listings (`:marks :registers :jumps :changes
-  :messages`), and `:vimgrep`/`:lvimgrep`.
+  the undo-travel family (`:undolist`, `:earlier`/`:later`),
+  `:set`/`:setlocal`/`:setglobal`, the listings (`:marks :registers :jumps
+  :changes :messages`), and `:vimgrep`/`:lvimgrep`.
 
 Not yet wired (see the [roadmap](#not-yet-implemented-roadmap)): `%` match-pair,
 the paragraph/sentence motions (`{ } ( )`), the screen motions (`H M L`), the
-`gu`/`gU`/`g~` case operators, `gq` reflow, HTML tag objects (in bemtvi `it`/`at`
-are the tree-sitter type/class object), and macros (`q`/`@`).
+`gu`/`gU`/`g~` case operators, `gq` reflow, and HTML tag objects (in bemtvi
+`it`/`at` are the tree-sitter type/class object). Macros are wired, but on
+`<F2>`/`<F3>` rather than `q`/`@` — see
+[keyboard macros](docs/features/macros.md).
 
 ---
 
 ## Notable additions
 
-Things bemtvi has that neovim doesn't:
+Things bemtvi has that neovim doesn't. The full index — with a guide per feature —
+is [**Beyond vim: what bemtvi adds**](docs/features.md); the highlights:
 
 - **Helix mode (selection-first editing).** An opt-in `noun→verb` model
   ([`docs/features/helix-mode.md`](docs/features/helix-mode.md)) alongside the vim
@@ -274,6 +316,18 @@ Things bemtvi has that neovim doesn't:
     preserving its edit / split / tab semantics.
   - `:wo` (and a bare `:w` on an unnamed buffer) pops a system **save** dialog
     and writes to the chosen path.
+
+  The pixel clients also render **Nerd Font icons at the size the font drew
+  them**. An icon is designed a full em wide where a coding font's cell is about
+  0.6 em, so a one-cell reservation either shrinks it or lets it collide; when
+  the cell to its right holds a space there is nothing to paint over, so the
+  glyph may take that room. `btv.o.guiglyphoverflow` picks the mode —
+  `never` / `always` / `when-followed-by-space` — and it is a *server* option
+  relayed on the redraw, so it reaches the browser too, which has no CLI to carry
+  a flag (`--glyph-overflow` / `BEMTVI_GUI_GLYPH_OVERFLOW` for the GUI,
+  `?glyph-overflow=` for the page, are the client-side defaults). Only the ink
+  moves: the glyph still *occupies* one cell, so every column the server computes
+  is untouched.
 
 ---
 
@@ -313,7 +367,7 @@ nothing more.
 
 ### Runnable examples
 
-The [`examples/`](examples) directory has ~85 self-contained, end-to-end-verified
+The [`examples/`](examples) directory has ~105 self-contained, end-to-end-verified
 configs — one per feature (treesitter, LSP, floats, registers, tabs, mouse,
 statusline, completion, picker, snippets, decor, docks, quickfix, image
 previews, …). Each is a config dir you point bemtvi at:
@@ -336,10 +390,15 @@ btv.plugins({
 })
 ```
 
+The first-party set — a statusline, a file tree, a which-key popup, `:help`,
+lspconfig, snippets, a diff viewer, a DAP debugger, and more — is catalogued in
+[**Recommended plugins**](docs/recommended-plugins.md), each with the spec to
+paste into your config.
+
 Plugins are testable end-to-end with the native framework — write `test/*_spec.lua`
 and run `bemtvi --test-plugin .`. See the full guides:
 [**Writing bemtvi plugins**](docs/plugin-authoring.md) and
-[**Testing bemtvi plugins**](docs/specs/2026-06-19-lua-plugin-testing.md).
+[**Testing bemtvi plugins**](docs/plugin-testing.md).
 
 Writing one with a coding agent? Install
 [**bemtvi-plugin-skills**](https://github.com/bemtvi/bemtvi-plugin-skills)
@@ -354,6 +413,8 @@ neovim APIs that don't exist here.
 The authoritative design doc is **[docs/architecture.md](docs/architecture.md)** —
 read it first for the crate layout, the client-server model, the RPC + `View`
 protocols, the rope text model, the Lua bridge, treesitter, LSP, and the roadmap.
+(It is also a chapter of [the book](https://bemtvi.github.io/bemtvi/), which
+`book/gen/generate.py` renders from `docs/` plus the Lua prelude.)
 
 The short version:
 
@@ -447,7 +508,6 @@ highlights:
 
 ### Not yet implemented (roadmap)
 
-- **Macros** — `q` record / `@` replay aren't built.
 - **Some motions.** `%` match-pair, the paragraph/sentence motions
   (`{` `}` `(` `)`), and the screen motions (`H` `M` `L`) aren't wired yet.
 - **More window-local options.** `wrap`, `number`/`relativenumber`,
@@ -455,9 +515,10 @@ highlights:
   `breakindent`/`showbreak`, the fold options
   (`foldenable`/`foldcolumn`/`foldlevel`), and the horizontal-scroll
   options are honored; the rest (`cursorcolumn`, `list`, …) are not.
-- **A broad options surface.** `:set` knows ~75 options — the search booleans,
+- **A broad options surface.** `:set` knows just over 80 options — the search booleans,
   the window options above, the buffer-local indentation options plus
-  `commentstring`, the fold / mouse / statusline / encoding families, and
+  `commentstring`, the fold / mouse / statusline / encoding families, the
+  editing-feedback pair `showcmd` / `report`, `undolevels`, and
   more — and fails loud (`E518`) on anything else; the bulk of vim's hundreds
   of options are missing. (The Lua surface is lenient instead: a `vim.o`/`btv.o`
   write to an unmodeled name is recorded with a warning but inert.)

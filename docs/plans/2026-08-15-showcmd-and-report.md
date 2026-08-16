@@ -2,6 +2,9 @@
 
 *2026-08-15*
 
+Status: **done** — both phases landed (`'report'` in `60b8801e`, `'showcmd'` in
+`2370aa58`). See [Outcome](#outcome) for where reality differed from the sketch.
+
 ## The gap
 
 bemtvi gives the user no feedback for two things vim/neovim show by default:

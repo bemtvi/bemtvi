@@ -336,7 +336,8 @@ a **list of windows** plus the global chrome. Each `WindowView` carries one
 window's `rect`, focus flag, visible text rows, cursor, selection/search spans,
 gutter numbers, and status-line data (file name, modified flag, ruler); the
 `View` adds the inter-split `separators` and the **global** fields one editor has
-(mode label, command line, message, and the list-overlay `menu`). The server
+(mode label, command line, message, the `'showcmd'` corner string — the pending
+run, or the selection size while one is up — and the list-overlay `menu`). The server
 sends it as a single
 `redraw` notification carrying one msgpack map (a `windows` array + a
 `separators` array + the global keys). With one window the list has a single
@@ -566,6 +567,20 @@ quit, which — like `:qa` — refuses when a modified buffer would be lost,
 switching the window to that buffer and reporting `E37` (so you see what's
 blocking), matching neovim's last-window behavior with `hidden` buffers. `:q!` /
 `:qa!` exit unconditionally.
+
+**A buffer's `filetype` is derived from the path, not set at read.** `:setf` /
+`btv.bo.filetype` pin an override; absent one, `language_of_path` consults three
+tables, most specific first — the exact basename (`Makefile`, `.bashrc`,
+`go.mod`, the `.*ignore` family, the dotfile configs whose syntax is a
+general-purpose format), a deliberately small set of globs on bemtvi's own glob
+engine (`.env.*`, `Dockerfile.*`, and the names that only mean something in one
+directory, like `config` under `.ssh/`), and the extension. A path no rule claims
+falls back to the interpreter named by a leading `#!` line — never an override,
+so a `.lua` file starting `#!/bin/sh` is still lua, and only an unclaimed path
+pays for the single-line read. Because it is a *derive* rather than vim's
+set-at-read, a rename retypes the buffer immediately and a buffer that never went
+through a read chain — a picker preview, a fresh scratch — is typed like one that
+did.
 
 The treesitter engine tracks each buffer independently: it keeps a parse tree +
 shadow text per `BufferId` (the editor owns the engine), the server memoizes the
@@ -973,9 +988,13 @@ state**, not a verb API:
 - **Query customization is the native bridge `btv._btv_set_ts_query(lang, name,
   text|nil)`** — it queues a `TsOp::SetQuery` the server pushes straight onto the
   engine, installing a `highlights` / `injections` / `indents` override (a
-  replace, `nil` to drop). There is no `;extends` / `after-queries` / runtimepath
-  *merge*: base queries come from the engine's data-dir files, an override
-  replaces them.
+  replace, `nil` to drop). Underneath it, the server *resolves* each query the
+  neovim way before handing it over: the language's bundled base, its
+  `; inherits:` chain (so `javascript` picks up `ecma`/`jsx`), and the
+  runtimepath `queries/` + `after/queries/` overlay, where a file carrying
+  `;; extends` is added and one without it replaces. The two remaining deviations
+  — extension ordering and the parenthesized `; inherits: (lang)` form — are in
+  [*Known approximations*](known-approximations.md).
 
 Injections are engine-native: the engine runs the resolved `injections` query
 over the live tree and parses each region with its child grammar, per-edit and
@@ -1281,8 +1300,8 @@ screen," and that is exactly the shape of these tests.
   'INCOMPLETE:'` for approximations, the `btv._notimpl` raises / runtime
   `btv._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — the bulk of vim's options beyond the subset
-  bemtvi honors (the registry is `canonical()` in
-  `crates/bemtvi-core/src/editor/options.rs`: the window-local gutter / wrap /
+  bemtvi honors (the registry is the `OPTIONS` catalog — and `canonical()` over
+  it — in `crates/bemtvi-core/src/options.rs`: the window-local gutter / wrap /
   scroll options, the buffer-local indentation options, and a steadily growing
   set besides; many others are not wired) and richer diagnostic
   surfaces. (Blocking reads — `vim.fn.input` / `vim.fn.confirm` / `vim.fn.getcharstr`

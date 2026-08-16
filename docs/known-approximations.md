@@ -92,10 +92,11 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   `breakindent` / `showbreak` / `sidescroll` / `sidescrolloff` / `winhighlight` /
   `fillchars`); the **fold** options (`foldmethod` / `foldenable` / `foldcolumn` /
   `foldlevel`); the **buffer-local indentation** options (`tabstop` / `shiftwidth`
-  / `softtabstop` / `expandtab` / `commentstring`); and a set of **bemtvi-native**
-  options (`scrollanim` / `scrollanimduration`, `qfdock`, `imagepreview`,
-  `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
-  `laststatus` / `showtabline`, …).
+  / `softtabstop` / `expandtab` / `commentstring`); the **editing-feedback** pair
+  `showcmd` / `report` and the undo bound `undolevels`; and a set of
+  **bemtvi-native** options (`scrollanim` / `scrollanimduration`, `qfdock`,
+  `imagepreview`, `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
+  `laststatus` / `showtabline`, `guiglyphoverflow`, …).
   Buffer- and window-local options are **global-local**, as in vim: each carries a
   global value (`:setglobal` / `vim.go` / `vim.opt_global`) alongside the per-instance
   one, `:set` / `vim.opt` write both, and a new buffer is born from the global value —
@@ -133,6 +134,16 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   be hand-authored as readable text, at the cost that playing a register that
   holds ordinary *yanked text* parses any `<...>` in it as a key rather than as
   literal characters.
+- **Filetype detection is a small, deliberate rule set — not vim's
+  `filetype.vim`.** Detection is a *derive* from the path (see architecture.md
+  → *Buffers*): the exact basename, ~7 globs, the extension, and a `#!` line as
+  the last resort. vim ships thousands of rules; bemtvi ships the ones that pay
+  for themselves, and the glob tier is kept small on purpose — a pattern that
+  *guesses* (`*.conf`, `*rc`) is worse than no detection, because a wrong
+  filetype is harder to notice than a missing one. A language bemtvi doesn't
+  recognize is named with `:setf {lang}` (or `btv.bo.filetype`) — from a config,
+  that means a `BufReadPost`/`BufNewFile` autocmd, since there is no
+  `vim.filetype.add`-style API for extending the tables themselves.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written set of helper aliases, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to

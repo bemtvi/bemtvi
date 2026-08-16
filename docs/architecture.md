@@ -2,9 +2,9 @@
 
 bemtvi is a modal, vim-style editor written in Rust: vim's editing language
 (keystrokes, modes, ex-commands) on an idiomatic, rust-native, fully-async,
-client-server design. bemtvi is its own editor, not a
-[neovim](https://neovim.io) build: editing behavior tracks vim/neovim's
-observable behavior, but every API is bemtvi's own — configuration and
+client-server design. It is neovim-inspired: editing behavior tracks
+vim/neovim's observable behavior, but every API is bemtvi's own —
+configuration and
 extensibility live in the `btv.*` Lua namespace
 ([the `btv` API](specs/2026-06-11-native-plugin-api.md);
 [ADR 0002](decisions/0002-native-plugin-system.md)) — and the `vim.*` that

@@ -624,6 +624,13 @@ impl Editor {
         if let Some(w) = ts {
             return w;
         }
+        // A user `'indentexpr'` sits *below* the treesitter verdict — structure
+        // beats a hand-written rule — but above `smartindent`, so it is the
+        // escape hatch for a filetype with no grammar or no `indents.scm`.
+        // Declining (`nil`) falls through as if it were not installed.
+        if let Some(w) = self.indent_expr_for(line) {
+            return w;
+        }
         // `smartindent` (bracket-aware) takes precedence over plain `autoindent`.
         if opts.smartindent {
             return self.smartindent_for(line);
@@ -634,6 +641,48 @@ impl Editor {
             return self.autoindent_copy_prev(line).unwrap_or(0);
         }
         0
+    }
+
+    /// The `'indentexpr'` verdict for 0-based `line`, or `None` when no expression
+    /// is installed or it declined — in which case the caller falls through to
+    /// `smartindent` / `autoindent`.
+    pub(crate) fn indent_expr_for(&mut self, line: usize) -> Option<usize> {
+        let handle = self.indent_fn?;
+        let opts = self.buffer().options;
+        let sw = opts.effective_shiftwidth() as i64;
+        let text = self.buffer().line(line);
+        let (prev, previndent) = match self.prev_nonblank_line(line) {
+            Some(p) => (
+                self.buffer().line(p),
+                indent_width(&self.buffer().line(p), opts.effective_tabstop()) as i64,
+            ),
+            None => (String::new(), 0),
+        };
+
+        let mut failure = None;
+        let out = self.with_sandbox(|_ed, sb| match sb.as_mut() {
+            Some(engine) => {
+                match engine.call_indent(handle, &prev, &text, line as i64 + 1, sw, previndent) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        failure = Some(err);
+                        None
+                    }
+                }
+            }
+            None => None,
+        });
+
+        // Loud once, then off: an indent expression runs per line of a `=` sweep,
+        // so a broken one must not echo per line.
+        if let Some(err) = failure {
+            self.echo(format!("btv.indent.expr: {err} — indentexpr disabled"));
+            if let Some(h) = self.indent_fn.take() {
+                self.sandbox_release(h);
+            }
+            return None;
+        }
+        out.map(|v| v.max(0) as usize)
     }
 
     /// `smartindent` target indent **width in columns** for a freshly-opened

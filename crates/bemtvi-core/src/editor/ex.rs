@@ -1,11 +1,13 @@
 //! Ex-command dispatch (`execute_ex`), range/address parsing, `:substitute`, and
 //! the file/window/tab ex-commands.
 
+use super::sandbox::subst_expr_src;
 use super::*;
 use crate::buffer::Buffer;
 use crate::extmark::{VirtChunk, VirtDecor, VirtTextPos, DEFAULT_PRIORITY, SUBST_PREVIEW_NS};
 use crate::input::{Key, KeyCode};
-use crate::search::SearchRegex;
+use crate::sandbox::SandboxError;
+use crate::search::{Repl, SearchRegex};
 use std::path::PathBuf;
 
 /// Byte offset of the char boundary just past `byte` in `line`, or `line.len()`
@@ -1620,34 +1622,68 @@ impl Editor {
         // giant file cheap while still covering any realistic viewport.
         const MAX_MARKS: usize = 1000;
         let hi = hi.min(self.buffer().line_count().saturating_sub(1));
-        let mut marks = 0usize;
-        'lines: for l in lo..=hi {
-            let line = self.buffer().line(l);
-            let line_start = self.buffer().line_start(l);
-            let mut from = 0;
-            while let Some((s, e, repl)) = re.match_replacement(&line, from, &rep) {
-                self.set_subst_preview_marks(line_start + s, line_start + e, &repl);
-                marks += 1 + usize::from(!repl.is_empty() && !repl.contains('\n'));
-                if marks >= MAX_MARKS {
-                    break 'lines;
-                }
-                if !global {
-                    break;
-                }
-                // Step past this match; a zero-width match advances one char so the
-                // scan can't spin in place.
-                from = if e > s {
-                    e
-                } else {
-                    match line[e..].chars().next() {
-                        Some(c) => e + c.len_utf8(),
-                        None => break,
+        // A `\=` preview compiles per keystroke (microseconds). One that will not
+        // compile simply previews nothing — the real `:s` is what reports the
+        // error, rather than echoing on every character typed.
+        let expr = subst_expr_src(&rep).map(str::to_string);
+        let handle = match &expr {
+            Some(src) => match self.sandbox_compile(src, &["m", "lnum"]) {
+                Ok(h) => Some(h),
+                Err(_) => return,
+            },
+            None => None,
+        };
+        self.with_sandbox(|ed, sb| {
+            let mut marks = 0usize;
+            'lines: for l in lo..=hi {
+                let line = ed.buffer().line(l);
+                let line_start = ed.buffer().line_start(l);
+                let mut from = 0;
+                loop {
+                    let mut call = |groups: &[Option<&str>]| match sb.as_mut() {
+                        Some(engine) => engine.call_subst(
+                            handle.expect("a handle exists whenever the expression form is used"),
+                            groups,
+                            l + 1,
+                        ),
+                        None => Err(SandboxError::Unavailable),
+                    };
+                    let mut repl_src = match handle {
+                        Some(_) => Repl::Expr(&mut call),
+                        None => Repl::Template(&rep),
+                    };
+                    let (s, e, repl) = match re.match_replacement(&line, from, &mut repl_src) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => break,
+                        // An erroring expression stops the preview entirely.
+                        Err(_) => break 'lines,
+                    };
+                    ed.set_subst_preview_marks(line_start + s, line_start + e, &repl);
+                    marks += 1 + usize::from(!repl.is_empty() && !repl.contains('\n'));
+                    if marks >= MAX_MARKS {
+                        break 'lines;
                     }
-                };
-                if from > line.len() {
-                    break;
+                    if !global {
+                        break;
+                    }
+                    // Step past this match; a zero-width match advances one char so the
+                    // scan can't spin in place.
+                    from = if e > s {
+                        e
+                    } else {
+                        match line[e..].chars().next() {
+                            Some(c) => e + c.len_utf8(),
+                            None => break,
+                        }
+                    };
+                    if from > line.len() {
+                        break;
+                    }
                 }
             }
+        });
+        if let Some(h) = handle {
+            self.sandbox_release(h);
         }
     }
 
@@ -1869,32 +1905,78 @@ impl Editor {
             return;
         }
 
+        // A `\=` replacement is a sandbox expression. Compile it *before* the edit
+        // pass, so an expression that will not compile aborts with the buffer
+        // untouched rather than partway through.
+        let handle = match subst_expr_src(&rep) {
+            Some(src) => match self.sandbox_compile(src, &["m", "lnum"]) {
+                Ok(h) => Some(h),
+                Err(err) => {
+                    self.echo(format!("E1300: {err}"));
+                    return;
+                }
+            },
+            None => None,
+        };
+
         // Edit pass. A `\r` in the replacement splits a line into several, so a
         // running `added` offset keeps later original lines pointing at the
         // right (shifted) index.
-        let (mut subs, mut nlines) = (0usize, 0usize);
-        let mut added = 0i64;
-        let mut last_changed: Option<usize> = None;
-        let mut pushed = false;
-        for orig in lo..=hi {
-            let idx = (orig as i64 + added) as usize;
-            let old = self.buffer().line(idx);
-            let (new_text, n) = re.substitute_line(&old, &rep, global);
-            if n == 0 {
-                continue;
+        let (subs, nlines, last_changed, failure) = self.with_sandbox(|ed, sb| {
+            let (mut subs, mut nlines) = (0usize, 0usize);
+            let mut added = 0i64;
+            let mut last_changed: Option<usize> = None;
+            let mut pushed = false;
+            let mut failure: Option<(usize, SandboxError)> = None;
+            for orig in lo..=hi {
+                let idx = (orig as i64 + added) as usize;
+                let old = ed.buffer().line(idx);
+                let mut call = |groups: &[Option<&str>]| match sb.as_mut() {
+                    Some(engine) => engine.call_subst(
+                        handle.expect("a handle exists whenever the expression form is used"),
+                        groups,
+                        idx + 1,
+                    ),
+                    None => Err(SandboxError::Unavailable),
+                };
+                let mut repl = match handle {
+                    Some(_) => Repl::Expr(&mut call),
+                    None => Repl::Template(&rep),
+                };
+                let (new_text, n) = match re.substitute_line(&old, &mut repl, global) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        failure = Some((idx, err));
+                        break;
+                    }
+                };
+                if n == 0 {
+                    continue;
+                }
+                if !pushed {
+                    ed.push_undo();
+                    pushed = true;
+                }
+                let start = ed.buffer().line_start(idx);
+                ed.buffer_mut().remove(start..start + old.len());
+                ed.buffer_mut().insert(start, &new_text);
+                let extra = new_text.matches('\n').count();
+                added += extra as i64;
+                subs += n;
+                nlines += 1;
+                last_changed = Some(idx + extra);
             }
-            if !pushed {
-                self.push_undo();
-                pushed = true;
-            }
-            let start = self.buffer().line_start(idx);
-            self.buffer_mut().remove(start..start + old.len());
-            self.buffer_mut().insert(start, &new_text);
-            let extra = new_text.matches('\n').count();
-            added += extra as i64;
-            subs += n;
-            nlines += 1;
-            last_changed = Some(idx + extra);
+            (subs, nlines, last_changed, failure)
+        });
+        if let Some(h) = handle {
+            self.sandbox_release(h);
+        }
+        // A failing expression aborts the run. Whatever it substituted first is a
+        // single undo step, so one `u` reverts the partial run.
+        if let Some((idx, err)) = failure {
+            self.buffer_mut().normalize();
+            self.echo(format!("E1300: line {}: {err}", idx + 1));
+            return;
         }
 
         let Some(last) = last_changed else {
@@ -2354,9 +2436,49 @@ impl Editor {
                 return;
             }
             let text = self.buffer().line(line);
-            let found = {
+            // Compile a `\=` replacement per seek — microseconds, and a handful of
+            // seeks per confirm walk, so it is not worth caching on the state.
+            let rep = {
                 let sc = self.subst_confirm.as_ref().expect("confirm active");
-                sc.re.match_replacement(&text, byte, &sc.rep)
+                sc.rep.clone()
+            };
+            let handle = match subst_expr_src(&rep) {
+                Some(src) => match self.sandbox_compile(src, &["m", "lnum"]) {
+                    Ok(h) => Some(h),
+                    Err(err) => {
+                        self.echo(format!("E1300: {err}"));
+                        self.subst_confirm_finish();
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let found = self.with_sandbox(|ed, sb| {
+                let mut call = |groups: &[Option<&str>]| match sb.as_mut() {
+                    Some(engine) => engine.call_subst(
+                        handle.expect("a handle exists whenever the expression form is used"),
+                        groups,
+                        line + 1,
+                    ),
+                    None => Err(SandboxError::Unavailable),
+                };
+                let mut repl_src = match handle {
+                    Some(_) => Repl::Expr(&mut call),
+                    None => Repl::Template(&rep),
+                };
+                let sc = ed.subst_confirm.as_ref().expect("confirm active");
+                sc.re.match_replacement(&text, byte, &mut repl_src)
+            });
+            if let Some(h) = handle {
+                self.sandbox_release(h);
+            }
+            let found = match found {
+                Ok(v) => v,
+                Err(err) => {
+                    self.echo(format!("E1300: {err}"));
+                    self.subst_confirm_finish();
+                    return;
+                }
             };
             match found {
                 Some((s, e, repl)) => {

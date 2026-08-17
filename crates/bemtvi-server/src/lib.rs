@@ -59,7 +59,6 @@ mod dispatch;
 #[cfg(feature = "native")]
 mod evloop;
 #[cfg(feature = "native")]
-mod folds;
 #[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]
@@ -1865,6 +1864,19 @@ impl EditHost {
     /// before the first [`redraw`](Self::redraw).
     pub fn new(editor: Editor, lua: LuaRuntime, fx: Box<dyn HostEffects>) -> EditHost {
         Self::install_core_catalogs(&lua);
+        // The bounded compute sandbox — the second, pure Lua VM the synchronous
+        // core paths call into (`:s/…/\=…/` today). Installed *here*, the one
+        // construction site the native server and the wasm edit-host share, so the
+        // feature behaves identically locally, over a daemon, and in the browser
+        // rather than being a native-only surface.
+        //
+        // A VM that fails to build leaves the seam `None`; it is not faked, and
+        // the first expression that needs it fails loud with
+        // `SandboxError::Unavailable` rather than silently substituting nothing.
+        let mut editor = editor;
+        if let Ok(sandbox) = bemtvi_sandbox::LuaSandbox::new() {
+            editor.set_sandbox_engine(Box::new(sandbox));
+        }
         EditHost {
             editor,
             lua,

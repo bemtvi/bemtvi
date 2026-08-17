@@ -21,6 +21,7 @@
 //! The core keeps only the logical state; the server projects the float's screen
 //! geometry from [`Editor::menu_view`] and orchestrates the (async) source.
 
+use crate::sandbox::{SandboxError, RERANK_LIMIT};
 use std::ops::Range;
 
 use super::*;
@@ -626,6 +627,13 @@ pub(crate) struct Menu {
     /// Which orchestration owns this menu — decides input-grab and confirm
     /// resolution. See [`MenuKind`].
     kind: MenuKind,
+    /// Set whenever the filtered view changed and a picker re-ranker has not yet
+    /// been applied to it. The scorer is *not* run where the view is rebuilt: a
+    /// streamed picker rebuilds per batch, and re-ranking per batch would undo
+    /// [`Menu::extend_view`]'s O(batch) property. It is settled once per repaint
+    /// instead (`Editor::settle_picker_rank`), the same
+    /// project-once-per-frame rule the rest of the editor follows.
+    rank_dirty: bool,
     /// Byte offset in the buffer where the completed prefix starts (`Complete`
     /// menus only; `0` and unused otherwise). Accepting a row replaces
     /// `[anchor .. cursor)` with the row's insert text.
@@ -747,6 +755,7 @@ impl Menu {
     fn new(kind: MenuKind, placement: MenuPlacement) -> Self {
         Menu {
             kind,
+            rank_dirty: false,
             anchor: 0,
             anchor_width: 0,
             all_items: Vec::new(),
@@ -850,6 +859,7 @@ impl Menu {
             self.filtered = Some(idx);
             self.match_spans = spans;
         }
+        self.rank_dirty = true;
         self.clamp_cursor();
     }
 
@@ -873,6 +883,7 @@ impl Menu {
             filtered.push(new_start + i);
             self.match_spans.push(spans);
         }
+        self.rank_dirty = true;
         self.clamp_cursor();
     }
 
@@ -1023,6 +1034,95 @@ impl Menu {
 }
 
 impl Editor {
+    /// Apply the picker re-ranker to the current view, at most once per repaint.
+    ///
+    /// Deliberately *not* called where the view is rebuilt. A streamed picker
+    /// rebuilds once per arriving batch, so re-ranking there would turn
+    /// `extend_view`'s O(batch) into O(view) per batch — the shape the
+    /// never-freeze rule exists to prevent. The server calls this from `redraw`,
+    /// just before projecting the menu, so cost is bounded per *frame* however
+    /// many batches landed in between.
+    ///
+    /// Only the top [`RERANK_LIMIT`] survivors are scored; the tail keeps native
+    /// order. There is nothing to do without an active query — an unfiltered
+    /// picker is passthrough, and re-ranking it would mean scoring `all_items`,
+    /// which is exactly what this feature must never do.
+    pub fn settle_picker_rank(&mut self) {
+        let Some(handle) = self.picker_scorer else {
+            return;
+        };
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        if menu.kind != MenuKind::Picker || !menu.rank_dirty || menu.filtered.is_none() {
+            return;
+        }
+        let query = menu.match_query().to_string();
+
+        let failure = self.with_sandbox(|ed, sb| {
+            let menu = ed.menu.as_mut().expect("checked above");
+            menu.rank_dirty = false;
+            let filtered = menu.filtered.as_ref().expect("checked above");
+            let n = filtered.len().min(RERANK_LIMIT);
+
+            // The native score each row already earned, so an expression can nudge
+            // the order instead of reinventing matching. One extra native pass over
+            // at most RERANK_LIMIT labels — nanoseconds each, next to microseconds
+            // per sandbox call.
+            let labels: Vec<&str> = filtered[..n]
+                .iter()
+                .map(|&i| menu.all_items[i].label.as_str())
+                .collect();
+            let mut scores = vec![0i64; n];
+            for (pos, sc, _) in crate::fuzzy::rank_scored(&query, &labels) {
+                scores[pos] = sc as i64;
+            }
+
+            let mut keys = Vec::with_capacity(n);
+            for (pos, label) in labels.iter().enumerate() {
+                let got = match sb.as_mut() {
+                    Some(engine) => engine.call_score(handle, label, &query, scores[pos]),
+                    None => Err(SandboxError::Unavailable),
+                };
+                match got {
+                    Ok(k) => keys.push(k),
+                    Err(err) => return Some(err),
+                }
+            }
+
+            // Sort a permutation so `filtered` and `match_spans` stay in lockstep.
+            // Stable, so rows the scorer ties keep their native order rather than
+            // shuffling frame to frame.
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| {
+                keys[b]
+                    .partial_cmp(&keys[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let menu = ed.menu.as_mut().expect("checked above");
+            let filtered = menu.filtered.as_mut().expect("checked above");
+            let head: Vec<usize> = order.iter().map(|&p| filtered[p]).collect();
+            filtered[..n].copy_from_slice(&head);
+            let spans: Vec<_> = order
+                .iter()
+                .map(|&p| std::mem::take(&mut menu.match_spans[p]))
+                .collect();
+            for (slot, v) in menu.match_spans[..n].iter_mut().zip(spans) {
+                *slot = v;
+            }
+            None
+        });
+
+        // Loud once, then off: this runs every repaint, so leaving a broken scorer
+        // installed would echo the same error on every keystroke.
+        if let Some(err) = failure {
+            self.echo(format!("btv.picker.scorer: {err} — scorer disabled"));
+            if let Some(h) = self.picker_scorer.take() {
+                self.sandbox_release(h);
+            }
+        }
+    }
+
     /// Open a promptless floating choice list (`btv.ui.select`): `items` are the
     /// display labels, `cursor` the initially-highlighted row (clamped). Grabs
     /// input until the user confirms (`<CR>`) or cancels (`<Esc>` / `q`); the

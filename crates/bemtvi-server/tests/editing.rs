@@ -15,6 +15,15 @@
 #[path = "editing/support.rs"]
 mod support;
 
+#[path = "editing/foldtext.rs"]
+mod foldtext;
+#[path = "editing/sandbox_exprs.rs"]
+mod sandbox_exprs;
+#[path = "editing/sandbox_stateless.rs"]
+mod sandbox_stateless;
+#[path = "editing/subst_expr.rs"]
+mod subst_expr;
+
 #[path = "editing/changelist.rs"]
 mod changelist;
 #[path = "editing/clipboard.rs"]

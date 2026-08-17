@@ -4239,6 +4239,51 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `btv._picker_set_scorer(src|nil)`: the native setter behind
+    // `btv.picker.scorer`. `src` is Lua *source* rather than a function because
+    // the re-ranker runs in the bounded compute sandbox — a separate VM, and a
+    // closure cannot cross between VMs. `nil` clears it.
+    let sh = shared.clone();
+    btv.set(
+        "_picker_set_scorer",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().picker_scorer = Some(src);
+            Ok(())
+        })?,
+    )?;
+
+    // `btv._fold_set_text(src|nil)`: the native setter behind `btv.fold.text`.
+    // Source rather than a function, for the same reason `btv.picker.scorer` takes
+    // source: the expression runs in the sandbox, a separate VM.
+    let sh = shared.clone();
+    btv.set(
+        "_fold_set_text",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().fold_text = Some(src);
+            Ok(())
+        })?,
+    )?;
+
+    // `btv._filetype_set_detect(src|nil)` / `btv._indent_set_expr(src|nil)`: the
+    // native setters behind `btv.filetype.detect` and `btv.indent.expr`. Source,
+    // not functions — both run in the sandbox, a separate VM.
+    let sh = shared.clone();
+    btv.set(
+        "_filetype_set_detect",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().filetype_detect = Some(src);
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    btv.set(
+        "_indent_set_expr",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().indent_expr = Some(src);
+            Ok(())
+        })?,
+    )?;
+
     // `btv._ts_highlight(lang, text, cb_id)`: the native highlighter behind the
     // promise `btv.treesitter.highlight`. Queues a [`TsOp::Highlight`] the server
     // runs through the off-buffer tree-sitter path (injections included) and settles

@@ -589,19 +589,16 @@ async fn foldmethod_expr_is_accepted_and_queryable() {
 #[tokio::test]
 async fn generic_foldexpr_folds_returned_levels() {
     let (rpc, mut incoming) = six_lines().await;
-    // A foldexpr that puts lines 2..4 at fold level 1 (everything else at level 0).
+    feed(&rpc, ":set foldmethod=expr<CR>");
+    // A generic `'foldexpr'` is a sandbox *expression* over `line` and `lnum` —
+    // there is no main-VM function to reference, and no `v:lnum`. Set through
+    // `btv.bo` rather than `:set`, since an expression contains spaces.
     exec_lua(
         &rpc,
-        "function MyFold()\n\
-         local l = vim.v.lnum\n\
-         if l >= 2 and l <= 4 then return 1 else return 0 end\n\
-         end\n\
-         return true",
+        r#"btv.bo.foldexpr = "(lnum >= 2 and lnum <= 4) and 1 or 0" return true"#,
     )
     .await;
-    feed(&rpc, ":set foldmethod=expr<CR>");
-    // Setting a generic foldexpr is silent now — it's evaluated, not warned about.
-    let map = redraw_after(&rpc, &mut incoming, ":set foldexpr=v:lua.MyFold()<CR>").await;
+    let map = redraw_after(&rpc, &mut incoming, "").await;
     assert_eq!(
         message(&map),
         "",
@@ -629,18 +626,15 @@ async fn generic_foldexpr_reflows_on_edit() {
     // level 0 — so the fold tracks the indentation, not absolute line numbers.
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihead<CR>  a<CR>  b<CR>c<CR>tail<Esc>gg");
+    feed(&rpc, ":set foldmethod=expr<CR>");
+    // The line's own text is passed in, so a content-driven foldexpr needs no
+    // buffer access at all — which is what lets it run in the pure sandbox.
     exec_lua(
         &rpc,
-        "function MyFold()\n\
-         local l = vim.v.lnum\n\
-         local s = vim.api.nvim_buf_get_lines(0, l - 1, l, false)[1] or ''\n\
-         if s:match('^%s') then return 1 else return 0 end\n\
-         end\n\
-         return true",
+        r#"btv.bo.foldexpr = "line:match('^%s') and 1 or 0" return true"#,
     )
     .await;
-    feed(&rpc, ":set foldmethod=expr<CR>");
-    let map = redraw_after(&rpc, &mut incoming, ":set foldexpr=v:lua.MyFold()<CR>").await;
+    let map = redraw_after(&rpc, &mut incoming, "").await;
     // Lines 2-3 (`  a`/`  b`) are indented and fold into one placeholder; line 4
     // (`c`, flush-left) and `tail` stay visible.
     assert_eq!(
@@ -664,9 +658,10 @@ async fn generic_foldexpr_reflows_on_edit() {
 async fn generic_foldexpr_eval_error_is_loud() {
     let (rpc, mut incoming) = six_lines().await;
     feed(&rpc, ":set foldmethod=expr<CR>");
-    // A foldexpr that calls an undefined function fails to evaluate — the error is
-    // surfaced on the message line (no silent no-op) and the buffer stays unfolded.
-    let map = redraw_after(&rpc, &mut incoming, ":set foldexpr=v:lua.NoSuchFold()<CR>").await;
+    // A foldexpr that raises fails loud on the message line (no silent no-op) and
+    // the buffer stays unfolded — the levels degrade flat rather than half-applied.
+    exec_lua(&rpc, r#"btv.bo.foldexpr = "error('boom')" return true"#).await;
+    let map = redraw_after(&rpc, &mut incoming, "").await;
     assert!(
         message(&map).contains("foldexpr"),
         "a broken foldexpr surfaces its error, got {:?}",

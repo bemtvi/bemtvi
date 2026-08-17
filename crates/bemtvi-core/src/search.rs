@@ -26,6 +26,8 @@
 
 use regex::{Captures, Regex, RegexBuilder};
 
+use crate::sandbox::SandboxError;
+
 /// Which regex dialect/engine compiles and matches a search or `:substitute`
 /// pattern, chosen by the `'regexsyntax'` option. (Distinct from vim's numeric
 /// `'regexpengine'`, which picks *between* vim's own backtracking/NFA engines —
@@ -114,14 +116,24 @@ impl SearchRegex {
         }
     }
 
-    /// Substitute matches in `line` with `rep` (the active engine's replacement
-    /// dialect — `$`-captures for `Pcre`, `&`/`\1` for `Vim`; see the module
-    /// header). With `global` false only the first match is replaced. Returns the
+    /// Substitute matches in `line` per `rep`, appending to a rewritten line.
+    ///
+    /// A [`Repl::Template`] expands the literal replacement dialect (`$`-captures
+    /// for `Pcre`, `&`/`\1` for `Vim`; see the module header). A [`Repl::Expr`]
+    /// hands each match's group texts to a sandbox expression instead, so the
+    /// replacement is *computed* per match.
+    ///
+    /// With `global` false only the first match is replaced. Returns the
     /// rewritten line and the number of matches replaced. The line is passed
     /// *without* its trailing newline, so `^`/`$` anchor to its real edges;
-    /// `\r`/`\n` in `rep` introduce real newlines into the result (the caller
-    /// splices them back in).
-    pub(crate) fn substitute_line(&self, line: &str, rep: &str, global: bool) -> (String, usize) {
+    /// `\r`/`\n` in a template introduce real newlines into the result (the
+    /// caller splices them back in). Only the expression form can fail.
+    pub(crate) fn substitute_line(
+        &self,
+        line: &str,
+        rep: &mut Repl<'_>,
+        global: bool,
+    ) -> Result<(String, usize), SandboxError> {
         match self {
             SearchRegex::Pcre(re) => {
                 let mut out = String::new();
@@ -130,7 +142,10 @@ impl SearchRegex {
                 for caps in re.captures_iter(line) {
                     let m = caps.get(0).expect("group 0 always present");
                     out.push_str(&line[last..m.start()]);
-                    expand_replacement(rep, &caps, &mut out);
+                    match rep {
+                        Repl::Template(t) => expand_replacement(t, &caps, &mut out),
+                        Repl::Expr(f) => out.push_str(&f(&pcre_groups(&caps))?),
+                    }
                     last = m.end();
                     count += 1;
                     if !global {
@@ -138,44 +153,113 @@ impl SearchRegex {
                     }
                 }
                 out.push_str(&line[last..]);
-                (out, count)
+                Ok((out, count))
             }
+            // The vendored engine expands its own templates, but an expression
+            // needs the match-by-match walk `find_all` uses, so it is driven here.
             #[cfg(feature = "vim-regex")]
-            SearchRegex::Vim(v) => v.substitute_line(line, rep, global),
+            SearchRegex::Vim(v) => match rep {
+                Repl::Template(t) => Ok(v.substitute_line(line, t, global)),
+                Repl::Expr(f) => {
+                    let mut out = String::new();
+                    let mut last = 0;
+                    let mut count = 0;
+                    let mut from = 0;
+                    while from <= line.len() {
+                        let Some(m) = v.exec(line, from) else { break };
+                        out.push_str(&line[last..m.start]);
+                        out.push_str(&f(&vim_groups(line, &m))?);
+                        last = m.end;
+                        count += 1;
+                        if !global {
+                            break;
+                        }
+                        from = advance(line, m.start, m.end);
+                    }
+                    out.push_str(&line[last..]);
+                    Ok((out, count))
+                }
+            },
         }
     }
 
     /// The next match in the non-overlapping sequence whose start is at byte
     /// offset `from` or later, as `(start, end, replacement)` where `replacement`
-    /// is `rep` expanded against that match's captures (same dialect as
-    /// [`Self::substitute_line`]). `None` past the last match. The single-match
-    /// primitive the interactive `:s///c` confirm walk uses to step one match at
-    /// a time.
+    /// is `rep` resolved against that match (same dialects as
+    /// [`Self::substitute_line`]). `Ok(None)` past the last match. The
+    /// single-match primitive the interactive `:s///c` confirm walk and the
+    /// `inccommand` live preview step one match at a time with.
     pub(crate) fn match_replacement(
         &self,
         line: &str,
         from: usize,
-        rep: &str,
-    ) -> Option<(usize, usize, String)> {
+        rep: &mut Repl<'_>,
+    ) -> Result<Option<(usize, usize, String)>, SandboxError> {
         match self {
             SearchRegex::Pcre(re) => {
-                let caps = re
+                let Some(caps) = re
                     .captures_iter(line)
-                    .find(|c| c.get(0).expect("group 0 always present").start() >= from)?;
+                    .find(|c| c.get(0).expect("group 0 always present").start() >= from)
+                else {
+                    return Ok(None);
+                };
                 let m = caps.get(0).expect("group 0 always present");
                 let mut out = String::new();
-                expand_replacement(rep, &caps, &mut out);
-                Some((m.start(), m.end(), out))
+                match rep {
+                    Repl::Template(t) => expand_replacement(t, &caps, &mut out),
+                    Repl::Expr(f) => out.push_str(&f(&pcre_groups(&caps))?),
+                }
+                Ok(Some((m.start(), m.end(), out)))
             }
             #[cfg(feature = "vim-regex")]
             SearchRegex::Vim(v) => {
-                let m = v.exec(line, from)?;
+                let Some(m) = v.exec(line, from) else {
+                    return Ok(None);
+                };
                 let mut out = String::new();
-                expand_vim_replacement(rep, line, &m, &mut out);
-                Some((m.start, m.end, out))
+                match rep {
+                    Repl::Template(t) => expand_vim_replacement(t, line, &m, &mut out),
+                    Repl::Expr(f) => out.push_str(&f(&vim_groups(line, &m))?),
+                }
+                Ok(Some((m.start, m.end, out)))
             }
         }
     }
+}
+
+/// The per-match call a [`Repl::Expr`] makes: this match's group texts in,
+/// the replacement text out, or the reason the sandbox could not produce one.
+pub(crate) type ExprCall<'a> = dyn FnMut(&[Option<&str>]) -> Result<String, SandboxError> + 'a;
+
+/// How a substitute builds each match's replacement text.
+///
+/// One abstraction rather than a parallel expression-only code path, so the
+/// literal and computed forms stay in lockstep across all three substitute call
+/// sites (bulk `:s`, the `inccommand` preview, and the `:s///c` confirm walk).
+pub(crate) enum Repl<'a> {
+    /// The literal replacement template, expanded against the match's captures.
+    Template(&'a str),
+    /// A compiled sandbox expression, called once per match with that match's
+    /// group texts — `[0]` the whole match, `[1..]` the groups, `None` for a
+    /// group that did not participate.
+    Expr(&'a mut ExprCall<'a>),
+}
+
+/// A PCRE match's groups as the uniform slice [`Repl::Expr`] takes.
+fn pcre_groups<'t>(caps: &Captures<'t>) -> Vec<Option<&'t str>> {
+    (0..caps.len())
+        .map(|i| caps.get(i).map(|m| m.as_str()))
+        .collect()
+}
+
+/// The vendored vim engine's groups, in the same shape (`submatches[0]` is the
+/// whole match there too).
+#[cfg(feature = "vim-regex")]
+fn vim_groups<'t>(line: &'t str, m: &bemtvi_regex::LineMatch) -> Vec<Option<&'t str>> {
+    m.submatches
+        .iter()
+        .map(|g| g.map(|(s, e)| &line[s..e]))
+        .collect()
 }
 
 /// Expand a substitute replacement against a match's captures, appending to

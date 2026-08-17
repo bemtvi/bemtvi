@@ -23,6 +23,7 @@ pub mod input;
 pub mod markdown;
 pub mod mode;
 pub mod options;
+pub mod sandbox;
 pub mod search;
 pub mod snippet;
 pub mod statusline;

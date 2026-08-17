@@ -23,6 +23,7 @@ use crate::search::{RegexEngine, SearchRegex};
 /// `(pattern, ignorecase, engine)` it was compiled from (see
 /// [`Editor::search_re_cache`]).
 type SearchReCache = Option<(String, bool, RegexEngine, Rc<SearchRegex>)>;
+use crate::sandbox::SandboxEngine;
 use crate::syntax::SyntaxEngine;
 use crate::view::View;
 
@@ -55,6 +56,7 @@ mod panel;
 mod persist;
 mod quickfix;
 mod registers;
+mod sandbox;
 mod search;
 mod select;
 mod selection;
@@ -1617,6 +1619,43 @@ pub struct Editor {
     /// methods never borrow [`Editor::buffers`]. Installed by the server via
     /// [`Editor::set_syntax_engine`].
     syntax: Option<Box<dyn SyntaxEngine>>,
+
+    /// The bounded compute sandbox — a second, tiny, *pure* Lua VM the
+    /// synchronous editing paths call under a wall-clock deadline (`:s`
+    /// replacement expressions today). `None` in a bare-core test or a front end
+    /// that ships without one, in which case every call site fails loud rather
+    /// than pretending the expression was empty. Installed by the server via
+    /// [`Editor::set_sandbox_engine`].
+    sandbox: Option<Box<dyn SandboxEngine>>,
+
+    /// The compiled picker re-ranker (`btv.picker.scorer`), applied to a
+    /// picker's *surviving* rows once per repaint. `None` when unset, or after
+    /// a failing expression was disabled.
+    picker_scorer: Option<crate::sandbox::SandboxFn>,
+
+    /// The compiled `'foldtext'` expression (`btv.fold.text`), and the memo of
+    /// what it rendered. Keyed by a closed fold's `(start line, line count)`
+    /// with the first line it was rendered from, so a fold whose content moved
+    /// re-renders and an unchanged one costs nothing. Filled by
+    /// `settle_fold_text` before the view is projected, since building the view
+    /// only has `&Editor` and the sandbox needs `&mut`.
+    fold_text_fn: Option<crate::sandbox::SandboxFn>,
+    /// The compiled content sniffer (`btv.filetype.detect`) and the set of
+    /// buffers it has already answered for. It runs **once per buffer**, and
+    /// writes its verdict as the buffer's explicit filetype — the same override
+    /// `:setf` sets — which is what gives it priority over the built-in
+    /// name/pattern/extension tables the way neovim's `vim.filetype.add`
+    /// function form does.
+    filetype_fn: Option<crate::sandbox::SandboxFn>,
+    filetype_sniffed: std::collections::HashMap<BufferId, Option<std::path::PathBuf>>,
+    /// The compiled `'indentexpr'` (`btv.indent.expr`), consulted below the
+    /// treesitter verdict and above `smartindent`.
+    indent_fn: Option<crate::sandbox::SandboxFn>,
+    /// The compiled generic `'foldexpr'`, with the source it was compiled from
+    /// so a changed option recompiles. Evaluated **synchronously** in the
+    /// sandbox now; there is no server round-trip and no stale frame.
+    foldexpr_fn: Option<(String, crate::sandbox::SandboxFn)>,
+    fold_text_cache: std::collections::HashMap<(usize, usize), (String, String)>,
     /// The language each buffer was last `open`ed in the engine with, so a query
     /// knows whether to re-`open` (first sync, or the path's language changed) vs
     /// apply incremental `edit` deltas. Dropped when the buffer is deleted. A
@@ -1693,7 +1732,8 @@ pub struct Editor {
     /// for); [`Editor::refresh_folds`] reads it for the
     /// [`FoldSource::GenericExpr`](crate::editor::fold::FoldSource)/`Lsp` sources,
     /// applying the buffer's `'foldnestmax'`/`'foldminlines'` itself. Keyed by
-    /// buffer. See [`Editor::set_foldexpr_values`] / [`Editor::set_lsp_folds`].
+    /// buffer. See [`Editor::set_lsp_folds`] — the LSP source is the only one
+    /// that is still *pushed*; a generic `'foldexpr'` is evaluated in-frame.
     pub(crate) external_folds: HashMap<BufferId, fold::ExternalFolds>,
     /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
     /// bare-core test (or a front end whose platform backend failed to start).
@@ -2211,6 +2251,14 @@ impl Editor {
             open_messages_after_lua: false,
             pending_sleep: None,
             syntax: None,
+            sandbox: None,
+            picker_scorer: None,
+            fold_text_fn: None,
+            filetype_fn: None,
+            filetype_sniffed: Default::default(),
+            indent_fn: None,
+            foldexpr_fn: None,
+            fold_text_cache: Default::default(),
             syntax_opened: HashMap::new(),
             syntax_failed: HashSet::new(),
             ts_filetype: HashMap::new(),

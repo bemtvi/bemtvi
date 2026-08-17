@@ -39,13 +39,23 @@ impl EditHost {
         // Color the focused terminal's scrollback only while it's being browsed (never
         // on the live flood path); a no-op when output is live or already materialized.
         self.sync_terminal_styles();
-        // Evaluate a generic Lua `'foldexpr'` for the focused buffer (vim's per-line
-        // model) and push the values into the fold engine *before* projecting, so
-        // `foldmethod=expr` with a non-native foldexpr collapses this frame. Native
-        // only — bemtvi-core can't run Lua, and the browser edit-host folds JS-side.
-        // Cached by `changedtick`, so it costs nothing on a frame with no edit.
-        #[cfg(feature = "native")]
-        self.refresh_expr_folds();
+        // Apply the picker re-ranker (`btv.picker.scorer`) to the surviving rows
+        // *before* projecting. Here rather than where the view is rebuilt: a
+        // streamed picker rebuilds once per arriving batch, and re-ranking per
+        // batch would turn `extend_view`'s O(batch) into O(view)-per-batch. Once
+        // per frame is bounded however many batches landed in between, and is a
+        // no-op when no scorer is installed or the view has not changed. Not
+        // native-gated — the sandbox exists in the wasm edit-host too.
+        self.editor.settle_picker_rank();
+        // Render any closed fold's custom `'foldtext'` into its memo before
+        // projecting — building the view only holds `&Editor`, and the sandbox
+        // needs `&mut`. Memoized on the fold's first line, so a steady screen
+        // makes no calls at all.
+        self.editor.settle_fold_text();
+        // Answer the content sniffer for any buffer it has not seen. Once per
+        // *buffer*, not per frame — the verdict is stored as the buffer's
+        // explicit filetype, so the render path never reaches the sandbox.
+        self.editor.settle_filetype_detect();
         let view = self.editor.view(w, h);
 
         // Refresh every visible buffer's highlights from the in-process engine for

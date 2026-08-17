@@ -1753,3 +1753,50 @@ btv.autocmd.create("VimEnter", {
     end, { default = true, desc = "Resume last picker" })
   end,
 })
+
+-- `btv.picker.scorer(src)`: install a **re-ranker** over a picker's surviving
+-- rows, or clear it with `nil`.
+--
+-- `src` is a string of Lua *source* — an expression, not a function value —
+-- because the re-ranker runs in the bounded compute sandbox: a second, pure VM
+-- with a wall-clock deadline, no editor state and no `btv.*`. A closure cannot
+-- cross between VMs, so the source crosses instead and is compiled there.
+--
+-- Three names are in scope, and the expression returns a number — the new sort
+-- key, **higher first**:
+--
+-- ```
+-- label   the row's text
+-- query   the active query
+-- score   the native fuzzy score this row already earned
+-- ```
+--
+--
+-- The sandbox is **stateless**: nothing carries from one call to the next, and
+-- assigning a global raises. That is deliberate — no call shape is a clean
+-- once-per-item traversal (`:s` re-runs on every keystroke of the live preview,
+-- a foldexpr sees only the rows an edit touched, the picker scorer only the top
+-- survivors, `foldtext` is memoized), so an accumulator would be quietly wrong.
+-- Because `score` is handed in, a scorer *nudges* the native order rather than
+-- reinventing matching:
+--
+-- ```lua
+-- -- push test files down, keep everything else as the matcher ranked it
+-- btv.picker.scorer([[ score - (label:find("/test") and 50 or 0) ]])
+--
+-- btv.picker.scorer(nil)   -- back to pure fuzzy order
+-- ```
+--
+-- It is applied to the **filtered** rows only, never to every candidate, and to
+-- at most the top 1000 of them — a picker streams 100k+ candidates and scoring
+-- them all would freeze the editor. Rows past that keep native order. The
+-- scorer also runs at most once per repaint, not once per streamed batch.
+--
+-- A scorer that errors, exceeds its deadline, or returns a non-number reports
+-- once and is then uninstalled, rather than repeating the error every frame.
+function btv.picker.scorer(src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv.picker.scorer: expected a string of Lua source (or nil), got " .. type(src), 2)
+  end
+  btv._picker_set_scorer(src)
+end

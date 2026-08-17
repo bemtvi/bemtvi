@@ -53,10 +53,11 @@ pub(crate) enum FoldSource {
     Marker,
     /// `foldmethod=expr` with the native tree-sitter `foldexpr`.
     Treesitter,
-    /// `foldmethod=expr` with a generic Lua `foldexpr`. bemtvi-core can't run Lua,
-    /// so the server evaluates the expression per line (with `v:lnum` bound) and
-    /// pushes the per-line values via [`Editor::set_foldexpr_values`]; the structure
-    /// is built from them by [`Editor::compute_generic_expr_folds`].
+    /// `foldmethod=expr` with a generic `'foldexpr'` — a Lua expression over
+    /// `line` and `lnum`, evaluated **synchronously** in the bounded compute
+    /// sandbox by [`Editor::compute_generic_expr_folds`], which also builds the
+    /// structure from the per-line values. There is no server round-trip: the
+    /// levels are ready in the frame the edit landed in.
     GenericExpr,
     /// `foldmethod=expr` with the LSP `foldexpr` marker (`btv.lsp.foldexpr`). The
     /// server requests `textDocument/foldingRange` and pushes the line ranges via
@@ -788,46 +789,6 @@ impl Editor {
         ))
     }
 
-    /// The focused buffer's generic `'foldexpr'` that needs (re)evaluation, or
-    /// `None`. `Some((buf, changedtick, expr, line_count))` when `foldmethod=expr`
-    /// resolves to a generic Lua foldexpr (not the native tree-sitter / LSP markers)
-    /// and no fresh result is stored for the buffer's current `changedtick`. The
-    /// server drives [`LuaRuntime::eval_foldexpr_lines`](bemtvi_lua) from this and
-    /// pushes the values back via [`Editor::set_foldexpr_values`]; once a current
-    /// result is stored this returns `None`, so the foldexpr isn't re-evaluated
-    /// every frame (only after an edit or a foldexpr change).
-    pub fn pending_foldexpr(&self) -> Option<(BufferId, u64, String, usize, usize)> {
-        if self.fold_source() != FoldSource::GenericExpr {
-            return None;
-        }
-        let buf = self.current_buffer_id();
-        let tick = self.buffer().changedtick;
-        let expr = self.foldexpr().to_string();
-        let line_count = self.buffer().line_count();
-        // The cache is spliced by `refresh_folds`, which runs on the input hook
-        // *before* the redraw this is driven from, so the unevaluated rows here are
-        // exactly the ones the last edit touched. An absent (or differently-derived)
-        // cache means the whole buffer needs evaluating.
-        let Some(FoldInputs {
-            tick: cached_tick,
-            params: FoldInputParams::Expr { expr: cached_expr },
-            lines: FoldLines::Expr(values),
-        }) = self.fold_inputs.get(&buf)
-        else {
-            return Some((buf, tick, expr, 0, line_count));
-        };
-        if *cached_tick != tick || *cached_expr != expr || values.len() != line_count {
-            return Some((buf, tick, expr, 0, line_count));
-        }
-        let first = values.iter().position(Option::is_none)?;
-        // The contiguous span covering every hole. An edit produces one run, so this
-        // is normally exactly the inserted rows; a batch that produced several runs
-        // re-evaluates the rows between them too, which is correct (if not minimal)
-        // and keeps the server's side a single range.
-        let last = values.iter().rposition(Option::is_none)?;
-        Some((buf, tick, expr, first, last - first + 1))
-    }
-
     /// Whether buffer `buf` resolves its folds from LSP `foldingRange` —
     /// `foldmethod=expr` with the LSP foldexpr marker (`btv.lsp.foldexpr`). The
     /// server gates its `textDocument/foldingRange` requests on this (a buffer that
@@ -988,64 +949,10 @@ impl Editor {
         self.refresh_folds();
     }
 
-    /// Store the server's per-line `'foldexpr'` values for `buf` (computed at
-    /// `changedtick`) and rebuild the focused window's folds from them. Called by
-    /// the server after evaluating a generic Lua `foldexpr` (which bemtvi-core can't
-    /// run). Busts the structure cache so the push is honored even when the
-    /// `changedtick` is unchanged (e.g. the first evaluation after an edit already
-    /// cached an empty set while the server caught up).
-    /// `first` is the 0-based row `values[0]` belongs to — the range
-    /// [`pending_foldexpr`](Self::pending_foldexpr) asked for. A push whose
-    /// `changedtick` no longer matches the buffer (the text moved on while the
-    /// server was evaluating) is dropped: the next frame asks again against the
-    /// current text rather than splicing values derived from stale lines.
-    pub fn set_foldexpr_values(
-        &mut self,
-        buf: BufferId,
-        changedtick: u64,
-        first: usize,
-        values: Vec<String>,
-    ) {
-        let current = self
-            .buffer_of(buf)
-            .map(|b| (b.changedtick, b.line_count()))
-            .unwrap_or((0, 0));
-        if current.0 != changedtick {
-            return;
-        }
-        let params = FoldInputParams::Expr {
-            expr: self.effective_foldexpr(buf).to_string(),
-        };
-        // A push covering the whole buffer can seed the cache outright; a partial one
-        // only makes sense against a cache that is already the right shape.
-        let entry = self.fold_inputs.entry(buf).or_insert_with(|| FoldInputs {
-            tick: changedtick,
-            params: params.clone(),
-            lines: FoldLines::Expr(vec![None; current.1]),
-        });
-        if entry.params != params || entry.tick != changedtick {
-            if first != 0 || values.len() != current.1 {
-                return;
-            }
-            *entry = FoldInputs {
-                tick: changedtick,
-                params,
-                lines: FoldLines::Expr(vec![None; current.1]),
-            };
-        }
-        if let FoldLines::Expr(slots) = &mut entry.lines {
-            for (i, v) in values.into_iter().enumerate() {
-                if let Some(slot) = slots.get_mut(first + i) {
-                    *slot = Some(v);
-                }
-            }
-        }
-        self.rebuild_pushed_folds(buf);
-    }
-
     /// Store the server's LSP `foldingRange` line spans for `buf` (computed at
-    /// `changedtick`) and rebuild the focused window's folds. Mirrors
-    /// [`Editor::set_foldexpr_values`] for the LSP source.
+    /// `changedtick`) and rebuild the focused window's folds. The one remaining
+    /// *pushed* fold source — a generic `'foldexpr'` is evaluated synchronously in
+    /// the sandbox now (see `fill_foldexpr_holes`), so it needs no push at all.
     pub fn set_lsp_folds(&mut self, buf: BufferId, changedtick: u64, ranges: Vec<(usize, usize)>) {
         self.external_folds.insert(
             buf,
@@ -1092,17 +999,26 @@ impl Editor {
     /// and `'foldminlines'`. `None` when no fresh values have been pushed yet (or
     /// the pushed data is for the LSP source) — leave folds alone and retry.
     fn compute_generic_expr_folds(&mut self) -> Option<Vec<(usize, usize, usize)>> {
-        let params = FoldInputParams::Expr {
-            expr: self.foldexpr().to_string(),
-        };
+        let expr = self.foldexpr().to_string();
+        let params = FoldInputParams::Expr { expr: expr.clone() };
         let bo = &self.buffer().options;
         let (nestmax, foldminlines, line_count) =
             (bo.foldnestmax, bo.foldminlines, self.buffer().line_count());
-        let Some(FoldLines::Expr(values)) = self.sync_fold_inputs(&params) else {
+        // Shape / splice the cache first; the borrow ends here so the sandbox can
+        // be called below.
+        if !matches!(self.sync_fold_inputs(&params), Some(FoldLines::Expr(_))) {
+            return None;
+        }
+        // Evaluate any row the splice left unfilled — synchronously, in the
+        // sandbox. This is the whole point of the retirement: the values are ready
+        // in *this* frame, so `foldmethod=expr` never shows a frame of stale folds
+        // waiting for a round-trip.
+        self.fill_foldexpr_holes(&expr);
+
+        let buf = self.current_buffer_id();
+        let Some(FoldLines::Expr(values)) = self.fold_inputs.get(&buf).map(|c| &c.lines) else {
             return None;
         };
-        // Any row still unevaluated: leave the folds alone and retry once the server
-        // has filled it in (it reads the same cache through `pending_foldexpr`).
         if values.iter().any(Option::is_none) {
             return None;
         }
@@ -1112,6 +1028,115 @@ impl Editor {
             nestmax,
             foldminlines,
         ))
+    }
+
+    /// Evaluate every unfilled row of the focused buffer's generic `'foldexpr'`
+    /// cache, in the bounded compute sandbox.
+    ///
+    /// The expression sees `line` (the row's text) and `lnum` (1-based) and
+    /// returns vim's fold-level value as a string. It is compiled once per
+    /// distinct `'foldexpr'` string and reused.
+    ///
+    /// A failure fills the outstanding rows with `"0"` and reports once, so a
+    /// broken expression costs a flat buffer rather than an error per row per
+    /// frame — and the expression is dropped so the next frame does not retry it.
+    fn fill_foldexpr_holes(&mut self, expr: &str) {
+        let buf = self.current_buffer_id();
+        let holes: Vec<usize> = match self.fold_inputs.get(&buf).map(|c| &c.lines) {
+            Some(FoldLines::Expr(values)) => values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| v.is_none().then_some(i))
+                .collect(),
+            _ => return,
+        };
+        if holes.is_empty() {
+            return;
+        }
+        // `foldmethod=expr` with no `'foldexpr'` yet is the ordinary intermediate
+        // state of `:set foldmethod=expr` followed by `:set foldexpr=…`. There is
+        // nothing to evaluate, so every line is level 0 — flat, and silent. Trying
+        // to compile `""` would raise a syntax error on a perfectly normal config.
+        if expr.trim().is_empty() {
+            self.fill_foldexpr_with(buf, &holes, "0");
+            return;
+        }
+
+        // Compile once per distinct expression; a changed `'foldexpr'` recompiles.
+        let handle = match &self.foldexpr_fn {
+            Some((src, h)) if src == expr => *h,
+            _ => {
+                if let Some((_, old)) = self.foldexpr_fn.take() {
+                    self.sandbox_release(old);
+                }
+                match self.sandbox_compile(expr, &["line", "lnum"]) {
+                    Ok(h) => {
+                        self.foldexpr_fn = Some((expr.to_string(), h));
+                        h
+                    }
+                    Err(err) => {
+                        self.echo(format!("foldexpr: {err}"));
+                        self.fill_foldexpr_with(buf, &holes, "0");
+                        return;
+                    }
+                }
+            }
+        };
+
+        let texts: Vec<String> = holes.iter().map(|&i| self.buffer().line(i)).collect();
+        let mut failure = None;
+        let mut out: Vec<String> = Vec::with_capacity(holes.len());
+        self.with_sandbox(|_ed, sb| {
+            for (slot, text) in holes.iter().zip(&texts) {
+                let got = match sb.as_mut() {
+                    Some(engine) => engine.call_foldexpr(handle, text, *slot as i64 + 1),
+                    None => Err(crate::sandbox::SandboxError::Unavailable),
+                };
+                match got {
+                    Ok(v) => out.push(v),
+                    Err(err) => {
+                        failure = Some(err);
+                        return;
+                    }
+                }
+            }
+        });
+
+        if let Some(err) = failure {
+            self.echo(format!("foldexpr: {err} — folds flattened"));
+            if let Some((_, h)) = self.foldexpr_fn.take() {
+                self.sandbox_release(h);
+            }
+            self.fill_foldexpr_with(buf, &holes, "0");
+            return;
+        }
+        if let Some(FoldInputs {
+            lines: FoldLines::Expr(values),
+            ..
+        }) = self.fold_inputs.get_mut(&buf)
+        {
+            for (slot, v) in holes.iter().zip(out) {
+                if let Some(cell) = values.get_mut(*slot) {
+                    *cell = Some(v);
+                }
+            }
+        }
+    }
+
+    /// Fill `holes` with a constant level — the degraded path when the expression
+    /// could not be compiled or raised.
+    fn fill_foldexpr_with(&mut self, buf: BufferId, holes: &[usize], level: &str) {
+        if let Some(FoldInputs {
+            lines: FoldLines::Expr(values),
+            ..
+        }) = self.fold_inputs.get_mut(&buf)
+        {
+            for &slot in holes {
+                if let Some(cell) = values.get_mut(slot) {
+                    *cell = Some(level.to_string());
+                }
+            }
+        }
     }
 
     /// Build the focused buffer's LSP folds from the server-pushed `foldingRange`
@@ -1590,10 +1615,10 @@ pub(crate) enum FoldLines {
     /// with none, which is almost every line and is the identity transition.
     Marker(Vec<Option<Box<[MarkerTok]>>>),
     /// The generic `'foldexpr'` value for each line, or `None` for a line whose
-    /// value has not been evaluated yet. Unlike the other two this cannot be derived
-    /// from text here — bemtvi-core cannot run Lua — so a fresh or spliced row is
-    /// left `None` and the server fills it in
-    /// ([`Editor::pending_foldexpr`] / [`Editor::set_foldexpr_values`]).
+    /// value has not been evaluated yet. A fresh or spliced row is left `None`
+    /// and filled in the same frame by `fill_foldexpr_holes`, which runs the
+    /// expression in the sandbox — so a splice still only re-evaluates the rows
+    /// the edit actually touched.
     Expr(Vec<Option<String>>),
 }
 
@@ -1732,4 +1757,96 @@ fn marker_levels_from(toks: &[MarkerTok], start_lvl: usize) -> (usize, usize) {
         }
     }
     (lvl, next)
+}
+
+impl Editor {
+    /// Install (or clear, with `None`) the `'foldtext'` expression: a sandbox
+    /// expression over `first` (the fold's first line), `lines` (how many it
+    /// covers) and `lnum` (its 1-based start), returning the text the collapsed
+    /// row shows. Compiled here so a bad expression is reported where it is
+    /// configured.
+    pub fn set_fold_text(&mut self, src: Option<String>) {
+        if let Some(old) = self.fold_text_fn.take() {
+            self.sandbox_release(old);
+        }
+        self.fold_text_cache.clear();
+        let Some(src) = src else { return };
+        match self.sandbox_compile(&src, &["first", "lines", "lnum"]) {
+            Ok(h) => self.fold_text_fn = Some(h),
+            Err(err) => self.echo(format!("btv.fold.text: {err}")),
+        }
+    }
+
+    /// Render every closed fold's custom `'foldtext'` into the memo, so the view
+    /// pass — which only holds `&Editor` — can read it back.
+    ///
+    /// Called once per repaint, before projecting. Memoized on the fold's first
+    /// line, so a steady screen costs nothing and only a changed fold re-enters
+    /// the sandbox.
+    pub fn settle_fold_text(&mut self) {
+        let Some(handle) = self.fold_text_fn else {
+            return;
+        };
+
+        // Collect first, so the sandbox call is not made while the window/buffer
+        // borrows are live.
+        let mut wanted: Vec<(usize, usize, String)> = Vec::new();
+        for w in self.windows.all_windows() {
+            let buf = &self.buffers.get(w.buffer).buffer;
+            let line_count = buf.line_count();
+            for f in w.folds.collapsed_regions(line_count) {
+                let first = buf.line(f.start);
+                let key = (f.start, f.line_count());
+                if self
+                    .fold_text_cache
+                    .get(&key)
+                    .is_some_and(|(had, _)| *had == first)
+                {
+                    continue;
+                }
+                wanted.push((f.start, f.line_count(), first));
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+
+        let failure = self.with_sandbox(|ed, sb| {
+            for (start, count, first) in &wanted {
+                let got = match sb.as_mut() {
+                    Some(engine) => {
+                        engine.call_fold_text(handle, first, *count as i64, *start as i64 + 1)
+                    }
+                    None => Err(crate::sandbox::SandboxError::Unavailable),
+                };
+                match got {
+                    Ok(text) => {
+                        ed.fold_text_cache
+                            .insert((*start, *count), (first.clone(), text));
+                    }
+                    Err(err) => return Some(err),
+                }
+            }
+            None
+        });
+
+        // Loud once, then off: this runs every repaint, so a broken expression
+        // would otherwise echo on every frame.
+        if let Some(err) = failure {
+            self.echo(format!("btv.fold.text: {err} — foldtext disabled"));
+            if let Some(h) = self.fold_text_fn.take() {
+                self.sandbox_release(h);
+            }
+            self.fold_text_cache.clear();
+        }
+    }
+
+    /// The custom text a closed fold renders with, or `None` for the built-in
+    /// default (no expression installed, or it has not been rendered yet).
+    pub(crate) fn fold_text_of(&self, start: usize, count: usize, first: &str) -> Option<&str> {
+        self.fold_text_cache
+            .get(&(start, count))
+            .filter(|(had, _)| had == first)
+            .map(|(_, text)| text.as_str())
+    }
 }

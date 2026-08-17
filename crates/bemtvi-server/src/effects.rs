@@ -1153,6 +1153,25 @@ impl EditHost {
         // process source. The chosen item / cancel comes back on `menu_results`,
         // routed to the picker by `picker_active` (a picker and a `ui.select` are
         // the same widget, mutually exclusive).
+        // `btv.picker.scorer(src|nil)`: compile the re-ranker into the sandbox now,
+        // so a bad expression is reported where it was configured rather than
+        // silently at the next picker.
+        if let Some(src) = self.lua.take_picker_scorer() {
+            self.editor.set_picker_scorer(src);
+        }
+        // `btv.fold.text(src|nil)`: the `'foldtext'` expression, compiled now so a
+        // bad one is reported where it was configured.
+        if let Some(src) = self.lua.take_fold_text() {
+            self.editor.set_fold_text(src);
+        }
+        // `btv.filetype.detect` / `btv.indent.expr`: same compile-at-configure-time
+        // contract, so a bad expression is reported where it was written.
+        if let Some(src) = self.lua.take_filetype_detect() {
+            self.editor.set_filetype_detect(src);
+        }
+        if let Some(src) = self.lua.take_indent_expr() {
+            self.editor.set_indent_expr(src);
+        }
         for req in self.lua.take_picker_opens() {
             // A bad alignment word is a loud echo, then the picker opens centered
             // rather than not at all (the prelude validates, so this is a guard).

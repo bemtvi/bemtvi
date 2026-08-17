@@ -276,17 +276,20 @@ async fn changing_foldmarker_re_derives_the_markers() {
 
 /// A foldexpr that folds by a marker word in the line's own text, so its value is a
 /// genuine per-line function of content the test can move around.
-const EXPR_SETUP: &str = "function _G.tfold(l)
-   local s = btv.buf.lines(0, l - 1, l, false)[1] or ''
-   if s:find('OPEN') then return '>1' end
-   if s:find('SHUT') then return '<1' end
-   return '='
- end";
+/// A generic `'foldexpr'` is a sandbox expression over `line` and `lnum`. It
+/// needs no buffer access — the row's own text is passed in — which is what lets
+/// it be evaluated synchronously, in the frame the edit landed in.
+const EXPR_SETUP: &str = r#"line:find('OPEN') and '>1' or line:find('SHUT') and '<1' or '='"#;
+
+/// Set the focused buffer's `'foldexpr'`. Through `btv.bo` rather than `:set`,
+/// since an expression contains spaces.
+async fn set_foldexpr(rpc: &Rpc, expr: &str) {
+    exec_lua(rpc, &format!("btv.bo.foldexpr = {expr:?} return true")).await;
+}
 
 async fn expr_fixture(text: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (rpc, inc) = start_with_file(text).await;
-    exec_lua(&rpc, EXPR_SETUP).await;
-    command(&rpc, "set foldexpr=v:lua.tfold(vim.v.lnum)").await;
+    set_foldexpr(&rpc, EXPR_SETUP).await;
     command(&rpc, "set foldmethod=expr").await;
     (rpc, inc)
 }
@@ -366,17 +369,11 @@ async fn changing_the_foldexpr_re_evaluates_every_line() {
     feed(&rpc, "gg");
     let by_open = visible(&frame(&rpc, &mut inc).await);
 
-    exec_lua(
+    set_foldexpr(
         &rpc,
-        "function _G.tfold2(l)
-           local s = btv.buf.lines(0, l - 1, l, false)[1] or ''
-           if s:find('middle') then return '>1' end
-           if s:find('end') then return '<1' end
-           return '='
-         end",
+        r#"line:find('middle') and '>1' or line:find('end') and '<1' or '='"#,
     )
     .await;
-    command(&rpc, "set foldexpr=v:lua.tfold2(vim.v.lnum)").await;
     feed(&rpc, "gg");
     let by_middle = visible(&frame(&rpc, &mut inc).await);
     assert_ne!(

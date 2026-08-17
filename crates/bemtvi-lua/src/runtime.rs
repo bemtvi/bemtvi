@@ -45,18 +45,6 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// Stringify one `'foldexpr'` per-line result for [`LuaRuntime::eval_foldexpr_lines`]:
-/// a number becomes its integer text (`1`, `-1`, …), a string passes through
-/// (`">1"`, `"="`, …), and any other type reads as `"0"` — the line isn't folded.
-fn foldexpr_value_string(value: &mlua::Value) -> String {
-    match value {
-        mlua::Value::Integer(i) => i.to_string(),
-        mlua::Value::Number(n) => (*n as i64).to_string(),
-        mlua::Value::String(s) => s.to_string_lossy(),
-        _ => "0".to_string(),
-    }
-}
-
 /// The outcome of resolving a command-line completion request
 /// (`Runtime::run_cmdline_complete`): either inline catalog candidates for the
 /// wildmenu, or a signal that the Lua source launched the file picker instead
@@ -795,6 +783,15 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // btv.decor: viewport-scoped decoration providers (the registry + off-tick
     // dispatch; needs btv.ns from api and btv.notify from runtime, both above).
     ("bemtvi:prelude/decor", include_str!("prelude/decor.lua")),
+    // `btv.fold.*` — the customizable `'foldtext'` expression.
+    ("bemtvi:prelude/fold", include_str!("prelude/fold.lua")),
+    // `btv.filetype.*` — content-based detection.
+    (
+        "bemtvi:prelude/filetype",
+        include_str!("prelude/filetype.lua"),
+    ),
+    // `btv.indent.*` — the `'indentexpr'` escape hatch.
+    ("bemtvi:prelude/indent", include_str!("prelude/indent.lua")),
     // The file-explorer's visual layer (directory-row highlighting), authored as an
     // `btv.decor` provider — so it loads AFTER decor.lua, whose `btv.decor.provider`
     // it registers against.
@@ -977,6 +974,18 @@ pub(crate) struct Shared {
     /// Treesitter bridge requests from `vim.treesitter.start` / `stop`, drained
     /// by the server into the editor's per-buffer treesitter override.
     pub(crate) ts_ops: Vec<TsOp>,
+    /// A pending `btv.picker.scorer(src | nil)` — the picker re-ranker's sandbox
+    /// source, drained by the server into the editor. Two levels of option: the
+    /// outer says a change was *requested*, the inner carries `nil` for "clear".
+    /// A single slot, not a queue: last write in a chunk wins, as for any setter.
+    pub(crate) picker_scorer: Option<Option<String>>,
+    /// A pending `btv.fold.text(src | nil)` — the `'foldtext'` sandbox source.
+    /// Same two-level shape as [`Shared::picker_scorer`].
+    pub(crate) fold_text: Option<Option<String>>,
+    /// A pending `btv.filetype.detect(src | nil)` — the content sniffer.
+    pub(crate) filetype_detect: Option<Option<String>>,
+    /// A pending `btv.indent.expr(src | nil)` — the `'indentexpr'`.
+    pub(crate) indent_expr: Option<Option<String>>,
     /// Register writes from `vim.fn.setreg`, drained by the server into the
     /// editor's register file after the chunk. Reads resolve from the
     /// `btv._registers` mirror, so only the write needs an op.
@@ -1205,6 +1214,10 @@ impl Shared {
             global_ops,
             workspace_option_ops,
             ts_ops,
+            picker_scorer,
+            fold_text,
+            filetype_detect,
+            indent_expr,
             reg_ops,
             textobject_ops,
             clipboard_seeds,
@@ -1275,6 +1288,10 @@ impl Shared {
         *global_ops = Default::default();
         *workspace_option_ops = Default::default();
         *ts_ops = Default::default();
+        *picker_scorer = Default::default();
+        *fold_text = Default::default();
+        *filetype_detect = Default::default();
+        *indent_expr = Default::default();
         *reg_ops = Default::default();
         *textobject_ops = Default::default();
         *clipboard_seeds = Default::default();
@@ -1588,40 +1605,6 @@ impl LuaRuntime {
     pub fn eval_to_value(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
         let value: mlua::Value = self.lua.load(chunk).eval()?;
         lua_to_rmpv(&value)
-    }
-
-    /// Evaluate a generic `'foldexpr'` for the `count` buffer lines starting at the
-    /// 0-based row `first` — vim's per-line fold-expr model, with `v:lnum` (the
-    /// 1-based line) bound before each call — and return one fold value string per
-    /// evaluated line (`"0"`, `"1"`, `">1"`,
-    /// `"<1"`, `"="`, …) for the core fold engine to resolve. bemtvi-core can't run
-    /// Lua, so the server drives this off the [`Editor`]'s `'foldexpr'` and pushes
-    /// the result back via `set_foldexpr_values`.
-    ///
-    /// The expression is the `'foldexpr'` value with an optional `v:lua.` prefix
-    /// stripped (the realistic bemtvi spelling, e.g. `v:lua.MyMod.foldexpr()`),
-    /// compiled once as `return <expr>` and called per line so the foldexpr re-reads
-    /// `vim.v.lnum` each time. A numeric result stringifies to its integer; a string
-    /// result passes through; anything else reads as `"0"` (the line isn't folded).
-    /// A compile/eval error propagates so the server can surface it (no silent
-    /// no-op).
-    pub fn eval_foldexpr_lines(
-        &self,
-        expr: &str,
-        first: usize,
-        count: usize,
-    ) -> mlua::Result<Vec<String>> {
-        let trimmed = expr.trim();
-        let chunk = trimmed.strip_prefix("v:lua.").unwrap_or(trimmed);
-        let func: mlua::Function = self.lua.load(format!("return {chunk}")).into_function()?;
-        let vmirror: Table = self.btv()?.get("_v_mirror")?;
-        let mut out = Vec::with_capacity(count);
-        for lnum in (first + 1)..=(first + count) {
-            vmirror.set("lnum", lua_int(lnum as i64))?;
-            let value: mlua::Value = func.call(())?;
-            out.push(foldexpr_value_string(&value));
-        }
-        Ok(out)
     }
 
     /// Mirror a buffer's diagnostics into `btv._diagnostics[bufnr]` as the plain
@@ -2030,6 +2013,29 @@ impl LuaRuntime {
         /// `stop` since the last drain, for the server to apply to the editor's
         /// per-buffer treesitter override.
         take_ts_ops -> Vec<TsOp> = ts_ops
+    }
+
+    /// Take a pending `btv.picker.scorer` change, if one was requested since the
+    /// last drain. `Some(Some(src))` installs, `Some(None)` clears, `None` means
+    /// the setter was not called.
+    pub fn take_picker_scorer(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().picker_scorer.take()
+    }
+
+    /// Take a pending `btv.fold.text` change, if one was requested since the last
+    /// drain. `Some(Some(src))` installs, `Some(None)` clears.
+    pub fn take_fold_text(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().fold_text.take()
+    }
+
+    /// Take a pending `btv.filetype.detect` change.
+    pub fn take_filetype_detect(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().filetype_detect.take()
+    }
+
+    /// Take a pending `btv.indent.expr` change.
+    pub fn take_indent_expr(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().indent_expr.take()
     }
 
     take_queue! {

@@ -1393,12 +1393,18 @@ fn cursor_band_row(
     screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop, wp) + above
 }
 
-/// The placeholder text a closed fold shows on its single collapsed row — vim's
-/// default `'foldtext'` shape: a dash run, the folded-line count, and the fold's
-/// first line (leading/trailing whitespace trimmed). Customizable `foldtext` is a
-/// later phase; this is the built-in default.
-fn fold_text(buf: &Buffer, fold: &Fold) -> String {
+/// The placeholder text a closed fold shows on its single collapsed row.
+///
+/// A `btv.fold.text` expression wins when one is installed and has been rendered
+/// for this fold (`Editor::settle_fold_text` fills the memo before the view is
+/// built, since here we only hold `&Editor`). Otherwise this is vim's default
+/// `'foldtext'` shape: a dash run, the folded-line count, and the fold's first
+/// line, whitespace-trimmed.
+fn fold_text(ed: &Editor, buf: &Buffer, fold: &Fold) -> String {
     let first = buf.line_cow(fold.start);
+    if let Some(custom) = ed.fold_text_of(fold.start, fold.line_count(), &first) {
+        return custom.to_string();
+    }
     format!("+--{:>3} lines: {}", fold.line_count(), first.trim())
 }
 
@@ -1421,6 +1427,7 @@ fn fold_text(buf: &Buffer, fold: &Fold) -> String {
 /// cell-accurate break.
 #[allow(clippy::too_many_arguments)]
 fn row_skeleton(
+    ed: &Editor,
     buf: &Buffer,
     base: usize,
     height: usize,
@@ -1468,7 +1475,7 @@ fn row_skeleton(
                     line: f.start,
                     count: f.line_count(),
                 },
-                fold_text(buf, f),
+                fold_text(ed, buf, f),
                 None,
                 usize::MAX,
                 0,
@@ -1583,7 +1590,7 @@ fn render_rows(
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
     let mut rows = row_skeleton(
-        buf, base, height, line_count, wrap, width, tabstop, wp, eob, folds,
+        ed, buf, base, height, line_count, wrap, width, tabstop, wp, eob, folds,
     );
     if !focused {
         return rows;

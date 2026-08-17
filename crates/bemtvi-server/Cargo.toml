@@ -85,6 +85,9 @@ portable-pty = { workspace = true, optional = true }
 bemtvi-core = { workspace = true, features = ["vim-regex", "serde"] }
 bemtvi-rpc = { workspace = true, optional = true }
 bemtvi-lua.workspace = true
+# The bounded compute sandbox (`:s` replacement expressions). Not feature-gated:
+# it must exist in the wasm edit-host too, so the surface is not native-only.
+bemtvi-sandbox.workspace = true
 bemtvi-lsp.workspace = true
 # In-process treesitter: the server constructs the engine and installs it on the
 # editor, which owns and queries it synchronously (no worker process). Native only

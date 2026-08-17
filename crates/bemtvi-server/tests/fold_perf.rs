@@ -82,42 +82,52 @@ async fn typing_does_not_scale_with_marker_folds() {
 #[tokio::test]
 async fn a_lua_foldexpr_is_not_evaluated_for_every_line_on_every_keystroke() {
     // The sharpest form of the bug: a generic `'foldexpr'` was called once per
-    // buffer line per keystroke — 1 500 000 Lua calls for this run — when an edit
+    // buffer line per keystroke — 1 500 000 evaluations for this run — when an edit
     // changes the fold value of the rows it touched and nothing else.
+    //
+    // It used to be counted with a main-VM counter the expression incremented. The
+    // expression runs in the *pure* sandbox now and cannot increment anything, so
+    // the cost is measured — against a **baseline of the same typing with no
+    // foldexpr at all**, which is what isolates the foldexpr from the rest of the
+    // per-keystroke frame cost (redraw over 5000 lines dominates otherwise).
     let (rpc, _i) = open(&sample(LINES)).await;
     exec_lua(&rpc, "btv.on('CursorMoved', function() end)").await;
-    exec_lua(
-        &rpc,
-        "_G.calls = 0
-         function _G.probe_fold(l)
-           _G.calls = _G.calls + 1
-           return 0
-         end",
-    )
-    .await;
-    command(&rpc, "set foldexpr=v:lua.probe_fold(vim.v.lnum)").await;
-    command(&rpc, "set foldmethod=expr").await;
 
+    // Baseline: the same typing, no computed fold source.
     feed(&rpc, "2500GA");
     let _ = lines(&rpc).await;
-    let before = exec_lua(&rpc, "return _G.calls").await.as_u64().unwrap();
-    assert!(
-        before >= LINES as u64,
-        "the foldexpr must have run over the buffer at least once ({before} calls) — \
-         otherwise this test proves nothing",
-    );
-
+    let base_start = std::time::Instant::now();
     for _ in 0..KEYS {
         feed(&rpc, "z");
     }
     let _ = lines(&rpc).await;
-    let after = exec_lua(&rpc, "return _G.calls").await.as_u64().unwrap();
+    let baseline = base_start.elapsed();
 
-    let per_key = (after - before) as f64 / KEYS as f64;
+    // Now with a foldexpr whose value genuinely depends on the line, so a full
+    // re-evaluation really would touch every row.
+    exec_lua(
+        &rpc,
+        r#"btv.bo.foldexpr = "line:find('    ') and 1 or 0" return true"#,
+    )
+    .await;
+    command(&rpc, "set foldmethod=expr").await;
+    let _ = lines(&rpc).await;
+
+    let expr_start = std::time::Instant::now();
+    for _ in 0..KEYS {
+        feed(&rpc, "z");
+    }
+    let _ = lines(&rpc).await;
+    let with_expr = expr_start.elapsed();
+
+    // Re-running the whole buffer per keystroke would add KEYS × (a full 5000-line
+    // pass) — seconds — on top of the baseline. The incremental splice adds a
+    // handful of evaluations per keystroke, which disappears into the noise. 3x the
+    // baseline is far above the latter and far below the former.
     assert!(
-        per_key < 50.0,
-        "a keystroke evaluated the foldexpr {per_key:.0} times ({} calls over {KEYS} \
-         keystrokes in a {LINES}-line buffer) — it is being re-run for the whole buffer",
-        after - before,
+        with_expr < baseline * 3,
+        "{KEYS} keystrokes took {with_expr:?} under a generic foldexpr against \
+         {baseline:?} without one, over {LINES} lines — the foldexpr is being re-run \
+         for the whole buffer on every keystroke",
     );
 }

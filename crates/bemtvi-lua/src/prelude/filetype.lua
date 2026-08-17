@@ -1,0 +1,55 @@
+-- Filetype surfaces (`btv.filetype.*`) — content-based detection.
+btv.filetype = btv.filetype or {}
+
+-- `btv.filetype.detect(src)`: decide a buffer's filetype from its **content**,
+-- or clear the sniffer with `nil`.
+--
+-- bemtvi's built-in tables resolve a filetype from the file's name, a path
+-- pattern, or its extension, and deliberately stop there: extensions neovim
+-- resolves by looking *inside* the file (`.h` C-vs-C++, `.r`, `.v`, `.m`, `.pl`)
+-- are omitted rather than guessed, because guessing in the core would be exactly
+-- the kind of heuristic that silently rots. This is the seam that answers them —
+-- your rule, not the editor's guess.
+--
+-- `src` is a string of Lua *source* — an expression, not a function value —
+-- because it runs in the bounded compute sandbox: a second, pure VM with a
+-- wall-clock deadline, no editor state and no `btv.*`.
+--
+-- Three names are in scope:
+--
+-- ```
+-- name   the file's basename ("" for an unnamed buffer)
+-- ext    its extension, without the dot ("" when it has none)
+-- head   the first few lines of content (bounded, ~2KB)
+-- ```
+--
+-- Return a filetype string, or `nil` (or `""`) to **decline** — declining is a
+-- normal answer, and leaves the built-in name/pattern/extension tables to
+-- resolve it as before. A returned filetype *wins* over them, which is what
+-- makes the `.h` case work:
+--
+-- ```lua
+-- btv.filetype.detect([[
+--   ext == "h" and (head:find("template", 1, true) or head:find("::", 1, true))
+--     and "cpp" or nil
+-- ]])
+-- ```
+--
+--
+-- The sandbox is **stateless**: nothing carries from one call to the next, and
+-- assigning a global raises. That is deliberate — no call shape is a clean
+-- once-per-item traversal (`:s` re-runs on every keystroke of the live preview,
+-- a foldexpr sees only the rows an edit touched, the picker scorer only the top
+-- survivors, `foldtext` is memoized), so an accumulator would be quietly wrong.
+-- It runs **once per buffer**, and its verdict is stored as that buffer's
+-- explicit filetype — the same thing `:setf` writes — so nothing on the render
+-- path ever calls back into the sandbox.
+--
+-- An expression that errors, exceeds its deadline, or returns a non-string
+-- reports once and is then uninstalled.
+function btv.filetype.detect(src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv.filetype.detect: expected a string of Lua source (or nil), got " .. type(src), 2)
+  end
+  btv._filetype_set_detect(src)
+end

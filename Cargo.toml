@@ -14,6 +14,7 @@ members = [
     "crates/bemtvi-view",
     "crates/bemtvi-width",
     "crates/bemtvi-regex",
+    "crates/bemtvi-sandbox",
     "crates/bemtvi-test-harness",
 ]
 # bemtvi-edithost is the real wasm edit-host: the reusable synchronous `EditHost` tick
@@ -52,6 +53,9 @@ bemtvi-ts = { path = "crates/bemtvi-ts" }
 bemtvi-lsp = { path = "crates/bemtvi-lsp", default-features = false }
 bemtvi-view = { path = "crates/bemtvi-view" }
 bemtvi-regex = { path = "crates/bemtvi-regex" }
+# The bounded compute sandbox: a second, pure, deadline-bounded Lua VM the
+# synchronous core paths call into (`:s` replacement expressions).
+bemtvi-sandbox = { path = "crates/bemtvi-sandbox" }
 # Test-only harness (a single Lua backend, PUC lua54, baked in via mlua).
 bemtvi-test-harness = { path = "crates/bemtvi-test-harness" }
 

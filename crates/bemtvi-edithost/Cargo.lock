@@ -111,6 +111,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bemtvi-sandbox"
+version = "0.1.0"
+dependencies = [
+ "bemtvi-core",
+ "mlua",
+]
+
+[[package]]
 name = "bemtvi-server"
 version = "0.1.0"
 dependencies = [
@@ -118,6 +126,7 @@ dependencies = [
  "bemtvi-core",
  "bemtvi-lsp",
  "bemtvi-lua",
+ "bemtvi-sandbox",
  "rmpv",
  "serde_json",
  "vt100",

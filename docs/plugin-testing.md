@@ -44,10 +44,49 @@ The runner boots an embedded editor with your plugin on the runtimepath (so
 ## The hermetic slate
 
 Each plugin runs in isolation: **no** user `init.lua`, an in-memory clipboard, no
-persistence (shada), and **your plugin as the sole runtimepath entry**. Every test
-starts from a **fresh slate** — a new empty buffer in normal mode — so one test's
-edits never bleed into the next. A test exercises *your* plugin against a clean
-editor and nothing else.
+persistence (shada), and **your plugin as the sole runtimepath entry**. A test
+exercises *your* plugin against a clean editor and nothing else.
+
+Isolation also holds *between* tests. One editor serves the whole run, so the
+runner takes a **baseline snapshot** of the world once — after every spec file has
+been sourced — and restores it before each test. That timing is the contract:
+
+- **A file's load-time setup is the baseline.** A `require("my-plugin").setup{}`
+  or a `dofile` at the top of a spec file runs before the snapshot, so it is the
+  state every test in the run starts from, and no test can undo it.
+- **What a *test* changes is put back.** Restored: global and window-local
+  options, `btv.g`, the named registers, the `btv.*` expression surfaces, and any
+  keymap or user command a test added. The buffer goes back to a fresh empty one
+  in normal mode.
+
+Some things are **not** restored, because a snapshot has no way to rebuild them: a
+keymap or user command a test *deleted*, autocmds, and buffers beyond the one the
+reset replaces. Avoid deleting a shared keymap mid-test, or re-register it in
+`after_each`.
+
+### The one thing restore cannot reach: your module's own state
+
+Restore puts the *editor* back. It cannot see the locals inside your plugin, and
+that asymmetry has a sharp edge — a module that memoizes "I already registered my
+command" will go stale:
+
+```lua
+-- WRONG. Test 1 registers the command and flips the memo. Restore then removes
+-- the command (a test added it), but `state.commands` is still true, so every
+-- later `setup` early-returns and `:MyPlugin` no longer exists.
+local function register_commands()
+  if state.commands then return end
+  state.commands = true
+  btv.command("MyPlugin", run, opts)
+end
+```
+
+`btv.user_command.create` and `btv.keymap.set` key their registries by name, so
+**re-registering is already idempotent** — the memo buys nothing and only encodes
+an assumption about global state your module does not own. Drop it and register
+unconditionally. The same applies to any "did I do this once" flag guarding
+something the editor holds; keep such flags for state your module genuinely owns
+(a spawned process, a cache).
 
 ## The tick model — why the context is async
 
@@ -120,6 +159,14 @@ Matchers are called with a dot; prefix any with `.never` to invert
 | `t:keymaps([mode])` | The defined maps (maparg shape). |
 | `t:float()` | The content float — `{ text, lines, title }` — or nil. |
 | `t:message()` / `t:statusline()` | The message / status line text. |
+| `t:screen()` | The focused window's **painted** rows, as a list of strings. |
+
+`t:screen()` is the sibling of `t:lines()`, and the difference decides which one a
+test should assert on. `t:lines()` is buffer text; `t:screen()` is what the client
+would actually draw. Anything the editor renders *instead of* a buffer line shows
+up only in the latter — a closed fold's `'foldtext'` placeholder, a `~` filler past
+the end of the buffer, a decoration's virtual text. Assert on `t:screen()` for
+those and on `t:lines()` for an edit.
 
 ### Hermetic seams
 

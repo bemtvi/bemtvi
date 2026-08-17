@@ -345,6 +345,30 @@ enum CmdlineKind {
     /// [`Editor::helix_apply_regex`] (`<Esc>` cancels). Opened from a Helix mode,
     /// it resumes [`Mode::HelixNormal`] on close. See [`crate::editor::helix`].
     HelixRegex(HelixRegexOp),
+    /// The **expression register** prompt (`"=` / `<C-r>=`): `<CR>` evaluates the
+    /// typed Lua in the bounded sandbox and delivers the result to
+    /// [`ExprTarget`] (`<Esc>` cancels, computing nothing). See
+    /// [`Editor::enter_expr_register`].
+    Expr(ExprTarget),
+}
+
+/// Where an evaluated [`CmdlineKind::Expr`] result goes — the three places vim's
+/// expression register is reachable from. A `Copy` tag only: the per-target
+/// payload (the pending command to restore, the outer command line to splice
+/// into) lives on the [`Editor`], because [`CmdlineKind`] is `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExprTarget {
+    /// `<C-r>=` in Insert: insert the result at every cursor and resume the insert
+    /// flavour the prompt was opened from.
+    Insert,
+    /// `"=` at a command boundary: store the result in the `=` register and
+    /// restore the pending count + register, so the *following* `p` pastes it
+    /// (vim's `"=…<CR>p` ordering).
+    Register,
+    /// `<C-r>=` in an open command line: restore the line that was being typed and
+    /// splice the result in at its cursor. The outer line is saved on
+    /// [`Editor::expr_cmdline_stack`] for the duration.
+    Cmdline,
 }
 
 /// Which selection transform a [`CmdlineKind::HelixRegex`] prompt drives.
@@ -1633,6 +1657,20 @@ pub struct Editor {
     /// a failing expression was disabled.
     picker_scorer: Option<crate::sandbox::SandboxFn>,
 
+    /// The pending command an [`ExprTarget::Register`] prompt has to put back on
+    /// submit: entering the command line calls `reset_pending`, but vim's
+    /// `"=…<CR>p` needs the count and `register = Some('=')` still armed when the
+    /// `p` that follows is parsed.
+    expr_saved_pending: Option<PendingCommand>,
+    /// The command lines an [`ExprTarget::Cmdline`] prompt is suspended over — a
+    /// stack, so an expression prompt opened from an expression prompt costs
+    /// nothing extra. Pushed on entry, popped on submit *or* cancel.
+    expr_cmdline_stack: Vec<cmdline::SavedCmdline>,
+    /// The expression-register prompt's own history ring (vim's `@=` history),
+    /// recalled with `<Up>`/`<Down>` while the prompt is open. Session-only, like
+    /// the scripted-prompt rings.
+    expr_history: Vec<String>,
+
     /// The compiled `'foldtext'` expression (`btv.fold.text`), and the memo of
     /// what it rendered. Keyed by a closed fold's `(start line, line count)`
     /// with the first line it was rendered from, so a fold whose content moved
@@ -2253,6 +2291,9 @@ impl Editor {
             syntax: None,
             sandbox: None,
             picker_scorer: None,
+            expr_saved_pending: None,
+            expr_cmdline_stack: Vec::new(),
+            expr_history: Vec::new(),
             fold_text_fn: None,
             filetype_fn: None,
             filetype_sniffed: Default::default(),

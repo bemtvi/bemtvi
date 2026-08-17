@@ -317,6 +317,20 @@ impl SandboxEngine for LuaSandbox {
         text_result(result.map_err(Self::runtime_err)?)
     }
 
+    fn call_eval(
+        &mut self,
+        f: SandboxFn,
+        line: &str,
+        lnum: i64,
+        col: i64,
+    ) -> Result<String, SandboxError> {
+        let func = self.lookup(f, "expression register")?;
+        self.deadline.set(Some(Instant::now() + CALL_DEADLINE));
+        let result: Result<Value, mlua::Error> = func.call((line, lnum, col));
+        self.deadline.set(None);
+        text_result(result.map_err(Self::runtime_err)?)
+    }
+
     fn release(&mut self, f: SandboxFn) {
         self.fns.remove(&f.0);
     }

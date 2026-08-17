@@ -19,11 +19,12 @@ btv.filetype.detect([[ ext == "h" and head:find("template", 1, true) and "cpp" o
 Each one is an *expression*, not a function body: it evaluates to a value, and
 that value is the answer. There is no `return`, no statements, no `end`.
 
-## The six surfaces
+## The seven surfaces
 
 | Where | In scope | Returns |
 | --- | --- | --- |
 | `:s/…/\=…/` | `m`, `lnum` | the replacement text |
+| `"=` / `<C-r>=` | `line`, `lnum`, `col` | text to insert or paste |
 | `'foldexpr'` | `line`, `lnum` | a fold level (see [Fold levels](#fold-levels)) |
 | `btv.fold.text` | `first`, `lines`, `lnum` | a closed fold's collapsed row |
 | `btv.indent.expr` | `prev`, `line`, `lnum`, `sw`, `previndent` | indent columns, or `nil` |
@@ -169,6 +170,39 @@ It re-ranks only rows that already matched, and only the top 1000 of them.
 Matching stays native, which is what keeps a picker responsive while 100 000
 candidates stream in.
 
+## The expression register
+
+`"=` is the register whose contents are *computed*. It is reachable from three
+places, and each prompts with `=` for one expression:
+
+```
+i<C-r>=6*7<CR>          in Insert — inserts `42` at the cursor
+"=lnum*10<CR>p          in Normal — the following `p` pastes the result
+:e log-<C-r>=lnum<CR>   in the command line — splices the result into the line
+```
+
+In scope are `line` (the cursor's line text), `lnum` and `col` (1-based) — vim's
+expression register can reach the whole Vimscript environment, so the pure
+equivalent is handed what a computed insert actually wants.
+
+A result ending in a newline pastes **linewise**, anything else charwise — so
+`"="a\nb\n"<CR>p` opens two new lines below.
+
+Two consequences of it being an ordinary register once evaluated:
+
+- **It is evaluated when you submit the prompt, not each time it is read.** The
+  text is then stored, so `getreg("=")` shows it and `p` pastes it — but
+  `"=lnum<CR>p` followed by `j.` pastes the *first* line number again. (vim
+  re-evaluates on read; bemtvi cannot, because the paste path resolves registers
+  through a read-only borrow while the sandbox needs a mutable one.)
+- **A computed insert or paste is not `.`-repeatable**, for the same reason `:s`
+  and `d/foo` are not: it transits the command line. `.` replays the last
+  repeatable change instead.
+
+`<Esc>` at the prompt computes nothing. From a *nested* prompt it abandons only
+the expression — the command line you were typing comes back untouched, as it
+does when the expression fails.
+
 ## What an expression can do
 
 The expression runs in a second, deliberately tiny Lua VM. It has the
@@ -207,6 +241,7 @@ your expression once per item in order:
 | `btv.picker.scorer` | only the top survivors, re-run on each repaint |
 | `btv.fold.text` | memoized, so calls are skipped outright |
 | `btv.filetype.detect` | once per buffer |
+| `"=` / `<C-r>=` | evaluated once per prompt, then stored |
 
 A counter over `:%s/x/…/g` on a three-`x` line would read `16 17 18`, not
 `1 2 3`, because the preview got there first. Statelessness turns that class of
@@ -229,10 +264,11 @@ ranking — report the failure *once* and then uninstall the expression, falling
 back to the built-in behaviour. An expression evaluated on every repaint cannot
 be allowed to print the same error on every frame.
 
-`:s` is the exception, because it is a one-shot command: a failing expression
-aborts the substitution and says so. A compile error leaves the buffer
-untouched; a failure partway through leaves the substitutions already made,
-which one `u` undoes, since the whole run is a single undo step.
+`:s` and the expression register are the exceptions, because they are one-shot.
+A failing `"=` echoes, computes nothing, and leaves whatever was stored alone. A
+failing `:s` expression aborts the substitution and says so: a compile error
+leaves the buffer untouched; a failure partway through leaves the substitutions
+already made, which one `u` undoes, since the whole run is a single undo step.
 
 An expression that loops forever is stopped at its deadline rather than hanging
 the editor, and the VM has a hard memory ceiling, so `string.rep("x", 1e12)`

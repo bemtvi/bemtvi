@@ -10,15 +10,21 @@
 -- fold demos need the second, because a closed fold's placeholder replaces the
 -- lines rather than changing them.
 
-
 local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
 
 -- Load the example's config the way a session would, once.
 dofile(DIR .. "/init.lua")
 
 --- Open the sample buffer and park the cursor at the top.
+---
+--- Two commands, not one: the per-test baseline restores only the buffer `enew!`
+--- replaces, so a test that edited the sample leaves *that* buffer modified and a
+--- plain `:e` (which switches to an existing buffer without re-reading) would
+--- hand the next test the edited file back. The bare `:e!` re-reads it once it is
+--- current again.
 local function open(t)
   t:cmd("e " .. DIR .. "/sample.txt")
+  t:cmd("e!")
   t:feed("gg")
 end
 
@@ -111,6 +117,32 @@ btv.test.describe("examples/expressions", function()
     -- Whatever the matcher ranks first, it is not the row the scorer promoted —
     -- which is the whole point of offering the toggle.
     btv.test.expect(t:message()).never.to_contain("picked docs/model.md")
+  end)
+
+  -- Demo 6. The expression register needs no config, so the spec types exactly
+  -- what the notes tell a reader to type.
+  btv.test.it("demo 6 — <C-r>= inserts a computed value", function(t)
+    open(t)
+    t:feed("2G")
+    t:feed("o<C-r>=lnum * 10<CR><Esc>")
+    -- `o` opened line 3, so `lnum` was 3 when the expression ran.
+    btv.test.expect(t:line(3)).to_be("30")
+  end)
+
+  btv.test.it('demo 6 — "= stores a result the next p pastes', function(t)
+    open(t)
+    t:feed('gg"=("-"):rep(8)<CR>p')
+    btv.test.expect(t:lines()[1]).to_contain("--------")
+    btv.test.expect(vim.fn.getreg("=")).to_be("--------")
+  end)
+
+  btv.test.it("demo 6 — <C-r>= splices into a command line", function(t)
+    open(t)
+    t:feed("3G")
+    -- The replacement is *terminated* (`…/`): an unterminated `:s` trims its
+    -- trailing whitespace, which would eat the space after the computed number.
+    t:feed(":s/^/<C-r>=lnum<CR>. /<CR>")
+    btv.test.expect(t:line(3)).to_match("^3%. ")
   end)
 
   btv.test.it(":Cheat opens its float", function(t)

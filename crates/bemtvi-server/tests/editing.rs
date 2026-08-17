@@ -15,6 +15,8 @@
 #[path = "editing/support.rs"]
 mod support;
 
+#[path = "editing/expr_register.rs"]
+mod expr_register;
 #[path = "editing/foldtext.rs"]
 mod foldtext;
 #[path = "editing/sandbox_exprs.rs"]

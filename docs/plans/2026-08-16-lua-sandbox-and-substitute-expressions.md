@@ -418,3 +418,184 @@ It is not being built now because it trades away the incremental splice: a
 whole-buffer foldexpr is O(buffer) per edit, which is exactly what
 `fold_perf.rs` guards against. It would want to be opt-in per buffer rather than
 the default, and to carry its own perf guard.
+
+---
+
+## Phase 4 — the expression register (`"=` / `<C-r>=`)
+
+*2026-08-17*
+
+### The gap
+
+`registers.rs:10` names it: *"only the expression register `"=` is not yet
+wired."* Every other special resolves (`"%` the file name, `".` the last insert,
+`"/` the last pattern); `"=` is the one that needs to *compute*, which needed a
+synchronous VM. `is_readonly_register` already lists `'='`, so the write side is
+guarded; only the read side is missing.
+
+It is the `:s/…/\=…/` call shape reached from three places instead of one:
+
+| entry | what it does |
+| --- | --- |
+| `<C-r>=` in Insert | prompt, evaluate, insert the result at every cursor |
+| `"=` at a command boundary | prompt, evaluate, store — the following `p`/`P` pastes it |
+| `<C-r>=` in the command line | prompt, evaluate, insert the result into the line being typed |
+
+### In scope
+
+`line`, `lnum`, `col` — the cursor's line text, its 1-based line number, and its
+1-based column. Vim's expression register has the whole Vimscript environment;
+ours is pure, so what a computed insert actually reaches for is passed in
+instead. Three names cover the real uses (`lnum * 2`, a padded index, munging the
+line you are standing on) and each is a scalar the core already has.
+
+Returns the text to insert, through the same `text_result` conversion every other
+surface uses — so a number is fine (`<C-r>=6*7` inserts `42`).
+
+### Evaluated once, at confirm — not per read
+
+Vim re-evaluates `@=` on every read. bemtvi evaluates when the prompt is
+confirmed and stores the resulting text in the `=` cell, because
+`Editor::register_text` is `&self` (it is on paste-hot paths) and evaluating
+needs `&mut` for the engine. The consequences, all stated rather than discovered:
+
+- `"=lnum<CR>p` then `j.` pastes the *first* line number again. Vim would
+  re-evaluate and give the second.
+- `@=` from Lua (`getreg("=")`) reads the stored result, and the register mirror
+  sees the write like any other, so the value is introspectable — which
+  re-evaluation-on-read could not offer.
+- `<C-r>=` in the command line therefore has a defined meaning even before the
+  nested prompt lands: the stored result.
+
+### The prompt
+
+A new `CmdlineKind::Expr(ExprTarget)`, opened exactly the way
+`enter_helix_regex` opens its prompt: `cmdline_return_mode` remembers where to go
+back to, the kind routes `<CR>` in `submit_cmdline`, and the per-target payload
+lives in an `Editor` field rather than in the enum (`CmdlineKind` is `Copy`, as
+`let kind = self.cmdline_kind` in `submit_cmdline` requires). `cmdline_type()`
+reports `=`, matching vim's prompt character.
+
+`ExprTarget` is the `Copy` tag — `Insert`, `Register`, `Cmdline`:
+
+- **Insert** resumes the insert flavour it was opened from and routes the result
+  through `insert_text_session`, the same primitive `<C-r>{register}` uses, so a
+  multi-cursor insert and the `".` accumulator behave identically.
+- **Register** restores the count and `register = Some('=')` onto
+  `Editor::pending` at confirm, because entering the command line calls
+  `reset_pending`. Restoring is what makes the *following* `p` see the register —
+  vim's `"=…<CR>p` ordering.
+- **Cmdline** saves the whole outer command-line state and restores it with the
+  result spliced in at its cursor. A stack, not a single slot, so an expression
+  prompt opened from an expression prompt costs nothing extra.
+
+### Failure, loudly
+
+Compile error, runtime error, deadline expiry and a bad return type each echo and
+insert nothing, leaving the `=` cell as it was. There is no partial write: the
+evaluation happens before anything is inserted or stored.
+
+### Phases
+
+- **4A** — the seam's `call_eval`, the prompt, the Insert and Register targets.
+- **4B** — the Cmdline target (the nested prompt).
+
+### Testing
+
+`crates/bemtvi-server/tests/editing/expr_register.rs`, black-box as always:
+arithmetic and string results, `line`/`lnum`/`col` in scope, the linewise rule,
+`"=…<CR>p` and `"=…<CR>P`, the count surviving the prompt, insertion at every
+cursor with multi-cursors, each failure mode echoing and inserting nothing, the
+register mirror seeing the stored result, `<Esc>` cancelling, and (4B) `<C-r>=`
+splicing into a `:` line and a `/` line without disturbing what was already
+typed.
+
+---
+
+## Phase 5 — `btv.complete.scorer`
+
+### The gap
+
+`settle_picker_rank` bails on `menu.kind != MenuKind::Picker` (`menu.rs:1057`),
+so the completion popup — the same `Menu`, the same `filtered` / `match_spans`,
+the same fuzzy pass — cannot be re-ranked. A config can bias whole *sources*
+(`MenuItem::priority`, `lsp` 8 > snippets 5 > buffer 0) but cannot say "demote
+snippets while I am typing a call" or "prefer the shorter candidate".
+
+### In scope
+
+`label`, `query`, `score`, `kind` — and `score` is the **blended** native key
+(`fuzzy + priority`), the one `sort_complete_view` sorts on, so nudging it
+composes with the source bias rather than fighting it. `kind` is the row's kind
+label (`"Snippet"`, an LSP `CompletionItemKind` name, `""` for a buffer word).
+
+The source *name* is deliberately not in scope: `MenuItem` does not carry one,
+and inferring the source from `kind` is exactly the heuristic the "fix at the
+canonical layer" rule warns about. If source-level ranking is wanted, the fix is
+to thread the real name onto `MenuItem`, as its own change.
+
+### Where it runs
+
+Once per frame, from `redraw`, beside `settle_picker_rank` — not in
+`sort_complete_view`, which runs per arriving batch and would turn its O(batch)
+into O(view)-per-batch. Capped at `RERANK_LIMIT`. `rank_dirty` already covers the
+"nothing changed" case.
+
+One difference from the picker: the re-rank must **follow the selected row**, the
+hazard `sort_complete_view` documents at length — `self.cursor` is a position in
+the view, so reordering under a caret would make `<CR>` accept a candidate nobody
+chose. The permutation helper both paths share preserves the selected item's
+identity for a `Complete` menu.
+
+### Failure
+
+Identical to the picker's: a scorer runs every repaint, so the first failure
+reports once and **uninstalls** itself, degrading to native order. A compile
+error is caught at configure time.
+
+### Testing
+
+`crates/bemtvi-server/tests/complete_scorer.rs`: a scorer reorders the popup, the
+caret follows the row it was on, `kind` and the blended `score` are really in
+scope, a broken scorer reports once and uninstalls, `nil` clears it, and the
+order without a scorer is unchanged.
+
+### Outcome
+
+Shipped as planned, both sub-phases in one commit: 34 new black-box tests
+(`editing/expr_register.rs`), 3 new example specs, full suite **3990 passed / 0
+failed**. Mutation-tested — dropping the insert and restoring the wrong parse
+stage fails 14 of the 34. Six notes where reality differed from the sketch.
+
+- **The restored pending needs `Stage::Start`, not the stage `"` left behind.**
+  Cloning `Editor::pending` verbatim carried `Stage::RegisterPending`, so the key
+  after the prompt was read as a *register name* — and `p` is a valid one, which
+  made `"=…<CR>p` silently select register `p` and paste nothing. The saved state
+  is now built explicitly (count + `register = Some('=')` + a clean stage).
+- **A computed insert is not `.`-repeatable, and that fell out of an existing
+  rule** rather than needing one: any command that transits `Mode::Command` is
+  already marked non-repeatable centrally (the same rule that excludes `:s` and
+  `d/foo`), so `.` replays the last repeatable change. vim *does* repeat
+  `i<C-r>=…<CR>` by replaying the prompt keys, which bemtvi cannot: the submit
+  key is a `cmdline`-bucket keymap resolved in the server, and dot-repeat re-feeds
+  through `Editor::input`, where a Command-mode `<CR>` is inert. Pinned by tests
+  in both directions.
+- **The nested prompt must restore its outer line on *every* path.** The first
+  cut returned early on an empty or failing expression, which threw the suspended
+  command line away — a typo at the `=` prompt cost the whole `:s` you were
+  typing. The result is threaded as an `Option` instead, and `<Esc>` restores too,
+  so the line always comes back.
+- **Visual `"=…<CR>p` does not replace the selection**, and that is a
+  pre-existing gap unrelated to this: bemtvi's `p` pastes at the cursor in every
+  mode. What this phase owes Visual mode is that the prompt *returns* to it with
+  the selection intact, which is what the test asserts.
+- **`SavedCmdline` had to be a struct saved wholesale.** The prompt is a full
+  command line, so twelve fields — text, cursor, kind, prompt label, return mode,
+  visual origin, history index, the `btv.ui.input` history/completion opt-ins, and
+  a `/` search's count and origin — all have to come back. Field-by-field at the
+  call site would rot the moment a thirteenth is added.
+- **The example turned up two spec-hygiene facts, neither about this feature.**
+  A test that edits the sample leaves that buffer modified and the per-test
+  baseline does not restore it, so `open()` needs `:e` *then* a bare `:e!` (`:e
+  <path>` switches to an existing buffer without re-reading). And an unterminated
+  `:s` trims its trailing whitespace, so the demo's replacement is terminated.

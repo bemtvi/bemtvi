@@ -79,6 +79,8 @@ impl Editor {
             CmdlineKind::Search(SearchDir::Backward) => "?",
             CmdlineKind::Prompt | CmdlineKind::Confirm => "@",
             CmdlineKind::HelixRegex(_) => "/",
+            // vim's expression-register prompt character.
+            CmdlineKind::Expr(_) => "=",
         }
     }
 
@@ -228,6 +230,12 @@ impl Editor {
                 // transform reads the live selection set correctly.
                 self.helix_apply_regex(op, &text);
             }
+            CmdlineKind::Expr(target) => {
+                // The mode was already restored above, so an Insert-target result
+                // lands in a live insert session (its undo snapshot still open).
+                self.remember_expr(&text);
+                self.submit_expr_register(target, &text);
+            }
             CmdlineKind::Confirm => {}
         }
     }
@@ -268,6 +276,12 @@ impl Editor {
                 if let Some(word) = self.word_under_cursor() {
                     self.cmdline_insert_str(&word);
                 }
+            } else if key.as_char() == Some('=') {
+                // `<C-r>=` in the command line: the expression register computes
+                // rather than storing, so suspend this line under a nested prompt
+                // and splice the result in when it is submitted.
+                self.enter_expr_register(ExprTarget::Cmdline);
+                return;
             } else if let Some(name) = key.as_char() {
                 self.cmdline_insert_register(name);
             }
@@ -306,6 +320,9 @@ impl Editor {
         self.awaiting_register = false;
         // Drop any Helix selection-regex preview ranges (an abandoned `s`/`S`/… line).
         self.helix_regex_ranges = Vec::new();
+        // An abandoned `"=` computes nothing, so the pending command it stashed to
+        // restore (count + `"=`) is dropped with it.
+        self.expr_saved_pending = None;
         if matches!(self.cmdline_kind, CmdlineKind::Search(_)) {
             self.cursor = self.search_origin;
             self.clamp_cursor();
@@ -324,6 +341,12 @@ impl Editor {
         // Tear down any live `:s///` replacement diff overlay — the line has closed
         // (mode restored, text cleared), so this only clears the marks.
         self.refresh_subst_preview();
+        // An abandoned *nested* expression prompt returns to the line it was opened
+        // over, computing nothing — `<Esc>` costs the expression, not the command
+        // being typed. (This re-enters `Mode::Command` after the clear above.)
+        if matches!(self.cmdline_kind, CmdlineKind::Expr(ExprTarget::Cmdline)) {
+            self.resume_expr_cmdline("");
+        }
     }
 
     /// The mode an *ex* command line (`:`) opened now should restore when it
@@ -476,7 +499,7 @@ impl Editor {
     /// single editable line, so embedded newlines (a linewise register's trailing
     /// break, or a multi-line yank) are dropped rather than splitting it. Shared
     /// by `<C-r>{register}` and `<C-r><C-w>`.
-    fn cmdline_insert_str(&mut self, text: &str) {
+    pub(super) fn cmdline_insert_str(&mut self, text: &str) {
         for c in text.chars().filter(|&c| c != '\n') {
             self.cmdline_insert(c);
         }
@@ -528,6 +551,7 @@ impl Editor {
         match self.cmdline_kind {
             CmdlineKind::Ex => &self.ex_history,
             CmdlineKind::Search(_) | CmdlineKind::HelixRegex(_) => &self.search_history,
+            CmdlineKind::Expr(_) => &self.expr_history,
             CmdlineKind::Confirm => &[],
             CmdlineKind::Prompt => self
                 .prompt_history_key
@@ -602,6 +626,8 @@ impl Editor {
             CmdlineKind::Search(dir) => dir.prefix(),
             // The Helix selection-regex prompt reads like a search — a `/` prefix.
             CmdlineKind::HelixRegex(_) => '/',
+            // The expression register prompts with `=`, as vim does.
+            CmdlineKind::Expr(_) => '=',
             // A `vim.ui.input` prompt and a `vim.fn.confirm` dialog render their
             // multi-char label via `cmdline_prompt()` instead; the single-char
             // prefix is unused (a space keeps the projection well-formed).
@@ -628,5 +654,90 @@ impl Editor {
     /// [`Editor::cmdline`], for the client to place the terminal cursor.
     pub(crate) fn cmdline_cursor(&self) -> usize {
         self.cmdline[..self.cmdline_col].chars().count()
+    }
+}
+
+/// A command line suspended under a nested `<C-r>=` expression prompt — every
+/// field the prompt overwrites, so the outer line resumes exactly as it was.
+///
+/// Saved wholesale rather than field-by-field at the call site: the prompt is a
+/// full [`Mode::Command`] line of its own, so anything a line carries (its text
+/// and cursor, its kind, its `btv.ui.input` label / history namespace /
+/// completion opt-ins, a `/` search's origin and count) has to come back.
+#[derive(Debug, Clone)]
+pub(crate) struct SavedCmdline {
+    line: String,
+    col: usize,
+    kind: CmdlineKind,
+    prompt: String,
+    return_mode: Mode,
+    from_visual: Option<Mode>,
+    hist_idx: Option<usize>,
+    prompt_history_key: Option<String>,
+    prompt_complete_active: bool,
+    prompt_complete_docs: bool,
+    search_count: usize,
+    search_origin: Cursor,
+}
+
+impl Editor {
+    /// Lift the open command line's state out, for a nested prompt to restore.
+    pub(crate) fn save_cmdline_state(&mut self) -> SavedCmdline {
+        SavedCmdline {
+            line: std::mem::take(&mut self.cmdline),
+            col: self.cmdline_col,
+            kind: self.cmdline_kind,
+            prompt: std::mem::take(&mut self.cmdline_prompt),
+            return_mode: self.cmdline_return_mode,
+            from_visual: self.cmdline_from_visual,
+            hist_idx: self.hist_idx,
+            prompt_history_key: self.prompt_history_key.take(),
+            prompt_complete_active: self.prompt_complete_active,
+            prompt_complete_docs: self.prompt_complete_docs,
+            search_count: self.pending_search_count,
+            search_origin: self.search_origin,
+        }
+    }
+
+    /// Put a saved command line back and re-enter [`Mode::Command`] on it, with
+    /// `insert` (a computed result, or nothing for a cancelled prompt) spliced in
+    /// at its cursor.
+    pub(crate) fn restore_cmdline_state(&mut self, saved: SavedCmdline, insert: &str) {
+        let SavedCmdline {
+            line,
+            col,
+            kind,
+            prompt,
+            return_mode,
+            from_visual,
+            hist_idx,
+            prompt_history_key,
+            prompt_complete_active,
+            prompt_complete_docs,
+            search_count,
+            search_origin,
+        } = saved;
+        self.cmdline = line;
+        self.cmdline_col = col.min(self.cmdline.len());
+        self.cmdline_kind = kind;
+        self.cmdline_prompt = prompt;
+        self.cmdline_return_mode = return_mode;
+        self.cmdline_from_visual = from_visual;
+        self.hist_idx = hist_idx;
+        self.prompt_history_key = prompt_history_key;
+        self.prompt_complete_active = prompt_complete_active;
+        self.prompt_complete_docs = prompt_complete_docs;
+        self.pending_search_count = search_count;
+        self.search_origin = search_origin;
+        self.mode = Mode::Command;
+        if !insert.is_empty() {
+            self.cmdline_insert_str(insert);
+        }
+        // The outer line is live again, so its previews are too — the result may
+        // have completed a `/` pattern or a `:s` replacement.
+        if let CmdlineKind::Search(dir) = self.cmdline_kind {
+            self.update_incsearch_preview(dir);
+        }
+        self.refresh_subst_preview();
     }
 }

@@ -231,6 +231,11 @@ impl Editor {
                 if let Some(word) = self.word_under_cursor() {
                     self.insert_text_session(&word);
                 }
+            } else if key.as_char() == Some('=') {
+                // `<C-r>=`: the expression register has nothing stored to insert —
+                // it computes. Open the prompt; the result is inserted when it is
+                // submitted, back in this insert session.
+                self.enter_expr_register(ExprTarget::Insert);
             } else if let Some(name) = key.as_char() {
                 self.insert_register(name);
             }
@@ -677,7 +682,7 @@ impl Editor {
     /// shared body of `<C-r>{register}` and `<C-r><C-w>`. Records the text once in
     /// the `".` last-insert accumulator (not once per cursor), matching how a
     /// typed character is recorded.
-    fn insert_text_session(&mut self, text: &str) {
+    pub(super) fn insert_text_session(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }

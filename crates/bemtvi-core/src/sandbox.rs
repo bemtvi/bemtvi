@@ -178,6 +178,20 @@ pub trait SandboxEngine {
         lnum: i64,
     ) -> Result<String, SandboxError>;
 
+    /// Call a compiled **expression register** (`"=` / `<C-r>=`) once.
+    ///
+    /// `line` is the cursor's line text, `lnum` its 1-based line number and `col`
+    /// its 1-based column — vim's expression register has the whole Vimscript
+    /// environment to reach for, so the pure equivalent is handed what a computed
+    /// insert actually wants. Returns the text to insert.
+    fn call_eval(
+        &mut self,
+        f: SandboxFn,
+        line: &str,
+        lnum: i64,
+        col: i64,
+    ) -> Result<String, SandboxError>;
+
     /// Drop a compiled chunk. Releasing an unknown handle is a no-op.
     fn release(&mut self, f: SandboxFn);
 }

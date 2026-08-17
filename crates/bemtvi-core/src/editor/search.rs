@@ -739,6 +739,7 @@ impl Editor {
             CmdlineKind::Ex
             | CmdlineKind::Prompt
             | CmdlineKind::Confirm
+            | CmdlineKind::Expr(_)
             | CmdlineKind::HelixRegex(_) => None,
         };
         // The live incsearch preview belongs to the focused window (the command

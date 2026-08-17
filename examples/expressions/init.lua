@@ -99,7 +99,7 @@ btv.filetype.detect([[
 
 local SCORER = [[ score + (label:find("^docs/") and 500 or 0) ]]
 
-btv.picker.source {
+btv.picker.source({
   name = "demo",
   -- Report the pick rather than opening it: these are illustrative paths, and
   -- seeing which row `<CR>` took is the whole point of the demo.
@@ -113,10 +113,10 @@ btv.picker.source {
       "src/module.rs",
       "docs/model.md",
     }) do
-      ctx.push { text = t }
+      ctx.push({ text = t })
     end
   end,
-}
+})
 
 btv.picker.scorer(SCORER)
 
@@ -127,6 +127,27 @@ btv.command("Scorer", function(a)
     btv.picker.scorer(SCORER)
   end
 end, { nargs = "?", desc = "Toggle the picker scorer" })
+
+-- ===========================================================================
+-- 6. The expression register — `"=` and `<C-r>=`
+--
+--    Nothing to configure: this one is built in. It is the register whose
+--    contents are *computed*, and it prompts with `=` for the expression.
+--
+--    type:  o<C-r>=lnum * 10<CR><Esc>
+--    see:   the new line reads `20` — `lnum` is the line you are on
+--
+--    type:  "=("-"):rep(20)<CR>p
+--    see:   a rule pasted in; `"=` stores the result and the `p` after it pastes
+--
+--    type:  :s/^/<C-r>=lnum<CR>. /<CR>
+--    see:   the line numbered — `<C-r>=` inside a command line splices its
+--           result into the line you are typing (`<Esc>` there abandons only the
+--           expression, not the command)
+--
+--    In scope: `line` (the text of the line you are on), `lnum` and `col`, both
+--    1-based. The result is evaluated once, when you submit the prompt, and
+--    stored — so `:registers` shows it and `getreg("=")` reads it back.
 
 -- ===========================================================================
 -- The shortcuts. 1 and 3 put a command on the command line (an `<expr>`
@@ -157,6 +178,7 @@ local CHEATS = {
   "<leader>3   :16,19=  — reindent the flat block (indentexpr)",
   "<leader>4   alternate widget.h (cpp by content) and plain.h (stays c)",
   "<leader>5   the demo picker — type `mod`; docs/ leads.  :Scorer off compares",
+  "6           no mapping — type o<C-r>=lnum * 10<CR><Esc> yourself",
 }
 
 btv.command("Cheat", function()

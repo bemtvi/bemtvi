@@ -471,32 +471,36 @@ impl ObjectKind {
 /// [`parse_command`], applied in [`Editor::execute_normal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NormalCmd {
-    InsertBefore,           // i
-    InsertLineStart,        // I
-    InsertAfter,            // a
-    InsertLineEnd,          // A
-    OpenBelow,              // o
-    OpenAbove,              // O
-    DeleteUnder,            // x
-    DeleteBefore,           // X
-    DeleteToEol,            // D
-    ChangeToEol,            // C
-    SubstituteChar,         // s
-    EnterReplace,           // R
-    PasteAfter,             // p
-    PasteBefore,            // P
-    Undo,                   // u
-    Redo,                   // <C-r>
-    TimeTravel(bool),       // g- (true) / g+
-    Join,                   // J
-    ToggleCase,             // ~
-    EnterVisual,            // v
-    EnterVisualLine,        // V
-    EnterSelect(bool),      // gh / gH (Select mode; true = linewise)
-    ToggleVisualSelect,     // <C-g> (toggle Visual <-> Select, keeping the selection)
-    VisualSwapEnds,         // o / O (move to other end of selection)
-    ReselectVisual,         // gv (reselect the last Visual selection)
-    EnterCommand,           // :
+    InsertBefore,       // i
+    InsertLineStart,    // I
+    InsertAfter,        // a
+    InsertLineEnd,      // A
+    OpenBelow,          // o
+    OpenAbove,          // O
+    DeleteUnder,        // x
+    DeleteBefore,       // X
+    DeleteToEol,        // D
+    ChangeToEol,        // C
+    SubstituteChar,     // s
+    EnterReplace,       // R
+    PasteAfter,         // p
+    PasteBefore,        // P
+    Undo,               // u
+    Redo,               // <C-r>
+    TimeTravel(bool),   // g- (true) / g+
+    Join,               // J
+    ToggleCase,         // ~
+    EnterVisual,        // v
+    EnterVisualLine,    // V
+    EnterSelect(bool),  // gh / gH (Select mode; true = linewise)
+    ToggleVisualSelect, // <C-g> (toggle Visual <-> Select, keeping the selection)
+    VisualSwapEnds,     // o / O (move to other end of selection)
+    ReselectVisual,     // gv (reselect the last Visual selection)
+    EnterCommand,       // :
+    /// `"=` — the expression-register prompt. The typed Lua is evaluated in the
+    /// sandbox on `<CR>` and the result stored in the `=` register, with the count
+    /// and register put back so the following `p`/`P` pastes it.
+    EnterExprRegister,
     EnterSearch(SearchDir), // / ?
     SearchNext,             // n
     SearchPrev,             // N
@@ -1162,6 +1166,10 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             // The next key names the register. An unsupported name is a loud
             // dead-end (`Reset`), exactly like a missed find/text-object arg.
             return match key.as_char() {
+                // `"=` is the one register whose contents are *computed*: it opens
+                // the expression prompt now, and the result is what the following
+                // `p` pastes. The count rides along (`3"=…<CR>p`).
+                Some('=') => Complete(ResolvedCommand::Normal(NormalCmd::EnterExprRegister)),
                 Some(name) if is_register_name(name) => {
                     let mut next = pending.clone();
                     next.register = Some(name);
@@ -2688,6 +2696,7 @@ impl Editor {
                 self.mode = Mode::VisualLine;
             }
             NormalCmd::EnterCommand => self.enter_command(),
+            NormalCmd::EnterExprRegister => self.enter_expr_register(ExprTarget::Register),
             NormalCmd::EnterSearch(dir) => self.enter_search(dir, count),
             NormalCmd::SearchNext => self.search_repeat(true, count),
             NormalCmd::SearchPrev => self.search_repeat(false, count),

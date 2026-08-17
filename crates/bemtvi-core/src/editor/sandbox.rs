@@ -1,7 +1,8 @@
 //! The editor's leg of the bounded compute sandbox — see [`crate::sandbox`].
 
-use super::BufferId;
-use super::Editor;
+use super::command::{PendingCommand, Stage};
+use super::{BufferId, CmdlineKind, Editor, ExprTarget, RegKind};
+use crate::mode::Mode;
 use crate::sandbox::{SandboxEngine, SandboxError, SandboxFn};
 
 /// The prefix that marks a `:s` replacement as a sandbox **expression**
@@ -199,5 +200,147 @@ impl Editor {
                 self.sandbox_release(h);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The expression register (`"=` / `<C-r>=`)
+// ---------------------------------------------------------------------------
+
+impl Editor {
+    /// Open the **expression register** prompt: a [`CmdlineKind::Expr`] line whose
+    /// `<CR>` evaluates the typed Lua in the sandbox and delivers the result to
+    /// `target` (`<Esc>` cancels, computing nothing). Mirrors
+    /// [`Editor::enter_helix_regex`] — one [`Mode::Command`] line, a kind that
+    /// routes the submit.
+    ///
+    /// Reached from `<C-r>=` in Insert ([`ExprTarget::Insert`]) and from `"=` at a
+    /// command boundary ([`ExprTarget::Register`]).
+    pub(crate) fn enter_expr_register(&mut self, target: ExprTarget) {
+        // Opened from an already-open command line: suspend it (text, cursor, kind
+        // and all) so the result can be spliced back into it.
+        if matches!(target, ExprTarget::Cmdline) {
+            let saved = self.save_cmdline_state();
+            self.expr_cmdline_stack.push(saved);
+        }
+        // Come back to the mode `"=` / `<C-r>=` was typed in: the insert flavour
+        // for a computed insert, and Visual for `"=…<CR>p` over a selection (whose
+        // selection stays painted while the line is open, as a `/` search's does).
+        self.cmdline_return_mode = self.mode;
+        self.cmdline_from_visual = self.mode.is_visual().then_some(self.mode);
+        // The count and register of the command being built (`3"=…<CR>p`) — the
+        // command line resets the parse state, so `submit_expr_register` puts them
+        // back for the `p` that follows.
+        // Stage::Start, not the `RegisterPending` the `"` left behind: restoring
+        // that stage would make the *next* key read as a register name, silently
+        // swallowing the `p`.
+        self.expr_saved_pending = matches!(target, ExprTarget::Register).then(|| PendingCommand {
+            register: Some('='),
+            stage: Stage::Start,
+            ..self.pending.clone()
+        });
+        self.mode = Mode::Command;
+        self.cmdline.clear();
+        self.cmdline_col = 0;
+        self.cmdline_kind = CmdlineKind::Expr(target);
+        // See `enter_command`: never inherit a stale `<C-r>` register-read — the
+        // `=` that opened an insert-mode prompt was itself one.
+        self.awaiting_register = false;
+        self.hist_idx = None;
+        self.message.clear();
+        self.reset_pending();
+    }
+
+    /// Record a submitted expression in the `@=` history ring, skipping an empty
+    /// line or a consecutive duplicate (mirroring [`Editor::remember_ex`]).
+    pub(crate) fn remember_expr(&mut self, src: &str) {
+        if src.is_empty() || self.expr_history.last().is_some_and(|last| last == src) {
+            return;
+        }
+        self.expr_history.push(src.to_string());
+    }
+
+    /// Evaluate a submitted expression-register line and deliver the result.
+    ///
+    /// Evaluated **once, here** — not re-evaluated per read the way vim's `@=` is
+    /// — because [`Editor::register_text`] is `&self` (it sits on the paste path)
+    /// while the engine needs `&mut`. The consequence is stated in the plan doc:
+    /// `"=lnum<CR>p` then `j.` pastes the first line number again, and in exchange
+    /// the result is a stored, introspectable register value.
+    ///
+    /// Every failure — compile, runtime, deadline, a non-text result, no engine —
+    /// echoes and delivers nothing, leaving the `=` register as it was.
+    pub(crate) fn submit_expr_register(&mut self, target: ExprTarget, src: &str) {
+        let saved = self.expr_saved_pending.take();
+        // An empty line computes nothing (vim beeps; the abort is the whole signal),
+        // and a failing one delivers nothing — but a *suspended command line* has to
+        // come back either way, so the result is threaded as an `Option` rather than
+        // returned early.
+        let result = if src.trim().is_empty() {
+            None
+        } else {
+            match self.eval_expr_register(src) {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    self.echo(format!("E:{err}"));
+                    None
+                }
+            }
+        };
+        if let Some(text) = &result {
+            // Vim's rule for a register set from a value: text ending in a newline
+            // pastes linewise, anything else charwise. This is what lets
+            // `"=…<CR>p` paste whole lines.
+            let kind = if text.ends_with('\n') {
+                RegKind::Line
+            } else {
+                RegKind::Char
+            };
+            self.registers.set_api('=', text.clone(), kind, false);
+        }
+        let text = result.unwrap_or_default();
+        match target {
+            // Insert at every cursor through the same primitive `<C-r>{register}`
+            // uses, so multi-cursor insertion and the `".` accumulator behave
+            // identically. The insert session's undo snapshot is still open, so
+            // this groups into the surrounding insert.
+            ExprTarget::Insert => self.insert_text_session(&text),
+            // Put the count + `"=` back so the *following* `p` sees the register.
+            ExprTarget::Register => {
+                if let Some(saved) = saved {
+                    self.pending = saved;
+                }
+            }
+            // Resume the suspended line with the result spliced in at its cursor —
+            // and resume it even when nothing was computed, so a typo at the nested
+            // prompt costs the expression, never the line being typed.
+            ExprTarget::Cmdline => self.resume_expr_cmdline(&text),
+        }
+    }
+
+    /// Resume the command line a nested `<C-r>=` prompt was opened over, splicing
+    /// `insert` in at its cursor (empty when the prompt computed nothing). Shared
+    /// by the submit and cancel paths.
+    pub(crate) fn resume_expr_cmdline(&mut self, insert: &str) {
+        if let Some(outer) = self.expr_cmdline_stack.pop() {
+            self.restore_cmdline_state(outer, insert);
+        }
+    }
+
+    /// Compile and call one expression-register line, with the cursor's own line,
+    /// 1-based line number and 1-based column in scope.
+    fn eval_expr_register(&mut self, src: &str) -> Result<String, SandboxError> {
+        let handle = self.sandbox_compile(src, &["line", "lnum", "col"])?;
+        let line = self.buffer().line_cow(self.cursor.line).to_string();
+        let lnum = self.cursor.line as i64 + 1;
+        let col = self.cursor.col as i64 + 1;
+        let got = self.with_sandbox(|_ed, sb| match sb.as_mut() {
+            Some(engine) => engine.call_eval(handle, &line, lnum, col),
+            None => Err(SandboxError::Unavailable),
+        });
+        // One compile per submit, released immediately: the chunk is never reused
+        // (a later `p` pastes the stored text, it does not re-evaluate).
+        self.sandbox_release(handle);
+        got
     }
 }

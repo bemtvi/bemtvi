@@ -101,6 +101,11 @@ local SCORER = [[ score + (label:find("^docs/") and 500 or 0) ]]
 
 btv.picker.source {
   name = "demo",
+  -- Report the pick rather than opening it: these are illustrative paths, and
+  -- seeing which row `<CR>` took is the whole point of the demo.
+  confirm = function(item)
+    btv.notify("picked " .. item.text)
+  end,
   items = function(ctx)
     for _, t in ipairs({
       "src/test/mod.rs",

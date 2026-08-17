@@ -46,5 +46,6 @@ function btv.indent.expr(src)
   if src ~= nil and type(src) ~= "string" then
     error("btv.indent.expr: expected a string of Lua source (or nil), got " .. type(src), 2)
   end
+  btv.indent._src = src
   btv._indent_set_expr(src)
 end

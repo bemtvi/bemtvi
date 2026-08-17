@@ -448,6 +448,29 @@ function Ctx:statusline()
   return ui and ui.statusline or ""
 end
 
+-- `t:screen()` — the focused window's **painted** rows, top to bottom, as a list
+-- of strings.
+--
+-- The sibling of `t:lines()`, and the difference matters: `t:lines()` is buffer
+-- text, while this is what the client would actually draw. Anything the editor
+-- renders *instead of* a buffer line is only visible here — a closed fold's
+-- placeholder, a `~` filler past the end, a virtual line. So a test for
+-- `'foldtext'`, `'listchars'` or a decoration's virtual text asserts on this;
+-- a test for an edit asserts on `t:lines()`.
+--
+-- ```lua
+-- t:feed("zM")
+-- btv.test.expect(t:screen()[4]).to_contain("5 lines: fn alpha")
+-- ```
+--
+-- The text is display-scrubbed the same way the wire's rows are (an unprintable
+-- byte reads as `^X` / `<xx>`), so it is character-for-character what is painted.
+-- Only the focused window; splits and docks are not included.
+function Ctx:screen()
+  local ui = btv._ui
+  return (ui and ui.screen) or {}
+end
+
 -- ----- the runner -----------------------------------------------------------
 
 -- Run one hook/test fn, which may await. Returns ok, error-value. Runs inside the
@@ -456,11 +479,196 @@ local function run_protected(fn, ctx)
   return pcall(fn, ctx)
 end
 
+-- ----- per-test isolation ---------------------------------------------------
+--
+-- A test must not be able to affect the next one. Resetting the *buffer* is not
+-- enough: options, globals, registers, keymaps, user commands and the sandbox
+-- expressions all live above the buffer and used to survive, so a suite's
+-- outcome depended on the order its cases happened to run in.
+--
+-- The fix is a baseline rather than a wipe. `_run` takes a snapshot *after* the
+-- spec files have been sourced, so whatever a file installs at load time (a
+-- `require("plugin").setup{}`, a `dofile` of an example's `init.lua`) is part of
+-- the baseline and stays; anything a *test* changes is put back before the next
+-- one. That keeps the install-once model specs are written against while making
+-- the cases independent of each other.
+--
+-- What is restored: global options (the catalog's global-tier names plus the
+-- `btv._o_store` catch-all), `btv.g`, the named registers, the `btv.*`
+-- expression surfaces, and any keymap or user command a test *added*. What is
+-- not: a keymap or command a test *deleted* (there is no spec to rebuild it
+-- from), autocmds, and buffers other than the one `enew!` replaces.
+
+local REGISTERS = 'abcdefghijklmnopqrstuvwxyz0123456789"-'
+
+--- Every global-scope option name the core catalog knows.
+local function global_option_names()
+  local names = {}
+  for _, row in ipairs(btv._options_catalog or {}) do
+    if row.scope == "global" or row.global_tier then
+      names[#names + 1] = row.name
+    end
+  end
+  return names
+end
+
+--- The window-local option names. `enew!` gives a fresh *buffer*, so
+--- buffer-locals come back from their global tier on their own — but the window
+--- survives, and a window-local value shadows the global tier a `btv.o` write
+--- sets. Those have to be put back explicitly.
+local function window_option_names()
+  local names = {}
+  for _, row in ipairs(btv._options_catalog or {}) do
+    if row.scope == "window" then
+      names[#names + 1] = row.name
+    end
+  end
+  return names
+end
+
+local function shallow_copy(t)
+  local out = {}
+  for k, v in pairs(t or {}) do
+    out[k] = v
+  end
+  return out
+end
+
+--- Capture everything a test may mutate above the buffer.
+local function snapshot()
+  local opts = {}
+  for _, name in ipairs(global_option_names()) do
+    local ok, v = pcall(function()
+      return btv.o[name]
+    end)
+    if ok then
+      opts[name] = v
+    end
+  end
+  local wopts = {}
+  for _, name in ipairs(window_option_names()) do
+    local ok, v = pcall(function()
+      return btv.wo[name]
+    end)
+    if ok then
+      wopts[name] = v
+    end
+  end
+  local regs = {}
+  for i = 1, #REGISTERS do
+    local name = REGISTERS:sub(i, i)
+    local ok, v = pcall(btv.reg.get, name)
+    regs[name] = ok and v or nil
+  end
+  local maps = {}
+  for _, mode in ipairs({ "n", "i", "v", "x", "s", "o", "c", "t" }) do
+    local seen = {}
+    for _, m in ipairs(btv.keymap.get(mode) or {}) do
+      seen[m.lhs] = true
+    end
+    maps[mode] = seen
+  end
+  return {
+    options = opts,
+    window_options = wopts,
+    o_store = shallow_copy(btv._o_store),
+    g = shallow_copy(btv.g),
+    regs = regs,
+    maps = maps,
+    commands = shallow_copy(btv._user_commands),
+    exprs = {
+      fold = btv.fold and btv.fold._src,
+      indent = btv.indent and btv.indent._src,
+      filetype = btv.filetype and btv.filetype._src,
+      scorer = btv.picker and btv.picker._scorer_src,
+    },
+  }
+end
+
+--- Put the world back the way `snapshot` found it.
+local function restore(b)
+  if not b then
+    return
+  end
+  -- Options: write only what actually changed, so an option with a side effect
+  -- (a fold rebuild, a redraw) is not poked on every single test.
+  for name, want in pairs(b.options) do
+    local ok, now = pcall(function()
+      return btv.o[name]
+    end)
+    if ok and now ~= want then
+      pcall(function()
+        btv.o[name] = want
+      end)
+    end
+  end
+  for name, want in pairs(b.window_options or {}) do
+    local ok, now = pcall(function()
+      return btv.wo[name]
+    end)
+    if ok and now ~= want then
+      pcall(function()
+        btv.wo[name] = want
+      end)
+    end
+  end
+  for k in pairs(btv._o_store or {}) do
+    if b.o_store[k] == nil then
+      btv._o_store[k] = nil
+    end
+  end
+  for k, v in pairs(b.o_store) do
+    btv._o_store[k] = v
+  end
+
+  for k in pairs(btv.g or {}) do
+    if b.g[k] == nil then
+      btv.g[k] = nil
+    end
+  end
+  for k, v in pairs(b.g) do
+    btv.g[k] = v
+  end
+
+  for name, want in pairs(b.regs) do
+    local ok, now = pcall(btv.reg.get, name)
+    if ok and now ~= want then
+      pcall(btv.reg.set, name, want or "")
+    end
+  end
+
+  -- Only additions are undone: a mapping a test *deleted* cannot be rebuilt
+  -- from a snapshot of its left-hand sides.
+  for mode, seen in pairs(b.maps) do
+    for _, m in ipairs(btv.keymap.get(mode) or {}) do
+      if not seen[m.lhs] then
+        pcall(btv.keymap.del, mode, m.lhs)
+      end
+    end
+  end
+  for name in pairs(btv._user_commands or {}) do
+    if b.commands[name] == nil then
+      btv._user_commands[name] = nil
+    end
+  end
+
+  if btv.fold and btv.fold._src ~= b.exprs.fold then
+    pcall(btv.fold.text, b.exprs.fold)
+  end
+  if btv.indent and btv.indent._src ~= b.exprs.indent then
+    pcall(btv.indent.expr, b.exprs.indent)
+  end
+  if btv.filetype and btv.filetype._src ~= b.exprs.filetype then
+    pcall(btv.filetype.detect, b.exprs.filetype)
+  end
+  if btv.picker and btv.picker._scorer_src ~= b.exprs.scorer then
+    pcall(btv.picker.scorer, b.exprs.scorer)
+  end
+end
+
 -- Give each test a clean slate, the Lua analogue of the Rust harness's fresh
--- server-per-test: drop to normal mode and open a new empty unnamed buffer, so one
--- test's buffer edits / cursor / mode never bleed into the next. (Global keymaps and
--- user-commands persist — a plugin's `before_each` setup() re-applies them anyway,
--- and tests that assert on them want them present.)
+-- server-per-test: restore the baseline above, drop to normal mode, and open a
+-- new empty unnamed buffer, so one test's state never bleeds into the next.
 local function fresh_slate()
   -- <Esc> through the keymap matcher (remap = true), NOT straight to the editor: a
   -- raw <Esc> bypasses the matcher and leaves any pending mapping-prefix from the
@@ -471,6 +679,7 @@ local function fresh_slate()
   pcall(function()
     vim.cmd("silent! enew!")
   end)
+  restore(M._baseline)
   settle(1)
 end
 
@@ -482,6 +691,9 @@ function M._run()
   M._results = nil
   M._done = false
   local cases = flatten()
+  -- Taken here, after every spec file has been sourced: a file's load-time setup
+  -- belongs to the baseline, a test's changes do not.
+  M._baseline = snapshot()
   btv
     .async(function()
       local results = {}

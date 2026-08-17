@@ -3385,6 +3385,7 @@ impl LuaRuntime {
         message: &str,
         cmdline: &str,
         statusline: &str,
+        screen: &[String],
         clipboard: Option<(&str, bool)>,
     ) -> mlua::Result<()> {
         let btv = self.btv()?;
@@ -3393,6 +3394,14 @@ impl LuaRuntime {
         ui.set("message", message)?;
         ui.set("cmdline", cmdline)?;
         ui.set("statusline", statusline)?;
+        // The focused window's painted rows, so a spec can assert on what is
+        // actually drawn — a closed fold's placeholder, a `~` filler — and not
+        // only on buffer state. Already display-scrubbed, so it is character-for
+        // character what a client paints.
+        ui.set(
+            "screen",
+            self.lua.create_sequence_from(screen.iter().cloned())?,
+        )?;
         // The clipboard contents (for `btv.test.clipboard.peek`), or nil when empty.
         if let Some((text, linewise)) = clipboard {
             let c = self.lua.create_table()?;

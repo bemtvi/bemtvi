@@ -187,3 +187,136 @@ fn clipboard_and_tempdir_seams() {
     assert!(ok, "expected the seams to work; stdout:\n{stdout}");
     assert!(stdout.contains("3 passed, 0 failed"), "stdout:\n{stdout}");
 }
+
+/// `t:screen()` is the painted-rows accessor — the sibling of `t:lines()`, and the
+/// only way a spec can see what the editor draws *instead of* buffer text.
+#[test]
+fn screen_exposes_painted_rows_not_buffer_text() {
+    let dir = fixture_dir("screen");
+    std::fs::write(
+        dir.join("test/screen_spec.lua"),
+        r#"
+        btv.test.describe("t:screen", function()
+          btv.test.it("shows the rows the client would paint", function(t)
+            t:feed("ione<CR>two<Esc>gg")
+            -- Buffer text and painted rows agree on the lines that exist…
+            btv.test.expect(t:lines()).to_equal({ "one", "two" })
+            btv.test.expect(t:screen()[1]).to_be("one")
+            btv.test.expect(t:screen()[2]).to_be("two")
+            -- …and only the screen carries the `~` fillers past the end, which are
+            -- painted but are not buffer lines at all.
+            btv.test.expect(t:screen()[3]).to_be("~")
+            btv.test.expect(#t:screen() > #t:lines()).to_be(true)
+          end)
+
+          btv.test.it("shows a closed fold's placeholder in place of its lines", function(t)
+            t:feed("ia<CR>b<CR>c<CR>d<Esc>gg")
+            t:feed("zfj") -- fold lines 1-2, created closed
+            -- The buffer still has every line; the screen collapses two into one.
+            btv.test.expect(#t:lines()).to_be(4)
+            btv.test.expect(t:screen()[1]).to_contain("2 lines: a")
+            btv.test.expect(t:screen()[2]).to_be("c")
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(ok, "expected exit 0; stdout:\n{stdout}");
+    assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
+}
+
+/// Cases must be independent: what one test changes above the buffer — options,
+/// globals, registers, keymaps, commands, the `btv.*` expression surfaces — must
+/// not reach the next one, or a suite's result depends on the order it ran in.
+#[test]
+fn a_test_cannot_leak_state_into_the_next() {
+    let dir = fixture_dir("isolation");
+    std::fs::write(
+        dir.join("test/isolation_spec.lua"),
+        r#"
+        local base = {}
+        btv.test.describe("isolation", function()
+          btv.test.it("mutates everything it can reach", function(t)
+            base.number = btv.o.number
+            base.sw = btv.o.shiftwidth
+            base.wrap = btv.wo.wrap
+            btv.o.number = not base.number
+            btv.o.shiftwidth = (base.sw or 8) + 7
+            btv.wo.wrap = not base.wrap
+            btv.keymap.set("n", "<leader>zzq", "ihi<Esc>")
+            btv.command("LeakCmd", function() end, {})
+            btv.fold.text([[ "LEAKED" ]])
+            btv.picker.scorer([[ score + 1 ]])
+            btv.reg.set("z", "leaked")
+            btv.g.leak_global = "yes"
+          end)
+
+          btv.test.it("sees none of it", function(t)
+            local left = {}
+            local function note(n, cond) if cond then left[#left + 1] = n end end
+            note("o.number", btv.o.number ~= base.number)
+            note("o.shiftwidth", btv.o.shiftwidth ~= base.sw)
+            note("wo.wrap", btv.wo.wrap ~= base.wrap)
+            note("keymap", (function()
+              for _, m in ipairs(btv.keymap.get("n") or {}) do
+                if (m.lhs or ""):find("zzq") then return true end
+              end
+              return false
+            end)())
+            note("command", (btv._user_commands or {}).LeakCmd ~= nil)
+            note("fold.text", btv.fold._src ~= nil)
+            note("scorer", btv.picker._scorer_src ~= nil)
+            note("register", (btv.reg.get("z") or ""):find("leaked") ~= nil)
+            note("g", btv.g.leak_global == "yes")
+            btv.test.expect(table.concat(left, ",")).to_be("")
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(ok, "state leaked between tests; stdout:\n{stdout}");
+    assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
+}
+
+/// Isolation is a *baseline*, not a wipe: whatever a spec file installs at load
+/// time is the state every test starts from. Otherwise the install-once model
+/// specs are written against (`require("plugin").setup{}` at the top of a file)
+/// would silently stop working.
+#[test]
+fn file_level_setup_survives_into_every_test() {
+    let dir = fixture_dir("baseline");
+    std::fs::write(
+        dir.join("test/baseline_spec.lua"),
+        r#"
+        -- File-level setup: part of the baseline, so it must persist.
+        btv.g.from_file = "kept"
+        btv.keymap.set("n", "<leader>qq", "ihi<Esc>")
+
+        btv.test.describe("baseline", function()
+          btv.test.it("sees the file's setup", function(t)
+            btv.test.expect(btv.g.from_file).to_be("kept")
+            btv.g.from_test = "temporary"
+          end)
+
+          btv.test.it("still sees it, and not the previous test's change", function(t)
+            btv.test.expect(btv.g.from_file).to_be("kept")
+            btv.test.expect(btv.g.from_test).to_be_nil()
+            local found = false
+            for _, m in ipairs(btv.keymap.get("n") or {}) do
+              if (m.lhs or ""):find("qq") then found = true end
+            end
+            btv.test.expect(found).to_be(true)
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(ok, "the baseline was not preserved; stdout:\n{stdout}");
+    assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
+}

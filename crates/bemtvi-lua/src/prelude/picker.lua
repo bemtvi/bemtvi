@@ -1798,5 +1798,6 @@ function btv.picker.scorer(src)
   if src ~= nil and type(src) ~= "string" then
     error("btv.picker.scorer: expected a string of Lua source (or nil), got " .. type(src), 2)
   end
+  btv.picker._scorer_src = src
   btv._picker_set_scorer(src)
 end

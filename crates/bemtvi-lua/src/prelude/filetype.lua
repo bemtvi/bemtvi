@@ -51,5 +51,6 @@ function btv.filetype.detect(src)
   if src ~= nil and type(src) ~= "string" then
     error("btv.filetype.detect: expected a string of Lua source (or nil), got " .. type(src), 2)
   end
+  btv.filetype._src = src
   btv._filetype_set_detect(src)
 end

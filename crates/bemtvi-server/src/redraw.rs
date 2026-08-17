@@ -282,7 +282,8 @@ impl EditHost {
         };
 
         // Mirror the projected UI into `btv._ui` for the plugin test framework
-        // (`t:float()` / `t:message()` / `t:cmdline()` / `t:statusline()`), before
+        // (`t:float()` / `t:message()` / `t:cmdline()` / `t:statusline()` /
+        // `t:screen()`), before
         // `map` takes ownership of `float` / `global_status`. The status text is
         // pulled out of its chunk runs; the float is mirrored as-is (its lines carry
         // per-frame style ids, so tests assert on text). Only under `--test-plugin`
@@ -290,11 +291,20 @@ impl EditHost {
         if self.test_mode {
             let statusline_text = chunk_runs_text(&global_status);
             let clipboard = self.editor.clipboard_contents();
+            // The focused window's painted rows, scrubbed exactly as the wire's
+            // `lines` array is, so `t:screen()` sees what a client would draw.
+            let screen: Vec<String> = view
+                .focused()
+                .rows
+                .iter()
+                .map(|r| unicode::display_line(&r.text).into_owned())
+                .collect();
             let _ = self.lua.set_ui_mirror(
                 &float,
                 &message,
                 view.cmdline.as_str(),
                 &statusline_text,
+                &screen,
                 clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             );
         }

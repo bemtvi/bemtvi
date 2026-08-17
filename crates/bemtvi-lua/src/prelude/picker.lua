@@ -771,6 +771,7 @@ function btv._picker_run(gen, query, include, exclude)
     -- unpainted row. nil until a row declares one, exactly like `layouts`.
     local hls = nil
     local pushed = 0 -- this run's result count, for the cap (p.items is session-wide)
+    local flush_pending = false -- an end-of-tick flush is already scheduled
     local function flush()
       if batched > 0 then
         btv._picker_push(gen, labels, keys, paths, rows, cols, layouts, hls)
@@ -784,6 +785,29 @@ function btv._picker_run(gen, query, include, exclude)
         layouts = nil
         hls = nil
       end
+    end
+    -- Cross a *partial* batch at the end of the tick it was pushed on, so results
+    -- appear as the source finds them instead of only when `FLUSH_N` fills (or the
+    -- run ends). Without this a query with fewer hits than the threshold shows NOTHING
+    -- until the whole tree has been scanned — the picker looks broken while it works.
+    -- `btv.schedule` is the right primitive: a source pushes a burst synchronously
+    -- (one `rg` chunk out of `btv.await_each`, one walk step) and yields, so the
+    -- microtask fires exactly at that burst's boundary — one crossing per chunk, which
+    -- is what the count threshold was protecting in the first place.
+    local function flush_soon()
+      if flush_pending or batched == 0 then
+        return
+      end
+      flush_pending = true
+      btv.schedule(function()
+        flush_pending = false
+        -- The run may have been superseded (or the picker closed) while the microtask
+        -- sat queued; its rows are dead either way, and `btv._picker_push` would drop
+        -- them server-side. Same identity + generation gate the sink uses.
+        if btv._picker == p and p.gen == gen then
+          flush()
+        end
+      end)
     end
     local function push(item)
       -- Drop a push from a run the user has typed past (`p.gen ~= gen`) OR from a
@@ -886,6 +910,8 @@ function btv._picker_run(gen, query, include, exclude)
       end
       if batched >= FLUSH_N then
         flush()
+      else
+        flush_soon()
       end
     end
     -- `done()` settles the picker: flush any tail, then a query that matched nothing

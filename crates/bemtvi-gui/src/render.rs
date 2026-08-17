@@ -2875,14 +2875,23 @@ impl Renderer {
 
         if has_prompt {
             let query = menu.query.as_deref().unwrap_or("");
-            // A collapsed filter box shows its badge right-aligned on the prompt row,
-            // so a search that is hiding files never looks like one that isn't.
+            // The prompt row's right-hand gutter, both halves composed server-side: the
+            // progress readout (the result count, spinner-led while the source is still
+            // running — otherwise a long search is indistinguishable from a broken
+            // picker), then a collapsed filter box's badge, so a search that is hiding
+            // files never looks like one that isn't.
             let badge = menu
                 .filters
                 .as_ref()
                 .and_then(|f| f.badge.as_deref())
                 .unwrap_or("");
-            let text = pmenu_row(&format!("> {query}"), badge, list_w as usize);
+            let status = menu.status.as_deref().unwrap_or("");
+            let right = match (status.is_empty(), badge.is_empty()) {
+                (true, true) => String::new(),
+                (false, false) => format!("{status}  {badge}"),
+                _ => format!("{status}{badge}"),
+            };
+            let text = pmenu_row(&format!("> {query}"), &right, list_w as usize);
             self.push_plain(
                 items,
                 &text,

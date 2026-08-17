@@ -670,6 +670,13 @@ pub struct MenuData {
     /// The picker box's optional title (`btv.picker.open{ title = … }`), rendered on
     /// the top border. `None` (key absent) for the wildmenu / completion / select.
     pub title: Option<String>,
+    /// The picker's progress readout, right-aligned on the prompt row beside the
+    /// filter [`badge`](MenuFilters::badge): the result count (`"128"`, or
+    /// `"12/3480"` once the local matcher has narrowed the candidates), led by a
+    /// spinner frame while the source is still running. Already composed by the
+    /// server — the client places the string and counts nothing itself. `None` (key
+    /// absent) for a promptless `select` / completion / cmdline menu.
+    pub status: Option<String>,
     /// Whether this is the **command-line** completion wildmenu
     /// (`btv.cmdline_complete`). When set, the client anchors the box to the
     /// command-line area (frame-bottom, no number gutter) rather than the focused
@@ -1044,6 +1051,9 @@ impl View {
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
                 title: map_get(m, "title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                status: map_get(m, "status")
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 cmdline: map_get(m, "cmdline").and_then(Value::as_bool) == Some(true),

@@ -2995,16 +2995,29 @@ fn render_menu(
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
     let prompt_line = || -> Line<'static> {
         let query = menu.query.as_deref().unwrap_or("");
-        // A collapsed filter box shows its badge (`[+2 -1]`) right-aligned on the
-        // prompt row — the picker keeps its usual single-line shape, but a search that
-        // is quietly hiding files never looks like one that isn't.
+        // The prompt row's right-hand gutter carries the two indicators the picker
+        // reports itself with, both already composed server-side:
+        //
+        //   * the **progress readout** — the result count, spinner-led while the source
+        //     is still running (`⠹ 128`). Without it a search over a big tree looks
+        //     identical to a broken picker: the rows on screen are the previous query's
+        //     until the new run returns, so nothing moves for as long as it takes.
+        //   * the filter **badge** (`[+2 -1]`) of a collapsed include/exclude box — the
+        //     picker keeps its usual single-line shape, but a search that is quietly
+        //     hiding files never looks like one that isn't.
         let badge = menu
             .filters
             .as_ref()
             .and_then(|f| f.badge.as_deref())
             .unwrap_or("");
+        let status = menu.status.as_deref().unwrap_or("");
+        let right = match (status.is_empty(), badge.is_empty()) {
+            (true, true) => String::new(),
+            (false, false) => format!("{status}  {badge}"),
+            _ => format!("{status}{badge}"),
+        };
         let body_w = width.saturating_sub(2);
-        if badge.is_empty() {
+        if right.is_empty() {
             return Line::from(vec![
                 Span::styled("> ", prompt_style),
                 Span::styled(
@@ -3013,14 +3026,14 @@ fn render_menu(
                 ),
             ]);
         }
-        let badge_w = str_width(badge);
+        let right_w = str_width(&right);
         Line::from(vec![
             Span::styled("> ", prompt_style),
             Span::styled(
-                pmenu_row(query, "", body_w.saturating_sub(badge_w)),
+                pmenu_row(query, "", body_w.saturating_sub(right_w)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(badge.to_string(), prompt_style),
+            Span::styled(right, prompt_style),
         ])
     };
     // One `include`/`exclude` row: a dim label, then the raw comma-separated line the

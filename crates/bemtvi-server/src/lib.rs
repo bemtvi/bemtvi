@@ -922,6 +922,14 @@ pub(crate) struct ReadChain {
 pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
+    /// Whether a picker-spinner wake ([`PICKER_SPIN_TIMER_ID`]) is already pending.
+    /// The animation is a *one-shot re-armed per frame*, and a running search repaints
+    /// far more often than once per frame interval (every streamed batch is a repaint) —
+    /// so without this guard each repaint would replace the pending wake with a fresh
+    /// one and push its deadline out, freezing the spinner exactly when the picker is
+    /// busiest. Cleared where the wake lands (both legs), which is also what frees the
+    /// next frame to arm the frame after.
+    picker_spin_armed: bool,
     /// The outbound async-effect seam (Phase 4, Open Decision #6 (a)): the editor
     /// tick pushes redraws / notifications / responses to the client and hands
     /// timer / process / watch commands to the event-loop actor *through* this,
@@ -1902,6 +1910,7 @@ impl EditHost {
             keyboard_protocol: false,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
+            picker_spin_armed: false,
             #[cfg(feature = "native")]
             first_highlight_deferred: HashSet::new(),
             #[cfg(feature = "native")]
@@ -2591,6 +2600,17 @@ impl EditHost {
             if timer.id == DIAG_DEBOUNCE_TIMER_ID {
                 self.on_diag_debounce();
                 self.apply_lua_effects();
+                fired_any = true;
+                continue;
+            }
+            // And the picker's spinner clock (the browser twin of the native run
+            // loop's arm): one animation frame on, then the trailing `redraw` below
+            // paints it — and re-arms the next wake while the search is still running.
+            // A browser session is a tier-1 target: it shows the same "it is working"
+            // signal a local one does.
+            if timer.id == PICKER_SPIN_TIMER_ID {
+                self.picker_spin_armed = false;
+                self.editor.picker_spin();
                 fired_any = true;
                 continue;
             }
@@ -3317,6 +3337,27 @@ pub(crate) const WORKSPACE_FS_TIMEOUT_TIMER_ID: u64 = 1 << 52;
 /// parked set without waiting for `InsertLeave`. Not armed at all when the interval
 /// is `0` (apply at once) or `update_in_insert` is `false` (hold to `InsertLeave`).
 pub(crate) const DIAG_DEBOUNCE_TIMER_ID: u64 = 1 << 53;
+
+/// The loop id of the **picker spinner** wake — the animation clock behind the
+/// prompt-row progress readout. A one-shot re-armed from each frame while
+/// [`Editor::picker_running`](bemtvi_core::Editor::picker_running) holds (the
+/// parse-resume pattern), so a finished search leaves nothing ticking and an idle
+/// session is never woken. Handled on both legs: the native run loop's timer arm and
+/// the Worker's timer wheel ([`EditHost::fire_due_timers`]) — a remote or browser
+/// session must show the same "it is working" signal a local one does.
+pub(crate) const PICKER_SPIN_TIMER_ID: u64 = 1 << 54;
+
+/// How long one picker-spinner frame lasts. Ten frames, so a full turn is ~0.8s — fast
+/// enough to read as motion, slow enough that the repaint it drives is negligible next
+/// to the search it is reporting on.
+pub(crate) const PICKER_SPIN_INTERVAL_MS: u64 = 80;
+
+/// Whether `event` is the picker-spinner wake (vs. a real Lua timer / the shada,
+/// parse-resume or watchdog wakes).
+#[cfg(feature = "native")]
+pub(crate) fn is_picker_spin_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == PICKER_SPIN_TIMER_ID)
+}
 
 /// How long one workspace file operation may take before the watchdog gives up on it.
 /// Generous — a single `rename` / `delete` / `mkdir` is milliseconds locally and one

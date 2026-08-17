@@ -251,7 +251,8 @@ A dynamic source is **debounced**: a query edit cancels the in-flight job and
 schedules the search `debounce` ms later, so a fast typist spawns one process per
 *pause*, not one per keystroke. While the new search runs the previous results
 stay on screen — the list never flashes empty; they swap out only when the first
-new result arrives (or clear if nothing matched). The delay defaults to
+new result arrives (or clear if nothing matched). The prompt row's
+[spinner](#progress--the-count-and-the-spinner) is what tells the two states apart. The delay defaults to
 `btv.picker.debounce` (250 ms), overridable per source (`debounce = N`) or per
 open; `0` disables it.
 
@@ -316,6 +317,39 @@ The actions are `next`, `prev`, `confirm`, `confirm_tab`, `confirm_split`,
 map is an arbitrary printable char — there is no way to enumerate every char, so an
 unmapped printable just inserts into whichever line has focus.
 
+## Progress — the count and the spinner
+
+The right end of the prompt row is the picker's own status line:
+
+```
+┌─ Live Grep ──────────────────────┐      ┌─ Live Grep ──────────────────────┐
+│ > handler                  ⠹ 128 │      │ > handler                    247 │
+├──────────────────────────────────┤ ───► ├──────────────────────────────────┤
+│ src/net/handler.rs:12:5: …       │      │ src/net/handler.rs:12:5: …       │
+└──────────────────────────────────┘      └──────────────────────────────────┘
+    still searching (128 hits so far)          done — 247 hits
+```
+
+* A **spinner** turns while the source is still working. It covers the whole
+  in-flight window — the debounce, the process spawn, the scan — so a search over a
+  big tree never looks like a picker that has stopped responding. It matters most for
+  a dynamic source, where the rows on screen belong to the *previous* query until the
+  new run's first result lands (see [Dynamic sources](#dynamic-live-sources)): with no
+  spinner, "searching" and "broken" look identical.
+* The **count** is the number of rows the list is showing. Once the local matcher has
+  narrowed the candidates it reads `matched/total` (`12/3480` — twelve rows answer
+  what you typed, out of 3480 the source found), and a bare number when everything
+  found is on show — which is always the case for a dynamic source, since it does its
+  own filtering. A finished search that found nothing says `0`.
+
+Results also appear *as they stream*: a partial batch crosses to the widget at the
+end of the tick it was pushed on, so a query with three hits shows them the moment
+`rg` prints them rather than when the scan of the whole tree finishes.
+
+The readout is composed server-side, so the terminal, GUI and web clients all show
+the same thing, and a remote (daemon) or browser session animates exactly like a
+local one.
+
 ## Include / exclude filters
 
 `files` and `live_grep` carry two glob boxes, the way VSCode's search panel does —
@@ -325,7 +359,7 @@ whichever has focus.
 
 ```
 ┌─ Find Files ─────────────────────┐      ┌─ Find Files ─────────────────────┐
-│ > handler               [+1 -2]  │      │ > handler                        │
+│ > handler        12/3480 [+1 -2] │      │ > handler                12/3480 │
 ├──────────────────────────────────┤ <C-g>│ include  src/**                  │
 │ src/net/handler.rs               │ ───► │ exclude  target/, *.lock         │ ← focus
 │ src/ui/handler.rs                │      ├──────────────────────────────────┤
@@ -426,9 +460,10 @@ means, the `<C-Up>` history, pre-scoped pickers, and a custom filterable source.
 
 The full item tables stay Lua-side; only a display label and an integer key cross
 the bridge per result (exactly like `btv.ui.select`), so an item's arbitrary
-fields never need to serialize. Candidates are batched (~1000 per bridge call)
-rather than crossing one at a time, which is what makes streaming 100k results
-fast. A generation token stamps every run, so a push from a query you've typed
+fields never need to serialize. Candidates are batched rather than crossing one at
+a time, which is what makes streaming 100k results fast: a batch crosses every ~1000
+items, or at the end of the tick it was pushed on — whichever comes first, so a
+handful of hits is never held back waiting for a threshold it will not reach. A generation token stamps every run, so a push from a query you've typed
 past — or from a picker that has since closed — is dropped.
 
 For the full design — the unified float-list widget, the Rust matcher, dynamic

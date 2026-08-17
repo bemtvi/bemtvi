@@ -337,6 +337,12 @@ pub struct MenuView {
     /// The picker box's optional title (`btv.picker.open(name, { title = … })`),
     /// rendered on the top border. `None` for the wildmenu / completion / select.
     pub title: Option<String>,
+    /// The picker's progress readout — the result count, led by a spinner frame while
+    /// a source run is in flight (`"⠹ 128"`, `"12/3480"`). Already composed, like
+    /// [`FilterView::badge`]: the client right-aligns the string on the prompt row and
+    /// counts nothing itself. `None` for a promptless `select` / completion / cmdline
+    /// menu, which have no prompt row and no source behind them.
+    pub status: Option<String>,
 }
 
 /// A picker's include / exclude glob filter boxes — VSCode's "files to include" and

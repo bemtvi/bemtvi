@@ -2234,6 +2234,54 @@ fn a_collapsed_filter_box_shows_its_badge_on_the_prompt_row() {
 }
 
 #[test]
+fn the_progress_readout_rides_the_prompt_row_ahead_of_the_badge() {
+    // The picker's "it is working" signal: the count (spinner-led while its source is
+    // still running) at the right end of the prompt row. When a collapsed filter box
+    // also has something to say, both are painted — the readout first, the badge last,
+    // so the badge keeps the same rightmost slot it always had.
+    let menu = Value::Map(vec![
+        (Value::from("items"), Value::Array(vec![Value::from("one")])),
+        (Value::from("selected"), Value::from(0u64)),
+        (Value::from("row"), Value::from(0u64)),
+        (Value::from("col"), Value::from(0u64)),
+        (Value::from("width"), Value::from(32u64)),
+        (Value::from("height"), Value::from(8u64)),
+        (Value::from("query"), Value::from("hand")),
+        (Value::from("query_cursor"), Value::from(4u64)),
+        (Value::from("status"), Value::from("\u{2839} 128")),
+        (
+            Value::from("filters"),
+            Value::Map(vec![
+                (Value::from("include"), Value::from("src/**")),
+                (Value::from("exclude"), Value::from("")),
+                (Value::from("focus"), Value::from("query")),
+                (Value::from("expanded"), Value::from(false)),
+                (Value::from("badge"), Value::from("[+1]")),
+            ]),
+        ),
+    ]);
+    let v = view(vec![("lines", lines(&["x"])), ("menu", menu)]);
+    let (buf, _cursor) = paint_with_cursor(&v, 48, 14);
+
+    let (qy, _) = find_text(&buf, "hand").expect("the prompt row is painted");
+    let (sy, sx) = find_text(&buf, "\u{2839} 128").expect("the readout is painted");
+    let (by, bx) = find_text(&buf, "[+1]").expect("the badge is painted");
+    assert_eq!(sy, qy, "the readout rides the prompt row");
+    assert_eq!(by, qy, "so does the badge");
+    assert!(
+        sx < bx,
+        "the readout sits ahead of the badge, got {sx} vs {bx}"
+    );
+    // Both live in the row's right-hand gutter, not next to the query: the badge ends
+    // the row's content, flush against the box border.
+    let row = row_text(&buf, qy);
+    assert!(
+        row.trim_end().ends_with("[+1]\u{2502}"),
+        "the gutter is right-aligned: {row:?}"
+    );
+}
+
+#[test]
 fn the_unfocused_window_status_bar_takes_status_line_nc() {
     // vim paints the focused window's status bar with `StatusLine` and every other
     // one with `StatusLineNC`, which is the only cue telling you which split has

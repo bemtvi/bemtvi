@@ -4630,3 +4630,195 @@ async fn the_column_shaped_builtin_sources_declare_real_columns() {
         feed(&rpc, "<Esc>");
     }
 }
+
+#[tokio::test]
+async fn a_partial_batch_shows_before_the_source_finishes() {
+    // A source that pushes a handful of rows and then keeps running (a `rg` scan
+    // still walking a big tree). Those rows must reach the widget *now*, not when
+    // the run completes: the Lua→server crossing is batched by count, so a query
+    // with fewer hits than the batch threshold would otherwise show nothing at all
+    // until the whole tree had been scanned — the picker looks broken while it works.
+    let dir = temp_dir("picker_partial_flush");
+    let src = r#"
+_G.gate = btv.promise.new(function(resolve) _G.open_gate = resolve end)
+btv.picker.source {
+  name = "slow",
+  items = btv.async(function(ctx)
+    ctx.push { text = "alpha" }
+    ctx.push { text = "beta" }
+    btv.await(_G.gate)                       -- still searching…
+    ctx.push { text = "gamma" }
+  end),
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('slow')").await;
+
+    // The two early rows land while the source is still running.
+    let mut items = Vec::new();
+    for _ in 0..40 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            items = menu_items(&menu_of(&map));
+            if !items.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        items,
+        vec!["alpha", "beta"],
+        "a partial batch is visible while the source is still running"
+    );
+
+    // Letting it finish appends the tail.
+    exec_lua(&rpc, "_G.open_gate()").await;
+    for _ in 0..40 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            items = menu_items(&menu_of(&map));
+            if items.len() == 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(items, vec!["alpha", "beta", "gamma"]);
+}
+
+/// The picker's prompt-row progress readout (`menu.status`), composed server-side.
+fn menu_status(menu: &[(Value, Value)]) -> String {
+    map_get(menu, "status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+const SPINNER_FRAMES: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+#[tokio::test]
+async fn the_prompt_reports_a_spinner_and_the_count_while_the_source_runs() {
+    // A source that pushes two rows and then keeps working. While it does, the prompt
+    // row must say so — a spinner frame plus the count so far — and the spinner must
+    // actually *turn* (the server's animation wake), because a frozen glyph is the
+    // very thing being fixed. When the run completes the spinner goes and the bare
+    // count stays.
+    let dir = temp_dir("picker_status_running");
+    let src = r#"
+_G.gate = btv.promise.new(function(resolve) _G.open_gate = resolve end)
+btv.picker.source {
+  name = "slow",
+  items = btv.async(function(ctx)
+    ctx.push { text = "alpha" }
+    ctx.push { text = "beta" }
+    btv.await(_G.gate)
+  end),
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('slow')").await;
+
+    // Sample the readout across several animation frames while the source is running.
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..12 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            let status = menu_status(&menu_of(&map));
+            if !status.is_empty() && !seen.contains(&status) {
+                seen.push(status);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    let running: Vec<&String> = seen
+        .iter()
+        .filter(|s| s.chars().next().is_some_and(|c| SPINNER_FRAMES.contains(c)))
+        .collect();
+    assert!(
+        !running.is_empty(),
+        "a spinner-led readout while the source runs, got {seen:?}"
+    );
+    for s in &running {
+        assert_eq!(
+            s.chars().skip(2).collect::<String>(),
+            "2",
+            "the readout counts the rows that have arrived, got {s:?}"
+        );
+    }
+    assert!(
+        running.len() > 1,
+        "the spinner animates rather than freezing on one frame, got {seen:?}"
+    );
+
+    // Finishing drops the spinner and leaves the count.
+    exec_lua(&rpc, "_G.open_gate()").await;
+    let mut settled = String::new();
+    for _ in 0..40 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            settled = menu_status(&menu_of(&map));
+            if settled == "2" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        settled, "2",
+        "a finished search shows the bare count — no spinner left turning"
+    );
+}
+
+#[tokio::test]
+async fn the_count_reports_matched_out_of_total_once_a_query_narrows() {
+    // A static source: typing filters locally, so the readout becomes `matched/total`
+    // — the count says both how many rows answer the query and how big the haystack
+    // was. No spinner: a static source is not re-run by a query edit.
+    let dir = temp_dir("picker_status_count");
+    let src = r#"
+btv.picker.source {
+  name = "four",
+  items = function(ctx)
+    for _, t in ipairs { "alpha", "beta", "gamma", "delta" } do ctx.push { text = t } end
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+    exec_lua(&rpc, "btv.picker.open('four')").await;
+    let mut status = String::new();
+    for _ in 0..40 {
+        if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+            status = menu_status(&menu_of(&map));
+            if status == "4" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(status, "4", "every candidate shown ⇒ a bare count");
+
+    feed(&rpc, "alp");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered"));
+    assert_eq!(menu_items(&menu), vec!["alpha"]);
+    assert_eq!(
+        menu_status(&menu),
+        "1/4",
+        "a narrowed view reports matched out of total"
+    );
+}
+
+#[tokio::test]
+async fn a_promptless_select_has_no_progress_readout() {
+    // `btv.ui.select` has no prompt row to hang a readout on and no source behind it,
+    // so its map must stay exactly as it was — the key is absent, not empty.
+    let dir = temp_dir("picker_status_select");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    exec_lua(
+        &rpc,
+        "btv.ui.select({ 'one', 'two' }, {}):thenc(function(c) _G.chose = c end)",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("select opens"));
+    assert_eq!(menu_items(&menu), vec!["one", "two"]);
+    assert!(
+        map_get(&menu, "status").is_none(),
+        "a promptless select carries no status key"
+    );
+}

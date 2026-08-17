@@ -2564,13 +2564,18 @@
           }
           return html;
         };
-        // A collapsed filter box shows its badge right-aligned on the prompt row, so a
-        // search that is quietly hiding files never looks like one that isn't.
+        // The prompt row's right-hand gutter, both halves already composed server-side:
+        // the progress readout (the result count, spinner-led while the source is still
+        // running — without it a long search looks exactly like a broken picker), then a
+        // collapsed filter box's badge, so a search that is quietly hiding files never
+        // looks like one that isn't.
         const badge = (filters && filters.badge) || "";
+        const status = menu.status || "";
+        const right = status && badge ? status + "  " + badge : status + badge;
         let promptText = menu.query;
-        if (badge) {
-          const room = Math.max(0, listW - 2 - badge.length);
-          promptText = promptText.slice(0, room).padEnd(room) + badge;
+        if (right) {
+          const room = Math.max(0, listW - 2 - [...right].length);
+          promptText = promptText.slice(0, room).padEnd(room) + right;
         }
         promptEl = document.createElement("div");
         promptEl.className = "row" + (sPrompt ? "" : " pmenu-prompt");

@@ -67,6 +67,13 @@ impl PickerOpenMode {
 /// its whole list in memory until the next picker opens.
 pub(crate) const RESUME_WINDOW: usize = 1000;
 
+/// The picker's "working" spinner frames, cycled by [`Editor::picker_spin`] while a
+/// source run is in flight and rendered at the head of the prompt-row
+/// [`status`](Menu::status_text). Braille dots: one cell wide in every client, and no
+/// glyph outside the base BMP (a nerd-font icon would render as a box for anyone
+/// without one patched in).
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 /// Where the float (menu or content float) anchors on the shared placement layer.
 /// `Cursor` anchors it under the cursor (the `btv.ui.select` / completion shape);
 /// `Editor` centers it over the editor (the picker shape); `Bottom` pins it to the
@@ -744,6 +751,19 @@ pub(crate) struct Menu {
     /// resume snapshot of the last user-facing picker. Always `false` for a
     /// `select` / completion / cmdline menu (only a picker resumes).
     resumable: bool,
+    /// Whether a source run is **in flight** for the live generation — set the moment
+    /// a run is queued ([`Editor::open_picker`]'s generation-0 kick, or a prompt edit
+    /// that re-runs the source) and cleared when that generation's `done()` lands
+    /// ([`Editor::menu_finish`]). It spans the Lua-side debounce as well as the search
+    /// itself, which is the point: the interval it covers is exactly "the results on
+    /// screen are not the answer to what is typed yet", and that is what the prompt's
+    /// [`status`](Menu::status_text) readout tells the user. Always `false` for a
+    /// promptless `select` / completion / cmdline menu, which have no source to run.
+    running: bool,
+    /// The spinner animation frame, advanced by [`Editor::picker_spin`] while
+    /// `running` (the server wakes on a timer to bump it and repaint). Only ever read
+    /// through [`Menu::status_text`], modulo the frame count, so it wraps freely.
+    spin: u8,
 }
 
 impl Menu {
@@ -782,7 +802,44 @@ impl Menu {
             title: None,
             multiselect: false,
             resumable: false,
+            running: false,
+            spin: 0,
         }
+    }
+
+    /// The picker's progress readout, rendered right-aligned on the prompt row: the
+    /// result count, led by a spinner frame while a source run is in flight.
+    ///
+    /// This is the picker's only "it is working" signal, and it exists because a
+    /// search over a large tree spends most of its time in a state that looks
+    /// identical to a broken one — the rows on screen belong to the *previous* query
+    /// (deliberately: they stay confirmable until the new run's first result lands),
+    /// so with no readout the box simply looks frozen. Composed here rather than in
+    /// each client for the same reason the filter [`badge`](PromptSet::badge) is: one
+    /// format, three clients, no counting done thrice.
+    ///
+    /// `matched/total` whenever the local matcher has narrowed the candidates (a
+    /// static source with a query typed); a bare count when every candidate is shown —
+    /// which is always the case for a **dynamic** source, since it filters itself and
+    /// its rows ride through in passthrough. `None` for a promptless `btv.ui.select` /
+    /// completion / cmdline menu: no prompt row to hang it on, and no source behind it.
+    fn status_text(&self) -> Option<String> {
+        self.prompt.as_ref()?;
+        let matched = self.view_len();
+        let total = self.all_items.len();
+        let mut out = String::new();
+        if self.running {
+            out.push(SPINNER[self.spin as usize % SPINNER.len()]);
+            out.push(' ');
+        }
+        if matched == total {
+            out.push_str(&matched.to_string());
+        } else {
+            out.push_str(&matched.to_string());
+            out.push('/');
+            out.push_str(&total.to_string());
+        }
+        Some(out)
     }
 
     /// The number of rows in the effective view.
@@ -1323,6 +1380,10 @@ impl Editor {
             title,
             multiselect,
             resumable,
+            // The server kicks the source's generation-0 run immediately after this
+            // open, so the picker is already working by the time the first frame is
+            // painted — say so on that frame rather than a tick later.
+            running: true,
             ..Menu::new(MenuKind::Picker, placement)
         });
     }
@@ -1501,6 +1562,25 @@ impl Editor {
         self.menu.as_ref().map_or(0, |m| m.generation)
     }
 
+    /// Whether the open picker has a source run **in flight** — the queued-to-`done()`
+    /// window described on [`Menu::running`]. The server reads it to keep the spinner
+    /// animating: while this holds it re-arms a short timer that calls
+    /// [`picker_spin`](Self::picker_spin) and repaints. `false` when no menu is open, or
+    /// when the open one is a promptless `select` / completion popup.
+    pub fn picker_running(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.running)
+    }
+
+    /// Advance the picker's spinner one frame (the server's animation wake). A no-op
+    /// unless a run is in flight — the wake that arrives just after a search finished
+    /// paints the settled readout instead, and the frame it paints re-arms nothing
+    /// (`picker_running` is false by then), so the clock stops on its own.
+    pub fn picker_spin(&mut self) {
+        if let Some(m) = self.menu.as_mut().filter(|m| m.running) {
+            m.spin = m.spin.wrapping_add(1);
+        }
+    }
+
     /// Feed streamed candidates of generation `gen` into the open picker. When
     /// `gen` is **newer** than the displayed items (`gen > items_gen`) this is the
     /// new query's first batch: the stale results are atomically *replaced* (not
@@ -1574,6 +1654,11 @@ impl Editor {
         };
         if gen > menu.items_gen {
             menu.reset_items(gen);
+        }
+        // The live generation's search is over: stop the spinner. A *stale* run's
+        // `done()` (the user has typed on) must not — its successor is still working.
+        if gen == menu.generation {
+            menu.running = false;
         }
     }
 
@@ -2005,6 +2090,10 @@ impl Editor {
         snap.selected_active = true;
         snap.marked = marked;
         snap.preview_scroll = None;
+        // A resume kicks NO run (the frozen window *is* the content), so the snapshot
+        // must not carry the in-flight flag of a picker closed mid-search — the reopened
+        // box would spin forever over rows nothing is looking for.
+        snap.running = false;
         self.picker_snapshot = Some(snap);
         keys
     }
@@ -2381,6 +2470,7 @@ impl Editor {
             let rerun = menu.dynamic || field != PromptField::Query;
             if rerun {
                 menu.generation += 1;
+                menu.running = true;
                 Some(menu.picker_run())
             } else {
                 menu.refilter();
@@ -2441,6 +2531,7 @@ impl Editor {
                 selected_doc: sel.and_then(|i| i.doc.clone()),
                 selected_resolve: sel.and_then(|i| i.resolve),
                 title: m.title.clone(),
+                status: m.status_text(),
             }
         })
     }

@@ -3025,6 +3025,26 @@ impl EditHost {
         }
     }
 
+    /// Arm the one-shot picker-spinner wake while a source run is in flight, so the
+    /// prompt-row readout keeps animating through a long search — including one that
+    /// streams nothing for seconds, which is exactly when the box would otherwise look
+    /// frozen. Called from every frame: a search that ends leaves nothing armed, and a
+    /// session with no picker open never arms it at all.
+    ///
+    /// Deliberately *not* `#[cfg(native)]` and routed through `apply_loop_op` — the
+    /// wasm leg has its own timer wheel behind the same [`LoopOp`](bemtvi_lua::LoopOp),
+    /// so one arm serves the local, daemon and browser sessions.
+    pub(crate) fn arm_picker_spin_if_running(&mut self) {
+        if self.editor.picker_running() && !self.picker_spin_armed {
+            self.picker_spin_armed = true;
+            self.apply_loop_op(bemtvi_lua::LoopOp::TimerStart {
+                id: crate::PICKER_SPIN_TIMER_ID,
+                delay_ms: crate::PICKER_SPIN_INTERVAL_MS,
+                repeat_ms: 0,
+            });
+        }
+    }
+
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
     /// forward a timer / process op to the event-loop actor (a fire-and-forget
     /// [`LoopCommand`], never awaited).

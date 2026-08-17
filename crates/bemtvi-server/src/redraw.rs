@@ -73,6 +73,9 @@ impl EditHost {
         // the next budget's progress (and re-arm until it converges).
         #[cfg(feature = "native")]
         self.arm_parse_resume_if_pending();
+        // Keep the picker's progress spinner turning while its source is still running
+        // (both legs — a browser/daemon session animates off the Worker's timer wheel).
+        self.arm_picker_spin_if_running();
         // Hand off any grammar the frame's work asked for (a buffer's language, one it
         // injects, a fold query) to be loaded off this thread — compiling a language's
         // queries is hundreds of ms and would otherwise stall the frame that needed it.
@@ -2152,6 +2155,13 @@ impl EditHost {
         // on the top border. Absent ⇒ no title.
         if let Some(title) = &m.title {
             map.push((Value::from("title"), Value::from(title.as_str())));
+        }
+        // The prompt-row progress readout (`"⠹ 128"` / `"12/3480"`) — the result count,
+        // with a spinner frame while the source is still running. Composed in core, so
+        // every client just right-aligns it beside the filter badge. Absent for a
+        // promptless `select` / completion / cmdline menu.
+        if let Some(status) = &m.status {
+            map.push((Value::from("status"), Value::from(status.as_str())));
         }
         // The `Editor` / `Bottom` picker overlay floats over the WHOLE editor: its
         // `row`/`col` are editor-absolute (windows-area cells, computed by

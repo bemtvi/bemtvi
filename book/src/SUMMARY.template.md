@@ -26,6 +26,7 @@
   - [Helix mode (selection-first)](features/helix-mode.md)
   - [Multi-cursor mode](features/multicursor.md)
   - [Keyboard macros](features/macros.md)
+  - [Expressions](features/expressions.md)
   - [Smooth scrolling](features/smooth-scrolling.md)
   - [Image previews](features/image-previews.md)
   - [UI primitives](features/ui-primitives.md)

@@ -50,9 +50,12 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   `btv.bo.ts_highlight` (the one `vim.treesitter` survivor is the `foldexpr`
   marker), and query customization rides the runtimepath `queries/` /
   `after/queries/` overlay (next bullet).
-  **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
-  wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
-  Rust indent stays.
+  **Lua-driven indent** is wired, through the bounded compute sandbox rather than
+  the main VM: `btv.indent.expr` is a Lua expression handed the line, the previous
+  non-blank line and the effective `'shiftwidth'`, sitting below the tree-sitter
+  verdict and above `smartindent` (see
+  [*Expressions*](features/expressions.md)). Passing the line *in* is what avoids
+  the snapshot bridge — the expression never reads the buffer.
 - **Treesitter query resolution.** The query bridge
   ([design](specs/2026-06-08-treesitter-query-bridge-design.md)) merges a language's
   bundled base with runtimepath `queries/` + `after/queries/` and the `; inherits:`

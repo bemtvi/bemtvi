@@ -72,6 +72,7 @@ IMPORTS = [
     ("docs/features/helix-mode.md", "features/helix-mode.md"),
     ("docs/features/multicursor.md", "features/multicursor.md"),
     ("docs/features/macros.md", "features/macros.md"),
+    ("docs/features/expressions.md", "features/expressions.md"),
     ("docs/features/smooth-scrolling.md", "features/smooth-scrolling.md"),
     ("docs/features/image-previews.md", "features/image-previews.md"),
     ("docs/features/workspaces.md", "features/workspaces.md"),

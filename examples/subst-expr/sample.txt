@@ -1,0 +1,28 @@
+bemtvi — `:s/…/\=…/` replacement expressions
+
+-- 1. m[0] is the whole match ------------------------------------
+alpha beta gamma
+
+-- 2. numbered groups, reordered ---------------------------------
+one_two
+three_four
+
+-- 3. arithmetic on a captured number ----------------------------
+item 7, item 21
+
+-- 4. lnum is the line the match sits on -------------------------
+tick
+tick
+tick
+
+-- 5. a group that did not participate is nil --------------------
+ab
+
+-- 6. the sandbox is closed --------------------------------------
+probe
+
+-- 7. failure is loud --------------------------------------------
+alpha
+
+-- 8. the literal template is unchanged --------------------------
+left_right

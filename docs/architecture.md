@@ -1261,7 +1261,10 @@ screen," and that is exactly the shape of these tests.
   `btv.bo.ts_highlight`, also reachable from `:set`), query customization is the
   native bridge `btv._btv_set_ts_query`, and **injections** are engine-native. There
   is no Lua parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
-  **Lua-driven indent remains the one deferred item on this axis.**
+  Lua-driven indent has landed too, through the bounded compute sandbox rather
+  than a parser API: `btv.indent.expr` sits below the tree-sitter verdict and
+  above `smartindent`, and is one of the six
+  [*expression* surfaces](features/expressions.md).
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` RPC + Lua-read surface),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay

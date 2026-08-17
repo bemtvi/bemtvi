@@ -1,0 +1,19 @@
+bemtvi — expression surfaces
+
+-- 1 & 2. folds: a trailing `{` opens one, a leading `}` closes it ----
+fn alpha() {
+    one
+    two
+    three
+}
+
+fn beta() {
+    four
+    five
+}
+
+-- 3. indentation: this block is deliberately flat ------------------
+fn gamma() {
+six
+seven
+}

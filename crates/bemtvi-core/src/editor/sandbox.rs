@@ -87,6 +87,23 @@ impl Editor {
     }
 }
 
+impl Editor {
+    /// Install (or clear, with `None`) the completion **re-ranker**: a sandbox
+    /// expression over `label`, `query`, `score` and `kind` returning a new sort
+    /// key, higher first. Compiled here rather than on first use, so a bad
+    /// expression is reported when it is configured instead of at the next popup.
+    pub fn set_complete_scorer(&mut self, src: Option<String>) {
+        if let Some(old) = self.complete_scorer.take() {
+            self.sandbox_release(old);
+        }
+        let Some(src) = src else { return };
+        match self.sandbox_compile(&src, &["label", "query", "score", "kind"]) {
+            Ok(h) => self.complete_scorer = Some(h),
+            Err(err) => self.echo(format!("btv.complete.scorer: {err}")),
+        }
+    }
+}
+
 /// How much of a buffer the content sniffer sees. Enough for a shebang, an XML
 /// declaration, a mode line or a distinctive first construct — and bounded, so
 /// opening a huge file never hands a huge string across the VM boundary.

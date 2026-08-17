@@ -979,6 +979,9 @@ pub(crate) struct Shared {
     /// outer says a change was *requested*, the inner carries `nil` for "clear".
     /// A single slot, not a queue: last write in a chunk wins, as for any setter.
     pub(crate) picker_scorer: Option<Option<String>>,
+    /// A pending `btv.complete.scorer(src | nil)` — the completion re-ranker's
+    /// sandbox source. Same two-level shape as [`Shared::picker_scorer`].
+    pub(crate) complete_scorer: Option<Option<String>>,
     /// A pending `btv.fold.text(src | nil)` — the `'foldtext'` sandbox source.
     /// Same two-level shape as [`Shared::picker_scorer`].
     pub(crate) fold_text: Option<Option<String>>,
@@ -1215,6 +1218,7 @@ impl Shared {
             workspace_option_ops,
             ts_ops,
             picker_scorer,
+            complete_scorer,
             fold_text,
             filetype_detect,
             indent_expr,
@@ -1289,6 +1293,7 @@ impl Shared {
         *workspace_option_ops = Default::default();
         *ts_ops = Default::default();
         *picker_scorer = Default::default();
+        *complete_scorer = Default::default();
         *fold_text = Default::default();
         *filetype_detect = Default::default();
         *indent_expr = Default::default();
@@ -2018,6 +2023,11 @@ impl LuaRuntime {
     /// Take a pending `btv.picker.scorer` change, if one was requested since the
     /// last drain. `Some(Some(src))` installs, `Some(None)` clears, `None` means
     /// the setter was not called.
+    pub fn take_complete_scorer(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().complete_scorer.take()
+    }
+
+    /// Take a pending `btv.complete.scorer` request's sibling — the picker's.
     pub fn take_picker_scorer(&self) -> Option<Option<String>> {
         self.shared.borrow_mut().picker_scorer.take()
     }

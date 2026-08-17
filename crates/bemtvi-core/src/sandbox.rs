@@ -178,6 +178,22 @@ pub trait SandboxEngine {
         lnum: i64,
     ) -> Result<String, SandboxError>;
 
+    /// Call a compiled completion re-ranker for one row of the popup.
+    ///
+    /// `score` is the **blended** native key the popup already sorted on (the
+    /// fuzzy score plus the source's `priority` bias), so nudging it composes with
+    /// the source order rather than fighting it. `kind` is the row's kind label
+    /// (`"Snippet"`, an LSP `CompletionItemKind` name, `""` for a plain buffer
+    /// word). The result is the new sort key — **higher sorts first**.
+    fn call_complete_score(
+        &mut self,
+        f: SandboxFn,
+        label: &str,
+        query: &str,
+        score: i64,
+        kind: &str,
+    ) -> Result<f64, SandboxError>;
+
     /// Call a compiled **expression register** (`"=` / `<C-r>=`) once.
     ///
     /// `line` is the cursor's line text, `lnum` its 1-based line number and `col`

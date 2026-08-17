@@ -4252,6 +4252,18 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._complete_set_scorer(src|nil)`: the native setter behind
+    // `btv.complete.scorer`. Source rather than a function, for the same reason
+    // `btv.picker.scorer` takes source: the expression runs in the sandbox.
+    let sh = shared.clone();
+    btv.set(
+        "_complete_set_scorer",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().complete_scorer = Some(src);
+            Ok(())
+        })?,
+    )?;
+
     // `btv._fold_set_text(src|nil)`: the native setter behind `btv.fold.text`.
     // Source rather than a function, for the same reason `btv.picker.scorer` takes
     // source: the expression runs in the sandbox, a separate VM.

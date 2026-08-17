@@ -129,6 +129,52 @@ btv.command("Scorer", function(a)
 end, { nargs = "?", desc = "Toggle the picker scorer" })
 
 -- ===========================================================================
+-- 6b. Completion ranking — `btv.complete.scorer`, over `label`, `query`,
+--     `score` and `kind`
+--
+--    type:  o then `for`   (insert mode, in this buffer)
+--    see:   the snippet row `for_loop` sits *below* the two real words, even
+--           though its source outranks theirs
+--
+--    `:CompleteScorer off` puts the native order back — the snippet leads again,
+--    which is the complaint this nudge answers. `score` is the *blended* native
+--    key (fuzzy score + the source's own bias), so subtracting from it composes
+--    with source order instead of replacing it.
+
+btv.complete.source {
+  name = "demo_snippets",
+  priority = 50,
+  debounce = 0,
+  complete = function(ctx)
+    ctx.push { text = "for_loop", kind = "Snippet" }
+  end,
+}
+
+btv.complete.source {
+  name = "demo_words",
+  priority = 1,
+  debounce = 0,
+  complete = function(ctx)
+    ctx.push("format_all")
+    ctx.push("forward_ref")
+  end,
+}
+
+btv.complete.setup { sources = { { "demo_snippets" }, { "demo_words" } }, min_chars = 3 }
+
+local CSCORER = [[ score - (kind == "Snippet" and 100 or 0) ]]
+
+btv.complete.scorer(CSCORER)
+
+btv.command("CompleteScorer", function(a)
+  if a.fargs[1] == "off" then
+    btv.complete.scorer(nil)
+  else
+    btv.complete.scorer(CSCORER)
+  end
+end, { nargs = "?", desc = "Toggle the completion scorer" })
+
+-- ===========================================================================
 -- 6. The expression register — `"=` and `<C-r>=`
 --
 --    Nothing to configure: this one is built in. It is the register whose
@@ -179,6 +225,7 @@ local CHEATS = {
   "<leader>4   alternate widget.h (cpp by content) and plain.h (stays c)",
   "<leader>5   the demo picker — type `mod`; docs/ leads.  :Scorer off compares",
   "6           no mapping — type o<C-r>=lnum * 10<CR><Esc> yourself",
+  "6b          type `ofor` — the snippet row sorts last.  :CompleteScorer off",
 }
 
 btv.command("Cheat", function()

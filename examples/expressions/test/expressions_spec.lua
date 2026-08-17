@@ -145,6 +145,27 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(t:line(3)).to_match("^3%. ")
   end)
 
+  -- Demo 6b. `<C-n>` takes the *top* row and `<C-y>` accepts it, so what lands in
+  -- the buffer is the popup's order — no need to read the popup itself.
+  btv.test.it("demo 6b — the scorer sorts the snippet row last", function(t)
+    open(t)
+    t:feed("ofor")
+    t:sleep(50)
+    t:feed("<C-n><C-y>")
+    btv.test.expect(t:line(2)).never.to_be("for_loop")
+    btv.test.expect(t:line(2)).to_match("^for")
+  end)
+
+  btv.test.it("demo 6b — :CompleteScorer off puts the snippet back on top", function(t)
+    open(t)
+    t:cmd("CompleteScorer off")
+    t:feed("ofor")
+    t:sleep(50)
+    t:feed("<C-n><C-y>")
+    -- Its source outranks the words', so natively the snippet leads.
+    btv.test.expect(t:line(2)).to_be("for_loop")
+  end)
+
   btv.test.it(":Cheat opens its float", function(t)
     open(t)
     t:cmd("Cheat")

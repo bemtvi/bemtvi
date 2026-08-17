@@ -1156,6 +1156,9 @@ impl EditHost {
         // `btv.picker.scorer(src|nil)`: compile the re-ranker into the sandbox now,
         // so a bad expression is reported where it was configured rather than
         // silently at the next picker.
+        if let Some(src) = self.lua.take_complete_scorer() {
+            self.editor.set_complete_scorer(src);
+        }
         if let Some(src) = self.lua.take_picker_scorer() {
             self.editor.set_picker_scorer(src);
         }

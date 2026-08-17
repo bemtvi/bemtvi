@@ -914,23 +914,76 @@ impl Menu {
     /// the streamed spans are kept; only the order changes. A stable sort over the
     /// parallel `filtered` / `match_spans`. Called by [`Editor::menu_push`] for
     /// [`MenuKind::Complete`] menus only (a single-source picker keeps pure fuzzy order).
+    /// The `all_items` index the caret is standing on, when a row is *actively*
+    /// chosen — the identity a reorder has to keep. `self.cursor` is a position in
+    /// the *view*, so leaving it alone slides whatever the reorder moves into that
+    /// slot under the caret: the popup would accept a candidate the user never
+    /// chose.
+    ///
+    /// `None` when there is no identity to preserve and the caret belongs at the
+    /// top: a noselect popup (nothing highlighted yet), and equally a
+    /// *preselection* — the top row a manual trigger highlights before the async
+    /// sources have answered. A preselection means "the top row", so following it
+    /// down as the snippet/LSP rows sort above would open the popup with its caret
+    /// parked mid-list, on a candidate nobody chose.
+    fn chosen_identity(&self) -> Option<usize> {
+        (self.selected_active && self.selection_chosen && self.cursor < self.view_len())
+            .then(|| self.item_at(self.cursor))
+    }
+
+    /// Park the caret back on `identity` after a reorder — or on the new top row
+    /// when there was none. A row that vanished mid-reorder is not reachable (a
+    /// reorder is a permutation, never a filter), but fall back to the cursor as it
+    /// was rather than assuming it.
+    fn follow_identity(&mut self, identity: Option<usize>) {
+        match identity {
+            Some(item) => {
+                if let Some(at) = self
+                    .filtered
+                    .as_ref()
+                    .and_then(|f| f.iter().position(|&i| i == item))
+                {
+                    self.cursor = at;
+                }
+            }
+            None => self.cursor = 0,
+        }
+    }
+
+    /// Reorder the first `keys.len()` rows of the view by **descending** key,
+    /// keeping the parallel `filtered` / `match_spans` in lockstep. Stable, so rows
+    /// the keys tie keep their existing order rather than shuffling frame to frame.
+    ///
+    /// Shared by both re-rankers ([`Editor::settle_picker_rank`] and
+    /// [`Editor::settle_complete_rank`]); neither touches the tail beyond
+    /// `keys.len()`, which keeps native order.
+    fn reorder_head_by_keys(&mut self, keys: &[f64]) {
+        let n = keys.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            keys[b]
+                .partial_cmp(&keys[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let filtered = self.filtered.as_mut().expect("caller checked");
+        let head: Vec<usize> = order.iter().map(|&p| filtered[p]).collect();
+        filtered[..n].copy_from_slice(&head);
+        let spans: Vec<_> = order
+            .iter()
+            .map(|&p| std::mem::take(&mut self.match_spans[p]))
+            .collect();
+        for (slot, v) in self.match_spans[..n].iter_mut().zip(spans) {
+            *slot = v;
+        }
+    }
+
     fn sort_complete_view(&mut self) {
         if self.filtered.is_none() {
             return;
         }
-        // The row the user is standing on, as an `all_items` index — the identity the
-        // selection has to keep across the reorder. `self.cursor` is a position in the
-        // *view*, so leaving it alone slides whatever the sort moves into that slot
-        // under the caret: the popup would accept a candidate the user never chose.
-        // `None` when there is no identity to preserve and the caret belongs at the
-        // top: a noselect popup (nothing highlighted yet), and equally a *preselection*
-        // — the top row a manual trigger highlights before the async sources have
-        // answered. A preselection means "the top row", so following it down as the
-        // snippet/LSP rows sort above would open the popup with its caret parked
-        // mid-list, on a candidate nobody chose.
-        let selected =
-            (self.selected_active && self.selection_chosen && self.cursor < self.view_len())
-                .then(|| self.item_at(self.cursor));
+        // The identity the caret has to keep across the reorder — see
+        // [`Menu::chosen_identity`] for why the view position alone will not do.
+        let selected = self.chosen_identity();
         let filtered = self.filtered.take().unwrap();
         let spans = std::mem::take(&mut self.match_spans);
         // The blend needs each row's fuzzy score against the live prefix; re-rank the
@@ -962,19 +1015,10 @@ impl Menu {
             .map(|&pos| spans[pos].take().unwrap_or_default())
             .collect();
         let reordered: Vec<usize> = order.into_iter().map(|pos| filtered[pos]).collect();
-        // Follow the chosen row to wherever it landed. A row that vanished mid-sort
-        // is not reachable here (the reorder is a permutation, never a filter), but
-        // fall back to the cursor as it was rather than assuming it.
-        match selected {
-            Some(item) => {
-                if let Some(at) = reordered.iter().position(|&i| i == item) {
-                    self.cursor = at;
-                }
-            }
-            // A preselection / noselect caret re-parks on the new top row.
-            None => self.cursor = 0,
-        }
         self.filtered = Some(reordered);
+        // Follow the chosen row to wherever it landed (a preselection / noselect
+        // caret re-parks on the new top row).
+        self.follow_identity(selected);
     }
 
     /// The [`PreviewTarget`] for the highlighted row, when this picker carries a
@@ -1090,26 +1134,8 @@ impl Editor {
                 }
             }
 
-            // Sort a permutation so `filtered` and `match_spans` stay in lockstep.
-            // Stable, so rows the scorer ties keep their native order rather than
-            // shuffling frame to frame.
-            let mut order: Vec<usize> = (0..n).collect();
-            order.sort_by(|&a, &b| {
-                keys[b]
-                    .partial_cmp(&keys[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
             let menu = ed.menu.as_mut().expect("checked above");
-            let filtered = menu.filtered.as_mut().expect("checked above");
-            let head: Vec<usize> = order.iter().map(|&p| filtered[p]).collect();
-            filtered[..n].copy_from_slice(&head);
-            let spans: Vec<_> = order
-                .iter()
-                .map(|&p| std::mem::take(&mut menu.match_spans[p]))
-                .collect();
-            for (slot, v) in menu.match_spans[..n].iter_mut().zip(spans) {
-                *slot = v;
-            }
+            menu.reorder_head_by_keys(&keys);
             None
         });
 
@@ -1118,6 +1144,87 @@ impl Editor {
         if let Some(err) = failure {
             self.echo(format!("btv.picker.scorer: {err} — scorer disabled"));
             if let Some(h) = self.picker_scorer.take() {
+                self.sandbox_release(h);
+            }
+        }
+    }
+
+    /// Apply `btv.complete.scorer` to the completion popup's rows.
+    ///
+    /// The picker's sibling ([`Editor::settle_picker_rank`]), and bounded the same
+    /// way: once per *frame* rather than once per arriving batch (a streaming source
+    /// rebuilds the view per batch, and re-ranking there would turn `extend_view`'s
+    /// O(batch) into O(view)-per-batch), and over at most [`RERANK_LIMIT`] rows.
+    ///
+    /// Two differences from the picker. The `score` handed in is the **blended**
+    /// native key — the fuzzy score *plus* the row's source `priority` bias, which
+    /// is what [`Menu::sort_complete_view`] sorts on — so nudging it composes with
+    /// the source order instead of fighting it. And the caret follows the row it was
+    /// standing on ([`Menu::chosen_identity`]): a popup that reorders under the
+    /// caret would accept a candidate nobody chose.
+    pub fn settle_complete_rank(&mut self) {
+        let Some(handle) = self.complete_scorer else {
+            return;
+        };
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        if menu.kind != MenuKind::Complete || !menu.rank_dirty || menu.filtered.is_none() {
+            return;
+        }
+        let query = menu.match_query().to_string();
+
+        let failure = self.with_sandbox(|ed, sb| {
+            let menu = ed.menu.as_mut().expect("checked above");
+            menu.rank_dirty = false;
+            let filtered = menu.filtered.as_ref().expect("checked above");
+            let n = filtered.len().min(RERANK_LIMIT);
+
+            // The blended key each row already earned. One extra native pass over at
+            // most RERANK_LIMIT labels — nanoseconds each, next to microseconds per
+            // sandbox call.
+            let labels: Vec<&str> = filtered[..n]
+                .iter()
+                .map(|&i| menu.all_items[i].label.as_str())
+                .collect();
+            let mut scores = vec![0i64; n];
+            for (pos, sc, _) in crate::fuzzy::rank_scored(&query, &labels) {
+                scores[pos] = sc as i64;
+            }
+            for (pos, &i) in filtered[..n].iter().enumerate() {
+                scores[pos] += menu.all_items[i].priority as i64;
+            }
+            let kinds: Vec<&str> = filtered[..n]
+                .iter()
+                .map(|&i| menu.all_items[i].kind.as_deref().unwrap_or(""))
+                .collect();
+
+            let mut keys = Vec::with_capacity(n);
+            for (pos, label) in labels.iter().enumerate() {
+                let got = match sb.as_mut() {
+                    Some(engine) => {
+                        engine.call_complete_score(handle, label, &query, scores[pos], kinds[pos])
+                    }
+                    None => Err(SandboxError::Unavailable),
+                };
+                match got {
+                    Ok(k) => keys.push(k),
+                    Err(err) => return Some(err),
+                }
+            }
+
+            let menu = ed.menu.as_mut().expect("checked above");
+            let chosen = menu.chosen_identity();
+            menu.reorder_head_by_keys(&keys);
+            menu.follow_identity(chosen);
+            None
+        });
+
+        // Loud once, then off — as for the picker: a scorer that runs every repaint
+        // must not echo the same error on every keystroke.
+        if let Some(err) = failure {
+            self.echo(format!("btv.complete.scorer: {err} — scorer disabled"));
+            if let Some(h) = self.complete_scorer.take() {
                 self.sandbox_release(h);
             }
         }

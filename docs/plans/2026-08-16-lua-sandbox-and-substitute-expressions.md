@@ -599,3 +599,31 @@ stage fails 14 of the 34. Six notes where reality differed from the sketch.
   baseline does not restore it, so `open()` needs `:e` *then* a bare `:e!` (`:e
   <path>` switches to an existing buffer without re-reading). And an unterminated
   `:s` trims its trailing whitespace, so the demo's replacement is terminated.
+
+### Outcome
+
+Shipped as planned: 13 new black-box tests (`tests/complete_scorer.rs`), 2 new
+example specs, full suite **4003 passed / 0 failed**. Mutation-tested — dropping
+the `settle_complete_rank` call fails 9 of the 13. Four notes.
+
+- **The two re-rankers now share their reorder.** Both needed the same
+  permutation over the parallel `filtered` / `match_spans`, and the completion one
+  additionally needed the selection-identity handling `sort_complete_view` already
+  had. Extracted as three `Menu` methods (`chosen_identity`, `follow_identity`,
+  `reorder_head_by_keys`) that all three callers use, so the popup's
+  don't-move-the-caret rule has one implementation rather than two.
+- **`kind` is in scope; the source *name* deliberately is not.** `MenuItem`
+  carries no source name, and inferring the source from the kind label is exactly
+  the heuristic the "fix at the canonical layer" rule warns against. If
+  source-level ranking is wanted, the fix is to thread the real name onto
+  `MenuItem` as its own change.
+- **Two test fixtures had to be built around the fuzzy scores rather than
+  assumed.** `-score` does not reverse two candidates that *tie* fuzzily (`zoom`
+  and `zombie` against `zo`), so the inversion test uses two sources whose only
+  difference is the source bias — which also proves `score` carries the blended
+  key. And "the query is in scope" needs a promotion that *fights* the native
+  order at the longer query, else the assertion passes vacuously.
+- **"Reported once" is not directly observable, so the test asserts the
+  consequence.** The message line holds the last echo either way; what proves the
+  uninstall is that the popup returns to native order, which also makes a repeat
+  impossible.

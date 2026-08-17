@@ -773,3 +773,52 @@ function btv._complete_run_accept(id, buf, start_row, start_col, end_row, end_co
     btv.notify("btv.complete: on_accept error: " .. tostring(err), "error")
   end
 end
+
+-- `btv.complete.scorer(src)`: install a **re-ranker** over the completion popup's
+-- rows, or clear it with `nil`. The sibling of `btv.picker.scorer`.
+--
+-- `src` is a string of Lua *source* — an expression, not a function value —
+-- because the re-ranker runs in the bounded compute sandbox: a second, pure VM
+-- with a wall-clock deadline, no editor state and no `btv.*`. A closure cannot
+-- cross between VMs, so the source crosses instead and is compiled there.
+--
+-- Four names are in scope, and the expression returns a number — the new sort
+-- key, **higher first**:
+--
+-- ```
+-- label   the candidate's text
+-- query   the word prefix being completed
+-- score   the native key this row already earned (fuzzy score + source bias)
+-- kind    the row's kind label: "Snippet", an LSP kind name, or "" (a buffer word)
+-- ```
+--
+-- `score` is the **blended** key the popup already sorted on — the fuzzy score
+-- plus the source's own bias (`lsp` 8 > snippets 5 > buffer 0) — so nudging it
+-- composes with source order instead of fighting it:
+--
+-- ```lua
+-- -- keep snippets available but below real code completions
+-- btv.complete.scorer([[ score - (kind == "Snippet" and 20 or 0) ]])
+--
+-- -- prefer shorter candidates among equally-good matches
+-- btv.complete.scorer([[ score - #label / 10 ]])
+--
+-- btv.complete.scorer(nil)   -- back to the native order
+-- ```
+--
+-- It re-ranks the **filtered** rows only, at most the top 1000 of them, and at
+-- most once per repaint rather than once per streamed batch — an LSP server can
+-- answer with thousands of candidates. The caret follows the row it was standing
+-- on, so a re-rank never accepts a candidate you did not choose.
+--
+-- The sandbox is **stateless**: nothing carries from one call to the next, and
+-- assigning a global raises. A scorer that errors, exceeds its deadline, or
+-- returns a non-number reports once and is then uninstalled, rather than
+-- repeating the error on every keystroke.
+function btv.complete.scorer(src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv.complete.scorer: expected a string of Lua source (or nil), got " .. type(src), 2)
+  end
+  btv.complete._scorer_src = src
+  btv._complete_set_scorer(src)
+end

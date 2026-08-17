@@ -19,7 +19,7 @@ btv.filetype.detect([[ ext == "h" and head:find("template", 1, true) and "cpp" o
 Each one is an *expression*, not a function body: it evaluates to a value, and
 that value is the answer. There is no `return`, no statements, no `end`.
 
-## The seven surfaces
+## The eight surfaces
 
 | Where | In scope | Returns |
 | --- | --- | --- |
@@ -30,6 +30,7 @@ that value is the answer. There is no `return`, no statements, no `end`.
 | `btv.indent.expr` | `prev`, `line`, `lnum`, `sw`, `previndent` | indent columns, or `nil` |
 | `btv.filetype.detect` | `name`, `ext`, `head` | a filetype, or `nil` |
 | `btv.picker.scorer` | `label`, `query`, `score` | a sort key, higher first |
+| `btv.complete.scorer` | `label`, `query`, `score`, `kind` | a sort key, higher first |
 
 Everything an expression needs is handed to it. That is the whole design, and
 the reason for most of what follows.
@@ -155,7 +156,7 @@ over them, which is what makes the `.h` case work.
 It runs once per buffer, and its verdict becomes that buffer's filetype exactly
 as `:setf` would set it.
 
-## Picker ranking
+## Picker and completion ranking
 
 `btv.picker.scorer` reorders a picker's results. It is handed the native fuzzy
 `score` alongside the row's `label` and the active `query`, so the natural shape
@@ -169,6 +170,20 @@ btv.picker.scorer([[ score - (label:find("/test") and 50 or 0) ]])
 It re-ranks only rows that already matched, and only the top 1000 of them.
 Matching stays native, which is what keeps a picker responsive while 100 000
 candidates stream in.
+
+`btv.complete.scorer` is the same thing for the completion popup, with the row's
+`kind` also in scope (`"Snippet"`, an LSP kind name, or `""` for a buffer word):
+
+```lua
+-- keep snippets available, but below real code completions
+btv.complete.scorer([[ score - (kind == "Snippet" and 20 or 0) ]])
+```
+
+Its `score` is the **blended** native key — the fuzzy score plus the source's own
+bias (`lsp` 8 > snippets 5 > buffer 0) — so nudging it composes with source order
+rather than replacing it. Both re-rankers run at most once per repaint, never once
+per streamed batch, and the completion caret follows the row it was standing on:
+a popup that reordered under the caret would accept a candidate nobody chose.
 
 ## The expression register
 
@@ -239,6 +254,7 @@ your expression once per item in order:
 | `:s` | the live preview re-runs it on every keystroke you type |
 | `'foldexpr'` | only the rows an edit touched are re-evaluated |
 | `btv.picker.scorer` | only the top survivors, re-run on each repaint |
+| `btv.complete.scorer` | the same, over the popup's rows |
 | `btv.fold.text` | memoized, so calls are skipped outright |
 | `btv.filetype.detect` | once per buffer |
 | `"=` / `<C-r>=` | evaluated once per prompt, then stored |

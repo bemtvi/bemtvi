@@ -1657,6 +1657,11 @@ pub struct Editor {
     /// a failing expression was disabled.
     picker_scorer: Option<crate::sandbox::SandboxFn>,
 
+    /// The compiled completion re-ranker (`btv.complete.scorer`), applied to the
+    /// popup's rows once per repaint. `None` when unset, or after a failing
+    /// expression was disabled.
+    complete_scorer: Option<crate::sandbox::SandboxFn>,
+
     /// The pending command an [`ExprTarget::Register`] prompt has to put back on
     /// submit: entering the command line calls `reset_pending`, but vim's
     /// `"=…<CR>p` needs the count and `register = Some('=')` still armed when the
@@ -2291,6 +2296,7 @@ impl Editor {
             syntax: None,
             sandbox: None,
             picker_scorer: None,
+            complete_scorer: None,
             expr_saved_pending: None,
             expr_cmdline_stack: Vec::new(),
             expr_history: Vec::new(),

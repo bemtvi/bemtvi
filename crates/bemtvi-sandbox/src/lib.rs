@@ -255,13 +255,7 @@ impl SandboxEngine for LuaSandbox {
         let result: Result<Value, mlua::Error> = func.call((label, query, score));
         self.deadline.set(None);
 
-        match result.map_err(Self::runtime_err)? {
-            Value::Integer(n) => Ok(n as f64),
-            Value::Number(n) => Ok(n),
-            // A sort key has to be a number: coercing a string would order rows
-            // lexically and look like a working scorer that ranks nonsense.
-            other => Err(SandboxError::BadReturn(other.type_name().to_string())),
-        }
+        number_result(result.map_err(Self::runtime_err)?)
     }
 
     fn call_filetype(
@@ -317,6 +311,21 @@ impl SandboxEngine for LuaSandbox {
         text_result(result.map_err(Self::runtime_err)?)
     }
 
+    fn call_complete_score(
+        &mut self,
+        f: SandboxFn,
+        label: &str,
+        query: &str,
+        score: i64,
+        kind: &str,
+    ) -> Result<f64, SandboxError> {
+        let func = self.lookup(f, "completion scorer")?;
+        self.deadline.set(Some(Instant::now() + CALL_DEADLINE));
+        let result: Result<Value, mlua::Error> = func.call((label, query, score, kind));
+        self.deadline.set(None);
+        number_result(result.map_err(Self::runtime_err)?)
+    }
+
     fn call_eval(
         &mut self,
         f: SandboxFn,
@@ -368,6 +377,19 @@ fn read_only(lua: &Lua, inner: Table) -> mlua::Result<Table> {
     meta.set("__metatable", false)?;
     proxy.set_metatable(Some(meta))?;
     Ok(proxy)
+}
+
+/// The shared result conversion for the two re-rankers, which produce a *sort
+/// key*.
+///
+/// A sort key has to be a number: coercing a string would order rows lexically
+/// and look like a working scorer that ranks nonsense.
+fn number_result(v: Value) -> Result<f64, SandboxError> {
+    match v {
+        Value::Integer(n) => Ok(n as f64),
+        Value::Number(n) => Ok(n),
+        other => Err(SandboxError::BadReturn(other.type_name().to_string())),
+    }
 }
 
 /// The shared result conversion for the calls that produce *text*.

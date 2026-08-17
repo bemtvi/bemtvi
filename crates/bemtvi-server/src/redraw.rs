@@ -47,6 +47,9 @@ impl EditHost {
         // no-op when no scorer is installed or the view has not changed. Not
         // native-gated — the sandbox exists in the wasm edit-host too.
         self.editor.settle_picker_rank();
+        // …and its sibling over the completion popup's rows (`btv.complete.scorer`),
+        // bounded the same way and for the same reasons.
+        self.editor.settle_complete_rank();
         // Render any closed fold's custom `'foldtext'` into its memo before
         // projecting — building the view only holds `&Editor`, and the sandbox
         // needs `&mut`. Memoized on the fold's first line, so a steady screen

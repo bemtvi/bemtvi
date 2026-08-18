@@ -55,6 +55,12 @@ impl EditHost {
         // needs `&mut`. Memoized on the fold's first line, so a steady screen
         // makes no calls at all.
         self.editor.settle_fold_text();
+        // Run the frame-time paint (`btv.decor.expr`) over the visible rows, into
+        // the reserved paint namespace, so its spans ride the ordinary extmark
+        // highlight projection *this* frame. Memoized per window, so a steady screen
+        // costs nothing; unlike a `btv.decor` provider this is pure, which is what
+        // makes it safe on the frame path at all.
+        self.editor.settle_decor_expr();
         // Answer the content sniffer for any buffer it has not seen. Once per
         // *buffer*, not per frame — the verdict is stored as the buffer's
         // explicit filetype, so the render path never reaches the sandbox.
@@ -305,14 +311,34 @@ impl EditHost {
                 .iter()
                 .map(|r| unicode::display_line(&r.text).into_owned())
                 .collect();
-            let _ = self.lua.set_ui_mirror(
-                &float,
-                &message,
-                view.cmdline.as_str(),
-                &statusline_text,
-                &screen,
-                clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
-            );
+            // …and the highlight spans painted over them, read back out of the
+            // window value already built rather than re-projected, so a spec sees
+            // exactly what the client was sent. This is the only way a plugin test
+            // can observe a decoration at all — `t:lines()` is text and `t:screen()`
+            // is glyphs; a paint lives in neither.
+            let focused_id = view.focused().id;
+            let highlights = view
+                .windows
+                .iter()
+                .position(|w| w.id == focused_id)
+                .and_then(|i| windows.get(i))
+                .and_then(|w| match w {
+                    Value::Map(entries) => entries
+                        .iter()
+                        .find(|(k, _)| k.as_str() == Some("highlights"))
+                        .map(|(_, v)| v.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Value::Nil);
+            let _ = self.lua.set_ui_mirror(bemtvi_lua::UiMirror {
+                float: &float,
+                message: &message,
+                cmdline: view.cmdline.as_str(),
+                statusline: &statusline_text,
+                screen: &screen,
+                highlights: &highlights,
+                clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
+            });
         }
 
         // Built last: every per-window/`chrome` style id above indexes into it.

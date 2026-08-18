@@ -418,3 +418,61 @@ function btv._decor_dispatch(ctx)
     end
   end
 end
+
+-- `btv.decor.expr(src)`: install a **frame-time** paint block over every visible
+-- line, or clear it with `nil`. The pure sibling of `btv.decor.provider`.
+--
+-- `src` is a string of Lua *source* — a function **body**, not a value — because
+-- the block runs in the bounded compute sandbox: a second, pure VM with a
+-- wall-clock deadline, no editor state and no `btv.*`. A closure cannot cross
+-- between VMs, so the source crosses instead and is compiled there. It is a body
+-- rather than a single expression because a per-line paint loops over the matches
+-- on the line, so it ends in its own `return`.
+--
+-- Two names are in scope, and the block returns a list of spans to highlight:
+--
+-- ```
+-- line    the text of the line being painted
+-- lnum    its 1-based line number
+-- ```
+--
+-- Each span is `{ first, last, group }` — **1-based inclusive** columns, which is
+-- what `string.find` hands back, so a match drops straight in:
+--
+-- ```lua
+-- btv.decor.expr([[
+--   local out, i = {}, 1
+--   while true do
+--     local s, e = line:find("TODO", i, true)
+--     if not s then break end
+--     out[#out + 1] = { s, e, "Todo" }
+--     i = e + 1
+--   end
+--   return out
+-- ]])
+--
+-- btv.decor.expr(nil)   -- stop painting
+-- ```
+--
+-- Returning an empty list (or `nil`) declines the line. A malformed span fails
+-- loud rather than silently not painting.
+--
+-- **Which one to use.** `btv.decor.provider` is the general surface: full Lua,
+-- async, any editor state, and the whole extmark vocabulary (virtual text, signs,
+-- line backgrounds). It runs *off* the frame, so its marks land on the next one.
+-- `btv.decor.expr` can only see the line it was handed and can only draw highlight
+-- spans — and in exchange it runs *during* the frame, so a paint that is a pure
+-- function of the text (indent guides, colour swatches, trailing whitespace, a
+-- keyword badge) appears in the same frame as the edit or scroll, with no
+-- round trip and no flicker.
+--
+-- It is evaluated over the visible rows of each window, memoized on the viewport,
+-- so a steady screen makes no calls at all. A block that errors, exceeds its
+-- deadline, or returns a malformed span reports once and is then uninstalled.
+function btv.decor.expr(src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv.decor.expr: expected a string of Lua source (or nil), got " .. type(src), 2)
+  end
+  btv.decor._expr_src = src
+  btv._decor_set_expr(src)
+end

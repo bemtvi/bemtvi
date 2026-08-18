@@ -102,6 +102,19 @@ pub const SIGNATURE_NS: u32 = u32::MAX - 6;
 /// just below [`SIGNATURE_NS`].
 pub const DIAGNOSTIC_NS: u32 = u32::MAX - 7;
 
+/// Reserved namespace for the **frame-time paint** a `btv.decor.expr` block asks
+/// for. One range extmark per span it returned, carrying an `hl_group`, so the
+/// paint rides the ordinary extmark highlight projection to every client with no
+/// client change — the same ephemeral-mark route the `:s` diff preview takes.
+///
+/// Rewritten from scratch for a window whose `(buffer, top, bot, changedtick)`
+/// moved, and cleared when the expression is uninstalled. Between those it is
+/// carried by the buffer's edit choke point ([`ExtmarkStore::shift`]) like any
+/// other mark, so a paint stays on its text while you type on the line. Like the
+/// other reserved namespaces it is kept out of the user-facing extmark mirror.
+/// Sits just below [`DIAGNOSTIC_NS`].
+pub const PAINT_NS: u32 = u32::MAX - 8;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

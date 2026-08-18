@@ -166,6 +166,29 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(t:line(2)).to_be("for_loop")
   end)
 
+  -- Demo 7. A paint is neither buffer text nor a painted glyph, so this is the
+  -- one thing only `t:highlights()` can see.
+  btv.test.it("demo 7 — the paint lights up every TODO", function(t)
+    open(t)
+    t:feed("<Space>7")
+    t:feed("ITODO: fix this<Esc>")
+    local spans = t:highlights(1)
+    btv.test.expect(#spans).to_be(1)
+    btv.test.expect(spans[1][3]).to_be("Todo")
+    -- 1-based inclusive in, 0-based end-exclusive out: `TODO` at the line start.
+    btv.test.expect(spans[1][1]).to_be(0)
+    btv.test.expect(spans[1][2]).to_be(4)
+  end)
+
+  btv.test.it("demo 7 — :Paint off takes the paint with it", function(t)
+    open(t)
+    t:feed("<Space>7")
+    t:feed("ITODO<Esc>")
+    btv.test.expect(#t:highlights(1)).to_be(1)
+    t:cmd("Paint off")
+    btv.test.expect(#t:highlights(1)).to_be(0)
+  end)
+
   btv.test.it(":Cheat opens its float", function(t)
     open(t)
     t:cmd("Cheat")

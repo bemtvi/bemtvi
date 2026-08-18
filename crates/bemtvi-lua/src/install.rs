@@ -4252,6 +4252,18 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._decor_set_expr(src|nil)`: the native setter behind `btv.decor.expr`.
+    // Source rather than a function, and a *block* rather than an expression —
+    // the paint runs in the sandbox, and a per-line paint loops over matches.
+    let sh = shared.clone();
+    btv.set(
+        "_decor_set_expr",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().decor_expr = Some(src);
+            Ok(())
+        })?,
+    )?;
+
     // `btv._complete_set_scorer(src|nil)`: the native setter behind
     // `btv.complete.scorer`. Source rather than a function, for the same reason
     // `btv.picker.scorer` takes source: the expression runs in the sandbox.

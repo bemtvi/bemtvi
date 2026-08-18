@@ -196,6 +196,46 @@ end, { nargs = "?", desc = "Toggle the completion scorer" })
 --    stored — so `:registers` shows it and `getreg("=")` reads it back.
 
 -- ===========================================================================
+-- 7. Frame-time paint — `btv.decor.expr`, over `line` and `lnum`
+--
+--    type:  <leader>7   then scroll around
+--    see:   every `TODO` and `FIXME` in the file lit up, and the paint keeps up
+--           with typing and scrolling *in the same frame* — there is no
+--           round trip to wait for
+--
+--    `:Paint off` removes it. This is the one surface that takes a **block**
+--    rather than a single expression: a per-line paint loops over the matches on
+--    the line, so the source ends in its own `return`. Spans are
+--    `{ first, last, group }` with the 1-based inclusive columns `string.find`
+--    already hands back.
+--
+--    Its sibling `btv.decor.provider` is the general surface — async, full Lua,
+--    virtual text and signs. Reach for the block when the paint is a pure
+--    function of the line, and for the provider when it is not.
+
+local PAINT = [[
+  local out, i = {}, 1
+  while true do
+    local s, e = line:find("TODO", i, true)
+    if not s then
+      s, e = line:find("FIXME", i, true)
+    end
+    if not s then break end
+    out[#out + 1] = { s, e, "Todo" }
+    i = e + 1
+  end
+  return out
+]]
+
+btv.command("Paint", function(a)
+  if a.fargs[1] == "off" then
+    btv.decor.expr(nil)
+  else
+    btv.decor.expr(PAINT)
+  end
+end, { nargs = "?", desc = "Toggle the frame-time paint" })
+
+-- ===========================================================================
 -- The shortcuts. 1 and 3 put a command on the command line (an `<expr>`
 -- mapping returns keys to feed, which is the public way to produce keystrokes);
 -- the rest act directly.
@@ -217,6 +257,9 @@ end, { desc = "Alternate the two .h headers" })
 btv.keymap.set("n", "<leader>5", function()
   btv.picker.open("demo")
 end, { desc = "Open the demo picker" })
+btv.keymap.set("n", "<leader>7", function()
+  btv.decor.expr(PAINT)
+end, { desc = "Install the frame-time paint" })
 
 local CHEATS = {
   "<leader>1   zM — fold (foldexpr);  zR reopens",
@@ -226,6 +269,7 @@ local CHEATS = {
   "<leader>5   the demo picker — type `mod`; docs/ leads.  :Scorer off compares",
   "6           no mapping — type o<C-r>=lnum * 10<CR><Esc> yourself",
   "6b          type `ofor` — the snippet row sorts last.  :CompleteScorer off",
+  "<leader>7   paint every TODO/FIXME as you scroll;  :Paint off removes it",
 }
 
 btv.command("Cheat", function()

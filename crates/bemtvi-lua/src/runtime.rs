@@ -979,6 +979,9 @@ pub(crate) struct Shared {
     /// outer says a change was *requested*, the inner carries `nil` for "clear".
     /// A single slot, not a queue: last write in a chunk wins, as for any setter.
     pub(crate) picker_scorer: Option<Option<String>>,
+    /// A pending `btv.decor.expr(src | nil)` — the frame-time paint block's
+    /// sandbox source. Same two-level shape as [`Shared::picker_scorer`].
+    pub(crate) decor_expr: Option<Option<String>>,
     /// A pending `btv.complete.scorer(src | nil)` — the completion re-ranker's
     /// sandbox source. Same two-level shape as [`Shared::picker_scorer`].
     pub(crate) complete_scorer: Option<Option<String>>,
@@ -1219,6 +1222,7 @@ impl Shared {
             ts_ops,
             picker_scorer,
             complete_scorer,
+            decor_expr,
             fold_text,
             filetype_detect,
             indent_expr,
@@ -1294,6 +1298,7 @@ impl Shared {
         *ts_ops = Default::default();
         *picker_scorer = Default::default();
         *complete_scorer = Default::default();
+        *decor_expr = Default::default();
         *fold_text = Default::default();
         *filetype_detect = Default::default();
         *indent_expr = Default::default();
@@ -1498,6 +1503,27 @@ macro_rules! take_queue {
             std::mem::take(&mut self.shared.borrow_mut().$field)
         }
     };
+}
+
+/// One frame's worth of UI, mirrored into `btv._ui` for the plugin test framework.
+///
+/// A struct rather than eight parameters: every field is a different projection of
+/// the same frame, and the test framework's accessors map onto them one for one.
+pub struct UiMirror<'a> {
+    /// The projected content float (`rmpv` map, `Nil` when none is open).
+    pub float: &'a rmpv::Value,
+    /// The message line.
+    pub message: &'a str,
+    /// The command line's text.
+    pub cmdline: &'a str,
+    /// The status line, flattened out of its chunk runs.
+    pub statusline: &'a str,
+    /// The focused window's painted rows (`t:screen()`).
+    pub screen: &'a [String],
+    /// The highlight spans over those rows (`t:highlights()`).
+    pub highlights: &'a rmpv::Value,
+    /// The clipboard contents, or `None` when empty.
+    pub clipboard: Option<(&'a str, bool)>,
 }
 
 impl LuaRuntime {
@@ -2023,6 +2049,11 @@ impl LuaRuntime {
     /// Take a pending `btv.picker.scorer` change, if one was requested since the
     /// last drain. `Some(Some(src))` installs, `Some(None)` clears, `None` means
     /// the setter was not called.
+    pub fn take_decor_expr(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().decor_expr.take()
+    }
+
+    /// Take a pending `btv.complete.scorer` request.
     pub fn take_complete_scorer(&self) -> Option<Option<String>> {
         self.shared.borrow_mut().complete_scorer.take()
     }
@@ -3383,21 +3414,23 @@ impl LuaRuntime {
         install.call(())
     }
 
-    /// Refresh the `btv._ui` mirror the plugin test framework reads (`t:float()` /
+    /// Refresh the `btv._ui` mirror from a [`UiMirror`] snapshot — what the plugin
+    /// test framework reads (`t:float()` /
     /// `t:message()` / `t:cmdline()` / `t:statusline()`): the projected content
     /// float (an `rmpv` map, or `Nil` when none is open), the message line, the
     /// command line, and the status-line text. Pushed once per redraw. O(1) — the
     /// float is `Nil` on the common path and the rest are short strings — so it
     /// follows the same every-tick mirror discipline as `btv._bufs`.
-    pub fn set_ui_mirror(
-        &self,
-        float: &rmpv::Value,
-        message: &str,
-        cmdline: &str,
-        statusline: &str,
-        screen: &[String],
-        clipboard: Option<(&str, bool)>,
-    ) -> mlua::Result<()> {
+    pub fn set_ui_mirror(&self, ui: UiMirror<'_>) -> mlua::Result<()> {
+        let UiMirror {
+            float,
+            message,
+            cmdline,
+            statusline,
+            screen,
+            highlights,
+            clipboard,
+        } = ui;
         let btv = self.btv()?;
         let ui = self.lua.create_table()?;
         ui.set("float", crate::convert::rmpv_to_lua(&self.lua, float)?)?;
@@ -3411,6 +3444,15 @@ impl LuaRuntime {
         ui.set(
             "screen",
             self.lua.create_sequence_from(screen.iter().cloned())?,
+        )?;
+        // The focused window's highlight spans, per painted row — what
+        // `t:highlights()` reads. A decoration (a `btv.decor` provider's marks, a
+        // `btv.decor.expr` paint, a treesitter capture) shows up in neither the
+        // buffer text nor the painted glyphs, so without this a spec cannot see it
+        // at all. Rows are the same rows `screen` holds.
+        ui.set(
+            "highlights",
+            crate::convert::rmpv_to_lua(&self.lua, highlights)?,
         )?;
         // The clipboard contents (for `btv.test.clipboard.peek`), or nil when empty.
         if let Some((text, linewise)) = clipboard {

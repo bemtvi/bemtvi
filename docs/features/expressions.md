@@ -17,9 +17,11 @@ btv.filetype.detect([[ ext == "h" and head:find("template", 1, true) and "cpp" o
 ```
 
 Each one is an *expression*, not a function body: it evaluates to a value, and
-that value is the answer. There is no `return`, no statements, no `end`.
+that value is the answer. There is no `return`, no statements, no `end`. (The
+one exception is the frame-time paint, which is a **block** — a per-line paint
+loops over the line's matches, so it ends in its own `return`.)
 
-## The eight surfaces
+## The nine surfaces
 
 | Where | In scope | Returns |
 | --- | --- | --- |
@@ -31,6 +33,7 @@ that value is the answer. There is no `return`, no statements, no `end`.
 | `btv.filetype.detect` | `name`, `ext`, `head` | a filetype, or `nil` |
 | `btv.picker.scorer` | `label`, `query`, `score` | a sort key, higher first |
 | `btv.complete.scorer` | `label`, `query`, `score`, `kind` | a sort key, higher first |
+| `btv.decor.expr` | `line`, `lnum` | spans to highlight (a **block**) |
 
 Everything an expression needs is handed to it. That is the whole design, and
 the reason for most of what follows.
@@ -218,6 +221,46 @@ Two consequences of it being an ordinary register once evaluated:
 the expression — the command line you were typing comes back untouched, as it
 does when the expression fails.
 
+## Painting a line
+
+`btv.decor.expr` runs over every visible line **during** the frame and returns the
+spans to highlight on it:
+
+```lua
+btv.decor.expr([[
+  local out, i = {}, 1
+  while true do
+    local s, e = line:find("TODO", i, true)
+    if not s then break end
+    out[#out + 1] = { s, e, "Todo" }
+    i = e + 1
+  end
+  return out
+]])
+```
+
+Each span is `{ first, last, group }` with **1-based inclusive** columns — what
+`string.find` hands back, so a match drops straight in. An empty list declines the
+line. This is the surface that takes a block rather than an expression, for the
+loop above.
+
+It is the pure sibling of `btv.decor.provider`, and the choice between them is
+what each can see:
+
+| | `btv.decor.provider` | `btv.decor.expr` |
+| --- | --- | --- |
+| power | full Lua, async, any editor state | `line` and `lnum`, nothing else |
+| when | off the frame, one frame later | during the frame it belongs to |
+| draws | virtual text, signs, line backgrounds, highlights | highlight spans |
+
+Reach for the block when the paint is a pure function of the text — indent guides,
+colour swatches, trailing whitespace, a keyword badge — and for the provider when
+it needs git, an LSP reply, or anything the line alone cannot tell it.
+
+The paint is evaluated over each window's visible rows and memoized on the
+viewport, so a steady screen costs nothing and only scrolling, resizing or editing
+re-evaluates.
+
 ## What an expression can do
 
 The expression runs in a second, deliberately tiny Lua VM. It has the
@@ -255,6 +298,7 @@ your expression once per item in order:
 | `'foldexpr'` | only the rows an edit touched are re-evaluated |
 | `btv.picker.scorer` | only the top survivors, re-run on each repaint |
 | `btv.complete.scorer` | the same, over the popup's rows |
+| `btv.decor.expr` | only the rows on screen, and only when the viewport moved |
 | `btv.fold.text` | memoized, so calls are skipped outright |
 | `btv.filetype.detect` | once per buffer |
 | `"=` / `<C-r>=` | evaluated once per prompt, then stored |

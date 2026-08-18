@@ -627,3 +627,131 @@ the `settle_complete_rank` call fails 9 of the 13. Four notes.
   consequence.** The message line holds the last echo either way; what proves the
   uninstall is that the popup returns to native order, which also makes a repeat
   impossible.
+
+---
+
+## Phase 6 — a table-returning seam, and frame-time paint (`btv.decor.expr`)
+
+*2026-08-18*
+
+### The gap
+
+`decor.rs:10` states it: *"neovim's frame-time `on_win`/`on_line` model can't host
+that on the PUC backend (ADR 0002 rule 4), so the trigger is detached from
+rendering."* `btv.decor` therefore wakes **off** the frame, hands the provider a
+viewport snapshot, and takes a generation-stamped publish back — machinery a
+decoration needs when it draws from git, an LSP reply, or any state only the main
+VM can reach.
+
+A decoration that is a **pure function of one line** needs none of it, and pays
+for all of it: indent guides, `#rrggbb` swatches, trailing whitespace, a TODO
+badge all land a frame late, which is visible as flicker while scrolling. The
+sandbox can run *during* projection. What it cannot do is return a decoration:
+every `call_*` on the seam returns a scalar.
+
+### The seam
+
+Two additions, both mechanical:
+
+- **`compile_block(src, params)`** — the source is a function *body* rather than a
+  single expression, because a per-line paint naturally loops over matches. Same
+  closed environment, same deadline, same memory ceiling; only the wrapper differs
+  (`function(…) <src> end` rather than `function(…) return (<src>) end`). Scoped to
+  this surface — the other six stay expressions, where a `return` would be noise.
+- **`call_paint(f, line, lnum) -> Vec<PaintSpan>`**, with
+  `PaintSpan { start, end, group }` in **0-based, end-exclusive byte** offsets —
+  what an extmark takes.
+
+Lua returns a list of `{ first, last, group }` with **1-based inclusive** columns,
+because that is exactly what `string.find` gives back:
+
+```lua
+local out, i = {}, 1
+while true do
+  local s, e = line:find("TODO", i, true)
+  if not s then break end
+  out[#out + 1] = { s, e, "Todo" }
+  i = e + 1
+end
+return out
+```
+
+The engine validates every element (a 3-tuple of two integers and a string) and
+the core clamps each span to the line and snaps it to character boundaries. A
+malformed element is a `BadReturn`, never a silently dropped span.
+
+### The surface
+
+`btv.decor.expr(src | nil)` — a sibling of `btv.decor.provider`, not a
+replacement. The choice between them is what each can see:
+
+| | `btv.decor.provider` | `btv.decor.expr` |
+| --- | --- | --- |
+| power | full Lua, async, any editor state | pure: `line`, `lnum`, nothing else |
+| when | off-frame, generation-stamped | during projection, same frame |
+| draws | extmarks — text, virt lines, signs | highlight spans |
+| costs | a round trip, and one frame of lag | ~1us per visible row |
+
+### Where it runs
+
+`settle_decor_expr()` from `redraw()`, beside `settle_picker_rank` and
+`settle_fold_text`. For every visible window it evaluates each visible row and
+writes range extmarks into a new reserved `PAINT_NS`, replacing that buffer's
+previous ones — the ephemeral-mark pattern the `:s` diff preview already uses, so
+the paint rides `highlights_for` to every client with no client change at all.
+
+Two bounds keep it inside a frame. The work is **screen-bounded by construction**
+(the visible rows of the visible windows, ~50 each), and it is **memoized on
+`(buffer, top, bot, changedtick)` per window** — the same key
+`recompute_decor_dirty` uses — so a steady screen costs nothing and only scroll,
+resize or an edit re-evaluates.
+
+### Failure
+
+Loud once, then uninstall, like every surface that runs continuously: a paint
+expression that errors, exceeds its deadline, or returns a malformed span reports
+once and is removed, and the buffer paints as it did before. A compile error is
+caught at configure time.
+
+### Testing
+
+`crates/bemtvi-server/tests/decor_expr.rs`: spans reach the projected highlights,
+the columns are the 1-based inclusive ones `string.find` returns, several spans on
+one line, a line the expression declines (an empty list), scrolling repaints the
+new rows, an edit re-evaluates, the marks do **not** leak into the user-facing
+extmark mirror, each failure mode reports once and uninstalls, and the paint
+survives (moves with) an edit on the same line.
+
+### Later, on the same seam
+
+A table *param* gives `quickfixtextfunc` (an entry in, a rendered line out), and
+the same table return gives an `errorformat` alternative that parses one line of
+build output into an entry. A `PaintSpan` that grows optional `virt_text` /
+`sign_text` extends the paint without touching the seam again.
+
+### Outcome
+
+Shipped as planned: 18 new black-box tests (`tests/decor_expr.rs`), 2 new example
+specs, full suite **4034 passed / 0 failed**. Mutation-tested twice — dropping the
+`settle_decor_expr` call fails 15 of the 18, and dropping the *memo* takes the
+steady-screen guard from 0.26s to 4.95s against a 55ms baseline. Five notes.
+
+- **The paint had nowhere to be seen from a plugin test, so the framework grew a
+  third view.** `t:lines()` is buffer text and `t:screen()` is the glyphs drawn; a
+  highlight changes neither, so no spec could observe a decoration at all — not
+  this one, and not a `btv.decor.provider`'s either. `t:highlights([row])` mirrors
+  the focused window's spans, read back out of the window value already built
+  rather than re-projected, so a spec sees exactly what the client was sent.
+- **The memo is the feature, not an optimization.** Without it, in-viewport cursor
+  motion re-evaluates every visible row on every keystroke. The guard measures the
+  same keystrokes against a no-block baseline (the shape `fold_perf.rs` settled
+  on), with the per-call cost kept to a few milliseconds so a loaded machine
+  cannot trip the 50ms deadline and pass it *vacuously* by uninstalling the paint.
+- **The whole buffer's paint is rebuilt when any window showing it moves.** Marks
+  are per buffer while viewports are per window, so clearing only the stale
+  window's rows would strand the other window's spans.
+- **A block, not an expression** — and the docs' opening claim ("no `return`, no
+  statements") needed the exception stated rather than quietly broken.
+- **`set_ui_mirror` outgrew clippy's argument limit** at eight, which was the
+  nudge to give it a `UiMirror` struct: every field is a different projection of
+  the same frame, and the test framework's accessors map onto them one for one.

@@ -204,14 +204,15 @@ fn byte_rowcol(buf: &bemtvi_core::Buffer, byte: usize) -> (u64, u64) {
 }
 
 /// Whether namespace `ns` is internal editor state (multi-cursor heads and their
-/// visual anchors, snippet tabstops, the `:s` preview, diagnostics) rather than a
-/// user-visible extmark — those are kept out of the `nvim_buf_get_extmarks` mirror.
+/// visual anchors, snippet tabstops, the `:s` preview, diagnostics, the
+/// `btv.decor.expr` paint) rather than a user-visible extmark — those are kept out of the `nvim_buf_get_extmarks` mirror.
 fn is_reserved_ns(ns: u32) -> bool {
     ns == bemtvi_core::extmark::CURSOR_NS
         || ns == bemtvi_core::extmark::ANCHOR_NS
         || ns == bemtvi_core::extmark::SNIPPET_NS
         || ns == bemtvi_core::extmark::SUBST_PREVIEW_NS
         || ns == bemtvi_core::extmark::DIAGNOSTIC_NS
+        || ns == bemtvi_core::extmark::PAINT_NS
 }
 
 /// Which marks an edit can have moved *in `(row, col)` terms*.
@@ -1156,6 +1157,9 @@ impl EditHost {
         // `btv.picker.scorer(src|nil)`: compile the re-ranker into the sandbox now,
         // so a bad expression is reported where it was configured rather than
         // silently at the next picker.
+        if let Some(src) = self.lua.take_decor_expr() {
+            self.editor.set_decor_expr(src);
+        }
         if let Some(src) = self.lua.take_complete_scorer() {
             self.editor.set_complete_scorer(src);
         }

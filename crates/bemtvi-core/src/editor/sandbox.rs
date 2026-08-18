@@ -26,6 +26,19 @@ impl Editor {
         self.sandbox = Some(engine);
     }
 
+    /// Compile `src` as a sandbox **block** (a function body), or report why it
+    /// could not be. The block sibling of [`Editor::sandbox_compile`].
+    pub(crate) fn sandbox_compile_block(
+        &mut self,
+        src: &str,
+        params: &[&str],
+    ) -> Result<SandboxFn, SandboxError> {
+        match self.sandbox.as_mut() {
+            Some(e) => e.compile_block(src, params),
+            None => Err(SandboxError::Unavailable),
+        }
+    }
+
     /// Compile `src` as a sandbox expression, or report why it could not be.
     ///
     /// [`SandboxError::Unavailable`] when no engine is installed — never silently
@@ -102,6 +115,158 @@ impl Editor {
             Err(err) => self.echo(format!("btv.complete.scorer: {err}")),
         }
     }
+}
+
+impl Editor {
+    /// Install (or clear, with `None`) the frame-time paint block
+    /// (`btv.decor.expr`): a sandbox **block** over `line` and `lnum` returning the
+    /// spans to highlight on that line.
+    ///
+    /// A block rather than an expression because a per-line paint loops over the
+    /// matches on the line; see [`SandboxEngine::compile_block`]. Compiled here, so
+    /// a bad block is reported when it is configured rather than at the next frame.
+    pub fn set_decor_expr(&mut self, src: Option<String>) {
+        if let Some(old) = self.decor_expr_fn.take() {
+            self.sandbox_release(old);
+        }
+        // Whatever the old block painted goes with it — including when the new one
+        // fails to compile, which must not leave a stale paint behind.
+        self.clear_paint_marks();
+        self.decor_expr_viewports.clear();
+        let Some(src) = src else { return };
+        match self.sandbox_compile_block(&src, &["line", "lnum"]) {
+            Ok(h) => self.decor_expr_fn = Some(h),
+            Err(err) => self.echo(format!("btv.decor.expr: {err}")),
+        }
+    }
+
+    /// Drop every paint mark from every buffer.
+    fn clear_paint_marks(&mut self) {
+        for id in self.buffer_ids() {
+            self.buffers
+                .get_mut(id)
+                .buffer
+                .extmarks
+                .clear(crate::extmark::PAINT_NS, None);
+        }
+    }
+
+    /// Run the paint block over every visible row, into [`PAINT_NS`].
+    ///
+    /// Called from `redraw` just before the view is projected, which is what makes
+    /// this *frame-time* paint: the spans reach the same frame as the edit or scroll
+    /// that produced them, where a `btv.decor.provider` publish would land on the
+    /// next one. It is affordable there because the work is **screen-bounded** — the
+    /// visible rows of the visible windows, at roughly a microsecond each — and
+    /// **memoized per window** on `(buffer, top, bot, changedtick)`, the same key
+    /// [`Editor::recompute_decor_dirty`] watches, so a steady screen makes no calls
+    /// at all.
+    ///
+    /// [`PAINT_NS`]: crate::extmark::PAINT_NS
+    pub fn settle_decor_expr(&mut self) {
+        let Some(handle) = self.decor_expr_fn else {
+            return;
+        };
+        // What each visible window shows, and whether that has moved since the last
+        // frame. Collected first, so the evaluation below borrows nothing but the
+        // buffer it writes to.
+        let mut stale: Vec<(BufferId, usize, usize)> = Vec::new();
+        let mut seen: Vec<super::WindowId> = Vec::new();
+        for win in self.window_ids() {
+            seen.push(win);
+            let Some(buf) = self.window_buffer(win) else {
+                continue;
+            };
+            let top = self.window_top(win);
+            let height = self.window_text_area(win).map_or(0, |(_, h)| h);
+            let (last_line, tick) = self.buffer_of(buf).map_or((0, 0), |b| {
+                (b.line_count().saturating_sub(1), b.changedtick)
+            });
+            let bot = top.saturating_add(height.saturating_sub(1)).min(last_line);
+            let key = (buf, top, bot, tick);
+            if self.decor_expr_viewports.get(&win) == Some(&key) {
+                continue;
+            }
+            self.decor_expr_viewports.insert(win, key);
+            stale.push((buf, top, bot));
+        }
+        self.decor_expr_viewports.retain(|w, _| seen.contains(w));
+        if stale.is_empty() {
+            return;
+        }
+
+        let failure = self.with_sandbox(|ed, sb| {
+            for (buf, top, bot) in stale {
+                // The whole buffer's paint is rebuilt, not just the stale window's
+                // rows: two windows can show the same buffer at different offsets,
+                // and marks are per buffer, so a partial clear would strand the other
+                // window's spans.
+                ed.buffers
+                    .get_mut(buf)
+                    .buffer
+                    .extmarks
+                    .clear(crate::extmark::PAINT_NS, None);
+                for lnum in top..=bot {
+                    let Some(b) = ed.buffer_of(buf) else { break };
+                    if lnum >= b.line_count() {
+                        break;
+                    }
+                    let text = b.line_cow(lnum).to_string();
+                    let line_start = b.line_start(lnum);
+                    let spans = match sb.as_mut() {
+                        Some(engine) => engine.call_paint(handle, &text, lnum as i64 + 1),
+                        None => Err(SandboxError::Unavailable),
+                    };
+                    let spans = match spans {
+                        Ok(spans) => spans,
+                        Err(err) => return Some(err),
+                    };
+                    for span in spans {
+                        // Clamp to the line and snap to character boundaries: a
+                        // column the expression invented (or the middle of a
+                        // multi-byte character) must not produce an extmark that
+                        // splits a grapheme.
+                        let start = snap(&text, span.start.min(text.len()));
+                        let end = snap(&text, span.end.min(text.len())).max(start);
+                        if start == end {
+                            continue;
+                        }
+                        ed.buffers.get_mut(buf).buffer.extmarks.set(
+                            crate::extmark::PAINT_NS,
+                            None,
+                            line_start + start,
+                            Some(line_start + end),
+                            Some(span.group.clone()),
+                            crate::extmark::DEFAULT_PRIORITY,
+                            None,
+                        );
+                    }
+                }
+            }
+            None
+        });
+
+        // Loud once, then off: this runs every frame a viewport moves, so a broken
+        // block would otherwise report on every scrolled row.
+        if let Some(err) = failure {
+            self.echo(format!("btv.decor.expr: {err} — paint disabled"));
+            if let Some(h) = self.decor_expr_fn.take() {
+                self.sandbox_release(h);
+            }
+            self.clear_paint_marks();
+            self.decor_expr_viewports.clear();
+        }
+    }
+}
+
+/// Round `at` down to a character boundary in `text` — the columns a paint block
+/// returns are Lua byte offsets, which a naive expression can land mid-character.
+fn snap(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// How much of a buffer the content sniffer sees. Enough for a shebang, an XML

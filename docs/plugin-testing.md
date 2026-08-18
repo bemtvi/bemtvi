@@ -160,6 +160,12 @@ Matchers are called with a dot; prefix any with `.never` to invert
 | `t:float()` | The content float — `{ text, lines, title }` — or nil. |
 | `t:message()` / `t:statusline()` | The message / status line text. |
 | `t:screen()` | The focused window's **painted** rows, as a list of strings. |
+| `t:highlights([row])` | The highlight spans over those rows — `{ first, last, group }`. |
+
+`t:highlights()` is the third view, and the only one that can see a
+**decoration**: a `btv.decor` provider's mark, a `btv.decor.expr` paint or a
+treesitter capture changes neither the buffer text nor the glyphs drawn, so a test
+for one asserts on the group it painted.
 
 `t:screen()` is the sibling of `t:lines()`, and the difference decides which one a
 test should assert on. `t:lines()` is buffer text; `t:screen()` is what the client

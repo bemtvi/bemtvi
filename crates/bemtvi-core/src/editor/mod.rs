@@ -1657,6 +1657,13 @@ pub struct Editor {
     /// a failing expression was disabled.
     picker_scorer: Option<crate::sandbox::SandboxFn>,
 
+    /// The compiled frame-time paint block (`btv.decor.expr`) and the viewport it
+    /// last painted per window — `(buffer, top, bot, changedtick)`, the same key
+    /// the off-frame decor detector watches, so a steady screen re-evaluates
+    /// nothing.
+    decor_expr_fn: Option<crate::sandbox::SandboxFn>,
+    decor_expr_viewports: HashMap<WindowId, (BufferId, usize, usize, u64)>,
+
     /// The compiled completion re-ranker (`btv.complete.scorer`), applied to the
     /// popup's rows once per repaint. `None` when unset, or after a failing
     /// expression was disabled.
@@ -2297,6 +2304,8 @@ impl Editor {
             sandbox: None,
             picker_scorer: None,
             complete_scorer: None,
+            decor_expr_fn: None,
+            decor_expr_viewports: HashMap::new(),
             expr_saved_pending: None,
             expr_cmdline_stack: Vec::new(),
             expr_history: Vec::new(),

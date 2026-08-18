@@ -471,6 +471,33 @@ function Ctx:screen()
   return (ui and ui.screen) or {}
 end
 
+-- `t:highlights([row])` — the highlight spans painted over the focused window's
+-- rows: a list of `{ first, last, group }` per row (1-based *screen* rows, matching
+-- `t:screen()`; columns are 0-based, end-exclusive display cells). With `row`, just
+-- that row's spans.
+--
+-- The third of the three views a spec has, and the only one that can see a
+-- **decoration**: `t:lines()` is buffer text, `t:screen()` is the glyphs drawn, and
+-- a highlight — a `btv.decor` provider's mark, a `btv.decor.expr` paint, a
+-- treesitter capture — changes neither. Groups are the names as painted, so a test
+-- asserts on the group it asked for rather than on a colour.
+--
+-- ```lua
+-- btv.decor.expr([[ local s, e = line:find("TODO") if s then return { { s, e, "Todo" } } end return {} ]])
+-- t:feed("iTODO<Esc>")
+-- btv.test.expect(t:highlights(1)[1][3]).to_be("Todo")
+-- ```
+--
+-- Only the focused window, like `t:screen()`.
+function Ctx:highlights(row)
+  local ui = btv._ui
+  local rows = (ui and ui.highlights) or {}
+  if row == nil then
+    return rows
+  end
+  return rows[row] or {}
+end
+
 -- ----- the runner -----------------------------------------------------------
 
 -- Run one hook/test fn, which may await. Returns ok, error-value. Runs inside the

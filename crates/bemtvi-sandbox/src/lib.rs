@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
-use bemtvi_core::sandbox::{SandboxEngine, SandboxError, SandboxFn, CALL_DEADLINE};
+use bemtvi_core::sandbox::{PaintSpan, SandboxEngine, SandboxError, SandboxFn, CALL_DEADLINE};
 use mlua::{Lua, Table, Value, VmState};
 
 /// How often the deadline hook runs, in VM instructions.
@@ -311,6 +311,44 @@ impl SandboxEngine for LuaSandbox {
         text_result(result.map_err(Self::runtime_err)?)
     }
 
+    fn compile_block(&mut self, src: &str, params: &[&str]) -> Result<SandboxFn, SandboxError> {
+        // The only difference from `compile_expr`: the body is spliced in as
+        // statements, so the source supplies its own `return`.
+        let wrapped = format!("return function({}) {src} end", params.join(", "));
+        let outer = self
+            .lua
+            .load(&wrapped)
+            .set_name("=btv-sandbox")
+            .set_environment(self.env.clone())
+            .into_function()
+            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
+        let f: mlua::Function = outer
+            .call(())
+            .map_err(|e| SandboxError::Compile(tidy(&e.to_string())))?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.fns.insert(id, f);
+        Ok(SandboxFn(id))
+    }
+
+    fn call_paint(
+        &mut self,
+        f: SandboxFn,
+        line: &str,
+        lnum: i64,
+    ) -> Result<Vec<PaintSpan>, SandboxError> {
+        let func = self.lookup(f, "paint")?;
+        self.deadline.set(Some(Instant::now() + CALL_DEADLINE));
+        let result: Result<Value, mlua::Error> = func.call((line, lnum));
+        self.deadline.set(None);
+        match result.map_err(Self::runtime_err)? {
+            // Declining is a normal answer: this line gets no paint.
+            Value::Nil => Ok(Vec::new()),
+            Value::Table(list) => paint_spans(list),
+            other => Err(SandboxError::BadReturn(other.type_name().to_string())),
+        }
+    }
+
     fn call_complete_score(
         &mut self,
         f: SandboxFn,
@@ -377,6 +415,43 @@ fn read_only(lua: &Lua, inner: Table) -> mlua::Result<Table> {
     meta.set("__metatable", false)?;
     proxy.set_metatable(Some(meta))?;
     Ok(proxy)
+}
+
+/// Convert the list a paint block returned into [`PaintSpan`]s.
+///
+/// Each element is `{ first, last, group }` with **1-based inclusive** columns
+/// (`string.find`'s convention). Anything else — a non-table element, a missing
+/// field, a group that is not a string — is a `BadReturn` naming what arrived,
+/// because a silently dropped span is a decoration that mysteriously fails to
+/// paint.
+fn paint_spans(list: Table) -> Result<Vec<PaintSpan>, SandboxError> {
+    let mut out = Vec::new();
+    for (i, entry) in list.sequence_values::<Value>().enumerate() {
+        let entry = entry.map_err(|e| SandboxError::Runtime(tidy(&e.to_string())))?;
+        let Value::Table(span) = entry else {
+            return Err(SandboxError::BadReturn(format!(
+                "span {} is {}, expected a {{ first, last, group }} table",
+                i + 1,
+                entry.type_name()
+            )));
+        };
+        let first: Option<i64> = span.get(1).ok().flatten();
+        let last: Option<i64> = span.get(2).ok().flatten();
+        let group: Option<String> = span.get(3).ok().flatten();
+        let (Some(first), Some(last), Some(group)) = (first, last, group) else {
+            return Err(SandboxError::BadReturn(format!(
+                "span {} is not {{ first, last, group }} (two columns and a highlight group)",
+                i + 1
+            )));
+        };
+        // 1-based inclusive -> 0-based end-exclusive. A `last` before `first` is an
+        // empty span, which paints nothing rather than erroring: `line:find` on a
+        // zero-width match legitimately produces one.
+        let start = (first.max(1) - 1) as usize;
+        let end = last.max(first - 1) as usize;
+        out.push(PaintSpan { start, end, group });
+    }
+    Ok(out)
 }
 
 /// The shared result conversion for the two re-rankers, which produce a *sort

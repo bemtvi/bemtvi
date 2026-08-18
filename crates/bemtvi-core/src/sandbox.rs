@@ -65,6 +65,19 @@ impl fmt::Display for SandboxError {
     }
 }
 
+/// One highlight span a paint expression asked for, in the units an extmark takes:
+/// **0-based, end-exclusive byte** offsets into the line, and the highlight group.
+///
+/// Lua hands back `{ first, last, group }` with 1-based *inclusive* columns —
+/// `string.find`'s convention, so a match drops straight in — and the engine
+/// converts here, at the boundary, rather than leaving two conventions in play.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaintSpan {
+    pub start: usize,
+    pub end: usize,
+    pub group: String,
+}
+
 /// How many surviving rows a picker re-ranker is applied to, at most.
 ///
 /// The scorer runs on the *filtered* set, never `all_items` — but a loose query
@@ -193,6 +206,29 @@ pub trait SandboxEngine {
         score: i64,
         kind: &str,
     ) -> Result<f64, SandboxError>;
+
+    /// Compile `src` as a Lua **block** — a function *body*, not a single
+    /// expression — callable with `params` in scope: the engine wraps it as
+    /// `function(<params>) <src> end`, so the source ends in its own `return`.
+    ///
+    /// The same closed environment, deadline and memory ceiling as
+    /// [`SandboxEngine::compile_expr`]; only the wrapper differs. It exists for the
+    /// one call shape whose natural form is a loop — a per-line paint walking the
+    /// matches on the line — where an expression would have to be an immediately
+    /// invoked closure.
+    fn compile_block(&mut self, src: &str, params: &[&str]) -> Result<SandboxFn, SandboxError>;
+
+    /// Call a compiled paint block for one visible line.
+    ///
+    /// Returns the spans to highlight, converted from the 1-based inclusive columns
+    /// Lua returned. An element that is not a `{ integer, integer, string }` triple
+    /// is a [`SandboxError::BadReturn`] — never a silently dropped span.
+    fn call_paint(
+        &mut self,
+        f: SandboxFn,
+        line: &str,
+        lnum: i64,
+    ) -> Result<Vec<PaintSpan>, SandboxError>;
 
     /// Call a compiled **expression register** (`"=` / `<C-r>=`) once.
     ///

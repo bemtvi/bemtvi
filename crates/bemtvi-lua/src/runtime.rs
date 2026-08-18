@@ -988,6 +988,9 @@ pub(crate) struct Shared {
     /// A pending `btv.qf.text(src | nil)` — the quickfix render expression's
     /// sandbox source. Same two-level shape as [`Shared::picker_scorer`].
     pub(crate) qf_text: Option<Option<String>>,
+    /// A pending `btv.qf.parse(src | nil)` — the quickfix line parser's sandbox
+    /// source. Same two-level shape as [`Shared::picker_scorer`].
+    pub(crate) qf_parse: Option<Option<String>>,
     /// A pending `btv.fold.text(src | nil)` — the `'foldtext'` sandbox source.
     /// Same two-level shape as [`Shared::picker_scorer`].
     pub(crate) fold_text: Option<Option<String>>,
@@ -1226,6 +1229,7 @@ impl Shared {
             picker_scorer,
             complete_scorer,
             qf_text,
+            qf_parse,
             decor_expr,
             fold_text,
             filetype_detect,
@@ -1303,6 +1307,7 @@ impl Shared {
         *picker_scorer = Default::default();
         *complete_scorer = Default::default();
         *qf_text = Default::default();
+        *qf_parse = Default::default();
         *decor_expr = Default::default();
         *fold_text = Default::default();
         *filetype_detect = Default::default();
@@ -2066,6 +2071,11 @@ impl LuaRuntime {
     /// Take a pending `btv.qf.text` request — the quickfix render expression.
     pub fn take_qf_text(&self) -> Option<Option<String>> {
         self.shared.borrow_mut().qf_text.take()
+    }
+
+    /// Take a pending `btv.qf.parse` request — the quickfix line parser.
+    pub fn take_qf_parse(&self) -> Option<Option<String>> {
+        self.shared.borrow_mut().qf_parse.take()
     }
 
     /// Take a pending `btv.complete.scorer` request's sibling — the picker's.

@@ -895,6 +895,30 @@ parser wins over `'errorformat'` while installed and the efm path returns when i
 is cleared, `type` drives the severity colour, and each failure mode reports once
 and uninstalls.
 
+### Outcome
+
+Shipped as planned: 18 new black-box tests (`tests/qf_parse.rs`), 2 new example
+specs, full suite **4069 passed / 0 failed**. Mutation-tested twice — forcing the
+Lua path off fails 12 of the 16 parse tests, and restoring the old drain order
+fails the same-chunk guard. Three notes.
+
+- **The drain order was wrong, and the example spec is what caught it.** Both
+  quickfix setters were drained *after* the queued list writes, so the one shape
+  everybody writes — `btv.qf.parse(…)` and then `setqflist{lines=…}` in a single
+  chunk — parsed with `'errorformat'` that first time. The Rust tests all passed,
+  because each of them set the parser in its own `exec_lua`. The example, written
+  the way a config is written, did not. Both setters now drain before the writes
+  they configure, with a guard test in the shape that failed.
+- **A declined line is not a dropped line.** vim keeps a line no pattern matched
+  as an *invalid* entry carrying its raw text, which is what makes `:copen` show a
+  build's prose alongside its errors; `nil` from the block means the same thing.
+- **Statelessness is the boundary, and it is the honest one.** A parser sees one
+  line and carries nothing, so errorformat's multi-line entries and directory
+  stack are out of reach — those are exactly the features that need an
+  accumulator. `'errorformat'` stays for them and stays the default; this is the
+  readable path for the common case, and the only path in a build without the
+  vendored C regexp engine.
+
 ## Phase 9 — a `PaintSpan` that carries decoration
 
 ### The gap

@@ -930,6 +930,70 @@ function btv.qf.text(src)
   btv._qf_set_text(src)
 end
 
+-- `btv.qf.parse(src)`: parse the lines of build output into quickfix entries with
+-- a Lua block instead of `'errorformat'`, or restore `'errorformat'` with `nil`.
+--
+-- `src` is a string of Lua *source* — a function **body**, not a value — because
+-- it runs in the bounded compute sandbox: a second, pure VM with a wall-clock
+-- deadline, no editor state and no `btv.*`. A closure cannot cross between VMs,
+-- so the source crosses instead and is compiled there. It is a body rather than a
+-- single expression because a parser matches and then builds a record, so it ends
+-- in its own `return`.
+--
+-- Two names are in scope, and the block returns one entry table (or `nil`):
+--
+-- ```
+-- line    the output line to parse
+-- lnum    its 1-based position in the output, not in any file
+-- ```
+--
+-- ```lua
+-- btv.qf.parse([[
+--   local file, ln, col, msg = line:match("^(%S+)%((%d+),(%d+)%): (.*)$")
+--   if not file then return nil end
+--   return {
+--     filename = file, lnum = tonumber(ln), col = tonumber(col), text = msg,
+--     type = msg:find("^error") and "E" or "W",
+--   }
+-- ]])
+--
+-- btv.qf.parse(nil)   -- back to 'errorformat'
+-- ```
+--
+-- The entry may set `filename`, `bufnr`, `module`, `lnum`, `end_lnum`, `col`,
+-- `end_col`, `vcol`, `nr`, `pattern`, `text`, `type` and `valid` — the keys
+-- `btv.qf.getqflist()` returns. Any other key is an **error**, not an ignored one:
+-- a parser that writes `line` where it meant `lnum` would otherwise quietly
+-- produce entries that cannot be jumped to. `valid` defaults to vim's rule (an
+-- entry with a line number is jumpable).
+--
+-- Returning `nil` declines the line, which is not the same as dropping it: like
+-- `'errorformat'`, a line no pattern matched is kept as an *invalid* entry
+-- carrying its raw text, which is what makes `:copen` show a build's prose
+-- alongside its errors.
+--
+-- It applies wherever `'errorformat'` does — `:cbuffer`, `:cfile`, `:cexpr`,
+-- `setqflist{ lines = … }`, `:make`, `:grep` — and *replaces* that pass rather
+-- than layering on it, because two parsers disagreeing about one line has no
+-- sensible answer.
+--
+-- **What it cannot do.** The sandbox is stateless: the block sees one line and
+-- carries nothing between calls. That rules out errorformat's multi-line entries
+-- (`%A`/`%C`/`%Z`) and its directory stack (`%D`/`%X`) — exactly the features that
+-- need an accumulator. `'errorformat'` stays for those, and stays the default.
+-- The trade is readability everywhere else, and output no errorformat can
+-- describe at all.
+--
+-- A block that errors, exceeds its deadline, or returns a malformed entry reports
+-- **once**, is uninstalled, and `'errorformat'` parses the input instead.
+function btv.qf.parse(src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv.qf.parse: expected a string of Lua source (or nil), got " .. type(src), 2)
+  end
+  btv.qf._parse_src = src
+  btv._qf_set_parse(src)
+end
+
 -- btv._qf_make(cmd, efm, title, open, jump, loclist_win): the async :make / :grep
 -- producer (dispatched from the server, which already expanded
 -- 'makeprg'/'grepprg' and merged stderr into stdout via the shell). Spawn `cmd`

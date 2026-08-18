@@ -220,11 +220,11 @@ client-side tree-sitter highlighter).
   vt100 emulation layer, end-to-end backpressure for runaway output, and
   scrollback, in both native clients and the web build.
 - **Quickfix, location lists & docks** — a quickfix list with `errorformat`
-  parsing and rows you can render yourself (`btv.qf.text`, vim's
-  `'quickfixtextfunc'`), window-local location lists (`:lopen`/`:lvimgrep`),
-  named and dynamic (function-sourced) lists with picker integration, and VSCode-style
-  permanent edge docks (`btv.dock`) with per-region tablines and spatial
-  `<C-w><C-w>` navigation.
+  parsing (or a Lua line parser in its place, `btv.qf.parse`) and rows you can
+  render yourself (`btv.qf.text`, vim's `'quickfixtextfunc'`), window-local
+  location lists (`:lopen`/`:lvimgrep`), named and dynamic (function-sourced)
+  lists with picker integration, and VSCode-style permanent edge docks
+  (`btv.dock`) with per-region tablines and spatial `<C-w><C-w>` navigation.
 - **Workspaces & a remote daemon** — `bemtvi --workspace <dir>` opens a directory
   as a session that persists its tabs, windows, unnamed buffers, and
   per-workspace option overrides (`btv.wso`) across restarts. `bemtvi --daemon`

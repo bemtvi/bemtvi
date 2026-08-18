@@ -139,6 +139,24 @@ impl Editor {
         }
         self.qf_refresh_all();
     }
+
+    /// Install (or clear, with `None`) the quickfix **line parser**
+    /// (`btv.qf.parse`): a sandbox block over `line` and `lnum` returning one
+    /// entry table, or `nil` to decline the line.
+    ///
+    /// A block rather than an expression: a parser matches, then builds a record,
+    /// which is two statements in any language. While one is installed it stands
+    /// in for `'errorformat'` everywhere the option is consulted.
+    pub fn set_qf_parse(&mut self, src: Option<String>) {
+        if let Some(old) = self.qf_parse_fn.take() {
+            self.sandbox_release(old);
+        }
+        let Some(src) = src else { return };
+        match self.sandbox_compile_block(&src, &["line", "lnum"]) {
+            Ok(h) => self.qf_parse_fn = Some(h),
+            Err(err) => self.echo(format!("btv.qf.parse: {err}")),
+        }
+    }
 }
 
 impl Editor {

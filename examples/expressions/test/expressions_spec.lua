@@ -208,6 +208,29 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(t:lines()[1]).to_contain("|5 col 1| one")
   end)
 
+  -- Demo 9. The parser runs where `'errorformat'` would, so the proof is the
+  -- entries the list ends up holding.
+  btv.test.it("demo 9 — the Lua parser builds entries errorformat cannot", function(t)
+    open(t)
+    t:feed("<Space>9")
+    local rows = t:lines()
+    btv.test.expect(rows[1]).to_contain("|5 col 1| one")
+    btv.test.expect(rows[2]).to_contain("|11 col 1| four")
+    -- The prose line is declined, and kept as an unjumpable row.
+    btv.test.expect(rows[3]).to_be("|| -- build finished with 1 error")
+  end)
+
+  btv.test.it("demo 9 — :QfParse off leaves the output to errorformat", function(t)
+    open(t)
+    t:feed("<Space>9")
+    btv.test.expect(t:lines()[1]).to_contain("|5 col 1| one")
+    -- `:QfParse off` re-populates from the same three lines, now unparsed: the
+    -- raw text is the whole entry, with no line number and no column.
+    t:cmd("QfParse off")
+    btv.test.expect(t:lines()[1]).to_contain("(5,1): error: one")
+    btv.test.expect(t:lines()[1]).never.to_contain("col 1|")
+  end)
+
   btv.test.it(":Cheat opens its float", function(t)
     open(t)
     t:cmd("Cheat")

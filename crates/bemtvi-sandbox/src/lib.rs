@@ -380,6 +380,27 @@ impl SandboxEngine for LuaSandbox {
         text_result(result.map_err(Self::runtime_err)?)
     }
 
+    fn call_qf_parse(
+        &mut self,
+        f: SandboxFn,
+        line: &str,
+        lnum: i64,
+    ) -> Result<Option<QfFields>, SandboxError> {
+        let func = self.lookup(f, "quickfix parser")?;
+        self.deadline.set(Some(Instant::now() + CALL_DEADLINE));
+        let result: Result<Value, mlua::Error> = func.call((line, lnum));
+        self.deadline.set(None);
+        match result.map_err(Self::runtime_err)? {
+            // Declining is a normal answer: the line is not an error line.
+            Value::Nil => Ok(None),
+            Value::Table(t) => qf_fields(t).map(Some),
+            other => Err(SandboxError::BadReturn(format!(
+                "{}, expected an entry table or nil",
+                other.type_name()
+            ))),
+        }
+    }
+
     fn call_qf_text(
         &mut self,
         f: SandboxFn,
@@ -431,6 +452,67 @@ fn read_only(lua: &Lua, inner: Table) -> mlua::Result<Table> {
     meta.set("__metatable", false)?;
     proxy.set_metatable(Some(meta))?;
     Ok(proxy)
+}
+
+/// The keys a `btv.qf.parse` block may set on the entry it returns. Anything else
+/// is a `BadReturn`: silently ignoring `line = 12` (for `lnum`) would leave a
+/// parser producing entries that cannot be jumped to, with nothing to say why.
+const QF_KEYS: &[&str] = &[
+    "filename", "bufnr", "module", "lnum", "end_lnum", "col", "end_col", "vcol", "nr", "pattern",
+    "text", "type", "valid",
+];
+
+/// Convert the entry table a parser returned into [`QfFields`].
+///
+/// Absent keys take their zero value; `valid` defaults to vim's rule (an entry
+/// with a line number is jumpable) so a parser that fills in `lnum` need not also
+/// say the entry is valid.
+fn qf_fields(t: Table) -> Result<QfFields, SandboxError> {
+    for pair in t.pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|e| SandboxError::Runtime(tidy(&e.to_string())))?;
+        let name = match &key {
+            Value::String(s) => s.to_string_lossy().to_string(),
+            other => format!("{other:?}"),
+        };
+        if !QF_KEYS.contains(&name.as_str()) {
+            return Err(SandboxError::BadReturn(format!(
+                "an entry with an unknown key `{name}` (expected one of {})",
+                QF_KEYS.join(", ")
+            )));
+        }
+    }
+    let text = |k: &str| -> Result<String, SandboxError> {
+        t.get::<Option<String>>(k)
+            .map(Option::unwrap_or_default)
+            .map_err(|e| SandboxError::BadReturn(format!("`{k}` is not a string ({e})")))
+    };
+    let int_or = |k: &str, d: i64| -> Result<i64, SandboxError> {
+        t.get::<Option<i64>>(k)
+            .map(|v| v.unwrap_or(d))
+            .map_err(|e| SandboxError::BadReturn(format!("`{k}` is not a number ({e})")))
+    };
+    let int = |k: &str| int_or(k, 0);
+    let flag = |k: &str| -> Result<Option<bool>, SandboxError> {
+        t.get::<Option<bool>>(k)
+            .map_err(|e| SandboxError::BadReturn(format!("`{k}` is not a boolean ({e})")))
+    };
+    let lnum = int("lnum")?;
+    Ok(QfFields {
+        filename: text("filename")?,
+        bufnr: int("bufnr")?,
+        module: text("module")?,
+        lnum,
+        end_lnum: int("end_lnum")?,
+        col: int("col")?,
+        end_col: int("end_col")?,
+        vcol: flag("vcol")?.unwrap_or(false),
+        // `-1` is "no error number" — the value `%n` leaves when it never fires.
+        nr: int_or("nr", -1)?,
+        pattern: text("pattern")?,
+        text: text("text")?,
+        typ: text("type")?,
+        valid: flag("valid")?.unwrap_or(lnum > 0),
+    })
 }
 
 /// Marshal a quickfix entry into the Lua table a `btv.qf.text` block reads.

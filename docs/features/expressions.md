@@ -17,11 +17,12 @@ btv.filetype.detect([[ ext == "h" and head:find("template", 1, true) and "cpp" o
 ```
 
 Each one is an *expression*, not a function body: it evaluates to a value, and
-that value is the answer. There is no `return`, no statements, no `end`. (The
-one exception is the frame-time paint, which is a **block** — a per-line paint
-loops over the line's matches, so it ends in its own `return`.)
+that value is the answer. There is no `return`, no statements, no `end`. (Two are
+**blocks** — the frame-time paint and the quickfix parser — because a per-line
+paint loops over the line's matches and a parser builds a record, so each ends in
+its own `return`.)
 
-## The ten surfaces
+## The eleven surfaces
 
 | Where | In scope | Returns |
 | --- | --- | --- |
@@ -35,6 +36,7 @@ loops over the line's matches, so it ends in its own `return`.)
 | `btv.complete.scorer` | `label`, `query`, `score`, `kind` | a sort key, higher first |
 | `btv.decor.expr` | `line`, `lnum` | spans to highlight (a **block**) |
 | `btv.qf.text` | `item`, `idx` | one quickfix row's text |
+| `btv.qf.parse` | `line`, `lnum` | one entry, or `nil` (a **block**) |
 
 Everything an expression needs is handed to it. That is the whole design, and
 the reason for most of what follows.
@@ -285,6 +287,41 @@ to a space, exactly as the default flattens a multi-line message.
 
 It applies to the quickfix list, every named list and every window's location
 list, and installing or clearing it re-renders the ones that are open.
+
+## Parsing build output
+
+`btv.qf.parse` turns one line of build output into a quickfix entry — the job
+`'errorformat'` does, in Lua rather than in a mini-language inherited from a
+1990s C compiler:
+
+```lua
+btv.qf.parse([[
+  local file, ln, col, msg = line:match("^(%S+)%((%d+),(%d+)%): (.*)$")
+  if not file then return nil end
+  return { filename = file, lnum = tonumber(ln), col = tonumber(col),
+           text = msg, type = msg:find("^error") and "E" or "W" }
+]])
+```
+
+The entry may set `filename`, `bufnr`, `module`, `lnum`, `end_lnum`, `col`,
+`end_col`, `vcol`, `nr`, `pattern`, `text`, `type` and `valid`. Any other key is
+an error rather than an ignored one — a parser that writes `line` where it meant
+`lnum` would otherwise quietly produce entries that cannot be jumped to.
+
+Returning `nil` declines the line, which is not the same as dropping it: like
+`'errorformat'`, a line no pattern matched is kept as an *invalid* entry carrying
+its raw text, which is what makes `:copen` show a build's prose alongside its
+errors.
+
+It applies wherever `'errorformat'` does — `:cbuffer`, `:cfile`, `:cexpr`,
+`setqflist{ lines = … }`, `:make`, `:grep` — and *replaces* that pass while it is
+installed, because two parsers disagreeing about one line has no sensible answer.
+
+**What it cannot do.** The block sees one line and carries nothing between calls,
+because the sandbox is [stateless](#expressions-are-stateless). That rules out
+errorformat's multi-line entries (`%A`/`%C`/`%Z`) and its directory stack
+(`%D`/`%X`) — exactly the features that need an accumulator. `'errorformat'` stays
+for those, and stays the default.
 
 ## What an expression can do
 

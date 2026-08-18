@@ -1674,6 +1674,10 @@ pub struct Editor {
     /// built-in `file|lnum col N| message` rendering, and is also where a failing
     /// expression lands once it is disabled.
     qf_text_fn: Option<crate::sandbox::SandboxFn>,
+    /// The compiled quickfix **line parser** (`btv.qf.parse`), called once per
+    /// line of build output wherever `'errorformat'` would be. `None` uses
+    /// `'errorformat'`, and is where a failing parser lands once it is disabled.
+    qf_parse_fn: Option<crate::sandbox::SandboxFn>,
 
     /// The pending command an [`ExprTarget::Register`] prompt has to put back on
     /// submit: entering the command line calls `reset_pending`, but vim's
@@ -2311,6 +2315,7 @@ impl Editor {
             picker_scorer: None,
             complete_scorer: None,
             qf_text_fn: None,
+            qf_parse_fn: None,
             decor_expr_fn: None,
             decor_expr_viewports: HashMap::new(),
             expr_saved_pending: None,

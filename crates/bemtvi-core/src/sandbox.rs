@@ -88,6 +88,10 @@ pub struct PaintSpan {
 /// `lnum`/`col` are vim's 1-based positions (`0` = none) and `typ` is the error
 /// type letter as a string (`"E"`/`"W"`/`"I"`/`"N"`, `""` for none) — the string
 /// form the Lua side uses, not the `u8` the core stores.
+///
+/// Coming *out* of a parser, an omitted key takes its zero value, except `valid`,
+/// which defaults to vim's rule — an entry with a line number is jumpable — so a
+/// parser that fills in `lnum` need not also say so.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QfFields {
     pub filename: String,
@@ -270,6 +274,23 @@ pub trait SandboxEngine {
         lnum: i64,
         col: i64,
     ) -> Result<String, SandboxError>;
+
+    /// Call a compiled quickfix **line parser** for one line of build output.
+    ///
+    /// `lnum` is the line's 1-based position in the output, not in any file.
+    /// `Ok(None)` when the parser declines (returns `nil`) — a normal answer,
+    /// meaning "not an error line", which the caller keeps as an *invalid* entry
+    /// carrying the raw text, the way `'errorformat'` does.
+    ///
+    /// An unknown key in the returned table is a [`SandboxError::BadReturn`]: a
+    /// parser that misspells `lnum` would otherwise silently produce entries that
+    /// cannot be jumped to.
+    fn call_qf_parse(
+        &mut self,
+        f: SandboxFn,
+        line: &str,
+        lnum: i64,
+    ) -> Result<Option<QfFields>, SandboxError>;
 
     /// Call a compiled quickfix **render** expression for one list entry.
     ///

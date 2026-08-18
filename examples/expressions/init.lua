@@ -266,6 +266,57 @@ btv.command("QfText", function(a)
 end, { nargs = "?", desc = "Toggle the custom quickfix rendering" })
 
 -- ===========================================================================
+-- 9. Parsing build output — `btv.qf.parse`, over `line` and `lnum`
+--
+--    type:  <leader>9
+--    see:   a quickfix list built from output no `'errorformat'` here reads —
+--           `sample.txt(5,1): error: one` — with the prose line kept as an
+--           unjumpable row, exactly as errorformat keeps it
+--
+--    `:QfParse off` hands the same output back to `'errorformat'`, which makes
+--    nothing of it. This is a **block**: a parser matches, then builds a record.
+--    Return `nil` to decline a line.
+--
+--    What it cannot do is what needs an accumulator — errorformat's multi-line
+--    entries (`%A`/`%C`/`%Z`) and its directory stack — because the sandbox is
+--    stateless. `'errorformat'` stays for those, and stays the default.
+
+local QF_PARSE = [[
+  local file, ln, col, kind, msg = line:match("^(%S+)%((%d+),(%d+)%): (%a+): (.*)$")
+  if not file then return nil end
+  return {
+    filename = file,
+    lnum = tonumber(ln),
+    col = tonumber(col),
+    text = msg,
+    type = kind == "error" and "E" or "W",
+  }
+]]
+
+-- The output to parse. Same three lines either way — the toggle re-populates so
+-- the difference the parser makes is on screen, not in your memory.
+local function qf_populate()
+  local file = btv.buf.name(0) or ""
+  btv.qf.setqflist({}, " ", {
+    lines = {
+      file .. "(5,1): error: one",
+      file .. "(11,1): warning: four",
+      "-- build finished with 1 error",
+    },
+  })
+  btv.qf.open()
+end
+
+btv.command("QfParse", function(a)
+  if a.fargs[1] == "off" then
+    btv.qf.parse(nil)
+  else
+    btv.qf.parse(QF_PARSE)
+  end
+  qf_populate()
+end, { nargs = "?", desc = "Toggle the Lua errorformat, and re-parse the output" })
+
+-- ===========================================================================
 -- The shortcuts. 1 and 3 put a command on the command line (an `<expr>`
 -- mapping returns keys to feed, which is the public way to produce keystrokes);
 -- the rest act directly.
@@ -300,6 +351,10 @@ btv.keymap.set("n", "<leader>8", function()
   btv.qf.text(QF_TEXT)
   btv.qf.open()
 end, { desc = "Populate and open a quickfix list, rendered by btv.qf.text" })
+btv.keymap.set("n", "<leader>9", function()
+  btv.qf.parse(QF_PARSE)
+  qf_populate()
+end, { desc = "Parse build output with btv.qf.parse" })
 
 local CHEATS = {
   "<leader>1   zM — fold (foldexpr);  zR reopens",
@@ -311,6 +366,7 @@ local CHEATS = {
   "6b          type `ofor` — the snippet row sorts last.  :CompleteScorer off",
   "<leader>7   paint every TODO/FIXME as you scroll;  :Paint off removes it",
   "<leader>8   a quickfix list with custom rows;  :QfText off restores vim's",
+  "<leader>9   parse build output in Lua;  :QfParse off hands it to errorformat",
 }
 
 btv.command("Cheat", function()

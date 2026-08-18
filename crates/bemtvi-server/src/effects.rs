@@ -971,6 +971,22 @@ impl EditHost {
         for (text, linewise) in self.lua.take_clipboard_seeds() {
             self.editor.clipboard_seed(&text, linewise);
         }
+        // The two quickfix sandbox surfaces, drained **before** the list writes
+        // below: both configure how those writes are parsed and rendered, so a
+        // single chunk that installs one and then populates a list has to see its
+        // own setting applied — `btv.qf.parse(…)` followed by `setqflist{lines=…}`
+        // is the natural way to write it, and would otherwise parse with
+        // `'errorformat'` this once.
+        //
+        // `btv.qf.parse(src|nil)` stands in for `'errorformat'` while installed;
+        // `btv.qf.text(src|nil)` re-renders every open list as it is installed, so
+        // the change is visible without waiting for a list to change.
+        if let Some(src) = self.lua.take_qf_parse() {
+            self.editor.set_qf_parse(src);
+        }
+        if let Some(src) = self.lua.take_qf_text() {
+            self.editor.set_qf_text(src);
+        }
         // `setqflist` writes: structured items, or raw lines parsed against `efm`
         // (the editor's `'errorformat'` when the op omits one). A malformed efm
         // fails loud on the message line rather than silently dropping the call.
@@ -1165,11 +1181,6 @@ impl EditHost {
         }
         if let Some(src) = self.lua.take_picker_scorer() {
             self.editor.set_picker_scorer(src);
-        }
-        // `btv.qf.text(src|nil)`: the quickfix render expression. Installing it
-        // re-renders every open list, so the change is visible at once.
-        if let Some(src) = self.lua.take_qf_text() {
-            self.editor.set_qf_text(src);
         }
         // `btv.fold.text(src|nil)`: the `'foldtext'` expression, compiled now so a
         // bad one is reported where it was configured.

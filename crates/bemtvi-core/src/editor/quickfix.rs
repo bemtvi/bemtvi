@@ -451,11 +451,14 @@ impl Editor {
         self.ex_qf_open(which, "");
     }
 
-    /// Parse `lines` against `efm` and set the list (vim's
+    /// Parse `lines` into entries and set the list (vim's
     /// `setqflist([], a, {lines, efm})` and the `:cexpr`/`:cfile` family). Returns
     /// the number of entries added, or an `E37x` error string for an invalid
-    /// `'errorformat'`. Behind `vim-regex`; without it, parsing fails loud.
-    #[cfg(feature = "vim-regex")]
+    /// `'errorformat'`.
+    ///
+    /// A `btv.qf.parse` block, if one is installed, *replaces* the `'errorformat'`
+    /// pass rather than layering on it: two parsers disagreeing about one line has
+    /// no sensible answer.
     pub fn qf_set_from_lines(
         &mut self,
         which: QfWhich,
@@ -464,8 +467,10 @@ impl Editor {
         action: QfAction,
         title: Option<String>,
     ) -> Result<usize, String> {
-        let format = Errorformat::compile(efm)?;
-        let items = format.parse(lines);
+        let items = match self.qf_parse_lua(lines) {
+            Some(items) => items,
+            None => self.qf_parse_efm(lines, efm)?,
+        };
         let n = items.len();
         if let Some(stack) = self.qf_stack_ensure(which) {
             stack.apply(items, action, title);
@@ -474,15 +479,59 @@ impl Editor {
         Ok(n)
     }
 
+    /// Parse `lines` with the installed `btv.qf.parse` block, or `None` when there
+    /// is none — and when one fails, since a failing parser is uninstalled and the
+    /// caller falls back to `'errorformat'` for the whole input.
+    ///
+    /// A line the block declines becomes an *invalid* entry carrying its raw text,
+    /// which is what `'errorformat'` does with a line no pattern matched and what
+    /// makes `:copen` show a build's prose alongside its errors.
+    fn qf_parse_lua(&mut self, lines: &[String]) -> Option<Vec<QfEntry>> {
+        let handle = self.qf_parse_fn?;
+        let mut items = Vec::with_capacity(lines.len());
+        let failure = self.with_sandbox(|_ed, sb| {
+            for (i, line) in lines.iter().enumerate() {
+                let parsed = match sb.as_mut() {
+                    Some(engine) => engine.call_qf_parse(handle, line, i as i64 + 1),
+                    None => Err(SandboxError::Unavailable),
+                };
+                match parsed {
+                    Ok(Some(fields)) => items.push(qf_entry(fields)),
+                    Ok(None) => items.push(QfEntry {
+                        text: line.clone(),
+                        nr: -1,
+                        ..QfEntry::default()
+                    }),
+                    Err(err) => return Some(err),
+                }
+            }
+            None
+        });
+
+        // Loud once, then off: the block runs per output line, so a failure on line
+        // 3 of a 4000-line build must not report 3998 more times.
+        if let Some(err) = failure {
+            self.echo(format!(
+                "btv.qf.parse: {err} — 'errorformat' parsing restored"
+            ));
+            if let Some(h) = self.qf_parse_fn.take() {
+                self.sandbox_release(h);
+            }
+            return None;
+        }
+        Some(items)
+    }
+
+    /// Parse `lines` against `efm` with the vendored vim regexp engine. Behind
+    /// `vim-regex`; without it this fails loud — but a `btv.qf.parse` block, which
+    /// needs no regexp engine at all, still works in such a build.
+    #[cfg(feature = "vim-regex")]
+    fn qf_parse_efm(&mut self, lines: &[String], efm: &str) -> Result<Vec<QfEntry>, String> {
+        Ok(Errorformat::compile(efm)?.parse(lines))
+    }
+
     #[cfg(not(feature = "vim-regex"))]
-    pub fn qf_set_from_lines(
-        &mut self,
-        _which: QfWhich,
-        _lines: &[String],
-        _efm: &str,
-        _action: QfAction,
-        _title: Option<String>,
-    ) -> Result<usize, String> {
+    fn qf_parse_efm(&mut self, _lines: &[String], _efm: &str) -> Result<Vec<QfEntry>, String> {
         Err("E: 'errorformat' parsing requires the vim-regex engine (not built)".to_string())
     }
 
@@ -1357,6 +1406,27 @@ fn qf_file_key(e: &QfEntry) -> Option<String> {
     e.filename
         .clone()
         .or_else(|| (e.bufnr > 0).then(|| format!("\0buf{}", e.bufnr)))
+}
+
+/// Build a list entry from what a `btv.qf.parse` block returned. The inverse of
+/// [`qf_fields`], with the same one conversion: the error type is a string in Lua
+/// and a byte here.
+fn qf_entry(f: QfFields) -> QfEntry {
+    QfEntry {
+        filename: (!f.filename.is_empty()).then_some(f.filename),
+        bufnr: f.bufnr as i32,
+        module: f.module,
+        lnum: f.lnum.max(0) as usize,
+        end_lnum: f.end_lnum.max(0) as usize,
+        col: f.col.max(0) as usize,
+        end_col: f.end_col.max(0) as usize,
+        vcol: f.vcol,
+        nr: f.nr as i32,
+        pattern: f.pattern,
+        text: f.text,
+        typ: f.typ.bytes().next().unwrap_or(0),
+        valid: f.valid,
+    }
 }
 
 /// A quickfix entry in the shape a sandbox expression sees it — the keys

@@ -2137,3 +2137,49 @@ async fn the_docs_float_tracks_the_wildmenu_box() {
         "the docs float sits flush against the box's right border"
     );
 }
+
+/// The number of tab cells in a frame's `tabline` (empty when only one tab is open,
+/// since `'showtabline'` hides it) — the marker for "the tab layout of this frame".
+fn tab_cells(map: &[(Value, Value)]) -> usize {
+    match map_get(map, "tabline") {
+        Some(Value::Array(tabs)) => tabs.len(),
+        _ => 0,
+    }
+}
+
+/// Accepting a wildmenu row whose command opens a **new tab** must not strand the docs
+/// float in the tab it was opened in. The float lives in the old tab's (now stashed)
+/// window tree, so the close that runs after the command must reach across tabs —
+/// otherwise the registry entry is dropped while the window survives, and the orphan
+/// re-appears, undismissable, when the user comes back to that tab.
+#[tokio::test]
+async fn accepting_a_row_whose_command_opens_a_tab_leaves_no_orphan_docs_float() {
+    let dir = temp_dir("cmdcomplete_docs_orphan");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    feed(&rpc, ":tabe<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    wait_redraw(&mut incoming, |m| {
+        menu_sel_is(m, 0, true) && cmdline_docs_window(m).is_some()
+    })
+    .await;
+
+    // <CR> accepts the row and runs the command, which opens a second tab page.
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    let map = wait_redraw(&mut incoming, |m| tab_cells(m) == 2).await;
+    assert!(
+        cmdline_docs_window(&map).is_none(),
+        "the docs float is gone in the new tab"
+    );
+
+    // Back in the original tab, the float must be gone there too.
+    feed(&rpc, ":tabclose<CR>");
+    barrier(&rpc).await;
+    let map = wait_redraw(&mut incoming, |m| tab_cells(m) == 0).await;
+    assert!(
+        cmdline_docs_window(&map).is_none(),
+        "no orphaned docs float survives in the tab the wildmenu was open in"
+    );
+}

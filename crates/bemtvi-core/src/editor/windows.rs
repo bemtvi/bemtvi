@@ -2037,6 +2037,42 @@ impl Editor {
         self.remove_window(id)
     }
 
+    /// Close **float** window `id` wherever it lives: the live tree (the ordinary
+    /// [`close_window_by_id`](Self::close_window_by_id) path) *or* any parked one —
+    /// an inactive tab's stashed tree, or the active tab of an unfocused layer.
+    ///
+    /// A float opened in one tab outlives a switch away from it (the tree it sits in
+    /// is parked wholesale), so a close that only ever consults `self.windows` silently
+    /// no-ops and strands the float in the tab it was opened in — where it re-appears,
+    /// owned by nothing and dismissable by nothing, the moment the user comes back.
+    /// That is exactly what happens to the doc floats, whose owner (the completion /
+    /// wildmenu popup) tears them down *after* the accepted command may already have
+    /// opened a tab. Returns whether a window actually closed. Floats only: a parked
+    /// *tiled* window is left alone (removing it would have to collapse its split and
+    /// re-lay a tree that isn't live).
+    pub(crate) fn close_float_in_any_tree(&mut self, id: WindowId) -> bool {
+        if self.windows.windows.contains_key(&id) {
+            return self.close_window_by_id(id, false);
+        }
+        for tree in self.parked_trees_mut() {
+            if tree.windows.get(&id).is_none_or(|w| w.float.is_none()) {
+                continue;
+            }
+            tree.windows.remove(&id);
+            tree.floats.retain(|f| *f != id);
+            // A doc float is never focused (opened with `enter = false`), but a parked
+            // tree pointing `current` at the window we just freed would panic the next
+            // time that tab is entered — re-point it at a surviving tiled window.
+            if tree.current == id {
+                if let Some(w) = tree.leaves().first().copied() {
+                    tree.current = w;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     /// `nvim_open_win` (split form) — split the focused window and bind the new,
     /// now-focused window to `buf`. Returns the new window's id. `vertical`
     /// chooses a `:vsplit` over a `:split`.

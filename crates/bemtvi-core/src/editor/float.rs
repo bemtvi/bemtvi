@@ -813,7 +813,7 @@ impl Editor {
     pub fn close_doc_float(&mut self, name: &str) -> bool {
         if let Some(pos) = self.doc_float_wins.iter().position(|(n, _)| n == name) {
             let (_, win) = self.doc_float_wins.remove(pos);
-            return self.close_window_by_id(win, false);
+            return self.close_float_in_any_tree(win);
         }
         false
     }
@@ -827,7 +827,7 @@ impl Editor {
         }
         let wins: Vec<WindowId> = self.doc_float_wins.drain(..).map(|(_, w)| w).collect();
         for win in wins {
-            self.close_window_by_id(win, false);
+            self.close_float_in_any_tree(win);
         }
         true
     }
@@ -863,7 +863,7 @@ impl Editor {
                 if keep.contains(&name.as_str()) {
                     Some((name, win))
                 } else {
-                    self.close_window_by_id(win, false);
+                    self.close_float_in_any_tree(win);
                     closed = true;
                     None
                 }

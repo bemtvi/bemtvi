@@ -71,7 +71,7 @@ native edit-host split uses, so only the transport differs:
 
 ```sh
 cd crates/bemtvi-edithost
-./build.sh                  # cargo → emcc link → dist/eh.{mjs,wasm} + tree-sitter assets
+./build.sh                  # cargo → em++ link → dist/eh.{mjs,wasm} + tree-sitter assets
 cd web && npm install       # once: Playwright + chromium
 node serve.mjs              # a cross-origin-isolated (COOP/COEP) dev server
 # open http://localhost:8088/web/

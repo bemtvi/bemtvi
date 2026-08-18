@@ -24,6 +24,12 @@ command -v emcc >/dev/null 2>&1 || {
   echo "error: emcc not found — install emsdk or the system emscripten package first" >&2
   exit 1
 }
+# The final link runs through em++ (see step 2 for why); it ships beside emcc in every
+# layout, so a missing one means a half-installed toolchain rather than an old version.
+command -v em++ >/dev/null 2>&1 || {
+  echo "error: em++ not found beside emcc — the emscripten install is incomplete" >&2
+  exit 1
+}
 
 # 1. Staticlib: Rust core + Lua + the server tick, plus the lua54/regex C, as wasm
 #    objects. This crate's bemtvi-server dep is `default-features = false`, so the
@@ -49,8 +55,18 @@ REGEX_A=$(newest '*/out/libbemtvi_regex_c.a')
 # 2. Final link → an importable ES module. Archive order: the edit-host lib first, then
 #    the C libs it depends on (wasm-ld pulls members to satisfy earlier undefineds).
 #    --no-entry: this is a library, no main().
+#
+#    Linked with **em++**, not emcc, even though nothing here is C++: rustc's wasm-EH
+#    objects reference the `__cpp_exception` tag, and that tag is defined in
+#    **libc++abi** (`system/lib/libcxxabi/src/__cpp_exception.S`) — which emscripten
+#    links only when `LINK_AS_CXX` is set, i.e. when linking via `em++`. It used to be
+#    implied for `emcc` too; emscripten 6.0.6 disabled `DEFAULT_TO_CXX` ("em++ is now
+#    required when linking C++ programs, matching clang and gcc"), and the link began
+#    failing with `undefined symbol: __cpp_exception` out of mlua's codegen units.
+#    `emcc -sDEFAULT_TO_CXX` is the equivalent escape hatch; `em++` is the way upstream
+#    now spells it, and it works on either side of that release.
 mkdir -p dist
-emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
+em++ "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -fwasm-exceptions \
   --no-entry \
   --js-library web/eh-lib.js \

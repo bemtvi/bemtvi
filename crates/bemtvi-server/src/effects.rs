@@ -1166,6 +1166,11 @@ impl EditHost {
         if let Some(src) = self.lua.take_picker_scorer() {
             self.editor.set_picker_scorer(src);
         }
+        // `btv.qf.text(src|nil)`: the quickfix render expression. Installing it
+        // re-renders every open list, so the change is visible at once.
+        if let Some(src) = self.lua.take_qf_text() {
+            self.editor.set_qf_text(src);
+        }
         // `btv.fold.text(src|nil)`: the `'foldtext'` expression, compiled now so a
         // bad one is reported where it was configured.
         if let Some(src) = self.lua.take_fold_text() {

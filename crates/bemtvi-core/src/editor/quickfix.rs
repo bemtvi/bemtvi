@@ -18,6 +18,7 @@
 
 use super::*;
 use crate::buffer::Buffer;
+use crate::sandbox::{QfFields, SandboxError};
 use std::path::{Path, PathBuf};
 
 /// How a populate request combines with the existing list.
@@ -737,8 +738,91 @@ impl Editor {
         }
     }
 
-    /// `which`'s display text: one `file|lnum col N| message` line per entry.
-    fn qf_render_text(&self, which: QfWhich) -> String {
+    /// Every list that currently has a display buffer: the quickfix list, each
+    /// named list, and each window's location list. The set `btv.qf.text` has to
+    /// re-render when it is installed or cleared.
+    fn qf_open_lists(&self) -> Vec<QfWhich> {
+        let mut out = Vec::new();
+        if self.qf_bufnr.is_some() {
+            out.push(QfWhich::Quickfix);
+        }
+        let mut named: Vec<_> = self
+            .named_lists
+            .iter()
+            .filter(|(_, nl)| nl.display_bufnr.is_some())
+            .map(|(&id, _)| id)
+            .collect();
+        // The registry is a map, so fix an order rather than rendering in whatever
+        // order the hash gives — the echo of a failing block must be reproducible.
+        named.sort_unstable_by_key(|id| id.0);
+        out.extend(named.into_iter().map(QfWhich::Named));
+        for w in self.window_ids() {
+            if self
+                .window(w)
+                .is_some_and(|win| win.loclist_bufnr.is_some())
+            {
+                out.push(QfWhich::Location(w));
+            }
+        }
+        out
+    }
+
+    /// Re-render every open list — how installing or clearing `btv.qf.text`
+    /// becomes visible without waiting for a list to change.
+    pub(crate) fn qf_refresh_all(&mut self) {
+        for which in self.qf_open_lists() {
+            self.qf_refresh_window(which);
+        }
+    }
+
+    /// `which`'s display text: one line per entry.
+    ///
+    /// The built-in rendering is vim's `file|lnum col N| message`; a `btv.qf.text`
+    /// block replaces it. Either way the result is **one row per entry** — a
+    /// custom row's embedded newlines are flattened, exactly as the default
+    /// flattens a multi-line message — because the row index *is* the entry index
+    /// for `<CR>`, `:cc` and the severity paint.
+    fn qf_render_text(&mut self, which: QfWhich) -> String {
+        let Some(handle) = self.qf_text_fn else {
+            return self.qf_render_default(which);
+        };
+        let items: Vec<QfFields> = self.qf_cur(which).items.iter().map(qf_fields).collect();
+        let mut rows = Vec::with_capacity(items.len());
+        let failure = self.with_sandbox(|_ed, sb| {
+            for (i, item) in items.iter().enumerate() {
+                let rendered = match sb.as_mut() {
+                    Some(engine) => engine.call_qf_text(handle, item, i as i64 + 1),
+                    None => Err(SandboxError::Unavailable),
+                };
+                match rendered {
+                    Ok(row) => rows.push(row.replace('\n', " ")),
+                    Err(err) => return Some(err),
+                }
+            }
+            None
+        });
+
+        // Loud once, then off: the block runs per entry, so a list of 5000 would
+        // otherwise report 5000 times. Every open list goes back to the default,
+        // not just this one.
+        if let Some(err) = failure {
+            self.echo(format!("btv.qf.text: {err} — default rendering restored"));
+            if let Some(h) = self.qf_text_fn.take() {
+                self.sandbox_release(h);
+            }
+            for other in self.qf_open_lists() {
+                if other != which {
+                    self.qf_refresh_window(other);
+                }
+            }
+            return self.qf_render_default(which);
+        }
+        rows.join("\n")
+    }
+
+    /// `which`'s display text in the built-in format: one
+    /// `file|lnum col N| message` line per entry.
+    fn qf_render_default(&self, which: QfWhich) -> String {
         self.qf_cur(which)
             .items
             .iter()
@@ -1273,6 +1357,31 @@ fn qf_file_key(e: &QfEntry) -> Option<String> {
     e.filename
         .clone()
         .or_else(|| (e.bufnr > 0).then(|| format!("\0buf{}", e.bufnr)))
+}
+
+/// A quickfix entry in the shape a sandbox expression sees it — the keys
+/// `btv.qf.getqflist()` returns. The one conversion is the error type, which the
+/// core stores as a byte and Lua reads as a (possibly empty) string.
+fn qf_fields(e: &QfEntry) -> QfFields {
+    QfFields {
+        filename: e.filename.clone().unwrap_or_default(),
+        bufnr: e.bufnr as i64,
+        module: e.module.clone(),
+        lnum: e.lnum as i64,
+        end_lnum: e.end_lnum as i64,
+        col: e.col as i64,
+        end_col: e.end_col as i64,
+        vcol: e.vcol,
+        nr: e.nr as i64,
+        pattern: e.pattern.clone(),
+        text: e.text.clone(),
+        typ: if e.typ == 0 {
+            String::new()
+        } else {
+            (e.typ as char).to_string()
+        },
+        valid: e.valid,
+    }
 }
 
 /// Render one quickfix entry as a `:copen` line: `file|lnum col N| message`

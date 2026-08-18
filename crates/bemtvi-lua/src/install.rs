@@ -4276,6 +4276,18 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._qf_set_text(src|nil)`: the native setter behind `btv.qf.text`. Source
+    // rather than a function, for the same reason `btv.picker.scorer` takes
+    // source: the expression runs in the sandbox, a separate VM.
+    let sh = shared.clone();
+    btv.set(
+        "_qf_set_text",
+        lua.create_function(move |_, src: Option<String>| {
+            sh.borrow_mut().qf_text = Some(src);
+            Ok(())
+        })?,
+    )?;
+
     // `btv._fold_set_text(src|nil)`: the native setter behind `btv.fold.text`.
     // Source rather than a function, for the same reason `btv.picker.scorer` takes
     // source: the expression runs in the sandbox, a separate VM.

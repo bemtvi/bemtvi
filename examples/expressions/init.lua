@@ -236,6 +236,36 @@ btv.command("Paint", function(a)
 end, { nargs = "?", desc = "Toggle the frame-time paint" })
 
 -- ===========================================================================
+-- 8. Quickfix rows — `btv.qf.text`, over `item` and `idx`
+--
+--    type:  <leader>8
+--    see:   a quickfix list whose rows read `1. [E] one — sample.txt:5`
+--           instead of vim's `sample.txt|5 col 1| one`
+--
+--    `:QfText off` restores the built-in rendering; the list stays put and
+--    re-renders under you. This is vim's `'quickfixtextfunc'`, and the first
+--    surface handed a **record** rather than a list of scalars: `item` is the
+--    entry, keyed exactly as `btv.qf.getqflist()` returns it, and `idx` is its
+--    1-based position.
+--
+--    `<CR>` on a row still jumps to its entry — one row per entry is a hard
+--    rule, so a newline inside a rendered row is flattened to a space.
+
+local QF_TEXT = [[
+  idx .. ". [" .. (item.type ~= "" and item.type or "-") .. "] "
+    .. item.text .. " — " .. item.filename:match("[^/]+$") .. ":" .. item.lnum
+]]
+
+btv.command("QfText", function(a)
+  -- Spelled out rather than `cond and nil or X`, which in Lua always yields `X`.
+  if a.fargs[1] == "off" then
+    btv.qf.text(nil)
+  else
+    btv.qf.text(QF_TEXT)
+  end
+end, { nargs = "?", desc = "Toggle the custom quickfix rendering" })
+
+-- ===========================================================================
 -- The shortcuts. 1 and 3 put a command on the command line (an `<expr>`
 -- mapping returns keys to feed, which is the public way to produce keystrokes);
 -- the rest act directly.
@@ -260,6 +290,16 @@ end, { desc = "Open the demo picker" })
 btv.keymap.set("n", "<leader>7", function()
   btv.decor.expr(PAINT)
 end, { desc = "Install the frame-time paint" })
+btv.keymap.set("n", "<leader>8", function()
+  local file = btv.buf.name(0) or ""
+  btv.qf.setqflist({
+    { filename = file, lnum = 5, col = 1, text = "one", type = "E" },
+    { filename = file, lnum = 11, col = 1, text = "four", type = "W" },
+    { filename = file, lnum = 17, col = 1, text = "six" },
+  }, " ")
+  btv.qf.text(QF_TEXT)
+  btv.qf.open()
+end, { desc = "Populate and open a quickfix list, rendered by btv.qf.text" })
 
 local CHEATS = {
   "<leader>1   zM — fold (foldexpr);  zR reopens",
@@ -270,6 +310,7 @@ local CHEATS = {
   "6           no mapping — type o<C-r>=lnum * 10<CR><Esc> yourself",
   "6b          type `ofor` — the snippet row sorts last.  :CompleteScorer off",
   "<leader>7   paint every TODO/FIXME as you scroll;  :Paint off removes it",
+  "<leader>8   a quickfix list with custom rows;  :QfText off restores vim's",
 }
 
 btv.command("Cheat", function()

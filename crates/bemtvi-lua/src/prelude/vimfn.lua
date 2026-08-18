@@ -879,6 +879,57 @@ function btv.qf.lnewer(count)
   vim.cmd(count and ("lnewer " .. count) or "lnewer")
 end
 
+-- `btv.qf.text(src)`: install a custom rendering for the rows of the quickfix
+-- window, or restore the built-in one with `nil`. vim spells this
+-- `'quickfixtextfunc'`.
+--
+-- `src` is a string of Lua *source* — an expression, not a function value —
+-- because it runs in the bounded compute sandbox: a second, pure VM with a
+-- wall-clock deadline, no editor state and no `btv.*`. A closure cannot cross
+-- between VMs, so the source crosses instead and is compiled there.
+--
+-- Two names are in scope, and the expression returns the row's text:
+--
+-- ```
+-- item    the entry, as a table (the keys `btv.qf.getqflist()` returns)
+-- idx     its 1-based position in the list
+-- ```
+--
+-- `item` carries `filename`, `bufnr`, `module`, `lnum`, `end_lnum`, `col`,
+-- `end_col`, `vcol`, `nr`, `pattern`, `text`, `type` and `valid`. The built-in
+-- rendering is vim's `file|lnum col N| message`:
+--
+-- ```lua
+-- -- the message first, the location trailing
+-- btv.qf.text([[ item.text .. "  (" .. item.filename .. ":" .. item.lnum .. ")" ]])
+--
+-- -- number the rows, and lead with the severity letter
+-- btv.qf.text([[ idx .. ". [" .. (item.type ~= "" and item.type or "-") .. "] " .. item.text ]])
+--
+-- btv.qf.text(nil)   -- back to the default rendering
+-- ```
+--
+-- One row per entry is a hard rule — the row index is the entry index for `<CR>`,
+-- `:cc` and the severity colouring — so a newline inside a rendered row is
+-- flattened to a space, exactly as the default flattens a multi-line message.
+--
+-- It applies to the quickfix list, every named list (`btv.qf.list`) and every
+-- window's location list, and installing or clearing it re-renders the ones that
+-- are open. The severity colouring (a row tinted by its `type`) is unaffected: it
+-- paints whole rows, whatever text they hold.
+--
+-- The sandbox is **stateless**: nothing carries from one call to the next, and
+-- assigning a global raises. An expression that errors, exceeds its deadline, or
+-- returns a non-string reports **once** and is then uninstalled, with every open
+-- list restored to the default rendering.
+function btv.qf.text(src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv.qf.text: expected a string of Lua source (or nil), got " .. type(src), 2)
+  end
+  btv.qf._text_src = src
+  btv._qf_set_text(src)
+end
+
 -- btv._qf_make(cmd, efm, title, open, jump, loclist_win): the async :make / :grep
 -- producer (dispatched from the server, which already expanded
 -- 'makeprg'/'grepprg' and merged stderr into stdout via the shell). Spawn `cmd`

@@ -118,6 +118,30 @@ impl Editor {
 }
 
 impl Editor {
+    /// Install (or clear, with `None`) the quickfix **render** expression
+    /// (`btv.qf.text`): a sandbox expression over `item` (one entry, as a table)
+    /// and `idx` (its 1-based position) returning that row's text.
+    ///
+    /// An expression rather than a block, like its sibling `btv.fold.text`:
+    /// rendering one record as one line is what an expression is for. Compiled
+    /// here, so a bad one is reported where it was configured. Every open list is
+    /// re-rendered immediately, so installing or clearing it is visible without
+    /// touching the list.
+    pub fn set_qf_text(&mut self, src: Option<String>) {
+        if let Some(old) = self.qf_text_fn.take() {
+            self.sandbox_release(old);
+        }
+        if let Some(src) = src {
+            match self.sandbox_compile(&src, &["item", "idx"]) {
+                Ok(h) => self.qf_text_fn = Some(h),
+                Err(err) => self.echo(format!("btv.qf.text: {err}")),
+            }
+        }
+        self.qf_refresh_all();
+    }
+}
+
+impl Editor {
     /// Install (or clear, with `None`) the frame-time paint block
     /// (`btv.decor.expr`): a sandbox **block** over `line` and `lnum` returning the
     /// spans to highlight on that line.

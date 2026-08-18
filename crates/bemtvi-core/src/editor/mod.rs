@@ -1669,6 +1669,12 @@ pub struct Editor {
     /// expression was disabled.
     complete_scorer: Option<crate::sandbox::SandboxFn>,
 
+    /// The compiled quickfix **render** expression (`btv.qf.text`), called once
+    /// per entry whenever a list's display buffer is rebuilt. `None` uses the
+    /// built-in `file|lnum col N| message` rendering, and is also where a failing
+    /// expression lands once it is disabled.
+    qf_text_fn: Option<crate::sandbox::SandboxFn>,
+
     /// The pending command an [`ExprTarget::Register`] prompt has to put back on
     /// submit: entering the command line calls `reset_pending`, but vim's
     /// `"=…<CR>p` needs the count and `register = Some('=')` still armed when the
@@ -2304,6 +2310,7 @@ impl Editor {
             sandbox: None,
             picker_scorer: None,
             complete_scorer: None,
+            qf_text_fn: None,
             decor_expr_fn: None,
             decor_expr_viewports: HashMap::new(),
             expr_saved_pending: None,

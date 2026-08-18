@@ -21,7 +21,7 @@ that value is the answer. There is no `return`, no statements, no `end`. (The
 one exception is the frame-time paint, which is a **block** — a per-line paint
 loops over the line's matches, so it ends in its own `return`.)
 
-## The nine surfaces
+## The ten surfaces
 
 | Where | In scope | Returns |
 | --- | --- | --- |
@@ -34,6 +34,7 @@ loops over the line's matches, so it ends in its own `return`.)
 | `btv.picker.scorer` | `label`, `query`, `score` | a sort key, higher first |
 | `btv.complete.scorer` | `label`, `query`, `score`, `kind` | a sort key, higher first |
 | `btv.decor.expr` | `line`, `lnum` | spans to highlight (a **block**) |
+| `btv.qf.text` | `item`, `idx` | one quickfix row's text |
 
 Everything an expression needs is handed to it. That is the whole design, and
 the reason for most of what follows.
@@ -260,6 +261,30 @@ it needs git, an LSP reply, or anything the line alone cannot tell it.
 The paint is evaluated over each window's visible rows and memoized on the
 viewport, so a steady screen costs nothing and only scrolling, resizing or editing
 re-evaluates.
+
+## Quickfix rows
+
+`btv.qf.text` renders the rows of the quickfix window — vim's
+`'quickfixtextfunc'`. It is the one surface handed a **record**: `item` is the
+entry, keyed exactly as `btv.qf.getqflist()` returns it, and `idx` is its 1-based
+position.
+
+```lua
+-- the message first, the location trailing
+btv.qf.text([[ item.text .. "  (" .. item.filename .. ":" .. item.lnum .. ")" ]])
+
+btv.qf.text(nil)   -- back to vim's `file|lnum col N| message`
+```
+
+`item` carries `filename`, `bufnr`, `module`, `lnum`, `end_lnum`, `col`,
+`end_col`, `vcol`, `nr`, `pattern`, `text`, `type` and `valid`.
+
+One row per entry is a hard rule — the row index *is* the entry index for `<CR>`,
+`:cc` and the severity colouring — so a newline inside a rendered row is flattened
+to a space, exactly as the default flattens a multi-line message.
+
+It applies to the quickfix list, every named list and every window's location
+list, and installing or clearing it re-renders the ones that are open.
 
 ## What an expression can do
 

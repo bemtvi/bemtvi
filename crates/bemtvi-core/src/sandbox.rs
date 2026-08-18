@@ -78,6 +78,33 @@ pub struct PaintSpan {
     pub group: String,
 }
 
+/// One quickfix entry as a sandbox expression sees it.
+///
+/// The field names are the keys `btv.qf.getqflist()` already returns, so a render
+/// block reads the vocabulary a plugin knows rather than a third spelling of an
+/// entry, and it travels in **both** directions: a `btv.qf.text` block is handed
+/// one, a `btv.qf.parse` block returns one.
+///
+/// `lnum`/`col` are vim's 1-based positions (`0` = none) and `typ` is the error
+/// type letter as a string (`"E"`/`"W"`/`"I"`/`"N"`, `""` for none) — the string
+/// form the Lua side uses, not the `u8` the core stores.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QfFields {
+    pub filename: String,
+    pub bufnr: i64,
+    pub module: String,
+    pub lnum: i64,
+    pub end_lnum: i64,
+    pub col: i64,
+    pub end_col: i64,
+    pub vcol: bool,
+    pub nr: i64,
+    pub pattern: String,
+    pub text: String,
+    pub typ: String,
+    pub valid: bool,
+}
+
 /// How many surviving rows a picker re-ranker is applied to, at most.
 ///
 /// The scorer runs on the *filtered* set, never `all_items` — but a loose query
@@ -242,6 +269,18 @@ pub trait SandboxEngine {
         line: &str,
         lnum: i64,
         col: i64,
+    ) -> Result<String, SandboxError>;
+
+    /// Call a compiled quickfix **render** expression for one list entry.
+    ///
+    /// `item` is marshalled into a Lua table keyed as [`QfFields`] documents;
+    /// `idx` is the entry's 1-based position in the list, so a block can number
+    /// its rows. Returns the text of that row in the `:copen` window.
+    fn call_qf_text(
+        &mut self,
+        f: SandboxFn,
+        item: &QfFields,
+        idx: i64,
     ) -> Result<String, SandboxError>;
 
     /// Drop a compiled chunk. Releasing an unknown handle is a no-op.

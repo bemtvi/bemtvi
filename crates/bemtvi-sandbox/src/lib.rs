@@ -30,7 +30,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
-use bemtvi_core::sandbox::{PaintSpan, SandboxEngine, SandboxError, SandboxFn, CALL_DEADLINE};
+use bemtvi_core::sandbox::{
+    PaintSpan, QfFields, SandboxEngine, SandboxError, SandboxFn, CALL_DEADLINE,
+};
 use mlua::{Lua, Table, Value, VmState};
 
 /// How often the deadline hook runs, in VM instructions.
@@ -378,6 +380,20 @@ impl SandboxEngine for LuaSandbox {
         text_result(result.map_err(Self::runtime_err)?)
     }
 
+    fn call_qf_text(
+        &mut self,
+        f: SandboxFn,
+        item: &QfFields,
+        idx: i64,
+    ) -> Result<String, SandboxError> {
+        let func = self.lookup(f, "quickfix text")?;
+        let table = qf_table(&self.lua, item)?;
+        self.deadline.set(Some(Instant::now() + CALL_DEADLINE));
+        let result: Result<Value, mlua::Error> = func.call((table, idx));
+        self.deadline.set(None);
+        text_result(result.map_err(Self::runtime_err)?)
+    }
+
     fn release(&mut self, f: SandboxFn) {
         self.fns.remove(&f.0);
     }
@@ -415,6 +431,32 @@ fn read_only(lua: &Lua, inner: Table) -> mlua::Result<Table> {
     meta.set("__metatable", false)?;
     proxy.set_metatable(Some(meta))?;
     Ok(proxy)
+}
+
+/// Marshal a quickfix entry into the Lua table a `btv.qf.text` block reads.
+///
+/// The keys are exactly the ones `btv.qf.getqflist()` returns — including the
+/// `type` spelling for the error letter — so the two surfaces cannot drift into
+/// different names for the same field.
+fn qf_table(lua: &Lua, item: &QfFields) -> Result<Table, SandboxError> {
+    let build = || -> mlua::Result<Table> {
+        let t = lua.create_table()?;
+        t.set("filename", item.filename.as_str())?;
+        t.set("bufnr", item.bufnr)?;
+        t.set("module", item.module.as_str())?;
+        t.set("lnum", item.lnum)?;
+        t.set("end_lnum", item.end_lnum)?;
+        t.set("col", item.col)?;
+        t.set("end_col", item.end_col)?;
+        t.set("vcol", item.vcol)?;
+        t.set("nr", item.nr)?;
+        t.set("pattern", item.pattern.as_str())?;
+        t.set("text", item.text.as_str())?;
+        t.set("type", item.typ.as_str())?;
+        t.set("valid", item.valid)?;
+        Ok(t)
+    };
+    build().map_err(|e| SandboxError::Runtime(tidy(&e.to_string())))
 }
 
 /// Convert the list a paint block returned into [`PaintSpan`]s.

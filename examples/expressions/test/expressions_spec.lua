@@ -189,6 +189,25 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(#t:highlights(1)).to_be(0)
   end)
 
+  -- Demo 8. The quickfix window's rows are buffer text, so `t:lines()` reads
+  -- them once the list is open and focused.
+  btv.test.it("demo 8 — the quickfix rows follow btv.qf.text", function(t)
+    open(t)
+    t:feed("<Space>8")
+    local rows = t:lines()
+    btv.test.expect(rows[1]).to_be("1. [E] one — sample.txt:5")
+    btv.test.expect(rows[2]).to_be("2. [W] four — sample.txt:11")
+    btv.test.expect(rows[3]).to_be("3. [-] six — sample.txt:17")
+  end)
+
+  btv.test.it("demo 8 — :QfText off restores vim's rendering in place", function(t)
+    open(t)
+    t:feed("<Space>8")
+    btv.test.expect(t:lines()[1]).to_contain("1. [E] one")
+    t:cmd("QfText off")
+    btv.test.expect(t:lines()[1]).to_contain("|5 col 1| one")
+  end)
+
   btv.test.it(":Cheat opens its float", function(t)
     open(t)
     t:cmd("Cheat")

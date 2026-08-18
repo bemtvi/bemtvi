@@ -755,3 +755,184 @@ steady-screen guard from 0.26s to 4.95s against a 55ms baseline. Five notes.
 - **`set_ui_mirror` outgrew clippy's argument limit** at eight, which was the
   nudge to give it a `UiMirror` struct: every field is a different projection of
   the same frame, and the test framework's accessors map onto them one for one.
+
+## Phase 7 — a table *param*: `btv.qf.text`
+
+### The gap
+
+Phase 6 taught the seam to return a table. The other direction — handing an
+expression a *record* rather than a list of scalars — is still missing, and the
+surface that wants it is the one vim spells `'quickfixtextfunc'`.
+
+Today `qf_render_line` is a hardcoded `file|lnum col N| message`, vim's default
+and nothing else. It is the right default and the wrong only-option: a `:grep`
+list wants the match text first, a diagnostics list wants the severity letter, a
+list of test failures wants neither a column nor a `|`. Every one of those is a
+pure function of one entry, which is exactly what the sandbox is for.
+
+### The seam
+
+One addition, and it deliberately reuses `compile_expr` — a render is naturally a
+single expression, like its sibling `btv.fold.text`:
+
+- **`call_qf_text(f, item, idx) -> String`**, where `item` is a
+  [`QfFields`] record marshalled into a Lua table.
+
+`QfFields` carries the keys `btv.qf.getqflist()` already returns — `filename`,
+`bufnr`, `module`, `lnum`, `end_lnum`, `col`, `end_col`, `vcol`, `nr`, `pattern`,
+`text`, `type`, `valid` — so what a render block reads is the vocabulary a
+plugin already knows, rather than a third spelling of an entry. It is defined
+once and used in *both* directions: Phase 8's parser returns one.
+
+### The surface
+
+```lua
+btv.qf.text([[ item.filename .. ":" .. item.lnum .. "  " .. item.text ]])
+btv.qf.text(nil)   -- back to the default rendering
+```
+
+`idx` is the entry's 1-based position, so a block can number its rows.
+
+The severity paint (`qf_paint_severity`, which colours a row from its `type`)
+keeps working unchanged: it paints whole rows, whatever text they hold.
+
+### Failure
+
+Loud once, then uninstall. The render runs per entry on every list refresh, so a
+block that errors on entry 300 of 5000 must not report 4700 times. The list is
+re-rendered with the default immediately after.
+
+### Testing
+
+`crates/bemtvi-server/tests/qf_text.rs`: the rendered `:copen` buffer follows the
+block, every documented key is readable off `item`, `idx` counts entries,
+uninstalling restores the default, the severity colouring still lands on the
+custom rows, a location list and a named list use it too, and each failure mode
+reports once and restores the default.
+
+### Outcome
+
+Shipped as planned: 17 new black-box tests (`tests/qf_text.rs`), 2 new example
+specs, full suite **4051 passed / 0 failed**. Mutation-tested — forcing the render
+back to the default fails 14 of the 17. Three notes.
+
+- **The report of a failure during `:copen` never reaches the message line.**
+  Opening the quickfix dock clears it, as every dock open does, so the echo is
+  gone by the time the frame is projected. It is still *recorded*, which is what
+  `:messages` is for, and a test pins that; the failures a user actually meets
+  (installing a render while looking at a list, a list updating under one) report
+  on the message line normally, and those are the tests that assert on it.
+- **A failure restores every open list, not just the one that failed.** The block
+  is uninstalled the moment it errors, so the lists rendered *after* it in the
+  same pass would come out right anyway — but a list rendered *before* it, or in
+  an earlier refresh, would keep its custom text. `qf_open_lists()` exists to make
+  "loud once, then off" mean the whole editor, not one window.
+- **`cond and nil or X` bit the example, not the code.** The `:QfText off` toggle
+  read `btv.qf.text(a.fargs[1] == "off" and nil or QF_TEXT)`, which in Lua always
+  yields `QF_TEXT`. The spec caught it, which is the entire argument for specs
+  that drive the very keys the notes tell a reader to press.
+
+## Phase 8 — a table *return*: `btv.qf.parse`, an `errorformat` in Lua
+
+### The gap
+
+`'errorformat'` is a mini-language — `%f:%l:%c: %m`, `%A`, `%C`, `%Z`, `%+G`,
+`%D` — inherited from a 1990s C compiler's output and unchanged since. It is
+excellent at what it was built for and hostile to everything else, and bemtvi
+pays for a whole vendored C regexp engine to run it.
+
+A build tool's output line is a string; an entry is a record. Parsing one into
+the other is a pure function, which is the sandbox's shape exactly — and the
+seam already returns a table.
+
+### The surface
+
+```lua
+btv.qf.parse([[
+  local file, ln, col, msg = line:match("^(%S+)%((%d+),(%d+)%): (.*)$")
+  if not file then return nil end
+  return { filename = file, lnum = tonumber(ln), col = tonumber(col),
+           text = msg, type = msg:find("^error") and "E" or "W" }
+]])
+```
+
+A **block** (it needs statements), over `line` and `lnum` — the 1-based position
+in the output, not in any file. It returns an entry table using the same key
+vocabulary as Phase 7, or `nil` to decline.
+
+Declining is not "drop the line": vim keeps a non-matching output line as an
+*invalid* entry carrying the raw text, which is what makes `:copen` show a
+build's prose alongside its errors, and bemtvi does the same.
+
+An **unknown key is an error**, not an ignored one. `{ line = 12 }` (for `lnum`)
+would otherwise be a parser that silently produces unjumpable entries.
+
+Where it applies: everywhere `'errorformat'` does — `:cbuffer`, `:cfile`,
+`:cexpr`, `setqflist{lines=…}`, `:make`, `:grep` — because all of them funnel
+through `qf_set_from_lines`. When a parser is installed it *replaces* the
+errorformat pass rather than layering on it; two parsers disagreeing about one
+line has no sensible answer.
+
+### What it cannot do
+
+The sandbox is stateless by construction (Phase 3's follow-up), so a parser sees
+one line and carries nothing between calls. That rules out errorformat's
+multi-line entries (`%A`/`%C`/`%Z`) and its directory stack (`%D`/`%X`), which
+are precisely the features that need an accumulator. `'errorformat'` stays for
+those, and stays the default. The Lua parser is for the common case — one line,
+one entry — where it is far more readable, and for output efm cannot describe at
+all.
+
+It also means the parser works in a build *without* the vendored C engine, where
+`qf_set_from_lines` today fails loud.
+
+### Testing
+
+`crates/bemtvi-server/tests/qf_parse.rs`: a parser populates a list from
+`:cbuffer`, entries are jumpable (`:cc` lands on the file and line), a declined
+line becomes an invalid entry carrying its text, an unknown key fails loud, the
+parser wins over `'errorformat'` while installed and the efm path returns when it
+is cleared, `type` drives the severity colour, and each failure mode reports once
+and uninstalls.
+
+## Phase 9 — a `PaintSpan` that carries decoration
+
+### The gap
+
+`btv.decor.expr` draws one thing: a highlight range. `btv.decor.provider`, its
+off-frame sibling, draws the whole extmark vocabulary. So a decoration that is a
+pure function of one line but wants a *badge* rather than a colour — an inline
+`← 3 refs`, a gutter `▶`, a tinted row — has to leave the frame, and lands late,
+for no reason but the shape of `PaintSpan`.
+
+### The change
+
+`PaintSpan` grows optional fields, and the span table grows the named keys that
+fill them:
+
+```lua
+{ s, e, "Todo" }                                     -- unchanged
+{ s, e, "Todo", virt_text = " ← fix me", virt_hl = "Comment" }
+{ 1, 0, sign_text = "▶", sign_hl = "DiagnosticError" }
+{ 1, 0, line_hl = "CursorLine" }
+```
+
+Positional 1–3 stay exactly as they are, so every existing block is untouched.
+`group` becomes optional *when* the span carries a decoration — a sign or a line
+background has no range to colour — and a span with neither a group nor a
+decoration is still an error rather than a no-op.
+
+`virt_pos` (`"eol"` — the default — `"inline"`, `"overlay"`, `"right_align"`)
+picks where the text draws, at the span's start column.
+
+All of it lowers into the `VirtDecor` an extmark already carries, so it reaches
+every client through the projection that already exists — no client change, the
+same as Phase 6.
+
+### Testing
+
+`crates/bemtvi-server/tests/decor_expr.rs` grows: virtual text reaches the
+projected `virt_text` in each position, a sign reaches the sign column, a line
+background reaches the `line_bg` layer, a decoration-only span with no range
+paints, a span with neither group nor decoration fails loud, and an unknown named
+key fails loud rather than being ignored.

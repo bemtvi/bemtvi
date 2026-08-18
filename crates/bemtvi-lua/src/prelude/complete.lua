@@ -816,9 +816,5 @@ end
 -- returns a non-number reports once and is then uninstalled, rather than
 -- repeating the error on every keystroke.
 function btv.complete.scorer(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.complete.scorer: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.complete._scorer_src = src
-  btv._complete_set_scorer(src)
+  btv._sandbox_set("complete.scorer", btv._complete_set_scorer, src)
 end

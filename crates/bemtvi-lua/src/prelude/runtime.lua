@@ -193,6 +193,48 @@ function btv._set_proc_pid(id, pid)
   btv._proc_pids[id] = pid
 end
 
+-- The **bounded compute sandbox** surfaces, by their public dotted name
+-- (`"fold.text"`, `"qf.parse"`, …) → the Lua source last installed on each, or nil.
+--
+-- Every `btv.*` setter that hands source to the sandbox writes here through
+-- `btv._sandbox_set` rather than into a private field of its own, so the set of
+-- installed surfaces is enumerable in one place. That is what `btv.test`'s per-test
+-- baseline snapshots and restores: keyed by the setter's own path, a surface added
+-- later is isolated the moment it uses the helper, with no second list to keep in
+-- step. (It stopped being kept in step once already — `complete.scorer`,
+-- `decor.expr` and both `qf` surfaces leaked between tests until this replaced the
+-- hand-written list.)
+btv._sandbox_srcs = btv._sandbox_srcs or {}
+
+-- `btv._sandbox_set(name, native, src)`: the shared body of every sandbox-source
+-- setter. Validates that `src` is a string (or nil, to clear), records it under
+-- `name` in `btv._sandbox_srcs`, and hands it to the native setter that compiles it.
+--
+-- `name` is the setter's own dotted path under `btv.` — `"qf.text"` for
+-- `btv.qf.text` — because the restore path resolves the setter back from the key.
+-- An error blames the caller's caller (level 3): the user called `btv.qf.text`, not
+-- this.
+function btv._sandbox_set(name, native, src)
+  if src ~= nil and type(src) ~= "string" then
+    error("btv." .. name .. ": expected a string of Lua source (or nil), got " .. type(src), 3)
+  end
+  btv._sandbox_srcs[name] = src
+  native(src)
+end
+
+-- `btv._sandbox_setter(name)`: resolve a `btv._sandbox_srcs` key back to the public
+-- setter it names, or nil when the surface's module was not loaded.
+function btv._sandbox_setter(name)
+  local fn = btv
+  for part in name:gmatch("[^.]+") do
+    if type(fn) ~= "table" then
+      return nil
+    end
+    fn = fn[part]
+  end
+  return type(fn) == "function" and fn or nil
+end
+
 -- Streaming-stdout registry for streaming-child handles (`btv.run_stream`, defined
 -- in prelude/process.lua). Unlike `btv._cb_fns` (one-shot), an on_stdout fires
 -- repeatedly — once per newline-delimited batch the child emits — so its function

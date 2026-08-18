@@ -499,9 +499,5 @@ end
 -- so a steady screen makes no calls at all. A block that errors, exceeds its
 -- deadline, or returns a malformed span reports once and is then uninstalled.
 function btv.decor.expr(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.decor.expr: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.decor._expr_src = src
-  btv._decor_set_expr(src)
+  btv._sandbox_set("decor.expr", btv._decor_set_expr, src)
 end

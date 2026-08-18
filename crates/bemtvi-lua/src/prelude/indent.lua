@@ -43,9 +43,5 @@ btv.indent = btv.indent or {}
 -- an expression that errors, exceeds its deadline, or returns a non-number
 -- reports once and is then uninstalled rather than repeating per line.
 function btv.indent.expr(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.indent.expr: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.indent._src = src
-  btv._indent_set_expr(src)
+  btv._sandbox_set("indent.expr", btv._indent_set_expr, src)
 end

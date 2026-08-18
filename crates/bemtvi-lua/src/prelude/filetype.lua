@@ -48,9 +48,5 @@ btv.filetype = btv.filetype or {}
 -- An expression that errors, exceeds its deadline, or returns a non-string
 -- reports once and is then uninstalled.
 function btv.filetype.detect(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.filetype.detect: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.filetype._src = src
-  btv._filetype_set_detect(src)
+  btv._sandbox_set("filetype.detect", btv._filetype_set_detect, src)
 end

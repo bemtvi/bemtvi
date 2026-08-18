@@ -578,11 +578,14 @@ end
 -- one. That keeps the install-once model specs are written against while making
 -- the cases independent of each other.
 --
--- What is restored: global options (the catalog's global-tier names plus the
--- `btv._o_store` catch-all), `btv.g`, the named registers, the `btv.*`
--- expression surfaces, and any keymap or user command a test *added*. What is
--- not: a keymap or command a test *deleted* (there is no spec to rebuild it
--- from), autocmds, and buffers other than the one `enew!` replaces.
+-- What is restored: global and window-local options (the catalog's names plus the
+-- `btv._o_store` catch-all), `btv.g`, the named registers, every sandbox
+-- expression surface (from `btv._sandbox_srcs`, which the setters write
+-- themselves — see the note there on why this is not a list kept here), the
+-- quickfix list, and any keymap, user command or `btv.decor` provider a test
+-- *added*. What is not: a keymap, command or provider a test *deleted* (there is
+-- no spec to rebuild it from), autocmds, the window layout, and buffers other
+-- than the one `enew!` replaces.
 
 local REGISTERS = 'abcdefghijklmnopqrstuvwxyz0123456789"-'
 
@@ -661,12 +664,12 @@ local function snapshot()
     regs = regs,
     maps = maps,
     commands = shallow_copy(btv._user_commands),
-    exprs = {
-      fold = btv.fold and btv.fold._src,
-      indent = btv.indent and btv.indent._src,
-      filetype = btv.filetype and btv.filetype._src,
-      scorer = btv.picker and btv.picker._scorer_src,
-    },
+    -- Every sandbox surface, from the registry the setters write themselves —
+    -- deliberately not a list maintained here, which is what let `complete.scorer`,
+    -- `decor.expr` and the two `qf` surfaces leak between tests for four releases.
+    exprs = shallow_copy(btv._sandbox_srcs),
+    providers = shallow_copy((btv._decor or {}).providers),
+    qflist = { items = btv.qf.getqflist(), title = (btv._qflist or {}).title },
   }
 end
 
@@ -737,17 +740,46 @@ local function restore(b)
     end
   end
 
-  if btv.fold and btv.fold._src ~= b.exprs.fold then
-    pcall(btv.fold.text, b.exprs.fold)
+  -- The sandbox surfaces: every key either side knows, so a surface a *test*
+  -- installed is cleared and one the baseline holds is put back. Only what
+  -- actually differs is re-set, since installing one recompiles it (and, for the
+  -- quickfix render, re-renders every open list).
+  local names = {}
+  for name in pairs(b.exprs) do
+    names[name] = true
   end
-  if btv.indent and btv.indent._src ~= b.exprs.indent then
-    pcall(btv.indent.expr, b.exprs.indent)
+  for name in pairs(btv._sandbox_srcs or {}) do
+    names[name] = true
   end
-  if btv.filetype and btv.filetype._src ~= b.exprs.filetype then
-    pcall(btv.filetype.detect, b.exprs.filetype)
+  for name in pairs(names) do
+    if btv._sandbox_srcs[name] ~= b.exprs[name] then
+      local set = btv._sandbox_setter(name)
+      if set then
+        pcall(set, b.exprs[name])
+      end
+    end
   end
-  if btv.picker and btv.picker._scorer_src ~= b.exprs.scorer then
-    pcall(btv.picker.scorer, b.exprs.scorer)
+
+  -- Decoration providers: like keymaps, only *additions* are undone. A provider is
+  -- a closure, so one a test removed cannot be rebuilt from a snapshot.
+  local providers = (btv._decor or {}).providers
+  if providers then
+    local kept = {}
+    for _, p in ipairs(b.providers) do
+      kept[p] = true
+    end
+    for i = #providers, 1, -1 do
+      if not kept[providers[i]] then
+        table.remove(providers, i)
+      end
+    end
+  end
+
+  -- The quickfix list, which is global state a `:make` / `:vimgrep` / `setqflist`
+  -- in one test would otherwise hand to the next. Location lists are per window and
+  -- go with the window; named lists are not restored.
+  if #(btv.qf.getqflist() or {}) > 0 or #(b.qflist.items or {}) > 0 then
+    pcall(btv.qf.setqflist, b.qflist.items or {}, "r", { title = b.qflist.title })
   end
 end
 

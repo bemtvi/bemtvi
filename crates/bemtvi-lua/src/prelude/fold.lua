@@ -35,9 +35,5 @@ btv.fold = btv.fold or {}
 -- An expression that errors, exceeds its deadline, or returns a table reports
 -- once and is then uninstalled, rather than repeating the error every frame.
 function btv.fold.text(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.fold.text: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.fold._src = src
-  btv._fold_set_text(src)
+  btv._sandbox_set("fold.text", btv._fold_set_text, src)
 end

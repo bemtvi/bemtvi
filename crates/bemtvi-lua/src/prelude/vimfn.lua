@@ -923,11 +923,7 @@ end
 -- returns a non-string reports **once** and is then uninstalled, with every open
 -- list restored to the default rendering.
 function btv.qf.text(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.qf.text: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.qf._text_src = src
-  btv._qf_set_text(src)
+  btv._sandbox_set("qf.text", btv._qf_set_text, src)
 end
 
 -- `btv.qf.parse(src)`: parse the lines of build output into quickfix entries with
@@ -987,11 +983,7 @@ end
 -- A block that errors, exceeds its deadline, or returns a malformed entry reports
 -- **once**, is uninstalled, and `'errorformat'` parses the input instead.
 function btv.qf.parse(src)
-  if src ~= nil and type(src) ~= "string" then
-    error("btv.qf.parse: expected a string of Lua source (or nil), got " .. type(src), 2)
-  end
-  btv.qf._parse_src = src
-  btv._qf_set_parse(src)
+  btv._sandbox_set("qf.parse", btv._qf_set_parse, src)
 end
 
 -- btv._qf_make(cmd, efm, title, open, jump, loclist_win): the async :make / :grep

@@ -248,7 +248,15 @@ fn a_test_cannot_leak_state_into_the_next() {
             btv.keymap.set("n", "<leader>zzq", "ihi<Esc>")
             btv.command("LeakCmd", function() end, {})
             btv.fold.text([[ "LEAKED" ]])
+            btv.indent.expr([[ 4 ]])
+            btv.filetype.detect([[ "leaked" ]])
             btv.picker.scorer([[ score + 1 ]])
+            btv.complete.scorer([[ score + 1 ]])
+            btv.decor.expr([[ return { { 1, 1, "Todo" } } ]])
+            btv.qf.text([[ "LEAKED " .. item.text ]])
+            btv.qf.parse([[ return { text = "LEAKED" } ]])
+            btv.decor.provider({ name = "leaky", on_range = function() end })
+            btv.qf.setqflist({ { filename = "leak.c", lnum = 1, text = "leaked" } }, " ")
             btv.reg.set("z", "leaked")
             btv.g.leak_global = "yes"
           end)
@@ -266,8 +274,21 @@ fn a_test_cannot_leak_state_into_the_next() {
               return false
             end)())
             note("command", (btv._user_commands or {}).LeakCmd ~= nil)
-            note("fold.text", btv.fold._src ~= nil)
-            note("scorer", btv.picker._scorer_src ~= nil)
+            -- Every sandbox-expression surface, not a hand-picked four: the
+            -- restore list stopped growing with them once already.
+            -- Every sandbox surface, from the registry rather than a list written
+            -- here: a surface added later is covered without touching this test,
+            -- which is exactly how the restore list fell behind in the first place.
+            for name, src in pairs(btv._sandbox_srcs or {}) do
+              note("expr:" .. name, src ~= nil)
+            end
+            note("decor.provider", (function()
+              for _, p in ipairs((btv._decor or {}).providers or {}) do
+                if p.name == "leaky" then return true end
+              end
+              return false
+            end)())
+            note("qflist", #(btv.qf.getqflist() or {}) > 0)
             note("register", (btv.reg.get("z") or ""):find("leaked") ~= nil)
             note("g", btv.g.leak_global == "yes")
             btv.test.expect(table.concat(left, ",")).to_be("")

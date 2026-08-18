@@ -55,14 +55,28 @@ been sourced — and restores it before each test. That timing is the contract:
   or a `dofile` at the top of a spec file runs before the snapshot, so it is the
   state every test in the run starts from, and no test can undo it.
 - **What a *test* changes is put back.** Restored: global and window-local
-  options, `btv.g`, the named registers, the `btv.*` expression surfaces, and any
-  keymap or user command a test added. The buffer goes back to a fresh empty one
-  in normal mode.
+  options, `btv.g`, the named registers, **every** sandbox expression surface
+  (`btv.fold.text`, `btv.indent.expr`, `btv.filetype.detect`,
+  `btv.picker.scorer`, `btv.complete.scorer`, `btv.decor.expr`, `btv.qf.text`,
+  `btv.qf.parse`), the quickfix list, and any keymap, user command or
+  `btv.decor` provider a test added. The buffer goes back to a fresh empty one in
+  normal mode.
 
 Some things are **not** restored, because a snapshot has no way to rebuild them: a
-keymap or user command a test *deleted*, autocmds, and buffers beyond the one the
-reset replaces. Avoid deleting a shared keymap mid-test, or re-register it in
-`after_each`.
+keymap, user command or decor provider a test *deleted*, autocmds, the window
+layout, and buffers beyond the one the reset replaces. For those, clear down
+yourself — a `before_each` that puts the state you depend on into a known shape is
+more reliable than an `after_each` that tidies up, because a test that fails
+part-way never reaches its `after_each`:
+
+```lua
+btv.test.describe("my plugin", function()
+  btv.test.before_each(function()
+    btv.cmd("silent! only")        -- one window, whatever the last test opened
+    btv.augroup.create("MyPluginTest", { clear = true })  -- and no stale autocmds
+  end)
+end)
+```
 
 ### The one thing restore cannot reach: your module's own state
 

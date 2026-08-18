@@ -177,21 +177,14 @@ async fn the_computed_text_is_readable_as_the_equals_register() {
 }
 
 #[tokio::test]
-async fn the_prompt_returns_to_visual_mode() {
+async fn a_computed_value_can_replace_a_selection() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "iabcd<Esc>");
-    feed_sync(&rpc, "0vl").await;
-    // `"=` opened from Visual comes *back* to Visual, so the selection it was
-    // typed over is still there for the command that follows. (What a Visual-mode
-    // `p` then does with it — vim replaces the selection — is a separate,
-    // pre-existing gap: bemtvi's `p` pastes at the cursor in every mode.)
-    feed_sync(&rpc, "\"=\"XY\"<CR>").await;
-    let mode = exec_lua(&rpc, "return vim.fn.mode()")
-        .await
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert_eq!(mode, "v", "the prompt must not drop the selection");
+    // `"=` opened from Visual comes *back* to Visual, so the selection it was typed
+    // over is still there for the `p` that follows — which puts the computed text
+    // over it.
+    feed(&rpc, "0vl\"=\"XY\"<CR>p");
+    assert_eq!(lines(&rpc).await, vec!["XYcd"]);
     assert_eq!(reg_eq(&rpc).await, "XY");
 }
 

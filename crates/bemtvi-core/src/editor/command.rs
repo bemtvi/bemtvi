@@ -2616,6 +2616,12 @@ impl Editor {
             // `paste_multi`; the single-cursor path is plain `paste`.
             NormalCmd::PasteAfter if self.cursors_active() => self.paste_multi(true, count),
             NormalCmd::PasteBefore if self.cursors_active() => self.paste_multi(false, count),
+            // Over a selection, `p` and `P` alike *replace* it (vim's `v_p`): the
+            // selected text is deleted and the register put in its place. Checked
+            // after the multi-cursor arms, which keep their per-cursor broadcast.
+            NormalCmd::PasteAfter | NormalCmd::PasteBefore if self.mode.is_visual() => {
+                self.visual_paste(count)
+            }
             NormalCmd::PasteAfter => self.paste(true, count),
             NormalCmd::PasteBefore => self.paste(false, count),
             // In placement mode `u`/`<C-r>` step the cursor *placement* history

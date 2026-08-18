@@ -1420,6 +1420,104 @@ impl Editor {
         self.paste_text(&text, linewise, count, after);
     }
 
+    /// `p` / `P` over a **selection** (vim's `v_p`): delete the selected text and
+    /// put the register in its place, `count` times.
+    ///
+    /// Three things make this more than delete-then-paste:
+    ///
+    /// - **The source text is resolved first.** The delete writes the unnamed
+    ///   register, so reading it afterwards would put back the very text just
+    ///   removed on a plain (unnamed) `p`.
+    /// - **The replaced text goes to the unnamed register**, whichever register was
+    ///   put from — vim's rule, and what makes `"ap` over a selection leave `"a`
+    ///   intact while `""` holds what it displaced.
+    /// - **The insert is placed by byte offset, not by the post-delete cursor.**
+    ///   `lo` is where the selection began, which is exactly where the replacement
+    ///   belongs — including when the selection ran to the end of the buffer, where
+    ///   "above the line the cursor settled on" would be a line too high.
+    ///
+    /// The four selection/register kind combinations follow vim: a linewise
+    /// register replacing a charwise selection splits the line (the text either
+    /// side of the selection keeps its own line), and a charwise register replacing
+    /// a linewise selection becomes a line of its own.
+    pub(crate) fn visual_paste(&mut self, count: usize) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        // Resolved *before* the delete — see the doc comment. An empty / unreadable
+        // register leaves the selection alone (vim beeps); an explicitly named one
+        // reports, as `paste` does.
+        let Some((text, kind)) = self
+            .register_text(self.pending.register)
+            .filter(|(t, _)| !t.is_empty())
+        else {
+            if let Some(name) = self.pending.register {
+                self.echo(format!("E353: Nothing in register {name}"));
+            }
+            self.reset_pending();
+            return;
+        };
+        let (lo, hi, linewise, _first_line) = self.visual_range();
+
+        // Leaving Visual mode by operating on the selection stamps `` `< ``/`` `> ``
+        // and the change bounds, exactly as an operator does.
+        self.record_visual_marks();
+        self.record_change_bounds(lo, hi);
+        self.push_undo();
+
+        if let Some((replaced, replaced_kind)) = self.slice_for_register(lo, hi, linewise) {
+            self.registers.set_api('"', replaced, replaced_kind, false);
+        }
+        self.delete_range(lo, hi);
+
+        let chunk = text.repeat(count);
+        let reg_linewise = kind == RegKind::Line;
+        match (linewise, reg_linewise) {
+            // Whole lines for whole lines: the register's text already ends in a
+            // newline, so it drops straight into the hole the delete left.
+            (true, true) => self.insert_lines_at(lo, &chunk),
+            // A charwise register over whole lines becomes a line of its own.
+            (true, false) => self.insert_lines_at(lo, &format!("{chunk}\n")),
+            // Charwise into charwise: the text lands where the selection was, and
+            // the cursor on its last character (vim's `p`).
+            (false, false) => {
+                let last_len = chunk.len() - crate::unicode::prev_grapheme(&chunk, chunk.len());
+                self.buffer_mut().insert(lo, &chunk);
+                self.buffer_mut().normalize();
+                self.set_cursor_char((lo + chunk.len()).saturating_sub(last_len));
+            }
+            // Whole lines into part of a line: the line splits at the selection, so
+            // what was left of it and what was right of it each keep a line.
+            (false, true) => self.insert_lines_at(lo, &format!("\n{chunk}")),
+        }
+        self.buffer_mut().modified = true;
+        self.buffer_mut().normalize();
+        self.mode = Mode::Normal;
+        self.clamp_cursor();
+        self.reset_pending();
+    }
+
+    /// Insert a linewise `chunk` at byte offset `at` and park the cursor on the
+    /// first non-blank of the first line it added — the shared tail of the
+    /// line-shaped [`Editor::visual_paste`] combinations.
+    fn insert_lines_at(&mut self, at: usize, chunk: &str) {
+        let before = self.buffer().line_count();
+        self.buffer_mut().insert(at, chunk);
+        self.buffer_mut().normalize();
+        // `at` is a line start for a linewise selection, and mid-line for the split
+        // case — where the first *added* line is the one after it.
+        let line = self.buffer().byte_to_line(at);
+        let landed = if chunk.starts_with('\n') {
+            line + 1
+        } else {
+            line
+        };
+        self.cursor.line = landed.min(self.buffer().line_count().saturating_sub(1));
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+        self.report_line_delta(before);
+    }
+
     /// Insert register-resolved `text` at the cursor `count` times — the body of
     /// [`Editor::paste`] once the source text and its line/char kind are known.
     /// Split out so a multi-cursor paste can feed each cursor its own per-cursor

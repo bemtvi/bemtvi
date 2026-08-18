@@ -374,3 +374,152 @@ async fn ctrl_r_insert_is_dot_repeatable() {
     feed(&rpc, ".");
     assert_eq!(lines(&rpc).await, vec!["foo", "foo", "foo"]);
 }
+
+// ---- Visual-mode paste (`v_p`): the register replaces the selection ---------
+
+/// The register the given name holds, as Lua's `getreg` sees it.
+async fn reg(rpc: &Rpc, name: &str) -> String {
+    exec_lua(rpc, &format!(r#"return vim.fn.getreg("{name}")"#))
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn visual_p_replaces_the_selection_with_the_register() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    // Yank `one`, select `two`, paste over it.
+    feed(&rpc, "0yiwwviwp");
+    assert_eq!(lines(&rpc).await, vec!["one one"]);
+}
+
+#[tokio::test]
+async fn visual_capital_p_replaces_the_selection_too() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    // vim's `v_P` is `v_p` — both put over the selection.
+    feed(&rpc, "0yiwwviwP");
+    assert_eq!(lines(&rpc).await, vec!["one one"]);
+}
+
+#[tokio::test]
+async fn the_replaced_text_lands_in_the_unnamed_register() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    feed_sync(&rpc, "0yiwwviwp").await;
+    assert_eq!(
+        reg(&rpc, "\\\"").await,
+        "two",
+        "vim puts the previously selected text in the unnamed register"
+    );
+}
+
+#[tokio::test]
+async fn a_named_register_pastes_and_the_replacement_still_goes_unnamed() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    feed(&rpc, "0\"ayiw");
+    feed_sync(&rpc, "wviw\"ap").await;
+    assert_eq!(lines(&rpc).await, vec!["one one"]);
+    assert_eq!(reg(&rpc, "a").await, "one", "the source register is intact");
+    assert_eq!(
+        reg(&rpc, "\\\"").await,
+        "two",
+        "the replaced text went unnamed"
+    );
+}
+
+#[tokio::test]
+async fn a_linewise_register_replaces_a_linewise_selection() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ikeep<CR>x1<CR>x2<Esc>");
+    // `yy` on line 1, then select lines 2-3 linewise and put over them.
+    feed(&rpc, "ggyy2GVjp");
+    assert_eq!(lines(&rpc).await, vec!["keep", "keep"]);
+}
+
+#[tokio::test]
+async fn a_charwise_register_replacing_a_linewise_selection_takes_a_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha beta<CR>x1<CR>x2<Esc>");
+    // A charwise register put over whole lines becomes a line of its own.
+    feed(&rpc, "ggwyiw2GVjp");
+    assert_eq!(lines(&rpc).await, vec!["alpha beta", "beta"]);
+}
+
+#[tokio::test]
+async fn a_linewise_register_replacing_a_charwise_selection_splits_the_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabcd<CR>zz<Esc>");
+    // `yy` the `zz` line, then select `bc` on line 1 and put the line over it: the
+    // text either side of the selection keeps its own line.
+    feed(&rpc, "2Gyygg0lvlp");
+    // …and the line it was yanked from is of course still there.
+    assert_eq!(lines(&rpc).await, vec!["a", "zz", "d", "zz"]);
+}
+
+#[tokio::test]
+async fn a_count_repeats_the_text_put_over_the_selection() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ixy<Esc>");
+    feed(&rpc, "0yl$v3p");
+    assert_eq!(lines(&rpc).await, vec!["xxxx"]);
+}
+
+#[tokio::test]
+async fn visual_paste_leaves_visual_mode() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    feed_sync(&rpc, "0yiwwviwp").await;
+    let mode = exec_lua(&rpc, "return vim.fn.mode()").await;
+    assert_eq!(mode.as_str(), Some("n"), "the put ends the selection");
+}
+
+#[tokio::test]
+async fn visual_paste_undoes_as_one_step() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    feed(&rpc, "0yiwwviwp");
+    assert_eq!(lines(&rpc).await, vec!["one one"]);
+    feed(&rpc, "u");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one two"],
+        "delete + put is one undo step"
+    );
+}
+
+#[tokio::test]
+async fn the_cursor_lands_on_the_last_character_put() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    feed(&rpc, "0yiwwviwp");
+    // `one one` — the cursor sits on the final `e` of the text just put (vim's `p`).
+    assert_eq!(cursor(&rpc).await, (1, 6));
+}
+
+#[tokio::test]
+async fn an_empty_register_leaves_the_selection_alone() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>");
+    // Nothing has been yanked into `b`; the put must not delete the selection.
+    feed(&rpc, "0viw\"bp");
+    assert_eq!(lines(&rpc).await, vec!["one two"]);
+}
+
+#[tokio::test]
+async fn dot_repeats_a_visual_put_with_the_register_as_it_now_stands() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two three<Esc>");
+    feed(&rpc, "0yiwwviwp");
+    assert_eq!(lines(&rpc).await, vec!["one one three"]);
+    // `.` replays the visual put on the next word — and puts `two`, not `one`,
+    // because the first put moved the text it replaced into the unnamed register.
+    // That is vim's own behavior (the reason `"0p` exists), not an artifact here.
+    feed(&rpc, "w.");
+    assert_eq!(lines(&rpc).await, vec!["one one two"]);
+    // The yank register still holds the original, which is how you repeat properly.
+    assert_eq!(reg(&rpc, "0").await, "one");
+}

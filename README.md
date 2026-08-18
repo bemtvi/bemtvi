@@ -255,11 +255,14 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
   (`J`), and the line shortcuts (`x X D C s`). Counts and dot-repeat (`.`) work
   throughout.
 - **Visual modes** — charwise (`v`) and linewise (`V`), `o`/`O` to swap ends,
-  operators and text objects over a selection. (Blockwise `<C-v>` is a
-  deliberate non-goal — use [multi-cursor](#notable-additions) instead.)
+  operators and text objects over a selection, and `p`/`P` to put a register
+  *over* it. (Blockwise `<C-v>` is a deliberate non-goal — use
+  [multi-cursor](#notable-additions) instead.)
 - **Registers** — named (`"a`–`"z`), append (`"A`–`"Z`), the yank/delete ring
   (`"0`–`"9`), small-delete (`"-`), black-hole (`"_`), the read-only specials
-  (`"%` `"/` `":` `".`), and the system clipboard (`"+` `"*`).
+  (`"%` `"/` `":` `".`), the system clipboard (`"+` `"*`), and the expression
+  register (`"=` / `<C-r>=`), whose contents are a Lua expression the
+  [bounded sandbox](docs/features/expressions.md) evaluates.
 - **Marks & jumps** — `m` / `` ` `` / `'`, the automatic special marks, the
   jumplist (`<C-o>` / `<C-i>`), and the changelist (`g;` / `g,`).
 - **Insert mode** — `<C-r>` register insert (`<C-r><C-w>` for the word under the

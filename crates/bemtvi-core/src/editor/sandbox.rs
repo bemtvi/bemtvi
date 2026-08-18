@@ -270,17 +270,21 @@ impl Editor {
                         // splits a grapheme.
                         let start = snap(&text, span.start.min(text.len()));
                         let end = snap(&text, span.end.min(text.len())).max(start);
-                        if start == end {
+                        // An empty range is a *point* mark, which is exactly what a
+                        // sign, a line background or an eol badge anchors on — but a
+                        // highlight-only span with nothing to cover paints nothing,
+                        // so it is dropped rather than placed.
+                        if start == end && span.decor.is_none() {
                             continue;
                         }
                         ed.buffers.get_mut(buf).buffer.extmarks.set(
                             crate::extmark::PAINT_NS,
                             None,
                             line_start + start,
-                            Some(line_start + end),
-                            Some(span.group.clone()),
+                            (end > start).then_some(line_start + end),
+                            span.group.clone(),
                             crate::extmark::DEFAULT_PRIORITY,
-                            None,
+                            span.decor.clone(),
                         );
                     }
                 }

@@ -455,8 +455,9 @@ end
 -- text, while this is what the client would actually draw. Anything the editor
 -- renders *instead of* a buffer line is only visible here — a closed fold's
 -- placeholder, a `~` filler past the end, a virtual line. So a test for
--- `'foldtext'`, `'listchars'` or a decoration's virtual text asserts on this;
--- a test for an edit asserts on `t:lines()`.
+-- `'foldtext'` or `'listchars'` asserts on this; a test for an edit asserts on
+-- `t:lines()`. Virtual *text* is not here — it rides its own layer beside the
+-- rows, which is what `t:decor()` reads.
 --
 -- ```lua
 -- t:feed("zM")
@@ -476,11 +477,11 @@ end
 -- `t:screen()`; columns are 0-based, end-exclusive display cells). With `row`, just
 -- that row's spans.
 --
--- The third of the three views a spec has, and the only one that can see a
--- **decoration**: `t:lines()` is buffer text, `t:screen()` is the glyphs drawn, and
--- a highlight — a `btv.decor` provider's mark, a `btv.decor.expr` paint, a
--- treesitter capture — changes neither. Groups are the names as painted, so a test
--- asserts on the group it asked for rather than on a colour.
+-- One of the two views that can see a **decoration** (`t:decor()` is the other):
+-- `t:lines()` is buffer text, `t:screen()` is the glyphs drawn, and a highlight —
+-- a `btv.decor` provider's mark, a `btv.decor.expr` paint, a treesitter capture —
+-- changes neither. Groups are the names as painted, so a test asserts on the group
+-- it asked for rather than on a colour.
 --
 -- ```lua
 -- btv.decor.expr([[ local s, e = line:find("TODO") if s then return { { s, e, "Todo" } } end return {} ]])
@@ -492,6 +493,63 @@ end
 function Ctx:highlights(row)
   local ui = btv._ui
   local rows = (ui and ui.highlights) or {}
+  if row == nil then
+    return rows
+  end
+  return rows[row] or {}
+end
+
+-- Where a `virt_text` placement draws, by the code the wire carries.
+local VIRT_POS =
+  { [0] = "eol", [1] = "inline", [2] = "overlay", [3] = "right_align", [4] = "win_col" }
+
+-- `t:decor([row])` — the decoration drawn *beside* the focused window's rows:
+-- virtual text and gutter signs. A list of
+-- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, sign = "▶" }` per row
+-- (1-based *screen* rows, matching `t:screen()`); with `row`, just that row's.
+--
+-- The companion of `t:highlights()`, and the split is what each layer *is*: a
+-- highlight colours the buffer's own cells, while these draw glyphs that are not in
+-- the buffer at all — a `btv.decor.expr` badge or sign, a provider's inline blame,
+-- an LSP inlay hint or diagnostic. `t:screen()` cannot see them either: it is the
+-- buffer's rows as painted, and virtual text rides its own layer beside them.
+--
+-- ```lua
+-- btv.decor.expr([[ return { { 1, 1, "Todo", virt_text = " <- here", sign_text = ">>" } } ]])
+-- btv.test.expect(t:decor(1).virt_text).to_be(" <- here")
+-- btv.test.expect(t:decor(1).sign).to_be(">>")
+-- ```
+--
+-- `virt_text` is the row's placements joined, since one row can carry several;
+-- `virt_pos`/`virt_col` describe the first. Highlight *groups* are absent on
+-- purpose: the wire carries a per-frame palette id for these layers, not a name, so
+-- `t:highlights()` stays the group-level view.
+--
+-- Only the focused window, like `t:screen()`.
+function Ctx:decor(row)
+  local ui = btv._ui
+  local virt, signs = (ui and ui.virt_text) or {}, (ui and ui.signs) or {}
+  local rows, n = {}, math.max(#virt, #signs)
+  for i = 1, n do
+    local out = {}
+    local places = virt[i]
+    if type(places) == "table" and #places > 0 then
+      local texts = {}
+      for _, place in ipairs(places) do
+        for _, chunk in ipairs(place[4] or {}) do
+          texts[#texts + 1] = chunk[1]
+        end
+      end
+      out.virt_text = table.concat(texts)
+      out.virt_pos = VIRT_POS[places[1][1]]
+      out.virt_col = places[1][2]
+    end
+    local sign = signs[i]
+    if type(sign) == "table" then
+      out.sign = sign[1]
+    end
+    rows[i] = out
+  end
   if row == nil then
     return rows
   end

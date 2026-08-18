@@ -457,12 +457,41 @@ end
 -- Returning an empty list (or `nil`) declines the line. A malformed span fails
 -- loud rather than silently not painting.
 --
+-- **A span can draw more than a colour.** Beside the three positional slots it
+-- takes named keys, each the scalar form of the extmark key it lowers into:
+--
+-- ```
+-- virt_text    text drawn beside the line
+-- virt_hl      its highlight group
+-- virt_pos     where it draws: "eol" (the default), "inline", "overlay", "right_align"
+-- sign_text    a 1-2 cell glyph in the gutter
+-- sign_hl      its highlight group
+-- line_hl      a highlight group backing the whole line
+-- ```
+--
+-- ```lua
+-- -- a badge after the match, and a gutter mark on its line
+-- btv.decor.expr([[
+--   local s, e = line:find("FIXME", 1, true)
+--   if not s then return {} end
+--   return { { s, e, "Todo", virt_text = "  <- fix me", virt_hl = "Comment",
+--             sign_text = ">>", sign_hl = "DiagnosticWarn" } }
+-- ]])
+-- ```
+--
+-- The columns and the group are each optional *when the span carries a
+-- decoration*: a sign or a line background anchors on the line, not on a stretch
+-- of it, so `{ sign_text = ">>" }` is a whole span. What is refused is a span that
+-- draws **nothing** — no group and no decoration — and a qualifier with nothing to
+-- qualify (`virt_hl` without `virt_text`), because both are half-written spans that
+-- would otherwise vanish in silence.
+--
 -- **Which one to use.** `btv.decor.provider` is the general surface: full Lua,
--- async, any editor state, and the whole extmark vocabulary (virtual text, signs,
--- line backgrounds). It runs *off* the frame, so its marks land on the next one.
--- `btv.decor.expr` can only see the line it was handed and can only draw highlight
--- spans — and in exchange it runs *during* the frame, so a paint that is a pure
--- function of the text (indent guides, colour swatches, trailing whitespace, a
+-- async, any editor state, and the whole extmark vocabulary (including virtual
+-- *lines* and per-chunk styling, which a span cannot express). It runs *off* the
+-- frame, so its marks land on the next one. `btv.decor.expr` can only see the line
+-- it was handed — and in exchange it runs *during* the frame, so a paint that is a
+-- pure function of the text (indent guides, colour swatches, trailing whitespace, a
 -- keyword badge) appears in the same frame as the edit or scroll, with no
 -- round trip and no flicker.
 --

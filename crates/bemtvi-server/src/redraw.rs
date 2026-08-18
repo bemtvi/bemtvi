@@ -311,25 +311,31 @@ impl EditHost {
                 .iter()
                 .map(|r| unicode::display_line(&r.text).into_owned())
                 .collect();
-            // …and the highlight spans painted over them, read back out of the
+            // …and the decoration layers drawn over them, read back out of the
             // window value already built rather than re-projected, so a spec sees
-            // exactly what the client was sent. This is the only way a plugin test
+            // exactly what the client was sent. These are the only way a plugin test
             // can observe a decoration at all — `t:lines()` is text and `t:screen()`
             // is glyphs; a paint lives in neither.
             let focused_id = view.focused().id;
-            let highlights = view
+            let focused = view
                 .windows
                 .iter()
                 .position(|w| w.id == focused_id)
-                .and_then(|i| windows.get(i))
-                .and_then(|w| match w {
-                    Value::Map(entries) => entries
-                        .iter()
-                        .find(|(k, _)| k.as_str() == Some("highlights"))
-                        .map(|(_, v)| v.clone()),
-                    _ => None,
-                })
-                .unwrap_or(Value::Nil);
+                .and_then(|i| windows.get(i));
+            let layer = |key: &str| -> Value {
+                focused
+                    .and_then(|w| match w {
+                        Value::Map(entries) => entries
+                            .iter()
+                            .find(|(k, _)| k.as_str() == Some(key))
+                            .map(|(_, v)| v.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or(Value::Nil)
+            };
+            let highlights = layer("highlights");
+            let virt_text = layer("virt_text");
+            let signs = layer("diagnostics_signs");
             let _ = self.lua.set_ui_mirror(bemtvi_lua::UiMirror {
                 float: &float,
                 message: &message,
@@ -337,6 +343,8 @@ impl EditHost {
                 statusline: &statusline_text,
                 screen: &screen,
                 highlights: &highlights,
+                virt_text: &virt_text,
+                signs: &signs,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

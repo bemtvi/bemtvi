@@ -212,10 +212,11 @@ client-side tree-sitter highlighter).
   sources), a fuzzy picker (`btv.picker`, with a preview pane), a snippet engine
   (`btv.snippet`, LSP snippet syntax + tabstop navigation), composable statusline
   segments (`btv.statusline`, lualine-shaped, per-window), viewport decorations
-  (`btv.decor`, off-tick providers driving extmarks / virtual text), and the
-  floating-widget UI layer (`btv.ui.input`/`select`/`confirm`/`float`,
-  promise-based). Every widget's keys are rebindable through the real keymap
-  engine. See [`examples/`](examples).
+  (`btv.decor`, off-tick providers driving extmarks / virtual text, plus a
+  frame-time `btv.decor.expr` paint for decorations that are a pure function of
+  the line), and the floating-widget UI layer
+  (`btv.ui.input`/`select`/`confirm`/`float`, promise-based). Every widget's keys
+  are rebindable through the real keymap engine. See [`examples/`](examples).
 - **In-buffer terminals** — a PTY-backed terminal buffer (`:terminal`) with a
   vt100 emulation layer, end-to-end backpressure for runaway output, and
   scrollback, in both native clients and the web build.

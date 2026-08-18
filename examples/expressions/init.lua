@@ -209,8 +209,14 @@ end, { nargs = "?", desc = "Toggle the completion scorer" })
 --    `{ first, last, group }` with the 1-based inclusive columns `string.find`
 --    already hands back.
 --
+--    A span draws more than a colour: `virt_text` puts a badge beside the line
+--    (`virt_hl` colours it, `virt_pos` places it), `sign_text` puts a glyph in the
+--    gutter, `line_hl` backs the whole row. Below, the FIRST match on a line also
+--    carries both — so a marked line is legible from the gutter, not only by
+--    reading it.
+--
 --    Its sibling `btv.decor.provider` is the general surface — async, full Lua,
---    virtual text and signs. Reach for the block when the paint is a pure
+--    the whole extmark vocabulary. Reach for the block when the paint is a pure
 --    function of the line, and for the provider when it is not.
 
 local PAINT = [[
@@ -221,7 +227,17 @@ local PAINT = [[
       s, e = line:find("FIXME", i, true)
     end
     if not s then break end
-    out[#out + 1] = { s, e, "Todo" }
+    if #out == 0 then
+      out[1] = {
+        s, e, "Todo",
+        virt_text = "  <- unfinished",
+        virt_hl = "Comment",
+        sign_text = ">>",
+        sign_hl = "DiagnosticWarn",
+      }
+    else
+      out[#out + 1] = { s, e, "Todo" }
+    end
     i = e + 1
   end
   return out
@@ -364,7 +380,7 @@ local CHEATS = {
   "<leader>5   the demo picker — type `mod`; docs/ leads.  :Scorer off compares",
   "6           no mapping — type o<C-r>=lnum * 10<CR><Esc> yourself",
   "6b          type `ofor` — the snippet row sorts last.  :CompleteScorer off",
-  "<leader>7   paint every TODO/FIXME as you scroll;  :Paint off removes it",
+  "<leader>7   paint every TODO/FIXME, badge + gutter mark;  :Paint off removes it",
   "<leader>8   a quickfix list with custom rows;  :QfText off restores vim's",
   "<leader>9   parse build output in Lua;  :QfParse off hands it to errorformat",
 }

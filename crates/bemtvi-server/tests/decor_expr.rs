@@ -160,6 +160,224 @@ async fn a_multibyte_line_is_painted_on_character_boundaries() {
     assert_eq!(painted(&rpc, &mut inc, 0, "Search").await, vec![(0, 2)]);
 }
 
+// ===== decoration, not only colour ===========================================
+
+/// The `virt_text` placements the frame carries, as `(pos, col, text)` — the wire
+/// shape is `[pos, col, hl_mode, [[text, style], …]]`, and the style is a palette
+/// id, so a test asserts on the text and where it draws.
+fn virt_on(map: &[(Value, Value)], row: usize) -> Vec<(u64, u64, String)> {
+    window0_field(map, "virt_text")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.get(row))
+        .and_then(Value::as_array)
+        .map(|places| {
+            places
+                .iter()
+                .filter_map(|p| {
+                    let p = p.as_array()?;
+                    let text = p
+                        .get(3)?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|c| c.as_array()?.first()?.as_str())
+                        .collect::<String>();
+                    Some((p.first()?.as_u64()?, p.get(1)?.as_u64()?, text))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The gutter sign glyph on `row`, if any.
+fn sign_on(map: &[(Value, Value)], row: usize) -> Option<String> {
+    window0_field(map, "diagnostics_signs")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.get(row))
+        .and_then(Value::as_array)
+        .and_then(|s| s.first())
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The screen rows carrying a `line_bg` layer.
+fn line_bg_rows(map: &[(Value, Value)]) -> Vec<u64> {
+    window0_field(map, "line_bg")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_array()?.first()?.as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The frame, once the pending work has settled.
+async fn frame(rpc: &Rpc, inc: &mut UnboundedReceiver<Incoming>) -> Vec<(Value, Value)> {
+    let _ = exec_lua(rpc, "return 1").await;
+    wait_redraw(inc, |m| window0_field(m, "highlights").is_some()).await
+}
+
+#[tokio::test]
+async fn a_span_can_carry_virtual_text() {
+    let init = r#"btv.decor.expr([[
+      local s, e = line:find("TODO", 1, true)
+      if not s then return {} end
+      return { { s, e, "Todo", virt_text = " <- fix me", virt_hl = "Comment" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_virt", "ab TODO cd\n", init).await;
+    let map = frame(&rpc, &mut inc).await;
+    assert_eq!(
+        virt_on(&map, 0),
+        vec![(0, 0, " <- fix me".to_string())],
+        "an eol badge draws after the line, and the highlight still lands"
+    );
+    assert_eq!(spans_on(&map, 0), vec![(3, 7, "Todo".to_string())]);
+}
+
+#[tokio::test]
+async fn virt_pos_places_the_text() {
+    // `inline` draws at the span's own start column, not at the end of the line.
+    let init = r#"btv.decor.expr([[
+      return { { 4, 7, "Todo", virt_text = "!", virt_pos = "inline" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_virt_pos", "ab TODO cd\n", init).await;
+    let map = frame(&rpc, &mut inc).await;
+    assert_eq!(virt_on(&map, 0), vec![(1, 3, "!".to_string())]);
+}
+
+#[tokio::test]
+async fn a_span_can_carry_a_gutter_sign() {
+    let init = r#"btv.decor.expr([[
+      if not line:find("TODO", 1, true) then return {} end
+      return { { sign_text = ">>", sign_hl = "DiagnosticError" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_sign", "nothing\nTODO here\n", init).await;
+    let map = frame(&rpc, &mut inc).await;
+    assert_eq!(sign_on(&map, 0), None, "the first line has no match");
+    assert_eq!(sign_on(&map, 1).as_deref(), Some(">>"));
+}
+
+#[tokio::test]
+async fn a_span_can_back_the_whole_line() {
+    // The group has to exist for the layer to resolve a colour for it — a
+    // `line_hl_group` naming nothing is dropped at projection, as it is for any
+    // extmark.
+    let init = r##"vim.api.nvim_set_hl(0, "PaintBg", { bg = "#303030" })
+    btv.decor.expr([[
+      if lnum ~= 2 then return {} end
+      return { { line_hl = "PaintBg" } }
+    ]])"##;
+    let (rpc, mut inc) = start("paint_line_hl", "one\ntwo\nthree\n", init).await;
+    let map = frame(&rpc, &mut inc).await;
+    assert_eq!(
+        line_bg_rows(&map),
+        vec![1],
+        "only the second row gets a line background"
+    );
+}
+
+#[tokio::test]
+async fn a_decoration_needs_no_range_and_no_group() {
+    // A sign anchors on the line, not on a stretch of it, so the columns and the
+    // highlight group are both optional — and the span still paints.
+    let init = r#"btv.decor.expr([[ return { { sign_text = "*" } } ]])"#;
+    let (rpc, mut inc) = start("paint_pointmark", "x\n", init).await;
+    let map = frame(&rpc, &mut inc).await;
+    assert_eq!(sign_on(&map, 0).as_deref(), Some("*"));
+    assert!(
+        spans_on(&map, 0).is_empty(),
+        "and it paints no highlight of its own"
+    );
+}
+
+#[tokio::test]
+async fn a_span_can_do_both_at_once() {
+    let init = r##"vim.api.nvim_set_hl(0, "PaintBg", { bg = "#303030" })
+    btv.decor.expr([[
+      return { { 1, 2, "Todo", virt_text = "!", sign_text = "*", line_hl = "PaintBg" } }
+    ]])"##;
+    let (rpc, mut inc) = start("paint_all", "abc\n", init).await;
+    let map = frame(&rpc, &mut inc).await;
+    assert_eq!(spans_on(&map, 0), vec![(0, 2, "Todo".to_string())]);
+    assert_eq!(virt_on(&map, 0), vec![(0, 0, "!".to_string())]);
+    assert_eq!(sign_on(&map, 0).as_deref(), Some("*"));
+    assert_eq!(line_bg_rows(&map), vec![0]);
+}
+
+#[tokio::test]
+async fn a_decoration_is_repainted_as_the_line_changes() {
+    let init = r#"btv.decor.expr([[
+      if not line:find("TODO", 1, true) then return {} end
+      return { { sign_text = "*" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_decor_edit", "x\n", init).await;
+    assert_eq!(sign_on(&frame(&rpc, &mut inc).await, 0), None);
+    feed_sync(&rpc, "ITODO <Esc>").await;
+    assert_eq!(
+        sign_on(&frame(&rpc, &mut inc).await, 0).as_deref(),
+        Some("*")
+    );
+}
+
+#[tokio::test]
+async fn a_decoration_stays_out_of_the_extmark_mirror() {
+    let init = r#"btv.decor.expr([[ return { { sign_text = "*", virt_text = "!" } } ]])"#;
+    let (rpc, mut inc) = start("paint_decor_mirror", "x\n", init).await;
+    assert_eq!(
+        sign_on(&frame(&rpc, &mut inc).await, 0).as_deref(),
+        Some("*")
+    );
+    let marks = exec_lua(
+        &rpc,
+        "return #btv.buf.extmarks(0, -1, 0, -1, { details = true })",
+    )
+    .await;
+    assert_eq!(marks.as_u64(), Some(0));
+}
+
+#[tokio::test]
+async fn a_span_that_draws_nothing_is_refused() {
+    let init = r#"btv.decor.expr([[ return { { 1, 2 } } ]])"#;
+    let (rpc, mut inc) = start("paint_draws_nothing", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("draws nothing") && msg.contains("paint disabled"),
+        "a span with neither a group nor a decoration is a bug, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_span_key_is_refused() {
+    // `virt_texts` for `virt_text` would otherwise be a decoration that silently
+    // never appears.
+    let init = r#"btv.decor.expr([[ return { { 1, 2, "Todo", virt_texts = "!" } } ]])"#;
+    let (rpc, mut inc) = start("paint_unknown_key", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("unknown key `virt_texts`"),
+        "a misspelled key should name itself, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_virt_pos_is_refused() {
+    let init = r#"btv.decor.expr([[ return { { 1, 2, virt_text = "!", virt_pos = "middle" } } ]])"#;
+    let (rpc, mut inc) = start("paint_bad_pos", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(msg.contains("unknown `virt_pos` `middle`"), "got {msg:?}");
+}
+
+#[tokio::test]
+async fn a_qualifier_without_its_decoration_is_refused() {
+    let init = r#"btv.decor.expr([[ return { { 1, 2, "Todo", virt_hl = "Comment" } } ]])"#;
+    let (rpc, mut inc) = start("paint_dangling_hl", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("no `virt_text`"),
+        "a group with nothing to colour is a half-written span, got {msg:?}"
+    );
+}
+
 // ===== the marks are internal ================================================
 
 #[tokio::test]

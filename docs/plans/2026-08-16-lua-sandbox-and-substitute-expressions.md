@@ -960,3 +960,35 @@ projected `virt_text` in each position, a sign reaches the sign column, a line
 background reaches the `line_bg` layer, a decoration-only span with no range
 paints, a span with neither group nor decoration fails loud, and an unknown named
 key fails loud rather than being ignored.
+
+### Outcome
+
+Shipped as planned: 12 new black-box tests (`tests/decor_expr.rs`, now 30), 1 new
+example spec, full suite **4081 passed / 0 failed**. Mutation-tested — dropping
+the decor on the way to the extmark fails 8 of the 30. Four notes.
+
+- **The seam grew one field, not six.** `PaintSpan` carries the extmark's own
+  `VirtDecor` rather than a parallel vocabulary, so the engine translates the
+  named keys once and the core hands the result straight to `extmarks.set`. That
+  is also why the server needed **no change at all**: `virt_text_for`,
+  `line_bg_for` and the sign cells already walk every namespace, so the paint rode
+  three more projections for free — and a decoration key added later needs no
+  seam change either.
+- **The columns and the group became optional, which the plan had not.** A sign or
+  a line background anchors on the line, not on a stretch of it, so
+  `{ 1, 0, sign_text = "▶" }` was noise; `{ sign_text = "▶" }` is a whole span. An
+  empty range is now a *point* mark when the span carries a decoration, and still
+  dropped when it does not.
+- **A half-written span is refused, not ignored.** Two ways to write one: a span
+  that draws nothing (no group, no decoration), and a qualifier with nothing to
+  qualify (`virt_hl` without `virt_text`). Both were silently-nothing before the
+  error was added, which is the exact failure this surface is worst at — a
+  decoration that mysteriously never appears.
+- **The framework grew a fourth view, for the same reason it grew the third.**
+  `t:highlights()` colours the buffer's own cells; virtual text and signs are
+  glyphs that are not in the buffer at all, and `t:screen()` is the buffer's rows
+  as painted — so no spec could see a badge or a gutter mark. `t:decor([row])`
+  reads them out of the built window value, like `t:highlights()`. It deliberately
+  carries no highlight *groups*: the wire encodes those layers' colours as
+  per-frame palette ids rather than names, and inventing a name for a spec to
+  assert on would be a second, drifting source of truth.

@@ -65,17 +65,29 @@ impl fmt::Display for SandboxError {
     }
 }
 
-/// One highlight span a paint expression asked for, in the units an extmark takes:
-/// **0-based, end-exclusive byte** offsets into the line, and the highlight group.
+/// One decoration a paint expression asked for, in the units an extmark takes:
+/// **0-based, end-exclusive byte** offsets into the line, plus whatever the span
+/// draws.
 ///
 /// Lua hands back `{ first, last, group }` with 1-based *inclusive* columns —
 /// `string.find`'s convention, so a match drops straight in — and the engine
 /// converts here, at the boundary, rather than leaving two conventions in play.
+///
+/// [`group`](Self::group) and [`decor`](Self::decor) are each optional but not
+/// both: a span draws a highlight over its range, or virtual text / a sign / a
+/// line background anchored at its start, or both. A span that draws neither is a
+/// bug in the expression, not an empty decoration, and is refused.
+///
+/// `decor` is the extmark's own [`VirtDecor`](crate::extmark::VirtDecor) rather
+/// than a parallel vocabulary, so the paint reaches every client through the
+/// projection that already exists — and a decoration key added later needs no
+/// change here at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaintSpan {
     pub start: usize,
     pub end: usize,
-    pub group: String,
+    pub group: Option<String>,
+    pub decor: Option<Box<crate::extmark::VirtDecor>>,
 }
 
 /// One quickfix entry as a sandbox expression sees it.
@@ -251,9 +263,10 @@ pub trait SandboxEngine {
 
     /// Call a compiled paint block for one visible line.
     ///
-    /// Returns the spans to highlight, converted from the 1-based inclusive columns
-    /// Lua returned. An element that is not a `{ integer, integer, string }` triple
-    /// is a [`SandboxError::BadReturn`] — never a silently dropped span.
+    /// Returns the spans to draw, converted from the 1-based inclusive columns Lua
+    /// returned. An element that is not a table, carries a column that is not an
+    /// integer, names an unknown key, or draws nothing at all is a
+    /// [`SandboxError::BadReturn`] — never a silently dropped span.
     fn call_paint(
         &mut self,
         f: SandboxFn,

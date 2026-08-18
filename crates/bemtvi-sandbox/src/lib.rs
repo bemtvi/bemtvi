@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use bemtvi_core::extmark::{VirtChunk, VirtDecor, VirtTextPos};
 use bemtvi_core::sandbox::{
     PaintSpan, QfFields, SandboxEngine, SandboxError, SandboxFn, CALL_DEADLINE,
 };
@@ -541,13 +542,35 @@ fn qf_table(lua: &Lua, item: &QfFields) -> Result<Table, SandboxError> {
     build().map_err(|e| SandboxError::Runtime(tidy(&e.to_string())))
 }
 
+/// The named keys a paint span may carry, beside its two positional columns and
+/// its positional highlight group. Each is the scalar form of the extmark key it
+/// lowers into: a paint span draws one run, so `virt_text` is a string rather than
+/// neovim's chunk list and its group is a sibling key.
+const SPAN_KEYS: &[&str] = &[
+    "virt_text",
+    "virt_hl",
+    "virt_pos",
+    "sign_text",
+    "sign_hl",
+    "line_hl",
+];
+
+/// The `virt_pos` values, and the [`VirtTextPos`] each names.
+const VIRT_POSITIONS: &[(&str, VirtTextPos)] = &[
+    ("eol", VirtTextPos::Eol),
+    ("inline", VirtTextPos::Inline),
+    ("overlay", VirtTextPos::Overlay),
+    ("right_align", VirtTextPos::RightAlign),
+];
+
 /// Convert the list a paint block returned into [`PaintSpan`]s.
 ///
-/// Each element is `{ first, last, group }` with **1-based inclusive** columns
-/// (`string.find`'s convention). Anything else — a non-table element, a missing
-/// field, a group that is not a string — is a `BadReturn` naming what arrived,
-/// because a silently dropped span is a decoration that mysteriously fails to
-/// paint.
+/// Each element is a table: `{ first, last, group }` with **1-based inclusive**
+/// columns (`string.find`'s convention), plus any of [`SPAN_KEYS`]. Every part is
+/// optional on its own — a sign or a line background has no range to colour, and a
+/// highlight needs no decoration — but a span that draws *nothing* is refused, as
+/// is a non-table element, a column that is not an integer, and an unknown key.
+/// A silently dropped span is a decoration that mysteriously fails to paint.
 fn paint_spans(list: Table) -> Result<Vec<PaintSpan>, SandboxError> {
     let mut out = Vec::new();
     for (i, entry) in list.sequence_values::<Value>().enumerate() {
@@ -559,23 +582,125 @@ fn paint_spans(list: Table) -> Result<Vec<PaintSpan>, SandboxError> {
                 entry.type_name()
             )));
         };
-        let first: Option<i64> = span.get(1).ok().flatten();
-        let last: Option<i64> = span.get(2).ok().flatten();
-        let group: Option<String> = span.get(3).ok().flatten();
-        let (Some(first), Some(last), Some(group)) = (first, last, group) else {
-            return Err(SandboxError::BadReturn(format!(
-                "span {} is not {{ first, last, group }} (two columns and a highlight group)",
-                i + 1
-            )));
-        };
-        // 1-based inclusive -> 0-based end-exclusive. A `last` before `first` is an
-        // empty span, which paints nothing rather than erroring: `line:find` on a
-        // zero-width match legitimately produces one.
-        let start = (first.max(1) - 1) as usize;
-        let end = last.max(first - 1) as usize;
-        out.push(PaintSpan { start, end, group });
+        out.push(paint_span(span, i + 1)?);
     }
     Ok(out)
+}
+
+/// One span of [`paint_spans`], `nth` in the returned list (for the messages).
+fn paint_span(span: Table, nth: usize) -> Result<PaintSpan, SandboxError> {
+    let bad = |what: String| SandboxError::BadReturn(format!("span {nth} {what}"));
+
+    for pair in span.pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|e| SandboxError::Runtime(tidy(&e.to_string())))?;
+        match &key {
+            // The three positional slots.
+            Value::Integer(n) if (1..=3).contains(n) => {}
+            Value::String(s) if SPAN_KEYS.contains(&s.to_string_lossy().as_ref()) => {}
+            other => {
+                return Err(bad(format!(
+                    "has an unknown key `{}` (expected `first`, `last`, `group` \
+                     positionally, or one of {})",
+                    match other {
+                        Value::String(s) => s.to_string_lossy().to_string(),
+                        v => format!("{v:?}"),
+                    },
+                    SPAN_KEYS.join(", ")
+                )));
+            }
+        }
+    }
+
+    let col = |slot: i64, name: &str| -> Result<Option<i64>, SandboxError> {
+        span.get::<Option<i64>>(slot)
+            .map_err(|_| bad(format!("has a `{name}` that is not an integer")))
+    };
+    let text = |key: &str| -> Result<Option<String>, SandboxError> {
+        span.get::<Option<String>>(key)
+            .map_err(|_| bad(format!("has a `{key}` that is not a string")))
+    };
+    // Columns default to an empty range at the line start: a sign or a line
+    // background anchors on the line, not on a stretch of it.
+    let first = col(1, "first")?.unwrap_or(1);
+    let last = col(2, "last")?.unwrap_or(0);
+    let group = span
+        .get::<Option<String>>(3)
+        .map_err(|_| bad("has a `group` that is not a string".to_string()))?;
+
+    let virt_text = text("virt_text")?;
+    let sign_text = text("sign_text")?;
+    let line_hl = text("line_hl")?;
+    let decor = if virt_text.is_some() || sign_text.is_some() || line_hl.is_some() {
+        let virt_pos = match text("virt_pos")? {
+            None => VirtTextPos::Eol,
+            Some(name) => *VIRT_POSITIONS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, p)| p)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "has an unknown `virt_pos` `{name}` (expected one of {})",
+                        VIRT_POSITIONS
+                            .iter()
+                            .map(|(n, _)| *n)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?,
+        };
+        Some(Box::new(VirtDecor {
+            virt_text: virt_text
+                .map(|t| {
+                    vec![VirtChunk {
+                        text: t,
+                        hl_group: None,
+                    }]
+                })
+                .unwrap_or_default(),
+            virt_text_pos: virt_pos,
+            sign_text,
+            sign_hl_group: text("sign_hl")?,
+            line_hl_group: line_hl,
+            ..VirtDecor::default()
+        }))
+    } else {
+        // The keys that only qualify a decoration are meaningless without one, and
+        // silently ignoring them would leave a paint that looks configured.
+        for key in ["virt_hl", "virt_pos", "sign_hl"] {
+            if span.get::<Option<Value>>(key).ok().flatten().is_some() {
+                return Err(bad(format!(
+                    "has a `{key}` but no `virt_text`, `sign_text` or `line_hl` to apply it to"
+                )));
+            }
+        }
+        None
+    };
+    // A span that draws neither a highlight nor a decoration is a bug in the
+    // expression, not an empty one.
+    if group.is_none() && decor.is_none() {
+        return Err(bad(
+            "draws nothing: it needs a highlight group, or a `virt_text` / \
+             `sign_text` / `line_hl`"
+                .to_string(),
+        ));
+    }
+    let mut decor = decor;
+    if let (Some(hl), Some(d)) = (text("virt_hl")?, decor.as_deref_mut()) {
+        for chunk in &mut d.virt_text {
+            chunk.hl_group = Some(hl.clone());
+        }
+    }
+
+    // 1-based inclusive -> 0-based end-exclusive. A `last` before `first` is an
+    // empty span, which paints nothing rather than erroring: `line:find` on a
+    // zero-width match legitimately produces one, and a decoration-only span has no
+    // range by design.
+    Ok(PaintSpan {
+        start: (first.max(1) - 1) as usize,
+        end: last.max(first - 1) as usize,
+        group,
+        decor,
+    })
 }
 
 /// The shared result conversion for the two re-rankers, which produce a *sort

@@ -180,6 +180,20 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(spans[1][2]).to_be(4)
   end)
 
+  -- The badge and the gutter mark are in neither the buffer nor the painted
+  -- glyphs — they are the layer beside them, which is what `t:decor()` reads.
+  btv.test.it("demo 7 — the paint also badges the line and marks the gutter", function(t)
+    open(t)
+    t:feed("<Space>7")
+    t:feed("ITODO: fix this<Esc>")
+    local d = t:decor(1)
+    btv.test.expect(d.virt_text).to_be("  <- unfinished")
+    btv.test.expect(d.virt_pos).to_be("eol")
+    btv.test.expect(d.sign).to_be(">>")
+    -- The second line has no match, so it carries neither.
+    btv.test.expect(t:decor(2).sign).to_be(nil)
+  end)
+
   btv.test.it("demo 7 — :Paint off takes the paint with it", function(t)
     open(t)
     t:feed("<Space>7")
@@ -187,6 +201,7 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(#t:highlights(1)).to_be(1)
     t:cmd("Paint off")
     btv.test.expect(#t:highlights(1)).to_be(0)
+    btv.test.expect(t:decor(1).sign).to_be(nil)
   end)
 
   -- Demo 8. The quickfix window's rows are buffer text, so `t:lines()` reads

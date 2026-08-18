@@ -34,7 +34,7 @@ its own `return`.)
 | `btv.filetype.detect` | `name`, `ext`, `head` | a filetype, or `nil` |
 | `btv.picker.scorer` | `label`, `query`, `score` | a sort key, higher first |
 | `btv.complete.scorer` | `label`, `query`, `score`, `kind` | a sort key, higher first |
-| `btv.decor.expr` | `line`, `lnum` | spans to highlight (a **block**) |
+| `btv.decor.expr` | `line`, `lnum` | spans to draw (a **block**) |
 | `btv.qf.text` | `item`, `idx` | one quickfix row's text |
 | `btv.qf.parse` | `line`, `lnum` | one entry, or `nil` (a **block**) |
 
@@ -247,6 +247,23 @@ Each span is `{ first, last, group }` with **1-based inclusive** columns — wha
 line. This is the surface that takes a block rather than an expression, for the
 loop above.
 
+A span can draw more than a colour. Beside the three positional slots it takes
+`virt_text` (with `virt_hl` and `virt_pos` — `"eol"`, `"inline"`, `"overlay"`,
+`"right_align"`), `sign_text` (with `sign_hl`), and `line_hl`:
+
+```lua
+btv.decor.expr([[
+  local s, e = line:find("FIXME", 1, true)
+  if not s then return {} end
+  return { { s, e, "Todo", virt_text = "  <- fix me", sign_text = ">>" } }
+]])
+```
+
+The columns and the group are each optional *when the span carries a decoration* —
+a sign anchors on the line, not on a stretch of it, so `{ sign_text = ">>" }` is a
+whole span. A span that draws nothing at all, or a qualifier with nothing to
+qualify (`virt_hl` without `virt_text`), is refused rather than ignored.
+
 It is the pure sibling of `btv.decor.provider`, and the choice between them is
 what each can see:
 
@@ -254,7 +271,7 @@ what each can see:
 | --- | --- | --- |
 | power | full Lua, async, any editor state | `line` and `lnum`, nothing else |
 | when | off the frame, one frame later | during the frame it belongs to |
-| draws | virtual text, signs, line backgrounds, highlights | highlight spans |
+| draws | the whole extmark vocabulary | highlights, virtual text, signs, line backgrounds |
 
 Reach for the block when the paint is a pure function of the text — indent guides,
 colour swatches, trailing whitespace, a keyword badge — and for the provider when

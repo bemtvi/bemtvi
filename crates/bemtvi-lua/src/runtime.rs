@@ -1532,6 +1532,10 @@ pub struct UiMirror<'a> {
     pub screen: &'a [String],
     /// The highlight spans over those rows (`t:highlights()`).
     pub highlights: &'a rmpv::Value,
+    /// The virtual-text placements on those rows (`t:decor()`).
+    pub virt_text: &'a rmpv::Value,
+    /// The gutter signs on those rows (`t:decor()`).
+    pub signs: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3449,6 +3453,8 @@ impl LuaRuntime {
             statusline,
             screen,
             highlights,
+            virt_text,
+            signs,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3474,6 +3480,14 @@ impl LuaRuntime {
             "highlights",
             crate::convert::rmpv_to_lua(&self.lua, highlights)?,
         )?;
+        // The other two decoration layers over the same rows — virtual text and
+        // gutter signs — which `t:decor()` folds into one per-row answer. Neither
+        // is in the buffer text or the painted glyphs either.
+        ui.set(
+            "virt_text",
+            crate::convert::rmpv_to_lua(&self.lua, virt_text)?,
+        )?;
+        ui.set("signs", crate::convert::rmpv_to_lua(&self.lua, signs)?)?;
         // The clipboard contents (for `btv.test.clipboard.peek`), or nil when empty.
         if let Some((text, linewise)) = clipboard {
             let c = self.lua.create_table()?;

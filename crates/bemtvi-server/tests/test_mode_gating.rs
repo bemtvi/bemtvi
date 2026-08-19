@@ -451,3 +451,46 @@ async fn the_test_frameworks_feed_records_into_a_macro() {
         "a plugin's typeahead never lands in an open recording"
     );
 }
+
+#[tokio::test]
+async fn ui_mirror_carries_the_per_region_tablines() {
+    // bemtvi's tab pages are PER REGION — the main area and each dock carry their
+    // own independent set — but `nvim_list_tabpages` / `nvim_get_current_tabpage`
+    // report one global list from every region, so from Lua the three stacks were
+    // indistinguishable. A spec for the feature could not tell "a tab was added to
+    // the dock" from "a tab was added". Mirror the per-region tablines, which is
+    // what the clients already draw each region's strip from.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    feed(&rpc, "imain<Esc>");
+
+    // A region reports the tabline it DRAWS, so both need one shown.
+    feed(&rpc, ":set showtabline=2<CR>");
+    exec_lua(
+        &rpc,
+        r#"btv.dock.open({ side = "left", size = 20, showtabline = 2 })"#,
+    )
+    .await;
+    let _ = lines(&rpc).await;
+
+    // A tab added while the DOCK is focused belongs to the dock alone.
+    exec_lua(&rpc, r#"btv.layer.focus("left")"#).await;
+    feed(&rpc, ":tabnew<CR>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return #btv._ui.region_tabs.left.tabs")
+            .await
+            .as_i64(),
+        Some(2),
+        "the dock has two tabs"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return #btv._ui.region_tabs.main.tabs")
+            .await
+            .as_i64(),
+        Some(1),
+        "…and the main area still has one"
+    );
+}

@@ -381,6 +381,7 @@ impl EditHost {
                 number_shown,
                 leftcol: &leftcol_v,
                 numbers: &numbers_v,
+                region_tabs: &region_tablines,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

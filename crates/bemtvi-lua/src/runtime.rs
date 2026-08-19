@@ -1564,6 +1564,9 @@ pub struct UiMirror<'a> {
     /// line number of each painted row (`t:view()`).
     pub leftcol: &'a rmpv::Value,
     pub numbers: &'a rmpv::Value,
+    /// The per-region tablines — main plus each dock, each with its own tabs and
+    /// current index (`t:tabs()`).
+    pub region_tabs: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3499,6 +3502,7 @@ impl LuaRuntime {
             number_shown,
             leftcol,
             numbers,
+            region_tabs,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3578,6 +3582,14 @@ impl LuaRuntime {
         // (a closed fold takes its rows out of the list).
         ui.set("leftcol", crate::convert::rmpv_to_lua(&self.lua, leftcol)?)?;
         ui.set("numbers", crate::convert::rmpv_to_lua(&self.lua, numbers)?)?;
+        // The per-region tab stacks. Tab pages are PER REGION here — the main area
+        // and each dock carry their own — but `nvim_list_tabpages` reports one global
+        // list from every region, so from Lua the stacks were indistinguishable and a
+        // spec could not tell "a tab was added to the dock" from "a tab was added".
+        ui.set(
+            "region_tabs",
+            crate::convert::rmpv_to_lua(&self.lua, region_tabs)?,
+        )?;
         // The other decoration layers over the same rows — virtual text, virtual
         // lines and gutter signs — which `t:decor()` folds into one per-row answer.
         // None of them is in the buffer text or the painted glyphs either.

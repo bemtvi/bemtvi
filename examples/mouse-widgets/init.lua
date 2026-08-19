@@ -42,7 +42,7 @@ btv.cmdline_complete.setup {}
 
 --------------------------------------------------------------------------------
 -- 3. Fuzzy picker (`btv.picker`) — a centered box that GRABS the mouse modally.
---    TYPE  \f  to open it over a fixed list, then:
+--    TYPE  \o  to open it over a fixed list, then:
 --      click a row        highlight it
 --      click it again     confirm it (runs the source's `confirm`)
 --      wheel over the list scroll the highlight
@@ -61,15 +61,19 @@ btv.picker.source {
   confirm = function(item) btv.notify("picked " .. item.fruit) end,
 }
 
-btv.keymap.set("n", "<leader>f", function() btv.picker.open("fruits") end)
+-- `<leader>o`, not `<leader>f`: bemtvi ships a whole `<leader>f…` picker family
+-- (`\ff` files, `\fg` grep, `\fb` buffers, …), so a bare `\f` is a live prefix of
+-- them and would sit waiting for the timeout before this map could fire.
+btv.keymap.set("n", "<leader>o", function() btv.picker.open("fruits") end)
 
 --------------------------------------------------------------------------------
 -- 4. Promptless chooser (`btv.ui.select`) — a small list under the cursor that
 --    also grabs the mouse. TYPE  \s , then:
 --      click a row        highlight it
 --      click it again     resolve the promise with it
---    (A click off this small popup is ignored — only a picker cancels on an
---    outside click.)
+--    A click off it dismisses it, resolving the promise with nothing — the same
+--    as <Esc>. (The completion popup in section 1 is the odd one out: it lets an
+--    outside click through to the text instead of taking it as a dismissal.)
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>s", function()
   btv.ui.select({ "north", "south", "east", "west" }, { prompt = "Heading:" }):next(function(item)

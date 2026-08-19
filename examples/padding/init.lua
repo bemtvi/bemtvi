@@ -43,7 +43,9 @@ vim.wo.padding = 2
 --      :set padding=4            -> a fat 4-cell margin all round
 --      :set padding=0,6          -> no top/bottom, 6 cells left/right
 --      :set padding=1,2,3,4      -> top 1, right 2, bottom 3, left 4
---      :set padding?             -> echoes the canonical form, e.g. "padding=1 2 3 4"
+--      :set padding?             -> echoes the canonical form: the SHORTEST
+--                                   shorthand that says the same thing, so
+--                                   "padding=4", "padding=0 6", "padding=1 2 3 4"
 --      :set padding&             -> reset to no margin
 --
 -- 3. Prove it is PER WINDOW. Split the view and give each window its own margin:

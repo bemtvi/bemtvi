@@ -532,6 +532,39 @@ function Ctx:highlights(row)
   return rows[row] or {}
 end
 
+-- `t:tabs([region])` — a region's own tab pages:
+-- `{ labels = { "…" }, current = <1-based index> }`, or a map of every region when
+-- `region` is omitted. `region` is `"main"` or a dock side (`"left"` / `"right"` /
+-- `"top"` / `"bottom"`).
+--
+-- Tab pages here are PER REGION — the main area and each open dock carry their own
+-- independent set — but `nvim_list_tabpages` reports one global list whichever
+-- region is focused, so from Lua the stacks are indistinguishable and a spec cannot
+-- tell "a tab was added to the dock" from "a tab was added".
+--
+-- A region reports the tabline it DRAWS, so a region whose `'showtabline'` hides it
+-- (the default `1`, with a single tab) reports no labels.
+--
+-- ```lua
+-- btv.test.expect(#t:tabs("left").labels).to_be(2)
+-- btv.test.expect(#t:tabs("main").labels).to_be(1)
+-- ```
+function Ctx:tabs(region)
+  local all = (btv._ui and btv._ui.region_tabs) or {}
+  local function one(rt)
+    rt = rt or {}
+    return { labels = rt.tabs or {}, current = (rt.current or 0) + 1 }
+  end
+  if region == nil then
+    local out = {}
+    for name, rt in pairs(all) do
+      out[name] = one(rt)
+    end
+    return out
+  end
+  return one(all[region])
+end
+
 -- `t:view()` — where the focused window is SCROLLED to:
 -- `{ leftcol = <columns>, topline = <buffer line>, numbers = { <line per row> } }`.
 --
@@ -591,7 +624,9 @@ end
 -- offered or which row led.
 --
 -- `selected` is nil while nothing is highlighted — the popup opens `noselect`, so
--- `<CR>` runs the typed line until you actually pick a row.
+-- `<CR>` runs the typed line until you actually pick a row. `row`/`col`/`width`/
+-- `height` describe the box, but in the placement's own coordinate space (see
+-- below) — to CLICK a row, probe for the cell rather than deriving it.
 --
 -- ```lua
 -- t:feed(":ene<Tab>")
@@ -606,6 +641,15 @@ function Ctx:menu()
   return {
     items = m.items or {},
     selected = m.selected_active and ((m.selected or 0) + 1) or nil,
+    -- Where the box was placed, in the box's OWN space: a cursor-anchored menu (the
+    -- completion popup, `btv.ui.select`) reports window-relative cells, while an
+    -- editor-level one (the picker) reports windows-area cells. Neither is
+    -- necessarily the global screen cell `t:mouse` names, so treat these as the
+    -- box's size and rough position, not as mouse coordinates.
+    row = m.row,
+    col = m.col,
+    width = m.width,
+    height = m.height,
   }
 end
 

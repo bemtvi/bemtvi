@@ -500,6 +500,26 @@ function Ctx:highlights(row)
   return rows[row] or {}
 end
 
+-- `t:view()` — where the focused window is SCROLLED to:
+-- `{ leftcol = <columns>, topline = <buffer line>, numbers = { <line per row> } }`.
+--
+-- `t:screen()` carries each painted row's full text; the CLIENT is what clips it
+-- to the window and slides it left by `leftcol`. So sideways scrolling (`nowrap`)
+-- is visible in no row view at all, and the vertical position had to be guessed
+-- from the text. `numbers` is the buffer line each painted row shows — the top
+-- line, and which lines are visible at all, since a closed fold takes its rows out
+-- of the list.
+--
+-- ```lua
+-- t:feed("$")
+-- btv.test.expect(t:view().leftcol > 0).to_be(true)
+-- ```
+function Ctx:view()
+  local ui = btv._ui or {}
+  local numbers = ui.numbers or {}
+  return { leftcol = ui.leftcol or 0, topline = numbers[1], numbers = numbers }
+end
+
 -- `t:gutter()` — the focused window's reserved gutter, as
 -- `{ number_width = <cells>, sign_width = <cells>, total = <cells> }`.
 --

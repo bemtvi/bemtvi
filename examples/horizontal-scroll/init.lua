@@ -24,8 +24,9 @@
 --   0                back to column 0 — it scrolls all the way home
 --   :set sidescrolloff=10   keep 10 columns of lookahead, then move around
 --   :set ss=0               switch to recenter-on-scroll, then run off an edge
---   :set ss? siso?          query the current values (echoed to :messages)
---   :SideReport            re-run those queries from Lua
+--   :set ss?  then  :set siso?   query the current values (one per command — a
+--                                `:set a? b?` leaves only the last on the line)
+--   :SideReport                  report both at once, from Lua
 
 -- These options live on the focused window and are set through the `:set` ex
 -- path (the wired surface today). Give a generous lookahead margin out of the
@@ -34,11 +35,12 @@
 vim.cmd("set sidescrolloff=8")
 
 --------------------------------------------------------------------------------
--- :SideReport — echo the focused window's horizontal-scroll options by issuing
--- the `:set …?` queries (they land on the message line / in `:messages`).
+-- :SideReport — report the focused window's horizontal-scroll options. Read
+-- through `vim.wo` and announced in ONE notification: two `:set …?` queries echo
+-- one after the other, so only the second would still be on the message line.
 --------------------------------------------------------------------------------
 vim.api.nvim_create_user_command("SideReport", function()
-  vim.cmd("set sidescroll? sidescrolloff?")
+  vim.notify(("sidescroll=%d  sidescrolloff=%d"):format(vim.wo.sidescroll, vim.wo.sidescrolloff))
 end, {})
 
 vim.notify("horizontal scroll demo: move along a long line with l / w / $ / 0")

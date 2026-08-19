@@ -8,8 +8,8 @@
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    attach, command, exec_lua, lines, map_get, spawn, start_attached, temp_dir, wait_redraw,
-    window0_field, write_temp,
+    attach, command, exec_lua, feed, lines, map_get, spawn, start_attached, start_with_config,
+    temp_dir, wait_redraw, window0_field, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -200,5 +200,50 @@ async fn cli_file_arg_previews_after_config_enables_it() {
         map_get(im, "path").and_then(Value::as_str),
         Some(img_path.as_str()),
         "the marker carries the file-arg path"
+    );
+}
+
+#[tokio::test]
+async fn a_new_file_with_an_image_extension_is_an_ordinary_buffer() {
+    // `:e shot.png` where no such file exists is a NEW FILE, not a preview of
+    // nothing. It used to open as an inert image buffer anyway — the preview was
+    // chosen on the extension alone — so you could not type into the file you had
+    // just asked to create, and nothing said why.
+    let dir = temp_dir("img_newfile");
+    let (rpc, _incoming) = start_with_config(&dir, "btv.o.imagepreview = true\n").await;
+    let missing = dir.join("shot.png");
+    command(&rpc, &format!("e {}", missing.to_str().unwrap())).await;
+
+    feed(&rpc, "itext<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["text"],
+        "a new file with an image extension is editable"
+    );
+    // …and it writes as ordinary text.
+    command(&rpc, "w").await;
+    let written = std::fs::read_to_string(&missing).expect("the file was written");
+    assert_eq!(written, "text\n");
+}
+
+#[tokio::test]
+async fn an_existing_image_still_previews() {
+    // The other half: an image that IS on disk still opens inert, bytes unread.
+    let dir = temp_dir("img_existing");
+    let png = dir.join("real.png");
+    // A minimal PNG header is enough — the preview never decodes it here.
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n").expect("seed png");
+    let (rpc, _incoming) = start_with_config(&dir, "btv.o.imagepreview = true\n").await;
+    command(&rpc, &format!("e {}", png.to_str().unwrap())).await;
+
+    feed(&rpc, "itext<Esc>");
+    let shown = lines(&rpc).await;
+    assert!(
+        !shown.iter().any(|l| l.contains("text")),
+        "an image preview is inert, got {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|l| l.contains("PNG")),
+        "its bytes are never loaded as text, got {shown:?}"
     );
 }

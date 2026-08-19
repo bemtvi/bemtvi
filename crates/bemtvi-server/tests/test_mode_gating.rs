@@ -355,3 +355,57 @@ async fn ui_mirror_carries_the_gutter_widths() {
         Value::Boolean(true),
     );
 }
+
+#[tokio::test]
+async fn ui_mirror_carries_the_window_scroll_position() {
+    // Where the window is SCROLLED to is in none of the views: `t:screen()` carries
+    // each painted row's full text, and the client is what clips it to the window
+    // and offsets it by `leftcol`. So a spec for `nowrap` horizontal scrolling could
+    // see nothing at all, and one for vertical scrolling had to infer the top line
+    // from the text. Mirror the window's `leftcol` and its per-row buffer line
+    // numbers — the latter being both the top line and which lines are visible at
+    // all (a closed fold takes its rows out of the list).
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    feed(&rpc, ":set nowrap<CR>");
+    feed(&rpc, "i");
+    feed(&rpc, &format!("{}<Esc>", "x".repeat(300)));
+    feed(&rpc, "0");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.leftcol").await.as_i64(),
+        Some(0),
+        "at column 0 the window is scrolled home"
+    );
+    feed(&rpc, "$");
+    let _ = lines(&rpc).await;
+    let leftcol = exec_lua(&rpc, "return btv._ui.leftcol").await.as_i64();
+    assert!(
+        leftcol.unwrap_or(0) > 0,
+        "jumping to the end of a long line scrolls sideways, got {leftcol:?}"
+    );
+
+    // The vertical half: the first painted row's buffer line number is the top line.
+    feed(&rpc, ":set wrap<CR>");
+    feed(&rpc, "ggO<Esc>");
+    for _ in 0..60 {
+        feed(&rpc, "o<Esc>");
+    }
+    feed(&rpc, "gg");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.numbers[1]").await.as_i64(),
+        Some(1),
+        "at the top of the file the first painted row is line 1"
+    );
+    feed(&rpc, "G");
+    let _ = lines(&rpc).await;
+    let top = exec_lua(&rpc, "return btv._ui.numbers[1]").await.as_i64();
+    assert!(
+        top.unwrap_or(0) > 1,
+        "at the end of a long file the window has scrolled down, got {top:?}"
+    );
+}

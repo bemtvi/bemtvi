@@ -1384,17 +1384,24 @@ impl Editor {
         // policy can't drift between them. (The local sync path mirrors this via
         // `read_buffer` → `Buffer::from_image_file`. Off-tick has no synchronous stat, so
         // the disk version is left unset — the client keys its cache on the path.)
-        if self.options.imagepreview && super::is_image_path(Some(&path)) {
-            // Stamp the disk baseline (size + mtime the redraw's image marker carries)
-            // when we can stat synchronously — a *local* open (every `:edit` now defers
-            // through here behind the explorer's `BufReadCmd` handler, so this is the live
-            // local image path). Off-tick has no synchronous stat, so it's left unset and
-            // the client keys its cache on the path.
-            let stat = if self.host_fs_offtick {
-                None
-            } else {
-                self.host_fs.stat(&path)
-            };
+        // Stamp the disk baseline (size + mtime the redraw's image marker carries)
+        // when we can stat synchronously — a *local* open (every `:edit` now defers
+        // through here behind the explorer's `BufReadCmd` handler, so this is the live
+        // local image path). Off-tick has no synchronous stat, so it's left unset and
+        // the client keys its cache on the path.
+        let image_stat = if self.host_fs_offtick || !super::is_image_path(Some(&path)) {
+            None
+        } else {
+            self.host_fs.stat(&path)
+        };
+        // A local open only previews a file that is actually THERE: `:e shot.png` on a
+        // path with no file is a new file, and an inert preview of nothing leaves a
+        // buffer you cannot type into with nothing to say why. Off-tick cannot stat,
+        // so it keeps previewing on the extension and the client shows its own
+        // placeholder if the fetch comes back empty.
+        let previewable = self.host_fs_offtick || image_stat.is_some();
+        if self.options.imagepreview && super::is_image_path(Some(&path)) && previewable {
+            let stat = image_stat;
             if let Some(ob) = self.buffers.map.get_mut(&buffer) {
                 let len = ob.buffer.len_bytes();
                 if len > 0 {
@@ -1777,7 +1784,13 @@ impl Editor {
     /// and `'fileencoding'` records the forced value for `:w`.
     fn read_buffer(&self, path: &Path) -> anyhow::Result<Buffer> {
         let fs = self.host_fs.clone();
-        if self.options.imagepreview && super::is_image_path(Some(path)) {
+        // …and only for a file that is actually there: `:e shot.png` on a path with
+        // no file is a new file, and an inert preview of nothing is a buffer you
+        // cannot type into with nothing to say why.
+        if self.options.imagepreview
+            && super::is_image_path(Some(path))
+            && Buffer::image_file_exists(path, &*fs)
+        {
             Buffer::from_image_file(path, &*fs)
         } else {
             let fileencodings = self

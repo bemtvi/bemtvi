@@ -341,6 +341,8 @@ impl EditHost {
             let diagnostics_virt_layer = layer("diagnostics_virt");
             let number_width_v = layer("number_width");
             let sign_width_v = layer("sign_width");
+            let leftcol_v = layer("leftcol");
+            let numbers_v = layer("numbers");
             let number_shown = matches!(layer("number"), Value::Boolean(true))
                 || matches!(layer("relativenumber"), Value::Boolean(true));
             // The status line as painted. The global bar (`laststatus=3`) is the whole
@@ -370,6 +372,8 @@ impl EditHost {
                 number_width: &number_width_v,
                 sign_width: &sign_width_v,
                 number_shown,
+                leftcol: &leftcol_v,
+                numbers: &numbers_v,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

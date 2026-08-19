@@ -492,6 +492,13 @@ impl Buffer {
         })
     }
 
+    /// Whether `path` names a file that is actually there to preview. `:e shot.png`
+    /// on a path with no file is a NEW FILE, not a preview of nothing: previewing it
+    /// anyway leaves an inert buffer you cannot type into, with nothing to say why.
+    pub fn image_file_exists(path: impl AsRef<Path>, fs: &dyn HostFs) -> bool {
+        fs.stat(path.as_ref()).is_some()
+    }
+
     /// Number of editable lines (excludes the phantom final line).
     pub fn line_count(&self) -> usize {
         self.text.len_lines(LINE_TYPE).saturating_sub(1)

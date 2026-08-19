@@ -1554,6 +1554,10 @@ pub struct UiMirror<'a> {
     pub number_width: &'a rmpv::Value,
     pub sign_width: &'a rmpv::Value,
     pub number_shown: bool,
+    /// The focused window's scroll position: its horizontal offset, and the buffer
+    /// line number of each painted row (`t:view()`).
+    pub leftcol: &'a rmpv::Value,
+    pub numbers: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3481,6 +3485,8 @@ impl LuaRuntime {
             number_width,
             sign_width,
             number_shown,
+            leftcol,
+            numbers,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3553,6 +3559,13 @@ impl LuaRuntime {
         // actually asks — how wide is the gutter — rather than the width of a column
         // that may not be there.
         ui.set("number_shown", number_shown)?;
+        // Where the window is SCROLLED to. `screen` carries each painted row's full
+        // text and the CLIENT clips it to the window and offsets it by `leftcol`, so
+        // sideways scrolling shows up in none of the row views at all; the per-row
+        // buffer line numbers give the vertical half, and say which lines are visible
+        // (a closed fold takes its rows out of the list).
+        ui.set("leftcol", crate::convert::rmpv_to_lua(&self.lua, leftcol)?)?;
+        ui.set("numbers", crate::convert::rmpv_to_lua(&self.lua, numbers)?)?;
         // The other decoration layers over the same rows — virtual text, virtual
         // lines and gutter signs — which `t:decor()` folds into one per-row answer.
         // None of them is in the buffer text or the painted glyphs either.

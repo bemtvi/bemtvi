@@ -291,6 +291,7 @@ async fn g_prefix_merges_builtin_motions_with_user_maps() {
          ;/Older change position/map,\
          D/Go to declaration/map,\
          T/Previous tab/map,\
+         U/Uppercase/map,\
          `/Jump to mark (no jumplist)/group,\
          c/Toggle comment/map,\
          d/Go to definition/map,\
@@ -298,7 +299,9 @@ async fn g_prefix_merges_builtin_motions_with_user_maps() {
          j/Down one display line/map,\
          k/Up one display line/map,\
          r/Find references/map,\
-         t/Next tab/map"
+         t/Next tab/map,\
+         u/Lowercase/map,\
+         ~/Toggle case/map"
     );
 }
 

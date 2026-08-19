@@ -26,6 +26,8 @@ mod sandbox_stateless;
 #[path = "editing/subst_expr.rs"]
 mod subst_expr;
 
+#[path = "editing/case_ops.rs"]
+mod case_ops;
 #[path = "editing/changelist.rs"]
 mod changelist;
 #[path = "editing/clipboard.rs"]

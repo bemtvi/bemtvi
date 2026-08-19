@@ -1648,6 +1648,40 @@ impl Editor {
         self.clamp_cursor();
     }
 
+    /// Move `target`'s per-file marks into [`Editor::pending_file_marks`] so a later
+    /// open of the same path seeds them back — the in-session half of what shada does
+    /// across a relaunch. A buffer with no path (a scratch surface) or no marks is
+    /// left alone; an entry already pending for that path wins (it is the more
+    /// recently *stored* one only when this buffer never carried the mark).
+    fn stash_file_marks_of(&mut self, target: BufferId) {
+        let Some(ob) = self.buffers.map.get(&target) else {
+            return;
+        };
+        let Some(path) = ob
+            .buffer
+            .path
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .cloned()
+        else {
+            return;
+        };
+        let mut marks = ob.buffer.marks.clone();
+        if target == self.cur_buffer() {
+            marks.insert('"', (self.cursor.line, self.cursor.col));
+        }
+        if marks.is_empty() {
+            return;
+        }
+        let slot = self
+            .pending_file_marks
+            .entry(super::normalize_path(&path))
+            .or_default();
+        for (name, pos) in marks {
+            slot.insert(name, pos);
+        }
+    }
+
     /// Switch the current window to buffer `id` as a **jump**: record the position
     /// we leave in the jumplist (so `<C-o>` returns here) before the swap, exactly
     /// as vim's `do_buffer` sets the previous-context mark. Backs the buffer-list
@@ -3098,6 +3132,14 @@ impl Editor {
         // A `:%bd` sweep therefore ends with `#` naming the last buffer that was
         // current, which is what the `:%bd|e#` idiom relies on.
         let deleted_name = self.buffers.get(target).buffer.path.clone();
+        // A file-backed buffer's marks outlive the buffer: hand them to the same
+        // pending-by-path store shada's restored marks land in, so reopening the file
+        // gets `` `a `` and the `"` last-cursor mark back — vim's in-memory file-mark
+        // list. Without this "reopen where you left off" only worked across a
+        // *relaunch* (through shada); inside one session a wipe threw it away. The
+        // buffer being wiped while current has no `"` yet (that is written on leave),
+        // so its live cursor is stamped here.
+        self.stash_file_marks_of(target);
         let layer = self.focused_layer;
         let replacement = if was_current {
             self.replacement_in_layer(target, layer)

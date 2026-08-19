@@ -474,3 +474,42 @@ async fn setting_a_read_only_mark_errors_loudly() {
         view_str(&map, "message")
     );
 }
+
+/// A file-backed buffer's marks outlive the buffer itself: wiping it hands them to
+/// the same pending-by-path store shada's restored marks land in, so reopening the
+/// file gets `` `" `` (and every named mark) back — vim's in-memory file-mark list.
+///
+/// Without it the "reopen where you left off" behavior only ever worked across a
+/// relaunch, through shada: inside one session a `:bwipeout` threw the position away.
+#[tokio::test]
+async fn a_wiped_file_keeps_its_marks_for_the_next_open() {
+    let (rpc, _incoming) = start(None).await;
+    let path = write_temp("wiped_marks", "txt", "one\ntwo\nthree\nfour\nfive\n");
+    feed(&rpc, &format!(":e {path}<CR>"));
+    feed(&rpc, "3Gmax");
+    assert_eq!(lines(&rpc).await[2], "hree");
+    // Leave, wipe, and open the file again from scratch.
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, &format!(":bwipeout! {path}<CR>"));
+    feed(&rpc, &format!(":e {path}<CR>"));
+    // The named mark came back…
+    feed(&rpc, "gg`a");
+    assert_eq!(cursor(&rpc).await.0, 3);
+    // …and so did the last-cursor mark the leave recorded.
+    feed(&rpc, "gg`\"");
+    assert_eq!(cursor(&rpc).await.0, 3);
+}
+
+/// The buffer being wiped while it is the *current* one has no `"` yet (that mark is
+/// written on leave), so the wipe stamps the live cursor as it goes.
+#[tokio::test]
+async fn wiping_the_current_file_stamps_where_the_cursor_was() {
+    let (rpc, _incoming) = start(None).await;
+    let path = write_temp("wiped_current", "txt", "one\ntwo\nthree\nfour\nfive\n");
+    feed(&rpc, &format!(":e {path}<CR>"));
+    feed(&rpc, "4G");
+    feed(&rpc, ":bwipeout!<CR>");
+    feed(&rpc, &format!(":e {path}<CR>"));
+    feed(&rpc, "gg`\"");
+    assert_eq!(cursor(&rpc).await.0, 4);
+}

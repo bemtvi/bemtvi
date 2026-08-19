@@ -30,6 +30,39 @@ pub(crate) const COMMENT_OP: char = '\u{E000}';
 /// [`Editor::apply_operator_to_range`].
 pub(crate) const FOLD_OP: char = '\u{E001}';
 
+/// The private-use chars standing in for the three **case** operators —
+/// `gu{motion}` (lowercase), `gU{motion}` (uppercase) and `g~{motion}` (toggle) —
+/// the `g`-prefixed siblings of [`COMMENT_OP`]. Each arms like `gc` does, doubles
+/// on its own mnemonic key (`guu`, `gUU`, `g~~`) or on a repeat of the whole pair
+/// (`gugu`, `gUgU`, `g~g~`), and applies through the generic operator machinery in
+/// [`Editor::apply_operator_to_range`]. Unlike `gc`/`zf` they are **charwise**: the
+/// motion's own kind decides the span, exactly as in vim.
+pub(crate) const LOWER_OP: char = '\u{E002}';
+/// `gU{motion}` — see [`LOWER_OP`].
+pub(crate) const UPPER_OP: char = '\u{E003}';
+/// `g~{motion}` — see [`LOWER_OP`].
+pub(crate) const TOGGLE_OP: char = '\u{E004}';
+
+/// The case operator a `g`-prefixed key names (`u` / `U` / `~`), if any.
+pub(crate) fn case_op_for_key(c: char) -> Option<char> {
+    match c {
+        'u' => Some(LOWER_OP),
+        'U' => Some(UPPER_OP),
+        '~' => Some(TOGGLE_OP),
+        _ => None,
+    }
+}
+
+/// The mnemonic key a case operator doubles on (`gu` → `u`), for the `guu` form.
+pub(crate) fn case_op_key(op: char) -> Option<char> {
+    match op {
+        LOWER_OP => Some('u'),
+        UPPER_OP => Some('U'),
+        TOGGLE_OP => Some('~'),
+        _ => None,
+    }
+}
+
 /// A fold command resolved from the `z` prefix (the fold half of the `z` family,
 /// beside the viewport [`ViewPlace`] commands). Each maps to an `Editor::fold_*`
 /// method; [`CreateLines`](FoldCmd::CreateLines) carries its line count via the
@@ -900,6 +933,9 @@ fn g_continuations() -> Vec<CommandContinuation> {
         ("t", "Next tab"),
         ("T", "Previous tab"),
         ("c", "Toggle comment"),
+        ("u", "Lowercase"),
+        ("U", "Uppercase"),
+        ("~", "Toggle case"),
         (";", "Older change position"),
         (",", "Newer change position"),
         ("*", "Search word forward (partial)"),
@@ -1343,6 +1379,26 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             Some('T') => {
                 return Complete(ResolvedCommand::Normal(NormalCmd::TabPrev(pending.count)))
             }
+            // `gu` / `gU` / `g~` — the case operators. In visual mode they apply to
+            // the selection at once; in normal mode they arm for a following motion
+            // or text object. A second press of the mnemonic key (`gugu`, and the
+            // `guu` form handled with the other doublings below) doubles to the
+            // current line(s).
+            Some(c) if case_op_for_key(c).is_some() => {
+                let op = case_op_for_key(c).expect("checked by the guard");
+                if mode.is_visual() {
+                    return Complete(ResolvedCommand::VisualOperate(op));
+                }
+                if pending.operator == Some(op) {
+                    return Complete(ResolvedCommand::DoubledOperator(op));
+                }
+                let mut next = pending.clone();
+                next.operator = Some(op);
+                next.op_count = pending.count;
+                next.count = None;
+                next.stage = Stage::Start;
+                return Prefix(next);
+            }
             // `g;` / `g,` walk the change list (older / newer change positions).
             Some(';') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeOlder)),
             Some(',') => return Complete(ResolvedCommand::Normal(NormalCmd::ChangeNewer)),
@@ -1450,6 +1506,9 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             // `gcc`: the comment operator doubles on a second `c` (its mnemonic
             // key), not on its internal sentinel char.
             Some('c') if op == COMMENT_OP => Complete(RC::DoubledOperator(op)),
+            // `guu` / `gUU` / `g~~`: likewise, each case operator doubles on its own
+            // mnemonic key. (`gugu` doubles through the `g` prefix above.)
+            Some(c) if case_op_key(op) == Some(c) => Complete(RC::DoubledOperator(op)),
             Some('/') => Complete(RC::OperatorSearch {
                 op,
                 dir: SearchDir::Forward,
@@ -1539,12 +1598,13 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             // extend the side you started from.
             'o' | 'O' => return Complete(RC::Normal(N::VisualSwapEnds)),
             ':' => return Complete(RC::Normal(N::EnterCommand)),
-            // `u` never rewinds from a selection. vim redirects it to the `gu`
-            // lowercase *operator* (`nv_undo`), which bemtvi does not have yet — so
-            // until it does, this is a loud dead end rather than a silent undo that
-            // would leave the selection anchored into a state that no longer exists.
-            // Point it at the operator, not at `N::Undo`, when `gu`/`gU` land.
-            'u' => return Refuse,
+            // `u` never rewinds from a selection: vim redirects it to the `gu`
+            // lowercase *operator* (`nv_undo`), and `U` / `~` are its uppercase and
+            // toggle siblings. An undo here would leave the selection anchored into
+            // a state that no longer exists.
+            'u' => return Complete(RC::VisualOperate(LOWER_OP)),
+            'U' => return Complete(RC::VisualOperate(UPPER_OP)),
+            '~' => return Complete(RC::VisualOperate(TOGGLE_OP)),
             _ => {}
         }
     }

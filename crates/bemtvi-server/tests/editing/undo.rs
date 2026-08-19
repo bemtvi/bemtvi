@@ -884,41 +884,37 @@ async fn a_refused_time_travel_stops_a_macro() {
 }
 
 #[tokio::test]
-async fn undo_and_redo_are_refused_under_a_selection() {
-    // The same guard, for the rest of the family. vim reaches it two ways: `<C-r>` is
-    // `checkclearopq`-guarded outright (`nv_redo_or_register`), and `u` is redirected
-    // to the `gu` lowercase *operator* (`nv_undo`), so neither ever rewinds from a
-    // selection. bemtvi has no case operator to redirect to, so `u` is a loud dead end
-    // — which is the half that matters: a silent rewind leaves the selection anchored
-    // at offsets belonging to a state that no longer exists.
+async fn undo_and_redo_never_rewind_under_a_selection() {
+    // vim reaches this two ways: `<C-r>` is `checkclearopq`-guarded outright
+    // (`nv_redo_or_register`), and `u` is redirected to the `gu` lowercase
+    // *operator* (`nv_undo`) — so neither ever rewinds from a selection. A silent
+    // rewind would leave the selection anchored at offsets belonging to a state
+    // that no longer exists.
     let (rpc, _incoming) = start_with_file("alpha\nbravo\n").await;
-    feed_sync(&rpc, "ix<Esc>").await;
-    feed_sync(&rpc, "iy<Esc>").await;
-    assert_eq!(lines(&rpc).await, v(&["yxalpha", "bravo"]));
+    feed_sync(&rpc, "iX<Esc>").await;
+    feed_sync(&rpc, "iY<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["YXalpha", "bravo"]));
 
+    // `<C-r>` under a selection is the dead end, and it keeps the selection.
     feed_sync(&rpc, "vl").await;
-    feed_sync(&rpc, "u").await;
-    assert_eq!(
-        lines(&rpc).await,
-        v(&["yxalpha", "bravo"]),
-        "`u` under a selection does not rewind"
-    );
     feed_sync(&rpc, "<C-r>").await;
     assert_eq!(
         lines(&rpc).await,
-        v(&["yxalpha", "bravo"]),
+        v(&["YXalpha", "bravo"]),
         "`<C-r>` under a selection does not redo"
     );
-
     assert_eq!(mode(&rpc).await, "v", "still in Visual mode");
-    feed_sync(&rpc, "d").await;
+
+    // `u` is the lowercase operator over the selection — it edits, it does not undo.
+    feed_sync(&rpc, "u").await;
     assert_eq!(
         lines(&rpc).await,
-        v(&["alpha", "bravo"]),
-        "the selection survived both refusals"
+        v(&["yxalpha", "bravo"]),
+        "`u` under a selection lowercases it"
     );
+    assert_eq!(mode(&rpc).await, "n", "the operator left Visual mode");
 
-    // And Normal mode is untouched: `u` still walks the tree.
+    // And Normal mode is untouched: `u` still walks the tree, one step per press.
     feed_sync(&rpc, "u").await;
-    assert_eq!(lines(&rpc).await, v(&["yxalpha", "bravo"]));
+    assert_eq!(lines(&rpc).await, v(&["YXalpha", "bravo"]));
 }

@@ -1,7 +1,9 @@
 //! Operators (`d`/`c`/`y`/`>`/…) and the editing primitives they drive
 //! (delete/yank/paste/join/replace/case).
 
-use super::command::{is_clipboard_register, is_readonly_register, COMMENT_OP, FOLD_OP};
+use super::command::{
+    is_clipboard_register, is_readonly_register, COMMENT_OP, FOLD_OP, LOWER_OP, TOGGLE_OP, UPPER_OP,
+};
 use super::syntax::indent_width;
 use super::*;
 use crate::clipboard::Clipboard;
@@ -172,6 +174,20 @@ impl Editor {
             COMMENT_OP => {
                 let (first, last) = self.line_span(lo, hi);
                 self.toggle_comment_lines(first, last);
+            }
+            // `gu{motion}` / `gU{motion}` / `g~{motion}` (and the `guu` / `gUU` /
+            // `g~~` doublings): rewrite the range's case in place. Charwise unless
+            // the motion itself was linewise — the range already carries that — and
+            // the cursor settles on the range start, as vim's `op_tilde` does.
+            LOWER_OP | UPPER_OP | TOGGLE_OP => {
+                self.case_range(lo, hi, op);
+                if linewise {
+                    self.cursor.line = first_line;
+                    self.cursor.col = 0;
+                } else {
+                    self.set_cursor_char(lo);
+                }
+                self.clamp_cursor();
             }
             _ => {}
         }
@@ -352,6 +368,18 @@ impl Editor {
             self.create_fold(first, last);
             self.mode = Mode::Normal;
             self.reset_pending();
+            return;
+        }
+        // Visual `u` / `U` / `~` (and their `gu` / `gU` / `g~` spellings) rewrite the
+        // selection's case in place — like `=`, no yank / register. The cursor settles
+        // on the selection start and the selection is dropped, as vim does.
+        if matches!(op, LOWER_OP | UPPER_OP | TOGGLE_OP) {
+            self.record_change_bounds(lo, hi);
+            self.case_range(lo, hi, op);
+            self.set_cursor_char(lo);
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            self.clamp_cursor();
             return;
         }
         // Visual `gc` toggles comments on the selected lines — like `=`, no yank /
@@ -993,6 +1021,40 @@ impl Editor {
         self.visual_anchor = self.cursor;
         self.helix_count = None;
         self.clamp_cursor();
+    }
+
+    /// Rewrite the case of every character in `[lo, hi)` in a single undo step —
+    /// the engine behind `gu` / `gU` / `g~` (and visual `u` / `U` / `~`). `op` is one
+    /// of [`LOWER_OP`] / [`UPPER_OP`] / [`TOGGLE_OP`]. The span is replaced wholesale
+    /// so a width-changing case fold (`ß` → `SS`, `İ` → `i̇`) stays correct; the
+    /// cursor is the caller's.
+    pub(crate) fn case_range(&mut self, lo: usize, hi: usize, op: char) {
+        let (lo, hi) = self.snap_range(lo, hi);
+        if lo >= hi {
+            return;
+        }
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        self.push_undo();
+        let recased: String = self
+            .buffer()
+            .text
+            .slice(lo..hi)
+            .to_string()
+            .chars()
+            .map(|c| match op {
+                LOWER_OP => c.to_lowercase().collect::<String>(),
+                UPPER_OP => c.to_uppercase().collect::<String>(),
+                _ if c.is_uppercase() => c.to_lowercase().collect::<String>(),
+                _ if c.is_lowercase() => c.to_uppercase().collect::<String>(),
+                _ => c.to_string(),
+            })
+            .collect();
+        self.buffer_mut().remove(lo..hi);
+        self.buffer_mut().insert(lo, &recased);
+        self.buffer_mut().modified = true;
     }
 
     /// Toggle the case of every character in `[lo, hi)` in a single undo step — the

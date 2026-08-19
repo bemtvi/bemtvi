@@ -1507,6 +1507,44 @@ async fn editing_in_normal_fires_textchanged() {
 }
 
 #[tokio::test]
+async fn reading_a_file_does_not_fire_textchanged() {
+    // Loading text into a buffer is not an edit. neovim suppresses this
+    // explicitly — `readfile()` re-stamps `b_last_changedtick` "to avoid
+    // triggering a TextChanged autocommand right after it was added"
+    // (buffer.c) — and without the same suppression every `:e` / `:e!` looks
+    // like a change: a lint-on-change or autosave handler runs on every open,
+    // and any message a `BufReadPost` handler wrote is wiped by the spurious
+    // fire that lands behind it.
+    let dir = temp_dir("au_textchanged_read");
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "hello\nworld\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('TextChanged', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    // The first read: the file lands in the (reused) startup buffer.
+    command(&rpc, &format!("e {}", file.to_str().unwrap())).await;
+    let after_read = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(
+        after_read, "0",
+        "reading a file into a buffer is not a TextChanged"
+    );
+    // …and re-reading it isn't either, even though the text is replaced.
+    command(&rpc, "e!").await;
+    let after_reread = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(
+        after_reread, "0",
+        "re-reading the file is not a TextChanged either"
+    );
+    // A real edit still fires, so the suppression is not a blanket mute.
+    redraw_after(&rpc, &mut incoming, "x").await;
+    let after_edit = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after_edit, "1", "an actual edit still fires TextChanged");
+}
+
+#[tokio::test]
 async fn typing_in_insert_fires_textchangedi_per_change() {
     // Each character typed in insert fires TextChangedI (entering insert with `i`
     // doesn't, leaving with `<Esc>` doesn't).

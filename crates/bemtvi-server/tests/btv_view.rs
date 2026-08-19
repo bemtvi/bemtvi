@@ -988,6 +988,55 @@ async fn view_float_grab_locks_focus() {
     );
 }
 
+/// Re-opening a named panel while a grabbing float view holds the focus lock must
+/// not recurse. `open_panel`'s reuse branch focuses the panel window and then swaps
+/// its buffer — but the hard focus lock refuses that focus change, so the swap ran
+/// from *outside* the panel window, where `switch_buffer` re-routes a panel buffer
+/// back into `open_panel`. The two called each other until the stack ran out and the
+/// editor died with SIGSEGV; two listings in a row under an open modal dialog (a
+/// `btv.view.component` float, say) was all it took.
+#[tokio::test]
+async fn reopening_a_panel_under_a_grabbing_float_does_not_recurse() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = btv.view.create{}
+           vw:set_lines{ "dialog" }
+           vw:mount{ float = { width = 20, height = 4, grab = true } }"#,
+    )
+    .await;
+    // Two listings in a row: the second takes `open_panel`'s reuse branch.
+    exec_lua(&rpc, r#"vim.cmd("messages")"#).await;
+    exec_lua(&rpc, r#"vim.cmd("registers")"#).await;
+    // Still alive, still answering — and the lock still holds the float.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dialog"],
+        "the grabbing float keeps focus while the panel re-targets underneath it"
+    );
+    // One panel window, and it re-targeted to the newest listing rather than being
+    // left on the first one.
+    let shown = exec_lua(
+        &rpc,
+        r#"local names = {}
+           for _, w in ipairs(vim.api.nvim_list_wins()) do
+             names[#names + 1] = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w))
+           end
+           return table.concat(names, ",")"#,
+    )
+    .await;
+    let shown = shown.as_str().unwrap_or_default().to_string();
+    assert!(
+        shown.contains("[Registers]"),
+        "the panel window shows the second listing, got {shown:?}"
+    );
+    assert!(
+        !shown.contains("[Messages]"),
+        "the first listing was replaced, not stacked, got {shown:?}"
+    );
+}
+
 /// Dismissing a grabbing float view releases the lock and restores focus to the
 /// window it sprang from (open → interact → dismiss → back where you were).
 #[tokio::test]

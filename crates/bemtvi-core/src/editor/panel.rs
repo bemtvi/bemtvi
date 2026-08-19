@@ -48,10 +48,20 @@ impl Editor {
     pub(crate) fn open_panel(&mut self, buf: BufferId, height: usize) {
         if let Some(p) = self.panel {
             if self.window(p.window).is_some() {
-                // `set_current_window` is permitted here (target == the panel window);
-                // `switch_buffer` then re-targets that window's buffer in place.
+                // `set_current_window` is *usually* permitted here (the target is the
+                // panel window, which normally holds the focus lock itself).
                 self.set_current_window(p.window);
-                self.switch_buffer(buf);
+                // But it does not always land: a grabbing `btv.view` modal float sits
+                // ahead of the panel in `focus_lock_window`, and `focus_window` refuses
+                // every move off it — so the panel can be open while focus is elsewhere.
+                // Re-target the panel window's buffer BY ID rather than assuming it is
+                // current: `switch_buffer` on a panel buffer from a non-panel window
+                // routes straight back into `open_panel`, and the two called each other
+                // until the stack ran out. `set_window_buffer` covers both cases — it
+                // delegates to `switch_buffer` when the panel window really is current
+                // (where that reroute cannot trigger) and rebinds without focus when it
+                // is not.
+                self.set_window_buffer(p.window, buf);
                 return;
             }
             // The panel window vanished out from under us (e.g. `:only`); remount.

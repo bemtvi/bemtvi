@@ -484,7 +484,21 @@ impl EditHost {
             "TextChanged"
         };
         let want_text = self.au_active_events.contains(text_event);
+        // A buffer being READ is not a buffer being EDITED. `unannounced` is exactly
+        // "a read is landing in this buffer on this pass" — it gates the announce
+        // chain below, and a reload (`:e!`, an autoreload after `:checktime`) clears
+        // `announced` so the re-read raises it again. The load bumps `changedtick`,
+        // so without this the diff below reads as a change and every open fires
+        // `TextChanged`: a lint-on-change or autosave handler would run on each open,
+        // and the fire would land *behind* a `BufReadPost` handler's message and wipe
+        // it. neovim suppresses the same thing at the same point, by re-stamping
+        // `b_last_changedtick` right after `readfile` (buffer.c, "Set last_changedtick
+        // to avoid triggering a TextChanged autocommand right after it was added").
+        // The baseline refresh below still records the post-read tick, so the *next*
+        // real edit fires normally.
+        let reading = unannounced && !pending_open;
         let text_changed = want_text
+            && !reading
             && self
                 .last_text
                 .is_some_and(|(b, t)| b == buf && t != cur_tick);

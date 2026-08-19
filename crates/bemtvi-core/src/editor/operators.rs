@@ -1212,12 +1212,23 @@ impl Editor {
 
     pub(crate) fn open_line(&mut self, below: bool) {
         self.push_undo();
+        // On a CLOSED fold, open outside it — below its last line, or above its
+        // first — the same whole-fold rule every other linewise command follows.
+        // Opening inside it is not merely misplaced: the new line is hidden by the
+        // still-closed fold, the cursor snaps back to the fold's head, and
+        // everything typed next lands on the head line instead.
+        let line = if below {
+            self.fold_line_end(self.cursor.line)
+        } else {
+            self.fold_line_start(self.cursor.line)
+        };
+        self.cursor.line = line;
         if below {
-            let at = self.buffer().byte_at(self.cursor.line, self.line_len());
+            let at = self.buffer().byte_at(line, self.buffer().line_len(line));
             self.buffer_mut().insert_char(at, '\n');
             self.cursor.line += 1;
         } else {
-            let at = self.buffer().line_start(self.cursor.line);
+            let at = self.buffer().line_start(line);
             self.buffer_mut().insert_char(at, '\n');
         }
         self.buffer_mut().normalize();

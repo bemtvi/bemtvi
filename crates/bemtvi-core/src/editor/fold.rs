@@ -705,14 +705,30 @@ impl Editor {
 
     /// Snap the focused cursor out of any line a closed fold now hides, onto that
     /// fold's header — vim keeps the cursor on a visible line after folds change.
+    ///
+    /// Except while INSERTING, where vim keeps the fold under the cursor open
+    /// instead of moving the cursor: folds are recomputed on every keystroke, so a
+    /// `foldmethod=marker` buffer in which you have just typed the opening marker
+    /// would otherwise fold the line you are typing on out of view, snap the cursor
+    /// back to the fold's header, and scatter the rest of what you type across the
+    /// wrong line.
     fn snap_cursor_to_fold_header(&mut self) {
         let line = self.cursor.line;
         let start = self.fold_line_start(line);
-        if start != line {
-            self.cursor.line = start;
-            self.cursor.col = self.first_non_blank(start);
-            self.clamp_cursor();
+        if start == line {
+            return;
         }
+        // While INSERTING, leave the cursor where the typing is. Folds are recomputed
+        // on every keystroke, so a `foldmethod=marker` buffer in which you have just
+        // typed the opening marker folds the line you are typing on — and snapping
+        // then scatters the rest of what you type onto the fold's header line
+        // instead. The next recompute in Normal mode (after `<Esc>`) snaps as usual.
+        if self.mode.is_insert() {
+            return;
+        }
+        self.cursor.line = start;
+        self.cursor.col = self.first_non_blank(start);
+        self.clamp_cursor();
     }
 
     /// The focused buffer's resolved [`FoldSource`] — `'foldmethod'`, with `expr`

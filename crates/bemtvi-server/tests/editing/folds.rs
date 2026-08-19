@@ -906,3 +906,82 @@ async fn btv_bo_foldmarker_reaches_the_live_engine() {
         visible_numbers(&map)
     );
 }
+
+#[tokio::test]
+async fn open_line_on_a_closed_fold_opens_outside_it() {
+    // `o` / `O` with the cursor on a CLOSED fold act on the whole fold, like every
+    // other linewise command: `o` opens below its LAST line, `O` above its first.
+    // Neither was fold-aware, and the result was not merely off-by-a-few-lines —
+    // `o` inserted the break at the end of the fold's first line, so the new line
+    // landed INSIDE the still-closed fold, the cursor snapped back to the fold's
+    // head, and everything typed next went to the head line instead.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<CR>four<Esc>");
+    // A manual fold over lines 2-3, closed.
+    feed(&rpc, "2Gzfj");
+    feed(&rpc, "2Gzc");
+
+    feed(&rpc, "o<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "", "four"],
+        "`o` opens below the fold's last line"
+    );
+    feed(&rpc, "u");
+
+    feed(&rpc, "2GO<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "", "two", "three", "four"],
+        "`O` opens above the fold's first line"
+    );
+}
+
+#[tokio::test]
+async fn typing_after_open_line_on_a_fold_lands_on_the_new_line() {
+    // The consequence that made it obvious: the text you type next must end up on
+    // the line you just opened, not prepended to the fold's head.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>");
+    feed(&rpc, "1Gzfj");
+    feed(&rpc, "1Gzc");
+    feed(&rpc, "otyped<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "typed", "three"],
+        "the typed text lands on the opened line"
+    );
+}
+
+#[tokio::test]
+async fn open_line_off_a_fold_is_unchanged() {
+    // …and with no fold in play, or an OPEN one, `o` / `O` behave exactly as before.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>");
+    feed(&rpc, "1Gzfj");
+    feed(&rpc, "1Gzo"); // open the fold again
+    feed(&rpc, "1Gobelow<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "below", "two", "three"],
+        "an OPEN fold is not a fold for this purpose"
+    );
+}
+
+#[tokio::test]
+async fn typing_a_fold_marker_does_not_fold_the_line_being_typed() {
+    // Marker folds are recomputed on every keystroke, so the moment you type the
+    // opening `{{{` the fold exists — and it used to close over the very line the
+    // cursor was on, snapping the cursor back to the fold's header. Everything
+    // typed after that landed on the wrong line: `O` + three lines came out as one
+    // scrambled line. vim keeps the fold under the cursor open while inserting.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iaaa<CR>bbb<Esc>");
+    feed(&rpc, ":set foldmethod=marker<CR>");
+    feed(&rpc, "ggOstart {{{<CR>middle<CR>end }}}<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["start {{{", "middle", "end }}}", "aaa", "bbb"],
+        "the typed lines land where they were typed"
+    );
+}

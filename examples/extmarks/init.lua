@@ -44,9 +44,13 @@ end
 -- on the same text — that's the anchor-shifting, exercised through real edits.
 --------------------------------------------------------------------------------
 mark_word(1, "extmark", "ExtNote")
-mark_word(1, "namespace", "ExtNote")
 mark_word(2, "TODO:", "ExtTodo")
 mark_word(3, "NOTE:", "ExtWarn")
+-- Two marks on one line, from different namespaces' worth of intent: the tag
+-- above and the keyword here. (Row 3 is where "namespace" actually appears — the
+-- rows are 0-based, and `mark_word` returns quietly when the word is not on the
+-- line it was pointed at, so a wrong row is an invisible no-op.)
+mark_word(3, "namespace", "ExtNote")
 
 --------------------------------------------------------------------------------
 -- :ExtMark — highlight the word under the cursor in ExtTodo. Move the cursor onto

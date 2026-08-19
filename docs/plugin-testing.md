@@ -175,14 +175,15 @@ Matchers are called with a dot; prefix any with `.never` to invert
 | `t:message()` / `t:statusline()` | The message / status line text. |
 | `t:screen()` | The focused window's **painted** rows, as a list of strings. |
 | `t:highlights([row])` | The highlight spans over those rows — `{ first, last, group }`. |
-| `t:decor([row])` | The virtual text and gutter sign beside those rows. |
+| `t:decor([row])` | The virtual text, virtual lines and gutter sign beside those rows. |
 
 `t:highlights()` and `t:decor()` are the views that can see a **decoration** — a
 `btv.decor` provider's mark, a `btv.decor.expr` paint, a treesitter capture, an
 LSP inlay hint — which changes neither the buffer text nor the glyphs drawn. The
 split between them is what each layer *is*: `t:highlights()` colours the buffer's
 own cells and names the group it painted; `t:decor()` reads the glyphs that are
-not in the buffer at all (`{ virt_text, virt_pos, virt_col, sign }`). Groups are
+not in the buffer at all (`{ virt_text, virt_pos, virt_col, virt_lines, sign }`).
+Groups are
 absent from `t:decor()` on purpose — the wire carries a per-frame palette id for
 those layers rather than a name.
 
@@ -190,8 +191,10 @@ those layers rather than a name.
 test should assert on. `t:lines()` is buffer text; `t:screen()` is what the client
 would actually draw. Anything the editor renders *instead of* a buffer line shows
 up only in the latter — a closed fold's `'foldtext'` placeholder, a `~` filler past
-the end of the buffer, a virtual line. Assert on `t:screen()` for those and on
-`t:lines()` for an edit.
+the end of the buffer. Assert on `t:screen()` for those and on `t:lines()` for an
+edit. A virtual *line* is the exception in the other direction: it takes a screen
+row but its text rides its own layer, so the row reads blank in `t:screen()` and
+`t:decor(row).virt_lines` is what sees it.
 
 ### Hermetic seams
 

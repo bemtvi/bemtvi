@@ -1534,6 +1534,9 @@ pub struct UiMirror<'a> {
     pub highlights: &'a rmpv::Value,
     /// The virtual-text placements on those rows (`t:decor()`).
     pub virt_text: &'a rmpv::Value,
+    /// The virtual *lines* interleaved between those rows (`t:decor()`): a whole
+    /// screen row whose text is in this layer rather than in `screen`.
+    pub virt_lines: &'a rmpv::Value,
     /// The gutter signs on those rows (`t:decor()`).
     pub signs: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
@@ -3454,6 +3457,7 @@ impl LuaRuntime {
             screen,
             highlights,
             virt_text,
+            virt_lines,
             signs,
             clipboard,
         } = ui;
@@ -3480,12 +3484,19 @@ impl LuaRuntime {
             "highlights",
             crate::convert::rmpv_to_lua(&self.lua, highlights)?,
         )?;
-        // The other two decoration layers over the same rows — virtual text and
-        // gutter signs — which `t:decor()` folds into one per-row answer. Neither
-        // is in the buffer text or the painted glyphs either.
+        // The other decoration layers over the same rows — virtual text, virtual
+        // lines and gutter signs — which `t:decor()` folds into one per-row answer.
+        // None of them is in the buffer text or the painted glyphs either.
         ui.set(
             "virt_text",
             crate::convert::rmpv_to_lua(&self.lua, virt_text)?,
+        )?;
+        // Virtual lines are rows of their own: `screen` holds a blank for one,
+        // because its text rides this layer instead. Without it a spec cannot see a
+        // header or a rendered result at all.
+        ui.set(
+            "virt_lines",
+            crate::convert::rmpv_to_lua(&self.lua, virt_lines)?,
         )?;
         ui.set("signs", crate::convert::rmpv_to_lua(&self.lua, signs)?)?;
         // The clipboard contents (for `btv.test.clipboard.peek`), or nil when empty.

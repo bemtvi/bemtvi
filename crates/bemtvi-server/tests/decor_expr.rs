@@ -211,6 +211,41 @@ fn line_bg_rows(map: &[(Value, Value)]) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// Every virtual *line* row the frame carries, as `(screen row, text)`. A virtual
+/// line is a whole row of its own, so it reads blank in `lines` and its text rides
+/// this layer instead.
+fn virt_line_rows(map: &[(Value, Value)]) -> Vec<(usize, String)> {
+    window0_field(map, "virt_lines")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let text = r
+                        .as_array()?
+                        .iter()
+                        .filter_map(|c| c.as_array()?.first()?.as_str())
+                        .collect::<String>();
+                    (!text.is_empty()).then_some((i, text))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `hl_mode` code of the first `virt_text` placement on `row` (`0` replace,
+/// `1` combine, `2` blend).
+fn virt_hl_mode(map: &[(Value, Value)], row: usize) -> Option<u64> {
+    window0_field(map, "virt_text")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.get(row))
+        .and_then(Value::as_array)
+        .and_then(|places| places.first())
+        .and_then(Value::as_array)
+        .and_then(|p| p.get(2))
+        .and_then(Value::as_u64)
+}
+
 /// The frame, once the pending work has settled.
 async fn frame(rpc: &Rpc, inc: &mut UnboundedReceiver<Incoming>) -> Vec<(Value, Value)> {
     let _ = exec_lua(rpc, "return 1").await;
@@ -378,6 +413,99 @@ async fn a_qualifier_without_its_decoration_is_refused() {
     );
 }
 
+#[tokio::test]
+async fn a_span_can_carry_virtual_lines() {
+    let init = r#"btv.decor.expr([[
+      if lnum ~= 1 then return {} end
+      return { { virt_lines = "-- section --", virt_lines_hl = "Title" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_virt_lines", "one\ntwo\n", init).await;
+    assert_eq!(
+        virt_line_rows(&frame(&rpc, &mut inc).await),
+        vec![(1, "-- section --".to_string())],
+        "a virtual line takes the screen row under the line it is anchored on"
+    );
+}
+
+#[tokio::test]
+async fn virtual_lines_can_draw_above_their_line() {
+    let init = r#"btv.decor.expr([[
+      if lnum ~= 1 then return {} end
+      return { { virt_lines = "header", virt_lines_above = true } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_virt_lines_above", "one\ntwo\n", init).await;
+    assert_eq!(
+        virt_line_rows(&frame(&rpc, &mut inc).await),
+        vec![(0, "header".to_string())],
+        "`virt_lines_above` puts the row before the line, not after it"
+    );
+}
+
+#[tokio::test]
+async fn a_list_of_virtual_lines_stacks_top_to_bottom() {
+    let init = r#"btv.decor.expr([[
+      if lnum ~= 1 then return {} end
+      return { { virt_lines = { "first", "second" } } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_virt_lines_many", "one\ntwo\n", init).await;
+    assert_eq!(
+        virt_line_rows(&frame(&rpc, &mut inc).await),
+        vec![(1, "first".to_string()), (2, "second".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn a_span_can_fill_the_rest_of_the_row() {
+    let init = r#"btv.decor.expr([[
+      if lnum ~= 1 then return {} end
+      return { { line_fill = "-", line_fill_hl = "NonText" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_line_fill", "ab\ncd\n", init).await;
+    let places = virt_on(&frame(&rpc, &mut inc).await, 0);
+    let (pos, col, text) = places.first().expect("the fill draws a placement");
+    assert_eq!(
+        (*pos, *col),
+        (2, 2),
+        "an overlay starting past the line's text"
+    );
+    assert!(
+        text.len() > 1 && text.chars().all(|c| c == '-'),
+        "the glyph repeats out to the right edge, got {text:?}"
+    );
+    assert!(
+        virt_on(&frame(&rpc, &mut inc).await, 1).is_empty(),
+        "the second line declined"
+    );
+}
+
+#[tokio::test]
+async fn a_span_can_say_how_its_virtual_text_merges() {
+    let init = r#"btv.decor.expr([[
+      return { { 1, 2, "Todo", virt_text = "!", virt_pos = "overlay", hl_mode = "combine" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_hl_mode", "abc\n", init).await;
+    assert_eq!(
+        virt_hl_mode(&frame(&rpc, &mut inc).await, 0),
+        Some(1),
+        "`combine` reaches the placement rather than the `replace` default"
+    );
+}
+
+#[tokio::test]
+async fn a_span_paints_at_the_priority_it_asks_for() {
+    // Two spans over the same cells: the *later* one wins a priority tie, so the
+    // earlier one showing through at all means its `priority` was honored.
+    let init = r#"btv.decor.expr([[
+      return { { 1, 3, "Search", priority = 5000 }, { 1, 3, "Todo" } }
+    ]])"#;
+    let (rpc, mut inc) = start("paint_priority", "abc\n", init).await;
+    assert_eq!(
+        spans_on(&frame(&rpc, &mut inc).await, 0),
+        vec![(0, 3, "Search".to_string())],
+        "the higher-priority span paints over the one written after it"
+    );
+}
+
 // ===== the marks are internal ================================================
 
 #[tokio::test]
@@ -508,6 +636,60 @@ async fn a_function_is_refused_because_a_closure_cannot_cross_vms() {
     assert!(
         err.contains("expected a string of Lua source"),
         "a function must be refused loudly, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_qualifier_is_checked_against_its_own_decoration() {
+    // The span *does* carry a decoration, so a check that only asked "is there
+    // one?" would let this `sign_hl` through, colouring nothing.
+    let init = r#"btv.decor.expr([[ return { { virt_text = "!", sign_hl = "Error" } } ]])"#;
+    let (rpc, mut inc) = start("paint_wrong_target", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("`sign_hl`") && msg.contains("no `sign_text`"),
+        "a qualifier must name the decoration it wanted, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_virt_lines_list_draws_nothing() {
+    let init = r#"btv.decor.expr([[ return { { virt_lines = {} } } ]])"#;
+    let (rpc, mut inc) = start("paint_empty_lines", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("draws nothing"),
+        "no rows is not a decoration, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_virtual_line_that_is_not_text_is_refused() {
+    let init = r#"btv.decor.expr([[ return { { virt_lines = { {} } } } ]])"#;
+    let (rpc, mut inc) = start("paint_bad_line_row", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("`virt_lines` row 1"),
+        "a malformed row should name its position, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_hl_mode_is_refused() {
+    let init = r#"btv.decor.expr([[ return { { 1, 2, virt_text = "!", hl_mode = "merge" } } ]])"#;
+    let (rpc, mut inc) = start("paint_bad_mode", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(msg.contains("unknown `hl_mode` `merge`"), "got {msg:?}");
+}
+
+#[tokio::test]
+async fn a_priority_that_is_not_a_number_is_refused() {
+    let init = r#"btv.decor.expr([[ return { { 1, 2, "Todo", priority = "high" } } ]])"#;
+    let (rpc, mut inc) = start("paint_bad_priority", "abc\n", init).await;
+    let msg = message_after(&rpc, &mut inc, "j").await;
+    assert!(
+        msg.contains("`priority` that is not an integer"),
+        "got {msg:?}"
     );
 }
 

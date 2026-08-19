@@ -333,6 +333,50 @@ btv.command("QfParse", function(a)
 end, { nargs = "?", desc = "Toggle the Lua errorformat, and re-parse the output" })
 
 -- ===========================================================================
+-- 10. A paint that draws rows of its own — `btv.decor.expr` again
+--
+--     type:  <leader>0
+--     see:   each `-- N. …` section line gains a title row *above* it, a rule
+--            running out to the right edge, and its own section number lit up
+--            over the dimmed rest of the line
+--
+--     `:Rules off` removes it. Same block, same two names in scope — what is new
+--     is what one span may carry. `virt_lines` is a whole extra screen row (or a
+--     list of them) rather than text beside the line, `virt_lines_above` puts it
+--     before the line instead of after, and `line_fill` repeats a glyph from the
+--     end of the line's text to the right edge.
+--
+--     `priority` is the span's own — it applies to a plain highlight too — and it
+--     is what makes the two overlapping spans below resolve the way they read:
+--     the whole line is dimmed, and the section number asks for more and wins the
+--     cells it covers.
+
+local RULES = [[
+  local title = line:match("^%-%- (.-) %-+$")
+  if not title then return {} end
+  local number = line:match("^%-%- (%S+)")
+  return {
+    { 1, #line, "Comment", priority = 100 },
+    { 4, 3 + #number, "Todo", priority = 200 },
+    {
+      virt_lines = "   " .. title,
+      virt_lines_hl = "Title",
+      virt_lines_above = true,
+      line_fill = "-",
+      line_fill_hl = "NonText",
+    },
+  }
+]]
+
+btv.command("Rules", function(a)
+  if a.fargs[1] == "off" then
+    btv.decor.expr(nil)
+  else
+    btv.decor.expr(RULES)
+  end
+end, { nargs = "?", desc = "Toggle the section rules" })
+
+-- ===========================================================================
 -- The shortcuts. 1 and 3 put a command on the command line (an `<expr>`
 -- mapping returns keys to feed, which is the public way to produce keystrokes);
 -- the rest act directly.
@@ -371,6 +415,9 @@ btv.keymap.set("n", "<leader>9", function()
   btv.qf.parse(QF_PARSE)
   qf_populate()
 end, { desc = "Parse build output with btv.qf.parse" })
+btv.keymap.set("n", "<leader>0", function()
+  btv.decor.expr(RULES)
+end, { desc = "Draw the section rules" })
 
 local CHEATS = {
   "<leader>1   zM — fold (foldexpr);  zR reopens",
@@ -383,6 +430,7 @@ local CHEATS = {
   "<leader>7   paint every TODO/FIXME, badge + gutter mark;  :Paint off removes it",
   "<leader>8   a quickfix list with custom rows;  :QfText off restores vim's",
   "<leader>9   parse build output in Lua;  :QfParse off hands it to errorformat",
+  "<leader>0   section rules: a title row, a fill and a priority;  :Rules off",
 }
 
 btv.command("Cheat", function()

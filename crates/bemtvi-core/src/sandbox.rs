@@ -74,9 +74,10 @@ impl fmt::Display for SandboxError {
 /// converts here, at the boundary, rather than leaving two conventions in play.
 ///
 /// [`group`](Self::group) and [`decor`](Self::decor) are each optional but not
-/// both: a span draws a highlight over its range, or virtual text / a sign / a
-/// line background anchored at its start, or both. A span that draws neither is a
-/// bug in the expression, not an empty decoration, and is refused.
+/// both: a span draws a highlight over its range, or a decoration anchored at its
+/// start (virtual text, virtual *lines*, a sign, a line background, a line fill),
+/// or both. A span that draws neither is a bug in the expression, not an empty
+/// decoration, and is refused.
 ///
 /// `decor` is the extmark's own [`VirtDecor`](crate::extmark::VirtDecor) rather
 /// than a parallel vocabulary, so the paint reaches every client through the
@@ -88,6 +89,12 @@ pub struct PaintSpan {
     pub end: usize,
     pub group: Option<String>,
     pub decor: Option<Box<crate::extmark::VirtDecor>>,
+    /// Where the span sits in the paint stack, `None` for the extmark default
+    /// ([`DEFAULT_PRIORITY`](crate::extmark::DEFAULT_PRIORITY)). It belongs to the
+    /// *span*, not to its decoration, because a highlight-only span wants it too:
+    /// an indent guide draws *under* treesitter colour, a marker *over* a
+    /// diagnostic's underline.
+    pub priority: Option<u32>,
 }
 
 /// One quickfix entry as a sandbox expression sees it.

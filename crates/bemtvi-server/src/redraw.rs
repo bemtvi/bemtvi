@@ -335,6 +335,7 @@ impl EditHost {
             };
             let highlights = layer("highlights");
             let virt_text = layer("virt_text");
+            let virt_lines = layer("virt_lines");
             let signs = layer("diagnostics_signs");
             let _ = self.lua.set_ui_mirror(bemtvi_lua::UiMirror {
                 float: &float,
@@ -344,6 +345,7 @@ impl EditHost {
                 screen: &screen,
                 highlights: &highlights,
                 virt_text: &virt_text,
+                virt_lines: &virt_lines,
                 signs: &signs,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });

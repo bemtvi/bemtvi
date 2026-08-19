@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
-use bemtvi_core::extmark::{VirtChunk, VirtDecor, VirtTextPos};
+use bemtvi_core::extmark::{HlMode, VirtChunk, VirtDecor, VirtTextPos};
 use bemtvi_core::sandbox::{
     PaintSpan, QfFields, SandboxEngine, SandboxError, SandboxFn, CALL_DEADLINE,
 };
@@ -550,9 +550,38 @@ const SPAN_KEYS: &[&str] = &[
     "virt_text",
     "virt_hl",
     "virt_pos",
+    "hl_mode",
+    "virt_lines",
+    "virt_lines_hl",
+    "virt_lines_above",
     "sign_text",
     "sign_hl",
     "line_hl",
+    "line_fill",
+    "line_fill_hl",
+    "priority",
+];
+
+/// The keys that only *qualify* a decoration, each paired with the key it
+/// qualifies. A qualifier whose target is absent is refused rather than ignored:
+/// a `virt_pos` on a span that carries no `virt_text` is a half-written span, and
+/// silently dropping it leaves a paint that looks configured and draws nothing.
+const SPAN_QUALIFIERS: &[(&str, &str)] = &[
+    ("virt_hl", "virt_text"),
+    ("virt_pos", "virt_text"),
+    ("hl_mode", "virt_text"),
+    ("virt_lines_hl", "virt_lines"),
+    ("virt_lines_above", "virt_lines"),
+    ("sign_hl", "sign_text"),
+    ("line_fill_hl", "line_fill"),
+];
+
+/// The `hl_mode` values, and the [`HlMode`] each names — how a `virt_text` chunk
+/// merges with whatever is under it.
+const HL_MODES: &[(&str, HlMode)] = &[
+    ("replace", HlMode::Replace),
+    ("combine", HlMode::Combine),
+    ("blend", HlMode::Blend),
 ];
 
 /// The `virt_pos` values, and the [`VirtTextPos`] each names.
@@ -628,67 +657,101 @@ fn paint_span(span: Table, nth: usize) -> Result<PaintSpan, SandboxError> {
         .map_err(|_| bad("has a `group` that is not a string".to_string()))?;
 
     let virt_text = text("virt_text")?;
+    let virt_lines = span_virt_lines(&span, nth)?;
     let sign_text = text("sign_text")?;
     let line_hl = text("line_hl")?;
-    let decor = if virt_text.is_some() || sign_text.is_some() || line_hl.is_some() {
-        let virt_pos = match text("virt_pos")? {
-            None => VirtTextPos::Eol,
-            Some(name) => *VIRT_POSITIONS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, p)| p)
-                .ok_or_else(|| {
-                    bad(format!(
-                        "has an unknown `virt_pos` `{name}` (expected one of {})",
-                        VIRT_POSITIONS
-                            .iter()
-                            .map(|(n, _)| *n)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                })?,
-        };
+    let line_fill = text("line_fill")?;
+
+    // Every qualifier against the one thing it qualifies, before anything is
+    // built. Asking only "does the span carry *a* decoration?" would let
+    // `{ sign_text = "*", virt_pos = "inline" }` through with the `virt_pos`
+    // silently doing nothing.
+    let drawn = |target: &str| match target {
+        "virt_text" => virt_text.is_some(),
+        "virt_lines" => !virt_lines.is_empty(),
+        "sign_text" => sign_text.is_some(),
+        "line_fill" => line_fill.is_some(),
+        other => unreachable!("no span qualifies `{other}`"),
+    };
+    for (key, target) in SPAN_QUALIFIERS {
+        if !drawn(target) && span.get::<Option<Value>>(*key).ok().flatten().is_some() {
+            return Err(bad(format!(
+                "has a `{key}` but no `{target}` to apply it to"
+            )));
+        }
+    }
+
+    // The span's own priority — a highlight-only span takes one too, which is how
+    // a paint draws *under* treesitter colour rather than over it.
+    let priority = match span.get::<Option<i64>>("priority") {
+        Ok(None) => None,
+        Ok(Some(n)) if (0..=i64::from(u32::MAX)).contains(&n) => Some(n as u32),
+        Ok(Some(n)) => {
+            return Err(bad(format!(
+                "has a `priority` of {n}, outside 0..={}",
+                u32::MAX
+            )));
+        }
+        Err(_) => return Err(bad("has a `priority` that is not an integer".to_string())),
+    };
+
+    let decor = if virt_text.is_some()
+        || !virt_lines.is_empty()
+        || sign_text.is_some()
+        || line_hl.is_some()
+        || line_fill.is_some()
+    {
+        let virt_hl = text("virt_hl")?;
+        let virt_lines_hl = text("virt_lines_hl")?;
+        let line_fill_hl = text("line_fill_hl")?;
+        let above = span
+            .get::<Option<bool>>("virt_lines_above")
+            .map_err(|_| bad("has a `virt_lines_above` that is not a boolean".to_string()))?
+            .unwrap_or(false);
         Some(Box::new(VirtDecor {
             virt_text: virt_text
                 .map(|t| {
                     vec![VirtChunk {
                         text: t,
-                        hl_group: None,
+                        hl_group: virt_hl,
                     }]
                 })
                 .unwrap_or_default(),
-            virt_text_pos: virt_pos,
+            virt_text_pos: named_key(&span, "virt_pos", VIRT_POSITIONS, VirtTextPos::Eol, nth)?,
+            hl_mode: named_key(&span, "hl_mode", HL_MODES, HlMode::Replace, nth)?,
+            // One chunk per row: a span draws one run, so the whole block shares
+            // `virt_lines_hl` rather than carrying neovim's per-chunk list.
+            virt_lines: virt_lines
+                .into_iter()
+                .map(|t| {
+                    vec![VirtChunk {
+                        text: t,
+                        hl_group: virt_lines_hl.clone(),
+                    }]
+                })
+                .collect(),
+            virt_lines_above: above,
             sign_text,
             sign_hl_group: text("sign_hl")?,
+            line_fill: line_fill.map(|text| VirtChunk {
+                text,
+                hl_group: line_fill_hl,
+            }),
             line_hl_group: line_hl,
             ..VirtDecor::default()
         }))
     } else {
-        // The keys that only qualify a decoration are meaningless without one, and
-        // silently ignoring them would leave a paint that looks configured.
-        for key in ["virt_hl", "virt_pos", "sign_hl"] {
-            if span.get::<Option<Value>>(key).ok().flatten().is_some() {
-                return Err(bad(format!(
-                    "has a `{key}` but no `virt_text`, `sign_text` or `line_hl` to apply it to"
-                )));
-            }
-        }
         None
     };
+
     // A span that draws neither a highlight nor a decoration is a bug in the
     // expression, not an empty one.
     if group.is_none() && decor.is_none() {
         return Err(bad(
             "draws nothing: it needs a highlight group, or a `virt_text` / \
-             `sign_text` / `line_hl`"
+             `virt_lines` / `sign_text` / `line_hl` / `line_fill`"
                 .to_string(),
         ));
-    }
-    let mut decor = decor;
-    if let (Some(hl), Some(d)) = (text("virt_hl")?, decor.as_deref_mut()) {
-        for chunk in &mut d.virt_text {
-            chunk.hl_group = Some(hl.clone());
-        }
     }
 
     // 1-based inclusive -> 0-based end-exclusive. A `last` before `first` is an
@@ -700,7 +763,69 @@ fn paint_span(span: Table, nth: usize) -> Result<PaintSpan, SandboxError> {
         end: last.max(first - 1) as usize,
         group,
         decor,
+        priority,
     })
+}
+
+/// A span's `virt_lines`: a string (one whole virtual row) or a list of them (top
+/// to bottom). Absent and empty are the same answer — no rows — so a span whose
+/// only decoration is `virt_lines = {}` draws nothing and is refused like any
+/// other empty span.
+fn span_virt_lines(span: &Table, nth: usize) -> Result<Vec<String>, SandboxError> {
+    let bad = |what: String| SandboxError::BadReturn(format!("span {nth} {what}"));
+    let Some(value) = span.get::<Option<Value>>("virt_lines").ok().flatten() else {
+        return Ok(Vec::new());
+    };
+    let Value::Table(rows) = value else {
+        let kind = value.type_name();
+        return text_result(value).map(|t| vec![t]).map_err(|_| {
+            bad(format!(
+                "has a `virt_lines` that is {kind}, expected a string or a list of strings"
+            ))
+        });
+    };
+    let mut out = Vec::new();
+    for (i, row) in rows.sequence_values::<Value>().enumerate() {
+        let row = row.map_err(|e| SandboxError::Runtime(tidy(&e.to_string())))?;
+        let kind = row.type_name();
+        out.push(text_result(row).map_err(|_| {
+            bad(format!(
+                "has a `virt_lines` row {} that is {kind}, expected a string",
+                i + 1
+            ))
+        })?);
+    }
+    Ok(out)
+}
+
+/// Resolve one of a span's closed-set keys (`virt_pos`, `hl_mode`) into the enum
+/// it names, taking `default` when the key is absent.
+///
+/// An unknown name is refused rather than falling back to the default, which
+/// would draw something the block did not ask for and never say so.
+fn named_key<T: Copy>(
+    span: &Table,
+    key: &str,
+    set: &[(&str, T)],
+    default: T,
+    nth: usize,
+) -> Result<T, SandboxError> {
+    let bad = |what: String| SandboxError::BadReturn(format!("span {nth} {what}"));
+    let Some(name) = span
+        .get::<Option<String>>(key)
+        .map_err(|_| bad(format!("has a `{key}` that is not a string")))?
+    else {
+        return Ok(default);
+    };
+    set.iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| *v)
+        .ok_or_else(|| {
+            bad(format!(
+                "has an unknown `{key}` `{name}` (expected one of {})",
+                set.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+            ))
+        })
 }
 
 /// The shared result conversion for the two re-rankers, which produce a *sort

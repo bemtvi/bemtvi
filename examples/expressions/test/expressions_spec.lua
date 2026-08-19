@@ -246,6 +246,39 @@ btv.test.describe("examples/expressions", function()
     btv.test.expect(t:lines()[1]).never.to_contain("col 1|")
   end)
 
+  -- Demo 10. The title row is a screen row of its own, so it shifts everything
+  -- under it: the section line the paint anchors on is screen row 4, not 3.
+  btv.test.it("demo 10 — a title row is drawn above each section line", function(t)
+    open(t)
+    t:feed("<Space>0")
+    btv.test.expect(t:decor(3).virt_lines).to_contain("1 & 2. folds")
+    btv.test.expect(t:screen()[4]).to_contain("-- 1 & 2. folds")
+    -- A fill rides the row it anchors on, as an overlay past the line's own text.
+    btv.test.expect(t:decor(4).virt_text).to_contain("-")
+  end)
+
+  btv.test.it("demo 10 — the section number wins the cells it overlaps", function(t)
+    open(t)
+    t:feed("<Space>0")
+    local spans = t:highlights(4)
+    btv.test.expect(#spans).to_be(3)
+    btv.test.expect(spans[2][1]).to_be(3)
+    btv.test.expect(spans[2][2]).to_be(4)
+    btv.test.expect(spans[2][3]).to_be("Todo")
+    -- What the higher priority is *over*: the dimmed rest of the line.
+    btv.test.expect(spans[1][3]).to_be("Comment")
+    btv.test.expect(spans[3][3]).to_be("Comment")
+  end)
+
+  btv.test.it("demo 10 — :Rules off takes the rows with it", function(t)
+    open(t)
+    t:feed("<Space>0")
+    btv.test.expect(t:decor(3).virt_lines).to_contain("1 & 2. folds")
+    t:cmd("Rules off")
+    btv.test.expect(t:decor(3).virt_lines).to_be(nil)
+    btv.test.expect(t:screen()[3]).to_contain("-- 1 & 2. folds")
+  end)
+
   btv.test.it(":Cheat opens its float", function(t)
     open(t)
     t:cmd("Cheat")

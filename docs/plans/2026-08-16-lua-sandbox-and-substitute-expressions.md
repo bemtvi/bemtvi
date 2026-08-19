@@ -992,3 +992,106 @@ the decor on the way to the extmark fails 8 of the 30. Four notes.
   carries no highlight *groups*: the wire encodes those layers' colours as
   per-frame palette ids rather than names, and inventing a name for a spec to
   assert on would be a second, drifting source of truth.
+
+---
+
+## Phase 10 — the paint span reaches the rest of the extmark vocabulary
+
+### The gap
+
+Phase 9 gave `PaintSpan` a decoration, and the note it shipped with said a
+decoration key added later needs no seam change. Four are still unreachable, and
+each is the natural answer to a paint that is a pure function of one line:
+
+| missing | what it draws | why a block wants it |
+| --- | --- | --- |
+| `virt_lines` | whole extra screen rows above/below | a header over a section, a rendered result under a line |
+| `line_fill` | a repeated glyph out to the right edge | a `─────` rule on a blank line, a labelled divider |
+| `hl_mode` | how `virt_text` merges with the cell under it | an `overlay` badge that keeps the text's own background |
+| `priority` | where the span sits in the stack | an indent guide *under* treesitter colour, a marker *over* a diagnostic |
+
+So a block that wants a rule or a header has to leave the frame for
+`btv.decor.provider` — the exact asymmetry Phase 9 set out to remove, one layer
+up. The prelude docstring even says so out loud ("virtual *lines* … which a span
+cannot express"), which is the tell that the sentence is describing the seam's
+shape rather than a design decision.
+
+### The change
+
+Named keys only; the three positional slots are untouched, so every existing
+block keeps working:
+
+```lua
+{ 1, 0, virt_lines = "── section ──", virt_lines_hl = "Title",
+        virt_lines_above = true }
+{ 1, 0, line_fill = "─", line_fill_hl = "NonText" }
+{ s, e, "Todo", virt_text = "!", virt_pos = "overlay", hl_mode = "combine" }
+{ s, e, "IndentGuide", priority = 90 }
+```
+
+`virt_lines` takes a string (one row) or a list of strings (several), keeping the
+scalar idiom Phase 9 settled on: a span draws one run, so its group is a sibling
+key rather than neovim's per-chunk list. `priority` is the *span's*, not the
+decoration's — it applies to a highlight-only span too — so it lands on
+`PaintSpan` beside `group`, where the call site reads it instead of the hardcoded
+`DEFAULT_PRIORITY`.
+
+### Every qualifier gets checked against its own target
+
+Phase 9 refused a qualifier with nothing to qualify, but only when the span
+carried *no* decoration at all: `{ sign_text = "*", virt_pos = "inline" }` passed
+and the `virt_pos` did nothing. With four more keys and three more qualifiers
+that coarse check would leave most of the surface silently ignorable, so each
+qualifier is now checked against the one thing it qualifies — `virt_hl` /
+`virt_pos` / `hl_mode` want `virt_text`, `virt_lines_hl` / `virt_lines_above`
+want `virt_lines`, `sign_hl` wants `sign_text`, `line_fill_hl` wants
+`line_fill`.
+
+### The fifth view
+
+`t:decor()` reads the two layers a paint could reach; virtual *lines* are a
+third, and they are not in `t:screen()` either (a virtual row's text rides its
+own wire field, so the row reads as blank). So the mirror carries `virt_lines`
+too and `t:decor(row).virt_lines` reads the row's text — the same reasoning that
+grew the third and fourth views, and the reason an example spec can prove a
+header actually drew.
+
+### Failure
+
+Unchanged and loud: an unknown key names itself and lists the accepted set, a
+qualifier without its target names both, a `priority` that is not an integer (or
+is outside `u32`) is refused, and a block that errors reports once and
+uninstalls.
+
+### Testing
+
+`crates/bemtvi-server/tests/decor_expr.rs` grows: virtual lines reach the
+projected `virt_lines` above and below the anchor, a fill reaches the row's
+overlay, `hl_mode` and `priority` reach the mark, a span whose only decoration is
+an empty `virt_lines` list still fails as drawing nothing, and each new qualifier
+fails loud without its target. Plus an example demo and its spec.
+
+### Outcome
+
+Shipped as planned: 11 new black-box tests (`tests/decor_expr.rs`, now 41), 3 new
+example specs, full suite **4098 passed / 0 failed**. Mutation-tested — dropping
+`virt_lines`, `line_fill` or `hl_mode` on the way into the `VirtDecor` fails 6 of
+the 11, and ignoring the span's `priority` fails the priority guard. Three notes.
+
+- **The priority guard had to be written against the tie-break, not against a
+  hunch.** Two overlapping spans with the same priority resolve by *order*, and
+  the later one wins — so a test with the high-priority span written *second*
+  passes whether or not `priority` is read at all. It only bites when the
+  high-priority span comes first, which is how the test is now written; the first
+  version of it passed under mutation and proved nothing.
+- **The example is where `line_fill` earned its keep.** As a per-line pure
+  function, "repeat a glyph out to the right edge" needs nothing but the line, and
+  the section rules in `examples/expressions` read as a real feature rather than a
+  demo of a key. The same demo is what showed `virt_lines_above` shifts every
+  screen row under it — which the spec then had to account for, and which is
+  exactly the thing a reader would trip over.
+- **Two docs were describing the seam's old shape as if it were a design.** The
+  prelude's "which a span cannot express" and the testing guide's "a virtual line
+  shows up in `t:screen()`" were both true only until this phase; the second was
+  wrong in a way a spec author would have found the hard way, since a virtual
+  row's text was in no view at all before `t:decor()` grew its fifth layer.

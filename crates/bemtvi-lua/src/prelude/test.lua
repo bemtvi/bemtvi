@@ -454,10 +454,11 @@ end
 -- The sibling of `t:lines()`, and the difference matters: `t:lines()` is buffer
 -- text, while this is what the client would actually draw. Anything the editor
 -- renders *instead of* a buffer line is only visible here — a closed fold's
--- placeholder, a `~` filler past the end, a virtual line. So a test for
--- `'foldtext'` or `'listchars'` asserts on this; a test for an edit asserts on
--- `t:lines()`. Virtual *text* is not here — it rides its own layer beside the
--- rows, which is what `t:decor()` reads.
+-- placeholder, a `~` filler past the end. So a test for `'foldtext'` or
+-- `'listchars'` asserts on this; a test for an edit asserts on `t:lines()`.
+-- Virtual text and virtual *lines* are not here — they ride their own layers
+-- (a virtual line takes a row, but the row reads blank and its text is in the
+-- layer), which is what `t:decor()` reads.
 --
 -- ```lua
 -- t:feed("zM")
@@ -504,9 +505,10 @@ local VIRT_POS =
   { [0] = "eol", [1] = "inline", [2] = "overlay", [3] = "right_align", [4] = "win_col" }
 
 -- `t:decor([row])` — the decoration drawn *beside* the focused window's rows:
--- virtual text and gutter signs. A list of
--- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, sign = "▶" }` per row
--- (1-based *screen* rows, matching `t:screen()`); with `row`, just that row's.
+-- virtual text, virtual lines and gutter signs. A list of
+-- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, virt_lines = "…", sign = "▶" }`
+-- per row (1-based *screen* rows, matching `t:screen()`); with `row`, just that
+-- row's.
 --
 -- The companion of `t:highlights()`, and the split is what each layer *is*: a
 -- highlight colours the buffer's own cells, while these draw glyphs that are not in
@@ -521,15 +523,18 @@ local VIRT_POS =
 -- ```
 --
 -- `virt_text` is the row's placements joined, since one row can carry several;
--- `virt_pos`/`virt_col` describe the first. Highlight *groups* are absent on
--- purpose: the wire carries a per-frame palette id for these layers, not a name, so
--- `t:highlights()` stays the group-level view.
+-- `virt_pos`/`virt_col` describe the first. `virt_lines` is set on a row that *is* a
+-- virtual line — a whole extra screen row, so it reads blank in `t:screen()` and
+-- carries its text here instead. Highlight *groups* are absent on purpose: the wire
+-- carries a per-frame palette id for these layers, not a name, so `t:highlights()`
+-- stays the group-level view.
 --
 -- Only the focused window, like `t:screen()`.
 function Ctx:decor(row)
   local ui = btv._ui
   local virt, signs = (ui and ui.virt_text) or {}, (ui and ui.signs) or {}
-  local rows, n = {}, math.max(#virt, #signs)
+  local lines = (ui and ui.virt_lines) or {}
+  local rows, n = {}, math.max(#virt, #signs, #lines)
   for i = 1, n do
     local out = {}
     local places = virt[i]
@@ -543,6 +548,16 @@ function Ctx:decor(row)
       out.virt_text = table.concat(texts)
       out.virt_pos = VIRT_POS[places[1][1]]
       out.virt_col = places[1][2]
+    end
+    -- A virtual line is one row's whole content, carried as a chunk run like a
+    -- `virt_text` placement (the row's own `screen` text is blank).
+    local chunks = lines[i]
+    if type(chunks) == "table" and #chunks > 0 then
+      local texts = {}
+      for _, chunk in ipairs(chunks) do
+        texts[#texts + 1] = chunk[1]
+      end
+      out.virt_lines = table.concat(texts)
     end
     local sign = signs[i]
     if type(sign) == "table" then

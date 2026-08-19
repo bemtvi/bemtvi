@@ -248,8 +248,23 @@ line. This is the surface that takes a block rather than an expression, for the
 loop above.
 
 A span can draw more than a colour. Beside the three positional slots it takes
-`virt_text` (with `virt_hl` and `virt_pos` — `"eol"`, `"inline"`, `"overlay"`,
-`"right_align"`), `sign_text` (with `sign_hl`), and `line_hl`:
+named keys, each the scalar form of the extmark key it lowers into:
+
+```
+virt_text          text drawn beside the line
+virt_hl            its highlight group
+virt_pos           where it draws: "eol" (the default), "inline", "overlay", "right_align"
+hl_mode            how it merges with the cell under it: "replace" (default), "combine", "blend"
+virt_lines         a whole extra screen row, or a list of them
+virt_lines_hl      their highlight group
+virt_lines_above   draw them above the line instead of below
+sign_text          a 1-2 cell glyph in the gutter
+sign_hl            its highlight group
+line_hl            a highlight group backing the whole line
+line_fill          a glyph repeated from the end of the line to the right edge
+line_fill_hl       its highlight group
+priority           where the span sits in the paint stack (default 4096)
+```
 
 ```lua
 btv.decor.expr([[
@@ -257,12 +272,24 @@ btv.decor.expr([[
   if not s then return {} end
   return { { s, e, "Todo", virt_text = "  <- fix me", sign_text = ">>" } }
 ]])
+
+-- a heading above every `## ` line, and a rule out to the right edge
+btv.decor.expr([[
+  if not line:find("^## ") then return {} end
+  return { { virt_lines = line:gsub("^## ", ""), virt_lines_hl = "Title",
+             virt_lines_above = true, line_fill = "-", line_fill_hl = "NonText" } }
+]])
 ```
 
 The columns and the group are each optional *when the span carries a decoration* —
 a sign anchors on the line, not on a stretch of it, so `{ sign_text = ">>" }` is a
 whole span. A span that draws nothing at all, or a qualifier with nothing to
-qualify (`virt_hl` without `virt_text`), is refused rather than ignored.
+qualify (`virt_hl` without `virt_text`, `sign_hl` without `sign_text`), is refused
+rather than ignored.
+
+`priority` is the span's own, so a highlight takes one too: draw an indent guide
+below the treesitter layer (`priority = 90`) and it colours only what the syntax
+left plain.
 
 It is the pure sibling of `btv.decor.provider`, and the choice between them is
 what each can see:
@@ -271,7 +298,7 @@ what each can see:
 | --- | --- | --- |
 | power | full Lua, async, any editor state | `line` and `lnum`, nothing else |
 | when | off the frame, one frame later | during the frame it belongs to |
-| draws | the whole extmark vocabulary | highlights, virtual text, signs, line backgrounds |
+| draws | the whole extmark vocabulary, styled per chunk | the same decorations, one run each |
 
 Reach for the block when the paint is a pure function of the text — indent guides,
 colour swatches, trailing whitespace, a keyword badge — and for the provider when

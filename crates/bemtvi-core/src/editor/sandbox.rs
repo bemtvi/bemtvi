@@ -283,7 +283,7 @@ impl Editor {
                             line_start + start,
                             (end > start).then_some(line_start + end),
                             span.group.clone(),
-                            crate::extmark::DEFAULT_PRIORITY,
+                            span.priority.unwrap_or(crate::extmark::DEFAULT_PRIORITY),
                             span.decor.clone(),
                         );
                     }

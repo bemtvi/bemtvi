@@ -461,12 +461,19 @@ end
 -- takes named keys, each the scalar form of the extmark key it lowers into:
 --
 -- ```
--- virt_text    text drawn beside the line
--- virt_hl      its highlight group
--- virt_pos     where it draws: "eol" (the default), "inline", "overlay", "right_align"
--- sign_text    a 1-2 cell glyph in the gutter
--- sign_hl      its highlight group
--- line_hl      a highlight group backing the whole line
+-- virt_text          text drawn beside the line
+-- virt_hl            its highlight group
+-- virt_pos           where it draws: "eol" (the default), "inline", "overlay", "right_align"
+-- hl_mode            how it merges with the cell under it: "replace" (default), "combine", "blend"
+-- virt_lines         a whole extra screen row, or a list of them
+-- virt_lines_hl      their highlight group
+-- virt_lines_above   draw them above the line instead of below
+-- sign_text          a 1-2 cell glyph in the gutter
+-- sign_hl            its highlight group
+-- line_hl            a highlight group backing the whole line
+-- line_fill          a glyph repeated from the end of the line to the right edge
+-- line_fill_hl       its highlight group
+-- priority           where the span sits in the paint stack (default 4096)
 -- ```
 --
 -- ```lua
@@ -477,18 +484,30 @@ end
 --   return { { s, e, "Todo", virt_text = "  <- fix me", virt_hl = "Comment",
 --             sign_text = ">>", sign_hl = "DiagnosticWarn" } }
 -- ]])
+--
+-- -- a heading drawn above every `## ` line, and a rule out to the right edge
+-- btv.decor.expr([[
+--   if not line:find("^## ") then return {} end
+--   return { { virt_lines = line:gsub("^## ", ""), virt_lines_hl = "Title",
+--             virt_lines_above = true, line_fill = "-", line_fill_hl = "NonText" } }
+-- ]])
 -- ```
 --
 -- The columns and the group are each optional *when the span carries a
 -- decoration*: a sign or a line background anchors on the line, not on a stretch
 -- of it, so `{ sign_text = ">>" }` is a whole span. What is refused is a span that
 -- draws **nothing** — no group and no decoration — and a qualifier with nothing to
--- qualify (`virt_hl` without `virt_text`), because both are half-written spans that
--- would otherwise vanish in silence.
+-- qualify (`virt_hl` without `virt_text`, `sign_hl` without `sign_text`), because
+-- both are half-written spans that would otherwise vanish in silence.
+--
+-- `priority` belongs to the span rather than to its decoration, so a plain
+-- highlight takes one too: below the treesitter layer (`priority = 90`) a paint
+-- colours only what the syntax left plain, above the default it covers a
+-- diagnostic's underline.
 --
 -- **Which one to use.** `btv.decor.provider` is the general surface: full Lua,
--- async, any editor state, and the whole extmark vocabulary (including virtual
--- *lines* and per-chunk styling, which a span cannot express). It runs *off* the
+-- async, any editor state, and the extmark vocabulary at full width (per-chunk
+-- styling, which a span — one run per key — cannot express). It runs *off* the
 -- frame, so its marks land on the next one. `btv.decor.expr` can only see the line
 -- it was handed — and in exchange it runs *during* the frame, so a paint that is a
 -- pure function of the text (indent guides, colour swatches, trailing whitespace, a

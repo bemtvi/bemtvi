@@ -1207,3 +1207,51 @@ async fn percent_bdelete_keeps_the_tab_of_the_buffer_that_refused() {
     let _ = std::fs::remove_file(&b);
     let _ = std::fs::remove_file(&c);
 }
+
+/// `nvim_set_current_tabpage` — the one tab *mutation* in the API. Its server
+/// bridge (`btv._set_current_tab`) and its core op were both wired, but no Lua
+/// function ever called them: the surface documented as "the lone tab mutation"
+/// was simply absent, so `vim.api.nvim_set_current_tabpage(t)` raised.
+#[tokio::test]
+async fn nvim_set_current_tabpage_switches_tabs() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, ":tabnew<CR>").await;
+    feed_sync(&rpc, ":tabnew<CR>").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.api.nvim_tabpage_get_number(0)")
+            .await
+            .as_i64(),
+        Some(3)
+    );
+    // Switch to the first tab by id.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_current_tabpage(vim.api.nvim_list_tabpages()[1])",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.api.nvim_tabpage_get_number(0)")
+            .await
+            .as_i64(),
+        Some(1),
+        "the switch landed"
+    );
+    // …and it writes through, so a read later in the SAME chunk already agrees.
+    let same_chunk = exec_lua(
+        &rpc,
+        r#"vim.api.nvim_set_current_tabpage(vim.api.nvim_list_tabpages()[3])
+           return vim.api.nvim_tabpage_get_number(0)"#,
+    )
+    .await;
+    assert_eq!(same_chunk.as_i64(), Some(3), "write-through");
+    // An unknown tab id fails loud rather than silently doing nothing.
+    let err = exec_lua(
+        &rpc,
+        "return select(2, pcall(vim.api.nvim_set_current_tabpage, 9999))",
+    )
+    .await;
+    assert!(
+        err.as_str().unwrap_or_default().contains("tabpage"),
+        "an invalid tab is refused by name, got {err:?}"
+    );
+}

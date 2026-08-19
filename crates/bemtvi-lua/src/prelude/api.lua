@@ -273,6 +273,26 @@ function btv.tabpage.win(tab)
   return t and t.current_window or (btv._cur_win or 1000)
 end
 
+-- `btv.tabpage.set_current`(tab) [alias `nvim_set_current_tabpage`]: make `tab` the
+-- active tab page (`0`/`nil` = the current one, which is a no-op). The lone tab
+-- MUTATION in the API — every other `nvim_tabpage_*` call is a read off the
+-- `btv._tabs` mirror. The switch is queued for the server (`btv._set_current_tab`)
+-- and written through the mirror, so a read later in the same chunk already agrees.
+-- An unknown tab id fails loud rather than silently doing nothing.
+function btv.tabpage.set_current(tab)
+  tab = resolve_tab(tab)
+  if not btv.tabpage.is_valid(tab) then
+    error("nvim_set_current_tabpage: invalid tabpage id " .. tostring(tab), 2)
+  end
+  btv._set_current_tab(tab)
+  -- Write-through: the current tab, and the window focus that comes with it.
+  btv._cur_tab = tab
+  local t = (btv._tabs or {})[tab]
+  if t and t.current_window then
+    btv._cur_win = t.current_window
+  end
+end
+
 -- `nvim_win_get_config(win)`: the float placement of `win` as neovim's config map,
 -- or `{ relative = "" }` for a tiled window. Reads the `btv._wins` mirror (the
 -- server pushes each float's config into `w.float`; `nvim_open_win` /
@@ -1166,6 +1186,7 @@ vim.api.nvim_tabpage_get_number = btv.tabpage.number
 vim.api.nvim_tabpage_get_win = btv.tabpage.win
 vim.api.nvim_tabpage_list_wins = btv.tabpage.wins
 vim.api.nvim_tabpage_is_valid = btv.tabpage.is_valid
+vim.api.nvim_set_current_tabpage = btv.tabpage.set_current
 vim.api.nvim_set_hl = btv.hl.define
 vim.api.nvim_get_hl = btv.hl.get
 vim.api.nvim_create_namespace = btv.ns.create

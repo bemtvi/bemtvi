@@ -375,6 +375,7 @@ impl EditHost {
                 message: &message,
                 cmdline: view.cmdline.as_str(),
                 statusline: &statusline_text,
+                tabline: &chunk_runs_text(&tabline_segments),
                 screen: &screen,
                 highlights: &highlights,
                 virt_text: &virt_text,

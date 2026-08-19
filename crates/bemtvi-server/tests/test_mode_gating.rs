@@ -636,3 +636,39 @@ async fn ui_mirror_carries_the_search_matches() {
     let counts = exec_lua(&rpc, "return #btv._ui.search[1] + #btv._ui.search[3]").await;
     assert_eq!(counts.as_i64(), Some(0), "'nohlsearch' paints nothing");
 }
+
+/// A custom `'tabline'` is mirrored as its own rendered row. It is a wholly
+/// different payload from the structured per-region tab cells: setting the option
+/// replaces those, so a suite for a `%!`-built tabline could otherwise see only the
+/// built-in labels it was meant to replace.
+#[tokio::test]
+async fn ui_mirror_carries_a_custom_tabline() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    feed(&rpc, ":set showtabline=2<CR>");
+    // Unset, the mirror is empty and the client draws the cells itself.
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.tabline").await.as_str(),
+        Some(""),
+        "no custom tabline"
+    );
+    feed(&rpc, ":set tabline=hand-built%=right<CR>");
+    let _ = lines(&rpc).await;
+    let line = exec_lua(&rpc, "return btv._ui.tabline").await;
+    let line = line.as_str().unwrap_or_default();
+    assert!(
+        line.starts_with("hand-built") && line.ends_with("right"),
+        "the rendered row, `%=` resolved, got {line:?}"
+    );
+    // Hiding the tabline draws none of it.
+    feed(&rpc, ":set showtabline=0<CR>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.tabline").await.as_str(),
+        Some(""),
+        "'showtabline=0' draws nothing"
+    );
+}

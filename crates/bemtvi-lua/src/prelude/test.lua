@@ -586,6 +586,23 @@ function Ctx:statusline()
   return ui and ui.statusline or ""
 end
 
+-- `t:tabline()` — a custom `'tabline'` as rendered: the one styled row the
+-- `%`-format engine produced, with the `%#Group#` / `%nT` items already resolved
+-- away. `nil` when `'tabline'` is unset, or when no tabline is drawn this frame.
+--
+-- A wholly different payload from `t:tabs()`, which reads the STRUCTURED per-region
+-- tab cells the client formats itself. Only one of the two is ever drawn — setting
+-- `'tabline'` replaces the cells — so a suite for a `%!`-built tabline can see
+-- nothing in `t:tabs()` but the built-in labels it was meant to replace.
+function Ctx:tabline()
+  local ui = btv._ui
+  local line = ui and ui.tabline
+  if line == nil or line == "" then
+    return nil
+  end
+  return line
+end
+
 -- `t:screen()` — the focused window's **painted** rows, top to bottom, as a list
 -- of strings.
 --

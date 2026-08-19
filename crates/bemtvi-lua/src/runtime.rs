@@ -1536,6 +1536,10 @@ pub struct UiMirror<'a> {
     pub cmdline: &'a str,
     /// The status line, flattened out of its chunk runs.
     pub statusline: &'a str,
+    /// A custom `'tabline'`, flattened out of its chunk runs; empty when the option
+    /// is unset (the client draws the structured cells) or no tabline is shown
+    /// (`t:tabline()`).
+    pub tabline: &'a str,
     /// The focused window's painted rows (`t:screen()`).
     pub screen: &'a [String],
     /// The highlight spans over those rows (`t:highlights()`).
@@ -3501,6 +3505,7 @@ impl LuaRuntime {
             message,
             cmdline,
             statusline,
+            tabline,
             screen,
             highlights,
             virt_text,
@@ -3528,6 +3533,12 @@ impl LuaRuntime {
         ui.set("message", message)?;
         ui.set("cmdline", cmdline)?;
         ui.set("statusline", statusline)?;
+        // A custom `'tabline'` renders through the same `%`-format engine as the
+        // status line into one styled row — a wholly different payload from the
+        // structured per-region tab cells `t:tabs()` reads, which the client formats
+        // itself. Only one of the two is ever drawn, so without this a suite for a
+        // `%!`-built tabline could only see the cells it replaced.
+        ui.set("tabline", tabline)?;
         // The focused window's painted rows, so a spec can assert on what is
         // actually drawn — a closed fold's placeholder, a `~` filler — and not
         // only on buffer state. Already display-scrubbed, so it is character-for

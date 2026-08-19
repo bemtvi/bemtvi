@@ -1626,3 +1626,25 @@ async fn foldnestmax_zero_is_accepted() {
         "`foldnestmax=0` is legal in vim, got {msg:?}"
     );
 }
+
+/// `:set a? b?` reports **both**, the way vim does — one message line carrying every
+/// query in the command. Each token echoed on its own, so only the last one was
+/// visible and the earlier answers were lost off the bottom of the screen.
+#[tokio::test]
+async fn a_multi_option_query_reports_every_option() {
+    let (rpc, mut incoming) = start().await;
+    let msg = set_message(&rpc, &mut incoming, "scrolloff? wrap?").await;
+    assert!(
+        msg.contains("scrolloff=0") && msg.contains("nowrap"),
+        "both queries on the message line, got {msg:?}"
+    );
+    // A single query is unchanged.
+    let msg = set_message(&rpc, &mut incoming, "wrap?").await;
+    assert_eq!(msg, "nowrap");
+    // An unknown name among them still fails loud.
+    let msg = set_message(&rpc, &mut incoming, "wrap? nosuchopt?").await;
+    assert!(
+        msg.contains("E518"),
+        "unknown option still loud, got {msg:?}"
+    );
+}

@@ -60,13 +60,31 @@ impl Editor {
     /// born from *and* the current buffer's own, `:setlocal` only the buffer's,
     /// `:setglobal` only the global. Global-scope options have one value and ignore it.
     pub(crate) fn ex_set(&mut self, args: &str, scope: SetScope) {
-        for tok in split_set_args(args) {
+        let toks = split_set_args(args);
+        // `:set a? b?` answers BOTH on one message line, as vim does. Each `apply_set_*`
+        // echoes its own report, so a multi-token command would otherwise leave only the
+        // last one visible and the earlier answers scrolled away. The reports are
+        // gathered here and re-shown joined; `:messages` keeps the individual lines each
+        // `echo` already recorded.
+        let multi = toks.len() > 1;
+        let mut reports: Vec<String> = Vec::new();
+        for tok in toks {
+            if multi {
+                self.message.clear();
+            }
             match resolve_set(&tok) {
                 Some(SetCmd::Bool { name, op }) => self.apply_set_bool(name, op, scope),
                 Some(SetCmd::Num { name, op }) => self.apply_set_num(name, op, scope),
                 Some(SetCmd::Str { name, op }) => self.apply_set_str(name, op, scope),
                 None => self.echo(format!("E518: Unknown option: {tok}")),
             }
+            if multi && !self.message.is_empty() {
+                reports.push(std::mem::take(&mut self.message));
+            }
+        }
+        if !reports.is_empty() {
+            // Two spaces between reports — vim's column gap, without the alignment.
+            self.message = reports.join("  ");
         }
     }
 

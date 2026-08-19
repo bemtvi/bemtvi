@@ -598,3 +598,41 @@ async fn ui_mirror_carries_the_scroll_gesture() {
         "'noscrollanim' animates nothing"
     );
 }
+
+/// The search-match highlight is mirrored. It rides its own wire layer — the server
+/// sends per-row column spans and the client paints `Search` / `IncSearch` itself —
+/// so no highlight span is emitted for it and `t:highlights()` sees nothing at all.
+#[tokio::test]
+async fn ui_mirror_carries_the_search_matches() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    feed(&rpc, "ineedle one<CR>plain<CR>needle two needle<Esc>");
+
+    feed(&rpc, ":set hlsearch<CR>");
+    feed(&rpc, "gg");
+    feed(&rpc, "/needle<CR>");
+    let _ = lines(&rpc).await;
+    // One match on row 1, none on row 2, two on row 3.
+    let counts = exec_lua(
+        &rpc,
+        r#"local s = btv._ui.search
+           return #s[1] .. "," .. #s[2] .. "," .. #s[3]"#,
+    )
+    .await;
+    assert_eq!(counts.as_str(), Some("1,0,2"), "one row of spans per row");
+    // The spans are display columns, not a highlight group.
+    let first = exec_lua(
+        &rpc,
+        "return btv._ui.search[1][1][1] .. '-' .. btv._ui.search[1][1][2]",
+    )
+    .await;
+    assert_eq!(first.as_str(), Some("0-6"), "the match's columns");
+
+    // `'nohlsearch'` paints none of them.
+    feed(&rpc, ":set nohlsearch<CR>");
+    let _ = lines(&rpc).await;
+    let counts = exec_lua(&rpc, "return #btv._ui.search[1] + #btv._ui.search[3]").await;
+    assert_eq!(counts.as_i64(), Some(0), "'nohlsearch' paints nothing");
+}

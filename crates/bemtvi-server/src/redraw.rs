@@ -392,6 +392,8 @@ impl EditHost {
                 region_tabs: &region_tablines,
                 showcmd: &showcmd,
                 scroll: &self.test_scroll,
+                search: &layer("search"),
+                incsearch: &layer("incsearch"),
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

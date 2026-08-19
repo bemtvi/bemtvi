@@ -47,8 +47,8 @@ btv.snippet.add("lua", {
 --
 -- TYPE `fn` in insert mode and watch the popup:
 --   • Each snippet row shows a right-aligned "Snippet" KIND label (dimmed), so you
---     can tell it apart from a plain "buffer" word (which shows no kind). LSP rows
---     would likewise show "Function" / "Variable" / … here.
+--     can tell it apart from a plain buffer word, which is labelled "Text". LSP
+--     rows would likewise show "Function" / "Variable" / … here.
 --   • Move onto the snippet row (<C-n>) and a DOCS FLOAT opens beside the popup
 --     previewing the body you're about to expand — `function ${1:name}(${2})…` — the
 --     same surface LSP items use for their documentation.

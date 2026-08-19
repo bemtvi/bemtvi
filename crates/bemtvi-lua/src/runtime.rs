@@ -1575,6 +1575,10 @@ pub struct UiMirror<'a> {
     /// The focused window's one-shot scroll-animation descriptor, `Nil` on a frame
     /// that started no slide (`t:scroll()`).
     pub scroll: &'a rmpv::Value,
+    /// The search-match spans over the focused window's rows, and the one match the
+    /// cursor is being walked onto (`t:matches()`).
+    pub search: &'a rmpv::Value,
+    pub incsearch: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3514,6 +3518,8 @@ impl LuaRuntime {
             region_tabs,
             showcmd,
             scroll,
+            search,
+            incsearch,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3564,6 +3570,16 @@ impl LuaRuntime {
         // client is about to animate, not any state the editor keeps. So it appears
         // in no other view: `t:view()` already reports the settled destination.
         ui.set("scroll", crate::convert::rmpv_to_lua(&self.lua, scroll)?)?;
+        // The search-match highlight. It rides its own wire layer — the server sends
+        // per-row column spans and the client paints `Search` / `IncSearch` itself —
+        // so no highlight span is ever emitted for it and `t:highlights()` cannot see
+        // a match at all. `incsearch` is the one match being walked onto while a
+        // `/` or `:s` line is open.
+        ui.set("search", crate::convert::rmpv_to_lua(&self.lua, search)?)?;
+        ui.set(
+            "incsearch",
+            crate::convert::rmpv_to_lua(&self.lua, incsearch)?,
+        )?;
         // The fourth decoration payload: the full-width row tint a `line_hl_group`
         // lays down. It rides its own wire layer rather than the highlight spans, so
         // it was the one payload of the shared extmark vocabulary a spec could not

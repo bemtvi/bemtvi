@@ -538,6 +538,48 @@ function Ctx:scroll()
   return s
 end
 
+-- `t:matches([row])` — the SEARCH-match highlight over the focused window's rows:
+-- a list of `{ first, last, current }` per row (1-based screen rows, matching
+-- `t:screen()`; columns are 0-based display cells, end-exclusive). `current` marks
+-- the one match being walked onto while a `/` or `:s` command line is open (vim's
+-- `IncSearch`, as against the plain `Search` on the rest). With `row`, just that
+-- row's matches.
+--
+-- The match highlight rides its own wire layer — the server sends column spans and
+-- the client paints the group itself — so no highlight span is ever emitted for it
+-- and `t:highlights()` cannot see a match at all. This is the only view of
+-- `'hlsearch'`, of `'incsearch'`, and of the plain pattern preview a half-typed
+-- `:s/pat` shows before its replacement opens.
+--
+-- ```lua
+-- t:feed("/needle<CR>")
+-- btv.test.expect(#t:matches(3)).to_be(1)
+-- ```
+function Ctx:matches(row)
+  local ui = btv._ui or {}
+  local rows, inc = ui.search or {}, ui.incsearch or {}
+  local function one(i)
+    local out = {}
+    for _, span in ipairs(rows[i] or {}) do
+      local live = inc[i]
+      out[#out + 1] = {
+        span[1],
+        span[2],
+        live ~= nil and live[1] == span[1] and live[2] == span[2],
+      }
+    end
+    return out
+  end
+  if row ~= nil then
+    return one(row)
+  end
+  local all = {}
+  for i = 1, #rows do
+    all[i] = one(i)
+  end
+  return all
+end
+
 -- t:statusline() — the rendered status line text, when the mirror carries it.
 function Ctx:statusline()
   local ui = btv._ui
@@ -692,6 +734,11 @@ end
 -- `height` describe the box, but in the placement's own coordinate space (see
 -- below) — to CLICK a row, probe for the cell rather than deriving it.
 --
+-- `kinds` is the parallel list of per-row kind labels the completion popup
+-- right-aligns (`"Snippet"`, `"Function"`, …), `""` for a row that carries none (a
+-- plain buffer word). It is the whole of what the kind column shows, and it is
+-- empty for every other user of the widget.
+--
 -- ```lua
 -- t:feed(":ene<Tab>")
 -- btv.test.expect(t:menu().items[1]).to_be("enew")
@@ -702,8 +749,15 @@ function Ctx:menu()
   if not m then
     return nil
   end
+  -- One entry per row, `""` where the row has no kind: the wire omits the key
+  -- entirely when no row has one, and carries nil in the slots that don't.
+  local kinds = {}
+  for i = 1, #(m.items or {}) do
+    kinds[i] = (m.kinds or {})[i] or ""
+  end
   return {
     items = m.items or {},
+    kinds = kinds,
     selected = m.selected_active and ((m.selected or 0) + 1) or nil,
     -- Where the box was placed, in the box's OWN space: a cursor-anchored menu (the
     -- completion popup, `btv.ui.select`) reports window-relative cells, while an

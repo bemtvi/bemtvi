@@ -53,16 +53,28 @@ btv.dock.opt("left").showtabline = 2
 --------------------------------------------------------------------------------
 btv.dock.opt("left").winhighlight = "Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr"
 
--- Give the sidebar some content so the background is obvious (its own scratch
--- buffer is focused right after `btv.dock.open`, before focus returns to main).
-local sidebar = vim.api.nvim_get_current_buf()
-vim.api.nvim_buf_set_lines(sidebar, 0, -1, false, {
-  "  src/",
-  "    main.rs",
-  "    lib.rs",
-  "  Cargo.toml",
-  "  README.md",
-})
+-- Give the sidebar some content so the background is obvious.
+--
+-- `btv.dock.open` QUEUES the dock — the ops are applied after this chunk runs (the
+-- editor's "Lua queues, core mutates" flow), so the dock's scratch buffer does not
+-- exist yet and the current buffer is still the one you launched with. Reading it
+-- here would write this listing into the file you are editing. `btv.on_next_tick`
+-- runs on the next loop turn, once the dock is up and focused — and it is
+-- `on_next_tick`, not `btv.schedule`, because the dock's buffer only appears
+-- BETWEEN ticks.
+btv.on_next_tick(function()
+  local sidebar = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(sidebar, 0, -1, false, {
+    "  src/",
+    "    main.rs",
+    "    lib.rs",
+    "  Cargo.toml",
+    "  README.md",
+  })
+  -- …and land back in the main area, so the cursor starts in the file you opened
+  -- rather than in the sidebar.
+  btv.layer.main()
+end)
 
 -- winhighlight is per-WINDOW, not per-buffer: it is also exposed on `btv.wo`, so a
 -- single window (not in any dock) can remap its own groups the same way. Docks are

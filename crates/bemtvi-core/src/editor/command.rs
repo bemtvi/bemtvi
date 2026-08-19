@@ -2455,7 +2455,23 @@ impl Editor {
     fn cross_dir_target(&self, dir: WinDir) -> Option<Layer> {
         Self::cross_dir_candidates(self.focused_layer, dir)
             .into_iter()
-            .find(|&layer| layer != self.focused_layer && self.layer_is_open(layer))
+            .find(|&layer| layer != self.focused_layer && self.is_cross_target(layer))
+    }
+
+    /// Whether `layer` can be crossed INTO by `<C-w><C-w>{hjkl}`. Visible layers, of
+    /// course — plus a collapsed **autohide** dock, whose collapse is transient by
+    /// design: it exists to get out of the way and pop back when you return, and
+    /// [`Editor::focus_dock`] already un-hides whatever it focuses. Without this the
+    /// one dock kind built to be re-entered by the chord was the one the chord
+    /// skipped, leaving `:DockFocus` / `:DockShow` as the only way back in. A dock
+    /// collapsed ON PURPOSE (`:DockToggle` / `:DockHide`) stays skipped — otherwise
+    /// "hide this" would last until the next `<C-w>`.
+    fn is_cross_target(&self, layer: Layer) -> bool {
+        if self.layer_is_open(layer) {
+            return true;
+        }
+        matches!(layer, Layer::Dock(side)
+            if self.dock_exists(side) && self.dock_autohides(side))
     }
 
     /// Ordered candidate layers for a spatial `<C-w><C-w>` cross from `from` in

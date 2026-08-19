@@ -2074,3 +2074,57 @@ async fn editor_relative_float_centers_on_the_whole_screen_not_the_main_region()
         "centered on the whole 80-column screen, not on the dock-shrunk main region"
     );
 }
+
+#[tokio::test]
+async fn the_layer_cross_reaches_an_autohidden_dock() {
+    // An `autohide` dock collapses the moment focus leaves it — that is its whole
+    // point — and crossing back in is meant to pop it open again. But the spatial
+    // `<C-w><C-w>{hjkl}` cross skipped it: it only considered VISIBLE layers, and a
+    // collapsed autohide dock is not visible. So the one dock kind designed to be
+    // re-entered by the chord was the one the chord could not reach; only
+    // `:DockFocus` / `:DockShow` got back in.
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"btv.dock.open({ side = "bottom", size = 6 })
+           btv.dock.opt("bottom").autohide = true"#,
+    )
+    .await;
+    // Put something in the tray, then leave — which collapses it.
+    feed_sync(&rpc, "iin the tray<Esc>").await;
+    exec_lua(&rpc, r#"btv.layer.main()"#).await;
+    assert_eq!(
+        win_count(&rpc).await,
+        1,
+        "leaving an autohide dock collapses it"
+    );
+
+    // Crossing back in pops it open, with its content intact.
+    feed_sync(&rpc, "<C-w><C-w>j").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["in the tray"],
+        "<C-w><C-w>j must reach the collapsed autohide tray"
+    );
+    assert_eq!(win_count(&rpc).await, 2, "and entering it un-collapses it");
+}
+
+#[tokio::test]
+async fn the_layer_cross_still_skips_a_deliberately_hidden_dock() {
+    // The counterpart: a dock you collapsed ON PURPOSE (`:DockToggle` / `:DockHide`)
+    // stays out of the way. Only `autohide`'s transient collapse is re-enterable by
+    // the chord — otherwise "hide this" would last exactly until the next `<C-w>`.
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, r#"btv.dock.open({ side = "bottom", size = 6 })"#).await;
+    feed_sync(&rpc, "ihidden on purpose<Esc>").await;
+    exec_lua(&rpc, r#"btv.layer.main()"#).await;
+    feed_sync(&rpc, "imain text<Esc>").await;
+    exec_lua(&rpc, r#"btv.dock.hide("bottom")"#).await;
+
+    feed_sync(&rpc, "<C-w><C-w>j").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main text"],
+        "a deliberately hidden dock is not a cross target"
+    );
+}

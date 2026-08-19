@@ -42,6 +42,13 @@ impl Editor {
         }
     }
 
+    /// Whether the dock on `side` is set to collapse itself when focus leaves it
+    /// (`btv.dock.opt(side).autohide`). Its collapse is transient by design, which is
+    /// why the layer cross still treats it as a target.
+    pub(crate) fn dock_autohides(&self, side: DockSide) -> bool {
+        self.dock_options[side.idx()].auto_hide
+    }
+
     /// Whether the dock on `side` has state at all — a [`TabStack`] in
     /// [`Editor::dock_tabs`], whether visible or hidden. The lifecycle guards
     /// (`open`/`close`/`focus`/`hide`/`show`) test this so they still act on a

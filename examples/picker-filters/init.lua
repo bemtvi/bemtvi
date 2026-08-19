@@ -8,13 +8,17 @@
 -- `live_grep` list by default (they search unrestricted, so nothing is ever
 -- unfindable) and that the filter boxes are for hiding when you don't want them.
 
--- Space as the leader, so the maps below read as `<Space>ff`. (bemtvi's default is
--- vim's `\`; the shipped picker maps are registered against whatever this is set to.)
+-- Space as the leader, so the maps this file sets below read as `<Space>fs`.
+--
+-- The SHIPPED picker maps (`\ff` files, `\fg` grep, `\fb` buffers, …) keep
+-- bemtvi's default `\`: they are registered when the prelude loads, before any
+-- config runs, and `<leader>` is expanded at SET time — so a `mapleader` set here
+-- cannot reach them. Type `\ff` for those and `<Space>fs` for the ones below.
 vim.g.mapleader = " "
 
 -- 1. Defaults for every filterable picker.
 --
---    TYPE  <leader>ff
+--    TYPE  \ff
 --    SEE   the picker opens with `[-2]` on the prompt row — the badge for the two
 --          exclude patterns below — and neither `target/junk.rs` nor
 --          `vendor/lib.lock` in the list. This is the "stop showing me build
@@ -30,7 +34,7 @@ btv.picker.setup({
 
 -- 2. Editing a box re-runs the search.
 --
---    TYPE  <leader>ff  then  <C-g>  then  <BS> ten times (clearing the exclude box)
+--    TYPE  \ff  then  <C-g>  then  <BS> ten times (clearing the exclude box)
 --    SEE   `target/junk.rs` and `vendor/lib.lock` come back as you delete — the
 --          source re-runs against the new patterns, it is not a local re-rank.
 --
@@ -49,14 +53,14 @@ btv.picker.setup({
 --      **/{a,b}/**     ONE pattern — a comma inside {…} is alternation, not a
 --                      separator
 --
---    TYPE  <leader>ff  then  <C-g>  then clear the box and type  *.rs
+--    TYPE  \ff  then  <C-g>  then clear the box and type  *.rs
 --    SEE   with that in the EXCLUDE box, every Rust file vanishes; move it to the
 --          include box (<C-g> twice more to cycle round) and only Rust files remain.
 
 -- 4. The line history — <C-Up> / <C-Down>.
 --
---    TYPE  <leader>ff, <C-g>, clear the box, type `*.lock`, then <Esc>
---    then  <leader>ff, <C-g>
+--    TYPE  \ff, <C-g>, clear the box, type `*.lock`, then <Esc>
+--    then  \ff, <C-g>
 --    SEE   the box opens holding `*.lock` — the last line you used.
 --
 --    TYPE  <C-Up>
@@ -84,7 +88,7 @@ end, { desc = "Find files in src/" })
 -- 6. The same for grep.
 --
 --    TYPE  <leader>fS  then type  needle
---    SEE   only the hits under `src/`. Compare with <leader>fg (plain live grep),
+--    SEE   only the hits under `src/`. Compare with \fg (plain live grep),
 --          which also matches the vendored copy.
 btv.keymap.set("n", "<leader>fS", function()
   btv.picker.open("live_grep", { include = "src/**", filters = "open" })
@@ -125,7 +129,7 @@ btv.picker.source({
 
 -- 8. `<C-g>` on a picker that has no boxes.
 --
---    TYPE  <leader>fb  (the buffers picker)  then  <C-g>
+--    TYPE  \fb  (the buffers picker)  then  <C-g>
 --    SEE   a message saying this picker has no include/exclude filters — rather
 --          than two boxes that would filter nothing. Only a source that declared
 --          `filter = true` gets them.

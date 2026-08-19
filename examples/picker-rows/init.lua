@@ -12,7 +12,10 @@ vim.g.mapleader = " "
 
 -- 1. The shipped diagnostics picker.
 --
---    TYPE  <leader>fd
+--    TYPE  \fd     (the SHIPPED pickers keep bemtvi's default `\` leader: their
+--                    maps are registered when the prelude loads, before any config
+--                    runs, so a later `mapleader` cannot reach them. The maps this
+--                    file sets below are `<leader>…`, i.e. Space.)
 --    SEE   every row leads with its severity letter in that severity's color
 --          (`E` red, `W` yellow, `H` grey), then `file:line:col`, then the message
 --          — `source: text`, folded onto ONE line however many lines the server
@@ -24,8 +27,9 @@ vim.g.mapleader = " "
 btv.on("VimEnter", { desc = "picker-rows: seed example diagnostics" }, function()
   -- Stand-in for a language server: client-set diagnostics on this buffer, so the
   -- example needs no LSP installed. A real server's diagnostics render identically.
+  -- `btv.diagnostic.set(namespace, bufnr, diagnostics)` — the namespace first.
   local buf = btv.buf.current()
-  btv.diagnostic.set(buf, btv.ns.create("example"), {
+  btv.diagnostic.set(btv.ns.create("example"), buf, {
     {
       lnum = 2,
       col = 0,

@@ -226,7 +226,10 @@ btv.picker._config = btv.picker._config or { include = nil, exclude = nil, histo
 -- namespace is passed explicitly — `"picker"` is reserved for exactly this. Opened
 -- lazily so a session that never opens a filterable picker never touches shada.
 local function history_store()
-  return btv.shada.plugin("picker")
+  -- The picker's own store, not the caller's: `btv.shada.plugin` attributes the
+  -- namespace to whoever called in, so a user config reaching this through
+  -- `btv.picker.history()` / `forget_history()` was refused for "claiming" it.
+  return btv._shada_store("picker")
 end
 
 -- One box's recallable lines, most recent first. Missing (or a store holding

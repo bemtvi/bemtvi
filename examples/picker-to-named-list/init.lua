@@ -55,7 +55,10 @@ btv.picker.source({
   name = "marks",
   preview = "location",
   items = function(ctx)
-    local here = btv.fs and btv.fs.dirname and btv.fs.dirname(btv.buf.name()) or "."
+    -- `btv.utils.dirname`, not `btv.fs.dirname` — there is no such thing on
+    -- `btv.fs`, and the `or "."` fallback that used to guard it silently resolved
+    -- every path against the working directory instead of this example's own.
+    local here = btv.utils.dirname(btv.buf.name())
     for _, e in ipairs({
       { text = "sample.txt:7  the dock model", path = "sample.txt", row = 7 },
       { text = "sample.txt:9  multi-select", path = "sample.txt", row = 9 },

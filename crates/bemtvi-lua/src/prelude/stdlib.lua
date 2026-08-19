@@ -361,6 +361,17 @@ end
 -- derived, so an explicit one is required.
 function btv.shada.plugin(dev_namespace)
   local namespace = btv._resolve_namespace(dev_namespace, "btv.shada.plugin")
+  return btv._shada_store(namespace)
+end
+
+-- `btv._shada_store(namespace)` — the store itself, with no attribution check. The
+-- PRELUDE's own persistence (the picker's filter-line history, say) belongs to
+-- bemtvi rather than to whoever happened to call the public API that reaches it:
+-- `btv.shada.plugin` attributes to the caller, so a user config calling
+-- `btv.picker.forget_history()` was refused for "claiming" the picker's namespace.
+-- Not for plugin use — a plugin goes through `btv.shada.plugin`, which is exactly
+-- the check this skips.
+function btv._shada_store(namespace)
   return {
     namespace = namespace,
     -- store:set(key, value) — persist `value` (any JSON-able Lua value) under `key`.

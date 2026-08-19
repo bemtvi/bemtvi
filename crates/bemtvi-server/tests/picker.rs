@@ -4822,3 +4822,45 @@ async fn a_promptless_select_has_no_progress_readout() {
         "a promptless select carries no status key"
     );
 }
+
+/// `btv.picker.history()` / `forget_history()` are the documented way to read and
+/// clear the filter boxes' recall list — but they reach for the PICKER's own shada
+/// store, and `btv.shada.plugin` attributes the namespace to whoever called in. So
+/// from a file on the runtimepath — a user's config, or any plugin —
+/// `forget_history` raised "this caller's namespace is 'x'; it cannot claim
+/// 'picker'". The store belongs to the prelude, not to its caller.
+///
+/// Called through a user command defined IN the config, so the caller really does
+/// attribute (a bare `exec_lua` attributes to nothing, which the escape hatch
+/// permits and which is why this only ever bit real users).
+#[tokio::test]
+async fn the_filter_history_api_works_from_a_config() {
+    let dir = temp_dir("picker_history_ns");
+    let (rpc, _incoming) = start(
+        &dir,
+        "_G.hist_err = nil\n\
+         btv.command('ForgetHistory', function()\n\
+         \x20 local ok, err = pcall(btv.picker.forget_history)\n\
+         \x20 _G.hist_err = ok and 'ok' or tostring(err)\n\
+         end, {})\n\
+         btv.command('ReadHistory', function()\n\
+         \x20 local ok, err = pcall(btv.picker.history, 'exclude')\n\
+         \x20 _G.hist_err = ok and 'ok' or tostring(err)\n\
+         end, {})\n",
+    )
+    .await;
+
+    command(&rpc, "ReadHistory").await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.hist_err").await.as_str(),
+        Some("ok"),
+        "reading the history from a config must not raise"
+    );
+
+    command(&rpc, "ForgetHistory").await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.hist_err").await.as_str(),
+        Some("ok"),
+        "clearing the history from a config must not raise"
+    );
+}

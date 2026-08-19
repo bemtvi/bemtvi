@@ -179,6 +179,30 @@ async fn setreg_linewise_option_pastes_as_a_line() {
     assert_eq!(lines(&rpc).await, vec!["alpha", "beta"]);
 }
 
+/// A linewise register's text ends in a newline — the same shape a linewise yank
+/// leaves and a list value already produced. Forcing the type with the `l` flag on a
+/// plain string stored the string verbatim, so `getreg` handed back an unterminated
+/// last line while `getregtype` said `V`.
+#[tokio::test]
+async fn setreg_linewise_string_keeps_the_trailing_newline() {
+    let (rpc, _incoming) = start(None).await;
+    let got = exec_lua(
+        &rpc,
+        r#"vim.fn.setreg('a', 'beta', 'l')
+           return vim.fn.getreg('a') .. '|' .. vim.fn.getregtype('a')"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("beta\n|V"));
+    // A value that already ends in a newline is not doubled.
+    let got = exec_lua(
+        &rpc,
+        r#"vim.fn.setreg('b', 'beta\n', 'l')
+           return vim.fn.getreg('b')"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("beta\n"));
+}
+
 #[tokio::test]
 async fn setreg_list_value_is_linewise() {
     let (rpc, _incoming) = start(None).await;

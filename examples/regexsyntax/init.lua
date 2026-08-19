@@ -23,8 +23,9 @@
 --     vim.o.regexsyntax  = "vim"     -- the GLOBAL default (every buffer that
 --                                       hasn't pinned its own dialect)
 --     vim.bo.regexsyntax = "vim"     -- override THIS buffer only
---     :set regexsyntax=vim           -- override the current buffer (like :set ts=)
---     :setlocal rxs=vim              -- same, with the abbreviation
+--     :set regexsyntax=vim           -- like any global-local option, :set writes
+--                                       BOTH the global default and this buffer
+--     :setlocal rxs=vim              -- THIS buffer only (the abbreviation is rxs)
 --     :set regexsyntax&              -- drop the buffer override (follow global)
 -- An unknown value fails loud (`E474`), never silently sticks you on a dialect.
 
@@ -48,7 +49,9 @@ vim.api.nvim_create_autocmd("FileType", {
 -- A) The PCRE default — `$1` capture refs, canonical groups.
 --      :2<CR>                               -- jump to "hello world"
 --      :s/(\w+) (\w+)/$2 $1/<CR>            -- swap the two words -> "world hello"
---    (`\<foo\>` here would be an INVALID pattern: `\<` is not PCRE.)
+--    (Vim's *escaped* magic is wrong here: `\(\w\+\)` is a literal `(`, a word
+--     character and a literal `+`, so it matches nothing. `\<`/`\>` happen to
+--     spell the same word boundary in both dialects.)
 --
 -- B) Switch to vim's dialect:
 --      :set regexsyntax=vim<CR>
@@ -71,8 +74,10 @@ vim.api.nvim_create_autocmd("FileType", {
 -- F) Flip back any time:
 --      :set regexsyntax=pcre<CR>            -- (or `:set rxs&` to reset to default)
 --
--- G) Per-buffer: pin one buffer to vim, leave the next on the global default:
---      :set regexsyntax=vim<CR>             -- THIS buffer -> vim
+-- G) Per-buffer: pin one buffer to vim, leave the next on the global default.
+--    `:setlocal`, not `:set` — `:set` on a global-local option moves the global
+--    default with it, and every later buffer would follow:
+--      :setlocal regexsyntax=vim<CR>        -- THIS buffer -> vim
 --      :enew<CR>                            -- a new buffer follows the global...
 --      :set rxs?<CR>                        -- ...echoes "regexsyntax=pcre"
 --      :bp<CR>                              -- back; :set rxs? -> "regexsyntax=vim"

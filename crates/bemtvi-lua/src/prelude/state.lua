@@ -2232,6 +2232,12 @@ function btv.reg.set(name, value, options)
   if type(value) ~= "table" and not type_given and text:sub(-1) == "\n" then
     linewise = true
   end
+  -- A linewise register's text ends in a newline, whatever made it linewise: that
+  -- is the shape a linewise yank leaves and the shape the list form above builds,
+  -- so a `getreg` of a `V` register never hands back an unterminated last line.
+  if linewise and text ~= "" and text:sub(-1) ~= "\n" then
+    text = text .. "\n"
+  end
 
   local lower = reg:lower()
   btv._registers = btv._registers or {}

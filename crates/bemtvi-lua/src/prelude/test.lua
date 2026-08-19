@@ -358,6 +358,23 @@ function Ctx:wait_for(predicate, opts)
   return btv.await(btv.wait_for(predicate, opts))
 end
 
+-- `t:idle()` — the pause. A key that is a live prefix of a mapping is WITHHELD
+-- until the next keystroke; the client arms a `'timeoutlen'` timer and, on idle,
+-- nudges the server to resolve it. There is no such timer server-side, so a spec
+-- that just waits waits forever — `t:idle()` is how it says "the user stopped
+-- typing here", and it is the only way a genuinely-ambiguous mapped prefix
+-- resolves (`:set notimeout` makes it a no-op, exactly as it does for a client).
+--
+-- ```lua
+-- t:feed("gg")        -- a live prefix of the `ggx` mapping: held
+-- t:idle()            -- …and now it resolves to the `gg` built-in
+-- ```
+function Ctx:idle()
+  btv._test_idle()
+  settle(1)
+  return self
+end
+
 -- t:sleep(ms) — await a wall-clock delay (for genuinely time-based behavior).
 function Ctx:sleep(ms)
   btv.await(btv.promise.delay(ms))

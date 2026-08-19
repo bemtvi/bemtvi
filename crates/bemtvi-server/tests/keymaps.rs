@@ -1881,3 +1881,51 @@ async fn a_count_ahead_of_a_complete_rhs_does_not_leak() {
         "the consumed count did not prefix the following j"
     );
 }
+
+/// A key that is BOTH a complete mapping and a prefix of a longer one must be
+/// held, then resolved to the shorter MAP on the idle flush — vim's timeoutlen
+/// rule. It reached the editor as a built-in instead whenever it arrived on the
+/// break path of an earlier prefix: the disambiguation oracle asks "does the
+/// replayed run plus this key form a complete built-in?", which `ggj` does, and
+/// released the `j` to core — never noticing that `j` is a mapping in its own
+/// right. So `gg` followed by `j` ran two built-ins and the user's `j` map never
+/// fired, which is exactly the ambiguity examples/phase4-config is about.
+#[tokio::test]
+async fn a_key_that_is_itself_a_mapping_is_never_released_to_the_builtin() {
+    let dir = temp_dir("keymap_short_map_wins");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'ggx', function() print('ggx') end)\n\
+         vim.keymap.set('n', 'j', function() print('SHORT') end)\n\
+         vim.keymap.set('n', 'jk', function() print('LONG') end)\n",
+    )
+    .await;
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<Esc>gg");
+
+    // `gg` is held (a prefix of the `ggx` map); `j` breaks it, so `gg` replays raw
+    // to the editor — and the `j` must then be HELD as the ambiguous mapping it is,
+    // not released to the built-in.
+    let redraw = redraw_after(&rpc, &mut incoming, "j").await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        1,
+        "the j was held as a mapping prefix, not run as the built-in"
+    );
+    assert_eq!(message(&redraw), "", "and nothing fired yet");
+
+    // The idle flush resolves it to the shorter MAP, as it does anywhere else.
+    while incoming.try_recv().is_ok() {}
+    flush(&rpc).await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let mut fired = String::new();
+    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
+        if method == "redraw" {
+            if let Some(Value::Map(map)) = params.into_iter().next() {
+                if !message(&map).is_empty() {
+                    fired = message(&map);
+                }
+            }
+        }
+    }
+    assert_eq!(fired, "SHORT", "the idle flush fired the shorter (j) map");
+}

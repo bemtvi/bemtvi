@@ -1564,6 +1564,10 @@ impl EditHost {
                 Err(err) => self.editor.echo(format!("t:mouse: {err}")),
             }
         }
+        // The idle flush a client's `timeoutlen` timer sends, from `t:idle`.
+        for _ in 0..self.lua.take_test_idle() {
+            self.input_flush();
+        }
         // `nvim_feedkeys` typeahead: parse each request's keys and queue them onto
         // the server's feed buffer (the front for an `i` insert, else the back),
         // carrying the remap flag. The buffer is drained — fed through the matcher

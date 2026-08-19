@@ -2213,6 +2213,18 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `btv._test_idle()`: queue the idle flush a client's `timeoutlen` timer sends,
+    // so a spec can express "the user paused here" — which is the only way a
+    // genuinely-ambiguous mapped prefix ever resolves. Gated behind `btv.test`.
+    let sh = shared.clone();
+    btv.set(
+        "_test_idle",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().test_idle += 1;
+            Ok(())
+        })?,
+    )?;
+
     // `btv._test_clipboard_seed(text, linewise)`: queue a clipboard seed for the
     // server to write into the editor's clipboard provider (the plugin-test seam
     // behind `btv.test.clipboard.seed`). Reachable only via the gated `btv.test`.

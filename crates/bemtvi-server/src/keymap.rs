@@ -675,11 +675,31 @@ impl Keymaps {
                     // editor whole and fires instantly. The `would_hold` guard keeps
                     // user maps winning.
                     if let (Some(raw_run), Some(mode)) = (raw, scope.oracle_mode()) {
-                        let would_hold = matches!(
-                            self.tries[&bucket].classify(std::slice::from_ref(&key)),
-                            Classify::Prefix
-                        );
-                        if would_hold {
+                        // …and only when the key is a *bare* prefix. A key that is
+                        // ALSO a complete mapping of its own (`j` under a `jk` map,
+                        // with `j` itself mapped) is ambiguous in vim's sense: it is
+                        // held, and the idle flush resolves it to the shorter MAP.
+                        // Releasing it here would hand the user's own map's key to
+                        // the built-in — the oracle exists to stop a built-in waiting
+                        // on a map, never to make a map lose to one.
+                        let is_own_mapping = self.tries[&bucket]
+                            .longest_complete(std::slice::from_ref(&key))
+                            .is_some();
+                        let would_hold = !is_own_mapping
+                            && matches!(
+                                self.tries[&bucket].classify(std::slice::from_ref(&key)),
+                                Classify::Prefix
+                            );
+                        // …and only when `key` COMPLETES the replayed run into one
+                        // command. If the run is already complete on its own, `key`
+                        // is the start of a fresh command — and a fresh key belongs to
+                        // the matcher, which may still be waiting to see whether it
+                        // begins a mapping. Releasing it because "the run plus the key
+                        // parses" made `gg` followed by `<Space>` run the built-in
+                        // space instead of holding it for a `<leader>…` map.
+                        let run_already_complete =
+                            command_status(mode, &raw_run) == CommandStatus::Complete;
+                        if would_hold && !run_already_complete {
                             let mut run = raw_run;
                             run.push(key);
                             if command_status(mode, &run) == CommandStatus::Complete {

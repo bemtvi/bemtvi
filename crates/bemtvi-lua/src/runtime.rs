@@ -1193,6 +1193,9 @@ pub(crate) struct Shared {
     /// Mouse gestures queued by the `btv.test` harness (`t:mouse`), replayed by the
     /// server at the same seam a client's `btv_input_mouse` lands on.
     pub(crate) test_mouse: Vec<MouseOp>,
+    /// Idle-flush requests from the `btv.test` harness (`t:idle`), replayed by the
+    /// server at the seam the client's `timeoutlen` timer lands on.
+    pub(crate) test_idle: usize,
 }
 
 impl Shared {
@@ -1248,6 +1251,7 @@ impl Shared {
             ui_selects,
             choice_menus,
             test_mouse,
+            test_idle,
             ui_floats,
             picker_opens,
             picker_resume,
@@ -1326,6 +1330,7 @@ impl Shared {
         *prompt_complete_results = Default::default();
         *ui_selects = Default::default();
         *test_mouse = Default::default();
+        *test_idle = Default::default();
         *choice_menus = Default::default();
         *ui_floats = Default::default();
         *picker_opens = Default::default();
@@ -2366,6 +2371,11 @@ impl LuaRuntime {
         /// Take the mouse gestures the `btv.test` harness queued (`t:mouse`), for the
         /// server to replay through its own mouse seam.
         take_test_mouse -> Vec<MouseOp> = test_mouse
+    }
+
+    take_queue! {
+        /// Take the idle-flush requests the `btv.test` harness queued (`t:idle`).
+        take_test_idle -> usize = test_idle
     }
 
     /// Drop every queued-but-unapplied side effect — the whole set the `take_*`

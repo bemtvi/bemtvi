@@ -49,8 +49,11 @@
 --   :setlocal ts<Tab>  `:setlocal` shares the option-argument completer
 --   <Tab>              highlight a row — the docs float shows the option's name +
 --                      abbreviation, its scope + kind, and a one-line description
---   <CR>               accept the highlighted option name into the line (you then
---                      finish it, e.g. `:set tabstop=4`)
+--   <CR>               accept the highlighted option name AND run the line, exactly
+--                      as it does for a command name (`:set number` is complete on
+--                      its own). Only the file-path PICKER below pastes without
+--                      running — for a value form like `:set tabstop=4`, dismiss
+--                      the wildmenu with <Esc> and finish typing the line.
 --
 -- FILE-PATH COMPLETION — a fuzzy PICKER for file/dir arguments:
 --   :e <Tab>           open the btv.picker overlay OVER the still-open command line (a
@@ -76,7 +79,8 @@
 -- NAME ARGUMENT COMPLETION — buffers, color schemes, highlight groups (inline, like
 -- `:set`, sourced from what the editor already knows so it can never drift):
 --   :buffer <Tab>      list the loaded buffers by name (`:bdelete` / `:bwipeout`
---                      share it); type to fuzzy-narrow, <CR> accepts a name
+--                      share it); type to fuzzy-narrow, <CR> accepts the highlighted
+--                      name and runs the line
 --   :colorscheme <Tab> list every available color scheme — the bundled `bemtvi` plus
 --                      any `colors/<name>.lua` on the runtimepath (a plugin theme
 --                      shows the instant it's installed)

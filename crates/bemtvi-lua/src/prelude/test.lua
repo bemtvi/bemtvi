@@ -500,6 +500,35 @@ function Ctx:highlights(row)
   return rows[row] or {}
 end
 
+-- `t:menu()` — the open float-list menu, or nil when none is up:
+-- `{ items = { "…" }, selected = <1-based index|nil> }`.
+--
+-- One widget serves four features — the insert-mode completion popup, the `:`-line
+-- wildmenu, `btv.picker`, and `btv.ui.select` — and it is in none of the other
+-- views: not buffer text, not a painted row of the focused window (it floats over
+-- them), and not the content float `t:float()` reads. Without this a suite for any
+-- of those could only assert on what happened AFTER an accept, never on what was
+-- offered or which row led.
+--
+-- `selected` is nil while nothing is highlighted — the popup opens `noselect`, so
+-- `<CR>` runs the typed line until you actually pick a row.
+--
+-- ```lua
+-- t:feed(":ene<Tab>")
+-- btv.test.expect(t:menu().items[1]).to_be("enew")
+-- btv.test.expect(t:menu().selected).to_be_nil()
+-- ```
+function Ctx:menu()
+  local m = btv._ui and btv._ui.menu
+  if not m then
+    return nil
+  end
+  return {
+    items = m.items or {},
+    selected = m.selected_active and ((m.selected or 0) + 1) or nil,
+  }
+end
+
 -- `t:rulers()` — the focused window's `'colorcolumn'` rulers, as the 1-based text
 -- columns the client is told to paint with the `ColorColumn` group.
 --
@@ -547,16 +576,25 @@ local VIRT_POS =
 -- `virt_text` is the row's placements joined, since one row can carry several;
 -- `virt_pos`/`virt_col` describe the first. `virt_lines` is set on a row that *is* a
 -- virtual line — a whole extra screen row, so it reads blank in `t:screen()` and
--- carries its text here instead. Highlight *groups* are absent on purpose: the wire
--- carries a per-frame palette id for these layers, not a name, so `t:highlights()`
--- stays the group-level view.
+-- carries its text here instead. `line_bg` is `true` on a row a `line_hl_group`
+-- tints full width. Highlight *groups* are absent on purpose: the wire carries a
+-- per-frame palette id for these layers, not a name, so `t:highlights()` stays the
+-- group-level view.
 --
 -- Only the focused window, like `t:screen()`.
 function Ctx:decor(row)
   local ui = btv._ui
   local virt, signs = (ui and ui.virt_text) or {}, (ui and ui.signs) or {}
   local lines = (ui and ui.virt_lines) or {}
-  local rows, n = {}, math.max(#virt, #signs, #lines)
+  -- The line-background layer arrives as `{ row, style }` pairs on 0-based screen
+  -- rows; fold it into a set keyed the same 1-based way as everything else here.
+  local tinted, last_bg = {}, 0
+  for _, place in ipairs((ui and ui.line_bg) or {}) do
+    local tinted_row = (place[1] or 0) + 1
+    tinted[tinted_row] = true
+    last_bg = math.max(last_bg, tinted_row)
+  end
+  local rows, n = {}, math.max(#virt, #signs, #lines, last_bg)
   for i = 1, n do
     local out = {}
     local places = virt[i]
@@ -585,6 +623,7 @@ function Ctx:decor(row)
     if type(sign) == "table" then
       out.sign = sign[1]
     end
+    out.line_bg = tinted[i] or nil
     rows[i] = out
   end
   if row == nil then

@@ -3,7 +3,7 @@
 //! normal editor session, present only once enabled.
 
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, feed, start_attached};
+use bemtvi_test_harness::{exec_lua, feed, lines, start_attached};
 use rmpv::Value;
 
 #[tokio::test]
@@ -147,4 +147,106 @@ async fn ui_mirror_carries_the_resolved_colorcolumn_rulers() {
     feed(&rpc, "<Esc>");
     let cols = exec_lua(&rpc, "return #btv._ui.colorcolumn").await;
     assert_eq!(cols.as_i64(), Some(0), "cleared means no rulers");
+}
+
+#[tokio::test]
+async fn ui_mirror_carries_the_open_menu() {
+    // The completion popup, the wildmenu, `btv.ui.select` and the picker are all
+    // the same float-list widget — and a spec could see none of them. They are not
+    // buffer text, not painted rows of the focused window, and not the content
+    // float `t:float()` reads, so a suite for any of those features could only
+    // assert on what happened AFTER an accept. Mirror the projected menu.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    // Nothing open: the mirror says so rather than reporting an empty menu.
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.menu == nil").await,
+        Value::Boolean(true),
+        "no menu is open, so the mirror carries none"
+    );
+
+    // `btv.ui.select` puts one up.
+    exec_lua(
+        &rpc,
+        r#"btv.ui.select({ "alpha", "beta", "gamma" }, {}):next(function() end)"#,
+    )
+    .await;
+    // The mirror refreshes on the next redraw, so settle one first.
+    let _ = lines(&rpc).await;
+    let items = exec_lua(&rpc, "return table.concat(btv._ui.menu.items or {}, ',')").await;
+    assert_eq!(
+        items.as_str(),
+        Some("alpha,beta,gamma"),
+        "the menu's rows must reach the mirror"
+    );
+    // It opens `noselect`: a row index is carried, but nothing is highlighted yet.
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.menu.selected_active").await,
+        Value::Boolean(false),
+        "the menu opens with nothing highlighted"
+    );
+
+    // Moving the highlight moves it in the mirror too.
+    feed(&rpc, "j");
+    feed(&rpc, "<C-n>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.menu.selected")
+            .await
+            .as_i64(),
+        Some(1),
+        "the highlight advanced to the second row (0-based on the wire)"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.menu.selected_active").await,
+        Value::Boolean(true),
+    );
+
+    // …and dismissing it clears the mirror.
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.menu == nil").await,
+        Value::Boolean(true),
+        "a dismissed menu leaves nothing behind"
+    );
+}
+
+#[tokio::test]
+async fn ui_mirror_carries_the_line_background_layer() {
+    // `line_hl_group` — the full-width row tint — is the fourth decoration payload
+    // and the only one a spec could not see: it is not buffer text, it is not a
+    // glyph, and it rides its own `line_bg` wire layer rather than the highlight
+    // spans. Mirror which rows carry one. (Which GROUP is deliberately absent, as
+    // for the other decoration layers: the wire carries a per-frame palette id.)
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    feed(&rpc, "ione<CR>two<CR>three<Esc>");
+    exec_lua(
+        &rpc,
+        r##"btv.hl.define(0, "SpecRowTint", { bg = "#332211" })
+           local ns = btv.ns.create("spec-line-bg")
+           btv.buf.set_extmark(0, ns, 1, 0, { line_hl_group = "SpecRowTint" })"##,
+    )
+    .await;
+    let _ = lines(&rpc).await;
+    let tinted = exec_lua(
+        &rpc,
+        r#"local out = {}
+           for _, place in ipairs(btv._ui.line_bg or {}) do out[#out + 1] = place[1] + 1 end
+           table.sort(out)
+           return table.concat(out, ",")"#,
+    )
+    .await;
+    assert_eq!(
+        tinted.as_str(),
+        Some("2"),
+        "only the row carrying the line_hl_group is tinted (1-based screen rows)"
+    );
 }

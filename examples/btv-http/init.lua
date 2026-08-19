@@ -74,12 +74,14 @@ end))
 
 --------------------------------------------------------------------------------
 -- 3. <leader>p — a POST with a JSON body. A non-string `body` is JSON-encoded for
---    you and a `Content-Type: application/json` header is added. httpbin echoes the
---    request back, so we can read our own payload out of the response.
+--    you and a `Content-Type: application/json` header is added. httpbingo echoes
+--    the request back, so we can read our own payload out of the response.
+--    (httpbingo.org rather than httpbin.org: the original has been unreliable for
+--    years, and this demo hung on it.)
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>p", function()
-  show("POST httpbin.org/anything …")
-  btv.http.fetch("https://httpbin.org/anything", {
+  show("POST httpbingo.org/anything …")
+  btv.http.fetch("https://httpbingo.org/anything", {
     method = "POST",
     body = { editor = "bemtvi", feature = "btv.http" },
   })
@@ -117,8 +119,8 @@ end)
 --    itself instead of following it (the default is "follow"; "error" would reject).
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>r", function()
-  show("GET httpbin.org/redirect/1 with redirect='manual' …")
-  btv.http.fetch("https://httpbin.org/redirect/1", { redirect = "manual" })
+  show("GET httpbingo.org/redirect/1 with redirect='manual' …")
+  btv.http.fetch("https://httpbingo.org/redirect/1", { redirect = "manual" })
     :next(function(res)
       show(("redirect not followed: %d → %s"):format(res.status, res.headers["location"] or "?"))
     end)

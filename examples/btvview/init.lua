@@ -24,10 +24,13 @@
 --------------------------------------------------------------------------------
 -- A fixed list of entries to show (label -> path opened on <CR>). A real tree
 -- would build this from `btv.fs.readdir`, lazily, on expand.
+-- Paths are resolved against THIS directory, not the working one, so `<CR>` opens
+-- the right file however the playground was launched.
+local HERE = debug.getinfo(1, "S").source:match("^@(.*)/[^/]+$")
 local ENTRIES = {
-  { label = "  sample.txt", path = "examples/btvview/sample.txt" },
-  { label = "  init.lua", path = "examples/btvview/init.lua" },
-  { label = "  README (this repo)", path = "README.md" },
+  { label = "  sample.txt", path = HERE .. "/sample.txt" },
+  { label = "  init.lua", path = HERE .. "/init.lua" },
+  { label = "  README (this repo)", path = HERE .. "/../../README.md" },
 }
 
 -- A highlight + namespace for the per-line decoration (the leading glyph color).

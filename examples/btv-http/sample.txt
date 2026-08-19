@@ -6,9 +6,9 @@ maps (leader is "\") in Normal mode and watch the message line:
 
     \h   GET https://example.com            → status + byte count + content-type
     \j   GET https://api.github.com/…       → decode JSON, show a field (res:json())
-    \p   POST https://httpbin.org/anything  → send a JSON body, read it back echoed
+    \p   POST https://httpbingo.org/anything  → send a JSON body, read it back echoed
     \x   GET http://127.0.0.1:1             → a transport failure (the :catch path)
-    \r   GET httpbin.org/redirect/1         → redirect='manual' (don't follow the 3xx)
+    \r   GET httpbingo.org/redirect/1         → redirect='manual' (don't follow the 3xx)
     \l   GET https://example.com            → btv.http.fetch_local (forced local network)
 
 btv.http.fetch(url, opts) returns a PROMISE of a Response and never blocks the

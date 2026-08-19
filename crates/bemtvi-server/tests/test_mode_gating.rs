@@ -48,6 +48,42 @@ async fn test_api_is_absent_until_enabled() {
 }
 
 #[tokio::test]
+async fn ui_statusline_mirror_carries_the_per_window_bar_too() {
+    // The mirror used to read ONLY the global bar (`laststatus=3`), so at every
+    // other `'laststatus'` — including the default — `t:statusline()` reported an
+    // empty string even though a status line was plainly being painted. That is a
+    // stub that quietly succeeds: a spec asserting on the bar passes vacuously.
+    // With no global bar, mirror the FOCUSED window's own status row instead.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    // laststatus=2: every window paints its own bar, and there is no global one.
+    feed(&rpc, ":set laststatus=2<CR>");
+    feed(&rpc, ":set statusline=per-window-status<CR>");
+    feed(&rpc, "<Esc>");
+
+    let sl = exec_lua(&rpc, "return btv._ui.statusline").await;
+    assert_eq!(
+        sl.as_str().map(|s| s.trim().to_string()),
+        Some("per-window-status".to_string()),
+        "the mirror must carry the focused window's bar when there is no global one"
+    );
+
+    // The global bar still wins when there is one.
+    feed(&rpc, ":set laststatus=3<CR>");
+    feed(&rpc, ":set statusline=global-status<CR>");
+    feed(&rpc, "<Esc>");
+    let sl = exec_lua(&rpc, "return btv._ui.statusline").await;
+    assert_eq!(
+        sl.as_str().map(|s| s.trim().to_string()),
+        Some("global-status".to_string()),
+        "the global bar is still what the mirror reports at laststatus=3"
+    );
+}
+
+#[tokio::test]
 async fn ui_statusline_mirror_carries_the_rendered_segment_text() {
     // `t:statusline()` (the `btv._ui.statusline` mirror) must reflect the actual
     // rendered global status line. It mirrors `global_status` — an array of

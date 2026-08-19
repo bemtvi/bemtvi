@@ -301,7 +301,6 @@ impl EditHost {
         // per-frame style ids, so tests assert on text). Only under `--test-plugin`
         // (`test_mode`), so a normal session pays nothing.
         if self.test_mode {
-            let statusline_text = chunk_runs_text(&global_status);
             let clipboard = self.editor.clipboard_contents();
             // The focused window's painted rows, scrubbed exactly as the wire's
             // `lines` array is, so `t:screen()` sees what a client would draw.
@@ -337,6 +336,16 @@ impl EditHost {
             let virt_text = layer("virt_text");
             let virt_lines = layer("virt_lines");
             let signs = layer("diagnostics_signs");
+            // The status line as painted. The global bar (`laststatus=3`) is the whole
+            // story when there is one; at every other `'laststatus'` — the default
+            // included — it is `Nil` and each window paints its own row, so fall back
+            // to the focused window's. Without the fallback the mirror reported "" for
+            // the bar a client was visibly drawing, and a spec asserting on it passed
+            // vacuously.
+            let statusline_text = match &global_status {
+                Value::Nil => chunk_runs_text(&layer("status")),
+                bar => chunk_runs_text(bar),
+            };
             let _ = self.lua.set_ui_mirror(bemtvi_lua::UiMirror {
                 float: &float,
                 message: &message,

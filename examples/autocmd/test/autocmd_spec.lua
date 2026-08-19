@@ -40,8 +40,10 @@ btv.test.describe("examples/autocmd", function()
   -- §2. The Demo augroup's command-string autocmd, on a real editor event.
   btv.test.it("§2 — reading a .txt file echoes the Demo augroup's banner", function(t)
     -- Read on its own, with nothing typed after: `:echo` writes the message line
-    -- but — like vim — is not recorded in `:messages`, so the next keypress that
-    -- repaints it is the last chance to see it.
+    -- but — like vim — is not recorded in `:messages`, so the read's own frame is
+    -- the only chance to see it. §1's once-only `BufEnter` greeting would land on
+    -- top of it, so spend that first on a throwaway buffer.
+    t:cmd("e " .. btv.test.tempdir() .. "/warmup.txt")
     t:cmd("e " .. DIR .. "/sample.txt")
     btv.test.expect(t:message()).to_contain("Read a .txt file (from the Demo augroup)")
   end)

@@ -303,6 +303,7 @@ function Ctx:feed(keys, opts)
   -- The fourth argument marks these keys as TYPED — this is the user's keyboard,
   -- which is the whole premise of the framework. Plugin typeahead leaves it off,
   -- so an in-flight `<F2>` recording captures a spec's keys and not a plugin's.
+  btv._test_clear_scroll()
   btv._feedkeys(keys, opts.remap ~= false, opts.insert or false, true)
   settle(opts.settle or 1)
   return self
@@ -310,6 +311,7 @@ end
 
 -- t:cmd(excmd) — run an ex-command, then settle a tick.
 function Ctx:cmd(excmd)
+  btv._test_clear_scroll()
   vim.cmd(excmd)
   settle(1)
   return self
@@ -511,6 +513,29 @@ end
 function Ctx:showcmd()
   local ui = btv._ui
   return (ui and ui.showcmd) or ""
+end
+
+-- `t:scroll()` — the scroll-animation gesture the last frame started, as
+-- `{ from_row, to_row, duration_ms }` (buffer lines, and the milliseconds the
+-- client will take to slide between them), or nil when that frame started none.
+--
+-- A **one-shot**: only the frame that begins a slide carries it. It describes what
+-- the client is about to animate rather than any state the editor keeps, so no
+-- other view can see it — `t:view()` reports the destination the scroll already
+-- settled on, animated or not. Always nil under `'noscrollanim'` (and at
+-- `'scrollanimduration'` 0), which is exactly what those options mean.
+--
+-- ```lua
+-- t:feed("<C-d>")
+-- btv.test.expect(t:scroll().to_row > t:scroll().from_row).to_be(true)
+-- ```
+function Ctx:scroll()
+  local ui = btv._ui
+  local s = ui and ui.scroll
+  if type(s) ~= "table" then
+    return nil
+  end
+  return s
 end
 
 -- t:statusline() — the rendered status line text, when the mirror carries it.

@@ -1494,6 +1494,11 @@ impl EditHost {
         for _ in 0..self.lua.take_test_idle() {
             self.input_flush();
         }
+        // `t:scroll`'s per-input reset: forget the sticky gesture so the next one
+        // mirrored is the one this input starts.
+        if self.lua.take_test_scroll_clear() {
+            self.test_scroll = rmpv::Value::Nil;
+        }
         // `nvim_feedkeys` typeahead: parse each request's keys and queue them onto
         // the server's feed buffer (the front for an `i` insert, else the back),
         // carrying the remap flag. The buffer is drained — fed through the matcher

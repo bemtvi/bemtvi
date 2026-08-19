@@ -1191,6 +1191,10 @@ pub(crate) struct Shared {
     /// Idle-flush requests from the `btv.test` harness (`t:idle`), replayed by the
     /// server at the seam the client's `timeoutlen` timer lands on.
     pub(crate) test_idle: usize,
+    /// Whether the harness asked to forget the last scroll gesture (`t:scroll`'s
+    /// per-input reset). The mirrored gesture is sticky — it rides one frame only,
+    /// and the settle after an input would otherwise wipe it before a spec looks.
+    pub(crate) test_scroll_clear: bool,
 }
 
 impl Shared {
@@ -1245,6 +1249,7 @@ impl Shared {
             choice_menus,
             test_mouse,
             test_idle,
+            test_scroll_clear,
             ui_floats,
             picker_opens,
             picker_resume,
@@ -1322,6 +1327,7 @@ impl Shared {
         *ui_selects = Default::default();
         *test_mouse = Default::default();
         *test_idle = Default::default();
+        *test_scroll_clear = Default::default();
         *choice_menus = Default::default();
         *ui_floats = Default::default();
         *picker_opens = Default::default();
@@ -1566,6 +1572,9 @@ pub struct UiMirror<'a> {
     /// The `'showcmd'` corner — the partly-typed command, already truncated to
     /// vim's 10 columns (`t:showcmd()`).
     pub showcmd: &'a str,
+    /// The focused window's one-shot scroll-animation descriptor, `Nil` on a frame
+    /// that started no slide (`t:scroll()`).
+    pub scroll: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -2360,6 +2369,12 @@ impl LuaRuntime {
     take_queue! {
         /// Take the idle-flush requests the `btv.test` harness queued (`t:idle`).
         take_test_idle -> usize = test_idle
+    }
+
+    take_queue! {
+        /// Take the `t:scroll` reset the harness queued (see
+        /// [`Shared::test_scroll_clear`]).
+        take_test_scroll_clear -> bool = test_scroll_clear
     }
 
     /// Drop every queued-but-unapplied side effect — the whole set the `take_*`
@@ -3498,6 +3513,7 @@ impl LuaRuntime {
             numbers,
             region_tabs,
             showcmd,
+            scroll,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3543,6 +3559,11 @@ impl LuaRuntime {
         // and it is the only place a *withheld* mapped prefix is visible at all
         // (those keys never reach the editor, so no buffer/cursor state moves).
         ui.set("showcmd", showcmd)?;
+        // The scroll-animation descriptor. It is a ONE-SHOT gesture — the frame that
+        // starts a slide carries it and no other does — and it describes what the
+        // client is about to animate, not any state the editor keeps. So it appears
+        // in no other view: `t:view()` already reports the settled destination.
+        ui.set("scroll", crate::convert::rmpv_to_lua(&self.lua, scroll)?)?;
         // The fourth decoration payload: the full-width row tint a `line_hl_group`
         // lays down. It rides its own wire layer rather than the highlight spans, so
         // it was the one payload of the shared extmark vocabulary a spec could not

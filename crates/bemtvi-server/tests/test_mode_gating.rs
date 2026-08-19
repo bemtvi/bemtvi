@@ -544,3 +544,57 @@ async fn ui_mirror_carries_the_showcmd_corner() {
         "'noshowcmd' paints nothing"
     );
 }
+
+/// The scroll-animation gesture is mirrored, and it is **sticky** until the next
+/// input clears it. It rides exactly one frame — the settle after the input that
+/// started it repaints without one — so a spec reading it after its own `t:feed`
+/// would otherwise always find nothing.
+#[tokio::test]
+async fn ui_mirror_carries_the_scroll_gesture() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    let body: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+    let path = bemtvi_test_harness::write_temp("scroll_mirror", "txt", &body);
+    feed(&rpc, &format!(":e {path}<CR>"));
+    feed(&rpc, "gg");
+    let _ = lines(&rpc).await;
+
+    // A half-page scroll hands the client a slide from where it was to where it is.
+    feed(&rpc, "<C-d>");
+    let _ = lines(&rpc).await;
+    let to = exec_lua(&rpc, "return btv._ui.scroll and btv._ui.scroll.to_row").await;
+    assert!(
+        to.as_i64().is_some_and(|r| r > 0),
+        "the gesture names its destination, got {to:?}"
+    );
+    let ms = exec_lua(&rpc, "return btv._ui.scroll.duration_ms").await;
+    assert!(
+        ms.as_i64().is_some_and(|d| d > 0),
+        "…and how long the client should take, got {ms:?}"
+    );
+
+    // The reset the harness runs before each input is what forgets it.
+    exec_lua(&rpc, "btv._test_clear_scroll()").await;
+    let _ = lines(&rpc).await;
+    assert!(
+        exec_lua(&rpc, "return btv._ui.scroll == nil")
+            .await
+            .as_bool()
+            .unwrap_or(false),
+        "the reset cleared the sticky gesture"
+    );
+
+    // `'noscrollanim'` starts none at all — the viewport still moves.
+    feed(&rpc, ":set noscrollanim<CR>");
+    feed(&rpc, "<C-d>");
+    let _ = lines(&rpc).await;
+    assert!(
+        exec_lua(&rpc, "return btv._ui.scroll == nil")
+            .await
+            .as_bool()
+            .unwrap_or(false),
+        "'noscrollanim' animates nothing"
+    );
+}

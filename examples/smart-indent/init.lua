@@ -50,16 +50,27 @@ vim.o.autopairs = true
 --      TYPE:  bar           -> "foo(bar|)"
 --      TYPE:  )             -> "foo(bar)|"     (typed through the auto-closer)
 --
--- 2. SMARTINDENT after an opener — press <CR> after a line ending in { ( [:
+-- 2. BLOCK EXPANSION — with auto-pairs on, an opener already carries its closer,
+--    so <CR> between the two lays the whole body out for you:
+--      TYPE:  if cond {     -> "if cond {|}"     (the } came for free)
+--      TYPE:  <CR>          -> "if cond {"
+--                              "  |"             (one level deeper)
+--                              "}"               (snapped back to column 0)
+--      TYPE:  work          -> "if cond {"
+--                              "  work"
+--                              "}"               — done; do NOT type the }, it is
+--                                                already there
+--      TYPE:  fn(<CR>       -> the same three lines for a paren: "fn(", "  |", ")"
+--
+-- 3. SMARTINDENT ON ITS OWN — turn auto-pairs off and the closer is yours to type;
+--    what smartindent still does is indent after the opener and snap the closer
+--    back to it:
+--      TYPE:  :setlocal noautopairs<CR>
 --      TYPE:  if cond {<CR> -> "if cond {"
---                              "  |"            (one level deeper)
+--                              "  |"             (one level deeper)
 --      TYPE:  work<CR>}     -> "if cond {"
 --                              "  work"
---                              "}"              (the } snapped back to column 0)
---
--- 3. BLOCK EXPANSION — <CR> between an auto-paired bracket opens the body:
---      TYPE:  fn()<CR>      -> with autopairs, `(` paired and the <CR> lays:
---                              "fn(", "  |", ")"
+--                              "}"               (the } snapped back to column 0)
 --
 -- 4. BACKSPACE over an empty pair removes both halves:
 --      TYPE:  [   then <BS> -> "[|]" then ""    (both brackets gone)

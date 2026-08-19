@@ -2227,6 +2227,19 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._test_clear_scroll()`: forget the last mirrored scroll gesture, so the
+    // next `t:scroll()` reports what THIS input started and not a previous one. The
+    // gesture rides a single frame, and the settle after an input repaints without
+    // it — hence the sticky mirror this resets. Gated behind `btv.test`.
+    let sh = shared.clone();
+    btv.set(
+        "_test_clear_scroll",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().test_scroll_clear = true;
+            Ok(())
+        })?,
+    )?;
+
     // `btv._test_clipboard_seed(text, linewise)`: queue a clipboard seed for the
     // server to write into the editor's clipboard provider (the plugin-test seam
     // behind `btv.test.clipboard.seed`). Reachable only via the gated `btv.test`.

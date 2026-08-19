@@ -1588,6 +1588,12 @@ pub struct EditHost {
     /// and the `btv.test` framework is installed. Off by default, so a normal editor
     /// session neither pays the mirror cost nor exposes the test API.
     test_mode: bool,
+    /// The last scroll-animation gesture mirrored into `btv._ui.scroll` for the
+    /// plugin-test framework (`t:scroll()`). Sticky: the gesture rides a single
+    /// frame — the settle after the input that started it repaints without one — so
+    /// the mirror keeps the last seen and the harness's own per-input reset
+    /// (`btv._test_clear_scroll`) is what forgets it. `Nil` outside test mode.
+    test_scroll: rmpv::Value,
     /// Route captured Lua message output (`print` / `nvim_echo` / the `btv.err_write*`
     /// error writers) to the process's real **stdout / stderr** instead of the editor
     /// message line. Set only by the headless `bemtvi --lua CODE` one-shot (via
@@ -2029,6 +2035,7 @@ impl EditHost {
             macro_state_mirror: (None, None),
             paste_payload: None,
             test_mode: false,
+            test_scroll: rmpv::Value::Nil,
             lua_stdio: false,
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),

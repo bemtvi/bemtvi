@@ -355,6 +355,14 @@ impl EditHost {
             // `laststatus=0`, and at 1 with a single window, where the client gives
             // the freed row to text instead. Reporting the text the server computed
             // anyway would say a bar is up when none is.
+            // The scroll gesture rides exactly one frame — the settle after the input
+            // that started it repaints without it — so the mirror keeps the last one
+            // seen and `t:scroll`'s own reset (`btv._test_clear_scroll`) is what
+            // forgets it, once per input.
+            match layer("scroll") {
+                Value::Nil => {}
+                band => self.test_scroll = band,
+            }
             let statusline_text = match &global_status {
                 Value::Nil if matches!(layer("status_visible"), Value::Boolean(true)) => {
                     chunk_runs_text(&layer("status"))
@@ -383,6 +391,7 @@ impl EditHost {
                 numbers: &numbers_v,
                 region_tabs: &region_tablines,
                 showcmd: &showcmd,
+                scroll: &self.test_scroll,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

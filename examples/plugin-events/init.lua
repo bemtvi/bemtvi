@@ -9,7 +9,10 @@
 -- then hooks the two events the plugin manager fires.
 
 -- Where this config lives, so the plugins' `dir` paths resolve to an absolute path.
-local here = vim.fn.stdpath("config")
+-- Taken from this chunk's own source rather than `stdpath("config")`, so the paths
+-- hold however the file is loaded — including a `--test-plugin` run, which has no
+-- config dir at all.
+local here = debug.getinfo(1, "S").source:match("^@(.*)/[^/]+$")
 
 ------------------------------------------------------------------------------
 -- 1. Declare the plugins.

@@ -291,3 +291,67 @@ async fn ui_mirror_carries_the_diagnostic_inline_messages() {
         "a row with no diagnostic has no inline message"
     );
 }
+
+#[tokio::test]
+async fn ui_mirror_carries_the_gutter_widths() {
+    // `'numberwidth'` and `'signcolumn'` decide how wide the left gutter is, and
+    // the CLIENT draws it from the reserved widths the server sends — so it is not
+    // in `t:screen()` (those rows are the text area alone) nor in any other view. A
+    // spec could read the option strings back and nothing else, which says what was
+    // asked for rather than what was reserved.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    feed(&rpc, "ihello<Esc>");
+    feed(&rpc, ":setlocal number numberwidth=8 signcolumn=yes:2<CR>");
+    feed(&rpc, "<Esc>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.number_width").await.as_i64(),
+        Some(8),
+        "the reserved number column"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.sign_width").await.as_i64(),
+        Some(4),
+        "two sign columns of two cells each"
+    );
+
+    // …and they follow the options.
+    feed(&rpc, ":setlocal numberwidth=4<CR>");
+    feed(&rpc, ":setlocal signcolumn=no<CR>");
+    feed(&rpc, "<Esc>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.number_width").await.as_i64(),
+        Some(4),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.sign_width").await.as_i64(),
+        Some(0),
+    );
+
+    // With 'nonumber' the column is not drawn at all. `number_width` still reports
+    // the width it WOULD take, so the mirror also carries whether it is drawn —
+    // which is the half `t:gutter()` folds in.
+    // Both flags draw the column, so both have to go.
+    feed(&rpc, ":setlocal nonumber norelativenumber<CR>");
+    feed(&rpc, "j");
+    feed(&rpc, "k");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.number_shown").await,
+        Value::Boolean(false),
+    );
+    // …and `'relativenumber'` draws it just as `'number'` does.
+    feed(&rpc, ":setlocal relativenumber<CR>");
+    feed(&rpc, "j");
+    feed(&rpc, "k");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.number_shown").await,
+        Value::Boolean(true),
+    );
+}

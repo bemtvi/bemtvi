@@ -339,6 +339,10 @@ impl EditHost {
             let colorcolumn = layer("colorcolumn");
             let line_bg_layer = layer("line_bg");
             let diagnostics_virt_layer = layer("diagnostics_virt");
+            let number_width_v = layer("number_width");
+            let sign_width_v = layer("sign_width");
+            let number_shown = matches!(layer("number"), Value::Boolean(true))
+                || matches!(layer("relativenumber"), Value::Boolean(true));
             // The status line as painted. The global bar (`laststatus=3`) is the whole
             // story when there is one; at every other `'laststatus'` — the default
             // included — it is `Nil` and each window paints its own row, so fall back
@@ -363,6 +367,9 @@ impl EditHost {
                 menu: &menu,
                 line_bg: &line_bg_layer,
                 diagnostics_virt: &diagnostics_virt_layer,
+                number_width: &number_width_v,
+                sign_width: &sign_width_v,
+                number_shown,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

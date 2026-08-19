@@ -500,6 +500,34 @@ function Ctx:highlights(row)
   return rows[row] or {}
 end
 
+-- `t:gutter()` — the focused window's reserved gutter, as
+-- `{ number_width = <cells>, sign_width = <cells>, total = <cells> }`.
+--
+-- The CLIENT draws the number and sign columns from the widths the server
+-- reserves, so the gutter is in none of the row views — `t:screen()` is the text
+-- area alone. Without this a spec could read `'numberwidth'` / `'signcolumn'` back
+-- and nothing more, which reports what was ASKED for rather than what was
+-- reserved: `'numberwidth'` is a minimum that grows to fit the largest line
+-- number, `'signcolumn=auto'` collapses when no sign is placed, and `'nonumber'`
+-- removes the column whatever its width says.
+--
+-- ```lua
+-- t:cmd("set number numberwidth=4 signcolumn=yes:2")
+-- btv.test.expect(t:gutter().total).to_be(8)
+-- ```
+function Ctx:gutter()
+  local ui = btv._ui or {}
+  -- The reserved number width is the width the column takes WHEN drawn; with
+  -- `'nonumber'` and `'norelativenumber'` it is not drawn at all.
+  local number_width = ui.number_shown and (ui.number_width or 0) or 0
+  local sign_width = ui.sign_width or 0
+  return {
+    number_width = number_width,
+    sign_width = sign_width,
+    total = number_width + sign_width,
+  }
+end
+
 -- `t:menu()` — the open float-list menu, or nil when none is up:
 -- `{ items = { "…" }, selected = <1-based index|nil> }`.
 --

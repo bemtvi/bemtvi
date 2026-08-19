@@ -1549,6 +1549,11 @@ pub struct UiMirror<'a> {
     pub line_bg: &'a rmpv::Value,
     /// The end-of-line diagnostic messages over those rows (`t:decor()`).
     pub diagnostics_virt: &'a rmpv::Value,
+    /// The focused window's reserved gutter widths, and whether the number column
+    /// is drawn at all (`t:gutter()`).
+    pub number_width: &'a rmpv::Value,
+    pub sign_width: &'a rmpv::Value,
+    pub number_shown: bool,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3473,6 +3478,9 @@ impl LuaRuntime {
             menu,
             line_bg,
             diagnostics_virt,
+            number_width,
+            sign_width,
+            number_shown,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3527,6 +3535,24 @@ impl LuaRuntime {
             "diagnostics_virt",
             crate::convert::rmpv_to_lua(&self.lua, diagnostics_virt)?,
         )?;
+        // The reserved gutter widths. The CLIENT draws the number and sign columns
+        // from these, so the gutter appears in none of the row views — `screen` is
+        // the text area alone — and a spec could otherwise only read back the option
+        // strings, which say what was ASKED for rather than what was reserved.
+        ui.set(
+            "number_width",
+            crate::convert::rmpv_to_lua(&self.lua, number_width)?,
+        )?;
+        ui.set(
+            "sign_width",
+            crate::convert::rmpv_to_lua(&self.lua, sign_width)?,
+        )?;
+        // `number_width` is the width the column takes WHEN it is drawn; whether it
+        // is drawn is `'number'`/`'relativenumber'`, which the client checks
+        // separately. Carry that too, so `t:gutter()` can answer the question a spec
+        // actually asks — how wide is the gutter — rather than the width of a column
+        // that may not be there.
+        ui.set("number_shown", number_shown)?;
         // The other decoration layers over the same rows — virtual text, virtual
         // lines and gutter signs — which `t:decor()` folds into one per-row answer.
         // None of them is in the buffer text or the painted glyphs either.

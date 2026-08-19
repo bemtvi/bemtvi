@@ -491,6 +491,28 @@ function Ctx:message()
   return ui and ui.message or ""
 end
 
+-- `t:showcmd()` — the `'showcmd'` corner: the partly-typed command as the client
+-- would paint it in the last line's right corner, truncated to vim's 10 columns.
+--
+-- It is the one view that can see a **withheld** key run. A mapped prefix
+-- (`<Space>f` of a `<Space>fs` map) is held by the keymap matcher and never
+-- reaches the editor, so no buffer, cursor or mode state moves while it waits —
+-- the corner is the only place it exists. The editor's own pending run (a count,
+-- an armed register, an operator waiting for its motion, a Visual selection's
+-- size) shows here too.
+--
+-- ```lua
+-- t:feed("2d")
+-- btv.test.expect(t:showcmd()).to_be("2d")
+-- ```
+--
+-- Empty when nothing is pending — and always empty with `'showcmd'` off, which is
+-- what the option means.
+function Ctx:showcmd()
+  local ui = btv._ui
+  return (ui and ui.showcmd) or ""
+end
+
 -- t:statusline() — the rendered status line text, when the mirror carries it.
 function Ctx:statusline()
   local ui = btv._ui

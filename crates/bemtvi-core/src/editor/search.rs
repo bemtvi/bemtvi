@@ -166,6 +166,20 @@ impl Editor {
         self.run_search(&pattern, dir, offset, count, op);
     }
 
+    /// Arm `pattern` as the last search pattern from outside the keyboard — the
+    /// `setreg('/', …)` / `@/` write. Forward, no offset, exactly as a typed `/`
+    /// leaves it, so `n` repeats it and `'hlsearch'` paints it; an empty pattern
+    /// clears it. Unlike a typed search it records **no** history entry (vim's `@/`
+    /// write does not either) and moves no cursor.
+    pub fn set_search_pattern(&mut self, pattern: &str) {
+        self.last_search = if pattern.is_empty() {
+            None
+        } else {
+            Some((pattern.to_string(), SearchDir::Forward, SearchOffset::None))
+        };
+        self.search_active = !pattern.is_empty();
+    }
+
     /// Record a submitted pattern in the search history, skipping a consecutive
     /// duplicate (vim collapses repeats), then trim to the `'history'` cap.
     fn remember_search(&mut self, pattern: &str) {

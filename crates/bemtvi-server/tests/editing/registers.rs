@@ -547,3 +547,46 @@ async fn dot_repeats_a_visual_put_with_the_register_as_it_now_stands() {
     // The yank register still holds the original, which is how you repeat properly.
     assert_eq!(reg(&rpc, "0").await, "one");
 }
+
+/// `setreg('/', pat)` sets the **last search pattern**, the way neovim's `@/` write
+/// does — so `n` repeats it and `'hlsearch'` paints it. It used to be refused
+/// outright (`E354`) on the grounds that the search register projects from live
+/// state; it does not, it *is* stored state, and refusing it left a config with no
+/// way to arm a search at all.
+#[tokio::test]
+async fn setreg_on_the_search_register_arms_the_pattern() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<CR>needle here<CR>gamma<Esc>");
+    exec_lua(&rpc, r#"vim.fn.setreg('/', 'needle')"#).await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getreg('/')").await.as_str(),
+        Some("needle"),
+        "the pattern reads back"
+    );
+    // `n` repeats it — no `/` was ever typed.
+    feed(&rpc, "gg");
+    feed(&rpc, "n");
+    assert_eq!(cursor(&rpc).await.0, 2, "`n` found the armed pattern");
+    // Writing an empty pattern clears it: `n` then has nothing to repeat.
+    exec_lua(&rpc, r#"vim.fn.setreg('/', '')"#).await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getreg('/')").await.as_str(),
+        Some("")
+    );
+}
+
+/// The other read-only specials are still refused loud — the search register is the
+/// one that turned out to be plain stored state.
+#[tokio::test]
+async fn setreg_still_refuses_the_projected_specials() {
+    let (rpc, _incoming) = start(None).await;
+    for name in ['.', '%', ':', '=', '#'] {
+        let got = exec_lua(
+            &rpc,
+            &format!("return select(2, pcall(vim.fn.setreg, '{name}', 'x'))"),
+        )
+        .await;
+        let msg = got.as_str().unwrap_or_default().to_string();
+        assert!(msg.contains("E354"), "`{name}` still refused, got {msg:?}");
+    }
+}

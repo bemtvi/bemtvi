@@ -494,3 +494,53 @@ async fn ui_mirror_carries_the_per_region_tablines() {
         "…and the main area still has one"
     );
 }
+
+/// The `'showcmd'` corner is mirrored, so a spec can see a key run that has not
+/// reached the editor. A mapped prefix is *withheld* by the keymap matcher: no
+/// buffer, cursor or mode state moves while it waits, and the corner is the only
+/// place it exists at all.
+#[tokio::test]
+async fn ui_mirror_carries_the_showcmd_corner() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    feed(&rpc, "ione<CR>two<CR>three<Esc>");
+
+    // The editor's own pending run: a count and an operator awaiting its motion.
+    feed(&rpc, "2d");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.showcmd").await.as_str(),
+        Some("2d"),
+        "the partly-typed command"
+    );
+    feed(&rpc, "<Esc>");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.showcmd").await.as_str(),
+        Some(""),
+        "cleared once nothing is pending"
+    );
+
+    // A withheld mapped prefix — the half of the corner only the matcher knows.
+    exec_lua(&rpc, r#"btv.keymap.set("n", "<Space>fs", function() end)"#).await;
+    feed(&rpc, "<Space>f");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.showcmd").await.as_str(),
+        Some("<Space>f"),
+        "the mapped prefix the editor never saw"
+    );
+    feed(&rpc, "<Esc>");
+
+    // …and with the option off the corner is empty whatever is pending.
+    feed(&rpc, ":set noshowcmd<CR>");
+    feed(&rpc, "2d");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.showcmd").await.as_str(),
+        Some(""),
+        "'noshowcmd' paints nothing"
+    );
+}

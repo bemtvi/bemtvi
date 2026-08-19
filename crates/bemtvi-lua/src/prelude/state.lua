@@ -2162,13 +2162,15 @@ function btv.env.set(name, value)
 end
 vim.fn.setenv = btv.env.set
 
--- The read-only special registers `vim.fn.setreg` refuses to write: search `/`,
--- last-insert `.`, filename `%`, last-command `:`, expression `=`, alternate `#`.
--- bemtvi can't honor a write to these (their value projects from live editor
--- state), so it errors loud rather than storing a cell that the read path would
--- silently shadow.
+-- The read-only special registers `vim.fn.setreg` refuses to write: last-insert
+-- `.`, filename `%`, last-command `:`, expression `=`, alternate `#`. bemtvi can't
+-- honor a write to these (their value projects from live editor state), so it
+-- errors loud rather than storing a cell that the read path would silently shadow.
+--
+-- The search register `/` is NOT among them: it is plain stored state (the editor's
+-- last search pattern), so a write arms it exactly as neovim's `@/` does — `n`
+-- repeats it and `'hlsearch'` paints it.
 local SETREG_READONLY = {
-  ["/"] = true,
   ["."] = true,
   ["%"] = true,
   [":"] = true,

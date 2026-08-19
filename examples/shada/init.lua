@@ -21,14 +21,15 @@
 -- (Delete /tmp/bemtvi-shada-demo to start fresh.)
 --
 -- What to do in the FIRST session:
---   :SeedShada     stash a register, set global mark A, push a search
+--   :SeedShada     stash a register, set global mark A, arm a search pattern
 --   <space>w       :wshada — flush the store NOW (or just :qa, which flushes too)
 --   :qa            quit
 --
 -- What to do in the SECOND session:
 --   "ap            paste register "a from last session
 --   `A             jump to the global mark you set last session
---   /<Up><CR>      recall last session's search pattern
+--   n              repeat last session's search pattern (`/<Up><CR>` recalls the
+--                  history of patterns you TYPED; this one was armed from Lua)
 --   :rshada        re-read the store mid-session (picks up a sibling that exited)
 
 -- :SeedShada — populate a handful of cross-session slots in one go, then tell
@@ -39,7 +40,8 @@ vim.api.nvim_create_user_command("SeedShada", function()
   vim.fn.setreg("a", "hello from the previous session")
   -- A global file mark on the current line — `A jumps back to it next launch.
   vim.cmd("normal! mA")
-  -- A search, which pushes the / history that <Up> recalls next launch.
+  -- The search register: `setreg("/", …)` arms the last search pattern (neovim's
+  -- `@/`), so `n` repeats it — here, and again next launch.
   vim.fn.setreg("/", "needle")
   print('seeded: "a, global mark A (this line), and the / search "needle" — '
     .. "now :wshada (or :qa) and relaunch")

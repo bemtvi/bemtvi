@@ -1563,6 +1563,9 @@ pub struct UiMirror<'a> {
     /// The per-region tablines — main plus each dock, each with its own tabs and
     /// current index (`t:tabs()`).
     pub region_tabs: &'a rmpv::Value,
+    /// The `'showcmd'` corner — the partly-typed command, already truncated to
+    /// vim's 10 columns (`t:showcmd()`).
+    pub showcmd: &'a str,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3494,6 +3497,7 @@ impl LuaRuntime {
             leftcol,
             numbers,
             region_tabs,
+            showcmd,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3534,6 +3538,16 @@ impl LuaRuntime {
         // float — so without this a suite for any of them could only assert on what
         // happened after an accept, never on what was offered.
         ui.set("menu", crate::convert::rmpv_to_lua(&self.lua, menu)?)?;
+        // The `'showcmd'` corner. The client paints it from its own key in the
+        // redraw map, not from any window row, so it is in none of the views above —
+        // and it is the only place a *withheld* mapped prefix is visible at all
+        // (those keys never reach the editor, so no buffer/cursor state moves).
+        ui.set("showcmd", showcmd)?;
+        // The fourth decoration payload: the full-width row tint a `line_hl_group`
+        // lays down. It rides its own wire layer rather than the highlight spans, so
+        // it was the one payload of the shared extmark vocabulary a spec could not
+        // see at all. Folded into `t:decor()` as a per-row flag — the wire carries a
+        // per-frame palette id, not a group name, exactly as for `virt_text`.
         // The full-width row tint a `line_hl_group` lays down. It rides its own wire
         // layer rather than the highlight spans, so it was the one payload of the
         // shared extmark vocabulary a spec could not see at all. Folded into

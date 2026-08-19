@@ -382,6 +382,7 @@ impl EditHost {
                 leftcol: &leftcol_v,
                 numbers: &numbers_v,
                 region_tabs: &region_tablines,
+                showcmd: &showcmd,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

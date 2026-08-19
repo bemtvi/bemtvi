@@ -1456,6 +1456,13 @@ impl Editor {
     /// `append`, so this is the mechanical store (the black hole `'_'` discards
     /// inside [`Registers::set_api`]).
     pub fn set_register_api(&mut self, name: char, text: String, linewise: bool, append: bool) {
+        // The search register is not a register cell at all — it *is* the editor's
+        // last search pattern, so a write arms that (neovim's `@/`), and a read
+        // projects back out of it.
+        if name == '/' {
+            self.set_search_pattern(&text);
+            return;
+        }
         let kind = if linewise {
             RegKind::Line
         } else {

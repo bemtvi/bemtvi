@@ -556,16 +556,20 @@ local VIRT_POS =
   { [0] = "eol", [1] = "inline", [2] = "overlay", [3] = "right_align", [4] = "win_col" }
 
 -- `t:decor([row])` — the decoration drawn *beside* the focused window's rows:
--- virtual text, virtual lines and gutter signs. A list of
--- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, virt_lines = "…", sign = "▶" }`
--- per row (1-based *screen* rows, matching `t:screen()`); with `row`, just that
--- row's.
+-- virtual text, virtual lines, gutter signs, the full-width row tint, and the
+-- end-of-line diagnostic message. A list of
+-- `{ virt_text = "…", virt_pos = "eol", virt_col = 0, virt_lines = "…", sign = "▶",
+-- line_bg = true, diagnostic = "…", severity = 1 }` per row (1-based *screen* rows,
+-- matching `t:screen()`); with `row`, just that row's. Each key is absent on a row
+-- that carries nothing of that kind.
 --
 -- The companion of `t:highlights()`, and the split is what each layer *is*: a
 -- highlight colours the buffer's own cells, while these draw glyphs that are not in
--- the buffer at all — a `btv.decor.expr` badge or sign, a provider's inline blame,
--- an LSP inlay hint or diagnostic. `t:screen()` cannot see them either: it is the
--- buffer's rows as painted, and virtual text rides its own layer beside them.
+-- the buffer at all — a `btv.decor.expr` badge or sign, a provider's inline blame, a
+-- diagnostic's message. `t:screen()` cannot see them either: it is the buffer's rows
+-- as painted, and each of these rides its own layer beside them. (Which is also why
+-- `diagnostic` is its own key rather than part of `virt_text`: they are separate
+-- layers on the wire, and one row can carry both.)
 --
 -- ```lua
 -- btv.decor.expr([[ return { { 1, 1, "Todo", virt_text = " <- here", sign_text = ">>" } } ]])
@@ -594,7 +598,12 @@ function Ctx:decor(row)
     tinted[tinted_row] = true
     last_bg = math.max(last_bg, tinted_row)
   end
-  local rows, n = {}, math.max(#virt, #signs, #lines, last_bg)
+  -- The diagnostic layer is one entry PER ROW with holes for clean rows, so `#`
+  -- on it is unreliable (it stops at the first gap); the painted-row count is the
+  -- honest bound.
+  local diags = (ui and ui.diagnostics_virt) or {}
+  local rows, n =
+    {}, math.max(#virt, #signs, #lines, last_bg, #((ui and ui.screen) or {}))
   for i = 1, n do
     local out = {}
     local places = virt[i]
@@ -624,6 +633,13 @@ function Ctx:decor(row)
       out.sign = sign[1]
     end
     out.line_bg = tinted[i] or nil
+    -- The end-of-line diagnostic message, on its own layer beside the extmark
+    -- virtual text (a row can carry both, from different sources).
+    local diag = diags[i]
+    if type(diag) == "table" then
+      out.diagnostic = diag[1]
+      out.severity = diag[2]
+    end
     rows[i] = out
   end
   if row == nil then

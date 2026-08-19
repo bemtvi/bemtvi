@@ -250,3 +250,44 @@ async fn ui_mirror_carries_the_line_background_layer() {
         "only the row carrying the line_hl_group is tinted (1-based screen rows)"
     );
 }
+
+#[tokio::test]
+async fn ui_mirror_carries_the_diagnostic_inline_messages() {
+    // The end-of-line diagnostic message rides its OWN wire layer, not the extmark
+    // `virt_text` one — so `t:decor().virt_text` could not see it even though the
+    // signs beside it were already mirrored. A suite for diagnostic rendering could
+    // check the gutter letter and nothing else.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    feed(&rpc, "ione<CR>two<CR>three<Esc>");
+    exec_lua(
+        &rpc,
+        r#"btv.diagnostic.config({ signs = true, virtual_text = true })
+           local ns = btv.ns.create("spec-diags")
+           btv.diagnostic.set(ns, 0, {
+             { lnum = 1, col = 0, message = "a warning here", severity = btv.diagnostic.severity.WARN },
+           })"#,
+    )
+    .await;
+    let _ = lines(&rpc).await;
+
+    let text = exec_lua(
+        &rpc,
+        "return tostring((btv._ui.diagnostics_virt or {})[2] and btv._ui.diagnostics_virt[2][1])",
+    )
+    .await;
+    assert!(
+        text.as_str().unwrap_or_default().contains("a warning here"),
+        "the inline diagnostic message must reach the mirror, got {text:?}"
+    );
+    // …and a clean row carries nothing.
+    let clean = exec_lua(&rpc, "return type((btv._ui.diagnostics_virt or {})[1])").await;
+    assert_eq!(
+        clean.as_str(),
+        Some("nil"),
+        "a row with no diagnostic has no inline message"
+    );
+}

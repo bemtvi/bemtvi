@@ -1537,6 +1537,14 @@ impl Editor {
             };
             let chunk = text.repeat(count);
             self.buffer_mut().insert(at, &chunk);
+            // `'[` / `']` bracket what was just PUT, so `` `[ `` jumps to the paste
+            // and `` v`] `` selects it. Recorded AFTER the insert (unlike the operator
+            // path, which records before so the edit collapses them): here the marks
+            // belong to text that only exists once the insert has landed. The trailing
+            // newline is excluded so `']` is the last real character of the last pasted
+            // line rather than the line break after it.
+            let pasted_end = at + chunk.len();
+            self.record_change_bounds(at, pasted_end.saturating_sub(1).max(at + 1));
             self.buffer_mut().normalize();
             self.cursor.line = if after {
                 self.cursor.line + 1
@@ -1562,6 +1570,9 @@ impl Editor {
             let last_len = chunk.len() - unicode::prev_grapheme(&chunk, chunk.len());
             let end = at + chunk.len();
             self.buffer_mut().insert(at, &chunk);
+            // The charwise half of the same rule: `'[` on the first pasted character,
+            // `']` on the last.
+            self.record_change_bounds(at, end);
             self.set_cursor_char(end.saturating_sub(last_len));
         }
         self.buffer_mut().normalize();

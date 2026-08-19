@@ -1547,6 +1547,8 @@ pub struct UiMirror<'a> {
     /// The full-width row tints (`line_hl_group`) over the focused window's rows
     /// (`t:decor()`).
     pub line_bg: &'a rmpv::Value,
+    /// The end-of-line diagnostic messages over those rows (`t:decor()`).
+    pub diagnostics_virt: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3470,6 +3472,7 @@ impl LuaRuntime {
             colorcolumn,
             menu,
             line_bg,
+            diagnostics_virt,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3516,6 +3519,14 @@ impl LuaRuntime {
         // `t:decor()` as a per-row flag — the wire carries a per-frame palette id,
         // not a group name, exactly as for `virt_text`.
         ui.set("line_bg", crate::convert::rmpv_to_lua(&self.lua, line_bg)?)?;
+        // The end-of-line diagnostic message. It rides its own wire layer rather
+        // than the extmark `virt_text` one, so the signs beside it were mirrored
+        // while the message itself was not — leaving a diagnostic-rendering suite
+        // able to check the gutter letter and nothing else.
+        ui.set(
+            "diagnostics_virt",
+            crate::convert::rmpv_to_lua(&self.lua, diagnostics_virt)?,
+        )?;
         // The other decoration layers over the same rows — virtual text, virtual
         // lines and gutter signs — which `t:decor()` folds into one per-row answer.
         // None of them is in the buffer text or the painted glyphs either.

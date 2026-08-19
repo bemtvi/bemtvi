@@ -5,8 +5,9 @@
 --
 --   ]d / [d   jump to the next / previous diagnostic (any severity)
 --   ]e / [e   jump to the next / previous ERROR (severity = ERROR only)
---   <C-w>d    show the diagnostics under the cursor in a float
---             (<C-w><C-d> is the same)
+--   <C-w>d    show the diagnostics on the cursor's LINE in full, in a read-only
+--             listing (<C-w><C-d> is the same). Line-scoped, so you need not be
+--             sitting on the flagged span itself.
 --
 -- `]d`/`[d` and `]e`/`[e` are prelude default keymaps over `btv.diagnostic.goto_*`;
 -- `<C-w>d` rides the native `<C-w>` window grammar. Being defaults, any of them can
@@ -23,8 +24,8 @@
 --       cargo run -p bemtvi -- examples/diagnostic-nav/sample.txt
 --
 -- Then press `]d` a few times to walk the diagnostics (it wraps at the end), `]e`
--- to stop only on the errors, and `<C-w>d` while sitting on a flagged line to read
--- the full message in a float.
+-- to stop only on the errors, and `<C-w>d` while sitting anywhere on a flagged line
+-- to read the full message.
 
 --------------------------------------------------------------------------------
 -- Show the signs + inline messages so the seeded diagnostics are visible.

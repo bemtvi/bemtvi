@@ -862,7 +862,8 @@ impl EditHost {
     /// virtual text truncates to one line. Diagnostics are sorted by severity then
     /// start column; each is formatted as `E  source: message [code]`, its message
     /// split across as many panel rows as it has lines. A loud no-op (an echoed
-    /// message, no panel) when the cursor's line has no diagnostics.
+    /// message, no panel) when the cursor's line has no diagnostics — the scope is
+    /// the LINE, so the cursor need not sit on the flagged span itself.
     pub(crate) fn diagnostics_open_float(&mut self) {
         // The cursor line's diagnostics: those *starting* on it (neovim's `lnum`
         // scope), matching the virt-text / sign surfaces. Collected and sorted
@@ -880,7 +881,10 @@ impl EditHost {
             .flat_map(|t| diagnostic_float_lines(t.d))
             .collect::<Vec<_>>();
         if lines.is_empty() {
-            self.editor.echo("No diagnostics under cursor");
+            // Line-scoped, as neovim's `lnum` scope is and as the sign / virt-text
+            // surfaces beside it are — so say so. "under cursor" read as though the
+            // cursor had to sit on the flagged span itself.
+            self.editor.echo("No diagnostics on this line");
             return;
         }
         self.editor.open_scratch_listing("[Diagnostics]", lines, 0);

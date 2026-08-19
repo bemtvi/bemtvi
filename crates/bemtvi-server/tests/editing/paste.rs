@@ -268,3 +268,57 @@ async fn dot_repeat_of_a_fallback_mode_paste_also_replays_it_verbatim() {
         vec!["if x {", "    bodif x {", "    body"],
     );
 }
+
+#[tokio::test]
+async fn put_sets_the_change_marks_to_the_pasted_text() {
+    // `p` / `P` must leave `'[` and `']` bracketing what was just PUT — that is what
+    // makes `` `[ `` jump to the paste and `` v`] `` select it, and what `gp`-style
+    // workflows and plugins reading the change span rely on. They were never
+    // touched by the put at all: the marks left over from the yank stayed, and an
+    // insertion above them merely shifted them down, so `` `[ `` after `yyP` landed
+    // on the ORIGINAL line rather than the pasted copy.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<CR>four<Esc>");
+
+    // Linewise `P` pastes above: the copy is line 3, the original moves to 4.
+    feed(&rpc, "3GyyP");
+    assert_eq!(cursor(&rpc).await, (3, 0), "P lands on the pasted line");
+    feed(&rpc, "G`[");
+    assert_eq!(cursor(&rpc).await.0, 3, "`[ is the first pasted line");
+    feed(&rpc, "G`]");
+    assert_eq!(cursor(&rpc).await.0, 3, "`] is the last pasted line");
+
+    // Linewise `p` pastes below: the copy is the line after the cursor.
+    feed(&rpc, "u");
+    feed(&rpc, "3Gyyp");
+    feed(&rpc, "gg`[");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "`[ is the pasted line, not the source"
+    );
+
+    // A multi-line register brackets the whole run.
+    feed(&rpc, "u");
+    feed(&rpc, "1Gy2j");
+    feed(&rpc, "Gp");
+    feed(&rpc, "gg`[");
+    assert_eq!(cursor(&rpc).await.0, 5, "`[ is the first pasted line");
+    feed(&rpc, "gg`]");
+    assert_eq!(cursor(&rpc).await.0, 7, "`] is the last pasted line");
+}
+
+#[tokio::test]
+async fn charwise_put_sets_the_change_marks_across_the_pasted_span() {
+    // The charwise half: `'[` on the first pasted character, `']` on the last.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iabc def<Esc>");
+    // Yank `abc`, then put it after the `f` at the end of the line.
+    feed(&rpc, "0yiw");
+    feed(&rpc, "$p");
+    assert_eq!(lines(&rpc).await, vec!["abc defabc"]);
+    feed(&rpc, "0`[");
+    assert_eq!(cursor(&rpc).await, (1, 7), "`[ is the first pasted char");
+    feed(&rpc, "0`]");
+    assert_eq!(cursor(&rpc).await, (1, 9), "`] is the last pasted char");
+}

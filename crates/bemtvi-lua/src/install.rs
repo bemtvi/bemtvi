@@ -23,10 +23,10 @@ use crate::ops::{
     BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorInvalidate, DecorMark,
     DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GitJob, GlobalOptionOp,
     HlSet, HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, MouseOp, NamedListOp, PanelOp,
-    PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq,
-    SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget,
-    TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
+    PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, Sequenced,
+    SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
+    StatuslineTarget, TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq,
+    UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -446,7 +446,9 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     // `silent` / `emsg_silent`.
     let sh = shared.clone();
     let cmd = lua.create_function(move |_, (cmd, opts): (String, Option<mlua::Table>)| {
-        sh.borrow_mut().commands.push(cmd_with_mods(cmd, opts)?);
+        sh.borrow_mut()
+            .sequenced
+            .push(Sequenced::Command(cmd_with_mods(cmd, opts)?));
         Ok(())
     })?;
     btv.set("cmd", cmd.clone())?;
@@ -4149,7 +4151,7 @@ pub(crate) fn install_runtime_api(
                 };
                 // Default action is `' '` (new list); a non-empty arg's first char.
                 let action = action.and_then(|a| a.chars().next()).unwrap_or(' ');
-                sh.borrow_mut().qf_ops.push(QfSetOp {
+                sh.borrow_mut().sequenced.push(Sequenced::QfSet(QfSetOp {
                     items,
                     lines,
                     efm,
@@ -4160,7 +4162,7 @@ pub(crate) fn install_runtime_api(
                     loclist_win,
                     send: false,
                     named,
-                });
+                }));
                 Ok(())
             },
         )?,
@@ -4185,7 +4187,7 @@ pub(crate) fn install_runtime_api(
                 bool,
                 Option<u64>,
             )| {
-                sh.borrow_mut().qf_ops.push(QfSetOp {
+                sh.borrow_mut().sequenced.push(Sequenced::QfSet(QfSetOp {
                     items: None,
                     lines: Some(lines),
                     efm: Some(efm),
@@ -4196,7 +4198,7 @@ pub(crate) fn install_runtime_api(
                     loclist_win,
                     send: false,
                     named: None,
-                });
+                }));
                 Ok(())
             },
         )?,
@@ -4225,7 +4227,7 @@ pub(crate) fn install_runtime_api(
                     out.push(qf_item_from_table(&pair?)?);
                 }
                 let action = action.and_then(|a| a.chars().next()).unwrap_or(' ');
-                sh.borrow_mut().qf_ops.push(QfSetOp {
+                sh.borrow_mut().sequenced.push(Sequenced::QfSet(QfSetOp {
                     items: Some(out),
                     lines: None,
                     efm: None,
@@ -4236,7 +4238,7 @@ pub(crate) fn install_runtime_api(
                     loclist_win: if to_qf { None } else { Some(0) },
                     send: true,
                     named: None,
-                });
+                }));
                 Ok(())
             },
         )?,
@@ -4251,7 +4253,9 @@ pub(crate) fn install_runtime_api(
     btv.set(
         "_named_list_show",
         lua.create_function(move |_, name: String| {
-            sh.borrow_mut().named_list_ops.push(NamedListOp::Show(name));
+            sh.borrow_mut()
+                .sequenced
+                .push(Sequenced::NamedList(NamedListOp::Show(name)));
             Ok(())
         })?,
     )?;
@@ -4259,7 +4263,9 @@ pub(crate) fn install_runtime_api(
     btv.set(
         "_named_list_drop",
         lua.create_function(move |_, name: String| {
-            sh.borrow_mut().named_list_ops.push(NamedListOp::Drop(name));
+            sh.borrow_mut()
+                .sequenced
+                .push(Sequenced::NamedList(NamedListOp::Drop(name)));
             Ok(())
         })?,
     )?;

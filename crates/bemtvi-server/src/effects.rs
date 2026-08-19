@@ -15,8 +15,9 @@ use bemtvi_lua::FsJob;
 use bemtvi_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorInvalidate, DecorPublish, DockOp,
     ExtmarkMirror, ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp,
-    LinesDelta, LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, StatuslineKind,
-    StatuslineTarget, TabMirror, TabOp, TsOp, ViewOp, VirtDecorData, WindowMirror, WindowOp,
+    LinesDelta, LoopOp, NamedListOp, OptionValue, PanelOp, QfItem, QfMirror, Sequenced,
+    StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, ViewOp, VirtDecorData, WindowMirror,
+    WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -577,8 +578,37 @@ impl EditHost {
         for hl in self.lua.take_highlights() {
             self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
         }
-        for cmd in self.lua.take_commands() {
-            self.editor.command(&cmd);
+        // The two quickfix sandbox surfaces, drained **before** the list writes
+        // below: both configure how those writes are parsed and rendered, so a
+        // single chunk that installs one and then populates a list has to see its
+        // own setting applied — `btv.qf.parse(…)` followed by `setqflist{lines=…}`
+        // is the natural way to write it, and would otherwise parse with
+        // `'errorformat'` this once.
+        //
+        // `btv.qf.parse(src|nil)` stands in for `'errorformat'` while installed;
+        // `btv.qf.text(src|nil)` re-renders every open list as it is installed, so
+        // the change is visible without waiting for a list to change.
+        if let Some(src) = self.lua.take_qf_parse() {
+            self.editor.set_qf_parse(src);
+        }
+        if let Some(src) = self.lua.take_qf_text() {
+            self.editor.set_qf_text(src);
+        }
+        // The program-ordered queue: the `vim.cmd` ex-commands, the `setqflist` /
+        // `setloclist` writes, and the named-list show/drop ops, replayed in the order
+        // the chunk wrote them. They share one queue because their relative order is
+        // load-bearing in both directions — a chunk that fills a list and *then* opens
+        // it (`vim.fn.setloclist(0, …)` then `vim.cmd("lopen")`) needs the write first,
+        // and one that closes a window and *then* re-shows a named list needs the
+        // command first. Drained as separate buckets, one of the two always ran
+        // backwards.
+        for effect in self.lua.take_sequenced() {
+            match effect {
+                Sequenced::Command(cmd) => self.editor.command(&cmd),
+                Sequenced::QfSet(op) => self.apply_qf_set_op(op),
+                Sequenced::NamedList(NamedListOp::Show(name)) => self.editor.named_list_show(&name),
+                Sequenced::NamedList(NamedListOp::Drop(name)) => self.editor.named_list_drop(&name),
+            }
         }
         // `btv._cmdline_set_arg(path)`: the file picker confirm pasting a chosen path
         // into the still-open command line's argument token (no execute — the user
@@ -970,110 +1000,6 @@ impl EditHost {
         // editor's clipboard provider as if an external app set `"+` / `"*`.
         for (text, linewise) in self.lua.take_clipboard_seeds() {
             self.editor.clipboard_seed(&text, linewise);
-        }
-        // The two quickfix sandbox surfaces, drained **before** the list writes
-        // below: both configure how those writes are parsed and rendered, so a
-        // single chunk that installs one and then populates a list has to see its
-        // own setting applied — `btv.qf.parse(…)` followed by `setqflist{lines=…}`
-        // is the natural way to write it, and would otherwise parse with
-        // `'errorformat'` this once.
-        //
-        // `btv.qf.parse(src|nil)` stands in for `'errorformat'` while installed;
-        // `btv.qf.text(src|nil)` re-renders every open list as it is installed, so
-        // the change is visible without waiting for a list to change.
-        if let Some(src) = self.lua.take_qf_parse() {
-            self.editor.set_qf_parse(src);
-        }
-        if let Some(src) = self.lua.take_qf_text() {
-            self.editor.set_qf_text(src);
-        }
-        // `setqflist` writes: structured items, or raw lines parsed against `efm`
-        // (the editor's `'errorformat'` when the op omits one). A malformed efm
-        // fails loud on the message line rather than silently dropping the call.
-        for op in self.lua.take_qf_ops() {
-            // "Send/add these results to a list" (`btv.qf.{send,add}_to_{loc,qf}list`):
-            // route the structured items through `list_send`, which honors `'qfdock'`
-            // (a dock tab vs a split). `loclist_win == None` targets the global
-            // quickfix list, `Some(_)` a location list; the action char picks
-            // send (new) vs add (append). Distinct from the `which`-targeted writes.
-            if op.send {
-                let items = op.items.unwrap_or_default();
-                let entries = items.into_iter().map(qf_entry_from_item).collect();
-                let action = if op.action == 'a' {
-                    QfAction::Add
-                } else {
-                    QfAction::New
-                };
-                let to_qf = op.loclist_win.is_none();
-                self.editor
-                    .list_send(entries, op.title.unwrap_or_default(), action, to_qf);
-                continue;
-            }
-            let action = match op.action {
-                'a' => QfAction::Add,
-                'r' => QfAction::Replace,
-                _ => QfAction::New,
-            };
-            // A named target (`btv.qf.list(name, …)`) takes precedence over the
-            // quickfix / loclist routing: intern the name to its id and write that
-            // window-independent list. Otherwise: quickfix list (`loclist_win == None`)
-            // vs a window's location list. A `Some(0)` targets the current window
-            // (vim's `winnr` 0); any other id is a window handle. Drop the op on a
-            // stale window id rather than silently writing the quickfix list.
-            let which = if let Some(name) = &op.named {
-                Some(QfWhich::Named(self.editor.named_list_id(name)))
-            } else {
-                match op.loclist_win {
-                    None => Some(QfWhich::Quickfix),
-                    Some(0) => Some(QfWhich::Location(self.editor.current_window_id())),
-                    Some(id) => {
-                        let win = WindowId(id);
-                        if self.editor.window_ids().contains(&win) {
-                            Some(QfWhich::Location(win))
-                        } else {
-                            self.editor
-                                .echo(format!("E957: Invalid window number {id}"));
-                            None
-                        }
-                    }
-                }
-            };
-            let Some(which) = which else { continue };
-            let mut ok = true;
-            if let Some(items) = op.items {
-                let entries = items.into_iter().map(qf_entry_from_item).collect();
-                self.editor.qf_set_items(which, entries, action, op.title);
-            } else if let Some(lines) = op.lines {
-                let efm = op
-                    .efm
-                    .unwrap_or_else(|| self.editor.global_options().errorformat);
-                if let Err(e) = self
-                    .editor
-                    .qf_set_from_lines(which, &lines, &efm, action, op.title)
-                {
-                    self.editor.echo(e);
-                    ok = false;
-                }
-            } else {
-                // Neither items nor lines: an explicit clear.
-                self.editor
-                    .qf_set_items(which, Vec::new(), action, op.title);
-            }
-            // The `:make`/`:grep` post-populate behavior: open the window iff there
-            // are entries, then jump to the first valid one. Skipped when the parse
-            // failed (the list is unchanged).
-            if ok && (op.open || op.goto_first) {
-                self.editor.qf_post_populate(which, op.open, op.goto_first);
-            }
-        }
-        // Named-list lifecycle ops, drained *after* the `QfSetOp`s above so a
-        // `btv.qf.show` observes the refresh queued just before it (server-sequenced,
-        // no `set_current` + `on_next_tick` dance).
-        for op in self.lua.take_named_list_ops() {
-            match op {
-                NamedListOp::Show(name) => self.editor.named_list_show(&name),
-                NamedListOp::Drop(name) => self.editor.named_list_drop(&name),
-            }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
         // labelled text prompt and remember which callback awaits the result. Only
@@ -2943,6 +2869,87 @@ impl EditHost {
                 let items = qf_mirror_items(ll);
                 let _ = self.lua.set_loclist_mirror(win.0, &items, &ll.title);
             }
+        }
+    }
+
+    /// Apply one `setqflist` / `setloclist` write: structured items, or raw output
+    /// lines parsed against `efm` (the editor's `'errorformat'` when the op omits
+    /// one). A malformed efm fails loud on the message line rather than silently
+    /// dropping the call.
+    fn apply_qf_set_op(&mut self, op: bemtvi_lua::QfSetOp) {
+        // "Send/add these results to a list" (`btv.qf.{send,add}_to_{loc,qf}list`):
+        // route the structured items through `list_send`, which honors `'qfdock'`
+        // (a dock tab vs a split). `loclist_win == None` targets the global
+        // quickfix list, `Some(_)` a location list; the action char picks
+        // send (new) vs add (append). Distinct from the `which`-targeted writes.
+        if op.send {
+            let items = op.items.unwrap_or_default();
+            let entries = items.into_iter().map(qf_entry_from_item).collect();
+            let action = if op.action == 'a' {
+                QfAction::Add
+            } else {
+                QfAction::New
+            };
+            let to_qf = op.loclist_win.is_none();
+            self.editor
+                .list_send(entries, op.title.unwrap_or_default(), action, to_qf);
+            return;
+        }
+        let action = match op.action {
+            'a' => QfAction::Add,
+            'r' => QfAction::Replace,
+            _ => QfAction::New,
+        };
+        // A named target (`btv.qf.list(name, …)`) takes precedence over the
+        // quickfix / loclist routing: intern the name to its id and write that
+        // window-independent list. Otherwise: quickfix list (`loclist_win == None`)
+        // vs a window's location list. A `Some(0)` targets the current window
+        // (vim's `winnr` 0); any other id is a window handle. Drop the op on a
+        // stale window id rather than silently writing the quickfix list.
+        let which = if let Some(name) = &op.named {
+            Some(QfWhich::Named(self.editor.named_list_id(name)))
+        } else {
+            match op.loclist_win {
+                None => Some(QfWhich::Quickfix),
+                Some(0) => Some(QfWhich::Location(self.editor.current_window_id())),
+                Some(id) => {
+                    let win = WindowId(id);
+                    if self.editor.window_ids().contains(&win) {
+                        Some(QfWhich::Location(win))
+                    } else {
+                        self.editor
+                            .echo(format!("E957: Invalid window number {id}"));
+                        None
+                    }
+                }
+            }
+        };
+        let Some(which) = which else { return };
+        let mut ok = true;
+        if let Some(items) = op.items {
+            let entries = items.into_iter().map(qf_entry_from_item).collect();
+            self.editor.qf_set_items(which, entries, action, op.title);
+        } else if let Some(lines) = op.lines {
+            let efm = op
+                .efm
+                .unwrap_or_else(|| self.editor.global_options().errorformat);
+            if let Err(e) = self
+                .editor
+                .qf_set_from_lines(which, &lines, &efm, action, op.title)
+            {
+                self.editor.echo(e);
+                ok = false;
+            }
+        } else {
+            // Neither items nor lines: an explicit clear.
+            self.editor
+                .qf_set_items(which, Vec::new(), action, op.title);
+        }
+        // The `:make`/`:grep` post-populate behavior: open the window iff there
+        // are entries, then jump to the first valid one. Skipped when the parse
+        // failed (the list is unchanged).
+        if ok && (op.open || op.goto_first) {
+            self.editor.qf_post_populate(which, op.open, op.goto_first);
         }
     }
 

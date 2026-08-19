@@ -1492,10 +1492,15 @@ async fn named_list_survives_closing_the_window_it_was_shown_from() {
     // Close the window the list was shown from, then re-show by name. A loclist would
     // have died with its owner window; the named list lives on the editor, so it
     // survives and re-renders its entry.
+    //
+    // The focus move is its own chunk: `btv.win.set_current` queues a window op, which
+    // drains in its own bucket, while `vim.cmd`/`btv.qf.show` share the program-ordered
+    // queue — so the `close` below has to be told which window it means by a chunk that
+    // has already landed.
+    exec_lua(&rpc, "btv.win.set_current(_G.from)").await;
     exec_lua(
         &rpc,
-        r#"btv.win.set_current(_G.from)
-           vim.cmd("close")
+        r#"vim.cmd("close")
            btv.qf.show("s")"#,
     )
     .await;
@@ -1582,4 +1587,42 @@ async fn named_list_repaints_an_open_tab_in_place() {
         "the open tab repainted in place to the new items, got {:?}",
         lines(&rpc).await.first()
     );
+}
+
+/// A list write and the command that shows it, queued from the SAME Lua chunk, run
+/// in **program order**: `setloclist(0, …)` lands on the window that asked for it,
+/// and the `vim.cmd("lopen")` that follows shows those entries.
+///
+/// The queued effects used to drain by bucket, with `vim.cmd` far ahead of the list
+/// writes — so `:lopen` opened an empty display first, focus moved into it, and the
+/// list write (`winnr` 0 = *current* window) then landed on the display window
+/// itself. The owner lost its list, the display showed nothing, and `:ll`/`:lnext`
+/// from the owner answered `E42: No Errors`.
+#[tokio::test]
+async fn a_list_write_precedes_the_command_that_opens_it() {
+    let (rpc, _incoming) = start().await;
+    let path = write_temp("ll_order", "c", "one\ntwo\nthree\nfour\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setloclist(0, {{ {{ filename = "{path}", lnum = 2, col = 1, text = "note" }} }},
+                                 " ", {{ title = "Notes" }})
+               vim.cmd("lopen")"#
+        ),
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{path}|2 col 1| note")).await,
+        ":lopen showed the list written just before it, got {:?}",
+        lines(&rpc).await.first()
+    );
+    // …and the list belongs to the window that wrote it: closing the display hands
+    // focus back to an owner that can still navigate it.
+    exec_lua(&rpc, r#"vim.cmd("lclose")"#).await;
+    let owned = exec_lua(&rpc, "return #vim.fn.getloclist(0)")
+        .await
+        .as_u64();
+    assert_eq!(owned, Some(1), "the owner window kept its location list");
+    exec_lua(&rpc, r#"vim.cmd("ll 1")"#).await;
+    assert_eq!(cursor(&rpc).await.0, 2, ":ll 1 jumped to the entry");
 }

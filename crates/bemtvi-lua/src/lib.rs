@@ -52,8 +52,9 @@ pub use ops::{
     HlSet, HttpError, HttpMountError, HttpRequest, HttpResponse, HttpServerReply,
     HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, LspPickerItem,
     LspProgressData, LspServerCapabilities, NamedListOp, OpenTarget, OptionValue, PanelOp, QfItem,
-    QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget,
-    TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
+    QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, Sequenced, StatuslineKind,
+    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData,
+    VirtDecorData, WindowOp,
 };
 pub use runtime::{
     extract_prelude, BoGlobalMirror, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete,

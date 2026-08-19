@@ -20,11 +20,10 @@ use crate::ops::{
     BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq,
     DecorInvalidate, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue,
     GitValue, GlobalOptionOp, HlSet, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp,
-    LspClientData, LspOp, LspPickerItem, LspProgressData, MouseOp, NamedListOp, PanelOp,
-    PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
-    SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp,
-    TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp,
-    WorkspaceOptionOp,
+    LspClientData, LspOp, LspPickerItem, LspProgressData, MouseOp, PanelOp, PickerOpenReq,
+    PickerPush, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, Sequenced, SnippetAddReq,
+    SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq,
+    TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -908,8 +907,11 @@ pub(crate) type PromptCompleteCands = Vec<(String, String, String, Option<(usize
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 pub(crate) struct Shared {
-    /// Ex-commands requested via `vim.cmd(...)`.
-    pub(crate) commands: Vec<String>,
+    /// The **program-ordered** effect queue: ex-commands from `vim.cmd`, the
+    /// `setqflist`/`setloclist` writes, and the named-list show/drop ops, in the
+    /// order the chunk wrote them. They share one queue precisely because their
+    /// relative order is meaningful — see [`Sequenced`].
+    pub(crate) sequenced: Vec<Sequenced>,
     /// Text emitted via `print(...)` / `vim.api.nvim_echo(...)` / the error writers
     /// (`btv.err_write*`), each carrying whether it was an error so the server can
     /// route it through the red `echo_err` path.
@@ -1009,13 +1011,6 @@ pub(crate) struct Shared {
     /// Clipboard seeds from `btv.test.clipboard.seed` (plugin-test seam), drained by
     /// the server into the editor's clipboard provider — `(text, linewise)`.
     pub(crate) clipboard_seeds: Vec<(String, bool)>,
-    /// `vim.fn.setqflist` requests, drained by the server into the editor's
-    /// quickfix list after the chunk. Reads resolve from the `btv._qflist` mirror.
-    pub(crate) qf_ops: Vec<QfSetOp>,
-    /// Named-list lifecycle ops (`btv.qf.show` / `btv.qf.drop` for a `kind = "list"`
-    /// dynamic list), drained *after* [`Self::qf_ops`] so a show observes the
-    /// refresh queued just before it.
-    pub(crate) named_list_ops: Vec<NamedListOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
@@ -1215,7 +1210,7 @@ impl Shared {
     /// through the textlock).
     pub(crate) fn discard_effects(&mut self) {
         let Shared {
-            commands,
+            sequenced,
             output,
             highlights,
             dock_ops,
@@ -1244,8 +1239,6 @@ impl Shared {
             reg_ops,
             textobject_ops,
             clipboard_seeds,
-            qf_ops,
-            named_list_ops,
             ui_inputs,
             prompt_complete_results,
             ui_selects,
@@ -1295,7 +1288,7 @@ impl Shared {
             plugin_shada: _,
             key_pending_active: _,
         } = self;
-        *commands = Default::default();
+        *sequenced = Default::default();
         *output = Default::default();
         *highlights = Default::default();
         *dock_ops = Default::default();
@@ -1324,8 +1317,6 @@ impl Shared {
         *reg_ops = Default::default();
         *textobject_ops = Default::default();
         *clipboard_seeds = Default::default();
-        *qf_ops = Default::default();
-        *named_list_ops = Default::default();
         *ui_inputs = Default::default();
         *prompt_complete_results = Default::default();
         *ui_selects = Default::default();
@@ -1964,8 +1955,10 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take ex-commands queued by `vim.cmd` since the last drain.
-        take_commands -> Vec<String> = commands
+        /// Take the program-ordered effect queue (`vim.cmd` commands, `setqflist` /
+        /// `setloclist` writes, named-list show/drop) since the last drain. One queue,
+        /// because their relative order is the order the chunk wrote them.
+        take_sequenced -> Vec<Sequenced> = sequenced
     }
 
     take_queue! {
@@ -2155,18 +2148,6 @@ impl LuaRuntime {
         /// Take the clipboard seeds queued by `btv.test.clipboard.seed` since the last
         /// drain, for the server to write into the editor's clipboard provider.
         take_clipboard_seeds -> Vec<(String, bool)> = clipboard_seeds
-    }
-
-    take_queue! {
-        /// Take the `setqflist` requests queued since the last drain, for the server
-        /// to apply to the editor's quickfix list.
-        take_qf_ops -> Vec<QfSetOp> = qf_ops
-    }
-
-    take_queue! {
-        /// Take the named-list lifecycle ops (`btv.qf.show` / `btv.qf.drop`) queued
-        /// since the last drain. Drained *after* [`Self::take_qf_ops`].
-        take_named_list_ops -> Vec<NamedListOp> = named_list_ops
     }
 
     take_queue! {
@@ -4502,7 +4483,10 @@ impl LuaRuntime {
                 Ok(())
             }
             mlua::Value::String(s) => {
-                self.shared.borrow_mut().commands.push(s.to_string_lossy());
+                self.shared
+                    .borrow_mut()
+                    .sequenced
+                    .push(Sequenced::Command(s.to_string_lossy()));
                 Ok(())
             }
             _ => Ok(()),

@@ -31,8 +31,9 @@
 --   :LDiag           fill this window's LOCATION list from a canned set and open
 --                    it with :lopen. Location lists are per-window: split the
 --                    window (<C-w>v) and each side keeps its own :lopen list.
---   :ldo ... no — instead: :lnext / :lprev navigate the location list, :lopen /
---                    :lclose toggle its window.
+--   :lnext / :lprev   navigate the location list; :lopen / :lclose toggle its
+--                    window. Run them from the window that OWNS the list (the one
+--                    :LDiag filled) — the location window itself only displays it.
 
 local btv = btv
 

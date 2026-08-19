@@ -1559,6 +1559,23 @@ pub enum NamedListOp {
     Drop(String),
 }
 
+/// One queued effect whose position relative to the others in this queue is
+/// **program order**: an ex-command from `vim.cmd`, a `setqflist`/`setloclist`
+/// write, or a named-list show/drop. The three used to be separate buckets drained
+/// one after another, which silently reordered the chunk that wrote them — the
+/// natural "fill a list, then open it" (`vim.fn.setloclist(0, …)` then
+/// `vim.cmd("lopen")`) ran the open *first*, against an empty list, and the write
+/// then landed on the freshly-focused display window. Sharing one queue makes the
+/// order they were written in the order they run.
+pub enum Sequenced {
+    /// An ex-command requested via `vim.cmd(...)`.
+    Command(String),
+    /// A `setqflist` / `setloclist` write.
+    QfSet(QfSetOp),
+    /// A `btv.qf.show` / `btv.qf.drop` on a named list.
+    NamedList(NamedListOp),
+}
+
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the
 /// `btv.treesitter.set_query` → native-engine seam. The Lua side queues an
 /// override that the server pushes straight to the engine — no Lua merge or

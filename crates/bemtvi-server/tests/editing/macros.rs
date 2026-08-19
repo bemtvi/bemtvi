@@ -441,3 +441,67 @@ async fn the_statusline_can_show_the_recording() {
     let text = status_text(&map);
     assert!(!text.contains("recording"), "statusline was {text:?}");
 }
+
+#[tokio::test]
+async fn a_played_macro_runs_when_the_f3_arrives_through_typeahead() {
+    // `<F3>a` reaching the editor as TYPEAHEAD — which is how a plugin feeds keys,
+    // and how the `btv.test` harness types — must play the macro. Only the RPC input
+    // path drove playback, so a queued replay was collected and then never run: the
+    // register was right, the keys were parsed, and nothing happened.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+    feed(&rpc, "<F2>aI- <Esc>j<F2>");
+    assert_eq!(lines(&rpc).await, vec!["- one", "two", "three"]);
+
+    exec_lua(&rpc, r#"btv._feedkeys("<F3>a", true, false)"#).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["- one", "- two", "three"],
+        "a fed <F3> plays the macro"
+    );
+}
+
+#[tokio::test]
+async fn a_mapped_stop_key_is_not_part_of_the_recording() {
+    // The vim spelling — `q` mapped to `<F2>` — is one map away, and the recording
+    // captures what you TYPED, so it captures the mapping's LHS. But the key that
+    // ENDS a recording is never part of it: `stop_recording` pops a trailing
+    // `<F2>`, and a mapped stop left a trailing `q` behind instead, so every
+    // register recorded through the vim spelling ended with a stray key that
+    // re-toggled the recording on replay.
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(&rpc, r#"btv.keymap.set("n", "q", "<F2>")"#).await;
+    exec_lua(&rpc, r#"btv.keymap.set("n", "@", "<F3>")"#).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+
+    feed(&rpc, "qaI- <Esc>jq");
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.fn.getreg("a")"#)
+            .await
+            .as_str(),
+        Some("I-<Space><Esc>j"),
+        "the mapped stop key is not recorded"
+    );
+    // …and the register replays cleanly through the mapped play key.
+    feed(&rpc, "@a");
+    assert_eq!(lines(&rpc).await, vec!["- one", "- two", "three"]);
+}
+
+#[tokio::test]
+async fn a_mapping_fired_mid_recording_is_still_recorded() {
+    // The other half: an ordinary mapping fired while recording still goes in as
+    // its LHS, so the replay re-fires it.
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(&rpc, r#"btv.keymap.set("n", "gh", "IX<Esc>")"#).await;
+    feed(&rpc, "ione<CR>two<Esc>gg");
+    feed(&rpc, "<F2>aghj<F2>");
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.fn.getreg("a")"#)
+            .await
+            .as_str(),
+        Some("ghj"),
+        "the mapping's LHS is what was recorded"
+    );
+    feed(&rpc, "<F3>a");
+    assert_eq!(lines(&rpc).await, vec!["Xone", "Xtwo"]);
+}

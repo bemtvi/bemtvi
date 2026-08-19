@@ -1563,11 +1563,11 @@ impl EditHost {
             if op.insert {
                 // Insert at the front while preserving the keys' own order.
                 for key in keys.into_iter().rev() {
-                    self.feed_buffer.push_front((key, op.remap));
+                    self.feed_buffer.push_front((key, op.remap, op.typed));
                 }
             } else {
                 for key in keys {
-                    self.feed_buffer.push_back((key, op.remap));
+                    self.feed_buffer.push_back((key, op.remap, op.typed));
                 }
             }
         }

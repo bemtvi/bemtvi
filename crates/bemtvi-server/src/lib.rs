@@ -1553,12 +1553,22 @@ pub struct EditHost {
     /// settle. Each carries whether it should be remapped (the `m` flag) or fed
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
-    feed_buffer: VecDeque<(Key, bool)>,
+    /// `(key, remap, typed)` — `typed` marks keys standing in for what the user
+    /// pressed (only the `btv.test` harness's `t:feed`), which an in-flight macro
+    /// recording must capture; plugin typeahead never is.
+    feed_buffer: VecDeque<(Key, bool, bool)>,
     /// Depth of the "these keys are not typed input" guard around macro recording:
     /// a mapping's RHS, the `nvim_feedkeys` typeahead drain, and a macro playing
     /// back all raise it. A macro recording captures only what the user pressed (see
     /// `EditHost::note_macro_keys` and `bemtvi_core`'s `editor::macros`).
     macro_suppress: u32,
+    /// Whether a macro playback is running right now. [`drain_feedkeys`] drives any
+    /// playback its keys asked for, and playback drains typeahead between its own
+    /// keys — this stops the two from re-entering each other and consuming one
+    /// another's frames.
+    ///
+    /// [`drain_feedkeys`]: EditHost::drain_feedkeys
+    in_macro_play: bool,
     /// The macro playbacks in flight (`{count}<F3>{reg}`), innermost last — a
     /// stack so a macro can play another. Driven by `EditHost::drive_macro_play`.
     macro_play: Vec<MacroFrame>,
@@ -2014,6 +2024,7 @@ impl EditHost {
             preview_anchor: None,
             feed_buffer: VecDeque::new(),
             macro_suppress: 0,
+            in_macro_play: false,
             macro_play: Vec::new(),
             macro_state_mirror: (None, None),
             paste_payload: None,

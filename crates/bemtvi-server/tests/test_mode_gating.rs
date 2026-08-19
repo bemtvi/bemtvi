@@ -409,3 +409,45 @@ async fn ui_mirror_carries_the_window_scroll_position() {
         "at the end of a long file the window has scrolled down, got {top:?}"
     );
 }
+
+#[tokio::test]
+async fn the_test_frameworks_feed_records_into_a_macro() {
+    // `btv.test`'s `t:feed` stands in for the USER typing — that is the whole
+    // premise of the framework. It rode the `nvim_feedkeys` typeahead, which
+    // deliberately suppresses macro recording ("typeahead is not typed input", so a
+    // plugin feeding keys cannot pollute an open recording). Correct for a plugin,
+    // wrong for the test framework: it made macros — and anything else that keys
+    // off what was TYPED — silently untestable, recording an empty register while
+    // every visible effect looked right.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+
+    // The test framework's feed: typed.
+    exec_lua(&rpc, r#"btv._feedkeys("<F2>a", true, false, true)"#).await;
+    exec_lua(&rpc, r#"btv._feedkeys("I- <Esc>j", true, false, true)"#).await;
+    exec_lua(&rpc, r#"btv._feedkeys("<F2>", true, false, true)"#).await;
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.fn.getreg("a")"#)
+            .await
+            .as_str(),
+        Some("I-<Space><Esc>j"),
+        "a typed feed is captured by an open recording"
+    );
+
+    // A PLUGIN feed still is not: that distinction is the point of the flag.
+    exec_lua(&rpc, r#"btv._feedkeys("<F2>b", true, false, true)"#).await;
+    exec_lua(&rpc, r#"btv._feedkeys("Ix<Esc>", true, false)"#).await;
+    exec_lua(&rpc, r#"btv._feedkeys("<F2>", true, false, true)"#).await;
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, r#"return vim.fn.getreg("b")"#)
+            .await
+            .as_str(),
+        Some(""),
+        "a plugin's typeahead never lands in an open recording"
+    );
+}

@@ -300,7 +300,10 @@ end
 -- opts.settle (extra ticks to wait, for chained async). Returns self for chaining.
 function Ctx:feed(keys, opts)
   opts = opts or {}
-  btv._feedkeys(keys, opts.remap ~= false, opts.insert or false)
+  -- The fourth argument marks these keys as TYPED — this is the user's keyboard,
+  -- which is the whole premise of the framework. Plugin typeahead leaves it off,
+  -- so an in-flight `<F2>` recording captures a spec's keys and not a plugin's.
+  btv._feedkeys(keys, opts.remap ~= false, opts.insert or false, true)
   settle(opts.settle or 1)
   return self
 end

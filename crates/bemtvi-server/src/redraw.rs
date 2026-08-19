@@ -351,8 +351,15 @@ impl EditHost {
             // to the focused window's. Without the fallback the mirror reported "" for
             // the bar a client was visibly drawing, and a spec asserting on it passed
             // vacuously.
+            // …and only when a bar is actually drawn: `status_visible` is false at
+            // `laststatus=0`, and at 1 with a single window, where the client gives
+            // the freed row to text instead. Reporting the text the server computed
+            // anyway would say a bar is up when none is.
             let statusline_text = match &global_status {
-                Value::Nil => chunk_runs_text(&layer("status")),
+                Value::Nil if matches!(layer("status_visible"), Value::Boolean(true)) => {
+                    chunk_runs_text(&layer("status"))
+                }
+                Value::Nil => String::new(),
                 bar => chunk_runs_text(bar),
             };
             let _ = self.lua.set_ui_mirror(bemtvi_lua::UiMirror {

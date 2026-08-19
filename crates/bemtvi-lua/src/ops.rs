@@ -1431,6 +1431,12 @@ pub struct FeedKeysOp {
     pub remap: bool,
     /// Insert at the FRONT of the typeahead (the `i` flag) rather than appending.
     pub insert: bool,
+    /// Whether these keys stand in for what the USER typed. Plugin typeahead does
+    /// not (an in-flight `<F2>` recording must not capture what a plugin fed), but
+    /// the `btv.test` harness's `t:feed` is the user's keyboard by definition — and
+    /// without the distinction a spec could never record a macro, or test anything
+    /// else that keys off what was typed.
+    pub typed: bool,
 }
 
 /// A global (editor-wide) option mutation queued by `vim.o` for a search option

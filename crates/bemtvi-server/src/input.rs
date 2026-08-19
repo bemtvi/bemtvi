@@ -103,9 +103,10 @@ impl EditHost {
     /// is what stops it here) and a total key budget, both reported loudly.
     pub(crate) fn drive_macro_play(&mut self) {
         self.collect_macro_play();
-        if self.macro_play.is_empty() {
+        if self.macro_play.is_empty() || self.in_macro_play {
             return;
         }
+        self.in_macro_play = true;
         // Played keys are not typed keys: a recording in flight captured the
         // `<F3>a` the user pressed, and must not also capture what it expands to.
         self.macro_suppress += 1;
@@ -154,6 +155,7 @@ impl EditHost {
         // is playing now.
         self.editor.set_executing_register(None);
         self.macro_suppress -= 1;
+        self.in_macro_play = false;
     }
 
     /// Push a playback the editor just resolved onto the frame stack. Refuses
@@ -276,12 +278,8 @@ impl EditHost {
         // registry just before feeding (suspending its own triggers so the fed keys
         // hit the real maps); pick that up before feeding.
         self.refresh_keymaps();
-        // Typeahead is not typed input — an in-flight `<F2>` recording must not
-        // capture what a plugin fed (it already recorded whatever the user pressed
-        // to get here).
-        self.macro_suppress += 1;
         let mut budget = 10_000usize;
-        while let Some((key, remap)) = self.feed_buffer.pop_front() {
+        while let Some((key, remap, typed)) = self.feed_buffer.pop_front() {
             if budget == 0 {
                 self.editor
                     .echo("E132: feedkeys recursion limit exceeded".to_string());
@@ -289,6 +287,13 @@ impl EditHost {
                 break;
             }
             budget -= 1;
+            // Typeahead is not typed input — an in-flight `<F2>` recording must not
+            // capture what a plugin fed (it already recorded whatever the user pressed
+            // to get here). The `btv.test` harness's `t:feed` IS the user's keyboard,
+            // though, and marks its keys `typed` so a spec can record a macro at all.
+            if !typed {
+                self.macro_suppress += 1;
+            }
             if remap {
                 self.feed_matcher(key);
             } else {
@@ -302,8 +307,16 @@ impl EditHost {
             self.apply_lua_effects();
             self.run_pending();
             self.refresh_keymaps();
+            if !typed {
+                self.macro_suppress -= 1;
+            }
         }
-        self.macro_suppress -= 1;
+        // …and any macro one of those keys asked to play. A `<F3>a` arriving through
+        // the typeahead — which is how the `btv.test` harness types, and how a plugin
+        // feeds keys — used to queue a playback nobody ever drove: only the RPC input
+        // path drained it, so the macro simply never ran. Re-entry is guarded, since
+        // playback itself drains typeahead between its own keys.
+        self.drive_macro_play();
     }
 
     /// Run one key through the general mapping matcher and apply the steps it
@@ -493,8 +506,19 @@ impl EditHost {
                 // — not its RHS (a Lua handler produces no keys at all, and a
                 // `noremap` string RHS is fed below under the recording suppression
                 // `fire_mapping` holds). The replay re-fires the mapping.
-                self.note_macro_keys(&lhs);
+                //
+                // Noted AFTER the fire, and only if the recording state did not
+                // change across it: a key that starts or ends a recording is never
+                // part of one. That is what makes the vim spelling (`q` mapped to
+                // `<F2>`) record the same register the unmapped keys do — noting
+                // first left a trailing `q` that `stop_recording`'s "pop the `<F2>`"
+                // could not recognise, so every such register ended with a stray key
+                // that re-toggled recording on replay.
+                let recording_before = self.editor.recording_register();
                 self.fire_mapping(rhs, silent, expr);
+                if self.editor.recording_register() == recording_before {
+                    self.note_macro_keys(&lhs);
+                }
             }
         }
     }

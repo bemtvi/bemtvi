@@ -2168,20 +2168,27 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `btv._feedkeys(keys, remap, insert)`: queue a [`FeedKeysOp`] for the server
-    // to drain into its typeahead after the chunk. The Lua-facing
+    // `btv._feedkeys(keys, remap, insert[, typed])`: queue a [`FeedKeysOp`] for the
+    // server to drain into its typeahead after the chunk. The Lua-facing
     // `nvim_feedkeys` (prelude) parses the mode flags into `remap`/`insert`.
+    //
+    // `typed` marks keys that stand in for what the USER pressed — only the
+    // `btv.test` harness's `t:feed` sets it. Plugin typeahead leaves it false, so an
+    // in-flight `<F2>` recording never captures what a plugin fed.
     let sh = shared.clone();
     btv.set(
         "_feedkeys",
-        lua.create_function(move |_, (keys, remap, insert): (String, bool, bool)| {
-            sh.borrow_mut().feedkeys.push(FeedKeysOp {
-                keys,
-                remap,
-                insert,
-            });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (keys, remap, insert, typed): (String, bool, bool, Option<bool>)| {
+                sh.borrow_mut().feedkeys.push(FeedKeysOp {
+                    keys,
+                    remap,
+                    insert,
+                    typed: typed.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `btv._test_clipboard_seed(text, linewise)`: queue a clipboard seed for the

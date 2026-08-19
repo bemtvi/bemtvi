@@ -20,10 +20,11 @@ use crate::ops::{
     BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq,
     DecorInvalidate, DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue,
     GitValue, GlobalOptionOp, HlSet, HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp,
-    LspClientData, LspOp, LspPickerItem, LspProgressData, NamedListOp, PanelOp, PickerOpenReq,
-    PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, SnippetAddReq,
-    SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq,
-    TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
+    LspClientData, LspOp, LspPickerItem, LspProgressData, MouseOp, NamedListOp, PanelOp,
+    PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
+    SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp,
+    TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp,
+    WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -1189,6 +1190,9 @@ pub(crate) struct Shared {
     /// buffer and processed (through the mapping engine, or straight to the
     /// editor) after the chunk / off-tick settle.
     pub(crate) feedkeys: Vec<FeedKeysOp>,
+    /// Mouse gestures queued by the `btv.test` harness (`t:mouse`), replayed by the
+    /// server at the same seam a client's `btv_input_mouse` lands on.
+    pub(crate) test_mouse: Vec<MouseOp>,
 }
 
 impl Shared {
@@ -1243,6 +1247,7 @@ impl Shared {
             prompt_complete_results,
             ui_selects,
             choice_menus,
+            test_mouse,
             ui_floats,
             picker_opens,
             picker_resume,
@@ -1320,6 +1325,7 @@ impl Shared {
         *ui_inputs = Default::default();
         *prompt_complete_results = Default::default();
         *ui_selects = Default::default();
+        *test_mouse = Default::default();
         *choice_menus = Default::default();
         *ui_floats = Default::default();
         *picker_opens = Default::default();
@@ -2351,6 +2357,12 @@ impl LuaRuntime {
         /// for the server to parse and feed (through the mapping engine or straight to
         /// the editor).
         take_feedkeys -> Vec<FeedKeysOp> = feedkeys
+    }
+
+    take_queue! {
+        /// Take the mouse gestures the `btv.test` harness queued (`t:mouse`), for the
+        /// server to replay through its own mouse seam.
+        take_test_mouse -> Vec<MouseOp> = test_mouse
     }
 
     /// Drop every queued-but-unapplied side effect — the whole set the `take_*`

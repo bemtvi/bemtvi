@@ -22,7 +22,7 @@ use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorInvalidate, DecorMark,
     DecorPublish, DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GitJob, GlobalOptionOp,
-    HlSet, HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp,
+    HlSet, HttpRequest, HttpServerReply, LayerOp, LoopOp, LspOp, MouseOp, NamedListOp, PanelOp,
     PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq,
     SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget,
     TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
@@ -2185,6 +2185,28 @@ pub(crate) fn install_runtime_api(
                     remap,
                     insert,
                     typed: typed.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `btv._test_mouse(button, action, modifier, row, col)`: queue a mouse gesture for
+    // the server to replay at the same seam a client's `btv_input_mouse` lands on.
+    // Reachable only through the gated `btv.test` (`t:mouse`): a plugin has no business
+    // synthesising the user's pointer, but a SPEC is the user — and without this every
+    // mouse-driven feature was untestable.
+    let sh = shared.clone();
+    btv.set(
+        "_test_mouse",
+        lua.create_function(
+            move |_, (button, action, modifier, row, col): (String, String, String, usize, usize)| {
+                sh.borrow_mut().test_mouse.push(MouseOp {
+                    button,
+                    action,
+                    modifier,
+                    row,
+                    col,
                 });
                 Ok(())
             },

@@ -32,7 +32,7 @@ impl EditHost {
     /// injected fake clock ([`ServerInit::mouse_clock`](crate::ServerInit)) when a
     /// test supplies one — so `'mousetime'`-based multi-click detection is driven
     /// deterministically — otherwise the real monotonic clock since startup.
-    fn mouse_stamp_ms(&self) -> u64 {
+    pub(crate) fn mouse_stamp_ms(&self) -> u64 {
         match &self.mouse_clock {
             Some(c) => c.load(std::sync::atomic::Ordering::SeqCst),
             None => self.start.elapsed().as_millis() as u64,

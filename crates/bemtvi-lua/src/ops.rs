@@ -1423,6 +1423,19 @@ pub struct TextObjectOp {
 /// the front of the typeahead instead of the back. The server parses `keys` and
 /// drains them after the chunk — Lua queues, the server feeds.
 #[derive(Clone, Debug)]
+/// A mouse gesture queued by the `btv.test` harness (`t:mouse`) for the server to
+/// replay at the same seam the client's `btv_input_mouse` RPC lands on. There is no
+/// plugin-facing spelling: a plugin has no business synthesising the user's pointer,
+/// but a SPEC is the user, and without this a mouse-driven feature — every gesture in
+/// examples/mouse, every widget in examples/mouse-widgets — could not be tested at all.
+pub struct MouseOp {
+    pub button: String,
+    pub action: String,
+    pub modifier: String,
+    pub row: usize,
+    pub col: usize,
+}
+
 pub struct FeedKeysOp {
     /// The keys to feed, as vim notation (`parse_keys` turns them into `Key`s).
     pub keys: String,

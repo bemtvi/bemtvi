@@ -321,6 +321,35 @@ function Ctx:exec(fn)
   return fn()
 end
 
+-- `t:mouse(button, action, row, col[, modifier])` — send one mouse gesture at a
+-- global SCREEN cell, then settle a tick. The vocabulary is the wire's: `button` is
+-- `"left"` / `"right"` / `"middle"` / `"wheel"` / `"move"`, `action` is `"press"` /
+-- `"drag"` / `"release"` for a button and `"up"` / `"down"` / `"left"` / `"right"`
+-- for the wheel, and `modifier` is `""`, `"s"`, `"c"` or `"a"`. Rows and columns are 0-based, as the wire carries them.
+--
+-- The server owns every hit-test — cell to window to buffer position — so this is
+-- the same call a client makes, and a spec drives a click, a drag-select, a
+-- multi-click, a wheel scroll or a divider drag exactly as a user would. Multi-click
+-- detection compares arrival times against `'mousetime'`, so a double-click is two
+-- press/release pairs in quick succession, not a special action.
+--
+-- ```lua
+-- t:mouse("left", "press", 4, 12)
+-- t:mouse("left", "release", 4, 12)
+-- btv.test.expect(t:cursor()[1]).to_be(5)
+-- ```
+function Ctx:mouse(button, action, row, col, modifier)
+  btv._test_mouse(
+    tostring(button),
+    tostring(action),
+    tostring(modifier or ""),
+    tonumber(row) or 0,
+    tonumber(col) or 0
+  )
+  settle(1)
+  return self
+end
+
 -- t:wait_for(predicate[, opts]) — await until `predicate` returns truthy (polling
 -- between ticks), returning that value. Rejects (raising in the test) on timeout.
 -- Use for async UI: a debounced popup, a watch-driven refresh. opts = { tries=,

@@ -1542,6 +1542,28 @@ impl EditHost {
                 .open_confirm(req.label, req.accelerators, req.default);
             self.pending_ui_input = Some(req.cb_id);
         }
+        // Mouse gestures the `btv.test` harness queued (`t:mouse`), replayed at the
+        // same seam a client's `btv_input_mouse` lands on — including the multi-click
+        // stamp, so a spec's double-click really is one.
+        for op in self.lua.take_test_mouse() {
+            match bemtvi_core::MouseEvent::parse(
+                &op.button,
+                &op.action,
+                &op.modifier,
+                op.row,
+                op.col,
+            ) {
+                Ok(mut ev) => {
+                    ev.stamp_ms = self.mouse_stamp_ms();
+                    self.editor.mouse(ev);
+                    self.resolve_mouse_clicks();
+                    self.dispatch_statusline_clicks();
+                }
+                // A spec that names a button/action the editor does not know is a
+                // spec bug, and must say so rather than doing nothing.
+                Err(err) => self.editor.echo(format!("t:mouse: {err}")),
+            }
+        }
         // `nvim_feedkeys` typeahead: parse each request's keys and queue them onto
         // the server's feed buffer (the front for an `i` insert, else the back),
         // carrying the remap flag. The buffer is drained — fed through the matcher

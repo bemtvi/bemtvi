@@ -345,3 +345,74 @@ async fn empty_title_clears_on_the_lua_op_path() {
         "an empty title clears the title — msgpack-path parity"
     );
 }
+
+/// `nvim_win_get_config` reports where an **aligned** float actually sits. The
+/// unified geometry (`align` + `margin`) leaves `row`/`col` `0` in the request and
+/// places the box by alignment, so reporting the request said "top-left, no inset"
+/// for every aligned float — the same class of bug the resolved `width`/`height`
+/// already fixed.
+#[tokio::test]
+async fn an_aligned_float_reports_where_it_was_placed() {
+    let (rpc, _incoming) = start().await;
+    let cols = exec_lua(&rpc, "return vim.o.columns").await;
+    let cols = cols.as_i64().expect("columns");
+
+    exec_lua(
+        &rpc,
+        r#"_G.v = btv.view.create({ filetype = "geomtest" })
+           _G.v:set_lines({ "box" })
+           _G.v:mount({ float = {
+             width = 20, height = 5,
+             align = "top-right", margin = 2, border = "none",
+           } })"#,
+    )
+    .await;
+    // The view's window id is known only on a later tick.
+    let cfg = poll_lua(
+        &rpc,
+        r#"local w = _G.v:winid()
+           if not w then return nil end
+           local c = vim.api.nvim_win_get_config(w)
+           return c.row .. "," .. c.col"#,
+    )
+    .await;
+    // Top band + the 2-cell vertical margin; right band inset by the doubled
+    // horizontal margin (terminal cells are about twice as tall as wide).
+    assert_eq!(
+        cfg.as_deref(),
+        Some(format!("2,{}", cols - 20 - 4).as_str()),
+        "the aligned box's effective position"
+    );
+
+    // A centered float lands in the middle, margin-independent.
+    exec_lua(
+        &rpc,
+        r#"_G.v:mount({ float = { width = 20, height = 5, align = "center", border = "none" } })"#,
+    )
+    .await;
+    let cfg = poll_lua(
+        &rpc,
+        r#"local w = _G.v:winid()
+           if not w then return nil end
+           local c = vim.api.nvim_win_get_config(w)
+           if c.align ~= "center" then return nil end
+           return tostring(c.col)"#,
+    )
+    .await;
+    assert_eq!(
+        cfg.as_deref(),
+        Some(((cols - 20) / 2).to_string().as_str()),
+        "a centered float is centered"
+    );
+}
+
+/// Evaluate `code` until it returns a non-nil string, or give up.
+async fn poll_lua(rpc: &Rpc, code: &str) -> Option<String> {
+    for _ in 0..200 {
+        if let Some(s) = exec_lua(rpc, code).await.as_str() {
+            return Some(s.to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    None
+}

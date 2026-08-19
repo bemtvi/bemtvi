@@ -509,7 +509,18 @@ pub(crate) fn parse_align(align: Option<&str>) -> Result<Option<bemtvi_core::Ali
 /// so a fractional float reports its true on-screen size — matching neovim's
 /// integer `nvim_win_get_config` and self-healing on resize. The caller passes
 /// `window_content_size(id)`.
-fn float_mirror(cfg: FloatConfig, width: usize, height: usize) -> FloatMirror {
+///
+/// `pos` is the same story for the placement: the **effective** `(row, col)` the
+/// box was laid out at (`window_float_position(id)`), not the request. An
+/// `align`-placed float carries `row`/`col` `0` in its config and is put where the
+/// alignment says, so reporting the request said "top-left" for every one of them.
+fn float_mirror(
+    cfg: FloatConfig,
+    width: usize,
+    height: usize,
+    pos: Option<(isize, isize)>,
+) -> FloatMirror {
+    let (row, col) = pos.unwrap_or((cfg.row, cfg.col));
     let (relative, win) = match cfg.relative {
         FloatRelative::Editor => ("editor", 0),
         FloatRelative::Cursor => ("cursor", 0),
@@ -519,8 +530,8 @@ fn float_mirror(cfg: FloatConfig, width: usize, height: usize) -> FloatMirror {
         relative: relative.to_string(),
         win,
         anchor: cfg.anchor.as_str().to_string(),
-        row: cfg.row as i64,
-        col: cfg.col as i64,
+        row: row as i64,
+        col: col as i64,
         width: width as u64,
         height: height as u64,
         align: cfg.align.map(|a| a.as_str().to_string()),
@@ -2463,10 +2474,9 @@ impl EditHost {
                     // `winsaveview()` reports `topline` 1-based; `top` is 0-based.
                     topline: (top + 1) as u64,
                     leftcol: leftcol as u64,
-                    float: self
-                        .editor
-                        .window_float_config(id)
-                        .map(|cfg| float_mirror(cfg, cw, ch)),
+                    float: self.editor.window_float_config(id).map(|cfg| {
+                        float_mirror(cfg, cw, ch, self.editor.window_float_position(id))
+                    }),
                     jumps: jumps
                         .into_iter()
                         .map(|(bufnr, line, col)| JumpMirror {

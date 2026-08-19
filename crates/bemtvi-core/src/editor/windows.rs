@@ -398,6 +398,15 @@ pub(crate) struct Window {
     pub(crate) options: WindowOptions,
     /// `Some` for a floating window (its placement), `None` for a tiled one.
     pub(crate) float: Option<FloatConfig>,
+    /// A float's **effective** `(row, col)` — where the laid-out box actually sits,
+    /// as an offset from the origin its `relative` names — recomputed on every
+    /// layout beside [`Window::rect`]. The request in [`Window::float`] is not that
+    /// position: an `align`-placed float carries `row`/`col` `0` and is put where
+    /// the alignment says, and even a low-level offset is clamped on-screen. This is
+    /// what `nvim_win_get_config` reports, exactly as it reports the resolved
+    /// `width`/`height` rather than the raw `Extent`. `None` for a tiled window, and
+    /// until the first layout.
+    pub(crate) float_pos: Option<(isize, isize)>,
     /// This window's jump list — the positions jumped *from*, walked with
     /// `<C-o>`/`<C-i>`. Per-window like vim's; a split inherits a copy of its
     /// parent's. See [`crate::editor::JumpEntry`] and `editor/jumps.rs`.
@@ -605,6 +614,7 @@ impl WindowTree {
             rect: Rect::default(),
             options: WindowOptions::default(),
             float: None,
+            float_pos: None,
             jumps: Vec::new(),
             jump_idx: 0,
             jump_gen: 0,
@@ -771,7 +781,7 @@ impl WindowTree {
             Some(w) => (w.rect.x + cursor_off.0, w.rect.y + cursor_off.1),
             None => cursor_off,
         };
-        let placements: Vec<(WindowId, Rect)> = self
+        let placements: Vec<(WindowId, Rect, (isize, isize))> = self
             .floats
             .iter()
             .filter_map(|&id| {
@@ -795,12 +805,22 @@ impl WindowTree {
                         total,
                     ),
                 };
-                Some((id, place_float(origin, bounds, &cfg)))
+                let rect = place_float(origin, bounds, &cfg);
+                // Where the box ENDED UP, relative to the origin its `relative` names
+                // — what `nvim_win_get_config` reports. An `align`-placed float has
+                // `row`/`col` `0` in its request, and even a low-level offset is
+                // clamped on-screen, so the request is not the position.
+                let pos = (
+                    rect.y as isize - origin.y as isize,
+                    rect.x as isize - origin.x as isize,
+                );
+                Some((id, rect, pos))
             })
             .collect();
-        for (id, rect) in placements {
+        for (id, rect, pos) in placements {
             if let Some(w) = self.windows.get_mut(&id) {
                 w.rect = rect;
+                w.float_pos = Some(pos);
             }
         }
     }
@@ -2148,6 +2168,13 @@ impl Editor {
     pub fn window_float_config(&self, id: WindowId) -> Option<FloatConfig> {
         self.any_tab_tree_of_window(id)
             .and_then(|(_, t)| t.get(id).float.clone())
+    }
+
+    /// A float's **effective** `(row, col)` — see [`Window::float_pos`]. `None` for a
+    /// tiled window, or a float that has not been laid out yet.
+    pub fn window_float_position(&self, id: WindowId) -> Option<(isize, isize)> {
+        self.any_tab_tree_of_window(id)
+            .and_then(|(_, t)| t.get(id).float_pos)
     }
 
     /// `nvim_win_set_config(win, config)` — reconfigure window `id` from a partial

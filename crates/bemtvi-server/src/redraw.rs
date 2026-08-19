@@ -374,6 +374,8 @@ impl EditHost {
                 float: &float,
                 message: &message,
                 cmdline: view.cmdline.as_str(),
+                cmdline_prefix: &view.cmdline_prefix.to_string(),
+                cmdline_prompt: view.cmdline_prompt.as_str(),
                 statusline: &statusline_text,
                 tabline: &chunk_runs_text(&tabline_segments),
                 screen: &screen,

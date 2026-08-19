@@ -1534,6 +1534,10 @@ pub struct UiMirror<'a> {
     pub message: &'a str,
     /// The command line's text.
     pub cmdline: &'a str,
+    /// The `:` / `/` prefix character, and the prompt LABEL an `btv.ui.input` /
+    /// `btv.ui.confirm` draws ahead of the editable line (`t:cmdline()`).
+    pub cmdline_prefix: &'a str,
+    pub cmdline_prompt: &'a str,
     /// The status line, flattened out of its chunk runs.
     pub statusline: &'a str,
     /// A custom `'tabline'`, flattened out of its chunk runs; empty when the option
@@ -3504,6 +3508,8 @@ impl LuaRuntime {
             float,
             message,
             cmdline,
+            cmdline_prefix,
+            cmdline_prompt,
             statusline,
             tabline,
             screen,
@@ -3532,6 +3538,12 @@ impl LuaRuntime {
         ui.set("float", crate::convert::rmpv_to_lua(&self.lua, float)?)?;
         ui.set("message", message)?;
         ui.set("cmdline", cmdline)?;
+        // The command line's two other halves: the `:` / `/` prefix, and the prompt
+        // LABEL an `btv.ui.input` / `btv.ui.confirm` draws ahead of the editable text.
+        // Neither is part of `cmdline` (the client draws them separately), so without
+        // them a prompt suite could see what was typed but never what was asked.
+        ui.set("cmdline_prefix", cmdline_prefix)?;
+        ui.set("cmdline_prompt", cmdline_prompt)?;
         ui.set("statusline", statusline)?;
         // A custom `'tabline'` renders through the same `%`-format engine as the
         // status line into one styled row — a wholly different payload from the

@@ -580,6 +580,27 @@ function Ctx:matches(row)
   return all
 end
 
+-- `t:cmdline()` — the open command line as drawn: the `:` / `/` prefix, or an
+-- `btv.ui.input` / `btv.ui.confirm` prompt LABEL, followed by the editable text.
+-- `nil` when no command line is open.
+--
+-- The three are separate on the wire (the client draws the prefix and label itself),
+-- so the label — what the prompt actually ASKED — is in none of the other views.
+--
+-- ```lua
+-- t:feed(":ene")
+-- btv.test.expect(t:cmdline()).to_be(":ene")
+-- ```
+function Ctx:cmdline()
+  local ui = btv._ui or {}
+  local prefix, prompt, text = ui.cmdline_prefix or "", ui.cmdline_prompt or "", ui.cmdline or ""
+  local line = prefix .. prompt .. text
+  if line == "" then
+    return nil
+  end
+  return line
+end
+
 -- t:statusline() — the rendered status line text, when the mirror carries it.
 function Ctx:statusline()
   local ui = btv._ui

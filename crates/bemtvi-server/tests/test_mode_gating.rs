@@ -672,3 +672,50 @@ async fn ui_mirror_carries_a_custom_tabline() {
         "'showtabline=0' draws nothing"
     );
 }
+
+/// The command line's prefix and prompt LABEL are mirrored beside its text. The
+/// three are separate on the wire — the client draws the `:` and the label itself —
+/// so a prompt suite could see what was typed but never what was asked.
+#[tokio::test]
+async fn ui_mirror_carries_the_cmdline_prefix_and_prompt() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+    feed(&rpc, "ione<Esc>");
+
+    // An ex line: the `:` prefix, no prompt label.
+    feed(&rpc, ":ene");
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return btv._ui.cmdline_prefix .. btv._ui.cmdline_prompt .. btv._ui.cmdline"
+        )
+        .await
+        .as_str(),
+        Some(":ene")
+    );
+    feed(&rpc, "<Esc>");
+
+    // A prompt: the label is what it asked.
+    exec_lua(
+        &rpc,
+        r#"btv.ui.input({ prompt = "Name: ", default = "ada" })"#,
+    )
+    .await;
+    let _ = lines(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.cmdline_prompt")
+            .await
+            .as_str(),
+        Some("Name: "),
+        "the label"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv._ui.cmdline").await.as_str(),
+        Some("ada"),
+        "…beside the editable text"
+    );
+    feed(&rpc, "<Esc>");
+}

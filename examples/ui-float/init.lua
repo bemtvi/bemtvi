@@ -23,11 +23,15 @@
 vim.g.mapleader = "\\"
 
 --------------------------------------------------------------------------------
--- 1. <leader>f — a cursor-anchored content float from a multi-line string.
---    TYPE:  \f          A bordered box floats by the cursor. Press any key to
+-- 1. <leader>o — a cursor-anchored content float from a multi-line string.
+--    TYPE:  \o          A bordered box floats by the cursor. Press any key to
 --    dismiss it (it never grabs input — the key is still handled normally).
+--
+--    (Not `\f`: the bundled picker owns the whole `\f…` prefix — `\ff`, `\fg`,
+--    `\fb`, … — so a bare `\f` is an ambiguous prefix the matcher WITHHOLDS
+--    until the mapping timeout, and the float would appear a second late.)
 --------------------------------------------------------------------------------
-btv.keymap.set("n", "<leader>f", function()
+btv.keymap.set("n", "<leader>o", function()
   btv.ui.float(
     "btv.ui.float\n\nThe list-less content float.\nPress any key to dismiss.",
     { title = " info " }
@@ -35,9 +39,9 @@ btv.keymap.set("n", "<leader>f", function()
 end)
 
 --------------------------------------------------------------------------------
--- 2. <leader>F — a centered float from a list of lines, no border.
+-- 2. <leader>O — a centered float from a list of lines, double-bordered.
 --------------------------------------------------------------------------------
-btv.keymap.set("n", "<leader>F", function()
+btv.keymap.set("n", "<leader>O", function()
   btv.ui.float(
     { "centered over the editor", "", "relative = 'editor'" },
     { relative = "editor", border = "double" }
@@ -47,7 +51,7 @@ end)
 --------------------------------------------------------------------------------
 -- 3. K — LSP hover through the content float.
 --    btv.lsp.hover() requests hover for the symbol under the cursor; the
---    reply opens the float server-side (same surface as \f / \F above). Open
+--    reply opens the float server-side (same surface as \o / \O above). Open
 --    `sample.lua`, put the cursor on a stdlib symbol (e.g. `string` or `print`),
 --    and press K. With no server attached it echoes "No language server attached".
 --------------------------------------------------------------------------------

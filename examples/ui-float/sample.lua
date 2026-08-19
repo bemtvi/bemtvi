@@ -3,8 +3,8 @@
 --
 -- Maps this config wires (leader = "\"):
 --
---   \f   open a cursor-anchored float (a multi-line string, titled)
---   \F   open a centered, double-bordered float (a list of lines)
+--   \o   open a cursor-anchored float (a multi-line string, titled)
+--   \O   open a centered, double-bordered float (a list of lines)
 --   K    LSP hover for the symbol under the cursor (needs lua-language-server)
 --   \s   LSP signature help
 --

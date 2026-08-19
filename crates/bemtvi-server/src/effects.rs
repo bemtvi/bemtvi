@@ -1286,6 +1286,7 @@ impl EditHost {
                 enabled: true,
                 auto: req.auto,
                 min_chars: req.min_chars,
+                buffer_source: req.buffer_source,
                 buffer_min_chars: req.buffer_min_chars,
                 keys,
                 accept: parse_accept_behavior(&req.accept),

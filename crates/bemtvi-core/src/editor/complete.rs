@@ -96,6 +96,12 @@ pub struct CompleteConfig {
     /// met (the native `buffer` seed by [`buffer_min_chars`](Self::buffer_min_chars),
     /// the async/native sources by their own gate server-side).
     pub min_chars: usize,
+    /// Whether the native `buffer` word source contributes at all. `sources` is the
+    /// list of sources to draw from, so a `setup{}` that names others and omits
+    /// `buffer` gets no buffer words — the scan used to run regardless of whether it
+    /// was listed, and a config offering only its own candidates saw them competing
+    /// with every word already in the file.
+    pub buffer_source: bool,
     /// The native `buffer` word source's own `min_chars`: its candidates are seeded
     /// only once the prefix reaches this length (independent of the global open gate,
     /// so `buffer` can sit at 3 while a snippet source shows from 2). A manual trigger
@@ -149,6 +155,7 @@ impl Default for CompleteConfig {
             enabled: false,
             auto: true,
             min_chars: 1,
+            buffer_source: true,
             buffer_min_chars: 1,
             keys: CompleteKeys::default(),
             accept: AcceptBehavior::default(),
@@ -324,8 +331,8 @@ impl Editor {
         // the prefix is long enough (a manual trigger bypasses, offering everything).
         // The global open gate above is the *min* across sources, so the popup can be
         // open — for a lower-threshold source — before `buffer` contributes.
-        let buffer_gated =
-            !preselect && prefix.chars().count() < self.complete_config.buffer_min_chars;
+        let buffer_gated = !self.complete_config.buffer_source
+            || (!preselect && prefix.chars().count() < self.complete_config.buffer_min_chars);
         let candidates = if self.prefix_triggered(&prefix) || buffer_gated {
             Vec::new()
         } else {

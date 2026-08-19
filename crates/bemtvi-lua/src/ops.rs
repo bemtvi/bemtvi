@@ -2342,6 +2342,8 @@ pub struct CompleteSetupReq {
     /// once its own gate (below) is met.
     pub min_chars: usize,
     /// The native `buffer` source's own `min_chars` gate.
+    /// Whether the native `buffer` word source was listed in `sources` at all.
+    pub buffer_source: bool,
     pub buffer_min_chars: usize,
     /// The `lsp` source's own `min_chars` gate.
     pub lsp_min_chars: usize,

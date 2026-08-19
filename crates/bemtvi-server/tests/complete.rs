@@ -2674,3 +2674,50 @@ async fn a_pasted_tab_does_not_navigate_the_popup() {
     feed(&rpc, &bemtvi_view::encode_paste("\tx"));
     assert_eq!(lines(&rpc).await, vec!["hello he\tx"]);
 }
+
+/// `sources` is the list of sources to draw from, so a `setup{}` that lists other
+/// sources and omits `buffer` gets no buffer words. The native scan ran regardless
+/// of whether `buffer` was listed, so a config offering only its own candidates saw
+/// them competing with every word already in the file.
+#[tokio::test]
+async fn an_unlisted_buffer_source_contributes_nothing() {
+    let dir = temp_dir("complete_unlisted_buffer");
+    let (rpc, mut incoming) = start(
+        &dir,
+        r#"btv.complete.source {
+             name = "only", debounce = 0,
+             complete = function(ctx)
+               if ("alphabet"):sub(1, #ctx.prefix) == ctx.prefix then ctx.push("alphabet") end
+             end,
+           }
+           btv.complete.setup { sources = { { "only" } }, auto = true }"#,
+    )
+    .await;
+    // A buffer word that would match the prefix, on its own line.
+    feed(&rpc, "ialphanumeric<CR>alph");
+    let menu = poll_menu(&rpc, &mut incoming).await;
+    let items = menu_items(&menu_of(&menu.expect("a completion menu")));
+    assert!(
+        items.iter().any(|i| i == "alphabet"),
+        "the listed source answered, got {items:?}"
+    );
+    assert!(
+        !items.iter().any(|i| i == "alphanumeric"),
+        "…and the unlisted buffer source did not, got {items:?}"
+    );
+    feed(&rpc, "<C-e><Esc>");
+
+    // Listing it brings the buffer words back.
+    exec_lua(
+        &rpc,
+        r#"btv.complete.setup { sources = { { "only" }, { "buffer" } }, auto = true }"#,
+    )
+    .await;
+    feed(&rpc, "oalph");
+    let menu = poll_menu(&rpc, &mut incoming).await;
+    let items = menu_items(&menu_of(&menu.expect("a completion menu")));
+    assert!(
+        items.iter().any(|i| i == "alphanumeric"),
+        "a listed buffer source contributes, got {items:?}"
+    );
+}

@@ -64,10 +64,14 @@ local function reconcile()
     return
   end
 
-  -- The native sources' gates/priorities (defaults leave `buffer` seeding at 1, as
-  -- core always scans it) and the min across every active source (the global open
-  -- gate). `all_min` starts nil and lowers as sources are seen.
-  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 1, 1, 1
+  -- The native sources' gates/priorities and the min across every active source
+  -- (the global open gate). `all_min` starts nil and lowers as sources are seen.
+  --
+  -- A gate of `0` means "not listed at all": `sources` is the list of sources to
+  -- draw from, so a `setup{}` that names others and omits `buffer` gets no buffer
+  -- words. (The default `sources` is `{ { "buffer" } }`, so a bare `setup{}` still
+  -- has them.)
+  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 0, 1, 1
   local buffer_priority, lsp_priority, snippets_priority = 0, 0, 0
   local saw_lsp, saw_snippets = false, false
   local all_min = nil

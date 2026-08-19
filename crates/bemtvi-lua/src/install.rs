@@ -3506,7 +3506,10 @@ pub(crate) fn install_runtime_api(
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
                     min_chars: mc(0),
-                    buffer_min_chars: mc(1),
+                    // A `min_chars` of 0 in the wire slot means "not listed": the
+                    // native buffer source contributes nothing at all.
+                    buffer_source: mc(1) > 0,
+                    buffer_min_chars: mc(1).max(1),
                     lsp_min_chars: mc(2),
                     snippets_min_chars: mc(3),
                     next,

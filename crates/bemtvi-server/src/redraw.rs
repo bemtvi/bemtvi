@@ -336,6 +336,7 @@ impl EditHost {
             let virt_text = layer("virt_text");
             let virt_lines = layer("virt_lines");
             let signs = layer("diagnostics_signs");
+            let colorcolumn = layer("colorcolumn");
             // The status line as painted. The global bar (`laststatus=3`) is the whole
             // story when there is one; at every other `'laststatus'` — the default
             // included — it is `Nil` and each window paints its own row, so fall back
@@ -356,6 +357,7 @@ impl EditHost {
                 virt_text: &virt_text,
                 virt_lines: &virt_lines,
                 signs: &signs,
+                colorcolumn: &colorcolumn,
                 clipboard: clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
             });
         }

@@ -500,6 +500,28 @@ function Ctx:highlights(row)
   return rows[row] or {}
 end
 
+-- `t:rulers()` — the focused window's `'colorcolumn'` rulers, as the 1-based text
+-- columns the client is told to paint with the `ColorColumn` group.
+--
+-- The third view onto a layer that is not buffer text: `t:lines()` cannot see a
+-- ruler (it is not text), `t:screen()` cannot (it is a background behind cells
+-- that may hold nothing), and `t:highlights()` cannot either — the server sends
+-- the column list and the client draws it, so no span is ever emitted. This is
+-- also the only place the `+N` rule is visible: a `'textwidth'`-relative entry is
+-- accepted but resolves to nothing, while `'colorcolumn'` itself still reads
+-- `"+1"`.
+--
+-- ```lua
+-- t:cmd("set colorcolumn=80,120")
+-- btv.test.expect(t:rulers()).to_equal({ 80, 120 })
+-- ```
+--
+-- Only the focused window, like `t:screen()`.
+function Ctx:rulers()
+  local ui = btv._ui
+  return (ui and ui.colorcolumn) or {}
+end
+
 -- Where a `virt_text` placement draws, by the code the wire carries.
 local VIRT_POS =
   { [0] = "eol", [1] = "inline", [2] = "overlay", [3] = "right_align", [4] = "win_col" }

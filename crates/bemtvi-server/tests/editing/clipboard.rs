@@ -288,3 +288,46 @@ async fn osc52_stays_off_for_a_client_that_cannot_do_it() {
         "a client that can't do OSC 52 must not be sent one"
     );
 }
+
+#[tokio::test]
+async fn registers_listing_shows_the_clipboard_registers() {
+    // `:registers` must list `"+` / `"*` alongside the stored ones, as vim does —
+    // it is how you check what a `"+y` (or the `<C-c>` chord) actually put on the
+    // system clipboard. They were absent: the listing walked the stored register
+    // file plus `%` `/` `:` and stopped, so the one register whose contents live
+    // outside the editor was the one you could not see.
+    let (rpc, _incoming, clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello world<Esc>");
+    feed(&rpc, "\"+yiw");
+    let _ = lines(&rpc).await; // barrier: the yank has been processed
+    assert_eq!(clip.peek(), Some(("world".to_string(), false)));
+
+    feed(&rpc, ":registers<CR>");
+    let shown = lines(&rpc).await;
+    let plus = shown
+        .iter()
+        .find(|l| l.contains("\"+"))
+        .unwrap_or_else(|| panic!("no \"+ row in {shown:?}"));
+    assert!(
+        plus.contains("world"),
+        "the \"+ row must show the clipboard contents, got {plus:?}"
+    );
+    assert!(
+        shown.iter().any(|l| l.contains("\"*")),
+        "\"* is the same clipboard and is listed too, got {shown:?}"
+    );
+}
+
+#[tokio::test]
+async fn registers_listing_omits_an_empty_clipboard() {
+    // An empty clipboard is not a row: `:registers` lists what is *there*, and a
+    // blank `"+` line would be noise on every listing.
+    let (rpc, _incoming, _clip) = start_with_clipboard().await;
+    feed(&rpc, "ihello<Esc>");
+    feed(&rpc, ":registers<CR>");
+    let shown = lines(&rpc).await;
+    assert!(
+        shown.iter().all(|l| !l.contains("\"+")),
+        "an empty clipboard must not be listed, got {shown:?}"
+    );
+}

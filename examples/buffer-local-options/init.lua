@@ -43,5 +43,10 @@ vim.api.nvim_create_autocmd("FileType", {
 --      TYPE:  i<Tab>y<Esc>   -> "    y"  (four spaces — softtabstop, not tabstop)
 --      TYPE:  i<Tab><BS>z<Esc> -> "z"    (<BS> removes the whole 4-space soft tab)
 --      :set tabstop?          -> echoes "tabstop=8"
---      :set noexpandtab       -> back to literal tabs in this buffer
+--
+--    `noexpandtab` alone does NOT bring literal tabs back here: a 4-cell soft tab
+--    cannot BE a tab when tabstop is 8, so it is still spelled with spaces. Clear
+--    the soft tab too and the fill is a real "\t" again:
+--      :set noexpandtab softtabstop=0
+--      TYPE:  i<Tab>w<Esc>   -> "\tw"   (one tab, shown 8 cells wide)
 --------------------------------------------------------------------------------

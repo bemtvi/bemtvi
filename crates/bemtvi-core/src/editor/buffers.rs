@@ -2809,8 +2809,14 @@ impl Editor {
                 lines.push(format_register_line(name, &cell.text, cell.kind));
             }
         }
-        // Read-only specials, resolved against live editor state.
-        for name in ['%', '/', ':'] {
+        // Read-only specials, resolved against live editor state — plus the two
+        // clipboard names, whose contents live OUTSIDE the editor entirely. They
+        // resolve through the same `register_text`, which reads the injected
+        // provider for `+`/`*`; listing them is how you check what a `"+y` (or the
+        // `<C-c>` chord) actually put on the system clipboard, and vim shows them
+        // here too. Reading the host clipboard is a one-shot on an explicit
+        // command, exactly as `"+p` already does — not something on any hot path.
+        for name in ['%', '/', ':', '+', '*'] {
             if !wanted(name) {
                 continue;
             }

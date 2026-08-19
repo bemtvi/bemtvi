@@ -1539,6 +1539,8 @@ pub struct UiMirror<'a> {
     pub virt_lines: &'a rmpv::Value,
     /// The gutter signs on those rows (`t:decor()`).
     pub signs: &'a rmpv::Value,
+    /// The focused window's resolved `'colorcolumn'` ruler columns (`t:rulers()`).
+    pub colorcolumn: &'a rmpv::Value,
     /// The clipboard contents, or `None` when empty.
     pub clipboard: Option<(&'a str, bool)>,
 }
@@ -3459,6 +3461,7 @@ impl LuaRuntime {
             virt_text,
             virt_lines,
             signs,
+            colorcolumn,
             clipboard,
         } = ui;
         let btv = self.btv()?;
@@ -3483,6 +3486,15 @@ impl LuaRuntime {
         ui.set(
             "highlights",
             crate::convert::rmpv_to_lua(&self.lua, highlights)?,
+        )?;
+        // The resolved `'colorcolumn'` rulers, which the CLIENT paints from a column
+        // list rather than the server emitting spans — so they appear in none of the
+        // views above, and the resolved list is also the only place the "a
+        // 'textwidth'-relative +N entry is skipped" rule is visible (the option
+        // string reads "+1" either way).
+        ui.set(
+            "colorcolumn",
+            crate::convert::rmpv_to_lua(&self.lua, colorcolumn)?,
         )?;
         // The other decoration layers over the same rows — virtual text, virtual
         // lines and gutter signs — which `t:decor()` folds into one per-row answer.

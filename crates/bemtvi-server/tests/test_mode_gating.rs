@@ -109,3 +109,42 @@ async fn ui_statusline_mirror_carries_the_rendered_segment_text() {
         "the statusline mirror must carry the rendered global-bar text"
     );
 }
+
+#[tokio::test]
+async fn ui_mirror_carries_the_resolved_colorcolumn_rulers() {
+    // `'colorcolumn'` is painted by the CLIENT — the server sends the resolved
+    // column list, not highlight spans — so a spec could see it in none of the
+    // existing views: not `t:lines()` (it is not text), not `t:screen()` (it is a
+    // background), not `t:highlights()` (no span is emitted). Mirror the resolved
+    // list, which is also the only place the "+N is skipped" rule is observable:
+    // the option string still reads "+1" either way.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    feed(&rpc, ":set colorcolumn=10,40<CR>");
+    feed(&rpc, "<Esc>");
+    let cols = exec_lua(&rpc, "return table.concat(btv._ui.colorcolumn, ',')").await;
+    assert_eq!(
+        cols.as_str(),
+        Some("10,40"),
+        "the resolved 1-based ruler columns must reach the mirror"
+    );
+
+    // A 'textwidth'-relative entry is accepted but resolves to nothing (bemtvi
+    // models no 'textwidth' to anchor it), which only the resolved list shows.
+    feed(&rpc, ":set colorcolumn=+1<CR>");
+    feed(&rpc, "<Esc>");
+    let cols = exec_lua(&rpc, "return #btv._ui.colorcolumn").await;
+    assert_eq!(
+        cols.as_i64(),
+        Some(0),
+        "a textwidth-relative entry resolves to no ruler"
+    );
+
+    feed(&rpc, ":set colorcolumn=<CR>");
+    feed(&rpc, "<Esc>");
+    let cols = exec_lua(&rpc, "return #btv._ui.colorcolumn").await;
+    assert_eq!(cols.as_i64(), Some(0), "cleared means no rulers");
+}

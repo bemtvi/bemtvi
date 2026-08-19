@@ -52,19 +52,32 @@ impl UndoTree {
         }
     }
 
-    /// Overwrite the current node's snapshot cursor + multi-cursor marks with the
-    /// live ones, so undoing back to this node restores them — see
-    /// [`Editor::push_undo`]. Only the [`CURSOR_NS`] marks are replaced; the rest of
-    /// the snapshot (text, `a`–`z` marks, other extmarks) is untouched.
+    /// Re-sync the current node's snapshot with the live state we are about to edit
+    /// away from — see [`Editor::push_undo`]. The cursor and the multi-cursor
+    /// ([`CURSOR_NS`]) marks are taken from the arguments; `extmarks` and `marks` are
+    /// the live stores, replacing what the node was committed with.
+    ///
+    /// Refreshing the *marks* matters because a node is snapshotted when the state is
+    /// **entered**, and marks are routinely added to a state afterwards, outside any
+    /// `push_undo`: the root node is captured at buffer load, and a `BufReadPost`
+    /// handler decorates the buffer a moment later. Undoing back to a node
+    /// committed before those marks existed wiped every one of them — the first `u`
+    /// after opening a decorated file threw the decorations away. The live store is
+    /// in the same coordinate space as the snapshot's text (no edit has happened
+    /// yet), so it can be taken wholesale.
     fn set_cur_snapshot_cursors(
         &mut self,
         primary: Cursor,
         positions: &[usize],
         window: Option<WindowId>,
+        extmarks: crate::extmark::ExtmarkStore,
+        marks: std::collections::HashMap<char, (usize, usize)>,
     ) {
         let snap = &mut self.nodes[self.cur].snap;
         snap.cursor = primary;
         snap.cursor_window = window;
+        snap.extmarks = extmarks;
+        snap.marks = marks;
         snap.extmarks.clear(crate::extmark::CURSOR_NS, None);
         for &at in positions {
             snap.extmarks
@@ -739,10 +752,10 @@ impl Editor {
         let primary = self.cursor;
         let positions = self.secondary_cursor_bytes();
         let window = Some(self.windows.current);
-        self.buffers
-            .get_mut(id)
-            .undo
-            .set_cur_snapshot_cursors(primary, &positions, window);
+        let ob = self.buffers.get_mut(id);
+        let (extmarks, marks) = (ob.buffer.extmarks.clone(), ob.buffer.marks.clone());
+        ob.undo
+            .set_cur_snapshot_cursors(primary, &positions, window, extmarks, marks);
     }
 
     pub(crate) fn undo(&mut self) {

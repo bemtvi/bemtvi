@@ -318,3 +318,48 @@ async fn a_batch_whose_row_changes_cancel_out_still_moves_the_marks_between() {
     assert_eq!(pos(&rpc, between).await, (101, 0));
     assert_matches_full_rebuild(&rpc).await;
 }
+
+/// An extmark placed on a freshly-loaded buffer survives undoing the first edit
+/// made after it. Undo restores the snapshot the node it returns to was committed
+/// with, and the root node is snapshotted at buffer *load* — before any
+/// `BufReadPost` handler decorates it — so every mark a plugin placed there was
+/// wiped by the first `u`.
+#[tokio::test]
+async fn an_extmark_placed_after_load_survives_the_first_undo() {
+    let (rpc, _incoming) = open("alpha\nbravo\ncharlie\n").await;
+    // Decorate line 2, the way a `BufReadPost` handler would.
+    exec_lua(
+        &rpc,
+        r#"_G.ns = vim.api.nvim_create_namespace("undo_demo")
+           vim.api.nvim_buf_set_extmark(0, _G.ns, 1, 0, {
+             virt_text = { { " <- note", "Comment" } }, virt_text_pos = "eol",
+           })"#,
+    )
+    .await;
+    let before = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {})",
+    )
+    .await;
+    assert_eq!(before.as_i64(), Some(1), "the mark is placed");
+
+    // The first edit, then undo it.
+    feed(&rpc, "ggO<Esc>");
+    let moved = exec_lua(
+        &rpc,
+        "local m = vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {}) return m[1] and m[1][2]",
+    )
+    .await;
+    assert_eq!(moved.as_i64(), Some(2), "the mark rode the insert down");
+    feed(&rpc, "u");
+    let after = exec_lua(
+        &rpc,
+        "local m = vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {}) return m[1] and m[1][2]",
+    )
+    .await;
+    assert_eq!(
+        after.as_i64(),
+        Some(1),
+        "the mark rode back to the line it was on, rather than being wiped"
+    );
+}

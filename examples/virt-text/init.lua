@@ -41,6 +41,12 @@ local ns = vim.api.nvim_create_namespace("virt_text_demo")
 --    extmark. Guarded to the demo file so re-entering another buffer won't re-tag.
 --------------------------------------------------------------------------------
 local function decorate(buf)
+  -- Start from a clean slate: this runs on BufReadPost *and* BufWinEnter (and
+  -- again on every reload / new window onto the file), so without clearing the
+  -- namespace first each pass would stack another copy of every mark on the same
+  -- rows — two eol notes, two overlays, four virtual rows.
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+
   -- eol: a note after the line's last character.
   vim.api.nvim_buf_set_extmark(buf, ns, 2, 0, {
     virt_text = { { "  ← end-of-line note", "VtEol" } },

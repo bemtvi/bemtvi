@@ -704,8 +704,15 @@ end
 -- ```
 function Ctx:view()
   local ui = btv._ui or {}
-  local numbers = ui.numbers or {}
-  return { leftcol = ui.leftcol or 0, topline = numbers[1], numbers = numbers }
+  local wire = ui.numbers or {}
+  -- One entry per painted row, `false` where the row is not a buffer line at all (a
+  -- row an extmark reserved for a virtual LINE). The wire leaves those `nil`, which
+  -- would end an `ipairs` walk at the first virtual row and hide every row below it.
+  local numbers, rows = {}, #(ui.screen or {})
+  for i = 1, math.max(rows, #wire) do
+    numbers[i] = wire[i] or false
+  end
+  return { leftcol = ui.leftcol or 0, topline = numbers[1] or nil, numbers = numbers }
 end
 
 -- `t:gutter()` — the focused window's reserved gutter, as

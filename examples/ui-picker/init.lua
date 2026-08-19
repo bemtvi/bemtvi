@@ -18,6 +18,9 @@
 --   <CR>            confirm — runs the source's action on the highlighted item
 --   <C-t>           open the highlighted item in a NEW TAB (telescope's select_tab)
 --   <C-x> / <C-v>   open it in a horizontal / vertical SPLIT
+--                   (these three hand the gesture to the SOURCE's `confirm`; a
+--                   source that ignores it — like the `colours` one below — always
+--                   does its own thing, whichever key confirmed)
 --   <Esc>           cancel
 --
 -- Picker keys are ordinary `picker`-mode maps, so rebind any of them — e.g. the
@@ -161,8 +164,13 @@ btv.picker.source({
       ctx.push({ text = name, path = here .. "/" .. name })
     end
   end,
-  confirm = function(item)
-    vim.cmd("edit " .. item.path)
+  -- `confirm` is handed the CONFIRM GESTURE alongside the item: "current" for
+  -- <CR>, and "tab" / "split" / "vsplit" for <C-t> / <C-x> / <C-v>. Forward it to
+  -- `btv.picker.edit` (the opener the shipped sources use) and this source gets the
+  -- split/tab keys for free; a source that ignores the argument always opens in the
+  -- current window, whichever key confirmed it.
+  confirm = function(item, mode, layer)
+    btv.picker.edit(item, mode, layer)
   end,
 })
 btv.keymap.set("n", "<leader>fp", function()

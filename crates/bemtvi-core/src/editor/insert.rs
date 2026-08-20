@@ -734,14 +734,51 @@ impl Editor {
         let unit = opts.effective_softtabstop();
         let start = self.cursor_virtcol();
         let target = start - (start % unit) + unit; // next multiple of the unit
-        let ws = fill_indent(start, target, opts.effective_tabstop(), opts.expandtab);
-        let at = self.cursor_char();
+        let tabstop = opts.effective_tabstop();
+        // With `'noexpandtab'` and `'softtabstop'` on, vim re-tabs: the fill covers
+        // the whole whitespace run the cursor sits at the end of, so a pair of soft
+        // tabs that adds up to a real tabstop collapses into the `\t` it spans
+        // instead of leaving `"    \t"` behind (`ins_tab`'s "use as many TABs as
+        // possible" pass). The run may hold whitespace this keypress did not
+        // type — from the file, from autoindent — which is the point: the line ends
+        // up spelled the way `:retab` would spell it.
+        //
+        // Gated on `'softtabstop'` being *set*, not on the resolved chain: with
+        // `sts=0` the feature is off, a `<Tab>` is a literal tab character, and vim
+        // runs no pass at all — `"    \t"` is then the correct result.
+        let retab = !opts.expandtab && opts.softtabstop != 0;
+        let (from_col, from_vcol) = if retab {
+            let line = self.buffer().line_cow(self.cursor.line);
+            let mut col = self.cursor.col;
+            while col > 0 && matches!(line.as_bytes()[col - 1], b' ' | b'\t') {
+                col -= 1;
+            }
+            (col, unicode::virtcol(&line, col, tabstop))
+        } else {
+            (self.cursor.col, start)
+        };
+        let ws = fill_indent(from_vcol, target, tabstop, opts.expandtab);
+        let line_start = self.buffer().line_start(self.cursor.line);
+        let cursor_col = self.cursor.col;
+        let replaced = cursor_col - from_col;
+        if replaced > 0 {
+            self.buffer_mut()
+                .remove(line_start + from_col..line_start + cursor_col);
+        }
         // `ws` is ASCII (tabs/spaces), so its byte length is its column advance.
-        let n = ws.len();
-        self.buffer_mut().insert(at, &ws);
-        self.cursor.col += n;
+        self.buffer_mut().insert(line_start + from_col, &ws);
+        self.cursor.col = from_col + ws.len();
         self.buffer_mut().modified = true;
-        // The expanded tab is part of the `".` last-insert register.
+        // The `".` last-insert register holds what was inserted, so a re-tab that
+        // rewrote whitespace typed earlier in *this* session replaces it there too.
+        // Bounded to trailing blanks: the run can reach back into text the session
+        // never wrote, and popping non-blanks would eat a word.
+        for _ in 0..replaced {
+            if !matches!(self.insert_text.chars().last(), Some(' ') | Some('\t')) {
+                break;
+            }
+            self.insert_text.pop();
+        }
         self.insert_text.push_str(&ws);
     }
 

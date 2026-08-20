@@ -11,16 +11,6 @@ local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
 
 dofile(DIR .. "/init.lua")
 
---- Open the sample, re-reading it so each test starts from the same text.
-local function open(t)
-  t:cmd("e " .. DIR .. "/sample.lua")
-  t:cmd("e!")
-  t:feed("gg")
-  t:wait_for(function()
-    return #t:highlights(6) > 0
-  end, { message = "the provider never coloured the first TODO" })
-end
-
 --- The screen row showing `needle`, or nil. Screen rows are not buffer lines
 --- once the window has scrolled, and every view here is screen-indexed.
 local function row_of(t, needle)
@@ -32,13 +22,36 @@ local function row_of(t, needle)
   return nil
 end
 
---- The keyword spans on screen row `row` as `{ text, group }` pairs.
+--- The provider's own groups, by name.
+local KEYWORD_GROUPS = {
+  TodoKeyword = true,
+  FixmeKeyword = true,
+  NoteKeyword = true,
+  HackKeyword = true,
+}
+
+--- The PROVIDER's spans on screen row `row` as `{ text, group }` pairs. The
+--- highlight layer is shared — a `.lua` buffer with a grammar installed also
+--- carries tree-sitter's captures on these very rows — so every case here filters
+--- to the four groups this config defines rather than assuming the row is bare.
 local function keywords(t, row)
   local text, out = t:screen()[row] or "", {}
   for _, span in ipairs(t:highlights(row)) do
-    out[#out + 1] = { text:sub(span[1] + 1, span[2]), span[3] }
+    if KEYWORD_GROUPS[span[3]] then
+      out[#out + 1] = { text:sub(span[1] + 1, span[2]), span[3] }
+    end
   end
   return out
+end
+
+--- Open the sample, re-reading it so each test starts from the same text.
+local function open(t)
+  t:cmd("e " .. DIR .. "/sample.lua")
+  t:cmd("e!")
+  t:feed("gg")
+  t:wait_for(function()
+    return #keywords(t, 6) > 0
+  end, { message = "the provider never coloured the first TODO" })
 end
 
 btv.test.describe("examples/decor-todo", function()
@@ -70,7 +83,7 @@ btv.test.describe("examples/decor-todo", function()
     t:feed("Go-- XXX: and a HACK too<Esc>")
     local row = t:wait_for(function()
       local at = row_of(t, "XXX: and a HACK too")
-      return at and #t:highlights(at) == 2 and at or nil
+      return at and #keywords(t, at) == 2 and at or nil
     end, { message = "the appended line never coloured" })
     local spans = keywords(t, row)
     btv.test.expect(spans).to_contain({ "XXX", "HackKeyword" })
@@ -79,15 +92,14 @@ btv.test.describe("examples/decor-todo", function()
 
   btv.test.it("the span covers the bare keyword, nothing more", function(t)
     open(t)
-    for _, span in ipairs(t:highlights(6)) do
-      local text = t:screen()[6]:sub(span[1] + 1, span[2])
-      btv.test.expect(text).to_be("TODO")
-    end
+    local spans = keywords(t, 6)
+    btv.test.expect(#spans).to_be(1)
+    btv.test.expect(spans[1]).to_equal({ "TODO", "TodoKeyword" })
   end)
 
-  btv.test.it("a line with no keyword carries nothing", function(t)
+  btv.test.it("a line with no keyword carries nothing of the provider's", function(t)
     open(t)
-    btv.test.expect(#t:highlights(4)).to_be(0)
+    btv.test.expect(#keywords(t, 4)).to_be(0)
   end)
 
   btv.test.it("every occurrence on a line is coloured, not just the first", function(t)
@@ -95,10 +107,10 @@ btv.test.describe("examples/decor-todo", function()
     t:feed("GoTODO one TODO two TODO three<Esc>")
     local row = t:wait_for(function()
       local at = row_of(t, "TODO one TODO two TODO three")
-      return at and #t:highlights(at) == 3 and at or nil
+      return at and #keywords(t, at) == 3 and at or nil
     end, { message = "not every occurrence was coloured" })
-    for _, span in ipairs(t:highlights(row)) do
-      btv.test.expect(span[3]).to_be("TodoKeyword")
+    for _, span in ipairs(keywords(t, row)) do
+      btv.test.expect(span[2]).to_be("TodoKeyword")
     end
   end)
 
@@ -109,7 +121,7 @@ btv.test.describe("examples/decor-todo", function()
     t:wait_for(function()
       for row, text in ipairs(t:screen()) do
         if text:find("HACK", 1, true) or text:find("NOTE", 1, true) then
-          return #t:highlights(row) > 0
+          return #keywords(t, row) > 0
         end
       end
       -- Nothing keyword-bearing on screen is a pass too — nothing to colour.
@@ -126,7 +138,7 @@ btv.test.describe("examples/decor-todo", function()
     t:feed("<C-e><C-e><C-e><C-e><C-e><C-e><C-e><C-e>")
     local settled = t:wait_for(function()
       for row, text in ipairs(t:screen()) do
-        if text:find("HACK", 1, true) and #t:highlights(row) > 0 then
+        if text:find("HACK", 1, true) and #keywords(t, row) > 0 then
           return true
         end
       end
@@ -141,9 +153,9 @@ btv.test.describe("examples/decor-todo", function()
     t:cmd("enew")
     t:feed("iTODO in a brand new buffer<Esc>")
     t:wait_for(function()
-      return #t:highlights(1) > 0
+      return #keywords(t, 1) > 0
     end, { message = "the unscoped provider skipped a new buffer" })
-    btv.test.expect(t:highlights(1)[1][3]).to_be("TodoKeyword")
+    btv.test.expect(keywords(t, 1)[1]).to_equal({ "TODO", "TodoKeyword" })
   end)
 
   btv.test.it("the four highlight groups are defined", function(t)

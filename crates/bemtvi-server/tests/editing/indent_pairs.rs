@@ -498,3 +498,105 @@ async fn backspace_pads_back_a_tab_that_straddles_the_boundary() {
     feed(&rpc, "^i<BS>X<Esc>"); // cursor before `i`, at virtual column 8
     assert_eq!(lines(&rpc).await, vec!["    Xindented"]);
 }
+
+/// With `'noexpandtab'` and a `'softtabstop'` narrower than `'tabstop'`, a run of
+/// soft tabs that reaches a real tabstop is **re-tabbed**: the spaces collapse into
+/// the tab they add up to. vim's `ins_tab` does this pass over the whole whitespace
+/// run before the cursor after inserting the fill; without it the file ends up with
+/// `"    \t"` where every other editor — and the next `:retab` — has `"\t"`.
+#[tokio::test]
+async fn soft_tabs_collapse_into_a_real_tab_at_the_tabstop() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=4<CR>");
+    // One `<Tab>` is half a tabstop: spaces, because no tab fits yet.
+    feed(&rpc, "i<Tab><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    "], "half a tabstop is spaces");
+    // The second reaches column 8, so the pair becomes the single tab it spans.
+    feed(&rpc, "A<Tab><Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["\t"],
+        "two soft tabs are one real tab"
+    );
+    // A third goes back to a partial fill past it…
+    feed(&rpc, "A<Tab><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["\t    "]);
+    // …and the fourth collapses again.
+    feed(&rpc, "A<Tab><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["\t\t"]);
+}
+
+/// The pass re-tabs the whitespace run it lands in, not just what this keypress
+/// added — the spaces may have come from the file, from autoindent, or from an
+/// earlier session.
+#[tokio::test]
+async fn the_retab_pass_covers_whitespace_it_did_not_type() {
+    let path = write_temp("softtab_retab", "txt", "    existing\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=4<CR>");
+    // Insert before `existing`, at virtual column 4: one `<Tab>` reaches 8.
+    feed(&rpc, "^i<Tab><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["\texisting"]);
+}
+
+/// It stops at the first non-blank: a run of spaces after a word re-tabs on its
+/// own terms, and the word is never touched.
+#[tokio::test]
+async fn the_retab_pass_stops_at_the_first_non_blank() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "iab<Tab><Tab><Esc>");
+    // `ab` is 2 columns; two soft tabs land on 4 then 8, and the run from column
+    // 2 becomes a tab (which spans 2→8) with the `ab` untouched.
+    assert_eq!(lines(&rpc).await, vec!["ab\t"]);
+}
+
+/// `'softtabstop'` off is what turns the pass off, exactly as in vim: a `<Tab>`
+/// with `sts=0` is a literal tab character wherever the cursor is, and the spaces
+/// before it stay spaces.
+#[tokio::test]
+async fn without_softtabstop_a_tab_is_literal_and_nothing_is_retabbed() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=0<CR>");
+    feed(&rpc, "i    <Tab>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    \tX"]);
+}
+
+/// …and `'expandtab'` likewise: the fill is spaces, and no tab is ever produced.
+#[tokio::test]
+async fn expandtab_never_retabs() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "i<Tab><Tab>X<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["        X"]);
+}
+
+/// The re-tab rewrites whitespace, so the `".` last-insert register — and the
+/// dot-repeat that replays the session — has to end up holding the tab the run
+/// collapsed into rather than the spaces it replaced.
+#[tokio::test]
+async fn the_retab_pass_keeps_the_last_insert_register_honest() {
+    let path = write_temp("softtab_reg", "txt", "one\ntwo\n");
+    let (rpc, _incoming) = start(Some(path)).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "gg0i<Tab><Tab><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["\tone", "two"]);
+    let reg = exec_lua(&rpc, r#"return vim.fn.getreg('.')"#).await;
+    assert_eq!(reg.as_str(), Some("\t"), "the `\".` register");
+    // …and `.` replays the same keys on the next line, re-tab and all.
+    feed(&rpc, "j0.");
+    assert_eq!(lines(&rpc).await, vec!["\tone", "\ttwo"]);
+}
+
+/// The pass rewrites the whitespace run and nothing else: text after the cursor
+/// stays where it is, and the cursor lands past the fill.
+#[tokio::test]
+async fn a_retabbed_tab_leaves_the_rest_of_the_line_alone() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set noexpandtab tabstop=8 softtabstop=4<CR>");
+    feed(&rpc, "iab    cd<Esc>");
+    // Cursor before `c` (virtual column 6): one `<Tab>` reaches 8, and the run
+    // from column 2 becomes a tab — with `cd` untouched right after it.
+    feed(&rpc, "0fci<Tab><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["ab\tcd"]);
+}

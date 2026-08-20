@@ -13,7 +13,16 @@ local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
 
 dofile(DIR .. "/init.lua")
 
+--- Open the sample, with anything a previous case's request left on screen gone
+--- first. A code-action reply lands on a LATER tick — with a real gopls attached
+--- it can arrive mid-case and open its chooser over the next one — so each case
+--- starts from a settled screen rather than assuming one.
 local function open(t)
+  t:feed("<Esc>")
+  t:feed("<Esc>")
+  t:wait_for(function()
+    return t:menu() == nil
+  end, { tries = 200, interval = 20, message = "a chooser outlived the previous case" })
   t:cmd("only")
   t:cmd("e " .. DIR .. "/sample.go")
   t:cmd("e!")
@@ -103,10 +112,9 @@ btv.test.describe("examples/lsp-code-action-range", function()
   btv.test.it("the ex form takes the addressed lines", function(t)
     open(t)
     attach(t)
-    t:feed("9G")
-    t:feed("V3j")
-    t:feed(":")
-    -- The line is prefilled with the selection's address.
+    -- One feed: `:` prefills the selection's address only while the selection is
+    -- live, so nothing may settle between them.
+    t:feed("9GV3j:")
     btv.test.expect(t:cmdline()).to_be(":'<,'>")
     t:feed("LspCodeAction<CR>")
     t:wait_for(function()

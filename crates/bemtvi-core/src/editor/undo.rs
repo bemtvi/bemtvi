@@ -23,6 +23,7 @@ impl UndoTree {
             children: Vec::new(),
             time: 0,
             save: None,
+            snap_extmark_gen: buffer.extmarks.generation(),
             snap: Snapshot {
                 text: buffer.text.clone(),
                 cursor: Cursor::default(),
@@ -54,8 +55,10 @@ impl UndoTree {
 
     /// Re-sync the current node's snapshot with the live state we are about to edit
     /// away from — see [`Editor::push_undo`]. The cursor and the multi-cursor
-    /// ([`CURSOR_NS`]) marks are taken from the arguments; `extmarks` and `marks` are
-    /// the live stores, replacing what the node was committed with.
+    /// ([`CURSOR_NS`]) marks are taken from the arguments; `marks` is the live
+    /// per-file mark store, and `extmarks` the live extmark store — the latter only
+    /// when it has structurally moved since this node was last synced (`Some`), see
+    /// [`Editor::refresh_undo_cursor_marks`].
     ///
     /// Refreshing the *marks* matters because a node is snapshotted when the state is
     /// **entered**, and marks are routinely added to a state afterwards, outside any
@@ -70,19 +73,30 @@ impl UndoTree {
         primary: Cursor,
         positions: &[usize],
         window: Option<WindowId>,
-        extmarks: crate::extmark::ExtmarkStore,
+        extmarks: Option<crate::extmark::ExtmarkStore>,
         marks: std::collections::HashMap<char, (usize, usize)>,
+        live_extmark_gen: u64,
     ) {
-        let snap = &mut self.nodes[self.cur].snap;
+        let node = &mut self.nodes[self.cur];
+        node.snap_extmark_gen = live_extmark_gen;
+        let snap = &mut node.snap;
         snap.cursor = primary;
         snap.cursor_window = window;
-        snap.extmarks = extmarks;
+        if let Some(extmarks) = extmarks {
+            snap.extmarks = extmarks;
+        }
         snap.marks = marks;
         snap.extmarks.clear(crate::extmark::CURSOR_NS, None);
         for &at in positions {
             snap.extmarks
                 .set(crate::extmark::CURSOR_NS, None, at, None, None, 0, None);
         }
+    }
+
+    /// The live extmark generation the current node's snapshot was last synced to —
+    /// see [`UndoNode::snap_extmark_gen`].
+    fn cur_snapshot_extmark_gen(&self) -> u64 {
+        self.nodes[self.cur].snap_extmark_gen
     }
 
     /// Seq of the current state (`b_u_seq_cur`).
@@ -302,12 +316,17 @@ impl UndoTree {
         let seq = self.next_seq;
         self.next_seq += 1;
         let idx = self.nodes.len();
+        // The snapshot is a fresh clone of the live store, so it is in sync by
+        // construction — recorded here so the re-sync in `set_cur_snapshot_cursors`
+        // can skip a second clone of the very same marks.
+        let snap_extmark_gen = snap.extmarks.generation();
         self.nodes.push(UndoNode {
             seq,
             parent: Some(self.cur),
             children: Vec::new(),
             time: now,
             save: None,
+            snap_extmark_gen,
             snap,
         });
         self.nodes[self.cur].children.push(idx);
@@ -753,9 +772,24 @@ impl Editor {
         let positions = self.secondary_cursor_bytes();
         let window = Some(self.windows.current);
         let ob = self.buffers.get_mut(id);
-        let (extmarks, marks) = (ob.buffer.extmarks.clone(), ob.buffer.marks.clone());
-        ob.undo
-            .set_cur_snapshot_cursors(primary, &positions, window, extmarks, marks);
+        // The extmark store is re-cloned only when a mark has actually been set /
+        // deleted / cleared since this node was last synced — the structural
+        // `generation`. Cloning it unconditionally is per-change-group work that
+        // scales with the decoration count (5000 extmarks measured ~30% on typing),
+        // which is exactly the kind of total-size-per-event cost the editor must not
+        // pay. The per-file `marks` map is a handful of entries, so it always rides.
+        let live_extmark_gen = ob.buffer.extmarks.generation();
+        let extmarks = (ob.undo.cur_snapshot_extmark_gen() != live_extmark_gen)
+            .then(|| ob.buffer.extmarks.clone());
+        let marks = ob.buffer.marks.clone();
+        ob.undo.set_cur_snapshot_cursors(
+            primary,
+            &positions,
+            window,
+            extmarks,
+            marks,
+            live_extmark_gen,
+        );
     }
 
     pub(crate) fn undo(&mut self) {

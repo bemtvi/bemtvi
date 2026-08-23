@@ -442,6 +442,15 @@ struct UndoNode {
     /// `save` field of `vim.fn.undotree()` entries (neovim's `uh_save_nr`).
     save: Option<u64>,
     snap: Snapshot,
+    /// The live [`ExtmarkStore::generation`] this node's `snap.extmarks` was last
+    /// made equal to. `push_undo` re-syncs the snapshot's marks against the live
+    /// store, and cloning the whole store on every change group is work that scales
+    /// with the buffer's decoration count — measurably so: 5000 extmarks cost ~30%
+    /// on typing. Only a *structural* change (a mark set / deleted / cleared) can
+    /// make the snapshot diverge, and that is exactly what the generation counts, so
+    /// an unchanged counter skips the clone. Anchor *positions* need no such guard:
+    /// a re-sync only ever runs on a node the live text still matches.
+    snap_extmark_gen: u64,
 }
 
 /// A buffer's branching undo history. The live buffer text always corresponds to

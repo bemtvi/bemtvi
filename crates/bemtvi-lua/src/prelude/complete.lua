@@ -67,13 +67,15 @@ local function reconcile()
   -- The native sources' gates/priorities and the min across every active source
   -- (the global open gate). `all_min` starts nil and lowers as sources are seen.
   --
-  -- A gate of `0` means "not listed at all": `sources` is the list of sources to
-  -- draw from, so a `setup{}` that names others and omits `buffer` gets no buffer
-  -- words. (The default `sources` is `{ { "buffer" } }`, so a bare `setup{}` still
-  -- has them.)
-  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 0, 1, 1
+  -- `saw_buffer` rides its own wire slot rather than being read off a `0` gate:
+  -- `sources` is the list of sources to draw from, so a `setup{}` that names others
+  -- and omits `buffer` gets no buffer words — but `0` is also a legal `min_chars`
+  -- ("no gate"), so overloading it would silently disable the source for anyone who
+  -- asked for completion from the first character. (The default `sources` is
+  -- `{ { "buffer" } }`, so a bare `setup{}` still has them.)
+  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 1, 1, 1
   local buffer_priority, lsp_priority, snippets_priority = 0, 0, 0
-  local saw_lsp, saw_snippets = false, false
+  local saw_buffer, saw_lsp, saw_snippets = false, false, false
   local all_min = nil
   local function lower(mc)
     all_min = math.min(all_min or mc, mc)
@@ -81,6 +83,7 @@ local function reconcile()
 
   local bi = cfg.builtins
   if bi.buffer then
+    saw_buffer = true
     buffer_priority, buffer_min_chars = bi.buffer.priority, bi.buffer.min_chars
     lower(bi.buffer.min_chars)
   end
@@ -176,10 +179,12 @@ local function reconcile()
 
   btv._complete_setup(
     cfg.auto == true,
-    -- `{ open, buffer, lsp, snippets }` min_chars gates (one packed tuple slot): the
-    -- global open gate plus each native source's own threshold. Lua sources carry
-    -- theirs on `btv._complete.sources` (gated in `btv._complete_run`).
-    { min_chars, buffer_min_chars, lsp_min_chars, snippets_min_chars },
+    -- `{ open, buffer, lsp, snippets, buffer_listed }` (one packed tuple slot): the
+    -- global open gate, each native source's own threshold, and whether `buffer` was
+    -- listed in `sources` at all (`1`/`0` — a gate cannot carry that, since `0` is a
+    -- legal gate). Lua sources carry theirs on `btv._complete.sources` (gated in
+    -- `btv._complete_run`).
+    { min_chars, buffer_min_chars, lsp_min_chars, snippets_min_chars, saw_buffer and 1 or 0 },
     key_list(keys.next, "next"),
     key_list(keys.prev, "prev"),
     key_list(keys.confirm, "confirm"),

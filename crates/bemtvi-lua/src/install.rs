@@ -3458,9 +3458,9 @@ pub(crate) fn install_runtime_api(
     // list before calling this.
     let sh = shared.clone();
     // Two args are **packed lists** so the whole config fits mlua's 16-element
-    // `create_function` tuple cap: `min_chars` is `{ open, buffer, lsp, snippets }` (the
-    // global open gate plus each native source's own gate; missing entries default to
-    // `1`), and `priorities` is `{ buffer, lsp, snippets }` (merge rank per native
+    // `create_function` tuple cap: `min_chars` is `{ open, buffer, lsp, snippets, buffer_listed }`
+    // (the global open gate, each native source's own gate, and whether `buffer` was
+    // named in `sources`; missing entries default to `1`), and `priorities` is `{ buffer, lsp, snippets }` (merge rank per native
     // source; missing entries default to `0`). Per-source `min_chars` / `priority` for
     // *Lua* sources ride `btv._complete.sources` instead (gated in `btv._complete_run`).
     type CompleteSetupArgs = (
@@ -3506,10 +3506,13 @@ pub(crate) fn install_runtime_api(
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
                     min_chars: mc(0),
-                    // A `min_chars` of 0 in the wire slot means "not listed": the
-                    // native buffer source contributes nothing at all.
-                    buffer_source: mc(1) > 0,
-                    buffer_min_chars: mc(1).max(1),
+                    // Slot 4 is the "was `buffer` listed in `sources` at all" flag.
+                    // It gets its own slot rather than overloading the gate beside
+                    // it: `0` is a legal `min_chars` (no gate), so a config asking
+                    // for completion from the first character would otherwise read
+                    // as one that turned the buffer source off.
+                    buffer_source: mc(4) > 0,
+                    buffer_min_chars: mc(1),
                     lsp_min_chars: mc(2),
                     snippets_min_chars: mc(3),
                     next,

@@ -100,3 +100,13 @@ Notes.mount({
   dock = "left",
   size = 36,
 })
+
+-- …and land back in the main area. Mounting a dock focuses it, and a persistent mount
+-- lands a tick later than the config chunk — so without this the session opens with the
+-- cursor parked in the sidebar instead of in the file you asked for, and anything that
+-- then acts on "the current window" acts on the sidebar. `btv.on_next_tick` here fires
+-- after the mount's own (queued first, so it runs first), and the layer cross drains
+-- after the view ops it follows.
+btv.on_next_tick(function()
+  btv.layer.main()
+end)

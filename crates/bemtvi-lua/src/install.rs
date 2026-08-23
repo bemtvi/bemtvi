@@ -391,6 +391,25 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
 /// than quietly rounding it up to `:silent!` (which would also eat the output the
 /// caller asked to keep), it is rejected by name; likewise any modifier bemtvi
 /// doesn't dispatch, so a `mods` key can never be silently dropped.
+/// Refuse a `btv._test_*` primitive outside plugin-test mode. These three are the
+/// user's pointer (`_test_mouse`) and the user's idle pause (`_test_idle`, and the
+/// per-input `_test_clear_scroll` reset that goes with `t:feed`) — capabilities a
+/// spec legitimately has and a plugin does not. `btv.test` itself is installed only
+/// when the `--test-plugin` runner enables test mode, and this is the same gate on
+/// the primitives beneath it, so "reachable only through `btv.test`" is enforced
+/// rather than merely documented. It raises rather than no-opping: a call that
+/// quietly does nothing is exactly the silent stub that makes broken behavior look
+/// like working behavior.
+fn test_only(shared: &Rc<RefCell<Shared>>, name: &str) -> mlua::Result<()> {
+    if shared.borrow().test_api_installed {
+        return Ok(());
+    }
+    Err(mlua::Error::runtime(format!(
+        "{name} is only available under plugin-test mode (bemtvi --test-plugin); \
+         it synthesises what the USER did, which a plugin must not do"
+    )))
+}
+
 fn cmd_with_mods(cmd: String, opts: Option<mlua::Table>) -> mlua::Result<String> {
     let Some(opts) = opts else { return Ok(cmd) };
     let mut silent = false;
@@ -2197,12 +2216,14 @@ pub(crate) fn install_runtime_api(
     // the server to replay at the same seam a client's `btv_input_mouse` lands on.
     // Reachable only through the gated `btv.test` (`t:mouse`): a plugin has no business
     // synthesising the user's pointer, but a SPEC is the user — and without this every
-    // mouse-driven feature was untestable.
+    // mouse-driven feature was untestable. Outside plugin-test mode it raises rather
+    // than silently queueing a gesture nobody asked for — see [`test_only`].
     let sh = shared.clone();
     btv.set(
         "_test_mouse",
         lua.create_function(
             move |_, (button, action, modifier, row, col): (String, String, String, usize, usize)| {
+                test_only(&sh, "btv._test_mouse")?;
                 sh.borrow_mut().test_mouse.push(MouseOp {
                     button,
                     action,
@@ -2222,6 +2243,7 @@ pub(crate) fn install_runtime_api(
     btv.set(
         "_test_idle",
         lua.create_function(move |_, ()| {
+            test_only(&sh, "btv._test_idle")?;
             sh.borrow_mut().test_idle += 1;
             Ok(())
         })?,
@@ -2235,6 +2257,7 @@ pub(crate) fn install_runtime_api(
     btv.set(
         "_test_clear_scroll",
         lua.create_function(move |_, ()| {
+            test_only(&sh, "btv._test_clear_scroll")?;
             sh.borrow_mut().test_scroll_clear = true;
             Ok(())
         })?,

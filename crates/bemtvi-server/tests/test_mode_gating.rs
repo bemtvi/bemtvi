@@ -719,3 +719,48 @@ async fn ui_mirror_carries_the_cmdline_prefix_and_prompt() {
     );
     feed(&rpc, "<Esc>");
 }
+
+/// The `btv._test_*` primitives under `btv.test` — the user's pointer (`t:mouse`)
+/// and the user's idle pause (`t:idle`, plus the `t:feed` scroll reset) — are gated
+/// on the same test mode `btv.test` itself is. They were installed unconditionally,
+/// so a plugin in a normal session could synthesise the user's mouse: documented as
+/// test-only, not gated as test-only. They raise outside plugin-test mode rather
+/// than no-opping, so a wrong call says so instead of quietly doing nothing.
+#[tokio::test]
+async fn test_input_primitives_are_gated_on_test_mode() {
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+
+    for call in [
+        r#"btv._test_mouse("left", "press", "", 0, 0)"#,
+        "btv._test_idle()",
+        "btv._test_clear_scroll()",
+    ] {
+        let err = exec_lua(
+            &rpc,
+            &format!("local ok, e = pcall(function() {call} end) return tostring(e)"),
+        )
+        .await;
+        let msg = err.as_str().unwrap_or_default();
+        assert!(
+            msg.contains("plugin-test mode"),
+            "{call} must refuse loudly in a normal session, got {msg:?}"
+        );
+    }
+
+    rpc.request("btv_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    // …and each of them works once a spec is the caller.
+    for call in [
+        r#"btv._test_mouse("left", "press", "", 0, 0)"#,
+        "btv._test_idle()",
+        "btv._test_clear_scroll()",
+    ] {
+        assert_eq!(
+            exec_lua(&rpc, &format!("return (pcall(function() {call} end))")).await,
+            Value::Boolean(true),
+            "{call} must be callable under plugin-test mode"
+        );
+    }
+}

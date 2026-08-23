@@ -1185,6 +1185,13 @@ pub(crate) struct Shared {
     /// buffer and processed (through the mapping engine, or straight to the
     /// editor) after the chunk / off-tick settle.
     pub(crate) feedkeys: Vec<FeedKeysOp>,
+    /// Whether the `btv.test` framework has been installed (plugin-test mode). The
+    /// `btv._test_*` primitives the framework drives refuse to queue anything until
+    /// it is: they are the user's pointer and the user's idle pause, and a
+    /// capability that is only *documented* as test-only is not gated at all. Set by
+    /// [`LuaRuntime::install_test_api`], which the server calls when the
+    /// `--test-plugin` runner enables test mode.
+    pub(crate) test_api_installed: bool,
     /// Mouse gestures queued by the `btv.test` harness (`t:mouse`), replayed by the
     /// server at the same seam a client's `btv_input_mouse` lands on.
     pub(crate) test_mouse: Vec<MouseOp>,
@@ -1292,6 +1299,7 @@ impl Shared {
             workspace_dir: _,
             plugin_shada: _,
             key_pending_active: _,
+            test_api_installed: _,
         } = self;
         *sequenced = Default::default();
         *output = Default::default();
@@ -3493,7 +3501,11 @@ impl LuaRuntime {
     /// enables test mode, so the API exists only there.
     pub fn install_test_api(&self) -> mlua::Result<()> {
         let install: mlua::Function = self.btv()?.get("_install_test")?;
-        install.call(())
+        install.call::<()>(())?;
+        // …and unlock the `btv._test_*` primitives the framework drives — see
+        // [`Shared::test_api_installed`]. Outside a spec they raise.
+        self.shared.borrow_mut().test_api_installed = true;
+        Ok(())
     }
 
     /// Refresh the `btv._ui` mirror from a [`UiMirror`] snapshot — what the plugin

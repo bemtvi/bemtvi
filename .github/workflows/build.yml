@@ -422,10 +422,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Two wasm targets: emscripten for the edit-host staticlib emcc links, and bare
+      # `wasm32-unknown-unknown` for the column-math module (bemtvi-width), which the
+      # page instantiates directly with no JS glue. build.sh needs both.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-emscripten
+          targets: wasm32-unknown-emscripten, wasm32-unknown-unknown
 
       # emcc — the final linker build.sh invokes by hand to combine the Rust staticlib
       # with the vendored C archives. Pin to the EMSDK_VERSION netlify.toml uses so the

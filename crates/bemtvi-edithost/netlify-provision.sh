@@ -9,9 +9,10 @@
 TOOLCHAIN="${RUST_VERSION:-stable}"
 EMSDK_VERSION="${EMSDK_VERSION:-6.0.0}"
 
-# 1. Rust toolchain + the emscripten wasm target. Netlify's image ships `rustup` but with no
+# 1. Rust toolchain + both wasm targets. Netlify's image ships `rustup` but with no
 #    default toolchain configured, so install & select it explicitly. No wasm-bindgen — this
-#    build links via emcc.
+#    build links via emcc. The bare `wasm32-unknown-unknown` target is for the column-math
+#    module (bemtvi-width): no emscripten and no JS glue, instantiated by the page itself.
 if ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain none --profile minimal
@@ -20,7 +21,7 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 rustup toolchain install "$TOOLCHAIN" --profile minimal
 rustup default "$TOOLCHAIN"
-rustup target add wasm32-unknown-emscripten
+rustup target add wasm32-unknown-emscripten wasm32-unknown-unknown
 
 # 2. Emscripten SDK (emcc). Install into $HOME/emsdk — the exact path build.sh probes and
 #    sources when emcc isn't already on PATH. Downloaded prebuilt (a couple of minutes), not

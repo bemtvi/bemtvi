@@ -112,3 +112,41 @@ async fn a_case_operator_refuses_on_a_nomodifiable_buffer() {
     feed(&rpc, "gg0gUU");
     assert_eq!(lines(&rpc).await, vec!["AbC"]);
 }
+
+#[tokio::test]
+async fn a_case_operator_brackets_the_recased_span_with_the_change_marks() {
+    // vim's `op_tilde` leaves `'[` / `']` around what it recased, so `` `[ `` jumps
+    // to the change and `` v`] `` reselects it. The span is replaced wholesale, so
+    // marks recorded *before* the rewrite are collapsed onto the edit by the remove
+    // and dragged past its end by the insert: the visual spelling reported both
+    // marks one past the last recased character, and the operator spelling set
+    // neither. Both now record after the write, against the new length.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha beta gamma<Esc>");
+    feed(&rpc, "0wgUe");
+    assert_eq!(lines(&rpc).await, vec!["alpha BETA gamma"]);
+    feed(&rpc, "0`[");
+    assert_eq!(cursor(&rpc).await, (1, 6), "`[ is the first recased char");
+    feed(&rpc, "0`]");
+    assert_eq!(cursor(&rpc).await, (1, 9), "`] is the last recased char");
+
+    // The visual spelling of the same operator agrees.
+    feed(&rpc, "0wveu");
+    assert_eq!(lines(&rpc).await, vec!["alpha beta gamma"]);
+    feed(&rpc, "0`[");
+    assert_eq!(cursor(&rpc).await, (1, 6));
+    feed(&rpc, "0`]");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+}
+
+#[tokio::test]
+async fn a_width_changing_case_fold_brackets_its_grown_span() {
+    // `ß` → `SS` makes the recased text longer than the source, so `']` must follow
+    // the text that was actually written, not the range that was read.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ix straße y<Esc>");
+    feed(&rpc, "0wgUe");
+    assert_eq!(lines(&rpc).await, vec!["x STRASSE y"]);
+    feed(&rpc, "0`]");
+    assert_eq!(cursor(&rpc).await, (1, 8), "`] is the last char of STRASSE");
+}

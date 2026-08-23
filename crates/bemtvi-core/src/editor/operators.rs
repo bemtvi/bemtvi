@@ -374,7 +374,6 @@ impl Editor {
         // selection's case in place — like `=`, no yank / register. The cursor settles
         // on the selection start and the selection is dropped, as vim does.
         if matches!(op, LOWER_OP | UPPER_OP | TOGGLE_OP) {
-            self.record_change_bounds(lo, hi);
             self.case_range(lo, hi, op);
             self.set_cursor_char(lo);
             self.mode = Mode::Normal;
@@ -1055,6 +1054,13 @@ impl Editor {
         self.buffer_mut().remove(lo..hi);
         self.buffer_mut().insert(lo, &recased);
         self.buffer_mut().modified = true;
+        // `'[` / `']` bracket the recased span, as vim's `op_tilde` leaves them.
+        // Recorded AFTER the rewrite, and against the NEW length: the span is
+        // replaced wholesale, so marks recorded first are collapsed onto the edit by
+        // the remove and then dragged to its end by the insert — which is how the
+        // visual spelling reported both marks past the last recased character while
+        // the operator spelling set neither.
+        self.record_change_bounds(lo, lo + recased.len());
     }
 
     /// Toggle the case of every character in `[lo, hi)` in a single undo step — the

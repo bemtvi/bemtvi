@@ -17,9 +17,23 @@ local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
 
 dofile(DIR .. "/init.lua")
 
+--- Whether a case has already waited for the mount. The sidebar is mounted ONCE, by
+--- the config, so only the first case can legitimately be waiting on it — every
+--- later one is re-focusing a window that already exists. Splitting the two lets the
+--- first wait generously (a loaded machine can take seconds to get the dock up)
+--- without multiplying that patience by the number of cases.
+---
+--- It flips on the first ATTEMPT, not the first success. The suite has its own 30s
+--- budget, and a long per-case wait that survives a miss is what overruns it: eight
+--- cases each patiently waiting out the same absent sidebar spend minutes and report
+--- a bare "did not finish" naming nothing, instead of one named failure.
+local waited_for_mount = false
+
 --- Focus the sidebar the config mounted, waiting for it to appear, and return its
 --- rows with the cursor on the first one.
 local function sidebar(t)
+  local first = not waited_for_mount
+  waited_for_mount = true
   t:wait_for(function()
     for _, w in ipairs(vim.api.nvim_list_wins()) do
       if btv.buf.name(vim.api.nvim_win_get_buf(w)) == "Notes" then
@@ -28,16 +42,30 @@ local function sidebar(t)
       end
     end
     return false
-  end, { tries = 200, interval = 20, message = "the Notes sidebar never mounted" })
+  end, {
+    tries = first and 500 or 50,
+    interval = 20,
+    message = first and "the Notes sidebar never mounted" or "the Notes sidebar went away",
+  })
   t:feed("gg")
   return t:lines()
 end
 
---- Hand focus back to the editor.
+--- Hand focus back to the editor, and WAIT for the cross to land.
+---
+--- `btv.layer.main()` queues the move like every other mutation, and `t:exec` runs
+--- its function without settling — so on a slow tick a case can end with focus still
+--- in the dock. The next case's baseline `enew!` then runs THERE and replaces the
+--- sidebar's own buffer, and every case after it hunts a window that no longer
+--- exists. That was this spec's flake: not a wrong assertion anywhere, but a suite
+--- that ran out of time looking for a buffer an earlier case had destroyed.
 local function leave(t)
   t:exec(function()
     btv.layer.main()
   end)
+  t:wait_for(function()
+    return btv.buf.name(btv.buf.current()) ~= "Notes"
+  end, { tries = 100, interval = 20, message = "focus never left the Notes sidebar" })
 end
 
 btv.test.describe("examples/view-persist", function()

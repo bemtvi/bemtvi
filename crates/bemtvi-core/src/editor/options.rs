@@ -68,6 +68,15 @@ impl Editor {
         // `echo` already recorded.
         let multi = toks.len() > 1;
         let mut reports: Vec<String> = Vec::new();
+        // …and the joined line is an ERROR line if any token's report was one. Each
+        // `echo` overwrites `message_error` with its own verdict, so without this an
+        // `E518` followed by a successful query would light the joined line green.
+        let mut any_error = false;
+        // What was on the line before, so a `:set a b` that echoes nothing at all
+        // (two plain writes) leaves it alone instead of blanking it — the per-token
+        // `clear()` below is bookkeeping for the gather, not a message the user asked
+        // to have wiped.
+        let prior = (self.message.clone(), self.message_error);
         for tok in toks {
             if multi {
                 self.message.clear();
@@ -79,12 +88,16 @@ impl Editor {
                 None => self.echo(format!("E518: Unknown option: {tok}")),
             }
             if multi && !self.message.is_empty() {
+                any_error |= self.message_error;
                 reports.push(std::mem::take(&mut self.message));
             }
         }
         if !reports.is_empty() {
             // Two spaces between reports — vim's column gap, without the alignment.
             self.message = reports.join("  ");
+            self.message_error = any_error;
+        } else if multi && self.message.is_empty() {
+            (self.message, self.message_error) = prior;
         }
     }
 

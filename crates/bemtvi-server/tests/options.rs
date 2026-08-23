@@ -1647,4 +1647,24 @@ async fn a_multi_option_query_reports_every_option() {
         msg.contains("E518"),
         "unknown option still loud, got {msg:?}"
     );
+    // …and the joined line is still styled as an error, even though the *last*
+    // token echoed a perfectly good answer. Each `echo` overwrites `message_error`
+    // with its own verdict, so gathering the reports without OR-ing the flag left an
+    // `E518` line painted as ordinary output.
+    command(&rpc, "set nosuchopt? wrap?").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    let msg = message(&frame);
+    assert!(
+        msg.contains("E518") && msg.contains("nowrap"),
+        "got {msg:?}"
+    );
+    assert_eq!(
+        frame
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("message_error"))
+            .map(|(_, v)| v.as_bool()),
+        Some(Some(true)),
+        "an E518 among the reports still lights the line red"
+    );
 }

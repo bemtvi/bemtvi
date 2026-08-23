@@ -3620,11 +3620,6 @@ impl LuaRuntime {
         // it was the one payload of the shared extmark vocabulary a spec could not
         // see at all. Folded into `t:decor()` as a per-row flag — the wire carries a
         // per-frame palette id, not a group name, exactly as for `virt_text`.
-        // The full-width row tint a `line_hl_group` lays down. It rides its own wire
-        // layer rather than the highlight spans, so it was the one payload of the
-        // shared extmark vocabulary a spec could not see at all. Folded into
-        // `t:decor()` as a per-row flag — the wire carries a per-frame palette id,
-        // not a group name, exactly as for `virt_text`.
         ui.set("line_bg", crate::convert::rmpv_to_lua(&self.lua, line_bg)?)?;
         // The end-of-line diagnostic message. It rides its own wire layer rather
         // than the extmark `virt_text` one, so the signs beside it were mirrored

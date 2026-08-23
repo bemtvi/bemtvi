@@ -345,16 +345,6 @@ impl EditHost {
             let numbers_v = layer("numbers");
             let number_shown = matches!(layer("number"), Value::Boolean(true))
                 || matches!(layer("relativenumber"), Value::Boolean(true));
-            // The status line as painted. The global bar (`laststatus=3`) is the whole
-            // story when there is one; at every other `'laststatus'` — the default
-            // included — it is `Nil` and each window paints its own row, so fall back
-            // to the focused window's. Without the fallback the mirror reported "" for
-            // the bar a client was visibly drawing, and a spec asserting on it passed
-            // vacuously.
-            // …and only when a bar is actually drawn: `status_visible` is false at
-            // `laststatus=0`, and at 1 with a single window, where the client gives
-            // the freed row to text instead. Reporting the text the server computed
-            // anyway would say a bar is up when none is.
             // The scroll gesture rides exactly one frame — the settle after the input
             // that started it repaints without it — so the mirror keeps the last one
             // seen and `t:scroll`'s own reset (`btv._test_clear_scroll`) is what
@@ -363,6 +353,15 @@ impl EditHost {
                 Value::Nil => {}
                 band => self.test_scroll = band,
             }
+            // The status line as painted. The global bar (`laststatus=3`) is the whole
+            // story when there is one; at every other `'laststatus'` — the default
+            // included — it is `Nil` and each window paints its own row, so fall back
+            // to the focused window's. Without the fallback the mirror reported "" for
+            // the bar a client was visibly drawing, and a spec asserting on it passed
+            // vacuously. …and only when a bar is actually drawn: `status_visible` is
+            // false at `laststatus=0`, and at 1 with a single window, where the client
+            // gives the freed row to text instead. Reporting the text the server
+            // computed anyway would say a bar is up when none is.
             let statusline_text = match &global_status {
                 Value::Nil if matches!(layer("status_visible"), Value::Boolean(true)) => {
                     chunk_runs_text(&layer("status"))

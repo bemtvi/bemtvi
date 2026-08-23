@@ -1651,8 +1651,9 @@ impl Editor {
     /// Move `target`'s per-file marks into [`Editor::pending_file_marks`] so a later
     /// open of the same path seeds them back — the in-session half of what shada does
     /// across a relaunch. A buffer with no path (a scratch surface) or no marks is
-    /// left alone; an entry already pending for that path wins (it is the more
-    /// recently *stored* one only when this buffer never carried the mark).
+    /// left alone. This buffer's marks win over anything already pending for the
+    /// path: [`Editor::seed_pending_file_marks`] *removes* the entry when the file is
+    /// opened, so a leftover one can only predate this buffer's own edits.
     fn stash_file_marks_of(&mut self, target: BufferId) {
         let Some(ob) = self.buffers.map.get(&target) else {
             return;

@@ -1416,18 +1416,12 @@ pub struct TextObjectOp {
     pub capture: Option<String>,
 }
 
-/// A `nvim_feedkeys(keys, mode, …)` request: enqueue `keys` (vim key-notation)
-/// into the server's typeahead, to be processed at the end of the current input
-/// batch / off-tick settle. `remap` (the `m`/default flag, cleared by `n`) routes
-/// the fed keys through the mapping engine; `insert` (the `i` flag) puts them at
-/// the front of the typeahead instead of the back. The server parses `keys` and
-/// drains them after the chunk — Lua queues, the server feeds.
-#[derive(Clone, Debug)]
 /// A mouse gesture queued by the `btv.test` harness (`t:mouse`) for the server to
 /// replay at the same seam the client's `btv_input_mouse` RPC lands on. There is no
 /// plugin-facing spelling: a plugin has no business synthesising the user's pointer,
 /// but a SPEC is the user, and without this a mouse-driven feature — every gesture in
 /// examples/mouse, every widget in examples/mouse-widgets — could not be tested at all.
+#[derive(Clone, Debug)]
 pub struct MouseOp {
     pub button: String,
     pub action: String,
@@ -1436,6 +1430,13 @@ pub struct MouseOp {
     pub col: usize,
 }
 
+/// A `nvim_feedkeys(keys, mode, …)` request: enqueue `keys` (vim key-notation)
+/// into the server's typeahead, to be processed at the end of the current input
+/// batch / off-tick settle. `remap` (the `m`/default flag, cleared by `n`) routes
+/// the fed keys through the mapping engine; `insert` (the `i` flag) puts them at
+/// the front of the typeahead instead of the back. The server parses `keys` and
+/// drains them after the chunk — Lua queues, the server feeds.
+#[derive(Clone, Debug)]
 pub struct FeedKeysOp {
     /// The keys to feed, as vim notation (`parse_keys` turns them into `Key`s).
     pub keys: String,
@@ -2341,9 +2342,9 @@ pub struct CompleteSetupReq {
     /// popup can open for the lowest-threshold source; each source then contributes only
     /// once its own gate (below) is met.
     pub min_chars: usize,
-    /// The native `buffer` source's own `min_chars` gate.
     /// Whether the native `buffer` word source was listed in `sources` at all.
     pub buffer_source: bool,
+    /// The native `buffer` source's own `min_chars` gate.
     pub buffer_min_chars: usize,
     /// The `lsp` source's own `min_chars` gate.
     pub lsp_min_chars: usize,

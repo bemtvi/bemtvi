@@ -889,8 +889,7 @@ function Ctx:decor(row)
   -- on it is unreliable (it stops at the first gap); the painted-row count is the
   -- honest bound.
   local diags = (ui and ui.diagnostics_virt) or {}
-  local rows, n =
-    {}, math.max(#virt, #signs, #lines, last_bg, #((ui and ui.screen) or {}))
+  local rows, n = {}, math.max(#virt, #signs, #lines, last_bg, #((ui and ui.screen) or {}))
   for i = 1, n do
     local out = {}
     local places = virt[i]

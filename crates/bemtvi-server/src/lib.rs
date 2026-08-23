@@ -1829,6 +1829,31 @@ pub struct EditHost {
 }
 
 impl EditHost {
+    /// The current time in milliseconds for stamping a mouse event, so `'mousetime'`
+    /// multi-click detection has one clock across every entry point that lands a
+    /// gesture (the native `btv_input_mouse` dispatch, the wasm `mouse` tick, and the
+    /// `btv.test` harness's `t:mouse` replay — which is shared by both builds, and so
+    /// is why this is un-gated).
+    ///
+    /// Natively it reads the injected fake clock ([`ServerInit::mouse_clock`]) when a
+    /// test supplies one — driving multi-click deterministically — else the real
+    /// monotonic clock since startup. On wasm there is no per-message stamp: the
+    /// Worker sets the JS clock before each tick ([`set_clock`](Self::set_clock)) and
+    /// that is the only time source.
+    pub(crate) fn mouse_stamp_ms(&self) -> u64 {
+        #[cfg(feature = "native")]
+        {
+            match &self.mouse_clock {
+                Some(c) => c.load(std::sync::atomic::Ordering::SeqCst),
+                None => self.start.elapsed().as_millis() as u64,
+            }
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.clock_ms
+        }
+    }
+
     /// Hand Lua the catalogs core owns: the option catalog (each name's scope, global
     /// tier and doc), the bundled colorscheme names, and the recognized filetypes. The
     /// server is the integrator — bemtvi-lua stays decoupled from editor-core types, so
@@ -2405,7 +2430,7 @@ impl EditHost {
         self.editor.clear_session_focus_hold();
         match bemtvi_core::MouseEvent::parse(button, action, modifier, row, col) {
             Ok(mut ev) => {
-                ev.stamp_ms = self.clock_ms;
+                ev.stamp_ms = self.mouse_stamp_ms();
                 self.editor.mouse(ev);
                 // Resolve a mouse-button press against the keymaps (the same
                 // `<n-LeftMouse>` mapping path as the native dispatch — the "two mouse

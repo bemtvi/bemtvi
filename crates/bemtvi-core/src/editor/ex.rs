@@ -111,7 +111,8 @@ fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
 ///
 /// `home_override` is the **daemon's** home in a remote session (seeded at connect):
 /// the core runs on the client but the read lands on the daemon, so `~` must mean the
-/// daemon's home there. `None` — the local case — reads `$HOME` from this process.
+/// daemon's home there. `None` — the local case — resolves this process's home via
+/// [`crate::stdpath::home_dir`].
 fn expand_leading_tilde<'a>(
     arg: &'a str,
     home_override: Option<&std::path::Path>,
@@ -125,7 +126,7 @@ fn expand_leading_tilde<'a>(
     }
     let home = match home_override {
         Some(h) => Some(h.to_string_lossy().into_owned()),
-        None => std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned()),
+        None => crate::stdpath::home_dir().map(|h| h.to_string_lossy().into_owned()),
     };
     match home {
         Some(home) => std::borrow::Cow::Owned(format!("{home}{rest}")),

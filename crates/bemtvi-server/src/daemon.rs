@@ -2620,7 +2620,7 @@ fn serve_remove(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
 /// arrives is absolute or `~`-prefixed). Mirrors the edit-host's local `expand_cd_arg`,
 /// but rooted at the *daemon's* `$HOME` — the home `~` must mean on the remote.
 fn expand_remote_cd_arg(arg: &str) -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    let home = bemtvi_core::stdpath::home_dir;
     if arg.is_empty() {
         return home().unwrap_or_else(|| PathBuf::from("/"));
     }
@@ -4260,8 +4260,8 @@ fn serve_config_bundle(params: &[Value]) -> Result<Value, Value> {
                 // its shada over the fs seam (the daemon itself runs no shada logic).
                 state_dir,
                 // The daemon's home dir, so a leading `~` in a file argument (`:e ~/x`)
-                // expands against the daemon's `$HOME` — where the file read lands.
-                std::env::var_os("HOME").map(PathBuf::from),
+                // expands against the daemon's home — where the file read lands.
+                bemtvi_core::stdpath::home_dir(),
             ))
         }
         Err(e) => Err(Value::from(format!("config_bundle: {e}"))),

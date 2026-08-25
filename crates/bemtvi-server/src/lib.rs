@@ -187,7 +187,7 @@ pub use daemon::{
 #[cfg(feature = "native")]
 pub use reconnect::{ReconnectSpec, ReconnectTransport, SpawnCommand};
 /// Materialize a fetched bundle onto the per-process cache resolved from the environment
-/// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
+/// (`stdpath("cache")`) — the native edit-host's entry point.
 #[cfg(feature = "native")]
 pub use remote_config::materialize_remote_config;
 /// The fetched-config bundle, the wire decoder, and the materialize half — un-gated so the
@@ -555,8 +555,9 @@ pub enum ClipboardProvider {
 /// way the real binary starts up. Tests bypass this and pass explicit paths in
 /// [`ServerInit`] instead, so they never depend on the host's home directory.
 ///
-/// - **Config dir:** `$BEMTVI_CONFIG`, else `$XDG_CONFIG_HOME/bemtvi`, else
-///   `$HOME/.config/bemtvi` (`None` if none resolve).
+/// - **Config dir:** [`bemtvi_core::stdpath::config_dir`] — `$BEMTVI_CONFIG`, else
+///   `$XDG_CONFIG_HOME/bemtvi`, else the platform default (`~/.config/bemtvi`, or
+///   `%LOCALAPPDATA%\bemtvi` on Windows). `None` if none resolve.
 /// - **Runtimepath:** any `$BEMTVI_RUNTIMEPATH` entries first (explicit override),
 ///   then the config dir, then every plugin discovered under
 ///   `<config>/pack/*/start/*` (neovim's package layout, so a plugin checkout is
@@ -575,16 +576,12 @@ pub fn default_runtime() -> (Option<PathBuf>, Vec<PathBuf>) {
     (config_dir, runtimepath)
 }
 
-/// First of `$BEMTVI_CONFIG`, `$XDG_CONFIG_HOME/bemtvi`, `$HOME/.config/bemtvi`.
+/// First of `$BEMTVI_CONFIG`, `$XDG_CONFIG_HOME/bemtvi`, and the platform default
+/// (`~/.config/bemtvi`, or `%LOCALAPPDATA%\bemtvi` on Windows) — see
+/// [`bemtvi_core::stdpath`], which every crate resolving a std dir shares.
 #[cfg(feature = "native")]
 fn resolve_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("BEMTVI_CONFIG") {
-        return Some(PathBuf::from(dir));
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("bemtvi"));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("bemtvi"))
+    bemtvi_core::stdpath::config_dir()
 }
 
 /// One entry in the [system-plugin tier](ServerInit::system_plugins): a resolved

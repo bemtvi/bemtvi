@@ -142,32 +142,23 @@ impl LspLog {
     }
 }
 
-/// The log file path: `$BEMTVI_LSP_LOG_FILE`, else `<state-dir>/lsp.log`.
+/// The log file path: `$BEMTVI_LSP_LOG_FILE`, else `<state-dir>/lsp.log`. Public so
+/// `:LspInfo` can report the path the log *actually* goes to rather than reciting a
+/// hard-coded Unix one that is wrong on Windows.
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
-fn log_path() -> PathBuf {
+pub fn log_path() -> PathBuf {
     if let Some(path) = std::env::var_os("BEMTVI_LSP_LOG_FILE") {
         return PathBuf::from(path);
     }
     state_dir().join("lsp.log")
 }
 
-/// bemtvi's per-user state directory: `$XDG_STATE_HOME/bemtvi`, else
-/// `$HOME/.local/state/bemtvi` (and `%LOCALAPPDATA%\bemtvi` on Windows). Mirrors
-/// `bemtvi_ts::data_dir`, but for *state* (logs) rather than data (grammars).
+/// bemtvi's per-user state directory — `stdpath("state")`, the same one shada
+/// writes to. [`bemtvi_core::stdpath`] owns the policy across every crate; the
+/// relative last resort is for a process with no home and no platform base.
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(dir).join("bemtvi");
-    }
-    #[cfg(windows)]
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(dir).join("bemtvi");
-    }
-    #[cfg(not(windows))]
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/state/bemtvi");
-    }
-    PathBuf::from(".bemtvi")
+    bemtvi_core::stdpath::state_dir().unwrap_or_else(|| PathBuf::from(".bemtvi"))
 }
 
 /// Format a `SystemTime` as `YYYY-MM-DD HH:MM:SS` in **UTC**, dependency-free

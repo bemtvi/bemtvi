@@ -142,28 +142,23 @@ fn package_patterns_for(dir: &Path, out: &mut Vec<String>) {
     );
 }
 
-/// Resolve a `vim.fn.stdpath(what)` directory under an `bemtvi` subdir, the way
-/// neovim derives its standard paths from XDG (with `$HOME` fallbacks). `config`
-/// additionally honors `$BEMTVI_CONFIG`. Unknown `what` falls back to the cache
-/// dir rather than erroring.
+/// Resolve a `btv.stdpath(what)` / `vim.fn.stdpath(what)` directory. The policy —
+/// XDG first, platform default (`%LOCALAPPDATA%` on Windows) second, and
+/// `$BEMTVI_CONFIG` ahead of both for `config` — lives in
+/// [`bemtvi_core::stdpath`], so every crate that resolves one of these agrees.
+/// Unknown `what` falls back to the cache dir rather than erroring.
+///
+/// The relative last resort is for a process with no home directory *and* no XDG
+/// or platform base at all; it is the only case where this can return a path that
+/// is not absolute.
 pub fn stdpath(what: &str) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let xdg = |var: &str, fallback: &str| -> PathBuf {
-        if let Some(dir) = std::env::var_os(var) {
-            PathBuf::from(dir).join("bemtvi")
-        } else if let Some(home) = &home {
-            home.join(fallback).join("bemtvi")
-        } else {
-            PathBuf::from("bemtvi")
-        }
+    let dir = match what {
+        "config" => bemtvi_core::stdpath::config_dir(),
+        "data" => bemtvi_core::stdpath::data_dir(),
+        "state" => bemtvi_core::stdpath::state_dir(),
+        _ => bemtvi_core::stdpath::cache_dir(),
     };
-    let path = match what {
-        "config" => std::env::var_os("BEMTVI_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config")),
-        "data" => xdg("XDG_DATA_HOME", ".local/share"),
-        "state" => xdg("XDG_STATE_HOME", ".local/state"),
-        _ => xdg("XDG_CACHE_HOME", ".cache"),
-    };
-    path.to_string_lossy().into_owned()
+    dir.unwrap_or_else(|| PathBuf::from(".bemtvi"))
+        .to_string_lossy()
+        .into_owned()
 }

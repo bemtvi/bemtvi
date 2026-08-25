@@ -27,6 +27,7 @@ pub mod sandbox;
 pub mod search;
 pub mod snippet;
 pub mod statusline;
+pub mod stdpath;
 pub mod syntax;
 pub mod unicode;
 pub mod view;

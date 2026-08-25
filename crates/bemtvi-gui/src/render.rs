@@ -460,7 +460,7 @@ impl Renderer {
         let mut font_system = font_system_with_fallback(fonts.get(1..).unwrap_or(&[]));
         let swash_cache = SwashCache::new();
 
-        let font_size = cfg.font_size * scale;
+        let font_size = physical_font_size(cfg.font_size, scale);
         let line_height = (font_size * LINE_SPACING).round();
         let family = fonts
             .first()
@@ -520,7 +520,7 @@ impl Renderer {
             self.rebuild_font_system(fonts.get(1..).unwrap_or(&[]));
         }
         self.fonts = fonts.to_vec();
-        self.font_size = size_pt * self.scale;
+        self.font_size = physical_font_size(size_pt, self.scale);
         self.line_height = (self.font_size * LINE_SPACING).round();
         let family = self
             .fonts
@@ -4806,6 +4806,29 @@ fn line_key(segments: &[Seg], default_fg: u32) -> u64 {
         s.italic.hash(&mut h);
     }
     h.finish()
+}
+
+/// The font size in **device pixels** for a point size at a window scale factor —
+/// rounded to a whole pixel, which is what keeps a shaped row on the cell grid.
+///
+/// The rounding is not cosmetic. The renderer paints a row as one shaped buffer and
+/// paints the cursor at `col * cell_w`, so the shaper's advance has to *be* `cell_w`.
+/// Under `set_monospace_width` cosmic-text snaps each advance to a multiple of
+/// `monospace_width / font_size` — a px value divided by an em value, an upstream
+/// unit mismatch (cosmic-text 0.18.2, `shape.rs`) — which works out to
+/// `cell_w * round(font_size) / font_size`. That is exactly `cell_w` when the
+/// device-pixel size is whole, and drifts by a fraction of a pixel *per column* when
+/// it isn't: at Windows' 125% / 150% display scaling a 15pt font lands on 18.75 /
+/// 22.5 device pixels, and the row has slid a cell or more to the right of the grid
+/// by the time it reaches column 80 — the cursor reading ever further left of the
+/// character it is on. Whole device pixels are what `line_height` already rounds to
+/// for the vertical metric; this is the horizontal half of the same contract.
+///
+/// Only the *rendering* metric is quantized — `'guifont'`'s point size is kept as
+/// written, so `:set guifont=Mono:h13.5` still reads back `13.5` (it just paints at
+/// 14 device pixels at 100% scale).
+pub fn physical_font_size(size_pt: f32, scale: f32) -> f32 {
+    (size_pt * scale).round().max(1.0)
 }
 
 /// Measure the cell size from the configured font by shaping a single `M`.

@@ -24,26 +24,15 @@ pub use engine::{load_requested, Engine};
 pub use loader::{Grammar, LoadedLanguage};
 
 /// Resolve bemtvi's data directory (where `parser/` and `queries/` live).
-/// `$BEMTVI_DATA_DIR` overrides everything (used by tests); otherwise the
-/// platform's standard per-user data location, suffixed `bemtvi`.
+/// `$BEMTVI_DATA_DIR` overrides everything (used by tests); otherwise
+/// `stdpath("data")` — [`bemtvi_core::stdpath`] owns that policy, so the grammar
+/// root is the same directory `btv.stdpath("data")` reports and plugins install
+/// under, on every platform.
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("BEMTVI_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(windows)]
-    if let Ok(dir) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(dir).join("bemtvi");
-    }
-    #[cfg(not(windows))]
-    {
-        if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
-            return PathBuf::from(dir).join("bemtvi");
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".local/share/bemtvi");
-        }
-    }
-    PathBuf::from(".bemtvi")
+    bemtvi_core::stdpath::data_dir().unwrap_or_else(|| PathBuf::from(".bemtvi"))
 }
 
 /// One installed grammar discovered on the search path (what `:TSInstallInfo`
@@ -143,16 +132,23 @@ pub fn extra_roots() -> Vec<PathBuf> {
             roots.push(p);
         }
     };
+    // Neovim's *own* data dir, not bemtvi's — the same bases (so `$XDG_DATA_HOME`
+    // still wins) but neovim's suffix: `nvim`, or `nvim-data` on Windows, where
+    // config and data share the one `%LOCALAPPDATA%` root.
     #[cfg(windows)]
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        push(PathBuf::from(dir).join("nvim-data").join("site"));
+    {
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+            push(PathBuf::from(dir).join("nvim-data").join("site"));
+        } else if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+            push(PathBuf::from(dir).join("nvim-data").join("site"));
+        }
     }
     #[cfg(not(windows))]
     {
         if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
             push(PathBuf::from(dir).join("nvim").join("site"));
-        } else if let Some(home) = std::env::var_os("HOME") {
-            push(PathBuf::from(home).join(".local/share/nvim/site"));
+        } else if let Some(home) = bemtvi_core::stdpath::home_dir() {
+            push(home.join(".local").join("share").join("nvim").join("site"));
         }
     }
     roots

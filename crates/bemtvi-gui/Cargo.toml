@@ -40,6 +40,9 @@ unicode-segmentation.workspace = true
 pollster.workspace = true
 bemtvi-rpc.workspace = true
 bemtvi-view.workspace = true
+# The shared per-user directory policy (`bemtvi_core::stdpath`) — so the GUI's `~`
+# expansion resolves the home the same way the server does, Windows included.
+bemtvi-core.workspace = true
 # Decoder for `'imagepreview'` windows: the GUI shares the local filesystem (like
 # the TUI), so it decodes the image itself and uploads it as a wgpu texture (see
 # src/images.rs). No ratatui-image here — the GUI paints pixels directly.

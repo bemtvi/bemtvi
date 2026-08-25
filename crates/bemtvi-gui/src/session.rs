@@ -168,12 +168,14 @@ pub fn spawn_workspace_session(dir: PathBuf, config_source: ConfigSource) -> Res
     })
 }
 
-/// Expand a leading `~` / `~/` in a `:workspace` path against `$HOME`; anything else is
-/// returned verbatim (a relative path canonicalizes against the GUI process's cwd). Mirrors
-/// the server's `:cd` argument expansion so `:workspace ~/code` works as typed.
+/// Expand a leading `~` / `~/` in a `:workspace` path against the user's home; anything
+/// else is returned verbatim (a relative path canonicalizes against the GUI process's cwd).
+/// Mirrors the server's `:cd` argument expansion so `:workspace ~/code` works as typed —
+/// and resolves the home the same way ([`bemtvi_core::stdpath::home_dir`]), so it also
+/// works on Windows, which sets `%USERPROFILE%` rather than `$HOME`.
 fn expand_tilde(dir: PathBuf) -> PathBuf {
     let Some(s) = dir.to_str() else { return dir };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = bemtvi_core::stdpath::home_dir();
     if s == "~" {
         if let Some(home) = home {
             return home;

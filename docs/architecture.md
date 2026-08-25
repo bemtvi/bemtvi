@@ -884,7 +884,9 @@ the very same API functions remote clients invoke (`Lua → API → core`).
 
 **A config runtime.** bemtvi resolves a config dir and
 **runtimepath** the way neovim does (`$BEMTVI_CONFIG` / `$XDG_CONFIG_HOME/bemtvi` /
-`~/.config/bemtvi`, plus `pack/*/start/*` discovery and `$BEMTVI_RUNTIMEPATH`
+the platform default — `~/.config/bemtvi`, or `%LOCALAPPDATA%\bemtvi` on Windows;
+`bemtvi_core::stdpath` is the one place that policy lives, shared by every crate
+that resolves a std dir — plus `pack/*/start/*` discovery and `$BEMTVI_RUNTIMEPATH`
 for tests), seeds `package.path` from it so `require` resolves config and
 colorscheme modules, and sources `<config>/init.lua` at startup — before the
 first frame. The Lua

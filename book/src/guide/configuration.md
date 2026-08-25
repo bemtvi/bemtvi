@@ -1,9 +1,9 @@
 # Configuration
 
 bemtvi reads a Lua config. On startup it resolves a **config directory** — the
-first of `$BEMTVI_CONFIG`, `$XDG_CONFIG_HOME/bemtvi`, or `~/.config/bemtvi` — and
-sources `<config>/init.lua` before the first frame. The **runtimepath** is that
-dir plus every `pack/*/start/*` entry under it:
+first of `$BEMTVI_CONFIG`, `$XDG_CONFIG_HOME/bemtvi`, or the platform default —
+and sources `<config>/init.lua` before the first frame. The **runtimepath** is
+that dir plus every `pack/*/start/*` entry under it:
 
 ```
 ~/.config/bemtvi/
@@ -18,6 +18,23 @@ dir plus every `pack/*/start/*` entry under it:
 -- ~/.config/bemtvi/init.lua
 require("myplugin").setup()
 ```
+
+### Where the directories are
+
+The layout follows neovim's, so the `XDG_*` variables win everywhere and the
+platform default is only what they fall back to. `btv.stdpath("config")` (and
+`"data"` / `"state"` / `"cache"`) always reports the resolved path.
+
+| what | holds | Linux / macOS | Windows |
+|---|---|---|---|
+| config | `init.lua`, the runtimepath root | `~/.config/bemtvi` | `%LOCALAPPDATA%\bemtvi` |
+| data | installed plugins, tree-sitter grammars | `~/.local/share/bemtvi` | `%LOCALAPPDATA%\bemtvi-data` |
+| state | shada (marks, registers, session), logs | `~/.local/state/bemtvi` | `%LOCALAPPDATA%\bemtvi-data` |
+| cache | discardable scratch | `~/.cache/bemtvi` | `%TEMP%\bemtvi-data` |
+
+On Windows the managed directories take a `-data` suffix so they do not land on
+top of the config tree you hand-edit — the split neovim spells `nvim` /
+`nvim-data`.
 
 ## `btv.*` vs `vim.*`
 

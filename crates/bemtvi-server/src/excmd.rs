@@ -889,10 +889,12 @@ fn is_command_def(base: &str) -> bool {
     matches!(base, "com" | "comm" | "comma" | "comman" | "command")
 }
 
-/// The user's home directory from `$HOME` (the Unix `:cd` target / `~` base),
-/// or `None` when it is unset.
+/// The user's home directory (the bare `:cd` target / `~` base), or `None` when the
+/// process has none. Resolved through [`bemtvi_core::stdpath::home_dir`] so `~` means
+/// the same thing here as in every other crate — `%USERPROFILE%` on Windows, which
+/// does not set `$HOME`.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    bemtvi_core::stdpath::home_dir()
 }
 
 /// Lexically normalize an **absolute** path — collapse `.` and `..` components without

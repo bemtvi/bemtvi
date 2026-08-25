@@ -75,6 +75,7 @@ dependencies = [
 name = "bemtvi-lsp"
 version = "0.1.0"
 dependencies = [
+ "bemtvi-core",
  "lsp-types",
  "serde",
  "serde_json",

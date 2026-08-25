@@ -75,6 +75,10 @@ pub use render::{apply_cursor_fg, block_cursor_colors};
 // Where a floating menu box anchors — window-relative for a completion popup, but
 // screen-relative for the command-line wildmenu. Exported for the Tier-1 `menu` test.
 pub use render::menu_box_origin;
+// The point-size → device-pixel font size the cell grid is measured at, exported so
+// the Tier-1 `grid` test can shape a row at a fractional display scale and check it
+// still lands on the grid.
+pub use render::physical_font_size;
 // The sRGB→linear color conversions feeding the quad pipeline, exported so the Tier-1
 // `color` test can pin the channel order without a GPU.
 pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};

@@ -155,9 +155,9 @@ pub fn decode_config_bundle_bytes(bytes: &[u8]) -> Result<RemoteConfigBundle, St
 
 /// Mirror `bundle`'s files into this process's remote-config cache and return the
 /// rebased local `(config_dir, runtimepath)` to feed into [`ServerInit`](crate::ServerInit).
-/// The cache root is `$XDG_CACHE_HOME/bemtvi/remote/<pid>` (else `$HOME/.cache/…`); a
-/// failure to resolve it is loud (a remote session with no place to stage its config is
-/// not silently downgraded to "no config").
+/// The cache root is `stdpath("cache")/remote/<pid>`; a failure to resolve it is loud
+/// (a remote session with no place to stage its config is not silently downgraded to
+/// "no config").
 #[cfg(feature = "native")]
 pub fn materialize_remote_config(
     bundle: RemoteConfigBundle,
@@ -211,20 +211,11 @@ fn rebase(cache_root: &Path, remote: &str) -> PathBuf {
     local
 }
 
-/// The per-process remote-config cache dir: `$XDG_CACHE_HOME/bemtvi/remote/<pid>`, else
-/// `$HOME/.cache/bemtvi/remote/<pid>`. Errors loudly if neither resolves.
+/// The per-process remote-config cache dir: `stdpath("cache")/remote/<pid>`. Errors
+/// loudly when no cache dir resolves at all (see [`bemtvi_core::stdpath`]).
 fn remote_cache_root() -> std::io::Result<PathBuf> {
-    let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(xdg)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache")
-    } else {
-        return Err(std::io::Error::other(
-            "no XDG_CACHE_HOME or HOME to stage the remote config cache",
-        ));
-    };
-    Ok(base
-        .join("bemtvi")
-        .join("remote")
-        .join(std::process::id().to_string()))
+    let base = bemtvi_core::stdpath::cache_dir().ok_or_else(|| {
+        std::io::Error::other("no cache directory resolves to stage the remote config cache")
+    })?;
+    Ok(base.join("remote").join(std::process::id().to_string()))
 }

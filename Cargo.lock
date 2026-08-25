@@ -511,6 +511,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "bemtvi-core",
  "bemtvi-rpc",
  "bemtvi-server",
  "bemtvi-view",
@@ -537,6 +538,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-lsp",
+ "bemtvi-core",
  "futures",
  "lsp-types",
  "serde",

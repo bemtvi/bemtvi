@@ -1588,12 +1588,7 @@ impl EditHost {
         }
 
         lines.push(String::new());
-        lines.push(format!(
-            "Log: {}",
-            std::env::var("BEMTVI_LSP_LOG_FILE").unwrap_or_else(|_| {
-                "$XDG_STATE_HOME/bemtvi/lsp.log (or ~/.local/state/bemtvi/lsp.log)".to_string()
-            })
-        ));
+        lines.push(format!("Log: {}", bemtvi_lsp::log::log_path().display()));
         lines
     }
 

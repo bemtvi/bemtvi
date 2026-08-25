@@ -31,6 +31,9 @@ async-lsp = { workspace = true, optional = true }
 # Always on: the protocol types + JSON layer the sync client reuses are wasm-safe
 # (pure data / serde), so they compile for both the native async client and the
 # browser sync client.
+# The shared per-user directory policy (`bemtvi_core::stdpath`), so the LSP log
+# lands in the same state dir the rest of the editor uses — Windows included.
+bemtvi-core.workspace = true
 lsp-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

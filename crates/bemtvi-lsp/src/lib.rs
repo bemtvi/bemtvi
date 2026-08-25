@@ -25,7 +25,7 @@
 // / pure transforms, wasm-safe.
 mod client;
 mod convert;
-mod log;
+pub mod log;
 mod protocol;
 
 // The async client surface — tokio + `async-lsp`. Gated to `native`; absent in the

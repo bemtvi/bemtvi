@@ -1119,28 +1119,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The XDG base dir named by `var`, else `$HOME/<home_sub>`, else `last` — the
-/// resolution shared by [`shada_dir`] (state) and `remote_shada_staging` (cache).
-fn xdg_base(var: &str, home_sub: &str, last: PathBuf) -> PathBuf {
-    if let Some(dir) = std::env::var_os(var) {
-        PathBuf::from(dir)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(home_sub)
-    } else {
-        last
-    }
-}
-
-/// The default shada directory for the real binary: `stdpath("state")/shada`,
-/// i.e. `$XDG_STATE_HOME/bemtvi/shada` (or `$HOME/.local/state/bemtvi/shada`). Tests
-/// build a [`RedbFileStore`] over a temp dir instead, so they never touch this one.
+/// The default shada directory for the real binary: `stdpath("state")/shada`, i.e.
+/// `$XDG_STATE_HOME/bemtvi/shada` (`~/.local/state/bemtvi/shada`, or
+/// `%LOCALAPPDATA%\bemtvi-data\shada` on Windows) — [`bemtvi_core::stdpath`] owns
+/// the policy. Tests build a [`RedbFileStore`] over a temp dir instead, so they
+/// never touch this one.
+///
+/// The relative last resort only bites a process with no home and no XDG or
+/// platform base; it keeps the editor writable rather than losing the session.
 pub fn shada_dir() -> PathBuf {
-    let base = xdg_base(
-        "XDG_STATE_HOME",
-        ".local/state",
-        PathBuf::from(".local/state"),
-    );
-    base.join("bemtvi").join("shada")
+    bemtvi_core::stdpath::state_dir()
+        .unwrap_or_else(|| PathBuf::from(".bemtvi"))
+        .join("shada")
 }
 
 /// The default store for the native binaries: a [`RedbFileStore`] under
@@ -1277,13 +1267,12 @@ fn remote_shada_dir(state_dir: &str, namespace: Option<&str>) -> String {
 }
 
 /// A fresh per-process staging dir for a remote session's shada, cleared on entry so each
-/// connect starts clean (mirrors the remote-config cache): `$XDG_CACHE_HOME/bemtvi/
-/// remote-shada/<pid>` (else `$HOME/.cache/…`, else a temp dir).
+/// connect starts clean (mirrors the remote-config cache):
+/// `stdpath("cache")/remote-shada/<pid>`, else the platform temp dir.
 #[cfg(feature = "native")]
 fn remote_shada_staging() -> std::io::Result<PathBuf> {
-    let base = xdg_base("XDG_CACHE_HOME", ".cache", std::env::temp_dir());
+    let base = bemtvi_core::stdpath::cache_dir().unwrap_or_else(std::env::temp_dir);
     let dir = base
-        .join("bemtvi")
         .join("remote-shada")
         .join(std::process::id().to_string());
     // Fresh every connect (a stale dir from a crashed prior pid-reuse can't leak in).

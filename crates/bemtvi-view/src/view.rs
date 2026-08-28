@@ -702,7 +702,7 @@ pub struct MenuData {
     /// start that survives a head too narrow to fit. `None` for a plain row (which truncates
     /// path-tail-first); empty when no row declares one — the server omits the
     /// `layouts` key entirely then. Fed to [`fit_row`](crate::fit_row).
-    pub layouts: Vec<Option<(u16, u16, u16, u16)>>,
+    pub layouts: Vec<Option<(u32, u32, u32, u32)>>,
     /// Per visible row (parallel to `items`), the **highlight** the source painted the
     /// row with (`ctx.push { hl = … }`), already resolved against the colorscheme
     /// server-side — the severity color of a diagnostics row. It paints the row's HEAD

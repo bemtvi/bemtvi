@@ -2126,14 +2126,18 @@ impl EditHost {
                 .map(|(l, (label, _))| {
                     l.map_or(Value::Nil, |l| {
                         Value::Array(vec![
-                            Value::from(unicode::display_char_offset(label, l.head.into()) as u64),
                             Value::from(
-                                unicode::display_char_offset(label, l.match_start.into()) as u64
+                                unicode::display_char_offset(label, l.head as usize) as u64
                             ),
                             Value::from(
-                                unicode::display_char_offset(label, l.match_end.into()) as u64
+                                unicode::display_char_offset(label, l.match_start as usize) as u64
                             ),
-                            Value::from(unicode::display_char_offset(label, l.tag.into()) as u64),
+                            Value::from(
+                                unicode::display_char_offset(label, l.match_end as usize) as u64
+                            ),
+                            Value::from(
+                                unicode::display_char_offset(label, l.tag as usize) as u64
+                            ),
                         ])
                     })
                 })

@@ -169,19 +169,19 @@ pub type CmdlineCandidate = (String, String, Option<String>, Option<(usize, usiz
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowLayout {
     /// Char length of the leading location column (`"src/foo.rs:12:5: "`).
-    pub head: u16,
+    pub head: u32,
     /// The source's match within the label, as a half-open **char** range. Empty
     /// (`match_end == match_start`) when the source knows only where the interesting
     /// content begins — the body still windows around it, nothing is highlighted.
-    pub match_start: u16,
-    pub match_end: u16,
+    pub match_start: u32,
+    pub match_end: u32,
     /// Char length of a **pinned tag** at the head's start (`"E "` on a diagnostics
     /// row): the part that *classifies* the row, which survives the elision the rest
     /// of the head takes when the column is too narrow for it. Without it the head
     /// elides tail-first and the classification — the very thing the row is scanned
     /// by — would be the first thing to go. `0` for a head that is pure location
     /// (live_grep's `path:line:col: `), where the tail is what matters.
-    pub tag: u16,
+    pub tag: u32,
 }
 
 /// One candidate row: its display `label` and the **opaque source key** that

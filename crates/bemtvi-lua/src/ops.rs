@@ -2485,7 +2485,7 @@ pub struct PickerPush {
     /// into `label` — the live_grep shape, `path:line:col: ` followed by the matched
     /// line, plus the leading classification a narrow head must keep. `None` for a
     /// plain single-column row.
-    pub layout: Option<(u16, u16, u16, u16)>,
+    pub layout: Option<(u32, u32, u32, u32)>,
     /// The **highlight group** the source painted this row with (`push { hl = … }`):
     /// `"DiagnosticError"` on the diagnostics picker's error rows, and so on. The
     /// server resolves it against the live colorscheme per frame; `None` (an empty

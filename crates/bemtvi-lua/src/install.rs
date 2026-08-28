@@ -3846,7 +3846,7 @@ pub(crate) fn install_runtime_api(
         Option<Vec<String>>,
         Option<Vec<usize>>,
         Option<Vec<usize>>,
-        Option<Vec<u16>>,
+        Option<Vec<u32>>,
         Option<Vec<String>>,
     );
     btv.set(

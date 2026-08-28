@@ -257,12 +257,18 @@ pub fn fit_row(
     // Remap each span through the chunks; one straddling the head/body split lands as
     // two output ranges, and one wholly inside dropped text lands as none. The source's
     // own match joins the fuzzy spans so it highlights the same way.
-    let declared = (match_end > match_start).then_some((match_start as u16, match_end as u16));
+    // The declared range stays `usize` — it is a char offset into an unbounded label
+    // (a hit 70k chars into a minified line), not a screen coordinate like `spans`.
+    let declared = (match_end > match_start).then_some((match_start, match_end));
     let mut remapped = Vec::new();
-    for &(s, e) in spans.iter().chain(declared.iter()) {
+    for (s, e) in spans
+        .iter()
+        .map(|&(s, e)| (s as usize, e as usize))
+        .chain(declared)
+    {
         for &(out_start, src_start, len) in &chunks {
-            let ns = (s as usize).max(src_start);
-            let ne = (e as usize).min(src_start + len);
+            let ns = s.max(src_start);
+            let ne = e.min(src_start + len);
             if ns < ne {
                 remapped.push((
                     (ns - src_start + out_start) as u16,

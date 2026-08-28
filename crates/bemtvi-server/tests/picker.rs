@@ -3496,6 +3496,132 @@ async fn live_grep_rows_carry_the_location_head_and_the_hit() {
     );
 }
 
+/// A hit in a **pathologically long** line (a minified bundle, a one-line JSON blob)
+/// is clipped to a window around the hit. Uncut, the line arrives once per hit on it
+/// and each row then carries the whole of it — into the item list, across the bridge
+/// and into every frame — for a body the widget windows to the row's width anyway,
+/// which cost half a second per keystroke on a 1MB line. The clip is a safety cap,
+/// not a display rule: it is wider than any terminal, so an ordinary line (the test
+/// above) is untouched.
+#[tokio::test]
+async fn live_grep_clips_a_pathologically_long_line_around_the_hit() {
+    let _serial = serial_lock().lock().await;
+
+    let dir = temp_dir("picker_grep_clip_cfg");
+    let proj = temp_dir("picker_grep_clip");
+    let line = format!("{}zqxneedle{}", "x".repeat(20_000), "y".repeat(20_000));
+    std::fs::write(proj.join("bundle.js"), format!("{line}\n")).expect("write file");
+
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, &format!("cd {}", proj.display())).await;
+
+    exec_lua(&rpc, "btv.picker.open('live_grep')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("live_grep picker opens");
+    feed(&rpc, "zqxneedle");
+
+    let (mut rows, mut layouts) = (Vec::new(), Vec::new());
+    for _ in 0..200 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            let menu = menu_of(&m);
+            let now = menu_items(&menu);
+            if !now.is_empty() {
+                rows = now;
+                layouts = menu_layouts(&menu);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 1, "one hit; got {} rows", rows.len());
+    let (head, mstart, mend, _tag) = layouts
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| panic!("the row carries a two-column layout; got {layouts:?}"));
+    let chars: Vec<char> = rows[0].chars().collect();
+    assert!(
+        chars.len() < 4_000,
+        "the row is bounded, not the whole 40k-char line: {} chars",
+        chars.len()
+    );
+    let body: String = chars[head..].iter().collect();
+    assert!(
+        body.starts_with('…') && body.ends_with('…'),
+        "each cut end is marked: {:?}…{:?}",
+        &body[..8.min(body.len())],
+        &body[body.len() - 8..]
+    );
+    assert_eq!(
+        chars[mstart..mend].iter().collect::<String>(),
+        "zqxneedle",
+        "and the hit's char range still points at the hit inside the clip"
+    );
+}
+
+/// A row's `(head, match start, match end)` are char offsets into an **unbounded
+/// label** — a hit past 65535 chars into a line (a minified bundle, a one-line JSON
+/// blob) is an ordinary row, not a screen coordinate that fits in a `u16`. They used
+/// to cross the bridge as one, so `btv._picker_push` rejected the whole batch
+/// ("error converting Lua integer to u16 (out of range)") — an unhandled promise
+/// rejection that lost every row pushed with it.
+#[tokio::test]
+async fn a_row_whose_match_is_past_a_u16_of_chars_still_crosses_the_bridge() {
+    let _serial = serial_lock().lock().await;
+
+    let dir = temp_dir("picker_wide_layout_cfg");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // A two-column row whose body puts the hit well beyond `u16::MAX` chars in.
+    exec_lua(
+        &rpc,
+        r#"
+        btv.picker.source({
+          name = "wide_row_test",
+          dynamic = true,
+          items = function(ctx)
+            local lead = string.rep("x", 70000)
+            ctx.push({ head = "h: ", text = lead .. "zqxneedle", match = { 70001, 70009 } })
+          end,
+        })
+        btv.picker.open('wide_row_test')
+        "#,
+    )
+    .await;
+
+    let (mut rows, mut layouts) = (Vec::new(), Vec::new());
+    for _ in 0..200 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            let menu = menu_of(&m);
+            let now = menu_items(&menu);
+            if !now.is_empty() {
+                rows = now;
+                layouts = menu_layouts(&menu);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 1, "the pushed row survives the crossing");
+    let (head, mstart, mend, _tag) = layouts
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| panic!("the row carries a two-column layout; got {layouts:?}"));
+    let chars: Vec<char> = rows[0].chars().collect();
+    assert_eq!(head, 3, "the head is the declared location column");
+    assert!(
+        mstart > u16::MAX as usize,
+        "the hit is past a u16 of chars: {mstart}"
+    );
+    assert_eq!(
+        chars[mstart..mend].iter().collect::<String>(),
+        "zqxneedle",
+        "and its char range still points at the hit"
+    );
+}
+
 /// `live_grep`'s fallback chain (`rg` → `grep` → the `btv.fs` walk) must step to the
 /// next leg only when the previous binary **isn't there**, never because it ran and
 /// found nothing. Zero matches is a legitimate answer, and re-searching the whole

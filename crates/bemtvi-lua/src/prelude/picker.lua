@@ -1205,6 +1205,8 @@ btv.picker.source({
 -- of showing a long line's head and nothing else. The body's leading indentation is
 -- stripped — a deeply-indented hit would otherwise spend the row on whitespace —
 -- and `match` carries the hit's char range so it highlights like a `files` fuzzy hit.
+-- A pathologically long body (a minified bundle's single line) is clipped to a
+-- window around the hit, marked `…` — see `KEEP` below.
 -- The include/exclude boxes (`<C-g>`) narrow a single search without changing that.
 btv.picker.source({
   name = "live_grep",
@@ -1235,27 +1237,71 @@ btv.picker.source({
     end
     local re, lit = matcher(), matcher({ plain = true })
 
+    -- How much of a body survives on either side of the hit. A minified bundle or a
+    -- one-line JSON blob is a *single* line of hundreds of thousands of bytes, and it
+    -- arrives once per hit on it: uncut, those rows sit in the item list, cross the
+    -- bridge, and are re-shipped whole on every frame the picker paints — for a body
+    -- the widget windows down to the row's width anyway (seconds per keystroke on a
+    -- 1MB line). `KEEP` is bytes, and wider than any terminal, so an ordinary source
+    -- line is returned untouched.
+    local KEEP = 1024
+    -- The first byte index at or after `i` that STARTS a char, so a clip never cuts a
+    -- multi-byte char in half (grep's output is bytes, and needn't be valid UTF-8 —
+    -- hence the scan rather than `utf8.offset`, which errors on a stray continuation).
+    local function boundary(s, i)
+      for j = i, math.min(i + 3, #s) do
+        local b = s:byte(j)
+        if b < 0x80 or b >= 0xC0 then
+          return j
+        end
+      end
+      return i
+    end
+    -- Clip an over-long `body` to a window around the hit at BYTE offsets `s`..`e`
+    -- (`nil` when the leg's dialect found none — the head of the line is kept then),
+    -- marking each cut with `…`. Returns the body and the hit's offsets *within it*.
+    local function clip(body, s, e)
+      if #body <= KEEP * 2 then
+        return body, s, e
+      end
+      local from = math.max(1, (s or 1) - KEEP)
+      from = from > 1 and boundary(body, from) or 1
+      local to = math.min(#body, (e or 1) + KEEP)
+      to = to < #body and boundary(body, to + 1) - 1 or #body
+      local lead = from > 1 and "…" or ""
+      local out = lead .. body:sub(from, to) .. (to < #body and "…" or "")
+      if s then
+        local shift = (from - 1) - #lead
+        s, e = s - shift, e - shift
+      end
+      return out, s, e
+    end
+
     -- One parsed hit -> a two-column item: the `path:line:col: ` head, the matched
-    -- line (leading indentation stripped) as the body, and the hit's char range within
-    -- that body, measured with the leg's `find`er. `col` is 1-based and BYTE-based
-    -- (rg's convention) and stays untouched on the item — it is what `confirm` jumps
-    -- to; only the display body is trimmed.
+    -- line (leading indentation stripped, an over-long one clipped around the hit) as
+    -- the body, and the hit's char range within that body, measured with the leg's
+    -- `find`er. `col` is 1-based and BYTE-based (rg's convention) and stays untouched
+    -- on the item — it is what `confirm` jumps to; only the display body is trimmed.
     local function emit(find, file, lnum, col, line)
       local body = line:gsub("^%s+", "")
       local indent = #line - #body
-      local m
+      local s, e
       if find then
         -- Search from the reported column so a line with several hits highlights the
         -- one rg pointed at; a pattern that only matches from the line start (`^…`)
         -- falls back to a search from the beginning rather than losing its highlight.
         local at = math.max(1, (col or 1) - indent)
-        local s, e = find:find(body, at)
+        s, e = find:find(body, at)
         if not s and at > 1 then
           s, e = find:find(body)
         end
-        if s then
-          m = { charlen(body:sub(1, s - 1)) + 1, charlen(body:sub(1, e)) }
-        end
+      end
+      -- Clip before measuring: `charlen` over a megabyte-long body, once per hit on
+      -- it, is the same O(N^2) the clip exists to stop.
+      local m
+      body, s, e = clip(body, s, e)
+      if s then
+        m = { charlen(body:sub(1, s - 1)) + 1, charlen(body:sub(1, e)) }
       end
       ctx.push({
         head = file .. ":" .. lnum .. ":" .. (col or 1) .. ": ",

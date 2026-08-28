@@ -1958,7 +1958,10 @@ impl Editor {
     /// the reloaded (saved) state, refreshes the disk snapshot — so a following
     /// `:checktime` no longer reports a change — and clamps the cursor (the live
     /// one when `buffer` is current, the saved one otherwise) into the new extent
-    /// so a now-shorter file can't strand it past the end. On a read failure the
+    /// so a now-shorter file can't strand it past the end. The buffer keeps its own
+    /// settable options across the swap (as every other reload path does) while the
+    /// read re-decides the ones it owns — encoding, BOM, `'fileformat'`, `'endofline'`,
+    /// and the `'indentdetect'` verdict. On a read failure the
     /// buffer is left untouched and the error echoed. Local-only (synchronous
     /// `host_fs`); the daemon reload is part of the remote-watch slice. `pub` so the
     /// server can drive it from the `FileChangedShell` round-trip (a `v:fcs_choice`
@@ -1984,6 +1987,14 @@ impl Editor {
             let mut new_buf = new_buf;
             new_buf.save_tick = ob.buffer.save_tick;
             new_buf.changedtick = ob.buffer.changedtick;
+            // …and the buffer's own settable options, for the same reason every other
+            // reload path carries them (`load_into_current`, `load_pending_open`): this
+            // swaps the whole `Buffer` for one built from the *defaults*, so without the
+            // carry an external change to the file silently reset every `:setlocal` on
+            // this bufnr — and the global tier it was born from with them. The read still
+            // decides encoding / BOM / fileformat / endofline; that is the split
+            // `inherit_settable` draws.
+            new_buf.options.inherit_settable(&ob.buffer.options);
             ob.buffer = new_buf;
             // Reloaded from disk: discard the old history and start a fresh tree
             // rooted at the reloaded text, a state that is by definition saved.

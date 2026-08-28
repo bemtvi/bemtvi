@@ -336,6 +336,78 @@ async fn checktime_reloads_an_unmodified_buffer_when_the_file_changed() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An autoread reload keeps the buffer's own settable options. `reload_buffer` swaps the
+/// whole `Buffer` for a fresh read, and the fresh read starts from the built-in defaults
+/// — so without carrying the old options across, every `:setlocal` on that bufnr (and the
+/// global tier it was born from) silently reset the moment something touched the file on
+/// disk. The other reload paths (`:e!`, a deferred open's fill) already carry them; this
+/// is the same contract for the watch/`:checktime` leg.
+#[tokio::test]
+async fn an_autoread_reload_keeps_the_buffers_own_options() {
+    let path = temp_path("checktime-opts");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+
+    feed(&rpc, ":setlocal tabstop=3 autoindent<CR>");
+    // Round-trip so the option write lands server-side before the external write below
+    // — the file watch fires asynchronously and would otherwise race it.
+    assert_eq!(
+        lua_u64(&rpc, "return btv.bo[0].tabstop").await,
+        Some(3),
+        "precondition: the buffer-local option is set"
+    );
+
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    feed(&rpc, ":checktime<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three"],
+        "precondition: the reload happened"
+    );
+
+    assert_eq!(
+        lua_u64(&rpc, "return btv.bo[0].tabstop").await,
+        Some(3),
+        "a reload must not reset the buffer's `:setlocal` options"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return btv.bo[0].autoindent").await,
+        Some(true),
+        "…nor any other settable one"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The other half of the same contract: what the *read* decides is still decided by the
+/// read. A file rewritten with CRLF endings must come back as `fileformat=dos` — the
+/// options carried across a reload are the settable ones only, never the read-derived
+/// `'fileformat'` / `'fileencoding'` / `'endofline'` facts about the bytes.
+#[tokio::test]
+async fn an_autoread_reload_still_redetects_the_fileformat() {
+    let path = temp_path("checktime-ff");
+    std::fs::write(&path, b"one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.bo[0].fileformat").await.as_str(),
+        Some("unix"),
+        "precondition: opened as a unix file"
+    );
+
+    std::fs::write(&path, b"one\r\ntwo\r\nthree\r\n").unwrap();
+    feed(&rpc, ":checktime<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three"],
+        "precondition: the reload happened, with no stray \\r in the lines"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.bo[0].fileformat").await.as_str(),
+        Some("dos"),
+        "the reload re-detects the line-ending style from the new bytes"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 #[tokio::test]
 async fn checktime_warns_on_conflict_when_both_disk_and_buffer_changed() {
     let path = temp_path("checktime-conflict");

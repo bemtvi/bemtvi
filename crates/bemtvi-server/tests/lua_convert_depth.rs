@@ -22,8 +22,25 @@ async fn json_encode_cyclic_table_errors_not_crash() {
 #[tokio::test]
 async fn exec_lua_returning_cyclic_table_errors_not_crash() {
     let (rpc, _i) = start().await;
-    let res = exec_lua(&rpc, "local t = {}; t.self = t; return t").await;
-    assert_eq!(res, rmpv::Value::Nil);
+    // A value that cannot cross the wire comes back as an ERROR naming why — the depth
+    // guard's whole point is to say so rather than to recurse until the stack goes. (It
+    // answered `Nil` before `nvim_exec_lua` learned to carry a Lua failure to its caller,
+    // which made an unencodable value look like a chunk that returned nothing.)
+    let err = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![
+                rmpv::Value::from("local t = {}; t.self = t; return t"),
+                rmpv::Value::Array(vec![]),
+            ],
+        )
+        .await
+        .expect_err("a cyclic return value must not answer with a value");
+    let err = err.to_string();
+    assert!(
+        err.contains("nesting too deep"),
+        "the error names the depth guard, got {err:?}"
+    );
     assert_eq!(exec_lua(&rpc, "return 7").await.as_u64(), Some(7)); // alive
 }
 

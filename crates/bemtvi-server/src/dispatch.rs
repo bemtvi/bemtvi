@@ -294,16 +294,21 @@ impl EditHost {
                 // sees the buffer current NOW, not whatever the last autocmd left (this
                 // runs before the trailing `run_pending`, so it can't rely on that).
                 self.refresh_cur_buf_snapshot();
-                let value = match self.lua.eval_to_value(&code) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        self.editor.echo(format!("E5108: Error executing lua: {e}"));
-                        Value::Nil
-                    }
-                };
+                let result = self.lua.eval_to_value(&code);
+                // Drain first, either way: a chunk that raised halfway may already have
+                // queued effects, and those are as real as the ones a chunk that finished
+                // queued. The error is an answer to this one request, not a rollback.
                 self.apply_lua_effects();
                 self.run_pending();
-                Ok(value)
+                // A failing chunk is an ERROR to the caller, not a `Nil` value. This is an
+                // RPC *request* — someone is waiting on the answer — unlike the
+                // event-driven Lua entry points (keymaps, autocmds, LSP hooks) that can
+                // only echo `E5108` because they have no caller. Answering `Nil` made a
+                // raising chunk indistinguishable from one that returned nil, so a typo'd
+                // chunk read as "the feature answered nil" and the caller carried on with
+                // it — the silent-failure shape the project forbids. neovim answers this
+                // one with an error too.
+                result.map_err(|e| format!("E5108: Error executing lua: {e}"))
             }
             "btv_enable_test_mode" => {
                 // The `--test-plugin` runner turns on plugin-test mode: install the

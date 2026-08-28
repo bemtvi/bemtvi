@@ -445,7 +445,9 @@ pub async fn barrier(rpc: &Rpc) {
 
 // ===== Lua ===================================================================
 
-/// Run a Lua chunk via `nvim_exec_lua` and return its result value.
+/// Run a Lua chunk via `nvim_exec_lua` and return its result value. A chunk that
+/// **raises** panics the test (the server answers a Lua failure with an `E5108` error):
+/// a typo'd chunk must not read as "the feature answered nil".
 pub async fn exec_lua(rpc: &Rpc, code: &str) -> Value {
     rpc.request(
         "nvim_exec_lua",

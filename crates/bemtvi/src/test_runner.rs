@@ -232,10 +232,8 @@ async fn run(dir: PathBuf, files: Vec<PathBuf>) -> Result<bool> {
     Ok(report(&results, &load_errors))
 }
 
-/// `nvim_exec_lua(code)` returning its value; `Err` on a transport failure. A *Lua*
-/// failure in `code` never arrives as an error — the server turns it into an `:echo`
-/// and replies `Nil` — so chunks whose failure must be observed report their own
-/// outcome as a value (see [`source_spec`]).
+/// `nvim_exec_lua(code)` returning its value; `Err` on a transport failure **or** on a
+/// Lua failure in `code`, which the server answers with an `E5108` error.
 async fn exec_lua(rpc: &Rpc, code: &str) -> Result<Value> {
     rpc.request(
         "nvim_exec_lua",
@@ -246,10 +244,11 @@ async fn exec_lua(rpc: &Rpc, code: &str) -> Result<Value> {
 }
 
 /// Source one spec file, surfacing a load error (syntax) or a top-level throw as an
-/// `Err` with the Lua message. `nvim_exec_lua` can't carry a Lua error over the wire
-/// (it echoes and replies `Nil`), so the spec is compiled and run *inside* a wrapper
-/// chunk — `load` + `pcall` — that returns the error text as a value; the chunk is
-/// named after the file so line numbers in the message point at the real spec.
+/// `Err` with the Lua message. The spec is compiled and run *inside* a wrapper chunk —
+/// `load` + `pcall` — for the chunk **name**: named after the file, so line numbers in
+/// the message point at the real spec rather than at the wrapper. (The `pcall` is belt
+/// and braces now that `nvim_exec_lua` carries a Lua failure over the wire; it returns
+/// the error text as a value, which this reports the same way.)
 async fn source_spec(rpc: &Rpc, file: &Path, code: &str) -> Result<()> {
     let chunk = format!(
         "local __f, __e = load({src}, {name})\n\

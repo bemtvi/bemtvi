@@ -4367,9 +4367,14 @@ async fn scoped_clean_refuses_a_name_that_escapes_the_install_root() {
     std::fs::write(sibling.join("keep.txt"), "do not delete\n").unwrap();
 
     for name in ["..", "../precious", "..\\precious", ".", ""] {
+        // A long-bracket literal, because these names are chosen to be nasty: the
+        // backslash case in a quoted literal is `'..\precious'`, whose `\p` is an
+        // invalid Lua escape — the chunk then fails to COMPILE, so the `_G.err` reset at
+        // the top of `run_verb` never runs either and the assertion below passes on the
+        // previous iteration's error. `[[…]]` processes no escapes.
         run_verb(
             &rpc,
-            &format!("btv.plugins.clean({{ plugins = '{name}' }})"),
+            &format!("btv.plugins.clean({{ plugins = [[{name}]] }})"),
         )
         .await;
         assert!(

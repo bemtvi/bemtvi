@@ -4938,7 +4938,7 @@ async fn a_promptless_select_has_no_progress_readout() {
     let (rpc, mut incoming) = start(&dir, "").await;
     exec_lua(
         &rpc,
-        "btv.ui.select({ 'one', 'two' }, {}):thenc(function(c) _G.chose = c end)",
+        "btv.ui.select({ 'one', 'two' }, {}):next(function(c) _G.chose = c end)",
     )
     .await;
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("select opens"));

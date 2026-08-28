@@ -813,9 +813,59 @@ impl Editor {
         // caller built them; `inherit_global` is where that split is spelled out.
         buffer.options.inherit_settable(&self.buf_opts_global);
         let id = self.buffers.insert(buffer);
+        // …and *then* the file's own indentation gets the last word over the tier it was
+        // just born from — the whole point of `'indentdetect'`. It has to run after
+        // `inherit_settable`, not inside `Buffer::from_file` where the other read-derived
+        // facts are detected: `'expandtab'` and `'shiftwidth'` are settable options, so
+        // inheriting the global tier would overwrite a verdict reached any earlier.
+        self.detect_buffer_indent(id);
         // A freshly opened file reattaches any shada-restored marks for its path.
         self.seed_pending_file_marks(id);
         id
+    }
+
+    /// Apply `'indentdetect'` to buffer `id`: read the indentation convention off the
+    /// text that just landed ([`crate::indent::detect`]) and set the buffer's
+    /// `'expandtab'` / `'shiftwidth'` to match it.
+    ///
+    /// Called from every seam where a *file's* bytes become a buffer's text — the
+    /// synchronous open, the reload in place, a deferred open's local fill, and the
+    /// off-tick (daemon / wasm) landing — so a file indents the same way however it was
+    /// reached. Deliberately not called from [`load_str_into`](Self::load_str_into),
+    /// whose other callers fill panels, doc floats and the quickfix listing with editor
+    /// output: their layout is not a user's indent convention to adopt.
+    ///
+    /// Three ways this is a no-op, all of them "the user's configured style stands":
+    /// `'noindentdetect'`; a buffer with no path (a scratch buffer's text is not a
+    /// file's convention); and text the detector has no opinion on.
+    ///
+    /// A tab-indented file also takes `shiftwidth = 0` — bemtvi's "follow `'tabstop'`"
+    /// sentinel — because one indent level in such a file is exactly one tab, and a
+    /// `'shiftwidth'` that disagreed with `'tabstop'` would make `>>` insert a tab that
+    /// moves the line by some other amount.
+    pub(crate) fn detect_buffer_indent(&mut self, id: BufferId) {
+        if !self.options.indentdetect {
+            return;
+        }
+        let style = match self.buffers.map.get(&id) {
+            Some(ob) if ob.buffer.path.is_some() => crate::indent::detect(ob.buffer.iter_lines()),
+            _ => return,
+        };
+        let Some(style) = style else { return };
+        // A verdict rewrites two `bo` mirror rows, so the Lua side has to be told to
+        // re-push them — otherwise `btv.bo[buf].expandtab` keeps answering with what the
+        // buffer was born with while the editor indents by the file's rule (which is a
+        // statusline segment, or an `.editorconfig` plugin, reading a lie).
+        self.bump_options_generation();
+        let opts = &mut self.buffers.get_mut(id).buffer.options;
+        opts.expandtab = style.expandtab;
+        match style.width {
+            Some(width) => opts.shiftwidth = width,
+            // Tabs, whose one indent level is one `'tabstop'`. A space-indented file the
+            // detector could not measure keeps the configured width.
+            None if !style.expandtab => opts.shiftwidth = 0,
+            None => {}
+        }
     }
 
     /// Seed buffer `id`'s marks from any shada-restored pending set for its path,
@@ -984,6 +1034,9 @@ impl Editor {
                 ob.buffer.mark_resync();
                 ob.buffer.modified = false;
                 self.loaded_in_place.push(buffer);
+                // The read decides the indent convention again — the options carried
+                // across the swap above are the buffer's *previous* read's verdict.
+                self.detect_buffer_indent(buffer);
                 // Land the cursor: a located jump that was waiting on this deferred open
                 // goes to its target, else the top (a plain `:edit`).
                 self.settle_loaded_cursor(buffer);
@@ -1558,6 +1611,11 @@ impl Editor {
             // read round-trips a no-eol file exactly like a local one.
             ob.buffer.options.endofline = crate::buffer::ends_with_line_break(&text);
         }
+        // The off-tick twin of the `'indentdetect'` pass every synchronous read makes, so
+        // a file opened over a daemon or in the browser indents exactly like a local one.
+        // After the path is set (`load_str_into`), which is what marks these bytes a
+        // file's rather than a scratch buffer's.
+        self.detect_buffer_indent(buffer);
     }
 
     /// Make `id` the current buffer: stash the outgoing window position with its
@@ -1885,8 +1943,12 @@ impl Editor {
             }
             Err(e) => self.echo(e.to_string()),
         }
-        // Loading a file in place (`:e`, throwaway-reuse) reattaches its shada marks.
+        // Loading a file in place (`:e`, throwaway-reuse) reattaches its shada marks,
+        // and the newly-read text decides the indent convention afresh — the options
+        // carried across the swap are the *previous* file's (or read's) verdict, which is
+        // exactly what a `:edit` onto a different file must not keep.
         let id = self.cur_buffer();
+        self.detect_buffer_indent(id);
         self.seed_pending_file_marks(id);
     }
 
@@ -1934,6 +1996,9 @@ impl Editor {
             // dirty and the next reconcile would misread it as a conflict.
             ob.buffer.modified = false;
         }
+        // A reload is a read: the file may have been reindented on disk since we opened
+        // it, so `'indentdetect'` gets its say again.
+        self.detect_buffer_indent(buffer);
         if is_current {
             self.clamp_cursor();
             let last = self.last_line();
@@ -2047,6 +2112,21 @@ impl Editor {
             let id = self.cur_buffer();
             self.reload_buffer(id);
         }
+    }
+
+    /// Re-run `'indentdetect'` over the startup file, which was read at
+    /// [`Editor`](crate::Editor) construction — *before* the user's config ran. Without
+    /// this the config would be the one thing that beats a file's own indentation, and
+    /// only for the file named on the command line: an `init.lua` doing `:set expandtab`
+    /// writes the current buffer's local option too, landing on top of the verdict the
+    /// read reached. The server calls this once after sourcing the config (right beside
+    /// [`reconcile_image_preview`](Self::reconcile_image_preview), which exists for the
+    /// same startup-ordering reason), so the first file obeys the same precedence —
+    /// file over config — as every file opened afterwards. A no-op under
+    /// `'noindentdetect'`, or when the file gave the detector nothing to go on.
+    pub fn reconcile_indent_detect(&mut self) {
+        let id = self.cur_buffer();
+        self.detect_buffer_indent(id);
     }
 
     /// Enqueue an off-tick re-fetch of buffer `id`'s own file into itself — the daemon

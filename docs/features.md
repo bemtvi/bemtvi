@@ -18,6 +18,7 @@ the one-liner is the elevator pitch.
 | [Keyboard macros](features/macros.md) | vim's record-and-replay on bemtvi's keys: `<F2>{reg}` records what you *typed* (mappings included, so a Lua keymap replays), `{count}<F3>{reg}` plays it back, and a failed keystroke ends the run — so `99<F3>a` stops at the end of the buffer. The macro is a plain register holding readable key notation. |
 | [Expressions](features/expressions.md) | Hand bemtvi a small Lua expression where a fixed rule is not enough: `:s/…/\=…/` computes each replacement, `'foldexpr'` decides fold levels, and `btv.fold.text` / `btv.indent.expr` / `btv.filetype.detect` / `btv.picker.scorer` answer the questions the core will not guess at. They run in a stateless, deadline-bounded second Lua VM. |
 | [Smooth scrolling](features/smooth-scrolling.md) | Viewport scrolls slide instead of teleporting (neoscroll.nvim built in), interpolated client-side so it stays smooth even over a remote link. On by default. |
+| [Indent detection](features/indent-detection.md) | A file's own indentation sets its `'expandtab'` / `'shiftwidth'` on every read (vim-sleuth built in), per buffer, on every leg. On by default (`'indentdetect'`). |
 | [Image previews](features/image-previews.md) | Open an image file and the picture renders inline — ratatui-image in the terminal, a GPU texture in the GUI, an `<img>` in the browser. |
 
 ## UI surfaces

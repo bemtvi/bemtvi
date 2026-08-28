@@ -22,8 +22,8 @@ use std::time::Duration;
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    await_lines, buf_lines, buf_name, exec_lua, feed, poll_true, spawn_with_daemon_fs,
-    spawn_with_daemon_fs_init, DaemonFs,
+    await_lines, buf_lines, buf_name, exec_lua, feed, lua_bool, lua_u64, poll_true,
+    spawn_with_daemon_fs, spawn_with_daemon_fs_init, DaemonFs,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -96,6 +96,29 @@ async fn edit_fetches_a_second_file_over_the_wire() {
         buf_name(&rpc).await,
         "/virtual/other.txt",
         "the buffer is named for the edited remote path"
+    );
+}
+
+/// `'indentdetect'` reads the indentation off the bytes the daemon ships, exactly like a
+/// local open: the detection hangs off `load_bytes_into_enc` (core-side, where the wire's
+/// bytes become the replica's text), not off the local read path — so a remote session is
+/// not the one place a file's own indent convention is ignored.
+#[tokio::test]
+async fn indent_detect_reads_the_style_off_the_wire() {
+    let fake = DaemonFs::default();
+    fake.set_bytes("/virtual/spaced.py", b"def f():\n  if x:\n    g()\n  h()\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/spaced.py").await;
+
+    await_lines(&rpc, &["def f():", "  if x:", "    g()", "  h()"]).await;
+    assert_eq!(
+        lua_bool(&rpc, "return btv.bo[0].expandtab").await,
+        Some(true),
+        "a space-indented remote file must open with 'expandtab', like a local one"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return btv.bo[0].shiftwidth").await,
+        Some(2),
+        "…and with the 2-space step its own lines show"
     );
 }
 

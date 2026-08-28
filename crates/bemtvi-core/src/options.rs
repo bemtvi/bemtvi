@@ -137,6 +137,17 @@ pub struct Options {
     /// open path (wired in a later phase); stored here so `:set fencs=…` / `vim.o`
     /// accept it now. Default `"ucs-bom,utf-8,latin1"`.
     pub fileencodings: String,
+    /// Let an opened file's own indentation decide that buffer's `'expandtab'` and
+    /// `'shiftwidth'` (bemtvi's `'indentdetect'`, not a standard vim option — it is
+    /// vim-sleuth's behavior, built in). **On by default.** Every read seam runs
+    /// [`crate::indent::detect`] over the text that just landed: a file indented with
+    /// tabs gets `'noexpandtab'` and a `'shiftwidth'` of `0` (follow `'tabstop'`, since
+    /// one tab is one level), a file indented with spaces gets `'expandtab'` and the
+    /// step its own lines show. A file that gives no evidence — empty, unindented,
+    /// or evenly split — leaves the configured style exactly as it was, and so does
+    /// `:set noindentdetect`. The detection is per buffer and runs before
+    /// `BufReadPost`, so an `.editorconfig` (or any autocmd) still has the last word.
+    pub indentdetect: bool,
     /// Re-read a file from disk when it changed outside bemtvi and the buffer has
     /// no unsaved edits (`'autoread'`). On (neovim's default), `:checktime`
     /// silently reloads such a buffer; off, it warns (W11) and leaves the buffer
@@ -311,6 +322,7 @@ impl Options {
             ("hlsearch", Bool(b)) => self.hlsearch = *b,
             ("incsearch", Bool(b)) => self.incsearch = *b,
             ("autoread", Bool(b)) => self.autoread = *b,
+            ("indentdetect", Bool(b)) => self.indentdetect = *b,
             ("imagepreview", Bool(b)) => self.imagepreview = *b,
             ("timeout", Bool(b)) => self.timeout = *b,
             ("scrollanim", Bool(b)) => self.scrollanim = *b,
@@ -373,6 +385,7 @@ impl Options {
             "hlsearch" => Bool(self.hlsearch),
             "incsearch" => Bool(self.incsearch),
             "autoread" => Bool(self.autoread),
+            "indentdetect" => Bool(self.indentdetect),
             "imagepreview" => Bool(self.imagepreview),
             "timeout" => Bool(self.timeout),
             "scrollanim" => Bool(self.scrollanim),
@@ -563,6 +576,10 @@ impl Default for Options {
             // Reload externally-changed, unmodified buffers on `:checktime`
             // (neovim's default — vim's is off).
             autoread: true,
+            // Let each file's own indentation decide how it indents. On by default:
+            // matching the file you opened is right far more often than imposing a
+            // global default on it, and `:set noindentdetect` opts back out.
+            indentdetect: true,
             // Show image files as text, not pictures, until a config opts in.
             imagepreview: false,
             // Plugin HTTP mounts stay on loopback, and pick a free port, until the
@@ -2000,6 +2017,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Reread a file when it changes on disk and was not modified here.",
+        },
+        OptionInfo {
+            name: "indentdetect",
+            abbrev: Some("idt"),
+            kind: Bool,
+            scope: Global,
+            doc: "Let an opened file's own indentation set 'expandtab' and 'shiftwidth'.",
         },
         OptionInfo {
             name: "imagepreview",

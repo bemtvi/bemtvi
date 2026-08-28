@@ -575,6 +575,9 @@ pub struct GoMirror {
     /// `'autoread'` — whether `:checktime` silently reloads an externally-changed,
     /// unmodified buffer. Backs `vim.o.autoread`.
     pub autoread: bool,
+    /// `'indentdetect'` — whether an opened file's own indentation sets that buffer's
+    /// `'expandtab'` / `'shiftwidth'`. Backs `vim.o.indentdetect` / `btv.o.indentdetect`.
+    pub indentdetect: bool,
     /// `'imagepreview'` — whether image files open as rendered previews rather than
     /// raw bytes. Backs `vim.o.imagepreview` / `btv.o.imagepreview`.
     pub imagepreview: bool,

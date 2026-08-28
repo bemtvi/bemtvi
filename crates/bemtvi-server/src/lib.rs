@@ -4486,6 +4486,13 @@ where
     // before the lifecycle seed below, so the events fire over the final buffer.)
     host.editor.reconcile_image_preview();
 
+    // Same startup ordering, for `'indentdetect'`: the file arg's indentation was read
+    // at construction, and a config's `:set expandtab` / `:set shiftwidth=…` has just
+    // written it again. Let the file have the last word here, as it does on every `:e`
+    // after startup — otherwise the very first file would be the one place the config
+    // beat the file's own convention.
+    host.editor.reconcile_indent_detect();
+
     // Rebuild the workspace session's layout, now that the config has configured the
     // startup window/buffer every restored one is minted from (see
     // `apply_pending_session_restore` for why this can't run at `shada_load`). A no-op

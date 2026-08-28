@@ -1,0 +1,7 @@
+def outer():
+    if cond:
+        inner()
+    tail()
+
+def other():
+    body()

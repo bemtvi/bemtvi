@@ -74,6 +74,8 @@ mod helix_selections;
 mod helix_verbs;
 #[path = "editing/highlights.rs"]
 mod highlights;
+#[path = "editing/indent_detect.rs"]
+mod indent_detect;
 #[path = "editing/indent_pairs.rs"]
 mod indent_pairs;
 #[path = "editing/jumplist.rs"]

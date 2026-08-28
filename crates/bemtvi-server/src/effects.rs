@@ -2707,6 +2707,7 @@ impl EditHost {
             regexsyntax: go.regexsyntax.clone(),
             fileencodings: go.fileencodings.clone(),
             autoread: go.autoread,
+            indentdetect: go.indentdetect,
             imagepreview: go.imagepreview,
             httphost: go.httphost.clone(),
             httpport: go.httpport,

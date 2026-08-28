@@ -1,0 +1,7 @@
+root:
+  child:
+    grandchild: 1
+    other: 2
+  sibling: 3
+next:
+  leaf: 4

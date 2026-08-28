@@ -74,6 +74,7 @@ IMPORTS = [
     ("docs/features/macros.md", "features/macros.md"),
     ("docs/features/expressions.md", "features/expressions.md"),
     ("docs/features/smooth-scrolling.md", "features/smooth-scrolling.md"),
+    ("docs/features/indent-detection.md", "features/indent-detection.md"),
     ("docs/features/image-previews.md", "features/image-previews.md"),
     ("docs/features/workspaces.md", "features/workspaces.md"),
     ("docs/features/ui-primitives.md", "features/ui-primitives.md"),

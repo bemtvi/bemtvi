@@ -19,6 +19,7 @@ pub mod fuzzy;
 pub mod glob;
 pub mod highlight;
 pub mod host;
+pub mod indent;
 pub mod input;
 pub mod markdown;
 pub mod mode;

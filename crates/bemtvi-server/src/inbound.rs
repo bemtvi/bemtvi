@@ -91,6 +91,7 @@ impl EditHost {
         let mut had_real = false;
         let mut shada_due = false;
         let mut resume_due = false;
+        let mut preview_hl_due = false;
         let mut diag_due = false;
         let mut spin_due = false;
         let mut budget = LOOP_EVENT_BATCH;
@@ -105,6 +106,12 @@ impl EditHost {
                 diag_due = true;
             } else if crate::is_parse_resume_timer(&event) {
                 resume_due = true;
+            } else if crate::is_preview_hl_timer(&event) {
+                // The picker selection has sat still: let this frame's projection
+                // extract the preview's spans. Handled here like the wakes above — it
+                // is the editor's own timer, not a Lua callback.
+                self.preview_hl_due = true;
+                preview_hl_due = true;
             } else if crate::is_picker_spin_timer(&event) {
                 // The picker's animation wake: advance the spinner frame. Like the two
                 // above it is the editor's own timer, not a Lua callback — and like
@@ -147,12 +154,13 @@ impl EditHost {
             self.editor.picker_spin();
         }
         // Repaint when a real event ran, or when a parse-resume / diagnostic-debounce /
-        // picker-spinner wake is due: none changed editor state by itself, but the
-        // redraw each triggers is the whole point — resuming the in-flight treesitter
-        // parse and painting its new spans, painting the diagnostics the debounce just
-        // applied, painting the spinner's next frame. A shada-only wake, by contrast,
+        // picker-spinner / preview-highlight wake is due: none changed editor state by
+        // itself, but the redraw each triggers is the whole point — resuming the
+        // in-flight treesitter parse and painting its new spans, painting the
+        // diagnostics the debounce just applied, painting the spinner's next frame,
+        // extracting the settled preview's spans. A shada-only wake, by contrast,
         // touches nothing visible, so it never forces a frame.
-        if had_real || resume_due || diag_due || spin_due {
+        if had_real || resume_due || diag_due || spin_due || preview_hl_due {
             self.settle_events(true);
         }
     }

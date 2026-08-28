@@ -2531,8 +2531,11 @@ impl EditHost {
                 let start = (base + self.preview_scroll).clamp(0, max_start.max(0));
                 self.preview_scroll = start - base;
                 let start = start as usize;
-                let cache = &self.preview_cache;
                 let end = (start + pane_h).min(len);
+                // Bring this window's tree-sitter spans in (debounced, band-scoped)
+                // before reading them below — the pane paints plain until they land.
+                self.ensure_preview_highlights(start, end);
+                let cache = &self.preview_cache;
                 let win = cache.lines.get(start..end).unwrap_or(&[]);
                 // Expand each visible line's tabs to spaces up front. The preview
                 // renders char-by-char with each cell one column, but a raw `\t` handed
@@ -2719,22 +2722,88 @@ impl EditHost {
         self.session_cwd().join(p)
     }
 
-    /// Store the preview `lines` for `path` into [`preview_cache`](EditHost::preview_cache),
-    /// syntax-highlighting the whole file once here (so moving the selection within one
-    /// file's matches never re-parses). Highlights are keyed by 0-based file line; empty
-    /// when the read failed (`ok = false`) or no grammar is installed for the path.
-    /// Recompute the cached preview's highlights in place — its language's grammar
-    /// just landed, and the preview was stored while the load was still in flight (so
-    /// it painted as plain text). The file is not re-read: only the spans change.
+    /// Drop the cached preview's highlight band — its language's grammar just landed,
+    /// and the band was extracted (as nothing) while the load was still in flight, so
+    /// the pane is painting plain text. The file is not re-read and nothing is parsed
+    /// here: the next frame sees an uncovered band and re-arms the debounce, which
+    /// colours the pane in a beat later.
     pub(crate) fn rehighlight_preview(&mut self) {
+        self.preview_cache.highlights.clear();
+        self.preview_cache.block_bg_lines.clear();
+        self.preview_cache.band = 0..0;
+        self.preview_hl_pending = None;
+    }
+
+    /// Extract the preview's tree-sitter spans for the band around the visible window,
+    /// **debounced** so a moving selection never pays for them.
+    ///
+    /// Both halves matter. The *band*: a preview shows a pane's worth of lines, so
+    /// querying the whole file (as this once did) makes the cost scale with the file
+    /// instead of the pane — 4000 lines of Lua cost ~300ms of query against ~5ms for
+    /// the ~40 lines actually painted. The band is padded either side (see below), so
+    /// a scroll gesture usually lands inside what is already extracted. The
+    /// *debounce*: what the band cannot bound is the parse, which is whole-file by
+    /// nature (a partial parse would paint confidently wrong, see
+    /// `Engine::highlight_fragment`). So the work waits for the selection to settle
+    /// ([`PREVIEW_HL_DEBOUNCE_MS`](crate::PREVIEW_HL_DEBOUNCE_MS)) — holding `<C-n>`
+    /// through a result list re-arms the timer on every row and highlights none of
+    /// them, and the row you stop on colours in a beat later. Same "paint now,
+    /// highlight after" split as a buffer's first highlight
+    /// (`first_highlight_deferred`).
+    fn ensure_preview_highlights(&mut self, first: usize, last: usize) {
+        // Nothing to extract: no grammar for this path, or a placeholder (unreadable /
+        // still loading) rather than file content.
+        if self.preview_cache.lang.is_empty() || !self.preview_cache.ok {
+            return;
+        }
+        let band = &self.preview_cache.band;
+        if band.start <= first && last <= band.end {
+            self.preview_hl_pending = None;
+            return;
+        }
         let Some(path) = self.preview_cache.path.clone() else {
             return;
         };
-        let lines = std::mem::take(&mut self.preview_cache.lines);
-        let ok = self.preview_cache.ok;
-        self.store_preview(&path, lines, ok);
+        // Two pane heights of padding either side, so `<C-d>`/`<C-u>` over the pane —
+        // and a location picker's hops within one file — usually read out of the band
+        // rather than re-extracting (which would re-parse: the extraction is cheap next
+        // to the parse, so the padding is worth more than it costs).
+        let pad = last.saturating_sub(first).max(1) * 2;
+        let want = first.saturating_sub(pad)
+            ..(last.saturating_add(pad)).min(self.preview_cache.lines.len());
+        let ask = (path, want.clone());
+        if self.preview_hl_pending.as_ref() != Some(&ask) {
+            // A different file (or a scrolled-away window): (re)start the debounce.
+            // `TimerStart` replaces the pending one-shot, so a selection that keeps
+            // moving keeps pushing the extraction out — the shada-flush pattern.
+            self.preview_hl_pending = Some(ask);
+            self.preview_hl_due = false;
+            self.arm_preview_highlight();
+            return;
+        }
+        if !self.preview_hl_due {
+            return; // still within the debounce — the timer will bring us back
+        }
+        self.preview_hl_due = false;
+        self.preview_hl_pending = None;
+        // Trailing newline to match the engine's buffer invariant (it treats the last
+        // line as a phantom: `len_lines - 1`); without it a single-line file parses to
+        // zero lines and drops every span.
+        let text = self.preview_cache.lines.join("\n") + "\n";
+        let lang = self.preview_cache.lang.clone();
+        let (spans, bg) = self.resolved_preview_highlights(&lang, &text, want.start, want.end);
+        let mut highlights: HashMap<usize, Vec<bemtvi_core::Span>> = HashMap::new();
+        for span in spans {
+            highlights.entry(span.line).or_default().push(span);
+        }
+        self.preview_cache.highlights = highlights;
+        self.preview_cache.block_bg_lines = bg.into_iter().collect();
+        self.preview_cache.band = want;
     }
 
+    /// Store the preview `lines` for `path` into [`preview_cache`](EditHost::preview_cache),
+    /// resolving only its highlight *language* here — the spans themselves are
+    /// extracted later, per visible band, by [`ensure_preview_highlights`](Self::ensure_preview_highlights).
     fn store_preview(&mut self, p: &std::path::Path, lines: Vec<String>, ok: bool) {
         // The highlight language: the extension's grammar, or — for a vim help
         // `doc/*.txt`, which no extension rule catches — `vimdoc`, decided from the
@@ -2750,25 +2819,13 @@ impl EditHost {
         } else {
             None
         };
-        let mut highlights: HashMap<usize, Vec<bemtvi_core::Span>> = HashMap::new();
-        let mut block_bg_lines = std::collections::HashSet::new();
-        if let Some(lang) = lang {
-            // Trailing newline to match the engine's buffer invariant (it treats
-            // the last line as a phantom: `len_lines - 1`); without it a
-            // single-line file parses to zero lines and drops every span.
-            let text = lines.join("\n") + "\n";
-            let (spans, bg) = self.resolved_preview_highlights(lang, &text, 0, lines.len());
-            for span in spans {
-                highlights.entry(span.line).or_default().push(span);
-            }
-            block_bg_lines = bg.into_iter().collect();
-        }
         self.preview_cache = PreviewCache {
             path: Some(p.to_path_buf()),
             lines,
             ok,
-            highlights,
-            block_bg_lines,
+            highlights: HashMap::new(),
+            block_bg_lines: std::collections::HashSet::new(),
+            band: 0..0,
             lang: lang.unwrap_or_default().to_string(),
         };
     }
@@ -2818,10 +2875,17 @@ pub(crate) struct PreviewCache {
     /// location range-highlight, which would be meaningless over the placeholder.
     ok: bool,
     /// Native tree-sitter highlight spans (Phase 3b), keyed by 0-based file line —
-    /// the engine's raw byte-offset spans, computed **once** per file read (the whole
-    /// file is parsed on a path miss). `project_preview` maps the windowed slice to
-    /// char columns + per-frame style ids; an empty map ⇒ no grammar (plain preview).
+    /// the engine's raw byte-offset spans, extracted for [`band`](Self::band) only.
+    /// `project_preview` maps the windowed slice to char columns + per-frame style
+    /// ids; an empty map ⇒ no grammar (plain preview), or a band not extracted yet.
     highlights: HashMap<usize, Vec<bemtvi_core::Span>>,
+    /// The 0-based file lines [`highlights`](Self::highlights) and
+    /// [`block_bg_lines`](Self::block_bg_lines) were extracted for — the visible
+    /// window plus a couple of panes of padding, **not** the whole file (a preview
+    /// paints a pane, so its cost must scale with the pane). Empty until
+    /// [`EditHost::ensure_preview_highlights`] has run for this file; a window that
+    /// scrolls outside it re-extracts.
+    band: std::ops::Range<usize>,
     /// 0-based file lines a full-line-background capture (`@markup.raw.block` — a
     /// fenced code block) touches. Projected as the preview's `line_bg` layer so the
     /// block background is painted *under* the text rather than left in the per-cell

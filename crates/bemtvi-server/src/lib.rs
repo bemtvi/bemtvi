@@ -1524,6 +1524,15 @@ pub struct EditHost {
     /// Reset when the path differs; dropped implicitly when the picker closes (the
     /// next picker repopulates it). See [`redraw::project_menu`](crate::redraw).
     preview_cache: redraw::PreviewCache,
+    /// The preview highlight the debounce is holding: `(path, band)` — the file and
+    /// the 0-based line range [`ensure_preview_highlights`](EditHost::ensure_preview_highlights)
+    /// will extract once the selection settles. Re-set (and the timer re-armed) on
+    /// every change, so a selection moving row to row never reaches the extraction.
+    preview_hl_pending: Option<(std::path::PathBuf, std::ops::Range<usize>)>,
+    /// The preview-highlight debounce elapsed ([`PREVIEW_HL_TIMER_ID`]): the next
+    /// frame extracts the pending band instead of deferring it again. Cleared by
+    /// that extraction, and whenever the pending ask changes under it.
+    preview_hl_due: bool,
     /// `btv.treesitter.highlight` asks waiting on a grammar that is still loading:
     /// `(language, text, line count, callback id)`. Settling one early would fulfil its
     /// promise with an empty span list — "this text has no highlights" — so it is
@@ -2045,6 +2054,8 @@ impl EditHost {
             quit_all_replay: None,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
+            preview_hl_pending: None,
+            preview_hl_due: false,
             #[cfg(feature = "native")]
             parked_ts_highlights: Vec::new(),
             preview_scroll: 0,
@@ -2651,6 +2662,15 @@ impl EditHost {
             if timer.id == PICKER_SPIN_TIMER_ID {
                 self.picker_spin_armed = false;
                 self.editor.picker_spin();
+                fired_any = true;
+                continue;
+            }
+            // And the picker preview's highlight debounce (the browser twin of the
+            // native run loop's arm): the selection has sat still long enough, so the
+            // trailing `redraw` below extracts the pane's spans instead of deferring
+            // them once more.
+            if timer.id == PREVIEW_HL_TIMER_ID {
+                self.preview_hl_due = true;
                 fired_any = true;
                 continue;
             }
@@ -3397,6 +3417,28 @@ pub(crate) const PICKER_SPIN_INTERVAL_MS: u64 = 80;
 #[cfg(feature = "native")]
 pub(crate) fn is_picker_spin_timer(event: &LoopEvent) -> bool {
     matches!(event, LoopEvent::Timer { id, .. } if *id == PICKER_SPIN_TIMER_ID)
+}
+
+/// The loop id of the **picker-preview highlight** debounce — the one-shot that ends
+/// the pause after the selection stops moving. Highlighting a previewed file is a
+/// whole-file parse (a partial one would paint confidently wrong), so it must not ride
+/// the keystroke that re-targeted the pane: each move re-arms this timer, replacing the
+/// pending one (the shada-flush pattern), and only a settled selection is highlighted.
+/// Handled on both legs — the native run loop's timer arm and the Worker's timer wheel
+/// ([`EditHost::fire_due_timers`]) — so one path serves a local, daemon or browser
+/// session.
+pub(crate) const PREVIEW_HL_TIMER_ID: u64 = 1 << 55;
+
+/// How long the picker selection must sit still before its preview is highlighted.
+/// Longer than a key-repeat interval, so holding `<C-n>` highlights nothing on the way
+/// through; short enough that stopping on a row reads as immediate.
+pub(crate) const PREVIEW_HL_DEBOUNCE_MS: u64 = 90;
+
+/// Whether `event` is the picker-preview highlight debounce firing (vs. a real Lua
+/// timer / the shada, parse-resume, diagnostic or spinner wakes).
+#[cfg(feature = "native")]
+pub(crate) fn is_preview_hl_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id == PREVIEW_HL_TIMER_ID)
 }
 
 /// How long one workspace file operation may take before the watchdog gives up on it.

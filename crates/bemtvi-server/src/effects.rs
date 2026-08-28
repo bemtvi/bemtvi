@@ -3114,6 +3114,24 @@ impl EditHost {
         }
     }
 
+    /// Arm the one-shot picker-preview highlight debounce, replacing any pending one
+    /// — so a selection that keeps moving keeps pushing its preview's parse out, and
+    /// only the row it settles on is ever highlighted. Called from the frame that finds
+    /// the pane's band un-extracted (see
+    /// [`ensure_preview_highlights`](Self::ensure_preview_highlights)).
+    ///
+    /// Deliberately *not* `#[cfg(native)]` and routed through `apply_loop_op`, like the
+    /// picker spinner: the wasm leg drives the same [`LoopOp`](bemtvi_lua::LoopOp)
+    /// through its own timer wheel, so one arm serves the local, daemon and browser
+    /// sessions.
+    pub(crate) fn arm_preview_highlight(&mut self) {
+        self.apply_loop_op(bemtvi_lua::LoopOp::TimerStart {
+            id: crate::PREVIEW_HL_TIMER_ID,
+            delay_ms: crate::PREVIEW_HL_DEBOUNCE_MS,
+            repeat_ms: 0,
+        });
+    }
+
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
     /// forward a timer / process op to the event-loop actor (a fire-and-forget
     /// [`LoopCommand`], never awaited).

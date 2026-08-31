@@ -34,10 +34,13 @@
 --   * `:RemotePlugin` — a command from a PLUGIN the daemon served (see pack/ below).
 --   * `:lua btv.notify(_G.REMOTE_GREETING)` — proves `require` resolved a module from
 --     this config's `lua/` tree (also fetched).
---   * `:set tabstop?` — shows 7, the distinctive option set here.
+--   * `:set scrolloff?` — shows 7, the distinctive option set here.
 
--- A distinctive option, so `:set tabstop?` visibly reflects this config.
-btv.o.tabstop = 7
+-- A distinctive option, so `:set scrolloff?` visibly reflects this config (and you can
+-- see it: the cursor keeps a 7-line margin). Deliberately NOT an indent option —
+-- `'indentdetect'` reads those off each file you open, and would outrank a marker set
+-- here the moment the sample turned out to be indented. See examples/indent-detect.
+btv.o.scrolloff = 7
 vim.g.mapleader = " "
 
 -- A user command that exists only if THIS init.lua loaded.
@@ -51,6 +54,8 @@ _G.REMOTE_GREETING = require("remote_mod").greeting()
 -- Announce, once the editor has finished starting, that the remote config loaded.
 vim.api.nvim_create_autocmd("VimEnter", {
   callback = function()
-    btv.notify("bemtvi: loaded init.lua + plugins fetched from the daemon (" .. _G.REMOTE_GREETING .. ")")
+    btv.notify(
+      "bemtvi: loaded init.lua + plugins fetched from the daemon (" .. _G.REMOTE_GREETING .. ")"
+    )
   end,
 })

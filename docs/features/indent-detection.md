@@ -11,11 +11,22 @@ finds:
 
 * Indented with **tabs** → `'noexpandtab'`, and `shiftwidth=0` (bemtvi's "follow
   `'tabstop'`" sentinel), because one indent level in such a file is one tab.
-* Indented with **spaces** → `'expandtab'`, and `'shiftwidth'` set to the step
-  the file's own lines show (2, 4, …).
+  `'tabstop'` itself is left alone: how wide a tab *draws* is a preference the
+  bytes cannot reveal.
+* Indented with **spaces** → `'expandtab'`, and `'tabstop'` set to the step the
+  file's own lines show (2, 4, …), with `'shiftwidth'` left at its `0` sentinel.
 * **No usable evidence** — an empty or unindented file, a single indented line,
   or tabs and spaces exactly as common as each other → nothing changes, and the
   style your config chose stands.
+
+The width lands on `'tabstop'`, not on `'shiftwidth'`, and that is load-bearing.
+`'tabstop'` is the single knob that sets bemtvi's whole indent width —
+`'shiftwidth'` follows it through the `0` sentinel and `'softtabstop'` follows
+`'shiftwidth'` through `-1` — so a `FileType` autocmd doing the documented
+`btv.bo[buf].tabstop = 2` still changes how the buffer indents. Writing the
+detected width straight into `'shiftwidth'` would sever that chain silently: the
+later write would land on a knob nothing reads any more, and the file's width
+would win forever.
 
 The verdict is **per buffer**, not a mode: a tab-indented file and a 2-space file
 open side by side each keep their own.

@@ -22,9 +22,15 @@ local function open(t, name)
   t:cmd("e " .. path)
 end
 
---- The `(expandtab, shiftwidth)` the focused buffer ended up with.
+--- The `(expandtab, indent width)` the focused buffer ended up with. The width comes
+--- off `'tabstop'` whenever `'shiftwidth'` is at its `0` "follow tabstop" sentinel —
+--- which is where detection leaves it, and where an unconfigured buffer starts.
 local function style()
-  return { btv.bo.expandtab, btv.bo.shiftwidth }
+  local width = btv.bo.shiftwidth
+  if width == 0 then
+    width = btv.bo.tabstop
+  end
+  return { btv.bo.expandtab, width }
 end
 
 btv.test.describe("examples/indent-detect", function()
@@ -51,7 +57,9 @@ btv.test.describe("examples/indent-detect", function()
   -- "4. TYPE: :e tabbed.txt  SEE: tabs ; gg>> moves right by one real TAB"
   btv.test.it("4 — the tab-indented file indents with a real tab", function(t)
     open(t, "tabbed.txt")
-    btv.test.expect(style()).to_equal({ false, 0 })
+    -- `noexpandtab`, and the width stays the config's 8: one indent level here is one
+    -- tab, and how wide a tab DRAWS is a preference the file's bytes cannot reveal.
+    btv.test.expect(style()).to_equal({ false, 8 })
     t:feed("gg>>")
     btv.test.expect(t:line(1)).to_be("\tfn main() {")
   end)
@@ -60,7 +68,7 @@ btv.test.describe("examples/indent-detect", function()
   btv.test.it("4 — the verdict is per buffer, not a global mode", function(t)
     open(t, "sample.txt")
     open(t, "tabbed.txt")
-    btv.test.expect(style()).to_equal({ false, 0 })
+    btv.test.expect(style()).to_equal({ false, 8 })
     t:cmd("b#")
     btv.test.expect(style()).to_equal({ true, 2 })
   end)
@@ -84,7 +92,7 @@ btv.test.describe("examples/indent-detect", function()
     -- The read got there first…
     btv.test.expect(style()).to_equal({ true, 4 })
     -- …and setting the options by hand afterwards still wins.
-    t:cmd("setlocal noexpandtab shiftwidth=8")
+    t:cmd("setlocal noexpandtab tabstop=8")
     t:feed("gg>>")
     btv.test.expect(t:line(1)).to_be("\tdef outer():")
   end)
@@ -92,7 +100,7 @@ btv.test.describe("examples/indent-detect", function()
   -- "6. TYPE: :e!  SEE: back to spaces:4"
   btv.test.it("6 — re-reading the file runs the detection again", function(t)
     open(t, "four-space.txt")
-    t:cmd("setlocal noexpandtab shiftwidth=8")
+    t:cmd("setlocal noexpandtab tabstop=8")
     btv.test.expect(style()).to_equal({ false, 8 })
     t:cmd("e!")
     btv.test.expect(style()).to_equal({ true, 4 })

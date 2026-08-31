@@ -95,10 +95,19 @@ btv.test.describe("examples/folds", function()
     t:feed("zj")
     local second = t:cursor()[1]
     btv.test.expect(second > first).to_be(true)
+    -- A third step, so `zk` below has a previous SIBLING fold to land in. The second
+    -- fold here opens inside the first (`window = {` nested in `config = {`), and from
+    -- inside a nest there is no earlier fold above to step back to — `zk` correctly
+    -- stays put. Which folds nest depends on the file's own indent width, now that
+    -- `'indentdetect'` reads it off the file, so the step count is what makes this
+    -- assertion about the MOTION rather than about one particular fold picture.
+    t:feed("zj")
+    local third = t:cursor()[1]
+    btv.test.expect(third > second).to_be(true)
     -- `zk` lands on the END of the previous fold, not its start (vim's rule), so
     -- the assertion is direction, not symmetry.
     t:feed("zk")
-    btv.test.expect(t:cursor()[1] < second).to_be(true)
+    btv.test.expect(t:cursor()[1] < third).to_be(true)
   end)
 
   -- ":set foldlevel=1  show only the top level of nesting"

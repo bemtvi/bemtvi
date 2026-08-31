@@ -36,8 +36,15 @@ btv.test.describe("examples/ts-install", function()
   btv.test.it("the config sets spaces four wide", function(t)
     t:cmd("e " .. DIR .. "/sample.rs")
     btv.test.expect(btv.bo.expandtab).to_be(true)
-    btv.test.expect(btv.bo.shiftwidth).to_be(4)
     btv.test.expect(btv.bo.tabstop).to_be(4)
+    -- The EFFECTIVE width, not the raw slot: `'shiftwidth'` reads `0` here — its
+    -- "follow `'tabstop'`" sentinel — because this file's own 4-space indentation
+    -- agrees with the config and `'indentdetect'` writes the width to `'tabstop'`.
+    local width = btv.bo.shiftwidth
+    if width == 0 then
+      width = btv.bo.tabstop
+    end
+    btv.test.expect(width).to_be(4)
   end)
 
   btv.test.it("the sample really is a rust buffer", function(t)

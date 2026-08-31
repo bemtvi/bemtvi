@@ -17,6 +17,16 @@
 -- `vim.go` / `vim.opt_global` the global one.
 
 --------------------------------------------------------------------------------
+-- 0. `'indentdetect'` is ON by default, and it would talk over this whole demo: it
+--    reads each file's OWN indentation at read time and sets that buffer's
+--    `'expandtab'` / `'tabstop'` from it — deliberately outranking the config below,
+--    which is the one thing this example is here to show reaching a file. The sample
+--    has tab-indented lines inside its fold, so detection would (correctly) call it a
+--    tab-indented file and turn `'expandtab'` back off. Off, so the tiers are the only
+--    thing moving these options. See examples/indent-detect for what it does.
+vim.o.indentdetect = false
+
+--------------------------------------------------------------------------------
 -- 1. `vim.opt` — the one a config almost always wants. It moves BOTH tiers, so
 --    every file opened from here on indents by 3 and folds by markers, not just
 --    whatever buffer happened to be current while this file ran.
@@ -51,9 +61,12 @@ vim.opt_global.commentstring = "## %s"
 --------------------------------------------------------------------------------
 -- 4. `vim.opt_local` — the ftplugin case: one filetype's indent must not become
 --    everyone's default, so it writes the buffer and stops there.
-btv.on("FileType", { pattern = "lua", callback = function()
-  vim.opt_local.tabstop = 2
-end })
+btv.on("FileType", {
+  pattern = "lua",
+  callback = function()
+    vim.opt_local.tabstop = 2
+  end,
+})
 
 --------------------------------------------------------------------------------
 -- Try it:

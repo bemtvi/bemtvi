@@ -8,7 +8,7 @@
 -- `'indentdetect'` is ON by default — this config exists to make what it does
 -- visible, not to switch it on. Every time bemtvi reads a file it looks at the
 -- file's own leading whitespace and sets that buffer's `'expandtab'` and
--- `'shiftwidth'` to match, so you keep indenting a file the way it is already
+-- indent width to match, so you keep indenting a file the way it is already
 -- indented instead of the way your config would have. (This is what the vim-sleuth
 -- plugin does for vim; in bemtvi it is built in, and there is nothing to install.)
 --
@@ -20,12 +20,11 @@
 --    Without `'indentdetect'` every buffer below would indent with one 8-wide tab.
 vim.o.expandtab = false
 vim.o.tabstop = 8
-vim.o.shiftwidth = 8
 
 -- 2. Show the detected style in the statusline, so you can read the verdict off
 --    the screen instead of typing `:set et?` every time. It is recomputed when a
 --    buffer is entered or read (there is no `OptionSet` event) — so after you set
---    the options by hand in step 6, ask `:set expandtab? shiftwidth?` instead.
+--    the options by hand in step 6, ask `:set expandtab? tabstop?` instead.
 --
 --    TYPE:  (nothing — look at the bottom right of any window)
 --    SEE:   `spaces:2`, `spaces:4` or `tabs` for the focused buffer.
@@ -33,7 +32,14 @@ btv.statusline.segment({
   name = "indent",
   events = { "BufEnter", "BufReadPost" },
   render = function()
-    local text = btv.bo.expandtab and ("spaces:" .. tostring(btv.bo.shiftwidth)) or "tabs"
+    -- `'shiftwidth'` is `0` — its "follow `'tabstop'`" sentinel — on any buffer that
+    -- has not been given an explicit one, which is where the detected width lands.
+    -- Resolving the sentinel is what any reader of an indent width has to do.
+    local width = btv.bo.shiftwidth
+    if width == 0 then
+      width = btv.bo.tabstop
+    end
+    local text = btv.bo.expandtab and ("spaces:" .. tostring(width)) or "tabs"
     return { { text = text } }
   end,
 })
@@ -45,9 +51,15 @@ btv.statusline.setup({
 
 -- 3. THE SAMPLE FILE — 2-space indented.
 --
---    TYPE:  :set expandtab? shiftwidth?
---    SEE:   `expandtab` and `shiftwidth=2` — not the `noexpandtab` /
---           `shiftwidth=8` set above. The file won.
+--    TYPE:  :set expandtab? tabstop?
+--    SEE:   `expandtab` and `tabstop=2` — not the `noexpandtab` / `tabstop=8` set
+--           above. The file won.
+--
+--    The width lands on `'tabstop'` on purpose. It is the one knob that sets the
+--    whole indent width here — `'shiftwidth'` stays `0` and `'softtabstop'` stays
+--    `-1`, their "follow the one above" sentinels — so a later `:set tabstop=N`
+--    (step 6) still moves everything. Writing the width straight into
+--    `'shiftwidth'` would quietly break that chain.
 --
 --    TYPE:  gg>>
 --    SEE:   the first line moves right by exactly two SPACES.
@@ -70,13 +82,13 @@ btv.statusline.setup({
 --    SEE:   `spaces:4`.
 --
 --    TYPE:  ggo  then press <Tab>
---    SEE:   four spaces, because `'softtabstop'` follows the detected
---           `'shiftwidth'`.
+--    SEE:   four spaces: `'softtabstop'` follows `'shiftwidth'`, which follows the
+--           detected `'tabstop'`.
 
 -- 6. YOUR SETTING STILL WINS — as long as it comes after the read.
 --
---    TYPE:  :setlocal noexpandtab shiftwidth=8
---    SEE:   `>>` now inserts a tab (`:set expandtab? shiftwidth?` confirms it).
+--    TYPE:  :setlocal tabstop=8 noexpandtab
+--    SEE:   `>>` now inserts a tab (`:set expandtab? tabstop?` confirms it).
 --           Detection runs when
 --           the file is READ, so anything you (or an autocmd, or an
 --           `.editorconfig` plugin) set afterwards is the last word.

@@ -116,9 +116,14 @@ async fn indent_detect_reads_the_style_off_the_wire() {
         "a space-indented remote file must open with 'expandtab', like a local one"
     );
     assert_eq!(
-        lua_u64(&rpc, "return btv.bo[0].shiftwidth").await,
+        lua_u64(&rpc, "return btv.bo[0].tabstop").await,
         Some(2),
-        "…and with the 2-space step its own lines show"
+        "…and with the 2-space step its own lines show, on the `'tabstop'` knob"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return btv.bo[0].shiftwidth").await,
+        Some(0),
+        "…leaving `'shiftwidth'` at its follow-`'tabstop'` sentinel, as a local read does"
     );
 }
 

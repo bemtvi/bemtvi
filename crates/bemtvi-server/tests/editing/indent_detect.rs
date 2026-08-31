@@ -14,12 +14,16 @@ async fn open(content: &str) -> (Rpc, UnboundedReceiver<Incoming>, String) {
     (rpc, incoming, path)
 }
 
-/// The `(expandtab, shiftwidth)` pair a buffer ended up with, as Lua reads them.
-async fn style(rpc: &Rpc) -> (bool, i64) {
+/// The `(expandtab, tabstop, shiftwidth)` a buffer ended up with, as Lua reads them.
+/// `shiftwidth` is the RAW slot, so `0` reads as bemtvi's "follow `'tabstop'`" sentinel
+/// rather than as an effective width — which is the point of most of these assertions.
+async fn style(rpc: &Rpc) -> (bool, i64, i64) {
     let et = exec_lua(rpc, "return btv.bo[0].expandtab").await;
+    let ts = exec_lua(rpc, "return btv.bo[0].tabstop").await;
     let sw = exec_lua(rpc, "return btv.bo[0].shiftwidth").await;
     (
         et.as_bool().expect("expandtab is a boolean"),
+        ts.as_i64().expect("tabstop is a number"),
         sw.as_i64().expect("shiftwidth is a number"),
     )
 }
@@ -41,7 +45,7 @@ async fn tab_indented_file_turns_expandtab_off() {
     redraw_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
     // shiftwidth 0 is bemtvi's "follow tabstop" sentinel: one indent level in a
     // tab-indented file is exactly one tab.
-    assert_eq!(style(&rpc).await, (false, 0));
+    assert_eq!(style(&rpc).await, (false, 4, 0));
 }
 
 /// The startup file arg is read at editor construction — *before* `init.lua` runs and
@@ -59,7 +63,7 @@ async fn the_startup_file_beats_a_config_that_sets_the_opposite() {
         "vim.o.expandtab = true\nvim.o.shiftwidth = 2\n",
     )
     .await;
-    assert_eq!(style(&rpc).await, (false, 0));
+    assert_eq!(style(&rpc).await, (false, 4, 0));
 }
 
 /// …and the same config still stands when the startup file has nothing to say.
@@ -74,19 +78,23 @@ async fn a_config_still_configures_a_startup_file_with_no_indentation() {
         "vim.o.expandtab = true\nvim.o.shiftwidth = 2\n",
     )
     .await;
-    assert_eq!(style(&rpc).await, (true, 2));
+    assert_eq!(
+        style(&rpc).await,
+        (true, 4, 2),
+        "the config's own values, untouched — including the explicit shiftwidth"
+    );
 }
 
 #[tokio::test]
 async fn two_space_file_sets_expandtab_and_shiftwidth_two() {
     let (rpc, _incoming, _p) = open("a\n  b\n    c\n  d\ne\n  f\n").await;
-    assert_eq!(style(&rpc).await, (true, 2));
+    assert_eq!(style(&rpc).await, (true, 2, 0));
 }
 
 #[tokio::test]
 async fn four_space_file_sets_shiftwidth_four() {
     let (rpc, _incoming, _p) = open("a\n    b\n        c\n    d\ne\n    f\n").await;
-    assert_eq!(style(&rpc).await, (true, 4));
+    assert_eq!(style(&rpc).await, (true, 4, 0));
 }
 
 #[tokio::test]
@@ -97,7 +105,7 @@ async fn a_file_with_no_indentation_leaves_the_configured_style_alone() {
     redraw_after(&rpc, &mut incoming, ":set expandtab shiftwidth=7<CR>").await;
     // Re-read the same file: the detector runs again and still has nothing to say.
     redraw_after(&rpc, &mut incoming, ":e!<CR>").await;
-    assert_eq!(style(&rpc).await, (true, 7));
+    assert_eq!(style(&rpc).await, (true, 4, 7));
 }
 
 #[tokio::test]
@@ -105,7 +113,7 @@ async fn tab_indent_with_space_alignment_still_reads_as_tabs() {
     // The tabs-for-indent / spaces-for-alignment style: the leading run starts with a
     // tab, and the spaces after it align a continuation *inside* the line.
     let (rpc, _incoming, _p) = open("call(a,\n\t  b,\n\t  c);\n\tnext();\n\tmore();\n").await;
-    assert_eq!(style(&rpc).await, (false, 0));
+    assert_eq!(style(&rpc).await, (false, 4, 0));
 }
 
 #[tokio::test]
@@ -115,7 +123,7 @@ async fn block_comment_bodies_do_not_drag_the_width_to_one() {
     let (rpc, _incoming, _p) =
         open("/*\n * A doc comment.\n * Another line.\n */\nvoid f() {\n    g();\n    h();\n}\n")
             .await;
-    assert_eq!(style(&rpc).await, (true, 4));
+    assert_eq!(style(&rpc).await, (true, 4, 0));
 }
 
 /// A one-column step is never adopted as `'shiftwidth'`. It is far more often a stray
@@ -135,7 +143,7 @@ async fn a_single_indented_line_does_not_set_the_width() {
     let (rpc, mut incoming) = start(None).await;
     redraw_after(&rpc, &mut incoming, ":set shiftwidth=4<CR>").await;
     redraw_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
-    assert_eq!(style(&rpc).await, (true, 4));
+    assert_eq!(style(&rpc).await, (true, 4, 4));
 }
 
 #[tokio::test]
@@ -148,7 +156,7 @@ async fn a_one_space_step_sets_expandtab_but_not_the_width() {
     let (rpc, mut incoming) = start(None).await;
     redraw_after(&rpc, &mut incoming, ":set noexpandtab shiftwidth=4<CR>").await;
     redraw_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
-    assert_eq!(style(&rpc).await, (true, 4));
+    assert_eq!(style(&rpc).await, (true, 4, 4));
 }
 
 #[tokio::test]
@@ -159,7 +167,7 @@ async fn block_comments_do_not_outvote_a_tab_indented_file() {
     // them as space evidence would flip a tab-indented file to `expandtab`.
     let (rpc, _incoming, _p) =
         open("/*\n * one\n * two\n * three\n * four\n * five\n */\nvoid f() {\n\tg();\n}\n").await;
-    assert_eq!(style(&rpc).await, (false, 0));
+    assert_eq!(style(&rpc).await, (false, 4, 0));
 }
 
 #[tokio::test]
@@ -168,13 +176,13 @@ async fn detection_is_per_buffer_not_global() {
     let spaces = write_temp("idt_sp", "txt", "a\n  b\n    c\n  d\n");
     let tabs = write_temp("idt_tb", "txt", "a\n\tb\n\t\tc\n\tb\n");
     let (rpc, mut incoming) = start(Some(spaces)).await;
-    assert_eq!(style(&rpc).await, (true, 2));
+    assert_eq!(style(&rpc).await, (true, 2, 0));
     redraw_after(&rpc, &mut incoming, &format!(":e {tabs}<CR>")).await;
-    assert_eq!(style(&rpc).await, (false, 0));
+    assert_eq!(style(&rpc).await, (false, 4, 0));
     redraw_after(&rpc, &mut incoming, ":b#<CR>").await;
     assert_eq!(
         style(&rpc).await,
-        (true, 2),
+        (true, 2, 0),
         "the spaces buffer keeps its own verdict"
     );
 }
@@ -192,7 +200,7 @@ async fn noindentdetect_leaves_the_configured_style_untouched() {
     redraw_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
     assert_eq!(
         style(&rpc).await,
-        (true, 3),
+        (true, 4, 3),
         "with detection off the tab-indented file must not flip expandtab"
     );
 }
@@ -202,9 +210,9 @@ async fn a_later_setlocal_wins_over_the_detected_style() {
     // Detection runs at read time, before `BufReadPost` — so an autocmd, an
     // `.editorconfig`, or the user typing `:set` all still have the last word.
     let (rpc, mut incoming, _p) = open("a\n\tb\n\t\tc\n").await;
-    assert_eq!(style(&rpc).await, (false, 0));
+    assert_eq!(style(&rpc).await, (false, 4, 0));
     redraw_after(&rpc, &mut incoming, ":set expandtab shiftwidth=2<CR>").await;
-    assert_eq!(style(&rpc).await, (true, 2));
+    assert_eq!(style(&rpc).await, (true, 4, 2));
 }
 
 #[tokio::test]
@@ -233,8 +241,33 @@ async fn a_bufreadpost_autocmd_sees_and_can_override_the_detected_style() {
     );
     assert_eq!(
         style(&rpc).await,
-        (true, 8),
+        (true, 4, 8),
         "and an autocmd that sets the style overrides it"
+    );
+}
+
+/// THE contract this must not break: `'shiftwidth'` stays at its `0` sentinel ("follow
+/// `'tabstop'`"), and the detected width is written to `'tabstop'` — the one knob bemtvi
+/// documents as setting the whole indent width. Writing an explicit `'shiftwidth'`
+/// instead would silently sever that chain, so a `FileType` autocmd doing the documented
+/// `vim.bo.tabstop = 2` would stop changing how the buffer indents at all — the later
+/// write landing on a knob nothing reads any more.
+#[tokio::test]
+async fn the_width_is_expressed_through_tabstop_so_the_sentinel_still_drives_it() {
+    let (rpc, mut incoming, _path) = open("a\n    b\n        c\n    d\n").await;
+    assert_eq!(
+        style(&rpc).await,
+        (true, 4, 0),
+        "sentinel intact, width on tabstop"
+    );
+
+    // The documented single-knob move, as a FileType autocmd would make it.
+    redraw_after(&rpc, &mut incoming, ":setlocal tabstop=2<CR>").await;
+    redraw_after(&rpc, &mut incoming, "gg>>").await;
+    assert_eq!(
+        lines(&rpc).await[0],
+        "  a",
+        "setting `tabstop` after the read still sets the whole indent width"
     );
 }
 
@@ -272,7 +305,7 @@ async fn the_detected_style_survives_a_write_and_reload() {
         "the write put spaces on disk, not a tab"
     );
     redraw_after(&rpc, &mut incoming, ":e!<CR>").await;
-    assert_eq!(style(&rpc).await, (true, 2));
+    assert_eq!(style(&rpc).await, (true, 2, 0));
 }
 
 // ---- the option itself -----------------------------------------------------

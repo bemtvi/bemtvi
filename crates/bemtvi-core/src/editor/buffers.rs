@@ -839,10 +839,15 @@ impl Editor {
     /// `'noindentdetect'`; a buffer with no path (a scratch buffer's text is not a
     /// file's convention); and text the detector has no opinion on.
     ///
-    /// A tab-indented file also takes `shiftwidth = 0` — bemtvi's "follow `'tabstop'`"
-    /// sentinel — because one indent level in such a file is exactly one tab, and a
-    /// `'shiftwidth'` that disagreed with `'tabstop'` would make `>>` insert a tab that
-    /// moves the line by some other amount.
+    /// The verdict is written the way a *user* writes one: through `'tabstop'`, with
+    /// `'shiftwidth'` left at its `0` sentinel ("follow `'tabstop'`"). That is the single
+    /// knob bemtvi documents as setting the whole indent width, and expressing the
+    /// detected width any other way silently severs the chain — a `FileType` autocmd
+    /// doing the documented `btv.bo[buf].tabstop = 2` would land on a slot nothing reads
+    /// any more, and the file would keep indenting by the detected width no matter what
+    /// the user set afterwards. A tab-indented file takes the sentinel too and keeps its
+    /// `'tabstop'`: one level there is one tab, whose *display* width is a preference the
+    /// bytes cannot reveal.
     pub(crate) fn detect_buffer_indent(&mut self, id: BufferId) {
         if !self.options.indentdetect {
             return;
@@ -860,9 +865,13 @@ impl Editor {
         let opts = &mut self.buffers.get_mut(id).buffer.options;
         opts.expandtab = style.expandtab;
         match style.width {
-            Some(width) => opts.shiftwidth = width,
-            // Tabs, whose one indent level is one `'tabstop'`. A space-indented file the
-            // detector could not measure keeps the configured width.
+            Some(width) => {
+                opts.tabstop = width;
+                opts.shiftwidth = 0;
+            }
+            // Tabs, whose one indent level is one `'tabstop'` — whatever the user has it
+            // set to. A space-indented file the detector could not measure keeps the
+            // configured width the same way.
             None if !style.expandtab => opts.shiftwidth = 0,
             None => {}
         }

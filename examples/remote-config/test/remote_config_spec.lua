@@ -37,11 +37,11 @@ local function notified(body)
 end
 
 btv.test.describe("examples/remote-config", function()
-  -- "`:set tabstop?` — shows 7, the distinctive option set here."
+  -- "`:set scrolloff?` — shows 7, the distinctive option set here."
   btv.test.it("the config's distinctive option applies", function(t)
     open(t)
-    t:cmd("set tabstop?")
-    btv.test.expect(t:message()).to_contain("tabstop=7")
+    t:cmd("set scrolloff?")
+    btv.test.expect(t:message()).to_contain("scrolloff=7")
     btv.test.expect(vim.g.mapleader).to_be(" ")
   end)
 

@@ -120,42 +120,45 @@ btv.test.describe("examples/picker-rows", function()
 
   -- 1. "<leader>fd -> every row leads with its severity letter … then
   --     file:line:col, then the message — `source: text`, folded onto ONE line."
-  btv.test.it("§1 — the diagnostics picker rows carry severity, location and message", function(t)
-    open(t)
-    -- The config seeds them on VimEnter; re-seed here so the spec does not depend
-    -- on whether that already fired for this buffer.
-    btv.diagnostic.set(btv.ns.create("example"), btv.buf.current(), {
-      {
-        lnum = 2,
-        col = 0,
-        severity = btv.diagnostic.severity.ERROR,
-        source = "ty",
-        message = "expected `String`,\n   found `&str`",
-      },
-      {
-        lnum = 4,
-        col = 6,
-        severity = btv.diagnostic.severity.WARN,
-        source = "ty",
-        message = "unused variable `total`",
-      },
-    })
-    t:feed("<Esc>")
-    -- The SHIPPED pickers keep the default `\` leader — their maps predate any
-    -- config's `mapleader`.
-    local m = picker(t, "<Bslash>fd")
-    local joined = table.concat(m.items, "\n")
-    btv.test.expect(joined).to_contain("sample.txt")
-    btv.test.expect(joined).to_contain("ty:")
-    btv.test.expect(joined).to_contain("expected `String`")
-    -- "folded onto ONE line however many lines the server sent"
-    for _, row in ipairs(m.items) do
-      btv.test.expect(row).never.to_contain("\n")
+  btv.test.it(
+    "§1 — the diagnostics picker rows carry severity, location and message",
+    function(t)
+      open(t)
+      -- The config seeds them on VimEnter; re-seed here so the spec does not depend
+      -- on whether that already fired for this buffer.
+      btv.diagnostic.set(btv.ns.create("example"), btv.buf.current(), {
+        {
+          lnum = 2,
+          col = 0,
+          severity = btv.diagnostic.severity.ERROR,
+          source = "ty",
+          message = "expected `String`,\n   found `&str`",
+        },
+        {
+          lnum = 4,
+          col = 6,
+          severity = btv.diagnostic.severity.WARN,
+          source = "ty",
+          message = "unused variable `total`",
+        },
+      })
+      t:feed("<Esc>")
+      -- The SHIPPED pickers keep the default `\` leader — their maps predate any
+      -- config's `mapleader`.
+      local m = picker(t, "<Bslash>fd")
+      local joined = table.concat(m.items, "\n")
+      btv.test.expect(joined).to_contain("sample.txt")
+      btv.test.expect(joined).to_contain("ty:")
+      btv.test.expect(joined).to_contain("expected `String`")
+      -- "folded onto ONE line however many lines the server sent"
+      for _, row in ipairs(m.items) do
+        btv.test.expect(row).never.to_contain("\n")
+      end
+      -- "Errors sort first"
+      btv.test.expect(m.items[1]).to_match("^%s*E")
+      t:feed("<Esc>")
     end
-    -- "Errors sort first"
-    btv.test.expect(m.items[1]).to_match("^%s*E")
-    t:feed("<Esc>")
-  end)
+  )
 
   -- "the fuzzy match highlights inside the BODY while the head keeps its color"
   btv.test.it("§2 — typing narrows on the body", function(t)

@@ -1,11 +1,19 @@
-# Keep `stylua .` confined to first-party prelude Lua.
+# Keep `stylua .` confined to first-party Lua — the prelude and the examples.
 # Vendored neovim copies — never reformat (diverges from upstream).
 crates/bemtvi-lua/src/vendor/
-# Out of the pre-commit's chosen scope (prelude only).
-examples/
+# Out of the pre-commit's chosen scope (the prelude and examples/).
 crates/bemtvi/tests/
 vendor/
-# Out of the pre-commit's chosen scope (prelude only), and deliberately formatted:
+# An example's sample BUFFERS are content, not code: the reader OPENS them and types
+# at them, so their shape is the fixture. `rainbow/sample.lua` is deliberately thick
+# with redundant parentheses (there is nothing to colour otherwise) and
+# `buffer-local-options/two.lua` deliberately leaves a line at column 0 so `>>` has
+# somewhere to move it. Formatting either deletes the thing being demonstrated. The
+# rule is structural — a bare `.lua` in an example's root is a fixture; its `init.lua`,
+# its `test/` specs and any module/plugin tree under it are code, and stay formatted.
+examples/*/*.lua
+!examples/*/init.lua
+# Outside the hook's scope, and deliberately hand-formatted:
 # the colorscheme's palette is column-aligned (`bg          = "#282c34"`), which is how
 # a palette stays readable and which stylua cannot express, and the demo seed defines
 # one snippet PER ROW — stylua would explode each into a five-line block while still

@@ -35,12 +35,12 @@ vim.g.mapleader = "\\"
 -- the docs float only renders for `lsp` rows that carry documentation, so a buffer
 -- word simply shows none. Set `docs = false` to turn it off. `docs_wrap` (default
 -- true) wraps a long doc line within the float instead of truncating it.
-btv.complete.setup {
+btv.complete.setup({
   sources = { { "lsp" }, { "buffer", min_chars = 2 } },
   min_chars = 1,
   -- docs = false,       -- uncomment to hide the docs float
   -- docs_wrap = false,  -- uncomment to truncate long doc lines instead of wrapping
-}
+})
 
 --------------------------------------------------------------------------------
 -- Attach lua-language-server to `lua` buffers via the declarative btv.lsp control
@@ -53,7 +53,9 @@ btv.lsp.config("lua_ls", {
   filetypes = { "lua" },
   root_markers = { ".luarc.json", ".luarc.jsonc", ".git" },
   on_attach = function(_client, bufnr)
-    local function map(lhs, fn) btv.keymap.set("n", lhs, fn, { buffer = bufnr }) end
+    local function map(lhs, fn)
+      btv.keymap.set("n", lhs, fn, { buffer = bufnr })
+    end
     -- Go-to / references / symbols all open in btv.picker (with the "location"
     -- preview) when there's more than one hit; a single definition jumps straight.
     map("gd", btv.lsp.definition)
@@ -72,7 +74,10 @@ btv.lsp.config("lua_ls", {
     btv.lsp.inlay_hint.enable(true, { bufnr = bufnr })
     -- Toggle them with <leader>ih.
     map("<leader>ih", function()
-      btv.lsp.inlay_hint.enable(not btv.lsp.inlay_hint.is_enabled({ bufnr = bufnr }), { bufnr = bufnr })
+      btv.lsp.inlay_hint.enable(
+        not btv.lsp.inlay_hint.is_enabled({ bufnr = bufnr }),
+        { bufnr = bufnr }
+      )
     end)
   end,
 })

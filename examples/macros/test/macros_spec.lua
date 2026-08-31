@@ -68,7 +68,7 @@ btv.test.describe("examples/macros", function()
     t:feed("q")
   end)
 
-  btv.test.it("try-it 2 — \"ap pastes the keystrokes as text", function(t)
+  btv.test.it('try-it 2 — "ap pastes the keystrokes as text', function(t)
     open(t)
     t:feed("gg")
     t:feed("<F2>aI- <Esc>j<F2>")

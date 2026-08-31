@@ -41,7 +41,15 @@ btv.test.describe("examples/glob", function()
       end
     end
     btv.test.expect(banner).never.to_be_nil()
-    for _, cmd in ipairs({ ":Glob", ":GlobRegex", ":GlobStar", ":GlobWindows", ":GlobIgnore", ":GlobBench", ":GlobIsGlob" }) do
+    for _, cmd in ipairs({
+      ":Glob",
+      ":GlobRegex",
+      ":GlobStar",
+      ":GlobWindows",
+      ":GlobIgnore",
+      ":GlobBench",
+      ":GlobIsGlob",
+    }) do
       btv.test.expect(banner).to_contain(cmd)
     end
   end)
@@ -85,7 +93,9 @@ btv.test.describe("examples/glob", function()
     btv.test.expect(report).to_contain("literal_separator = false")
     -- The default carries the separator exclusion; the opt-out does not.
     btv.test.expect(btv.glob.to_regex("*.lua")).to_contain("[^/]")
-    btv.test.expect(btv.glob.to_regex("*.lua", { literal_separator = false })).never.to_contain("[^/]")
+    btv.test
+      .expect(btv.glob.to_regex("*.lua", { literal_separator = false })).never
+      .to_contain("[^/]")
   end)
 
   -- 3. ":GlobStar — the `*`-stops-at-`/` default, side by side with its two escapes"

@@ -43,8 +43,10 @@ vim.api.nvim_create_user_command("SeedShada", function()
   -- The search register: `setreg("/", …)` arms the last search pattern (neovim's
   -- `@/`), so `n` repeats it — here, and again next launch.
   vim.fn.setreg("/", "needle")
-  print('seeded: "a, global mark A (this line), and the / search "needle" — '
-    .. "now :wshada (or :qa) and relaunch")
+  print(
+    'seeded: "a, global mark A (this line), and the / search "needle" — '
+      .. "now :wshada (or :qa) and relaunch"
+  )
 end, {})
 
 -- <space>w — :wshada, the explicit flush. It writes this instance's store right

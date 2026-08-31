@@ -177,4 +177,6 @@ btv.keymap.set("n", "<leader>fp", function()
   btv.picker.open("preview")
 end)
 
-btv.notify("btv.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t>/<C-x>/<C-v> in any picker)")
+btv.notify(
+  "btv.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t>/<C-x>/<C-v> in any picker)"
+)

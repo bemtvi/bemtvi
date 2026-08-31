@@ -29,7 +29,7 @@
 -- to make the bypass visible: auto-completion would need four characters, but the
 -- manual session happily completes a one-character prefix.
 --------------------------------------------------------------------------------
-btv.complete.setup {
+btv.complete.setup({
   sources = { { "buffer" } },
   auto = false,
   min_chars = 4,
@@ -40,7 +40,7 @@ btv.complete.setup {
     confirm = { "<C-y>", "<CR>" },
     abort = "<C-e>",
   },
-}
+})
 
 --------------------------------------------------------------------------------
 -- 2. The same trigger as a Lua API, on a second key.

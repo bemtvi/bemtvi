@@ -35,9 +35,26 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      # --- First-party Lua (the bemtvi prelude) -------------------------------
-      # Scoped to crates/bemtvi-lua/src/prelude/ only: the vendored neovim copies
-      # under src/vendor/nvim/ and the examples/ are intentionally left alone.
+      # --- First-party Lua ----------------------------------------------------
+      # stylua covers the prelude AND examples/ — an example is read as much as it is
+      # run, so it is held to the same shape as the API it demonstrates. A block that
+      # is laid out by hand for a reason (a word list wrapped to four rows, a table
+      # whose columns are aligned) opts out at the statement with a bare
+      # `-- stylua: ignore`, reason on the comment line above it.
+      #
+      # An example's `init.lua`, its `test/` specs and any module tree under it are
+      # code. A bare `.lua` in an example's ROOT is a sample BUFFER — a fixture the
+      # reader opens and types at, whose shape is the demonstration (a line parked at
+      # column 0 for `>>` to move, parentheses stacked for the rainbow colours) — so
+      # the pattern below takes `<example>/init.lua` and anything one level deeper,
+      # and leaves the fixtures alone. `.styluaignore` says the same for a bare
+      # `stylua .`.
+      #
+      # selene stays on the prelude alone: the examples have never been lint-clean
+      # (they demonstrate ignored returns, shadowing, `_G` writes), and turning that
+      # into a commit gate is a separate cleanup, not a formatting one.
+      #
+      # The vendored neovim copies under src/vendor/nvim/ are never touched.
       # Config: stylua.toml / selene.toml + the bemtvi.yml selene std at the root.
       - id: stylua
         name: stylua
@@ -45,7 +62,7 @@ repos:
         entry: stylua --check
         language: system
         types: [lua]
-        files: ^crates/bemtvi-lua/src/prelude/.*\.lua$
+        files: ^(crates/bemtvi-lua/src/prelude/.*|examples/[^/]+/(init|.+/.+))\.lua$
 
       - id: selene
         name: selene

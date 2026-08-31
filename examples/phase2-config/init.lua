@@ -40,7 +40,9 @@ vim.keymap.set("n", "Y", "y$")
 --    TYPE:  Q   -> SEE message "X ACTION fired"
 --    TYPE:  W   -> SEE a character deleted, NO message (literal X reached core)
 --------------------------------------------------------------------------------
-vim.keymap.set("n", "X", function() print("X ACTION fired") end)
+vim.keymap.set("n", "X", function()
+  print("X ACTION fired")
+end)
 vim.keymap.set("n", "Q", "X", { remap = true }) -- recursive: resolves to X's map
 vim.keymap.set("n", "W", "X") -- non-recursive: literal X to the editor
 
@@ -51,7 +53,9 @@ vim.keymap.set("n", "W", "X") -- non-recursive: literal X to the editor
 --------------------------------------------------------------------------------
 vim.keymap.set("n", "<leader>a", "<leader>b", { remap = true })
 vim.keymap.set("n", "<leader>b", "<leader>c", { remap = true })
-vim.keymap.set("n", "<leader>c", function() print("reached c via a -> b -> c") end)
+vim.keymap.set("n", "<leader>c", function()
+  print("reached c via a -> b -> c")
+end)
 
 --------------------------------------------------------------------------------
 -- 5. A self-referential remap terminates instead of hanging (maxmapdepth).
@@ -83,7 +87,9 @@ vim.keymap.set("x", "L", "$")
 --    TYPE:  gh        -> SEE "gh mapping"
 --    TYPE:  gg        -> cursor jumps to the first line (core's gg, via replay)
 --------------------------------------------------------------------------------
-vim.keymap.set("n", "gh", function() print("gh mapping") end)
+vim.keymap.set("n", "gh", function()
+  print("gh mapping")
+end)
 
 -- Note: insert/command-mode maps (e.g. 'i', 'jk', '<Esc>') and buffer-local maps
 -- are Phase 3 — not wired here. String RHSs that run an ex-command use the

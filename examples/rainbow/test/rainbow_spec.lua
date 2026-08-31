@@ -144,7 +144,7 @@ btv.test.describe("examples/rainbow", function()
     open(t)
     t:cmd("enew")
     t:cmd("setlocal filetype=json")
-    t:feed("i{ \"a\": [1] }<Esc>")
+    t:feed('i{ "a": [1] }<Esc>')
     t:wait_for(function()
       return #brackets(t, 1) > 0
     end, { message = "a json buffer got no rainbow" })

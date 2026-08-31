@@ -49,19 +49,21 @@ btv.keymap.set("n", "<leader>c", function()
     { label = "Split window", cmd = "split" },
     { label = "Show messages", cmd = "messages" },
   }
-  btv.ui.select(actions, {
-    prompt = "Action:",
-    -- format_item renders the display label; the promise still resolves to the
-    -- ORIGINAL table, so the chosen entry's `cmd` round-trips even though only
-    -- strings cross the bridge.
-    format_item = function(a)
-      return a.label
-    end,
-  }):next(function(choice)
-    if choice then
-      btv.cmd(choice.cmd)
-    end
-  end)
+  btv.ui
+    .select(actions, {
+      prompt = "Action:",
+      -- format_item renders the display label; the promise still resolves to the
+      -- ORIGINAL table, so the chosen entry's `cmd` round-trips even though only
+      -- strings cross the bridge.
+      format_item = function(a)
+        return a.label
+      end,
+    })
+    :next(function(choice)
+      if choice then
+        btv.cmd(choice.cmd)
+      end
+    end)
 end)
 
 --------------------------------------------------------------------------------
@@ -71,13 +73,17 @@ end)
 --    select promise reads like a blocking read, but nothing blocks (the coroutine
 --    suspends and resumes when you confirm).
 --------------------------------------------------------------------------------
-btv.keymap.set("n", "<leader>n", btv.async(function()
-  local nums = {}
-  for i = 1, 20 do
-    nums[i] = "line " .. i
-  end
-  local item = btv.await(btv.ui.select(nums, { prompt = "Jump near:" }))
-  if item then
-    btv.notify("chose " .. item)
-  end
-end))
+btv.keymap.set(
+  "n",
+  "<leader>n",
+  btv.async(function()
+    local nums = {}
+    for i = 1, 20 do
+      nums[i] = "line " .. i
+    end
+    local item = btv.await(btv.ui.select(nums, { prompt = "Jump near:" }))
+    if item then
+      btv.notify("chose " .. item)
+    end
+  end)
+)

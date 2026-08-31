@@ -64,7 +64,9 @@ local MODES = {
 --------------------------------------------------------------------------------
 function _G.on_name_click(minwid, clicks, button, mods)
   local where = vim.fn.expand("%:p")
-  if where == "" then where = "[No Name]" end
+  if where == "" then
+    where = "[No Name]"
+  end
   vim.cmd(string.format("echo 'clicked %s (button=%s clicks=%d)'", where, button, clicks))
 end
 
@@ -79,7 +81,9 @@ function _G.statusline()
   -- Filename via the path builtins: the tail for the name, and the directory made
   -- relative to cwd then $HOME (`:~:.:h`) for a little context.
   local tail = vim.fn.expand("%:t")
-  if tail == "" then tail = "[No Name]" end
+  if tail == "" then
+    tail = "[No Name]"
+  end
   local dir = vim.fn.fnamemodify(vim.fn.expand("%"), ":~:.:h")
   local where = (dir ~= "" and dir ~= ".") and (dir .. "/") or ""
 
@@ -88,14 +92,26 @@ function _G.statusline()
   local pct = last > 1 and math.floor((line - 1) / (last - 1) * 100) or 100
 
   return table.concat({
-    "%#", mode[2], "# ", mode[1], " ",            -- coloured mode block
-    "%@v:lua.on_name_click@",                     -- start a clickable region…
-    "%#StlFile# ", where, tail, "%m ",            -- file (+ built-in modified flag)
-    "%X",                                         -- …end it: the file block is clickable
-    "%#StatusLine#%=",                            -- neutral spacer; %= pushes right
+    "%#",
+    mode[2],
+    "# ",
+    mode[1],
+    " ", -- coloured mode block
+    "%@v:lua.on_name_click@", -- start a clickable region…
+    "%#StlFile# ",
+    where,
+    tail,
+    "%m ", -- file (+ built-in modified flag)
+    "%X", -- …end it: the file block is clickable
+    "%#StatusLine#%=", -- neutral spacer; %= pushes right
     [[%#StlFile# %{&fileencoding}%{&bomb?"[bom]":""} ]], -- encoding via pure %{&opt}
-    "%#StlRuler# ", tostring(line), ":", tostring(col),
-    "  ", tostring(pct), "%% ",                   -- %% is a literal percent sign
+    "%#StlRuler# ",
+    tostring(line),
+    ":",
+    tostring(col),
+    "  ",
+    tostring(pct),
+    "%% ", -- %% is a literal percent sign
   })
 end
 

@@ -25,6 +25,8 @@ _G.WHERE = require("whereami").describe()
 
 vim.api.nvim_create_autocmd("VimEnter", {
   callback = function()
-    btv.notify("bemtvi: loaded the DAEMON config — fetched from the container (" .. _G.WHERE .. ")")
+    btv.notify(
+      "bemtvi: loaded the DAEMON config — fetched from the container (" .. _G.WHERE .. ")"
+    )
   end,
 })

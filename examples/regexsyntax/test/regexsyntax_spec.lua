@@ -141,8 +141,8 @@ btv.test.describe("examples/regexsyntax", function()
   btv.test.it("vim.fn.substitute stays on vim's dialect either way", function(t)
     open(t)
     t:cmd("set regexsyntax=pcre")
-    btv.test.expect(vim.fn.substitute("hello world", [[\(\w\+\) \(\w\+\)]], [[\2 \1]], "")).to_be(
-      "world hello"
-    )
+    btv.test
+      .expect(vim.fn.substitute("hello world", [[\(\w\+\) \(\w\+\)]], [[\2 \1]], ""))
+      .to_be("world hello")
   end)
 end)

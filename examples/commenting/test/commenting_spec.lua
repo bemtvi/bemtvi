@@ -28,9 +28,9 @@ btv.test.describe("examples/commenting", function()
   btv.test.it("try-it 1 — gcc comments the line, and gcc again uncomments it", function(t)
     open(t, "sample.rs")
     t:feed("2Ggcc")
-    btv.test.expect(t:line(2)).to_be("    // let greeting = \"hello\";")
+    btv.test.expect(t:line(2)).to_be('    // let greeting = "hello";')
     t:feed("gcc")
-    btv.test.expect(t:line(2)).to_be("    let greeting = \"hello\";")
+    btv.test.expect(t:line(2)).to_be('    let greeting = "hello";')
   end)
 
   -- 2. "gc2j -> comment this line and the next two"

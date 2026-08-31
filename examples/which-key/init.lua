@@ -158,46 +158,48 @@ end
 -- whole show/refresh/hide lifecycle is declarative. The same component model the checklist
 -- dialog uses, but on the "float" surface — which takes NO focus and binds NO keys (which-key
 -- must never interrupt the sequence you're typing), instead of the focus-taking "view".
-btv.component({
-  surface = "float",
-  setup = function(ctx)
-    -- The one piece of state: the current pending context (or nil when there's none).
-    local state = ctx.reactive({ pending = nil })
+btv
+  .component({
+    surface = "float",
+    setup = function(ctx)
+      -- The one piece of state: the current pending context (or nil when there's none).
+      local state = ctx.reactive({ pending = nil })
 
-    -- Debounce the SHOW so a fast, deliberate sequence (`<Space>w` typed quickly) never
-    -- flashes the popup — it only appears when you PAUSE. The HIDE is immediate (below), so
-    -- the popup never lingers after you've answered.
-    local show = btv.utils.debounce(function(c)
-      state.pending = c
-    end, DELAY)
+      -- Debounce the SHOW so a fast, deliberate sequence (`<Space>w` typed quickly) never
+      -- flashes the popup — it only appears when you PAUSE. The HIDE is immediate (below), so
+      -- the popup never lingers after you've answered.
+      local show = btv.utils.debounce(function(c)
+        state.pending = c
+      end, DELAY)
 
-    btv.on_key_pending(function(c)
-      -- Cleared context (prefix completed, broke, or timed out): cancel the pending show
-      -- and hide at once. A live source-B state (find-char, …) has empty continuations but
-      -- a non-empty `keys`/`label`, so gate on `keys` alone.
-      if c.keys == "" then
-        show:cancel()
-        state.pending = nil
-      else
-        show(c)
+      btv.on_key_pending(function(c)
+        -- Cleared context (prefix completed, broke, or timed out): cancel the pending show
+        -- and hide at once. A live source-B state (find-char, …) has empty continuations but
+        -- a non-empty `keys`/`label`, so gate on `keys` alone.
+        if c.keys == "" then
+          show:cancel()
+          state.pending = nil
+        else
+          show(c)
+        end
+      end)
+
+      return state
+    end,
+
+    -- Pure: the pending context in, the popup's rows out. `nil` → an empty render → hidden.
+    render = function(state)
+      local c = state.pending
+      if not c then
+        return { lines = {} }
       end
-    end)
-
-    return state
-  end,
-
-  -- Pure: the pending context in, the popup's rows out. `nil` → an empty render → hidden.
-  render = function(state)
-    local c = state.pending
-    if not c then
-      return { lines = {} }
-    end
-    -- Title the popup `keys — label` so the prefix isn't cryptic: a bare `d` reads as
-    -- "d — Delete". Source-A leader prefixes have no label, so they title with the keys.
-    local title = " " .. c.keys
-    if c.label and c.label ~= "" then
-      title = title .. " — " .. c.label
-    end
-    return { lines = lines_for(c), title = title .. " " }
-  end,
-}).mount({ relative = "bottom", border = "rounded" })
+      -- Title the popup `keys — label` so the prefix isn't cryptic: a bare `d` reads as
+      -- "d — Delete". Source-A leader prefixes have no label, so they title with the keys.
+      local title = " " .. c.keys
+      if c.label and c.label ~= "" then
+        title = title .. " — " .. c.label
+      end
+      return { lines = lines_for(c), title = title .. " " }
+    end,
+  })
+  .mount({ relative = "bottom", border = "rounded" })

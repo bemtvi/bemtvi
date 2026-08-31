@@ -50,5 +50,10 @@ end, { desc = "cycle signcolumn" })
 
 -- `:vsplit` then set the new window narrower to prove the options are per-window:
 --     <C-w>v  then  :setlocal nuw=4 scl=no
-vim.notify("gutter: nuw=" .. vim.o.numberwidth .. " scl=" .. vim.o.signcolumn
-  .. "  (<leader>n / <leader>s to cycle)")
+vim.notify(
+  "gutter: nuw="
+    .. vim.o.numberwidth
+    .. " scl="
+    .. vim.o.signcolumn
+    .. "  (<leader>n / <leader>s to cycle)"
+)

@@ -63,7 +63,9 @@ btv.test.describe("examples/keymap-builtin", function()
 
     open(t)
     t:feed("2Gdw")
-    btv.test.expect(t:line(2)).to_be("2 — delete me with `dd`; or `dw` to drop just the first word")
+    btv.test
+      .expect(t:line(2))
+      .to_be("2 — delete me with `dd`; or `dw` to drop just the first word")
   end)
 
   btv.test.it("§2 — dh still fires the mapping, and deletes nothing", function(t)

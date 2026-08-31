@@ -40,6 +40,8 @@ local function rnd(m)
   return seed % m
 end
 
+-- A word list, wrapped by hand to stay four readable rows.
+-- stylua: ignore
 local KEYWORDS = {
   "local", "function", "return", "end", "if", "then", "else", "for", "in",
   "pairs", "ipairs", "require", "vim", "btv", "buffer", "window", "config",
@@ -89,14 +91,18 @@ local function b2_find()
   local n, pos = 0, 1
   while true do
     local s, e = string.find(BLOB, "function", pos, true)
-    if not s then break end
+    if not s then
+      break
+    end
     n = n + 1
     pos = e + 1
   end
   pos = 1
   while true do
     local s, e = string.find(BLOB, "name%d+", pos)
-    if not s then break end
+    if not s then
+      break
+    end
     n = n + 1
     pos = e + 1
   end
@@ -127,7 +133,9 @@ local function b5_sort()
   for i = 1, 4000 do
     t[i] = { key = rnd(100000), name = "item" .. i }
   end
-  table.sort(t, function(a, b) return a.key < b.key end)
+  table.sort(t, function(a, b)
+    return a.key < b.key
+  end)
   return t[1].key + t[#t].key
 end
 
@@ -146,7 +154,9 @@ end
 
 -- 7. Function-call / closure overhead — callback-heavy iterator code.
 local function b7_calls()
-  local function add(a, b) return a + b end
+  local function add(a, b)
+    return a + b
+  end
   local s = 0
   for i = 1, 200000 do
     s = add(s, i)
@@ -157,14 +167,22 @@ end
 -- 8. Metatable OOP dispatch — the class systems most plugins are built on.
 local Vec = {}
 Vec.__index = Vec
-function Vec.new(x, y) return setmetatable({ x = x, y = y }, Vec) end
-function Vec:add(o) return Vec.new(self.x + o.x, self.y + o.y) end
-function Vec:len2() return self.x * self.x + self.y * self.y end
+function Vec.new(x, y)
+  return setmetatable({ x = x, y = y }, Vec)
+end
+function Vec:add(o)
+  return Vec.new(self.x + o.x, self.y + o.y)
+end
+function Vec:len2()
+  return self.x * self.x + self.y * self.y
+end
 local function b8_oop()
   local acc = Vec.new(0, 0)
   for i = 1, 50000 do
     acc = acc:add(Vec.new(i % 10, i % 7))
-    if acc.x > 1e6 then acc = Vec.new(0, 0) end
+    if acc.x > 1e6 then
+      acc = Vec.new(0, 0)
+    end
   end
   return acc:len2()
 end
@@ -175,14 +193,20 @@ local function score(needle, hay)
   local ni, s, last = 1, 0, 0
   local nl = #needle
   for hi = 1, #hay do
-    if ni > nl then break end
+    if ni > nl then
+      break
+    end
     if string.byte(hay, hi) == string.byte(needle, ni) then
       s = s + 1 + (hi == last + 1 and 2 or 0)
       last = hi
       ni = ni + 1
     end
   end
-  if ni > nl then return s else return -1 end
+  if ni > nl then
+    return s
+  else
+    return -1
+  end
 end
 local function b9_fuzzy()
   local best, bi = -1, 0
@@ -208,7 +232,9 @@ local function b10_coroutine()
     end)
     while coroutine.status(co) ~= "dead" do
       local ok, w = coroutine.resume(co, i)
-      if ok and w then total = total + (w % 3) end
+      if ok and w then
+        total = total + (w % 3)
+      end
     end
   end
   return total
@@ -220,6 +246,8 @@ end
 -- Iteration counts are tuned so each bench runs ~150-270 ms on a typical machine
 -- (total ~2 s), keeping every bench individually measurable. SCALE multiplies
 -- them all; the same counts run on both backends, so the comparison stays fair.
+-- One benchmark per row, columns aligned so the table reads as a table.
+-- stylua: ignore
 local BENCHES = {
   { label = "1  pattern tokenize",  iters = 150, fn = b1_tokenize },
   { label = "2  string.find sweep", iters = 300, fn = b2_find },
@@ -245,7 +273,11 @@ local function timeit(b)
   local dt = os.clock() - t0
   local line = string.format(
     "%-22s %5d it  %8.1f ms  %8.2f us/it  chk=%s",
-    b.label, iters, dt * 1000, dt / iters * 1e6, tostring(chk)
+    b.label,
+    iters,
+    dt * 1000,
+    dt / iters * 1e6,
+    tostring(chk)
   )
   return dt, line
 end
@@ -265,7 +297,9 @@ btv.user_command.create("benchall", function()
     total = total + dt
     print(line)
   end
-  print(string.format("-- total CPU: %.1f ms  (run :messages to see the full table) --", total * 1000))
+  print(
+    string.format("-- total CPU: %.1f ms  (run :messages to see the full table) --", total * 1000)
+  )
 end, {})
 
 print("bench suite loaded: :bench1 … :bench10, :benchall  (backend: " .. _VERSION .. ")")

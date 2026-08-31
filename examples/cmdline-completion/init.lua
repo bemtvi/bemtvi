@@ -114,7 +114,7 @@
 -- (`docs = true` — the synopsis/help float beside the highlighted row); pass
 -- `docs = false` for a names-only wildmenu. (A config that re-runs setup wins over
 -- the default, since the last setup call applies.)
-btv.cmdline_complete.setup {}
+btv.cmdline_complete.setup({})
 
 -- A plugin command with a `desc`: it joins the wildmenu catalog automatically (via
 -- btv.user_command.get()), ranked and previewed exactly like a built-in.

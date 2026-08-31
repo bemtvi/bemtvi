@@ -54,9 +54,27 @@ btv.o.grepprg = "grep -n $* examples/quickfix/sample.c /dev/null"
 vim.g.mapleader = "\\"
 vim.keymap.set("n", "<leader>q", function()
   btv.qf.setqflist({
-    { filename = "examples/quickfix/sample.c", lnum = 9, col = 18, text = "missing ';'", type = "E" },
-    { filename = "examples/quickfix/sample.c", lnum = 14, col = 28, text = "typo: totl", type = "W" },
-    { filename = "examples/quickfix/sample.c", lnum = 15, col = 5, text = "unknown function", type = "E" },
+    {
+      filename = "examples/quickfix/sample.c",
+      lnum = 9,
+      col = 18,
+      text = "missing ';'",
+      type = "E",
+    },
+    {
+      filename = "examples/quickfix/sample.c",
+      lnum = 14,
+      col = 28,
+      text = "typo: totl",
+      type = "W",
+    },
+    {
+      filename = "examples/quickfix/sample.c",
+      lnum = 15,
+      col = 5,
+      text = "unknown function",
+      type = "E",
+    },
   }, " ", { title = "Hand-built list" })
   btv.qf.open()
 end, { desc = "populate + open the quickfix list from Lua" })
@@ -66,8 +84,20 @@ end, { desc = "populate + open the quickfix list from Lua" })
 -- path from real LSP diagnostics.)
 vim.api.nvim_create_user_command("LDiag", function()
   vim.fn.setloclist(0, {
-    { filename = "examples/quickfix/sample.c", lnum = 14, col = 28, text = "this window's note", type = "W" },
-    { filename = "examples/quickfix/sample.c", lnum = 15, col = 5, text = "another note", type = "I" },
+    {
+      filename = "examples/quickfix/sample.c",
+      lnum = 14,
+      col = 28,
+      text = "this window's note",
+      type = "W",
+    },
+    {
+      filename = "examples/quickfix/sample.c",
+      lnum = 15,
+      col = 5,
+      text = "another note",
+      type = "I",
+    },
   }, " ", { title = "Window-local notes" })
   vim.cmd("lopen")
 end, { desc = "fill + open this window's location list" })

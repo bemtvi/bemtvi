@@ -100,9 +100,7 @@ btv.test.describe("examples/fragment-highlighting", function()
   -- "2b. INDENTATION-SENSITIVE languages."
   btv.test.it("the python def row carries its header", function(t)
     typing(t)
-    btv.test.expect(doc_for(t, "pyd")).to_contain(
-      "def frobnicate(name: str, count: int) -> bool"
-    )
+    btv.test.expect(doc_for(t, "pyd")).to_contain("def frobnicate(name: str, count: int) -> bool")
   end)
 
   btv.test.it("the python class row carries its header", function(t)

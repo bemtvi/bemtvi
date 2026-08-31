@@ -187,10 +187,11 @@ btv.keymap.set("n", "<leader>li", function()
   for _, c in ipairs(btv.lsp.clients({ bufnr = 0 })) do
     names[#names + 1] = c.name .. " (" .. c.offset_encoding .. ")"
   end
-  btv.notify(#names .. " client(s): " .. (table.concat(names, ", ") ~= "" and table.concat(
-    names,
-    ", "
-  ) or "none"))
+  btv.notify(
+    #names
+      .. " client(s): "
+      .. (table.concat(names, ", ") ~= "" and table.concat(names, ", ") or "none")
+  )
 end, { desc = "LSP: clients on this buffer" })
 
 -- <leader>lr — where did it decide the project root is?

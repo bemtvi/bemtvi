@@ -103,7 +103,8 @@ btv.test.describe("examples/btv-http-mount", function()
     btv.test.expect(info.method).to_be("GET")
     -- `?pretty=1` is read off `req.query` and changes the encoding.
     local plain = btv.await(btv.http.fetch(mount_url(t) .. "info")):text()
-    local pretty = btv.await(btv.http.fetch(mount_url(t) .. "info", { query = { pretty = "1" } })):text()
+    local pretty =
+      btv.await(btv.http.fetch(mount_url(t) .. "info", { query = { pretty = "1" } })):text()
     btv.test.expect(plain:find("\n", 1, true)).to_be_nil()
     btv.test.expect(pretty:find("\n", 1, true)).never.to_be_nil()
   end)

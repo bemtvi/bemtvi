@@ -27,7 +27,7 @@ vim.api.nvim_set_hl(0, "StatusClock", { fg = "#89b4fa" })
 --------------------------------------------------------------------------------
 local git_branch = nil
 
-btv.statusline.segment {
+btv.statusline.segment({
   name = "git",
   -- Recompute the branch when you enter a buffer or change directory; the async
   -- job below also invalidates explicitly when it finishes.
@@ -39,14 +39,14 @@ btv.statusline.segment {
   render = function()
     return git_branch and { { text = " " .. git_branch, hl = "StatusGit" } } or nil
   end,
-}
+})
 
 -- Kick off `git branch --show-current` without blocking; cache + invalidate when
 -- it returns. btv.run is the promise-shaped one-shot process API (btv is
 -- promise-only) — await it inside btv.async so the fetch reads top-to-bottom. If
 -- git isn't a repo it yields nothing and the segment stays empty.
 local refresh_git = btv.async(function()
-  local res = btv.await(btv.run { cmd = "git", args = { "branch", "--show-current" } })
+  local res = btv.await(btv.run({ cmd = "git", args = { "branch", "--show-current" } }))
   local branch = res.stdout:gsub("%s+$", "")
   git_branch = branch ~= "" and branch or nil
   btv.statusline.invalidate("git")
@@ -68,12 +68,12 @@ end
 -- without any built-in event.
 --------------------------------------------------------------------------------
 local moves = 0
-btv.statusline.segment {
+btv.statusline.segment({
   name = "moves",
   render = function()
     return { { text = "moves:" .. moves, hl = "StatusClock" } }
   end,
-}
+})
 btv.autocmd.create("CursorMoved", {
   callback = function()
     moves = moves + 1
@@ -85,7 +85,7 @@ btv.autocmd.create("CursorMoved", {
 -- The layout. Built-ins + the two custom segments above. `mode` and `filename`
 -- on the left; `diagnostics`, `filetype`, and the cursor `location` on the right.
 --------------------------------------------------------------------------------
-btv.statusline.setup {
+btv.statusline.setup({
   left = { "mode", "git", "filename", "modified" },
   right = { "moves", "diagnostics", "filetype", "location" },
-}
+})

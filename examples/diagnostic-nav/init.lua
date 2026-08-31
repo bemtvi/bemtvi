@@ -42,6 +42,7 @@ local S = btv.diagnostic.severity
 
 -- The fixed "lint" result, keyed to `sample.txt`. `lnum`/`col` are 0-based; this
 -- mirrors the shape an LSP server or a linter plugin hands `btv.diagnostic.set`.
+-- stylua: ignore
 local DIAGS = {
   { lnum = 2, col = 2, message = "undefined function `prnit` (did you mean `print`?)", severity = S.ERROR },
   { lnum = 3, col = 9, message = "undefined variable `naem` (did you mean `name`?)", severity = S.ERROR },

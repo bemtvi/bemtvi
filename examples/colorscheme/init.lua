@@ -36,4 +36,4 @@
 -- the Rust parser once with `:TSInstall rust` (see examples/ts-install) so the
 -- keywords/strings/types above get their colors.
 
-vim.cmd.colorscheme('bemtvi')
+vim.cmd.colorscheme("bemtvi")

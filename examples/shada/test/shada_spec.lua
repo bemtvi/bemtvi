@@ -59,7 +59,7 @@ btv.test.describe("examples/shada", function()
   end)
 
   -- ":ShadaShow — show whether register \"a survived from a prior session"
-  btv.test.it(":ShadaShow reports both states of \"a", function(t)
+  btv.test.it(':ShadaShow reports both states of "a', function(t)
     open(t)
     t:cmd("ShadaShow")
     btv.test.expect(t:message()).to_contain('"a is empty')

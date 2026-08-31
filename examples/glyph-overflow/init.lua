@@ -100,7 +100,12 @@
 btv.autocmd.create("UIEnter", {
   once = true,
   callback = function()
-    print("guiglyphoverflow=" .. (btv.o.guiglyphoverflow ~= "" and btv.o.guiglyphoverflow
-      or "<client default: when-followed-by-space>"))
+    print(
+      "guiglyphoverflow="
+        .. (
+          btv.o.guiglyphoverflow ~= "" and btv.o.guiglyphoverflow
+          or "<client default: when-followed-by-space>"
+        )
+    )
   end,
 })

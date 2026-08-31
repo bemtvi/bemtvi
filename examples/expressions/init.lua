@@ -141,16 +141,16 @@ end, { nargs = "?", desc = "Toggle the picker scorer" })
 --    key (fuzzy score + the source's own bias), so subtracting from it composes
 --    with source order instead of replacing it.
 
-btv.complete.source {
+btv.complete.source({
   name = "demo_snippets",
   priority = 50,
   debounce = 0,
   complete = function(ctx)
-    ctx.push { text = "for_loop", kind = "Snippet" }
+    ctx.push({ text = "for_loop", kind = "Snippet" })
   end,
-}
+})
 
-btv.complete.source {
+btv.complete.source({
   name = "demo_words",
   priority = 1,
   debounce = 0,
@@ -158,9 +158,9 @@ btv.complete.source {
     ctx.push("format_all")
     ctx.push("forward_ref")
   end,
-}
+})
 
-btv.complete.setup { sources = { { "demo_snippets" }, { "demo_words" } }, min_chars = 3 }
+btv.complete.setup({ sources = { { "demo_snippets" }, { "demo_words" } }, min_chars = 3 })
 
 local CSCORER = [[ score - (kind == "Snippet" and 100 or 0) ]]
 

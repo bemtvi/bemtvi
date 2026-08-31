@@ -59,9 +59,11 @@ vim.api.nvim_create_user_command("TabList", function()
     local wins = vim.api.nvim_tabpage_list_wins(t)
     lines[#lines + 1] = string.format(
       "tab %d (id %d)%s  wins=%d  focus=win %d",
-      vim.api.nvim_tabpage_get_number(t), t,
+      vim.api.nvim_tabpage_get_number(t),
+      t,
       t == cur and " (current)" or "",
-      #wins, vim.api.nvim_tabpage_get_win(t)
+      #wins,
+      vim.api.nvim_tabpage_get_win(t)
     )
   end
   vim.notify(table.concat(lines, "  |  "))

@@ -28,7 +28,9 @@ _G.promise_demo = {}
 --------------------------------------------------------------------------------
 btv.promise
   .resolve(20)
-  :next(function(v) return v + 1 end)
+  :next(function(v)
+    return v + 1
+  end)
   :next(function(v)
     _G.promise_demo.basic = v
     print("[1] basic chain → " .. v) -- 21
@@ -40,8 +42,12 @@ btv.promise
 --------------------------------------------------------------------------------
 btv.promise
   .resolve("config")
-  :next(function() error("disk on fire") end)
-  :next(function() print("[2] this NEVER runs") end)
+  :next(function()
+    error("disk on fire")
+  end)
+  :next(function()
+    print("[2] this NEVER runs")
+  end)
   :catch(function(err)
     _G.promise_demo.caught = err
     print("[2] caught: " .. tostring(err))
@@ -74,7 +80,9 @@ btv.promise
 
 btv.promise
   .race({ btv.promise.delay(300, "slow"), btv.promise.delay(60, "fast") })
-  :next(function(winner) print("[4] race winner → " .. winner) end)
+  :next(function(winner)
+    print("[4] race winner → " .. winner)
+  end)
 
 --------------------------------------------------------------------------------
 -- 5. btv.async / btv.await — the real cure for callback hell. Inside an btv.async
@@ -98,6 +106,8 @@ load_settings("init")
     _G.promise_demo.async = total
     vim.notify("[5] async/await done → " .. total .. " (two awaits, no nesting)")
   end)
-  :catch(function(err) vim.notify("[5] failed: " .. tostring(err)) end)
+  :catch(function(err)
+    vim.notify("[5] failed: " .. tostring(err))
+  end)
 
 print("[*] config sourced — promises settle on later microtasks/timers above")

@@ -36,7 +36,7 @@ end
 -- mark is extmark-shaped: `{ row, col, end_col = col+1, hl = group }` with `row`
 -- in absolute (buffer) coordinates.
 --------------------------------------------------------------------------------
-btv.decor.provider {
+btv.decor.provider({
   name = "rainbow",
   bufs = { filetype = { "lua", "rust", "json", "javascript", "c" } },
   on_range = function(ctx, publish)
@@ -56,7 +56,7 @@ btv.decor.provider {
     end
     publish(marks) -- carries ctx.gen; folded into the next frame, or dropped if scrolled past
   end,
-}
+})
 
 vim.o.number = true
 

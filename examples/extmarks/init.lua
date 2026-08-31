@@ -26,9 +26,13 @@ local ns = vim.api.nvim_create_namespace("playground")
 -- Helper: highlight `text`'s first occurrence on line `row` (0-based) in `group`.
 local function mark_word(row, text, group)
   local line = vim.api.nvim_buf_get_lines(0, row, row + 1, false)[1]
-  if not line then return end
+  if not line then
+    return
+  end
   local s = line:find(text, 1, true)
-  if not s then return end
+  if not s then
+    return
+  end
   return vim.api.nvim_buf_set_extmark(0, ns, row, s - 1, {
     end_row = row,
     end_col = s - 1 + #text,
@@ -62,11 +66,20 @@ vim.api.nvim_create_user_command("ExtMark", function()
   local col = vim.api.nvim_win_get_cursor(0)[2]
   -- Expand to the word around the cursor (simple [%w_] run).
   local s, e = col + 1, col + 1
-  while s > 1 and line:sub(s - 1, s - 1):match("[%w_]") do s = s - 1 end
-  while e <= #line and line:sub(e, e):match("[%w_]") do e = e + 1 end
-  if e <= s then vim.notify("no word under the cursor") return end
+  while s > 1 and line:sub(s - 1, s - 1):match("[%w_]") do
+    s = s - 1
+  end
+  while e <= #line and line:sub(e, e):match("[%w_]") do
+    e = e + 1
+  end
+  if e <= s then
+    vim.notify("no word under the cursor")
+    return
+  end
   vim.api.nvim_buf_set_extmark(0, ns, row, s - 1, {
-    end_row = row, end_col = e - 1, hl_group = "ExtTodo",
+    end_row = row,
+    end_col = e - 1,
+    hl_group = "ExtTodo",
   })
   vim.notify(("marked %q"):format(line:sub(s, e - 1)))
 end, {})

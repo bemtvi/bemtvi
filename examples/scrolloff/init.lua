@@ -78,4 +78,6 @@ end, {})
 -- 6. `:SoReport` to echo the current values.
 --------------------------------------------------------------------------------
 
-vim.notify("scrolloff demo: hold j to fall down the file — the view scrolls 8 lines early (:SoReport, :Wrap)")
+vim.notify(
+  "scrolloff demo: hold j to fall down the file — the view scrolls 8 lines early (:SoReport, :Wrap)"
+)

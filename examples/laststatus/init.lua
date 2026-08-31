@@ -25,13 +25,20 @@ vim.g.mapleader = " "
 vim.api.nvim_set_hl(0, "StlMode", { fg = "#1a1b26", bg = "#7aa2f7", bold = true })
 vim.api.nvim_set_hl(0, "StlFile", { fg = "#c0caf5", bg = "#3b4261" })
 
+-- stylua: ignore
 local MODES = { n = "NORMAL", i = "INSERT", v = "VISUAL", V = "V-LINE", R = "REPLACE", c = "COMMAND" }
 
 function _G.statusline()
   local mode = MODES[vim.fn.mode()] or vim.fn.mode():upper()
   local tail = vim.fn.expand("%:t")
-  if tail == "" then tail = "[No Name]" end
+  if tail == "" then
+    tail = "[No Name]"
+  end
   local line, col = vim.fn.line("."), vim.fn.col(".")
+  -- Grouped by statusline section — the highlight, its text, its terminator on
+  -- one row each, which is how the format reads. stylua would put every fragment
+  -- on its own line.
+  -- stylua: ignore
   return table.concat({
     -- The mode block is a click region (`%@v:lua.fn@…%X`): clicking it cycles
     -- 'laststatus'. Click regions work on the per-window status lines (modes 1/2)

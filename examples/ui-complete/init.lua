@@ -49,7 +49,7 @@ local KEYWORDS = {
   "connection",
   "configuration",
 }
-btv.complete.source {
+btv.complete.source({
   name = "keywords",
   -- Trailing delay (ms) before this source runs after a keystroke; coalesces a
   -- fast typist's keystrokes into one query. `0` would run on every key.
@@ -60,7 +60,7 @@ btv.complete.source {
       -- reacts to its input rather than dumping a canned list. No inline `doc`, so
       -- docs are fetched lazily via `resolve` below — only for the row you land on.
       if kw ~= ctx.prefix and kw:sub(1, #ctx.prefix) == ctx.prefix then
-        ctx.push { text = kw, insert = kw }
+        ctx.push({ text = kw, insert = kw })
       end
     end
   end,
@@ -69,9 +69,11 @@ btv.complete.source {
   -- (here just a string) runs once per landed-on row, not for every candidate. It
   -- returns a PROMISE of the docs (a doc string, or an item whose `.doc` is used).
   resolve = function(item)
-    return btv.promise.resolve { doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)" }
+    return btv.promise.resolve({
+      doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)",
+    })
   end,
-}
+})
 
 --------------------------------------------------------------------------------
 -- A TRIGGER-CHAR source (Phase 4-E) — the emoji shape from the plugin-API spec.
@@ -88,18 +90,18 @@ local EMOJI = {
   { ":tada:", "🎉" },
   { ":thumbsup:", "👍" },
 }
-btv.complete.source {
+btv.complete.source({
   name = "emoji",
   debounce = 0,
   trigger = { chars = { ":" } },
   complete = function(ctx)
     for _, e in ipairs(EMOJI) do
       if e[1]:sub(1, #ctx.prefix) == ctx.prefix then
-        ctx.push { text = e[1], insert = e[2], doc = e[1] .. "  →  " .. e[2] }
+        ctx.push({ text = e[1], insert = e[2], doc = e[1] .. "  →  " .. e[2] })
       end
     end
   end,
-}
+})
 
 --------------------------------------------------------------------------------
 -- Enable the engine. `sources` lists the sources to draw from — the native
@@ -109,7 +111,7 @@ btv.complete.source {
 -- we ALSO bind <CR> to accept, for folks who prefer Enter-to-confirm (the default
 -- leaves <CR> as a literal newline so it never eats a line break unexpectedly).
 --------------------------------------------------------------------------------
-btv.complete.setup {
+btv.complete.setup({
   sources = {
     { "buffer", min_chars = 2 },
     { "keywords" },
@@ -125,7 +127,7 @@ btv.complete.setup {
     -- to force completion on a 1-char (or empty) prefix, or with `auto = false`.
     trigger = "<C-Space>",
   },
-}
+})
 
 -- The same thing is available as a Lua API — map it yourself if you prefer:
 --   btv.keymap.set("i", "<C-x><C-n>", btv.complete.trigger)

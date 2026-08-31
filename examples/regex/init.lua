@@ -35,8 +35,10 @@ vim.api.nvim_create_user_command("Emails", function()
       found[#found + 1] = ("  %s@%s   (user=%q host=%q)"):format(user, host, user, host)
     end
   end
-  vim.notify(#found == 0 and "no emails found"
-    or ("found %d email(s):\n%s"):format(#found, table.concat(found, "\n")))
+  vim.notify(
+    #found == 0 and "no emails found"
+      or ("found %d email(s):\n%s"):format(#found, table.concat(found, "\n"))
+  )
 end, { desc = "List every email in the buffer (btv.regex :gmatch)" })
 
 -- :Numbers — sum every integer in the buffer. `\d+` is a real digit run (Lua's
@@ -63,8 +65,7 @@ vim.api.nvim_create_user_command("Phones", function()
       hits[#hits + 1] = ("  line %d: %s"):format(i, (phone:match(line)))
     end
   end
-  vim.notify(#hits == 0 and "no phone numbers"
-    or ("phone numbers:\n" .. table.concat(hits, "\n")))
+  vim.notify(#hits == 0 and "no phone numbers" or ("phone numbers:\n" .. table.concat(hits, "\n")))
 end, { desc = "Find phone-number lines (btv.regex :test / :match)" })
 
 -- :Redact — show the current line with its digits masked, a display-sanitization

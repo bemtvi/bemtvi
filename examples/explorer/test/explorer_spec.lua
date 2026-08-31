@@ -129,7 +129,7 @@ btv.test.describe("examples/explorer", function()
     t:cmd("ls")
     local listing = table.concat(t:lines(), "\n")
     btv.test.expect(listing).never.to_contain("tree\n")
-    btv.test.expect(listing).never.to_contain("/tree\"")
+    btv.test.expect(listing).never.to_contain('/tree"')
     t:feed("q")
   end)
 

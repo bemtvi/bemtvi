@@ -63,7 +63,7 @@ end)
 
 -- Surface the daemon link state so you can SEE the swap took effect (green ● daemon once
 -- connected). See examples/daemon-status for the full walk-through of this segment.
-btv.statusline.segment {
+btv.statusline.segment({
   name = "daemon",
   render = function()
     local phase = btv.daemon.status()
@@ -72,14 +72,14 @@ btv.statusline.segment {
     end
     return { { text = " ● " .. phase, hl = "Comment" } }
   end,
-}
+})
 btv.autocmd.create("User", {
   pattern = "DaemonStatusChanged",
   callback = function()
     btv.statusline.invalidate("daemon")
   end,
 })
-btv.statusline.setup {
+btv.statusline.setup({
   left = { "mode", "filename" },
   right = { "daemon", "location" },
-}
+})

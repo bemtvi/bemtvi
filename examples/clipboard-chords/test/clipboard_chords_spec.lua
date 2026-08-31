@@ -108,7 +108,7 @@ btv.test.describe("examples/clipboard-chords", function()
   end)
 
   -- 6. ":registers" shows what the chords put on `"+`.
-  btv.test.it("§6 — the \"+ row shows what the chord copied", function(t)
+  btv.test.it('§6 — the "+ row shows what the chord copied', function(t)
     open(t)
     goto_line(t, "copy me please")
     t:feed("^vee<C-c>")

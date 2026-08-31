@@ -54,10 +54,10 @@ end
 -- A custom statusline segment. Its render() is cheap (reads the pushed mirror), and
 -- only re-runs when invalidated — we invalidate on the status event below, so the
 -- segment repaints exactly when the link changes, not every frame.
-btv.statusline.segment {
+btv.statusline.segment({
   name = "daemon",
   render = phase_chunk,
-}
+})
 
 -- Re-render the segment whenever the link's phase changes. `DaemonStatusChanged` is a
 -- `User` autocmd the run loop fires off the reconnect supervisor's status feed.
@@ -70,7 +70,7 @@ btv.autocmd.create("User", {
 
 -- Put the segment on the right of the bar, alongside the usual built-ins. (If you
 -- already have a statusline config, just add the "daemon" segment + the autocmd above.)
-btv.statusline.setup {
+btv.statusline.setup({
   left = { "mode", "filename" },
   right = { "daemon", "filetype", "location" },
-}
+})

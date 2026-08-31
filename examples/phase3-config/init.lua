@@ -50,7 +50,9 @@ end, { buffer = 0 })
 --    Re-sourcing a config that re-sets a map leaves exactly one mapping — it
 --    can't double-fire — which is what makes augroup-clear-style reloads safe.
 --------------------------------------------------------------------------------
-vim.keymap.set("n", "<leader>g", function() print("you should never see this") end)
+vim.keymap.set("n", "<leader>g", function()
+  print("you should never see this")
+end)
 vim.keymap.del("n", "<leader>g")
 
 --------------------------------------------------------------------------------
@@ -61,6 +63,8 @@ vim.keymap.del("n", "<leader>g")
 --    TYPE:  T   -> SEE message "R action (low-level remap target)"
 --    TYPE:  U   -> a literal R reaches core (replace-pending), NO message.
 --------------------------------------------------------------------------------
-vim.keymap.set("n", "R", function() print("R action (low-level remap target)") end)
+vim.keymap.set("n", "R", function()
+  print("R action (low-level remap target)")
+end)
 vim.api.nvim_set_keymap("n", "T", "R", {}) -- remappable by default -> runs R's map
 vim.api.nvim_set_keymap("n", "U", "R", { noremap = true }) -- literal R to the editor

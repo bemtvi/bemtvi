@@ -33,14 +33,17 @@ end
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>h", function()
   show("GET https://example.com …")
-  btv.http.fetch("https://example.com")
+  btv.http
+    .fetch("https://example.com")
     :next(function(res)
-      show(("example.com → %d %s (%d bytes, %s)"):format(
-        res.status,
-        res.ok and "OK" or "not-ok",
-        #res:text(),
-        res.headers["content-type"] or "?"
-      ))
+      show(
+        ("example.com → %d %s (%d bytes, %s)"):format(
+          res.status,
+          res.ok and "OK" or "not-ok",
+          #res:text(),
+          res.headers["content-type"] or "?"
+        )
+      )
     end)
     :catch(function(err)
       show("request failed: " .. tostring(err.message))
@@ -54,23 +57,30 @@ end)
 --    field out with `res:json()`. Shown with the `btv.async` / `btv.await` style, which
 --    reads like straight-line code.
 --------------------------------------------------------------------------------
-btv.keymap.set("n", "<leader>j", btv.async(function()
-  show("GET api.github.com/search …")
-  local ok, res = pcall(btv.await, btv.http.fetch("https://api.github.com/search/repositories", {
-    query = { q = "language:rust stars:>10000", per_page = 1 },
-    headers = { ["User-Agent"] = "bemtvi-btv-http-example" },
-  }))
-  if not ok then
-    show("request failed: " .. tostring(res))
-    return
-  end
-  if res.ok then
-    local top = res:json().items[1]
-    show(("top rust repo: %s — ★ %d"):format(top.full_name, top.stargazers_count))
-  else
-    show("HTTP " .. res.status .. " (" .. res.statusText .. ")")
-  end
-end))
+btv.keymap.set(
+  "n",
+  "<leader>j",
+  btv.async(function()
+    show("GET api.github.com/search …")
+    local ok, res = pcall(
+      btv.await,
+      btv.http.fetch("https://api.github.com/search/repositories", {
+        query = { q = "language:rust stars:>10000", per_page = 1 },
+        headers = { ["User-Agent"] = "bemtvi-btv-http-example" },
+      })
+    )
+    if not ok then
+      show("request failed: " .. tostring(res))
+      return
+    end
+    if res.ok then
+      local top = res:json().items[1]
+      show(("top rust repo: %s — ★ %d"):format(top.full_name, top.stargazers_count))
+    else
+      show("HTTP " .. res.status .. " (" .. res.statusText .. ")")
+    end
+  end)
+)
 
 --------------------------------------------------------------------------------
 -- 3. <leader>p — a POST with a JSON body. A non-string `body` is JSON-encoded for
@@ -81,10 +91,11 @@ end))
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>p", function()
   show("POST httpbingo.org/anything …")
-  btv.http.fetch("https://httpbingo.org/anything", {
-    method = "POST",
-    body = { editor = "bemtvi", feature = "btv.http" },
-  })
+  btv.http
+    .fetch("https://httpbingo.org/anything", {
+      method = "POST",
+      body = { editor = "bemtvi", feature = "btv.http" },
+    })
     :next(function(res)
       if res.ok then
         local echoed = res:json()
@@ -105,7 +116,8 @@ end)
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>x", function()
   show("GET http://127.0.0.1:1 (expected to fail) …")
-  btv.http.fetch("http://127.0.0.1:1/nope", { timeout = 2000 })
+  btv.http
+    .fetch("http://127.0.0.1:1/nope", { timeout = 2000 })
     :next(function(res)
       show("unexpectedly resolved: " .. res.status)
     end)
@@ -120,7 +132,8 @@ end)
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>r", function()
   show("GET httpbingo.org/redirect/1 with redirect='manual' …")
-  btv.http.fetch("https://httpbingo.org/redirect/1", { redirect = "manual" })
+  btv.http
+    .fetch("https://httpbingo.org/redirect/1", { redirect = "manual" })
     :next(function(res)
       show(("redirect not followed: %d → %s"):format(res.status, res.headers["location"] or "?"))
     end)
@@ -137,7 +150,8 @@ end)
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<leader>l", function()
   show("GET https://example.com (forced local) …")
-  btv.http.fetch_local("https://example.com")
+  btv.http
+    .fetch_local("https://example.com")
     :next(function(res)
       show(("local fetch → %d (%d bytes)"):format(res.status, #res:text()))
     end)

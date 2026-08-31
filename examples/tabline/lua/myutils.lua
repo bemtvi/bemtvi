@@ -22,18 +22,18 @@ M.get_last_x = get_last_x
 -- Uses vim.spairs so iteration order is stable.
 local function str_join(chr, arr, fn)
   if #arr == 0 then
-    return ''
+    return ""
   end
-  local rest = ''
+  local rest = ""
   for i, p in vim.spairs(arr) do
-    rest = rest .. ((i > 1) and chr or '') .. (fn ~= nil and fn(p, i) or p)
+    rest = rest .. ((i > 1) and chr or "") .. (fn ~= nil and fn(p, i) or p)
   end
   return rest
 end
 M.str_join = str_join
 
 -- Buffer names that shouldn't be chosen as a tab's label (side panels etc.).
-local IGNORE_BUF_NAME = { '^NvimTree_[0-9]+', '^undotree_', '^diffpanel_' }
+local IGNORE_BUF_NAME = { "^NvimTree_[0-9]+", "^undotree_", "^diffpanel_" }
 
 local function match_any(patterns, cmp)
   for i = 1, #patterns do
@@ -62,20 +62,22 @@ local function my_tab_label(n)
   local bufnr = buflist[i]
   local bufname = vim.fn.bufname(bufnr)
   if #bufname == 0 then
-    bufname = '[No Name]'
+    bufname = "[No Name]"
   end
 
-  local parts = get_last_x(vim.split(bufname, '/'), 3)
+  local parts = get_last_x(vim.split(bufname, "/"), 3)
   local fname = table.remove(parts)
   if #fname > 20 then
-    fname = string.sub(fname, 0, 19) .. '…'
+    fname = string.sub(fname, 0, 19) .. "…"
   end
 
-  local rest = str_join('/', parts, function(part) return part:sub(1, 3) end)
+  local rest = str_join("/", parts, function(part)
+    return part:sub(1, 3)
+  end)
   if #rest > 0 then
-    rest = '(' .. rest .. ')'
+    rest = "(" .. rest .. ")"
   end
-  return n .. ':' .. fname .. (vim.bo[bufnr].modified and '*' or '') .. rest
+  return n .. ":" .. fname .. (vim.bo[bufnr].modified and "*" or "") .. rest
 end
 M.my_tab_label = my_tab_label
 
@@ -83,24 +85,24 @@ M.my_tab_label = my_tab_label
 -- (each label produced by a %{} expression calling my_tab_label), a %#TabLineFill#
 -- spacer, and — with more than one tab — a right-aligned %999X "close" region.
 local function my_tab_line()
-  local s = ''
-  local tabnr_last = vim.fn.tabpagenr('$')
+  local s = ""
+  local tabnr_last = vim.fn.tabpagenr("$")
   local tabnr_current = vim.fn.tabpagenr()
 
   for i = 1, tabnr_last do
     if i == tabnr_current then
-      s = s .. '%#TabLineSel#'
+      s = s .. "%#TabLineSel#"
     else
-      s = s .. '%#TabLine#'
+      s = s .. "%#TabLine#"
     end
-    s = s .. '%' .. i .. 'T'
-    s = s .. ' %{v:lua.require(\'myutils\').my_tab_label(' .. i .. ')}'
+    s = s .. "%" .. i .. "T"
+    s = s .. " %{v:lua.require('myutils').my_tab_label(" .. i .. ")}"
   end
 
-  s = s .. '%#TabLineFill#%T'
+  s = s .. "%#TabLineFill#%T"
 
   if tabnr_last > 1 then
-    s = s .. '%=%#TabLine#%999Xclose'
+    s = s .. "%=%#TabLine#%999Xclose"
   end
 
   return s

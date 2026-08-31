@@ -35,10 +35,13 @@ vim.api.nvim_create_user_command("GutterDemo", function()
     vim.wo[original].number = true
     vim.wo[original].relativenumber = true
 
-    vim.notify(string.format(
-      "win %d: gutter off  |  win %d: hybrid gutter — same buffer, two gutters",
-      fresh, original
-    ))
+    vim.notify(
+      string.format(
+        "win %d: gutter off  |  win %d: hybrid gutter — same buffer, two gutters",
+        fresh,
+        original
+      )
+    )
   end)
 end, {})
 
@@ -51,7 +54,8 @@ vim.api.nvim_create_user_command("GutterReport", function()
   for _, w in ipairs(vim.api.nvim_list_wins()) do
     out[#out + 1] = string.format(
       "win %d: number=%s relativenumber=%s",
-      w, tostring(vim.wo[w].number),
+      w,
+      tostring(vim.wo[w].number),
       tostring(vim.api.nvim_win_get_option(w, "relativenumber"))
     )
   end

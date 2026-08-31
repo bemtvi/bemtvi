@@ -47,8 +47,15 @@ vim.api.nvim_create_user_command("Glob", function(a)
   for _, p in ipairs(paths()) do
     table.insert(btv.glob.match(a.args, p) and hit or miss, p)
   end
-  vim.notify(("glob %q\n  matched (%d):\n    %s\n  not matched (%d):\n    %s"):format(
-    a.args, #hit, table.concat(hit, "\n    "), #miss, table.concat(miss, "\n    ")))
+  vim.notify(
+    ("glob %q\n  matched (%d):\n    %s\n  not matched (%d):\n    %s"):format(
+      a.args,
+      #hit,
+      table.concat(hit, "\n    "),
+      #miss,
+      table.concat(miss, "\n    ")
+    )
+  )
 end, { nargs = 1, desc = "Match every path in the buffer against a glob (btv.glob.match)" })
 
 -- 2. :GlobRegex <pattern> — show the regex a glob translates to. This is the whole
@@ -59,17 +66,21 @@ end, { nargs = 1, desc = "Match every path in the buffer against a glob (btv.glo
 --        :GlobRegex *.lua
 --        :GlobRegex **/*.lua
 vim.api.nvim_create_user_command("GlobRegex", function(a)
-  vim.notify(("glob %q translates to:\n  %s\n\nwith literal_separator = false:\n  %s"):format(
-    a.args,
-    btv.glob.to_regex(a.args),
-    btv.glob.to_regex(a.args, { literal_separator = false })))
+  vim.notify(
+    ("glob %q translates to:\n  %s\n\nwith literal_separator = false:\n  %s"):format(
+      a.args,
+      btv.glob.to_regex(a.args),
+      btv.glob.to_regex(a.args, { literal_separator = false })
+    )
+  )
 end, { nargs = 1, desc = "Show the regex a glob compiles to (btv.glob.to_regex)" })
 
 -- 3. :GlobStar — the `*`-stops-at-`/` default, side by side with its two escapes.
 --    Type it and see one path judged three ways.
 vim.api.nvim_create_user_command("GlobStar", function()
   local path = "conf/nvim/init.lua"
-  vim.notify(([[
+  vim.notify(
+    ([[
 path = %q
 
   btv.glob.match("*.lua", path)                              --> %s
@@ -83,11 +94,13 @@ path = %q
 
   btv.glob.match("*.lua", path, { literal_separator = false }) --> %s
       the opt-out: `*` crosses `/` again (vim's autocmd rule)]]):format(
-    path,
-    btv.glob.match("*.lua", path),
-    btv.glob.match("**/*.lua", path),
-    btv.glob.match("*.lua", path, { basename = true }),
-    btv.glob.match("*.lua", path, { literal_separator = false })))
+      path,
+      btv.glob.match("*.lua", path),
+      btv.glob.match("**/*.lua", path),
+      btv.glob.match("*.lua", path, { basename = true }),
+      btv.glob.match("*.lua", path, { literal_separator = false })
+    )
+  )
 end, { desc = "The `*` vs `/` default and its two escapes" })
 
 -- 4. :GlobWindows — path style is an OPTION, not the machine you're on. Running this
@@ -97,7 +110,8 @@ vim.api.nvim_create_user_command("GlobWindows", function()
   local win = { style = "windows" }
   local uni = { style = "unix" }
   -- A `[==[ ]==]` long bracket, because the text itself shows `[[ ]]` Lua literals.
-  vim.notify(([==[
+  vim.notify(
+    ([==[
 windows style — `\` is a SEPARATOR (so `src\*.rs` is a path):
 
   match([[src\*.rs]],    [[src\main.rs]])       --> %s
@@ -111,12 +125,14 @@ unix style — `\` is the ESCAPE character (so `\*` is a literal asterisk):
   match([[a\*b]], "axyzb") --> %s   (an escaped `*` is NOT a wildcard)
 
 Same host, same call, opposite answers — the convention belongs to the PATH.]==]):format(
-    btv.glob.match([[src\*.rs]], [[src\main.rs]], win),
-    btv.glob.match("src/*.rs", [[src\main.rs]], win),
-    btv.glob.match([[src\*.rs]], [[src\a\main.rs]], win),
-    btv.glob.match([[C:/**/*.txt]], [[C:\Users\me\a.txt]], win),
-    btv.glob.match([[a\*b]], "a*b", uni),
-    btv.glob.match([[a\*b]], "axyzb", uni)))
+      btv.glob.match([[src\*.rs]], [[src\main.rs]], win),
+      btv.glob.match("src/*.rs", [[src\main.rs]], win),
+      btv.glob.match([[src\*.rs]], [[src\a\main.rs]], win),
+      btv.glob.match([[C:/**/*.txt]], [[C:\Users\me\a.txt]], win),
+      btv.glob.match([[a\*b]], "a*b", uni),
+      btv.glob.match([[a\*b]], "axyzb", uni)
+    )
+  )
 end, { desc = "Windows vs unix path style on the same host (btv.glob style opt)" })
 
 -- 5. :GlobIgnore — a glob SET: one compiled RegexSet tests a path against every
@@ -134,10 +150,15 @@ vim.api.nvim_create_user_command("GlobIgnore", function()
       kept[#kept + 1] = p
     end
   end
-  vim.notify(("ignore set: %s\n\n  kept (%d):\n    %s\n\n  dropped (%d):\n    %s"):format(
-    table.concat(ignore:patterns(), "  "),
-    #kept, table.concat(kept, "\n    "),
-    #dropped, table.concat(dropped, "\n    ")))
+  vim.notify(
+    ("ignore set: %s\n\n  kept (%d):\n    %s\n\n  dropped (%d):\n    %s"):format(
+      table.concat(ignore:patterns(), "  "),
+      #kept,
+      table.concat(kept, "\n    "),
+      #dropped,
+      table.concat(dropped, "\n    ")
+    )
+  )
 end, { desc = "Filter the buffer's paths through a glob set (btv.glob.set)" })
 
 -- 6. :GlobBench — the cache, made measurable. 50k one-shot matches of the same glob.
@@ -153,9 +174,15 @@ vim.api.nvim_create_user_command("GlobBench", function()
     end
   end
   local ms = (os.clock() - started) * 1000
-  vim.notify(("%d matches of %q in %.1f ms (%.2f us each)\n\z
+  vim.notify(
+    ("%d matches of %q in %.1f ms (%.2f us each)\n\z
     one parse + one regex build total — the rest came from the cache"):format(
-    hits, pattern, ms, ms * 1000 / n))
+      hits,
+      pattern,
+      ms,
+      ms * 1000 / n
+    )
+  )
 end, { desc = "50k cached glob matches (btv.glob compile cache)" })
 
 -- 7. :GlobIsGlob — the canonical "is this a pattern or a plain path" predicate, for

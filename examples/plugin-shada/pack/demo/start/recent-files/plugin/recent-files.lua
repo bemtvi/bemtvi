@@ -68,6 +68,10 @@ end, {})
 local remembered = #recent()
 if remembered > 0 then
   vim.schedule(function()
-    print(("recent-files: %d file(s) remembered from a previous session — :RecentFiles"):format(remembered))
+    print(
+      ("recent-files: %d file(s) remembered from a previous session — :RecentFiles"):format(
+        remembered
+      )
+    )
   end)
 end

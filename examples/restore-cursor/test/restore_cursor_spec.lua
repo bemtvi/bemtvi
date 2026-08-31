@@ -74,9 +74,7 @@ btv.test.describe("examples/restore-cursor", function()
     open(t)
     t:cmd("%normal! guu")
     btv.test.expect(t:line(1)).to_be("restore-cursor demo")
-    btv.test.expect(t:line(4)).to_be(
-      "move the cursor somewhere down this file, then quit with :q."
-    )
+    btv.test.expect(t:line(4)).to_be("move the cursor somewhere down this file, then quit with :q.")
     btv.test.expect(t:line(5)).to_contain("re-run the same command")
   end)
 end)

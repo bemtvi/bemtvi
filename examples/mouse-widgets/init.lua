@@ -27,7 +27,7 @@ vim.cmd("set mouse=a")
 --      wheel over the box scroll the highlight, one row per notch (non-wrapping)
 --    The popup does NOT grab the mouse: a click off it falls through to the text.
 --------------------------------------------------------------------------------
-btv.complete.setup { sources = { { "buffer", min_chars = 2 } } }
+btv.complete.setup({ sources = { { "buffer", min_chars = 2 } } })
 
 --------------------------------------------------------------------------------
 -- 2. Command-line wildmenu (`btv.cmdline_complete`).
@@ -38,7 +38,7 @@ btv.complete.setup { sources = { { "buffer", min_chars = 2 } } }
 --      wheel over the box cycle the highlight
 --    Needs `mouse` to include `c` (set above via `mouse = a`).
 --------------------------------------------------------------------------------
-btv.cmdline_complete.setup {}
+btv.cmdline_complete.setup({})
 
 --------------------------------------------------------------------------------
 -- 3. Fuzzy picker (`btv.picker`) — a centered box that GRABS the mouse modally.
@@ -51,20 +51,24 @@ btv.cmdline_complete.setup {}
 --------------------------------------------------------------------------------
 vim.g.mapleader = "\\"
 
-btv.picker.source {
+btv.picker.source({
   name = "fruits",
   items = function(ctx)
     for _, t in ipairs({ "apple", "apricot", "banana", "blueberry", "cherry", "date" }) do
-      ctx.push { text = t, fruit = t }
+      ctx.push({ text = t, fruit = t })
     end
   end,
-  confirm = function(item) btv.notify("picked " .. item.fruit) end,
-}
+  confirm = function(item)
+    btv.notify("picked " .. item.fruit)
+  end,
+})
 
 -- `<leader>o`, not `<leader>f`: bemtvi ships a whole `<leader>f…` picker family
 -- (`\ff` files, `\fg` grep, `\fb` buffers, …), so a bare `\f` is a live prefix of
 -- them and would sit waiting for the timeout before this map could fire.
-btv.keymap.set("n", "<leader>o", function() btv.picker.open("fruits") end)
+btv.keymap.set("n", "<leader>o", function()
+  btv.picker.open("fruits")
+end)
 
 --------------------------------------------------------------------------------
 -- 4. Promptless chooser (`btv.ui.select`) — a small list under the cursor that

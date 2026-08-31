@@ -160,8 +160,9 @@ btv.test.describe("examples/named-lists", function()
       return vim.api.nvim_get_current_win() == main_win
     end, { message = "<CR> never crossed back to the main area" })
     btv.test.expect(t:cursor()[1]).to_be(want)
-    btv.test.expect(t:current_line():find("TODO") or t:current_line():find("FIXME"))
-      .never.to_be_nil()
+    btv.test
+      .expect(t:current_line():find("TODO") or t:current_line():find("FIXME")).never
+      .to_be_nil()
   end)
 
   -- The entry shape the notes name: "filename / lnum / col / text".

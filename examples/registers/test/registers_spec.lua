@@ -19,7 +19,7 @@ end
 
 btv.test.describe("examples/registers", function()
   -- "Seed two registers at startup, before you touch the keyboard."
-  btv.test.it("the config seeds \"h charwise and \"t linewise", function(t)
+  btv.test.it('the config seeds "h charwise and "t linewise', function(t)
     open(t)
     btv.test.expect(vim.fn.getreg("h")).to_be("hello from setreg")
     btv.test.expect(vim.fn.getregtype("h")).to_be("v")
@@ -58,7 +58,7 @@ btv.test.describe("examples/registers", function()
   end)
 
   -- ":Stash — copy the current line into register \"s"
-  btv.test.it(":Stash copies the cursor line into \"s, linewise", function(t)
+  btv.test.it(':Stash copies the cursor line into "s, linewise', function(t)
     open(t)
     t:feed("5G") -- "bread"
     t:cmd("Stash")
@@ -77,7 +77,7 @@ btv.test.describe("examples/registers", function()
     btv.test.expect(t:line(2)).to_be("bread")
   end)
 
-  btv.test.it(":Stashed says so while \"s is empty", function(t)
+  btv.test.it(':Stashed says so while "s is empty', function(t)
     open(t)
     local before = #t:lines()
     t:cmd("Stashed")
@@ -86,7 +86,7 @@ btv.test.describe("examples/registers", function()
   end)
 
   -- ":Shout — upper-case + append register \"h, then \"hp to see it"
-  btv.test.it(":Shout appends the upper-cased text to \"h", function(t)
+  btv.test.it(':Shout appends the upper-cased text to "h', function(t)
     open(t)
     t:cmd("Shout")
     btv.test.expect(vim.fn.getreg("h")).to_be("hello from setregHELLO FROM SETREG")

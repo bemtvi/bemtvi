@@ -74,7 +74,8 @@ btv.test.describe("examples/dock-winhighlight", function()
   -- §3. The star: the dock's chrome resolves through the remap.
   btv.test.it("§3 — the dock carries the winhighlight the config set", function(t)
     open(t)
-    btv.test.expect(btv.dock.opt("left").winhighlight)
+    btv.test
+      .expect(btv.dock.opt("left").winhighlight)
       .to_be("Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr")
   end)
 

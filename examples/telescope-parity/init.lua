@@ -127,7 +127,11 @@ make_files("git_files", "Git Files", "git", { "ls-files" })
 -- <leader>fG  live grep -uu + excludes
 make_grep("live_grep", "Live Grep", {})
 make_grep("live_grep_uu", "Live Grep (-uu)", { unrestricted = 2 })
-make_grep("live_grep_ex", "Live Grep (-uu, excludes)", { unrestricted = 2, globs = global_excludes })
+make_grep(
+  "live_grep_ex",
+  "Live Grep (-uu, excludes)",
+  { unrestricted = 2, globs = global_excludes }
+)
 
 -- The `curbuf` (current-buffer fuzzy find), `diagnostics`, `keymaps`, and
 -- `pickers` (picker-of-pickers) sources telescope has are all shipped built-in by
@@ -166,7 +170,12 @@ map("n", "<C-p>", open("git_files"), { desc = "Git files" })
 map("n", "<leader>fg", open("live_grep"), { desc = "Live grep" })
 map("v", "<leader>fg", with_selection("live_grep"), { desc = "Live grep (selection)" })
 map("n", "<leader>fG", open("live_grep_ex"), { desc = "Live grep -uu + excludes" })
-map("v", "<leader>fG", with_selection("live_grep_ex"), { desc = "Live grep -uu + excludes (selection)" })
+map(
+  "v",
+  "<leader>fG",
+  with_selection("live_grep_ex"),
+  { desc = "Live grep -uu + excludes (selection)" }
+)
 map("n", "<leader>fA", open("live_grep_uu"), { desc = "Live grep -uu" })
 map("v", "<leader>fA", with_selection("live_grep_uu"), { desc = "Live grep -uu (selection)" })
 map("n", "<leader>fb", open("buffers"), { desc = "Buffers" }) -- shipped source

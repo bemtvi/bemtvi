@@ -95,9 +95,9 @@ btv.test.describe("examples/virt-text", function()
     open(t)
     -- The reserved row above line 8 carries the header, and is not a buffer line.
     local above = row_of(t, 8)
-    btv.test.expect(t:decor(above - 1).virt_lines).to_contain(
-      "┌─ compute(): doubles and offsets ─┐"
-    )
+    btv.test
+      .expect(t:decor(above - 1).virt_lines)
+      .to_contain("┌─ compute(): doubles and offsets ─┐")
     btv.test.expect(t:view().numbers[above - 1]).to_be(false)
     -- …and the two annotation rows sit just below line 9.
     local below = row_of(t, 9)

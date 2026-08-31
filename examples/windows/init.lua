@@ -50,10 +50,13 @@ vim.api.nvim_create_user_command("WinList", function()
     local pos = vim.api.nvim_win_get_cursor(w)
     lines[#lines + 1] = string.format(
       "win %d%s  buf=%d  cursor=%d,%d  %dx%d",
-      w, w == cur and " (current)" or "",
+      w,
+      w == cur and " (current)" or "",
       vim.api.nvim_win_get_buf(w),
-      pos[1], pos[2],
-      vim.api.nvim_win_get_width(w), vim.api.nvim_win_get_height(w)
+      pos[1],
+      pos[2],
+      vim.api.nvim_win_get_width(w),
+      vim.api.nvim_win_get_height(w)
     )
   end
   vim.notify(table.concat(lines, "  |  "))
@@ -71,8 +74,13 @@ vim.api.nvim_create_user_command("WinDemo", function()
   btv.on_next_tick(function()
     local win = vim.api.nvim_get_current_win()
     btv.win.set_cursor(win, 3, 0)
-    vim.notify("[WinDemo] opened window " .. tostring(win)
-      .. "; now " .. #vim.api.nvim_list_wins() .. " windows. Try :WinList")
+    vim.notify(
+      "[WinDemo] opened window "
+        .. tostring(win)
+        .. "; now "
+        .. #vim.api.nvim_list_wins()
+        .. " windows. Try :WinList"
+    )
   end)
 end, {})
 

@@ -112,11 +112,13 @@ btv.test.describe("examples/promise", function()
 
   btv.test.it("§5 — …and :catch on the RESULT catches it too", function(t)
     local caught
-    btv.async(function()
-      btv.await(btv.promise.reject("bang"))
-    end)():catch(function(err)
-      caught = tostring(err)
-    end)
+    btv
+      .async(function()
+        btv.await(btv.promise.reject("bang"))
+      end)()
+      :catch(function(err)
+        caught = tostring(err)
+      end)
     t:wait_for(function()
       return caught ~= nil
     end, { message = "the result promise never rejected" })
@@ -175,9 +177,12 @@ btv.test.describe("examples/promise", function()
     btv.promise.resolve(1):finally(function()
       ran = ran + 1
     end)
-    btv.promise.reject("x"):finally(function()
-      ran = ran + 1
-    end):catch(function() end)
+    btv.promise
+      .reject("x")
+      :finally(function()
+        ran = ran + 1
+      end)
+      :catch(function() end)
     t:wait_for(function()
       return ran == 2
     end, { message = ":finally did not run on both paths" })

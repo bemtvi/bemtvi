@@ -19,7 +19,7 @@
 -- rather than inserting raw `$1` text — the project's no-silent-stubs rule.
 
 -- Jump keys (the defaults shown; change them here if you like):
-btv.snippet.setup { jump_next = "<Tab>", jump_prev = "<S-Tab>" }
+btv.snippet.setup({ jump_next = "<Tab>", jump_prev = "<S-Tab>" })
 
 -- Register snippets per filetype. `body` is a string (function bodies are a later
 -- phase). The sample file is `sample.lua`, so these are registered for `lua`.
@@ -52,12 +52,12 @@ btv.snippet.add("lua", {
 --   • Move onto the snippet row (<C-n>) and a DOCS FLOAT opens beside the popup
 --     previewing the body you're about to expand — `function ${1:name}(${2})…` — the
 --     same surface LSP items use for their documentation.
-btv.complete.setup {
+btv.complete.setup({
   sources = {
     { "snippets" },
     { "buffer", min_chars = 2 },
   },
-}
+})
 
 -- You can also expand a body directly, e.g. from an insert-mode mapping:
 btv.keymap.set("i", "<C-s>", function()

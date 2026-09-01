@@ -76,6 +76,26 @@ pub(crate) fn plain_float_lines(lines: Vec<String>) -> Vec<Vec<VirtChunk>> {
         .collect()
 }
 
+/// One contributor's docs in a doc float — a section of the merged hover, or of the
+/// completion-docs float: the server's name as the `label` (empty for a lone
+/// contributor, which renders bare), the completion item's `detail` (the one-line
+/// signature a server offers, fenced above the body in the buffer's own language),
+/// and its documentation as the `body`, in the `format` that server declared.
+///
+/// `detail` stays apart from `body` rather than being pre-fenced into it because the
+/// two carry different warranties: the body's fences are the server's, while the
+/// detail's is bemtvi's, so it renders as an [asserted](crate::markdown::MdCode::asserted)
+/// block and is painted only for what the parse confirms. `format` likewise covers
+/// only `body`: LSP declares a `MarkupKind` for `documentation` and for hover
+/// contents, and nothing at all for `detail`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocsSection {
+    pub label: String,
+    pub detail: Option<String>,
+    pub body: String,
+    pub format: crate::markdown::DocFormat,
+}
+
 /// The identity of an open completion docs float — its markdown sections, the popup
 /// box it was placed beside (`WindowId` + the box's `menu_geom` col/row/width), and
 /// `wrap`. When these are all unchanged [`Editor::open_completion_docs_float`] leaves
@@ -85,7 +105,7 @@ pub(crate) fn plain_float_lines(lines: Vec<String>) -> Vec<Vec<VirtChunk>> {
 /// change the float must take up.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CompletionDocsSig {
-    sections: Vec<(String, String)>,
+    sections: Vec<DocsSection>,
     win: WindowId,
     box_col: usize,
     box_row: usize,
@@ -112,6 +132,21 @@ pub(crate) struct ContentFloat {
     /// Lua target the right float and a *stale* handle's close no-ops. `0` for a
     /// transient float (which has no handle).
     pub id: u64,
+}
+
+/// Map the editor-level [`DocsSection`]s onto the renderer's own, fencing each
+/// section's `detail` in `detail_lang` (the buffer's filetype; empty for the hover,
+/// which has no detail to fence).
+fn doc_sections<'a>(
+    sections: &'a [DocsSection],
+    detail_lang: &'a str,
+) -> impl Iterator<Item = crate::markdown::DocSection<'a>> {
+    sections.iter().map(move |s| crate::markdown::DocSection {
+        label: s.label.as_str(),
+        detail: s.detail.as_deref().map(|d| (detail_lang, d)),
+        body: s.body.as_str(),
+        format: s.format,
+    })
 }
 
 impl Editor {
@@ -384,10 +419,9 @@ impl Editor {
     /// by [`crate::markdown::render_sections`]) so the reader can tell which contributor
     /// said what. This is the merged LSP hover — one server per section, in routing
     /// order.
-    pub fn open_markdown_sections(&mut self, name: &str, sections: &[(String, String)]) {
-        let rendered = crate::markdown::render_sections(
-            sections.iter().map(|(l, s)| (l.as_str(), s.as_str())),
-        );
+    pub fn open_markdown_sections(&mut self, name: &str, sections: &[DocsSection]) {
+        // No detail language: a hover section has no `detail` to fence.
+        let rendered = crate::markdown::render_doc_sections(doc_sections(sections, ""));
         self.open_markdown_float_rendered(name, rendered);
     }
 
@@ -460,10 +494,26 @@ impl Editor {
         &mut self,
         buf: BufferId,
         name: &str,
-        rendered: crate::markdown::Rendered,
+        mut rendered: crate::markdown::Rendered,
     ) -> Vec<String> {
         if rendered.lines.is_empty() {
             return Vec::new();
+        }
+        // An **untagged** fence is code in the language of the buffer the docs are
+        // about. A server writes its snippets that way — `pyright` sends an
+        // auto-import's statement as a bare ` ``` ` block, `lua_ls` its examples —
+        // and there is no other language it could be in: the document describes a
+        // symbol in *this* buffer. Filled in here rather than at parse time so the
+        // pure `btv.markdown.render` surface keeps reporting the fence as written,
+        // and so the language reaches BOTH the native paint below and the
+        // `code_blocks` a front-end highlighter (the wasm edit-host) works from.
+        if let Some(ft) = self
+            .buffer_filetype(self.current_buffer_id())
+            .filter(|f| !f.is_empty())
+        {
+            for block in rendered.code.iter_mut().filter(|b| b.lang.is_none()) {
+                block.lang = Some(ft.clone());
+            }
         }
         // Kept so the float can be repainted from the same document later — a fenced
         // block whose grammar was still loading when this ran has nothing but the code
@@ -575,7 +625,19 @@ impl Editor {
                 [block.first_line..(block.first_line + block.len).min(rendered.lines.len())]
                 .join("\n")
                 + "\n";
-            let spans = self.preview_highlights_fragment(lang, &text, 0, block.len);
+            // An **asserted** fence (the LSP item's `detail`, which bemtvi wrapped in
+            // code markers the server never wrote) is painted only as far as the parse
+            // confirms — up to the first `ERROR`. A signature it can place keeps every
+            // span; a label it rejects keeps none, where the fragment repaint would
+            // happily colour `import` out of `pyright`'s `Auto-import`. A fence the
+            // *document* declared keeps that repaint: an annotation dialect is the
+            // server's own claim that this is code, and its keywords really are
+            // keywords.
+            let spans = if block.asserted {
+                self.preview_highlights_fragment_confirmed(lang, &text, 0, block.len)
+            } else {
+                self.preview_highlights_fragment(lang, &text, 0, block.len)
+            };
             let b = &mut self.buffers.get_mut(buf).buffer;
             for span in spans {
                 let line = block.first_line + span.line;
@@ -588,7 +650,14 @@ impl Editor {
                     None,
                     base + span.start_byte,
                     Some(base + span.end_byte),
-                    Some(span.group),
+                    // `@`-prefixed: an extmark carries a highlight *group* name, and
+                    // the group a capture is painted through is `@` + the capture
+                    // (`keyword` -> `@keyword`). The bare name is not a group any
+                    // colorscheme defines, so it resolves to nothing and the block
+                    // renders in the plain foreground; the `@` name resolves through
+                    // the capture chain (`@keyword` -> `Keyword`) like every other
+                    // syntax span in the editor.
+                    Some(format!("@{}", span.group)),
                     DEFAULT_PRIORITY,
                     None,
                 );
@@ -659,12 +728,12 @@ impl Editor {
     /// markup — or no completion popup / no room beside it — closes the float instead of
     /// showing an empty box. Re-opening replaces the previous float in place.
     ///
-    /// Each `(label, markdown)` section is headed by a labelled rule, exactly as the
-    /// merged hover's are ([`open_markdown_sections`](Self::open_markdown_sections)):
-    /// a row several language servers all offer is one row in the popup, but each
-    /// server's docs stay its own. An **empty** label renders bare, which is the
-    /// ordinary single-contributor float.
-    pub fn open_completion_docs_float(&mut self, sections: &[(String, String)], wrap: bool) {
+    /// Each section is headed by a labelled rule, exactly as the merged hover's are
+    /// ([`open_markdown_sections`](Self::open_markdown_sections)): a row several
+    /// language servers all offer is one row in the popup, but each server's docs stay
+    /// its own. An **empty** label renders bare, which is the ordinary
+    /// single-contributor float.
+    pub fn open_completion_docs_float(&mut self, sections: &[DocsSection], wrap: bool) {
         // The popup box geometry this float is placed against (region cells) — also the
         // stable part of the signature that decides whether a redundant reopen (which
         // would reset the float's scroll) can be skipped. `None` ⇒ no completion popup.
@@ -695,9 +764,13 @@ impl Editor {
         // reflects the stripped display lines), then place — or close if it renders to
         // nothing / there's no room beside the popup.
         let buf = self.doc_float_buffer(COMPLETION_DOC_FLOAT);
-        let rendered = crate::markdown::render_sections(
-            sections.iter().map(|(l, s)| (l.as_str(), s.as_str())),
-        );
+        // The detail line is fenced in the language of the buffer the docs are about —
+        // the item is a symbol in *this* buffer, and there is no other language its
+        // signature could be in.
+        let ft = self
+            .buffer_filetype(self.current_buffer_id())
+            .unwrap_or_default();
+        let rendered = crate::markdown::render_doc_sections(doc_sections(sections, &ft));
         let lines = self.render_rendered_into(buf, COMPLETION_DOC_FLOAT, rendered);
         if lines.is_empty() {
             self.close_completion_docs_float();

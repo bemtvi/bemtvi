@@ -207,10 +207,19 @@ impl Highlights {
             .flat_map(|(&ns, table)| table.iter().map(move |(k, v)| (ns, k.as_str(), v)))
     }
 
-    /// Resolve a group in the global namespace to a concrete [`Style`].
-    /// Equivalent to [`resolve_ns(0, name)`](Self::resolve_ns).
+    /// Resolve a group in the global namespace to a concrete [`Style`] —
+    /// [`resolve_ns(0, name)`](Self::resolve_ns), plus the `@`-group fallback.
+    ///
+    /// A name that starts with `@` **is** a treesitter capture, wherever it was
+    /// written: a colorscheme's `@markup.heading.1`, an extmark's `hl_group`, a
+    /// `line_hl_group`, a virtual-text chunk. So an undefined one falls back through
+    /// its own hierarchy exactly as a capture painted by the syntax engine does
+    /// (`@keyword.import` -> `@keyword` -> `Keyword`) rather than resolving to
+    /// nothing — the same parent chain neovim gives every `@` group. Names without
+    /// the `@` are ordinary highlight groups and resolve exactly, as before.
     pub fn resolve(&self, name: &str) -> Option<Style> {
         self.resolve_ns(0, name)
+            .or_else(|| self.resolve_capture(name.strip_prefix('@')?))
     }
 
     /// Resolve a group within namespace `ns` to a concrete [`Style`], following
@@ -280,7 +289,10 @@ impl Highlights {
             buf.push(b'@');
             buf.extend_from_slice(&capture.as_bytes()[..end]);
             let group = std::str::from_utf8(&buf).ok()?;
-            if let Some(style) = self.resolve(group) {
+            // `resolve_ns`, not `resolve`: the candidates here are already the
+            // `@`-chain `resolve` delegates *to*, so going back through it would
+            // recurse.
+            if let Some(style) = self.resolve_ns(0, group) {
                 return Some(style);
             }
             match capture[..end].rfind('.') {
@@ -297,7 +309,7 @@ impl Highlights {
             Some(dot) => &capture[..dot],
             None => capture,
         };
-        self.resolve(legacy_group(major)?)
+        self.resolve_ns(0, legacy_group(major)?)
     }
 }
 

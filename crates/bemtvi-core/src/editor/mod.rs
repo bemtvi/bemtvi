@@ -84,7 +84,9 @@ pub(crate) use self::command::{
 };
 pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::{DecorScope, DecorViewport};
-pub use self::float::{SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT};
+pub use self::float::{
+    DocsSection, SIGNATURE_MARKER, SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT,
+};
 pub use self::macros::MacroPlay;
 pub use self::menu::{
     CmdlineCandidate, Extent, FilterSeed, MenuGeom, MenuItem, MenuMetrics, MenuPlacement,

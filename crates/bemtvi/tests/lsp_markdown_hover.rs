@@ -242,3 +242,79 @@ async fn hover_wraps_and_does_not_scroll_horizontally() {
 
     std::env::remove_var("BEMTVI_LSP_CMD");
 }
+
+/// The plain-text lines a hover whose `contents` is `contents_json` renders to.
+async fn hover_lines(tag: &str, contents_json: &str) -> Vec<String> {
+    let dir = temp_dir(tag);
+    arm_mock(
+        &dir,
+        &format!(r#"{{ "hover": {{ "contents": {contents_json} }} }}"#),
+    );
+    let (rpc, mut incoming) = open_rust(&dir).await;
+    exec_lua(
+        &rpc,
+        r#"
+        btv.lsp.config("mock", { cmd = { "placeholder" }, filetypes = { "rust" } })
+        btv.lsp.enable("mock")
+        "#,
+    )
+    .await;
+    let (lines, _) = await_hover(&rpc, &mut incoming, "Options:").await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    lines
+}
+
+/// The layout of a hover a server declared `plaintext` for. LSP's `MarkupKind` is a
+/// closed two-value set — `plaintext` or `markdown`, no rst or asciidoc — and the two
+/// are not interchangeable: markdown reflows soft line breaks into one paragraph and
+/// eats `*` / `_` as emphasis. A `plaintext` docstring put through the markdown
+/// renderer therefore comes out as a single run-on line with its markers stripped,
+/// which is the shape of most python docstrings. Declared `plaintext`, it renders
+/// verbatim.
+#[tokio::test]
+async fn a_plaintext_hover_renders_verbatim() {
+    let _guard = serial_lock().lock().await;
+    let lines = hover_lines(
+        "lsp_hover_plaintext",
+        r#"{ "kind": "plaintext",
+             "value": "Options:\n  *args* is positional\n  _kw_ is keyword" }"#,
+    )
+    .await;
+
+    let body: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        body,
+        vec!["Options:", "  *args* is positional", "  _kw_ is keyword",],
+        "a plaintext hover keeps its line breaks, its indentation and its literal \
+         `*`/`_`: {lines:?}"
+    );
+}
+
+/// The same document declared `markdown` is *not* verbatim — it reflows and strips,
+/// which is what makes honoring the declared kind worth the wiring. Guards the
+/// default too: nothing here may quietly start treating markdown as plain text.
+#[tokio::test]
+async fn a_markdown_hover_still_reflows_and_strips() {
+    let _guard = serial_lock().lock().await;
+    let lines = hover_lines(
+        "lsp_hover_markdown_kind",
+        r#"{ "kind": "markdown",
+             "value": "Options:\n  *args* is positional\n  _kw_ is keyword" }"#,
+    )
+    .await;
+
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Options:") && l.contains("is keyword")),
+        "markdown collapses the soft line breaks into one paragraph: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|l| !l.contains('*') && !l.contains('_')),
+        "…and reads the emphasis markers as markup rather than text: {lines:?}"
+    );
+}

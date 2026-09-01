@@ -134,7 +134,10 @@ export function setHlTheme(map) {
 // Exported so the remote (server-styled) renderer can reuse this theme as its
 // fallback for highlight spans the server sent without a resolved palette style.
 export function colorFor(group) {
-  let g = group;
+  // A server-sent span carries the highlight *group* a capture is painted through
+  // (`@keyword.import`); the tables here are keyed by the capture itself, so the
+  // leading `@` comes off before the walk. Locally-produced captures have none.
+  let g = group.startsWith('@') ? group.slice(1) : group;
   for (;;) {
     const c = (runtimeTheme && runtimeTheme[g]) || FG[g];
     if (c) return c;

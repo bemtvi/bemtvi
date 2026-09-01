@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use bemtvi_core::markdown::DocFormat;
+
 use lsp_types::{
     CodeAction, Diagnostic, Location, Position, Range, SemanticToken, SemanticTokensEdit,
     TextDocumentContentChangeEvent, TextDocumentSyncKind, TextEdit, Url,
@@ -661,7 +663,13 @@ pub enum LspReply {
     /// shapes all flattened to a name/kind/location list (empty ⇒ none found).
     Symbols(Vec<SymbolData>),
     /// Hover contents as plain display lines (empty ⇒ the server had nothing).
-    Hover(Vec<String>),
+    Hover {
+        lines: Vec<String>,
+        /// The `MarkupKind` the server declared for the hover contents. A
+        /// `MarkedString` (either form) is markdown by the protocol's own words; only
+        /// a `MarkupContent` can say `plaintext`.
+        format: DocFormat,
+    },
     /// The active signature, kept structural (see [`SignatureInfo`]) so the editor
     /// lays its parameters out itself. `None` ⇒ no signature help (no signatures,
     /// or the server returned nothing).
@@ -695,6 +703,9 @@ pub enum LspReply {
     /// faked).
     ResolvedCompletion {
         documentation: Option<String>,
+        /// The `MarkupKind` the resolved `documentation` declared (markdown unless the
+        /// server said `plaintext`).
+        documentation_format: DocFormat,
         detail: Option<String>,
     },
     /// The semantic tokens from `textDocument/semanticTokens/full` or
@@ -998,11 +1009,16 @@ pub struct CompletionItemData {
     pub text_edit: Option<TextEdit>,
     pub additional_text_edits: Vec<TextEdit>,
     /// The item's `documentation` (a plain string or `MarkupContent`) reduced to
-    /// plain display lines joined by `\n` (markdown is not styled — same as hover),
-    /// with trailing blank lines trimmed. `None` ⇒ the item carried no
-    /// documentation *inline*; many servers (rust_analyzer especially) send it only
-    /// on `completionItem/resolve` (Phase 2), keyed by [`Self::resolve_data`].
+    /// display lines joined by `\n`, with trailing blank lines trimmed. `None` ⇒ the
+    /// item carried no documentation *inline*; many servers (rust_analyzer especially)
+    /// send it only on `completionItem/resolve` (Phase 2), keyed by
+    /// [`Self::resolve_data`].
     pub documentation: Option<String>,
+    /// The `MarkupKind` the server declared for [`Self::documentation`] — markdown
+    /// unless it said `plaintext`, in which case the docs float renders it verbatim
+    /// instead of reflowing it. Covers the documentation only: `detail` is a bare
+    /// string with no declared format.
+    pub documentation_format: DocFormat,
     /// The original protocol [`CompletionItem`](lsp_types::CompletionItem)
     /// serialized verbatim, round-tripped to `completionItem/resolve` in Phase 2 to
     /// fetch the lazy `documentation`/`detail`. The whole item (not just its `data`

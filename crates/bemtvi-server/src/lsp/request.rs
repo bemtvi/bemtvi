@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+use bemtvi_core::markdown::DocFormat;
+use bemtvi_core::DocsSection;
 use bemtvi_lsp::lsp_types::{Location, Range, Url};
 use bemtvi_lsp::serde_json;
 use bemtvi_lsp::{
@@ -831,8 +833,8 @@ impl EditHost {
             // nothing here" — dropped now rather than at present time, so the "was
             // anything found at all" test and the "does this need a heading" count
             // are the same number.
-            LspReply::Hover(lines) if !lines.is_empty() => {
-                round.hovers.push((server.clone(), lines.clone()))
+            LspReply::Hover { lines, format } if !lines.is_empty() => {
+                round.hovers.push((server.clone(), lines.clone(), *format))
             }
             // As with hover, a server with nothing to say is dropped on arrival rather
             // than carried as an empty slot to the presentation.
@@ -904,7 +906,7 @@ impl EditHost {
                     return;
                 }
                 let mut hovers = round.hovers;
-                hovers.sort_by(|(a, _), (b, _)| self.lsp_routing_order(a, b));
+                hovers.sort_by(|(a, ..), (b, ..)| self.lsp_routing_order(a, b));
                 let result = self.show_merged_hover(hovers);
                 self.lsp_dirty = true;
                 self.settle_lsp_promise(round.cb_id, result);
@@ -1038,7 +1040,7 @@ impl EditHost {
             // Hover merges across servers, so its replies are folded into their round
             // by `absorb_fanout_reply` and never reach the single-slot kind path (see
             // the `CodeActions` arm below, and `LspFanout::is_fanout`).
-            LspReply::Hover(_) => {
+            LspReply::Hover { .. } => {
                 unreachable!("hover replies are routed in absorb_fanout_reply")
             }
             LspReply::SignatureHelp { .. } => {
@@ -1094,6 +1096,7 @@ impl EditHost {
             }
             LspReply::ResolvedCompletion {
                 documentation,
+                documentation_format,
                 detail,
             } => {
                 // The docs sidebar's lazy-docs fetch (Phase 4-D): fill the resolved
@@ -1101,7 +1104,7 @@ impl EditHost {
                 // gated — the completion menu follows the moving cursor while open
                 // (like the `Completion` reply), and the resolve is keyed to its row;
                 // a replaced list is dropped via the reset `lsp_complete_resolve_key`.
-                self.on_completion_resolve_reply(documentation, detail);
+                self.on_completion_resolve_reply(documentation, documentation_format, detail);
             }
             // The whole-buffer decorations (semantic tokens / inlay hints / folding
             // ranges) never reach here — they are routed by generation through
@@ -1173,30 +1176,36 @@ impl EditHost {
     /// The returned string — what an async `hover` promise resolves with — is the
     /// *markup*, so a section is announced there as the `# <client>` heading a caller
     /// can parse; the rule is a rendering of it, not text a caller should have to strip.
-    fn show_merged_hover(&mut self, hovers: Vec<(ServerKey, Vec<String>)>) -> serde_json::Value {
+    fn show_merged_hover(
+        &mut self,
+        hovers: Vec<(ServerKey, Vec<String>, DocFormat)>,
+    ) -> serde_json::Value {
         if hovers.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return serde_json::Value::Null;
         }
         let multi = hovers.len() > 1;
-        let sections: Vec<(String, String)> = hovers
+        let sections: Vec<DocsSection> = hovers
             .into_iter()
-            .map(|(key, doc)| {
-                let label = if multi {
+            .map(|(key, doc, format)| DocsSection {
+                label: if multi {
                     key.name.clone()
                 } else {
                     String::new()
-                };
-                (label, doc.join("\n"))
+                },
+                // Hover has no `detail`: every section is the server's own markup.
+                detail: None,
+                body: doc.join("\n"),
+                format,
             })
             .collect();
         let text = sections
             .iter()
-            .map(|(label, doc)| {
-                if label.is_empty() {
-                    doc.clone()
+            .map(|s| {
+                if s.label.is_empty() {
+                    s.body.clone()
                 } else {
-                    format!("# {label}\n\n{doc}")
+                    format!("# {}\n\n{}", s.label, s.body)
                 }
             })
             .collect::<Vec<_>>()

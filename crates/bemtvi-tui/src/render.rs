@@ -2414,8 +2414,15 @@ fn selection_style(base: Style, theme: &LineTheme) -> Style {
 /// `function.builtin`, … all share `function`'s color. This is the client's
 /// theme — the *only* place that decides how a group looks. Unknown groups fall
 /// back to the default foreground. Indexed ANSI colors keep it terminal-portable.
+///
+/// A leading `@` comes off first: a span carries the highlight *group* a capture
+/// is painted through (`@keyword.import`), and the families below are the captures.
 pub(crate) fn group_style(group: &str) -> Style {
-    let major = group.split('.').next().unwrap_or(group);
+    let major = group
+        .trim_start_matches('@')
+        .split('.')
+        .next()
+        .unwrap_or(group);
     let style = Style::default();
     match major {
         "keyword" | "conditional" | "repeat" | "include" | "exception" | "keyword_operator" => {

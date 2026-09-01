@@ -1463,18 +1463,21 @@ btv.complete.setup { sources = { { 'hover' } } }",
     assert!(
         !spans
             .iter()
-            .any(|(_, _, g)| g.split('.').next() == Some("constructor")),
+            .any(|(_, _, g)| g.split('.').next() == Some("@constructor")),
         "a construct recovered from an ERROR must not reach the float: {spans:?}"
     );
     assert!(
-        !spans.iter().any(|(_, _, g)| g == "type"),
+        !spans.iter().any(|(_, _, g)| g == "@type"),
         "with the ladder off there is no framed parse to name a type: {spans:?}"
     );
     // …and the fragment is not simply left plain: the tokens the parse *can* vouch
     // for (here the `:` delimiter and the `<` / `>` operators) are still painted.
     assert!(
         spans.iter().any(|(_, _, g)| {
-            matches!(g.split('.').next(), Some("punctuation") | Some("operator"))
+            matches!(
+                g.split('.').next(),
+                Some("@punctuation") | Some("@operator")
+            )
         }),
         "the fragment repaint still paints the tokens it can vouch for: {spans:?}"
     );
@@ -1520,7 +1523,7 @@ btv.complete.setup { sources = { { 'hover' } } }",
                     if let Some(spans) = win_hl(&win).get(row) {
                         painted = spans
                             .iter()
-                            .any(|(_, _, g)| g.split('.').next() == Some("keyword"));
+                            .any(|(_, _, g)| g.split('.').next() == Some("@keyword"));
                         if painted {
                             break;
                         }
@@ -1576,7 +1579,7 @@ btv.complete.setup { sources = { { 'hover' } } }",
                 if let Some(row) = lines.iter().position(|l| l.contains("field: Vec<String>")) {
                     if let Some(spans) = win_hl(&win).get(row) {
                         groups = spans.iter().map(|(_, _, g)| g.clone()).collect();
-                        if groups.iter().any(|g| g == "type") {
+                        if groups.iter().any(|g| g == "@type") {
                             break;
                         }
                     }
@@ -1586,11 +1589,11 @@ btv.complete.setup { sources = { { 'hover' } } }",
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        groups.iter().any(|g| g == "type"),
+        groups.iter().any(|g| g == "@type"),
         "the shipped framing must recover `Vec` / `String` as real types: {groups:?}"
     );
     assert!(
-        !groups.iter().any(|g| g == "constructor"),
+        !groups.iter().any(|g| g == "@constructor"),
         "and never resurrect the whole-file path's invented construct: {groups:?}"
     );
 }
@@ -1649,7 +1652,7 @@ btv.complete.setup { sources = { { 'hover' } } }",
                 };
                 labelled = groups("(field) count");
                 item = groups("let x = 1;");
-                if labelled.iter().any(|g| g == "type") && item.iter().any(|g| g == "keyword") {
+                if labelled.iter().any(|g| g == "@type") && item.iter().any(|g| g == "@keyword") {
                     break;
                 }
             }
@@ -1658,19 +1661,19 @@ btv.complete.setup { sources = { { 'hover' } } }",
     }
 
     assert!(
-        labelled.iter().any(|g| g == "type"),
+        labelled.iter().any(|g| g == "@type"),
         "the peeled row is framed as a struct field, so `Vec` is a real type: {labelled:?}"
     );
     assert!(
-        labelled.iter().any(|g| g == "property"),
+        labelled.iter().any(|g| g == "@property"),
         "…and `count` the field it names: {labelled:?}"
     );
     assert!(
-        labelled.iter().any(|g| g == "comment"),
+        labelled.iter().any(|g| g == "@comment"),
         "the display label itself paints as the non-code text it is: {labelled:?}"
     );
     assert!(
-        item.iter().any(|g| g == "keyword"),
+        item.iter().any(|g| g == "@keyword"),
         "the second item takes a different rung and is framed as a statement: {item:?}"
     );
 }
@@ -2057,5 +2060,287 @@ async fn a_stateless_highlight_waits_for_its_grammar_instead_of_resolving_empty(
     assert!(
         groups.iter().any(|g| g == "keyword"),
         "the promise resolved before the grammar was there: {groups:?}"
+    );
+}
+
+/// A window map's per-row highlight spans as `[(group, style_id)]` — the same rows
+/// [`win_hl`] reads, but keeping the **resolved style** the server interned for each
+/// span (`Nil` when the group resolved to nothing).
+fn win_hl_styled(win: &[(Value, Value)]) -> Vec<Vec<(String, Option<u64>)>> {
+    win.iter()
+        .find(|(k, _)| k.as_str() == Some("highlights"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|s| {
+                                    let a = s.as_array()?;
+                                    Some((a[2].as_str()?.to_string(), a[3].as_u64()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Drive the docs float for a completion row whose `doc` is `doc_md`, and return the
+/// `(group, style_id)` spans painted on the row containing `want`. Shared by the two
+/// doc-float-styling tests below.
+async fn docs_float_row_styles(
+    tag: &str,
+    doc_md: &str,
+    want: &str,
+    colorscheme: bool,
+) -> Vec<(String, Option<u64>)> {
+    let config_dir = temp_dir(tag);
+    std::fs::write(
+        config_dir.join("init.lua"),
+        format!(
+            "\
+btv.complete.source {{\n\
+  name = 'hover', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('field'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push {{ text = 'field', doc = '{doc_md}' }}\n\
+    end\n\
+  end,\n\
+}}\n\
+btv.complete.setup {{ sources = {{ {{ 'hover' }} }} }}"
+        ),
+    )
+    .expect("write init.lua");
+    let file = write_temp(tag, "rs", "\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(config_dir)).await;
+    if colorscheme {
+        exec_lua(&rpc, "vim.cmd('colorscheme bemtvi')").await;
+    }
+
+    feed(&rpc, "ifie");
+    feed(&rpc, "<C-n>");
+
+    let mut out: Vec<(String, Option<u64>)> = Vec::new();
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[CompletionDocs]") {
+                if let Some(row) = win_text(&win).iter().position(|l| l.contains(want)) {
+                    if let Some(spans) = win_hl_styled(&win).get(row) {
+                        if !spans.is_empty() {
+                            out = spans.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    out
+}
+
+/// A doc float's fenced code is painted from the **colorscheme**: the tree-sitter
+/// captures the block resolves to are real highlight-group names (`@keyword`, …), so
+/// the loaded scheme resolves them to a style the client can paint. Sending the bare
+/// capture name (`keyword`) instead leaves every span's `style_id` `Nil` — the block
+/// still *says* it is a keyword, and renders in the plain foreground.
+#[tokio::test]
+async fn a_doc_float_code_block_resolves_styles_from_the_colorscheme() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let spans =
+        docs_float_row_styles("docs-theme", "```rust\\nfn zzz() {}\\n```", "fn zzz", true).await;
+
+    let keyword = spans
+        .iter()
+        .find(|(g, _)| g.trim_start_matches('@').split('.').next() == Some("keyword"))
+        .unwrap_or_else(|| panic!("the block's `fn` is captured as a keyword: {spans:?}"));
+    assert!(
+        keyword.1.is_some(),
+        "the keyword capture must resolve to a colorscheme style: {spans:?}"
+    );
+}
+
+/// An **untagged** fence in a doc float is code in the language of the buffer the docs
+/// are about. Servers write their snippets that way — `pyright` sends an auto-import's
+/// statement as a bare ` ``` ` block — and painting it plain while the (synthesized)
+/// `detail` fence beside it is highlighted gets the two exactly backwards.
+#[tokio::test]
+async fn an_untagged_doc_float_fence_takes_the_buffer_language() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let spans =
+        docs_float_row_styles("docs-untagged", "```\\nfn zzz() {}\\n```", "fn zzz", true).await;
+
+    assert!(
+        spans
+            .iter()
+            .any(|(g, _)| g.trim_start_matches('@').split('.').next() == Some("keyword")),
+        "the untagged block is highlighted as rust (the buffer's language): {spans:?}"
+    );
+}
+
+/// A fence bemtvi **asserted** — the LSP item's `detail`, which core wraps in code
+/// markers the server never wrote — is painted only for what the parse confirms; a
+/// fence the *server* declared keeps the full fragment treatment, repaint included.
+///
+/// LSP calls `detail` "additional information about this item": `rust-analyzer` puts a
+/// signature there, `pyright` puts the label `Auto-import`. Fenced in the buffer's
+/// language and run through the whole ladder, a label ends at the repaint, which
+/// dutifully colours whatever its leaves lex as — so the docs float highlighted the
+/// label and (before the untagged-fence fix) left the server's own snippet plain,
+/// exactly backwards.
+#[tokio::test]
+async fn an_asserted_detail_fence_is_painted_only_where_the_parse_confirms_it() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let dir = temp_dir("lsp-detail-assert");
+    // SAFETY: serialized on `test_lock`, so no other test races this env mutation.
+    std::env::set_var(
+        "BEMTVI_LSP_CMD",
+        format!(
+            "{} --__lsp-mock {}/mock.json",
+            env!("CARGO_BIN_EXE_bemtvi"),
+            dir.display()
+        ),
+    );
+    // `detail` is a display label no framing takes; `documentation` is a code block the
+    // server itself fenced.
+    std::fs::write(
+        dir.join("mock.json"),
+        r#"{ "completion": [ { "label": "fnmatch", "insertText": "fnmatch",
+             "detail": "Auto-import from module",
+             "documentation": "```rust\nuse std::fs;\n```" } ] }"#,
+    )
+    .expect("write mock script");
+
+    let file = write_temp("lsp-detail-assert", "rs", "\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), None).await;
+    exec_lua(
+        &rpc,
+        "btv._lsp_start('mock', { 'placeholder' }, vim.fn.getcwd(), 'rust', \
+         vim.api.nvim_get_current_buf(), nil, nil, nil)",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "btv.complete.setup { sources = { { 'lsp' } }, min_chars = 1 }",
+    )
+    .await;
+    feed(&rpc, "ifn");
+
+    let mut label: Option<Vec<(u64, u64, String)>> = None;
+    let mut snippet: Option<Vec<(u64, u64, String)>> = None;
+    for _ in 0..200 {
+        exec_lua(&rpc, "btv.complete.trigger()").await;
+        barrier(&rpc).await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[CompletionDocs]") {
+                let lines = win_text(&win);
+                let spans = win_hl(&win);
+                let row = |needle: &str| {
+                    lines
+                        .iter()
+                        .position(|l| l.contains(needle))
+                        .and_then(|r| spans.get(r).cloned())
+                };
+                snippet = row("use std::fs;");
+                label = row("Auto-import from module");
+                // The server's own block is what tells us the grammar has landed and
+                // the float has been painted — poll until it has.
+                if snippet.as_ref().is_some_and(|s| !s.is_empty()) && label.is_some() {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    std::env::remove_var("BEMTVI_LSP_CMD");
+
+    let snippet = snippet.expect("the docs float renders the server's fenced snippet");
+    assert!(
+        snippet.iter().any(|(_, _, g)| g == "@keyword"),
+        "the fence the server declared is highlighted as rust: {snippet:?}"
+    );
+    let label = label.expect("the docs float renders the item's detail");
+    assert!(
+        label.is_empty(),
+        "a detail the parse cannot confirm stays plain — no colour borrowed from a \
+         repainted ERROR: {label:?}"
+    );
+}
+
+/// A hover's `MarkedString` **language tag** is the one place the protocol says
+/// outright "this is code, in *this* language" — and it must reach the float.
+///
+/// `MarkedString { language, value }` (deprecated in favour of `MarkupContent`, still
+/// widely sent) was distilled to its `value` alone, so the tag was dropped and the
+/// code arrived at the hover float as prose: no fence, nothing to highlight it by, on
+/// the one input where bemtvi was not guessing. Re-fenced in the declared language, it
+/// highlights like any other fenced block.
+#[tokio::test]
+async fn a_hovers_marked_string_language_tag_highlights_the_block() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let dir = temp_dir("lsp-marked-string");
+    // SAFETY: serialized on `test_lock`, so no other test races this env mutation.
+    std::env::set_var(
+        "BEMTVI_LSP_CMD",
+        format!(
+            "{} --__lsp-mock {}/mock.json",
+            env!("CARGO_BIN_EXE_bemtvi"),
+            dir.display()
+        ),
+    );
+    std::fs::write(
+        dir.join("mock.json"),
+        r#"{ "hover": { "contents": { "language": "rust", "value": "use std::fs;" } } }"#,
+    )
+    .expect("write mock script");
+
+    let file = write_temp("lsp-marked-string", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), None).await;
+    exec_lua(
+        &rpc,
+        "btv._lsp_start('mock', { 'placeholder' }, vim.fn.getcwd(), 'rust', \
+         vim.api.nvim_get_current_buf(), nil, nil, nil)",
+    )
+    .await;
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut spans: Option<Vec<(u64, u64, String)>> = None;
+    for _ in 0..200 {
+        exec_lua(&rpc, "btv.lsp.hover()").await;
+        barrier(&rpc).await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = named_win(&params, "[Hover]") {
+                lines = win_text(&win);
+                if let Some(row) = lines.iter().position(|l| l.contains("use std::fs;")) {
+                    spans = win_hl(&win).get(row).cloned();
+                    if spans.as_ref().is_some_and(|s| !s.is_empty()) {
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    std::env::remove_var("BEMTVI_LSP_CMD");
+
+    assert!(
+        lines.iter().all(|l| !l.contains("```")),
+        "the fence is markup, stripped from the rendered float: {lines:?}"
+    );
+    let spans = spans.expect("the hover float shows the language-tagged block");
+    assert!(
+        spans.iter().any(|(_, _, g)| g == "@keyword"),
+        "the block is highlighted in the language the server declared: {spans:?}"
     );
 }

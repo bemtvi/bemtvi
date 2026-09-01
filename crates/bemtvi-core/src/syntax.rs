@@ -221,6 +221,27 @@ pub trait SyntaxEngine {
         self.highlight_text(language, text, first, last)
     }
 
+    /// [`highlight_fragment`](Self::highlight_fragment) restricted to what the parse
+    /// **confirms**: a snippet the engine resolved whole is painted whole, but one it
+    /// could only recover keeps just the captures before its first `ERROR` — nothing
+    /// repainted from a guess, and nothing lexed out of the failed region either.
+    ///
+    /// For text bemtvi *asserted* was code rather than text a document *declared* as
+    /// code — an LSP item's `detail`, which the protocol defines as "additional
+    /// information about this item", not a signature — this is the difference between
+    /// a signature that highlights and a label with one word coloured as a keyword.
+    /// The default is the ordinary fragment path: an engine with no notion of a failed
+    /// parse (the wasm JS-side highlighter) has nothing to withhold.
+    fn highlight_fragment_confirmed(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        self.highlight_fragment(language, text, first, last)
+    }
+
     /// Install the **fragment contexts** for `language` — the framings
     /// [`highlight_fragment`](Self::highlight_fragment) tries, in order, when a
     /// snippet doesn't parse on its own (`"struct __btv {\n%s\n}"`, the `%s` marking

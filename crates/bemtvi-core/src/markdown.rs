@@ -107,6 +107,16 @@ pub struct MdCode {
     pub first_line: usize,
     pub len: usize,
     pub lang: Option<String>,
+    /// `true` when bemtvi **asserted** this fence rather than the document declaring
+    /// it — [`DocSection::detail`], an LSP item's `detail` fenced in the buffer's
+    /// language. The protocol calls that field "additional information about this
+    /// item"; servers put a type signature there, but `pyright` puts the label
+    /// `Auto-import`. So the claim is bemtvi's, not the author's, and the caller
+    /// paints it only for what the parse confirms
+    /// ([`Editor::preview_highlights_fragment_confirmed`](crate::Editor::preview_highlights_fragment_confirmed))
+    /// instead of letting the fragment repaint colour `import` out of a label.
+    /// `false` for every fence a document wrote itself.
+    pub asserted: bool,
 }
 
 /// The rendered markdown: stripped display lines plus the styling to paint over
@@ -143,10 +153,71 @@ pub fn render(src: &str) -> Rendered {
 /// heading's markup competing with headings inside a server's own markdown. A section
 /// with an **empty** label takes no rule at all — the lone contributor renders bare.
 pub fn render_sections<'a>(sections: impl IntoIterator<Item = (&'a str, &'a str)>) -> Rendered {
+    render_doc_sections(sections.into_iter().map(|(label, body)| DocSection {
+        label,
+        detail: None,
+        body,
+        format: DocFormat::Markdown,
+    }))
+}
+
+/// The format a server declared for a block of documentation — the whole of LSP's
+/// `MarkupKind`, which is a **closed two-value set**: `plaintext` or `markdown`.
+/// There is no rst / asciidoc / html kind in the protocol, so a server whose native
+/// docs are reStructuredText either converts them itself or sends them as plaintext.
+///
+/// The distinction is not cosmetic: markdown reflows soft line breaks into
+/// paragraphs, reads `*`/`_`/`#`/`>` as markup, and turns a four-space indent into a
+/// code block. Text a server declared `plaintext` — a docstring laid out in columns,
+/// a signature list, a table of options — loses its shape under all three, so it is
+/// rendered [verbatim](Renderer::feed_plain) instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DocFormat {
+    /// The default, and what every un-declared block is treated as: a `MarkupContent`
+    /// with `kind: "markdown"`, a hover `MarkedString` (markdown by the protocol's own
+    /// words), and a bare `documentation` string, which declares no kind at all.
+    #[default]
+    Markdown,
+    /// `MarkupContent { kind: "plaintext" }` — the server said, explicitly, that this
+    /// is not markup.
+    PlainText,
+}
+
+/// One section of a rendered doc float: a contributor's `label`, an optional
+/// `detail` line, and its `body` in the format the contributor declared.
+pub struct DocSection<'a> {
+    /// The contributor's name, headed by a labelled rule; empty renders bare (see
+    /// [`render_sections`]).
+    pub label: &'a str,
+    /// `(language, text)` for a code line bemtvi fences above the body — an LSP
+    /// completion item's `detail`, the one-line signature a server offers for the
+    /// symbol. Fencing it is what gives a signature syntax highlighting for free;
+    /// because the fence is bemtvi's own claim and not the server's, the block is
+    /// marked [`asserted`](MdCode::asserted).
+    pub detail: Option<(&'a str, &'a str)>,
+    /// The contributor's own documentation.
+    pub body: &'a str,
+    /// The format the server declared for `body`. `detail` is never covered by it:
+    /// `detail` is a bare string with no declared format at all.
+    pub format: DocFormat,
+}
+
+/// [`render_sections`] for sections that may carry a [`detail`](DocSection::detail)
+/// line — the completion-docs float, whose document is the item's signature over the
+/// server's documentation. The detail renders as a fenced block directly above the
+/// body, exactly as the equivalent markdown would, but flagged
+/// [`asserted`](MdCode::asserted) so the caller knows bemtvi wrote that fence.
+pub fn render_doc_sections<'a>(sections: impl IntoIterator<Item = DocSection<'a>>) -> Rendered {
     let mut r = Renderer::new();
-    for (label, src) in sections {
-        r.section_header(label);
-        r.feed(src);
+    for section in sections {
+        r.section_header(section.label);
+        if let Some((lang, text)) = section.detail {
+            r.asserted_code_block(lang, text);
+        }
+        match section.format {
+            DocFormat::Markdown => r.feed(section.body),
+            DocFormat::PlainText => r.feed_plain(section.body),
+        }
     }
     r.finish()
 }
@@ -668,7 +739,49 @@ impl Renderer {
             first_line,
             len,
             lang: self.code_lang.take(),
+            asserted: false,
         });
+    }
+
+    /// Emit `text` **verbatim** — one display line per source line, no markup read
+    /// and none stripped. The whole of rendering a [`DocFormat::PlainText`] body:
+    /// the server said this is not markup, so nothing here may reflow its line
+    /// breaks, eat its `*`s, or read an indented block as code. Spaced from its
+    /// surroundings like any other top-level block so a section rule still parts it
+    /// from the one above.
+    fn feed_plain(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.block_gap();
+        for line in text.lines() {
+            self.lines.push(line.to_string());
+        }
+        self.want_gap = true;
+    }
+
+    /// Emit a code block bemtvi itself wrote around `text` (an LSP item's `detail`),
+    /// spaced from its surroundings like any other top-level block. Identical to a
+    /// fenced block the source declared, except that it is marked
+    /// [`asserted`](MdCode::asserted): nothing in the document said this was code.
+    fn asserted_code_block(&mut self, lang: &str, text: &str) {
+        self.block_gap();
+        let first_line = self.lines.len();
+        let mut len = 0;
+        for line in text.lines() {
+            self.lines.push(line.to_string());
+            len += 1;
+        }
+        if len == 0 {
+            return;
+        }
+        self.code.push(MdCode {
+            first_line,
+            len,
+            lang: (!lang.is_empty()).then(|| lang.to_string()),
+            asserted: true,
+        });
+        self.want_gap = true;
     }
 
     /// A thematic break (`---`) — a full-width `─` rule on its own row, **tight**: no

@@ -4399,7 +4399,13 @@ pub fn apply_search_fg(
 /// resolved colorscheme style and this fallback as the same thing — and what lets
 /// an arm carry an attribute (`SpecialKey`'s bold) the way `group_style` does.
 pub fn group_fallback(group: &str) -> Style {
-    let major = group.split('.').next().unwrap_or(group);
+    // A leading `@` comes off first: a span carries the highlight *group* a capture
+    // is painted through (`@keyword.import`), and the families below are the captures.
+    let major = group
+        .trim_start_matches('@')
+        .split('.')
+        .next()
+        .unwrap_or(group);
     let fg = match major {
         "keyword" | "conditional" | "repeat" | "include" | "exception" | "keyword_operator" => {
             0xc6_78_dd

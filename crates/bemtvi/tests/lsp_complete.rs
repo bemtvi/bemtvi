@@ -936,3 +936,39 @@ async fn accepting_after_an_undispatched_edit_does_not_splice_into_the_word() {
 
     std::env::remove_var("BEMTVI_LSP_CMD");
 }
+
+/// A completion item's `documentation` is honored at the `MarkupKind` the server
+/// declared for it, exactly as a hover's contents is: `plaintext` renders verbatim in
+/// the docs float instead of being reflowed into one paragraph with its `*`/`_` eaten.
+/// The `detail` above it carries no kind — LSP declares one for `documentation` and
+/// hover contents, and nothing at all for `detail` — so it is unaffected.
+#[tokio::test]
+async fn plaintext_completion_docs_render_verbatim() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_docs_plaintext");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "BEMTVI_LSP_CMD",
+        format!("{BEMTVI_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    let completion = r#"[ { "label": "println", "insertText": "println",
+                          "documentation": { "kind": "plaintext",
+                            "value": "Options:\n  *args* is positional\n  _kw_ is keyword" } } ]"#;
+    let (rpc, mut incoming) = start_typed(&dir, completion, "pr").await;
+
+    await_items(&rpc, &mut incoming, "println").await;
+    let docs = await_docs(&rpc, &mut incoming, "Options:").await;
+    let body: Vec<&str> = docs
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        body,
+        vec!["Options:", "  *args* is positional", "  _kw_ is keyword"],
+        "plaintext docs keep their line breaks, indentation and literal markers: {docs:?}"
+    );
+
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}

@@ -11,12 +11,13 @@
 //! `pmenu_value` projected is back as a **doc-float window** (Phase 4-D): the selected
 //! `lsp` row's `detail` + `documentation`, lazily fetched via `completionItem/resolve`
 //! (`complete_lsp_maybe_resolve` / `on_completion_resolve_reply`), built into markdown by
-//! `EditHost::lsp_complete_docs_md` and rendered by `Editor::open_completion_docs_float`.
+//! `EditHost::lsp_complete_docs_parts` and rendered by `Editor::open_completion_docs_float`.
 //! A candidate several servers all offer is **one** row carrying an [`Offer`] each, so
 //! the float can show every server's docs under its own labelled rule
 //! (`EditHost::lsp_complete_docs_sections`) instead of the first-to-answer's alone.
 
-use bemtvi_core::{BufferId, Mode};
+use bemtvi_core::markdown::DocFormat;
+use bemtvi_core::{BufferId, DocsSection, Mode};
 use bemtvi_lsp::CompletionItemData;
 
 use super::*;
@@ -702,6 +703,7 @@ impl EditHost {
     pub(crate) fn on_completion_resolve_reply(
         &mut self,
         documentation: Option<String>,
+        documentation_format: DocFormat,
         detail: Option<String>,
     ) {
         let Some((key, idx)) = self.lsp_complete_resolve_key.take() else {
@@ -714,6 +716,7 @@ impl EditHost {
             .and_then(|r| r.offers.get_mut(idx))
         {
             offer.item.documentation = Some(documentation.unwrap_or_default());
+            offer.item.documentation_format = documentation_format;
             if detail.is_some() {
                 offer.item.detail = detail;
             }
@@ -726,7 +729,7 @@ impl EditHost {
     /// The **labelled sections** the completion docs float renders for the `lsp` row
     /// `key`: one per server that offered it, in routing order, each holding that
     /// server's own `detail` + `documentation`
-    /// ([`lsp_complete_docs_md`](Self::lsp_complete_docs_md)).
+    /// ([`lsp_complete_docs_parts`](Self::lsp_complete_docs_parts)).
     ///
     /// This is the completion twin of the merged hover: with two servers on a buffer,
     /// the same symbol is routinely offered by both, and what they say about it differs
@@ -739,57 +742,55 @@ impl EditHost {
     ///
     /// Empty when no contributor has docs yet, which closes the float rather than
     /// showing an empty box.
-    pub(crate) fn lsp_complete_docs_sections(&self, key: usize) -> Vec<(String, String)> {
+    pub(crate) fn lsp_complete_docs_sections(&self, key: usize) -> Vec<DocsSection> {
         let Some(row) = self.lsp_complete.as_ref().and_then(|c| c.rows.get(key)) else {
             return Vec::new();
         };
-        let mut sections: Vec<(String, String)> = row
+        let mut sections: Vec<DocsSection> = row
             .offers
             .iter()
             .filter_map(|o| {
-                self.lsp_complete_docs_md(&o.item)
-                    .map(|md| (o.server.name.clone(), md))
+                let (detail, body) = self.lsp_complete_docs_parts(&o.item)?;
+                Some(DocsSection {
+                    label: o.server.name.clone(),
+                    detail,
+                    body,
+                    format: o.item.documentation_format,
+                })
             })
             .collect();
         if sections.len() < 2 {
             for s in &mut sections {
-                s.0 = String::new();
+                s.label = String::new();
             }
         }
         sections
     }
 
-    /// Build the **markdown** the completion docs float renders for an `lsp` row
-    /// (Phase 4-D, now the doc-float-window model): the item's `detail` — a one-line
-    /// code signature — as a fenced code block in the *current buffer's* language, then
-    /// a blank line and the `documentation` body (already markdown). Fencing the
-    /// signature is what buys it syntax highlighting in the float for free (the win over
-    /// the old text-only sidebar); the float's markdown renderer highlights each fenced
-    /// block in its own language (fail-soft when the grammar is absent). `None` when the
+    /// The two parts the completion docs float renders for an `lsp` row (Phase 4-D,
+    /// now the doc-float-window model): the item's `detail` — a one-line code
+    /// signature — and its `documentation` body (already markdown). `None` when the
     /// item carries neither, which closes the float rather than showing an empty box.
-    pub(crate) fn lsp_complete_docs_md(&self, item: &CompletionItemData) -> Option<String> {
-        let mut md = String::new();
-        if let Some(detail) = item
-            .detail
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let ft = self
-                .editor
-                .buffer_filetype(self.editor.current_buffer_id())
-                .unwrap_or_default();
-            md.push_str(&format!("```{ft}\n{detail}\n```\n\n"));
-        }
-        if let Some(doc) = item
-            .documentation
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            md.push_str(doc);
-        }
-        let md = md.trim_end();
-        (!md.is_empty()).then(|| md.to_string())
+    ///
+    /// The detail rides *beside* the body rather than pre-fenced into it. Core fences
+    /// it in the buffer's language, which is what buys a signature syntax highlighting
+    /// in the float for free (the win over the old text-only sidebar) — but as an
+    /// [asserted](bemtvi_core::markdown::MdCode::asserted) block, because the fence is
+    /// bemtvi's claim and not the server's: LSP defines `detail` as "additional
+    /// information about this item", so `rust-analyzer` puts a signature there and
+    /// `pyright` puts the label `Auto-import`.
+    pub(crate) fn lsp_complete_docs_parts(
+        &self,
+        item: &CompletionItemData,
+    ) -> Option<(Option<String>, String)> {
+        let text = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let detail = text(&item.detail);
+        let body = text(&item.documentation).unwrap_or_default();
+        (detail.is_some() || !body.is_empty()).then_some((detail, body))
     }
 }

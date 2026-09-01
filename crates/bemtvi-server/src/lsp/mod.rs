@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use bemtvi_core::markdown::DocFormat;
 use bemtvi_core::unicode;
 use bemtvi_core::{Buffer, BufferEdit, BufferId};
 use std::collections::{BTreeMap, HashMap};
@@ -745,11 +746,12 @@ pub(crate) struct LspFanout {
     /// producing server's encoding for the same reason as
     /// [`locations`](Self::locations).
     pub(crate) symbols: Vec<(SymbolData, PositionEncoding)>,
-    /// Accumulated hover documents, each tagged with the server that produced it so
-    /// the merged float can head its section with the client's name. Unlike the
-    /// location/symbol accumulators these need no encoding: a hover's payload is
-    /// markdown, not positions.
-    pub(crate) hovers: Vec<(ServerKey, Vec<String>)>,
+    /// Accumulated hover documents, each tagged with the server that produced it (so
+    /// the merged float can head its section with the client's name) and with the
+    /// `MarkupKind` that server declared for it (so a `plaintext` contributor renders
+    /// verbatim beside a markdown one). Unlike the location/symbol accumulators these
+    /// need no encoding: a hover's payload is markup, not positions.
+    pub(crate) hovers: Vec<(ServerKey, Vec<String>, DocFormat)>,
     /// Accumulated signature help — `(server, active signature)`, tagged for the
     /// same reason as [`hovers`](Self::hovers): with two servers answering, an
     /// unlabelled list of signatures says nothing about which language tool is

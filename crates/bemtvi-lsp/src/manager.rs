@@ -640,7 +640,10 @@ fn degrade_request(req: &LspRequest, reason: &str) -> LspReply {
         LspRequest::DocumentSymbol { .. } | LspRequest::WorkspaceSymbol { .. } => {
             LspReply::Symbols(Vec::new())
         }
-        LspRequest::Hover { .. } => LspReply::Hover(Vec::new()),
+        LspRequest::Hover { .. } => LspReply::Hover {
+            lines: Vec::new(),
+            format: bemtvi_core::markdown::DocFormat::Markdown,
+        },
         LspRequest::SignatureHelp { .. } => LspReply::SignatureHelp(None),
         LspRequest::Completion { .. } => LspReply::Completion {
             is_incomplete: false,
@@ -652,6 +655,7 @@ fn degrade_request(req: &LspRequest, reason: &str) -> LspReply {
         LspRequest::ResolveCodeAction { .. } => LspReply::ResolvedCodeAction(None),
         LspRequest::ResolveCompletion { .. } => LspReply::ResolvedCompletion {
             documentation: None,
+            documentation_format: bemtvi_core::markdown::DocFormat::Markdown,
             detail: None,
         },
         LspRequest::SemanticTokensFull { .. } | LspRequest::SemanticTokensDelta { .. } => {

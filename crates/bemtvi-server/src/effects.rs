@@ -4163,8 +4163,18 @@ impl EditHost {
     /// Only the `lsp` source has more than one thing to say about a row (a symbol two
     /// servers both offer); the plugin sources produce a single, unlabelled section,
     /// which renders exactly as it did before sections existed.
-    fn selected_complete_docs_sections(&self) -> Vec<(String, String)> {
-        let bare = |doc: String| vec![(String::new(), doc)];
+    fn selected_complete_docs_sections(&self) -> Vec<bemtvi_core::DocsSection> {
+        // A plugin source hands over one finished markdown document — it has no
+        // separate `detail` field to fence, and no protocol kind to declare, so the
+        // body is the whole of it and it renders as markdown.
+        let bare = |doc: String| {
+            vec![bemtvi_core::DocsSection {
+                label: String::new(),
+                detail: None,
+                body: doc,
+                format: bemtvi_core::markdown::DocFormat::Markdown,
+            }]
+        };
         // Inline docs (a plugin source's `push { doc = … }`).
         if let Some(doc) = self.editor.complete_selected_doc() {
             return bare(doc);

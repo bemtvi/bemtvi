@@ -12,10 +12,12 @@ use lsp_types::{
     CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionResponse,
     CompletionTextEdit, DocumentSymbol, DocumentSymbolResponse, Documentation, FoldingRange,
     GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel,
-    Location, MarkedString, OneOf, ParameterInformation, ParameterLabel, ResourceOp,
+    Location, MarkedString, MarkupKind, OneOf, ParameterInformation, ParameterLabel, ResourceOp,
     SemanticTokensFullDeltaResult, SemanticTokensResult, SignatureHelp, SymbolInformation,
     SymbolKind, TextEdit, Url, WorkspaceSymbolResponse,
 };
+
+use bemtvi_core::markdown::DocFormat;
 
 use crate::protocol::{
     ChangeAnnotationData, CodeActionData, CompletionItemData, FoldRangeData, InlayHintData,
@@ -378,7 +380,11 @@ fn completion_item(item: CompletionItem) -> CompletionItemData {
     // issued, so the original is preserved verbatim, not rebuilt from our distill.
     let resolve_data = serde_json::to_value(&item).ok();
     let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
-    let documentation = item.documentation.and_then(documentation_lines);
+    let (documentation, documentation_format) =
+        match item.documentation.and_then(documentation_lines) {
+            Some((text, format)) => (Some(text), format),
+            None => (None, DocFormat::default()),
+        };
     let text_edit = item.text_edit.map(|edit| match edit {
         CompletionTextEdit::Edit(e) => e,
         CompletionTextEdit::InsertAndReplace(ir) => TextEdit {
@@ -397,22 +403,36 @@ fn completion_item(item: CompletionItem) -> CompletionItemData {
         text_edit,
         additional_text_edits: item.additional_text_edits.unwrap_or_default(),
         documentation,
+        documentation_format,
         resolve_data,
     }
 }
 
-/// Reduce a completion item's `documentation` (a plain string, or a
-/// `MarkupContent` whose markdown is rendered as plain lines — same as hover) to
-/// its display text, trailing blank lines trimmed. `None` when the result is
-/// empty, so a blank documentation block reads as "no docs" rather than an empty
+/// Reduce a completion item's `documentation` to its display text **and the format
+/// the server declared for it**, trailing blank lines trimmed. `None` when the result
+/// is empty, so a blank documentation block reads as "no docs" rather than an empty
 /// preview (it is never *faked* into one — an absent field is simply `None`).
-pub(crate) fn documentation_lines(doc: Documentation) -> Option<String> {
-    let text = match doc {
-        Documentation::String(s) => s,
-        Documentation::MarkupContent(mc) => mc.value,
+///
+/// A `MarkupContent` says which of LSP's two kinds it is and is taken at its word; the
+/// bare-string form declares nothing, so it keeps the markdown default rather than
+/// being demoted on a guess.
+pub(crate) fn documentation_lines(doc: Documentation) -> Option<(String, DocFormat)> {
+    let (text, format) = match doc {
+        Documentation::String(s) => (s, DocFormat::Markdown),
+        Documentation::MarkupContent(mc) => (mc.value, markup_format(mc.kind)),
     };
     let lines = markup_lines(text);
-    (!lines.is_empty()).then(|| lines.join("\n"))
+    (!lines.is_empty()).then(|| (lines.join("\n"), format))
+}
+
+/// LSP's `MarkupKind` — a closed two-value set, `plaintext` or `markdown` — as the
+/// core renderer's [`DocFormat`]. There is no third kind in the protocol (no rst, no
+/// asciidoc), so this is total, not a best-effort mapping.
+fn markup_format(kind: MarkupKind) -> DocFormat {
+    match kind {
+        MarkupKind::PlainText => DocFormat::PlainText,
+        MarkupKind::Markdown => DocFormat::Markdown,
+    }
 }
 
 /// The numeric `CompletionItemKind` (`1`=Text … `25`=TypeParameter), via serde so
@@ -433,18 +453,33 @@ fn kind_code(kind: Option<CompletionItemKind>) -> u8 {
 pub(crate) fn hover_reply(hover: Option<Hover>) -> LspReply {
     let hover = match hover {
         Some(hover) => hover,
-        None => return LspReply::Hover(Vec::new()),
+        None => {
+            return LspReply::Hover {
+                lines: Vec::new(),
+                format: DocFormat::Markdown,
+            }
+        }
     };
-    let text = match hover.contents {
-        HoverContents::Scalar(ms) => marked_string_text(ms),
-        HoverContents::Array(parts) => parts
-            .into_iter()
-            .map(marked_string_text)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        HoverContents::Markup(markup) => markup.value,
+    // Only `MarkupContent` declares a kind. A `MarkedString` — either form — is
+    // markdown by the protocol's own words ("the pair of a language and a value is an
+    // equivalent to markdown: ```${language}\n${value}\n```"), which is exactly what
+    // `marked_string_text` produces.
+    let (text, format) = match hover.contents {
+        HoverContents::Scalar(ms) => (marked_string_text(ms), DocFormat::Markdown),
+        HoverContents::Array(parts) => (
+            parts
+                .into_iter()
+                .map(marked_string_text)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            DocFormat::Markdown,
+        ),
+        HoverContents::Markup(markup) => (markup.value, markup_format(markup.kind)),
     };
-    LspReply::Hover(markup_lines(text))
+    LspReply::Hover {
+        lines: markup_lines(text),
+        format,
+    }
 }
 
 /// Split a markup/prose block (hover contents, completion `documentation`) into
@@ -465,13 +500,33 @@ fn markup_lines(text: String) -> Vec<String> {
     lines
 }
 
-/// The text of a `MarkedString` (a plain markdown string, or the code of a
-/// language-tagged block — the language fence is dropped since hover is rendered
-/// as plain lines).
+/// The markdown of a `MarkedString`: a plain markdown string as-is, or a
+/// **language-tagged** block re-fenced in the language it declares.
+///
+/// `MarkedString { language, value }` is the one place in the protocol where a
+/// server says outright "this is code, in *this* language" (deprecated in favour of
+/// `MarkupContent`, but still what several servers send). Dropping the tag threw that
+/// away and handed the code to the hover float as prose — the float then had nothing
+/// to highlight it by, on the one input that was not a guess. Re-fencing hands the
+/// declaration straight to `bemtvi_core::markdown`, which highlights a fenced block
+/// in its own language.
+///
+/// The fence is as long as it needs to be: a body containing a ` ``` ` run of its own
+/// would otherwise close the block early (CommonMark closes on a fence at least as
+/// long as the opener, so the opener is made longer than any run inside).
 fn marked_string_text(ms: MarkedString) -> String {
     match ms {
         MarkedString::String(s) => s,
-        MarkedString::LanguageString(ls) => ls.value,
+        MarkedString::LanguageString(ls) => {
+            let longest = ls
+                .value
+                .split(|c| c != '`')
+                .map(str::len)
+                .max()
+                .unwrap_or(0);
+            let fence = "`".repeat(longest.max(2) + 1);
+            format!("{fence}{}\n{}\n{fence}", ls.language, ls.value)
+        }
     }
 }
 
@@ -808,15 +863,14 @@ pub(crate) fn resolved_inlay_hint(hint: Option<&InlayHint>) -> LspReply {
 /// the editor leaves a docless item docless rather than fake a doc. Shared by the
 /// async (native) and sync (wasm) dispatch paths.
 pub(crate) fn resolved_completion(item: Option<CompletionItem>) -> LspReply {
-    match item {
-        Some(item) => LspReply::ResolvedCompletion {
-            documentation: item.documentation.and_then(documentation_lines),
-            detail: item.detail,
-        },
-        None => LspReply::ResolvedCompletion {
-            documentation: None,
-            detail: None,
-        },
+    let doc = item
+        .as_ref()
+        .and_then(|i| i.documentation.clone())
+        .and_then(documentation_lines);
+    LspReply::ResolvedCompletion {
+        documentation: doc.as_ref().map(|(text, _)| text.clone()),
+        documentation_format: doc.map(|(_, f)| f).unwrap_or_default(),
+        detail: item.and_then(|i| i.detail),
     }
 }
 

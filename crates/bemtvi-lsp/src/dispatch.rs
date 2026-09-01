@@ -417,6 +417,7 @@ async fn resolve_completion_reply(
 ) -> LspReply {
     let none = LspReply::ResolvedCompletion {
         documentation: None,
+        documentation_format: bemtvi_core::markdown::DocFormat::Markdown,
         detail: None,
     };
     let item: CompletionItem = match serde_json::from_value(item) {

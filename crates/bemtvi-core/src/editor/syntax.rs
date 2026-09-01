@@ -391,6 +391,27 @@ impl Editor {
         }
     }
 
+    /// [`preview_highlights_fragment`](Self::preview_highlights_fragment) restricted
+    /// to what the parse **confirms**: the spans before the first `ERROR`, with
+    /// nothing recovered from inside one. The doc float paints an
+    /// [asserted](crate::markdown::MdCode::asserted) fence through this — a fence
+    /// bemtvi wrapped around an LSP `detail` is bemtvi's own claim that the text is
+    /// code, so a signature the parse can place is highlighted while a label it
+    /// rejects stays plain instead of borrowing a keyword colour. Empty with no
+    /// engine / grammar.
+    pub fn preview_highlights_fragment_confirmed(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        match self.syntax.as_mut() {
+            Some(engine) => engine.highlight_fragment_confirmed(language, text, first, last),
+            None => Vec::new(),
+        }
+    }
+
     /// Install the **fragment contexts** for `language` — the framings the fragment
     /// highlighter tries, in order, when an LSP doc block doesn't parse on its own
     /// (`"struct __btv {\n%s\n}"`). Behind `btv.treesitter.fragment_context`, which

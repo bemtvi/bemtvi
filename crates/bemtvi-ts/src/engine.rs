@@ -1626,7 +1626,7 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> (Vec<Span>, Vec<usize>) {
-        self.highlight_snippet(lang, text, first_line, last_line, false)
+        self.highlight_snippet(lang, text, first_line, last_line, SnippetMode::Whole)
     }
 
     /// [`highlight_text`](Self::highlight_text) for a snippet that is **not a whole
@@ -1691,14 +1691,57 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> Vec<Span> {
-        if let Some(spans) = self.resolve_fragment(lang, text, first_line, last_line) {
-            return spans;
-        }
-        if let Some(spans) = self.split_fragment(lang, text, first_line, last_line) {
-            return spans;
-        }
-        self.highlight_snippet(lang, text, first_line, last_line, true)
-            .0
+        self.resolve_fragment(lang, text, first_line, last_line)
+            .or_else(|| self.split_fragment(lang, text, first_line, last_line))
+            .unwrap_or_else(|| {
+                self.highlight_snippet(lang, text, first_line, last_line, SnippetMode::Fragment)
+                    .0
+            })
+    }
+
+    /// [`highlight_fragment`](Self::highlight_fragment) **without** the repaint: the
+    /// spans the parse can actually vouch for.
+    ///
+    /// The ladder runs exactly as it does for `highlight_fragment` — a snippet that
+    /// resolves whole (a clean parse, a framing, an annotation peel, an item split)
+    /// is painted whole. What changes is the last rung. `highlight_fragment` ends at
+    /// the repaint, which paints an `ERROR` region from its leaves' own token kinds;
+    /// that is right for text somebody *declared* to be code, since an annotation
+    /// dialect is still the server's own fence and its keywords really are keywords.
+    /// It is wrong for text bemtvi merely **asserted** was code: an LSP item's
+    /// `detail` is "additional information about this item" by the protocol's own
+    /// words, so `pyright`'s `Auto-import` gets fenced in the buffer's language and
+    /// the repaint dutifully paints `import` as a python keyword.
+    ///
+    /// So the last rung here is the **confirmed head**: the captures lying before the
+    /// first `ERROR`, and nothing at or after it — token-classifying captures
+    /// included. Fragment mode keeps those inside an `ERROR` (the lexer worked where
+    /// the parser didn't, so a keyword really is one), but that reasoning needs
+    /// something to have established the text *is* the language first; without it,
+    /// a keyword found inside an error is precisely the false colour to avoid — the
+    /// `use` in `Deprecated: use the fs module`.
+    ///
+    /// What survives, in practice: a `detail` that resolves whole is painted whole
+    /// (`fn map(self, f: F) -> Map<Self, F>` frames as a trait item and keeps every
+    /// span), and a multi-item one keeps the items that parsed before the one that
+    /// didn't. A **truncated** `detail` keeps nothing: truncation cuts a bracket, and
+    /// tree-sitter opens its `ERROR` at the start of the construct that never closed,
+    /// so there is no confirmed head left to paint — only the repaint colours those,
+    /// and it is the same repaint that colours a label. Empty means a block painted as
+    /// code and coloured as nothing, which is the honest rendering of "no idea".
+    pub fn highlight_fragment_confirmed(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Vec<Span> {
+        self.resolve_fragment(lang, text, first_line, last_line)
+            .or_else(|| self.split_fragment(lang, text, first_line, last_line))
+            .unwrap_or_else(|| {
+                self.highlight_snippet(lang, text, first_line, last_line, SnippetMode::Confirmed)
+                    .0
+            })
     }
 
     /// The whole snippet resolved as **one** item — a clean parse, a framing, or a
@@ -1718,7 +1761,7 @@ impl Engine {
         // for a surface that just changed (a hover reply, a completion row).
         if self.parses_cleanly(lang, text) {
             return Some(
-                self.highlight_snippet(lang, text, first_line, last_line, false)
+                self.highlight_snippet(lang, text, first_line, last_line, SnippetMode::Whole)
                     .0,
             );
         }
@@ -1741,7 +1784,7 @@ impl Engine {
                     &wrapped,
                     first_line + context.line_offset,
                     last_line + context.line_offset,
-                    false,
+                    SnippetMode::Whole,
                 )
                 .0;
             return Some(unwrap_spans(spans, &context, &lines));
@@ -1865,15 +1908,14 @@ impl Engine {
 
     /// The shared body of [`highlight_text_bg`](Self::highlight_text_bg) and
     /// [`highlight_fragment`](Self::highlight_fragment): one stateless parse of
-    /// `text`, its injected child layers, and the span extraction. `fragment` turns
-    /// on the low-confidence repaint described on `highlight_fragment`.
+    /// `text`, its injected child layers, and the span extraction, under `mode`.
     fn highlight_snippet(
         &mut self,
         lang: &str,
         text: &str,
         first_line: usize,
         last_line: usize,
-        fragment: bool,
+        mode: SnippetMode,
     ) -> (Vec<Span>, Vec<usize>) {
         // The host language is an alias-resolvable name too: this is fed a fence's
         // info string (a markdown doc float's code block) as often as a filetype.
@@ -1902,7 +1944,25 @@ impl Engine {
         // Fragment mode: the byte ranges this parse could not make sense of, plus the
         // token-level paint to put there in place of the host layer's guessed
         // structure. Computed here, before the tree moves into the layer list.
-        let repaint = fragment.then(|| fragment_repaint(&tree, text));
+        let repaint = match mode {
+            SnippetMode::Whole => None,
+            SnippetMode::Fragment => Some(fragment_repaint(&tree, text)),
+            // Confirmed mode keeps the head the parse is sure of and nothing else:
+            // one "error" range running from the first real `ERROR` to the end of the
+            // snippet drops every capture from there on, and an empty token list means
+            // no recovered guess goes back in its place. A snippet whose very first
+            // byte is already inside an `ERROR` therefore paints nothing at all.
+            SnippetMode::Confirmed => {
+                let paint = fragment_repaint(&tree, text);
+                Some(FragmentPaint {
+                    errors: Vec::from_iter(
+                        paint.errors.first().map(|first| first.start..text.len()),
+                    ),
+                    tokens: Vec::new(),
+                    strict: true,
+                })
+            }
+        };
 
         // Build the layer trees, host first, then injected children — a **stateless**
         // mirror of the buffer path's `build_injection_layers` (no `BufferId`, no
@@ -2477,6 +2537,16 @@ impl SyntaxEngine for Engine {
         Engine::highlight_fragment(self, lang, text, first, last)
     }
 
+    fn highlight_fragment_confirmed(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> Vec<Span> {
+        Engine::highlight_fragment_confirmed(self, lang, text, first, last)
+    }
+
     fn set_fragment_context(&mut self, lang: &str, templates: Vec<String>) {
         Engine::set_fragment_context(self, lang, templates)
     }
@@ -2742,6 +2812,21 @@ fn unwrap_spans(spans: Vec<Span>, context: &FragmentContext, line_lens: &[usize]
 /// The regions of a fragment's parse the grammar could not make sense of, plus the
 /// token-level paint to put there — see
 /// [`Engine::highlight_fragment`](Engine::highlight_fragment).
+///
+/// How much a stateless snippet parse is allowed to claim.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetMode {
+    /// A whole program (a preview file, a fence that parses on its own): every
+    /// capture stands.
+    Whole,
+    /// Fragment mode: inside an `ERROR` the host layer's structural captures are
+    /// dropped and the region is repainted from its leaves' own token kinds.
+    Fragment,
+    /// Only what the parse is sure of: the captures **before the first `ERROR`**, and
+    /// nothing recovered. See [`Engine::highlight_fragment_confirmed`].
+    Confirmed,
+}
+
 struct FragmentPaint {
     /// Byte ranges covered by an `ERROR` node. The host layer's captures touching one
     /// are dropped: inside an `ERROR` the tree is a recovery guess, and a structural
@@ -2749,12 +2834,25 @@ struct FragmentPaint {
     errors: Vec<Range<usize>>,
     /// `(start, end, group)` recovered from the leaves inside those ranges.
     tokens: Vec<(usize, usize, &'static str)>,
+    /// Drop **every** capture touching an error range, token-classifying ones
+    /// included ([`SnippetMode::Confirmed`]). Fragment mode keeps the lexical ones —
+    /// the lexer worked where the parser didn't, so a keyword inside an `ERROR` still
+    /// really is that language's keyword. That reasoning holds only once something
+    /// has established the text *is* the language; for a fence bemtvi asserted, a
+    /// keyword found inside an error is exactly the false colour to avoid
+    /// (`pyright`'s `Auto-import`, `Deprecated: use the fs module`).
+    strict: bool,
 }
 
 impl FragmentPaint {
     /// Whether `[s, e)` touches a region the parse failed on.
     fn overlaps_error(&self, s: usize, e: usize) -> bool {
         self.errors.iter().any(|r| s < r.end && r.start < e)
+    }
+
+    /// Whether a capture named `group` over `[s, e)` must be dropped.
+    fn drops(&self, group: &str, s: usize, e: usize) -> bool {
+        (self.strict || !is_lexical_group(group)) && self.overlaps_error(s, e)
     }
 }
 
@@ -2838,6 +2936,7 @@ fn fragment_repaint(tree: &Tree, text: &str) -> FragmentPaint {
     let mut paint = FragmentPaint {
         errors: Vec::new(),
         tokens: Vec::new(),
+        strict: false,
     };
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -2959,10 +3058,7 @@ fn extract_spans(
             // it. Its *lexing* is still sound, so a capture that only classifies a
             // token (a keyword, a string, a number) is kept. Child layers keep
             // everything: an injected region is its own parse, with its own tree.
-            if rank == 0
-                && !is_lexical_group(name)
-                && repaint.is_some_and(|f| f.overlaps_error(s, e))
-            {
+            if rank == 0 && repaint.is_some_and(|f| f.drops(name, s, e)) {
                 continue;
             }
             if layer.ranges.is_empty() {

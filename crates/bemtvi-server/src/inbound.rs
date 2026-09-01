@@ -117,6 +117,14 @@ impl EditHost {
                 // above it is the editor's own timer, not a Lua callback — and like
                 // them, the repaint below is the point.
                 spin_due = true;
+            } else if crate::is_watch_retry_timer(&event) {
+                // A per-buffer file watch whose arm failed is due for another try.
+                // Handled here, like the editor's other own timers, rather than through
+                // `on_loop_event` — there is no Lua callback behind it.
+                if let LoopEvent::Timer { id, .. } = event {
+                    self.on_watch_retry(BufferId(id - crate::WATCH_RETRY_TIMER_BASE));
+                }
+                had_real = true;
             } else if crate::is_workspace_fs_timeout_timer(&event) {
                 // The workspace file-operation watchdog: a `rename`/`delete`/`mkdir`
                 // whose fs leg stopped answering. Handled here (not through

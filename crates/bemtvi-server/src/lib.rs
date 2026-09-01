@@ -1633,7 +1633,23 @@ pub struct EditHost {
     /// that buffer (the native file-watch machinery is the sole `FsEvent` producer —
     /// there is no Lua fs-event surface). Local sessions only — a daemon session uses
     /// [`EditHost::remote_watches`] instead.
+    ///
+    /// An entry records the key an arm was *attempted* with, not one known to have
+    /// succeeded: the arm is fire-and-forget, so the key goes in before the actor
+    /// reports back. A key whose arm failed therefore stays here deliberately — it is
+    /// what keeps `sync_buffer_watches` from re-arming the same doomed key on the very
+    /// next settle (see the `FsEvent` error branch in `effects.rs`); it clears itself
+    /// when the key changes or the buffer closes.
     buf_watches: HashMap<BufferId, (PathBuf, Option<FileStat>)>,
+    /// Buffers whose internal watch arm failed and is being retried with backoff, keyed
+    /// by buffer. An entry lives only between a failure and either a successful re-arm,
+    /// a key change (which hands the arm back to `sync_buffer_watches`), the buffer
+    /// closing, or the [`WATCH_RETRY_LIMIT`] budget running out. The corresponding
+    /// [`buf_watches`](Self::buf_watches) entry stays put throughout — the retries ride
+    /// the timer seam, and that entry is what keeps the *settle* path from arming in
+    /// parallel with them.
+    #[cfg(feature = "native")]
+    watch_retries: HashMap<BufferId, WatchRetry>,
     /// The paths watched on the **daemon** (`HostWatch` leg) in a daemon session — the
     /// remote analogue of [`EditHost::buf_watches`]. [`EditHost::sync_buffer_watches`] arms a
     /// watch (`HostFsAsync::watch`) for each file-backed buffer's path and disarms a
@@ -2074,6 +2090,8 @@ impl EditHost {
             saves_queued: HashMap::new(),
             quit_all_gate: None,
             buf_watches: HashMap::new(),
+            #[cfg(feature = "native")]
+            watch_retries: HashMap::new(),
             remote_watches: HashSet::new(),
             reload_posts: HashSet::new(),
             forced_fetch_enc: HashMap::new(),
@@ -3331,6 +3349,67 @@ impl EditHost {
 /// no side table. (Lua callback ids are monotonic from 1 and never approach `1 << 48`.)
 #[cfg(feature = "native")]
 pub(crate) const INTERNAL_WATCH_BASE: u64 = 1 << 48;
+
+/// Base for the loop ids of the **arm-retry** timers behind those same per-buffer
+/// watches: buffer `b`'s retry wake is `WATCH_RETRY_TIMER_BASE + b.0`, so it routes back
+/// to the buffer with no side table, exactly as [`INTERNAL_WATCH_BASE`] does for the
+/// watch itself. A range rather than one of the single-id timers below because the
+/// retries are per buffer and can overlap.
+///
+/// It must stay the **highest** base here: [`is_watch_retry_timer`] classifies by
+/// `id >= WATCH_RETRY_TIMER_BASE`, which is only unambiguous while nothing sits above it.
+#[cfg(feature = "native")]
+pub(crate) const WATCH_RETRY_TIMER_BASE: u64 = 1 << 56;
+
+/// How many times an internal per-buffer watch whose arm failed is retried before the
+/// editor gives up on it and says so. Bounded on purpose: the failure can be permanent
+/// (a file the kernel refuses to watch, an exhausted inotify budget), and an unbounded
+/// retry is how this path pegged a core in the first place.
+#[cfg(feature = "native")]
+pub(crate) const WATCH_RETRY_LIMIT: u32 = 5;
+
+/// The delay before the `failures`-th retry of a failed watch arm — exponential backoff
+/// (×3) off [`watch_retry_base_ms`], so the default schedule is 100ms, 300ms, 900ms,
+/// 2.7s, 8.1s: ~12s of patience in total, spent almost entirely in the last two waits.
+/// That covers the transient case this exists for (a writer that replaces the file, so
+/// the path is briefly absent between the key snapshot and the arm) without the editor
+/// doing measurable work while it waits.
+#[cfg(feature = "native")]
+pub(crate) fn watch_retry_delay(failures: u32) -> std::time::Duration {
+    let scale = 3u64.saturating_pow(failures.saturating_sub(1));
+    std::time::Duration::from_millis(watch_retry_base_ms().saturating_mul(scale))
+}
+
+/// The first retry's delay, in ms — overridable through `$BEMTVI_WATCH_RETRY_BASE_MS`,
+/// which is how a test exercises the whole schedule (including the give-up) without
+/// sitting through twelve real seconds. The `workspace_fs_timeout_ms` hook, same shape.
+#[cfg(feature = "native")]
+fn watch_retry_base_ms() -> u64 {
+    std::env::var("BEMTVI_WATCH_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+}
+
+/// Whether `event` is a per-buffer watch arm-retry wake (vs. the fixed-id editor timers
+/// or a real Lua timer). See [`WATCH_RETRY_TIMER_BASE`] for why `>=` classifies it.
+#[cfg(feature = "native")]
+pub(crate) fn is_watch_retry_timer(event: &LoopEvent) -> bool {
+    matches!(event, LoopEvent::Timer { id, .. } if *id >= WATCH_RETRY_TIMER_BASE)
+}
+
+/// One buffer's internal file watch whose arm failed and is being retried with backoff.
+/// Held in [`EditHost::watch_retries`] only while a retry is outstanding.
+#[cfg(feature = "native")]
+struct WatchRetry {
+    /// The key the failed arm went out with. A retry only makes sense for *this* key:
+    /// once the buffer's key changes (a reload / `:w` re-stamps its disk snapshot)
+    /// `sync_buffer_watches` arms afresh and this state is dropped.
+    key: (PathBuf, Option<FileStat>),
+    /// Arms that have failed for `key` so far — 1 after the first failure. The budget is
+    /// spent at [`WATCH_RETRY_LIMIT`].
+    failures: u32,
+}
 
 /// Base for the ids of the off-tick [`FsJob`](bemtvi_lua::FsJob)s the **editor itself**
 /// queues — a workspace edit's `rename` / `delete` resource operations

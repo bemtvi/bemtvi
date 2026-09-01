@@ -1341,6 +1341,11 @@ impl EditHost {
                     recursive: false,
                 });
                 self.buf_watches.insert(*id, key.clone());
+                // The file has a new identity, so any retry still counting down is about
+                // a watch we just replaced: cancel it and give the new key a full budget
+                // of its own. (A retry that fires anyway re-checks the key and bails, so
+                // this is tidiness rather than correctness.)
+                self.cancel_watch_retry(*id);
                 // Check the file once now that a watch is going up. A watch can never
                 // be armed atomically with respect to a file that is already being
                 // written: the actor drops the old watcher before creating the new one
@@ -1375,6 +1380,101 @@ impl EditHost {
                 id: INTERNAL_WATCH_BASE + id.0,
             });
             self.buf_watches.remove(&id);
+            self.cancel_watch_retry(id);
+        }
+    }
+
+    /// An internal per-buffer watch failed to arm: schedule a backed-off retry, or give
+    /// up loudly once [`WATCH_RETRY_LIMIT`](crate::WATCH_RETRY_LIMIT) arms have failed
+    /// for the same key.
+    ///
+    /// The retry rides the **timer** seam rather than the settle path, and that is the
+    /// whole point. `sync_buffer_watches` runs at the end of every `run_pending`, so a
+    /// re-arm driven from here — or from dropping the `buf_watches` entry and letting the
+    /// next settle notice — arms, fails, settles, and arms again as fast as the loop can
+    /// turn: an unbounded storm that pegs a core and pushes a frame every round. The
+    /// `buf_watches` entry therefore stays put (it is what holds that path off) and the
+    /// retries are paced by [`watch_retry_delay`](crate::watch_retry_delay) instead.
+    ///
+    /// Giving up leaves the buffer unwatched until its key next changes (a reload, a
+    /// `:w`). Say so on the message line rather than leaving it looking watched: with the
+    /// watch down nothing autoreloads that file, and nothing warns when it changes
+    /// underneath the buffer.
+    #[cfg(feature = "native")]
+    pub(crate) fn on_watch_arm_failed(&mut self, buf: BufferId, err: String) {
+        // The key the failed arm went out with. `sync_buffer_watches` recorded it before
+        // dispatching, so it is still here; gone means the buffer closed while the
+        // failure was in flight, and there is nothing left to retry.
+        let Some(key) = self.buf_watches.get(&buf).cloned() else {
+            self.cancel_watch_retry(buf);
+            return;
+        };
+        let retry = self
+            .watch_retries
+            .entry(buf)
+            .or_insert_with(|| crate::WatchRetry {
+                key: key.clone(),
+                failures: 0,
+            });
+        if retry.key != key {
+            // The key moved on: this failure is about a watch already replaced, and the
+            // new key deserves its own budget.
+            *retry = crate::WatchRetry {
+                key: key.clone(),
+                failures: 0,
+            };
+        }
+        retry.failures += 1;
+        let failures = retry.failures;
+        if failures > crate::WATCH_RETRY_LIMIT {
+            self.watch_retries.remove(&buf);
+            let name = self.editor.buffer_name(buf).unwrap_or_default();
+            self.editor.echo(format!(
+                "Warning: cannot watch \"{name}\" for changes ({err}) \
+                 — it will not autoreload"
+            ));
+            return;
+        }
+        self.fx.loop_command(LoopCommand::TimerStart {
+            id: crate::WATCH_RETRY_TIMER_BASE + buf.0,
+            delay: crate::watch_retry_delay(failures),
+            repeat: std::time::Duration::ZERO,
+        });
+    }
+
+    /// A watch arm-retry wake came due: arm the watch again, if the buffer still wants
+    /// exactly the key that failed. Anything else — the buffer closed, or its file
+    /// changed identity while we waited — means `sync_buffer_watches` owns the arm now,
+    /// so the retry retires instead. A failure comes straight back here through
+    /// [`on_watch_arm_failed`](Self::on_watch_arm_failed), one backoff step further along.
+    #[cfg(feature = "native")]
+    pub(crate) fn on_watch_retry(&mut self, buf: BufferId) {
+        let Some(retry) = self.watch_retries.get(&buf) else {
+            return;
+        };
+        if self.editor.buffer_watch_key(buf).as_ref() != Some(&retry.key) {
+            self.watch_retries.remove(&buf);
+            return;
+        }
+        self.fx.loop_command(LoopCommand::FsEventStart {
+            id: INTERNAL_WATCH_BASE + buf.0,
+            path: retry.key.0.to_string_lossy().into_owned(),
+            recursive: false,
+        });
+        // Same reason the first arm re-checks the file (see `sync_buffer_watches`): a
+        // watch is never armed atomically with respect to a file already being written,
+        // and everything that landed while this one was down fired no event at all.
+        self.editor.checktime_buffer(buf);
+    }
+
+    /// Retire any outstanding arm-retry for `buf` and disarm its pending wake — the
+    /// buffer closed, or its watch key changed and the normal arm path has taken over.
+    #[cfg(feature = "native")]
+    pub(crate) fn cancel_watch_retry(&mut self, buf: BufferId) {
+        if self.watch_retries.remove(&buf).is_some() {
+            self.fx.loop_command(LoopCommand::TimerStop {
+                id: crate::WATCH_RETRY_TIMER_BASE + buf.0,
+            });
         }
     }
 

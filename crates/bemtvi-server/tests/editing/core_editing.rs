@@ -515,6 +515,176 @@ async fn an_external_change_autoreloads_via_the_buffer_watch() {
     std::fs::remove_file(&path).ok();
 }
 
+// --- the internal file watch's arm-failure retry ------------------------------
+//
+// A watch can fail to *arm* (an absent path, a permission the kernel refuses, an
+// exhausted inotify budget). That must be retried — the common cause is transient, a
+// writer replacing the file so the path is briefly gone — but on a bounded, backed-off
+// schedule, never by re-arming from the settle path: `sync_buffer_watches` runs at the
+// end of every `run_pending`, so a settle-driven retry arms, fails, settles, and arms
+// again as fast as the loop turns, pegging a core and pushing a frame every round.
+//
+// All three provoke a real arm failure the same way: `inotify_add_watch` needs read
+// permission, so a mode-000 file can still be `stat`ed — which is all the watch KEY is —
+// but can never be watched. `:w` carries an existing file's mode onto its atomic
+// replacement, so the save leaves the file unreadable *and* re-stamps the buffer's disk
+// snapshot, which is what changes the key and forces the arm.
+
+/// Open `path`, make it unwatchable-but-stat-able, and `:w` so the watch key changes and
+/// the server arms onto a file the kernel refuses. Returns `None` when the process can
+/// read a mode-000 file anyway (running as root), which no assertion here can survive.
+#[cfg(unix)]
+async fn arm_onto_an_unwatchable_file(rpc: &Rpc, path: &std::path::Path) -> Option<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Let the startup watch arm before anything changes under it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(path).is_ok() {
+        eprintln!("skip: running as root — a mode-000 file is still readable and watchable");
+        return None;
+    }
+    feed(rpc, "ohere<Esc>:w<CR>");
+    assert_eq!(
+        lines(rpc).await,
+        vec!["one", "here", "two"],
+        "precondition: the save went through (an atomic replace needs only the directory)"
+    );
+    Some(())
+}
+
+/// How many `redraw` notifications the server pushed over `window` of complete idle.
+async fn redraws_while_idle(
+    incoming: &mut UnboundedReceiver<Incoming>,
+    window: std::time::Duration,
+) -> usize {
+    while incoming.try_recv().is_ok() {} // everything queued so far is legitimate traffic
+    tokio::time::sleep(window).await;
+    let mut redraws = 0;
+    while let Ok(inc) = incoming.try_recv() {
+        if matches!(&inc, Incoming::Notification { method, .. } if method == "redraw") {
+            redraws += 1;
+        }
+    }
+    redraws
+}
+
+/// A watch that cannot arm must not respawn itself in a loop.
+///
+/// The arm-failure path used to drop the buffer's `buf_watches` entry, on the theory that
+/// "a later tick re-arms it" — but the very settle that handles the failure ends in
+/// `emit_lifecycle_events` → `sync_buffer_watches`, which found no entry, armed, failed,
+/// and settled again. Reported in the wild as: leave the editor idle, let something
+/// rewrite the file in the background, come back to a pegged CPU and an editor that lags
+/// on every key. The retries are paced on the timer seam now, so an idle server stays
+/// idle between them.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_watch_that_cannot_arm_must_not_respawn_in_a_loop() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = serial_lock().lock().await;
+
+    let path = temp_path("watch-arm-fail");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    if arm_onto_an_unwatchable_file(&rpc, &path).await.is_some() {
+        // The default backoff spends only its first two waits (100ms, 300ms) inside this
+        // window, so a handful of frames is the honest ceiling — against thousands when
+        // the re-arm rode the settle path.
+        let redraws =
+            redraws_while_idle(&mut incoming, std::time::Duration::from_millis(300)).await;
+        assert!(
+            redraws < 50,
+            "a watch that cannot arm must not re-arm-spin: {redraws} redraws in 300ms of idle"
+        );
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+/// …and the retry is not decoration: once the obstacle clears, the watch comes back by
+/// itself and the buffer autoreloads again. Nothing else can re-arm it here — the key is
+/// unchanged, so `sync_buffer_watches` leaves it alone — so an autoreload is proof the
+/// backed-off retry actually re-armed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_watch_arm_is_retried_and_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = serial_lock().lock().await;
+
+    let path = temp_path("watch-arm-retry");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    if arm_onto_an_unwatchable_file(&rpc, &path).await.is_some() {
+        // The obstacle clears while the first retry is still counting down.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // An external change with no `:checktime` — only a live watch can notice it.
+        std::fs::write(&path, "one\nhere\ntwo\nthree\n").unwrap();
+
+        // Bounded wait: the retries land at ~100ms, 300ms, 900ms, 2.7s.
+        let mut got = vec![];
+        for _ in 0..80 {
+            rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+            got = lines(&rpc).await;
+            if got == vec!["one", "here", "two", "three"] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            got,
+            vec!["one", "here", "two", "three"],
+            "the retry must re-arm the watch once the file is watchable again"
+        );
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+/// A permanently unwatchable file exhausts the retry budget rather than trying forever,
+/// and says so — with the watch down, nothing autoreloads that file and nothing warns
+/// when it changes underneath the buffer, so leaving it looking watched would be the
+/// silent-degradation the "fail loud" rule exists to prevent.
+///
+/// `$BEMTVI_WATCH_RETRY_BASE_MS` compresses the whole schedule (the default spends ~12s
+/// getting here); `serial_lock` keeps that process-wide override off the two tests above.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_watch_arm_retry_gives_up_after_its_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = serial_lock().lock().await;
+    unsafe { std::env::set_var("BEMTVI_WATCH_RETRY_BASE_MS", "1") };
+
+    let path = temp_path("watch-arm-giveup");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let (rpc, mut incoming) = start(Some(path.to_string_lossy().into_owned())).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    if arm_onto_an_unwatchable_file(&rpc, &path).await.is_some() {
+        let frame = wait_redraw(&mut incoming, |m| message(m).contains("cannot watch")).await;
+        let msg = message(&frame);
+        assert!(
+            msg.contains(&path.to_string_lossy().into_owned()) && msg.contains("autoreload"),
+            "the give-up must name the file and what stopped working, got: {msg:?}"
+        );
+        // …and it really is the end of it: no further arms, no further frames.
+        let redraws =
+            redraws_while_idle(&mut incoming, std::time::Duration::from_millis(300)).await;
+        assert!(
+            redraws < 10,
+            "a spent retry budget must leave the server idle: {redraws} redraws in 300ms"
+        );
+    }
+    unsafe { std::env::remove_var("BEMTVI_WATCH_RETRY_BASE_MS") };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+    std::fs::remove_file(&path).ok();
+}
+
 /// A [`bemtvi_core::host::HostFs`] that models a file caught **mid-write**: while
 /// armed, `path` looks truncated (0 bytes, no content) to everyone; the first
 /// `open_read` to observe that disarms it, so every access from then on sees the

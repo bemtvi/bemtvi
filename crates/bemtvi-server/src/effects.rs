@@ -3685,20 +3685,34 @@ impl EditHost {
                 // `FileChangedShell` round-trip (autoreload / a handler's
                 // `v:fcs_choice` / W11 / W12 / E211) and re-arms the watch after any
                 // reload (a reload re-stamps the disk snapshot, so the watch key
-                // changed). `error` (the watch failed to arm) just drops the watch
-                // state and stops — a *later* tick (a lifecycle event or a reconcile)
-                // re-arms it. It must NOT re-arm here: re-arming the same failing key
-                // in place would fail again and re-enter this arm, spinning forever
-                // (an absent path can't be watched by kqueue/inotify). `sync_buffer_watches`
-                // already declines to arm a not-yet-written new-file buffer (no disk
-                // snapshot), so the common case never reaches here; this is the backstop
-                // for a transient arm failure (e.g. the file vanished between the key
-                // snapshot and the arm).
+                // changed).
+                //
+                // `error` means the watch never armed (an absent path, a permission the
+                // kernel refuses, an exhausted inotify budget), which
+                // [`on_watch_arm_failed`] retries on a backoff and then gives up on.
+                // Note what does NOT happen here: the buffer's `buf_watches` entry is
+                // left alone. Dropping it reads like "let a later tick retry", but the
+                // very settle that handles this event ends in `emit_lifecycle_events` →
+                // `sync_buffer_watches`, which would find no entry, arm, fail, and settle
+                // again — an unbounded arm→fail→re-arm loop that pegs a core and pushes a
+                // frame every round (regression-guarded by
+                // `a_watch_that_cannot_arm_must_not_respawn_in_a_loop`). The entry is
+                // what holds that path off; the retries are paced on the timer seam
+                // instead.
+                //
+                // `sync_buffer_watches` already declines to arm a not-yet-written
+                // new-file buffer (no disk snapshot), so the common case never reaches
+                // here at all.
                 let buf = BufferId(id - crate::INTERNAL_WATCH_BASE);
-                if error.is_some() {
-                    self.buf_watches.remove(&buf);
-                } else {
-                    self.editor.checktime_buffer(buf);
+                match error {
+                    Some(err) => self.on_watch_arm_failed(buf, err),
+                    None => {
+                        // A live change event proves the watch is up — retire any retry
+                        // still counting down for it (a late failure from a superseded
+                        // arm, say).
+                        self.cancel_watch_retry(buf);
+                        self.editor.checktime_buffer(buf);
+                    }
                 }
             }
             LoopEvent::FsResult { id, result } => {

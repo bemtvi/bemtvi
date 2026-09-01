@@ -580,7 +580,28 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     btv.set(
         "_markdown_render",
         lua.create_function(|lua, src: String| {
-            let rendered = bemtvi_core::markdown::render(&src);
+            rendered_table(lua, bemtvi_core::markdown::render(&src))
+        })?,
+    )?;
+    // `btv._rst_render(src)` (exposed by the prelude as `btv.rst.render`): the same
+    // transform for **reStructuredText**, through `bemtvi_core::rst` — the docstring
+    // dialect a server sends as `plaintext`, LSP having no kind to name it with.
+    // Identical output shape to `_markdown_render`, so a caller renders either format
+    // with one piece of layout code. Pure — no editor state.
+    btv.set(
+        "_rst_render",
+        lua.create_function(|lua, src: String| {
+            rendered_table(lua, bemtvi_core::rst::render(&src))
+        })?,
+    )?;
+    /// Convert a rendered markup document into the Lua table `btv.markdown.render` /
+    /// `btv.rst.render` return: 1-based lines and **char** columns (`col_end`
+    /// exclusive) so Lua layout code indexes by column, not byte.
+    fn rendered_table(
+        lua: &mlua::Lua,
+        rendered: bemtvi_core::markdown::Rendered,
+    ) -> mlua::Result<mlua::Table> {
+        {
             let out = lua.create_table()?;
             let lines = lua.create_table()?;
             for (i, line) in rendered.lines.iter().enumerate() {
@@ -625,8 +646,8 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             }
             out.set("code", code)?;
             Ok(out)
-        })?,
-    )?;
+        }
+    }
     // `nvim_set_hl(ns, name, opts)`: capture the group definition for the server
     // to fold into the core registry, keyed by namespace. `ns == 0` is the global
     // table a colorscheme populates; a non-zero `ns` is kept in its own table so
@@ -3198,6 +3219,31 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut()
                 .lsp_ops
                 .push(LspOp::SemanticTokensConfig { enabled });
+            Ok(())
+        })?,
+    )?;
+
+    // `btv._lsp_docs_format(name, format)`: queue [`LspOp::LspDocsFormat`] — how to
+    // render what `name` sends as `plaintext` (`btv.lsp.config`'s `docs_format`). The
+    // prelude has already validated `format` against the closed set, so an unknown
+    // string here is a bug rather than a user error and fails loud.
+    let sh = shared.clone();
+    btv.set(
+        "_lsp_docs_format",
+        lua.create_function(move |_, (name, format): (String, String)| {
+            let format = match format.as_str() {
+                "markdown" => bemtvi_core::markdown::DocFormat::Markdown,
+                "plaintext" => bemtvi_core::markdown::DocFormat::PlainText,
+                "rst" => bemtvi_core::markdown::DocFormat::Rst,
+                other => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "btv._lsp_docs_format: unknown format {other:?}"
+                    )))
+                }
+            };
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::LspDocsFormat { name, format });
             Ok(())
         })?,
     )?;

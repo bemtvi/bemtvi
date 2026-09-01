@@ -972,3 +972,48 @@ async fn plaintext_completion_docs_render_verbatim() {
 
     std::env::remove_var("BEMTVI_LSP_CMD");
 }
+
+/// The completion docs float honors `docs_format` too, and per contributor: a server
+/// declared to speak rst gets its `plaintext` documentation rendered as rst — the
+/// field list laid out, the emphasis stripped — where the same reply from an
+/// undeclared server stays verbatim.
+///
+/// The item's `detail` is untouched by it: LSP declares a `MarkupKind` for
+/// `documentation`, and none at all for `detail`, so there is nothing there for a
+/// format to apply to.
+#[tokio::test]
+async fn a_declared_rst_server_renders_its_completion_docs_as_rst() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_docs_rst");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "BEMTVI_LSP_CMD",
+        format!("{BEMTVI_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    let completion = r#"[ { "label": "println", "insertText": "println",
+                          "detail": "macro println!",
+                          "documentation": { "kind": "plaintext",
+                            "value": "Print to stdout.\n\n:param args: what to print\n:type args: str" } } ]"#;
+    let (rpc, mut incoming) = start_typed(&dir, completion, "pr").await;
+    exec_lua(&rpc, r#"btv.lsp.config("mock", { docs_format = "rst" })"#).await;
+
+    await_items(&rpc, &mut incoming, "println").await;
+    let docs = await_docs(&rpc, &mut incoming, "Print to stdout.").await;
+    let body: Vec<&str> = docs
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        body,
+        vec![
+            "macro println!",
+            "Print to stdout.",
+            "  args (str)  what to print",
+        ],
+        "the detail heads the float unchanged; the rst body lays its field list out: {docs:?}"
+    );
+
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}

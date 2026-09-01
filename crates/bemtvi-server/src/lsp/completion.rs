@@ -726,6 +726,26 @@ impl EditHost {
 }
 
 impl EditHost {
+    /// How to render a block `server` sent: what it **declared**, unless it declared
+    /// `plaintext` and this server has a configured `docs_format` (`btv.lsp.config`'s
+    /// `docs_format = "rst"`).
+    ///
+    /// The override reaches only `plaintext`, deliberately. That is the value a server
+    /// with no way to name its format is forced into — LSP's `MarkupKind` has no rst
+    /// kind — so it is the only one a person can know better than the server does. A
+    /// block declared `markdown` is markdown whatever the configuration says: there
+    /// the server *did* tell us, and it outranks us.
+    pub(crate) fn docs_format_for(&self, server: &ServerKey, declared: DocFormat) -> DocFormat {
+        match declared {
+            DocFormat::PlainText => self
+                .lsp_docs_format
+                .get(&server.name)
+                .copied()
+                .unwrap_or(DocFormat::PlainText),
+            declared => declared,
+        }
+    }
+
     /// The **labelled sections** the completion docs float renders for the `lsp` row
     /// `key`: one per server that offered it, in routing order, each holding that
     /// server's own `detail` + `documentation`
@@ -755,7 +775,7 @@ impl EditHost {
                     label: o.server.name.clone(),
                     detail,
                     body,
-                    format: o.item.documentation_format,
+                    format: self.docs_format_for(&o.server, o.item.documentation_format),
                 })
             })
             .collect();

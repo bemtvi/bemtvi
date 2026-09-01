@@ -1196,6 +1196,17 @@ pub struct EditHost {
     /// paint everywhere and stops the refresh requests (the per-buffer
     /// `LspDocState::semantic_enabled` is the narrower override).
     semantic_tokens_enabled: bool,
+    /// How to render what a given language server sends as **`plaintext`**, by config
+    /// name (`btv.lsp.config`'s `docs_format`). Absent ⇒ plaintext is plaintext, which
+    /// is the default and what every server that never declared otherwise gets.
+    ///
+    /// A client-side rendering choice rather than anything the server is told: LSP's
+    /// `MarkupKind` has only `plaintext` and `markdown`, so a server whose docstrings
+    /// are reStructuredText declares `plaintext` and nothing in the reply
+    /// distinguishes it from genuinely-plain text. Consulted where a reply becomes a
+    /// [`DocsSection`](bemtvi_core::DocsSection) — per contributor, so an rst server
+    /// and a markdown one merge into one float each rendered its own way.
+    lsp_docs_format: HashMap<String, bemtvi_core::markdown::DocFormat>,
     /// Registered snippets per filetype (`btv.snippet.add`), feeding the `snippets`
     /// completion source. String bodies only in this phase. Feature-agnostic (the
     /// engine is core), so present on the wasm build too.
@@ -2008,6 +2019,7 @@ impl EditHost {
             diag_mark_counts: HashMap::new(),
             diag_mark_gens: HashMap::new(),
             semantic_tokens_enabled: true,
+            lsp_docs_format: HashMap::new(),
             snippet_store: HashMap::new(),
             complete_snippets_active: false,
             complete_snippets_priority: 0,

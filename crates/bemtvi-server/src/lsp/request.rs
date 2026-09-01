@@ -1196,7 +1196,7 @@ impl EditHost {
                 // Hover has no `detail`: every section is the server's own markup.
                 detail: None,
                 body: doc.join("\n"),
-                format,
+                format: self.docs_format_for(&key, format),
             })
             .collect();
         let text = sections

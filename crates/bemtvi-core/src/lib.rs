@@ -24,6 +24,7 @@ pub mod input;
 pub mod markdown;
 pub mod mode;
 pub mod options;
+pub mod rst;
 pub mod sandbox;
 pub mod search;
 pub mod snippet;

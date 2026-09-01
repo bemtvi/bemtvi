@@ -318,3 +318,111 @@ async fn a_markdown_hover_still_reflows_and_strips() {
         "…and reads the emphasis markers as markup rather than text: {lines:?}"
     );
 }
+
+/// The same hover, rendered by whichever `docs_format` the server was configured
+/// with. `contents_json` is the mock's reply; `config` is the extra
+/// `btv.lsp.config` body.
+async fn hover_lines_configured(tag: &str, contents_json: &str, config: &str) -> Vec<String> {
+    let dir = temp_dir(tag);
+    arm_mock(
+        &dir,
+        &format!(r#"{{ "hover": {{ "contents": {contents_json} }} }}"#),
+    );
+    let (rpc, mut incoming) = open_rust(&dir).await;
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"
+            btv.lsp.config("mock", {{ cmd = {{ "placeholder" }}, filetypes = {{ "rust" }}{config} }})
+            btv.lsp.enable("mock")
+            "#
+        ),
+    )
+    .await;
+    let (lines, _) = await_hover(&rpc, &mut incoming, "Read a file").await;
+    std::env::remove_var("BEMTVI_LSP_CMD");
+    lines
+}
+
+/// A reStructuredText docstring — which a server can only send as `plaintext`, LSP
+/// having no kind to name rst with — renders as rst once the server is *declared* to
+/// speak it. The field list lays out, the `**` markers go, and `.. code-block::
+/// python` becomes a real code block; none of that can be inferred from the reply, so
+/// without the declaration the same text renders verbatim.
+#[tokio::test]
+async fn a_declared_rst_server_gets_its_plaintext_rendered_as_rst() {
+    let _guard = serial_lock().lock().await;
+    let rst = "Read a file.\\n\\nReturns the contents of *path*.\\n\\n\
+               :param path: the file to read\\n:type path: str\\n\\n\
+               .. code-block:: python\\n\\n   open(path).read()";
+    let contents = format!(r#"{{ "kind": "plaintext", "value": "{rst}" }}"#);
+
+    let declared =
+        hover_lines_configured("lsp_hover_rst", &contents, r#", docs_format = "rst""#).await;
+    let body: Vec<&str> = declared
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        body,
+        vec![
+            "Read a file.",
+            "Returns the contents of path.",
+            "  path (str)  the file to read",
+            "open(path).read()",
+        ],
+        "the rst renders: emphasis stripped, the field list laid out, the directive \
+         consumed: {declared:?}"
+    );
+
+    // Without the declaration the very same reply is verbatim plaintext — proof the
+    // rendering comes from the configuration and not from sniffing the content.
+    let undeclared = hover_lines_configured("lsp_hover_rst_off", &contents, "").await;
+    assert!(
+        undeclared.iter().any(|l| l.contains(":param path:")),
+        "an undeclared server's plaintext stays verbatim: {undeclared:?}"
+    );
+}
+
+/// The declaration reaches only what the server declared **`plaintext`**. A block it
+/// declared `markdown` is markdown whatever the configuration says — there the server
+/// told us, and it outranks us.
+#[tokio::test]
+async fn a_declared_rst_server_still_renders_its_markdown_as_markdown() {
+    let _guard = serial_lock().lock().await;
+    let lines = hover_lines_configured(
+        "lsp_hover_rst_markdown",
+        r#"{ "kind": "markdown", "value": "Read a file.\n\n:param path: the file" }"#,
+        r#", docs_format = "rst""#,
+    )
+    .await;
+
+    assert!(
+        lines.iter().any(|l| l.contains(":param path: the file")),
+        "a markdown block is markdown: the field list is not laid out: {lines:?}"
+    );
+}
+
+/// A `docs_format` outside the closed set fails at registration rather than silently
+/// meaning markdown — the one outcome that would look like the option working.
+#[tokio::test]
+async fn an_unknown_docs_format_is_refused() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_docs_format_bad");
+    let (rpc, _incoming) = open_rust(&dir).await;
+    let err = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![
+                Value::from(r#"btv.lsp.config("mock", { docs_format = "asciidoc" })"#),
+                Value::Array(Vec::new()),
+            ],
+        )
+        .await
+        .expect_err("an unknown docs_format must raise");
+    assert!(
+        format!("{err:?}").contains("docs_format"),
+        "the error names the offending option: {err:?}"
+    );
+}

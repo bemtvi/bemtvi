@@ -520,6 +520,22 @@ pub enum LspOp {
         /// Whether semantic tokens are enabled editor-wide (default on).
         enabled: bool,
     },
+    /// `btv.lsp.config(name, { docs_format = … })` — how to render the documentation
+    /// this server sends as **`plaintext`**.
+    ///
+    /// It is a client-side rendering choice, not something the server is told, and it
+    /// exists because LSP's `MarkupKind` has only `plaintext` and `markdown`: a server
+    /// whose docstrings are reStructuredText has no way to say so, and nothing in the
+    /// text distinguishes rst from genuinely-plain text without guessing. So a person
+    /// declares it, per server, and only the blocks that server declared `plaintext`
+    /// are affected — one it declared `markdown` is markdown regardless.
+    LspDocsFormat {
+        /// The config name (`btv.lsp.config`'s first argument), which is the name the
+        /// reply's `ServerKey` carries.
+        name: String,
+        /// What that server's `plaintext` really is.
+        format: bemtvi_core::markdown::DocFormat,
+    },
     /// `vim.lsp.inlay_hint.enable(enable, { bufnr })` — flip the per-buffer inlay-
     /// hint projection on or off (off by default, unlike semantic tokens). `enable`
     /// requests a fresh set; disabling clears the cache and hides the paint.

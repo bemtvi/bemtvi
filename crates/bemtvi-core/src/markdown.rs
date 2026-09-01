@@ -34,7 +34,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 /// treesitter buffers styles these popups identically — resolved through the same
 /// capture→`Style` table as buffer highlights, so `@markup.strong`'s bold attribute
 /// actually renders bold. Kept in one place so the styled surface is auditable.
-const HEADING: [&str; 6] = [
+pub(crate) const HEADING: [&str; 6] = [
     "@markup.heading.1",
     "@markup.heading.2",
     "@markup.heading.3",
@@ -42,15 +42,15 @@ const HEADING: [&str; 6] = [
     "@markup.heading.5",
     "@markup.heading.6",
 ];
-const STRONG: &str = "@markup.strong";
-const ITALIC: &str = "@markup.italic";
+pub(crate) const STRONG: &str = "@markup.strong";
+pub(crate) const ITALIC: &str = "@markup.italic";
 const STRIKE: &str = "@markup.strikethrough";
-const RAW: &str = "@markup.raw";
-const LINK_LABEL: &str = "@markup.link.label";
-const LINK_URL: &str = "@markup.link.url";
-const LIST: &str = "@markup.list";
-const QUOTE: &str = "@markup.quote";
-const RULE: &str = "@punctuation.special";
+pub(crate) const RAW: &str = "@markup.raw";
+pub(crate) const LINK_LABEL: &str = "@markup.link.label";
+pub(crate) const LINK_URL: &str = "@markup.link.url";
+pub(crate) const LIST: &str = "@markup.list";
+pub(crate) const QUOTE: &str = "@markup.quote";
+pub(crate) const RULE: &str = "@punctuation.special";
 
 /// The glyph a **section header** (and a thematic break) is drawn with, the text that
 /// leads one, and the groups its two parts take: `─ pyright ────────`, a label inset in
@@ -181,6 +181,15 @@ pub enum DocFormat {
     /// `MarkupContent { kind: "plaintext" }` — the server said, explicitly, that this
     /// is not markup.
     PlainText,
+    /// reStructuredText — rendered by [`crate::rst`].
+    ///
+    /// **Never produced by the protocol**, which has no kind to name it with: a
+    /// server whose docstrings are rst declares them `plaintext`, the only honest
+    /// value in a two-value set. This variant exists only because a *person* said so
+    /// (`btv.lsp.config(name, { docs_format = "rst" })`), and it applies only to
+    /// blocks that server declared `plaintext` — one it declared `markdown` is
+    /// markdown, whatever the configuration says, because the server told us.
+    Rst,
 }
 
 /// One section of a rendered doc float: a contributor's `label`, an optional
@@ -217,6 +226,7 @@ pub fn render_doc_sections<'a>(sections: impl IntoIterator<Item = DocSection<'a>
         match section.format {
             DocFormat::Markdown => r.feed(section.body),
             DocFormat::PlainText => r.feed_plain(section.body),
+            DocFormat::Rst => r.feed_rst(section.body),
         }
     }
     r.finish()
@@ -226,7 +236,7 @@ pub fn render_doc_sections<'a>(sections: impl IntoIterator<Item = DocSection<'a>
 /// whose next item number is `n`; `None` is a bullet list.
 type ListMarker = Option<u64>;
 
-struct Renderer {
+pub(crate) struct Renderer {
     lines: Vec<String>,
     spans: Vec<MdSpan>,
     fills: Vec<MdFill>,
@@ -286,7 +296,7 @@ struct Table {
 }
 
 impl Renderer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             lines: Vec::new(),
             spans: Vec::new(),
@@ -377,7 +387,7 @@ impl Renderer {
         self.fills.retain(|f| f.line < self.lines.len());
     }
 
-    fn finish(mut self) -> Rendered {
+    pub(crate) fn finish(mut self) -> Rendered {
         self.newline_if_dirty();
         self.trim_trailing();
         Rendered {
@@ -622,7 +632,7 @@ impl Renderer {
     }
 
     /// Append `text` to the current line, honoring embedded newlines as line breaks.
-    fn write(&mut self, text: &str) {
+    pub(crate) fn write(&mut self, text: &str) {
         for (i, part) in text.split('\n').enumerate() {
             if i > 0 {
                 self.newline();
@@ -637,7 +647,7 @@ impl Renderer {
 
     /// Flush the current line to the output, closing (and remembering to reopen)
     /// any styles that span the break.
-    fn newline(&mut self) {
+    pub(crate) fn newline(&mut self) {
         let end = self.line.len();
         for (group, start) in self.styles.iter() {
             if *start < end {
@@ -677,7 +687,7 @@ impl Renderer {
     }
 
     /// Flush only if a partial line is in progress (no empty line otherwise).
-    fn newline_if_dirty(&mut self) {
+    pub(crate) fn newline_if_dirty(&mut self) {
         if self.started || !self.line.is_empty() {
             self.newline();
         }
@@ -685,7 +695,7 @@ impl Renderer {
 
     /// Open a blank separator before a top-level block (never between list items or
     /// inside a quote/list, which read tighter).
-    fn block_gap(&mut self) {
+    pub(crate) fn block_gap(&mut self) {
         self.newline_if_dirty();
         if self.want_gap {
             self.want_gap = false;
@@ -695,13 +705,13 @@ impl Renderer {
         }
     }
 
-    fn open(&mut self, group: &'static str) {
+    pub(crate) fn open(&mut self, group: &'static str) {
         self.ensure_prefix();
         let at = self.line.len();
         self.styles.push((group, at));
     }
 
-    fn close(&mut self, group: &'static str) {
+    pub(crate) fn close(&mut self, group: &'static str) {
         if let Some(pos) = self.styles.iter().rposition(|(g, _)| *g == group) {
             let (g, start) = self.styles.remove(pos);
             let end = self.line.len();
@@ -713,7 +723,7 @@ impl Renderer {
 
     /// Append a link's URL after its label when it adds information (skip when the
     /// label already *is* the URL, as for a bare autolink).
-    fn append_link_url(&mut self, dest: &str) {
+    pub(crate) fn append_link_url(&mut self, dest: &str) {
         if dest.is_empty() || self.line.ends_with(dest) {
             return;
         }
@@ -765,6 +775,14 @@ impl Renderer {
     /// fenced block the source declared, except that it is marked
     /// [`asserted`](MdCode::asserted): nothing in the document said this was code.
     fn asserted_code_block(&mut self, lang: &str, text: &str) {
+        self.code_block((!lang.is_empty()).then_some(lang), text, true);
+    }
+
+    /// Emit `text` as a code block in `lang`, spaced from its surroundings like any
+    /// other top-level block. The block form for a caller that already holds the
+    /// body — the rst renderer's literal blocks, doctest blocks and `.. code-block::`
+    /// directives — where the markdown path accumulates one through `flush_code`.
+    pub(crate) fn code_block(&mut self, lang: Option<&str>, text: &str, asserted: bool) {
         self.block_gap();
         let first_line = self.lines.len();
         let mut len = 0;
@@ -778,10 +796,91 @@ impl Renderer {
         self.code.push(MdCode {
             first_line,
             len,
-            lang: (!lang.is_empty()).then(|| lang.to_string()),
-            asserted: true,
+            lang: lang.map(str::to_string),
+            asserted,
         });
         self.want_gap = true;
+    }
+
+    /// Emit `lines` verbatim as ordinary display rows — no markup read, no code
+    /// background. What the rst renderer shows a table with: a grid or simple table
+    /// is already ASCII art that reads as a table, and misparsing one loses more than
+    /// leaving it alone.
+    pub(crate) fn verbatim_lines(&mut self, lines: &[&str]) {
+        self.block_gap();
+        for line in lines {
+            self.lines.push((*line).to_string());
+        }
+        self.want_gap = true;
+    }
+
+    /// Open a list — `start` is `Some(n)` for an ordered list numbering from `n`,
+    /// `None` for a bullet list — and close it again. The rst renderer's twin of the
+    /// `Tag::List` / `TagEnd::List` events, so both formats draw a list identically.
+    pub(crate) fn list_push(&mut self, start: Option<u64>) {
+        if self.lists.is_empty() {
+            self.block_gap();
+        }
+        self.lists.push(start);
+    }
+
+    pub(crate) fn list_pop(&mut self) {
+        self.lists.pop();
+        if self.lists.is_empty() {
+            self.want_gap = true;
+        }
+    }
+
+    /// Begin a list item: the depth's indent plus this item's marker (the bullet, or
+    /// the ordinal, which advances the enclosing list's counter). The `Tag::Item` twin.
+    pub(crate) fn list_item(&mut self) {
+        self.newline_if_dirty();
+        let depth = self.lists.len().saturating_sub(1);
+        self.pending_indent = "  ".repeat(depth);
+        let marker = match self.lists.last_mut() {
+            Some(Some(n)) => {
+                let m = format!("{n}. ");
+                *n += 1;
+                m
+            }
+            _ => "• ".to_string(),
+        };
+        self.pending_marker = Some(marker);
+    }
+
+    /// Enter / leave a block quote — the `▎ ` bar every line of the quoted block
+    /// carries. The `Tag::BlockQuote` twin.
+    pub(crate) fn quote_push(&mut self) {
+        self.block_gap();
+        self.quote += 1;
+    }
+
+    pub(crate) fn quote_pop(&mut self) {
+        self.quote = self.quote.saturating_sub(1);
+        self.want_gap = true;
+    }
+
+    /// Mark that a blank row is due before the next block — what the markdown
+    /// parser's `TagEnd` arms do at the close of a paragraph, heading or list, and
+    /// what parts a title from its body and one paragraph from the next. Idempotent;
+    /// the gap is only actually drawn if a block follows.
+    pub(crate) fn end_block(&mut self) {
+        self.want_gap = true;
+    }
+
+    /// Cancel a pending block gap — the next block starts on the next row, with no
+    /// blank between. What a **tight** list needs: its items are adjacent in the
+    /// source, and each item's own content closed with an [`end_block`](Self::end_block)
+    /// that must not become a blank row before the next bullet.
+    pub(crate) fn no_gap(&mut self) {
+        self.want_gap = false;
+    }
+
+    /// Parse `src` as **reStructuredText** and fold it into the document — the
+    /// [`feed`](Self::feed) of the other markup format bemtvi renders. See
+    /// [`crate::rst`] for what the dialect covers.
+    pub(crate) fn feed_rst(&mut self, src: &str) {
+        crate::rst::feed(self, src);
     }
 
     /// A thematic break (`---`) — a full-width `─` rule on its own row, **tight**: no
@@ -796,7 +895,7 @@ impl Renderer {
     /// bare trailing rule, and one with no signature as a leading one; drawing that
     /// boundary line promises a section that isn't there. (The trailing case falls out
     /// of [`finish`](Self::finish), which pops the rule's own empty row.)
-    fn rule(&mut self) {
+    pub(crate) fn rule(&mut self) {
         if !self.has_separable_content() {
             return;
         }

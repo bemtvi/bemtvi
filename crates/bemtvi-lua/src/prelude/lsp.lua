@@ -315,6 +315,12 @@ function btv.lsp.get_config(name)
   return resolve(name)
 end
 
+-- The formats `docs_format` accepts. Closed and validated at registration: a typo'd
+-- value must not silently mean "markdown", which is the one outcome that would look
+-- like the option working. Declared above `btv.lsp.config`'s doc comment, which the
+-- book generator requires to be contiguous with the function it documents.
+local DOCS_FORMATS = { markdown = true, plaintext = true, rst = true }
+
 -- `btv.lsp.config(name, opts)`: accumulate `opts` into `name`'s override layer
 -- (deep-merged over any prior call — configs compose across files and plugins).
 -- `"*"` is the all-clients base inherited by every server. Function-call form
@@ -362,6 +368,27 @@ end
 -- the feature is skipped whatever its rank. `btv.lsp.hover{ name = … }` / `:LspHover <server>`
 -- override the rank outright for one call. A change takes effect on the next start,
 -- so `btv.lsp.restart(name)` applies it to a server already running.
+--
+-- `opts.docs_format` (`"markdown"` | `"plaintext"` | `"rst"`) says how to render what
+-- this server sends as **`plaintext`** — the hover float and the completion docs
+-- float.
+--
+-- It exists because the protocol cannot say. LSP's `MarkupKind` is a closed two-value
+-- set, `plaintext` or `markdown`; a server whose docstrings are reStructuredText has
+-- no value to name that with, so it declares `plaintext`, and nothing in the reply
+-- distinguishes rst from genuinely-plain text. Guessing from the content ("it starts
+-- with `:param`") would silently reinterpret a plain docstring that happens to
+-- contain a `*`, so bemtvi does not guess — you say it:
+--
+-- ```lua
+-- btv.lsp.config("pylsp", { docs_format = "rst" })
+-- ```
+--
+-- Only blocks the server declared `plaintext` are affected: one it declared
+-- `markdown` is markdown whatever this says, because there the server told us. Note
+-- that `python-lsp-server` and `jedi-language-server` convert rst to markdown
+-- themselves when the `docstring-to-markdown` package is installed alongside them,
+-- and bemtvi asks for markdown first — so install that and you need none of this.
 function btv.lsp.config(name, opts)
   if type(name) ~= "string" then
     error("btv.lsp.config: name must be a string", 2)
@@ -371,6 +398,21 @@ function btv.lsp.config(name, opts)
   end
   local prev = btv.lsp._config[name] or {}
   btv.lsp._config[name] = btv.tbl.deep_extend("force", prev, opts or {})
+  local format = btv.lsp._config[name].docs_format
+  if format ~= nil then
+    if type(format) ~= "string" or not DOCS_FORMATS[format] then
+      error(
+        "btv.lsp.config: docs_format must be one of 'markdown', 'plaintext', 'rst'"
+          .. " (got "
+          .. tostring(format)
+          .. ")",
+        2
+      )
+    end
+    -- Registered, not started: this is how the *reply* is rendered, so it needs no
+    -- running server and takes effect on the next float rather than the next spawn.
+    btv._lsp_docs_format(name, format)
+  end
 end
 
 -- ----- the config schema -----------------------------------------------------
@@ -399,6 +441,7 @@ local KNOWN_KEYS = {
   on_exit = true,
   offset_encoding = true,
   priority = true,
+  docs_format = true,
 }
 
 -- Keys bemtvi knows about and deliberately does NOT act on, each with the reason and

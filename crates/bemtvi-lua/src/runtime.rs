@@ -754,6 +754,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "bemtvi:prelude/markdown",
         include_str!("prelude/markdown.lua"),
     ),
+    // btv.rst: the reStructuredText renderer surface (btv.rst.render) over the pure
+    // btv._rst_render bridge — the format LSP has no `MarkupKind` for, so a server
+    // sends it as `plaintext`. Self-contained, like its markdown sibling above.
+    ("bemtvi:prelude/rst", include_str!("prelude/rst.lua")),
     // btv.test: the plugin test framework (describe/it/expect + an async-aware test
     // context). Inert until a spec registers tests and the `--test-plugin` runner
     // calls `btv.test._run()`; builds on btv.async/await/wait_for/on_next_tick (promise

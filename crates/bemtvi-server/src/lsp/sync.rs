@@ -270,6 +270,14 @@ impl EditHost {
                 self.lsp_dirty = true;
                 return;
             }
+            LspOp::LspDocsFormat { name, format } => {
+                // Purely a rendering choice, so nothing is requested or invalidated:
+                // the next doc float built for this server picks it up. `lsp_dirty`
+                // repaints an open one.
+                self.lsp_docs_format.insert(name, format);
+                self.lsp_dirty = true;
+                return;
+            }
             LspOp::SemanticTokensConfig { enabled } => {
                 self.semantic_tokens_enabled = enabled;
                 // Flipping back on re-requests every attached buffer so the paint

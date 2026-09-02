@@ -923,9 +923,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // is one row per buffer line. There is no separate per-array scatter step — the
     // overlays are written straight onto the rows they fall on.
     let wrap = w.options.wrap;
-    // `'breakindent'` / `'showbreak'` / `'breakindentopt'` only take effect with
-    // `wrap`; all default off. Bundled so the wrap helpers thread one value.
-    let wp = unicode::WrapPrefix {
+    // `'linebreak'` / `'breakindent'` / `'showbreak'` / `'breakindentopt'` only take
+    // effect with `wrap`; all default off. Bundled so the wrap helpers thread one value.
+    let wo = unicode::WrapOpts {
+        linebreak: w.options.linebreak,
         breakindent: w.options.breakindent,
         showbreak: w.options.showbreak.as_str(),
         sbr: w.options.breakindent_sbr(),
@@ -942,7 +943,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         Vec::new()
     };
     let rows = render_rows(
-        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wp, eob, &collapsed,
+        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wo, eob, &collapsed,
         w.cursor, ed.cursor,
     );
 
@@ -956,7 +957,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             let base_line = ps.from_top.min(ps.to_top);
             let max_top = ps.from_top.max(ps.to_top);
             let lead = screen_rows_between(
-                buf, base_line, max_top, line_count, wrap, width, tabstop, wp,
+                buf, base_line, max_top, line_count, wrap, width, tabstop, wo,
             );
             let band_height = lead + height;
             // How the selection rides the band, by selection kind. `sel_head` feeds
@@ -1006,7 +1007,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 width,
                 wrap,
                 tabstop,
-                wp,
+                wo,
                 eob,
                 // The scroll band ignores folds (its geometry helpers don't skip
                 // them yet); fold-aware scrolling lands in a later phase.
@@ -1023,10 +1024,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     wrap,
                     width,
                     tabstop,
-                    wp,
+                    wo,
                 ),
                 to_row: screen_rows_between(
-                    buf, base_line, ps.to_top, line_count, wrap, width, tabstop, wp,
+                    buf, base_line, ps.to_top, line_count, wrap, width, tabstop, wo,
                 ),
                 from_cursor_row: cursor_band_row(
                     buf,
@@ -1036,7 +1037,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     wrap,
                     width,
                     tabstop,
-                    wp,
+                    wo,
                 ),
                 to_cursor_row: cursor_band_row(
                     buf,
@@ -1046,7 +1047,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     wrap,
                     width,
                     tabstop,
-                    wp,
+                    wo,
                 ),
                 duration_ms: ps.duration_ms,
                 rows: band_rows,
@@ -1095,8 +1096,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         // `line_cow` borrows the rope chunk (no copy) when the line is contiguous —
         // the per-frame projection must not copy a huge wrapped line per window.
         let line = buf.line_cow(cur_line);
-        let indent = unicode::cont_indent(&line, tabstop, width, wp);
-        let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent);
+        let indent = unicode::cont_indent(&line, tabstop, width, wo);
+        let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent, wo.linebreak);
         let idx = segs
             .iter()
             .rposition(|s| w.cursor.col >= s.start_byte)
@@ -1336,14 +1337,14 @@ fn line_text_rows_of(
     wrap: bool,
     width: usize,
     tabstop: usize,
-    wp: unicode::WrapPrefix,
+    wo: unicode::WrapOpts,
 ) -> usize {
     if !wrap || width == 0 {
         return 1;
     }
     let text = buf.line_cow(line);
-    let indent = unicode::cont_indent(&text, tabstop, width, wp);
-    unicode::wrap_segments_indented(&text, tabstop, width, indent).len()
+    let indent = unicode::cont_indent(&text, tabstop, width, wo);
+    unicode::wrap_segments_indented(&text, tabstop, width, indent, wo.linebreak).len()
 }
 
 /// The number of **screen rows** the buffer lines `[base, target)` occupy: each
@@ -1361,13 +1362,13 @@ fn screen_rows_between(
     wrap: bool,
     width: usize,
     tabstop: usize,
-    wp: unicode::WrapPrefix,
+    wo: unicode::WrapOpts,
 ) -> usize {
     let virt = buf.virt_lines_by_line();
     (base..target)
         .map(|line| {
             if line < line_count {
-                line_text_rows_of(buf, line, wrap, width, tabstop, wp)
+                line_text_rows_of(buf, line, wrap, width, tabstop, wo)
                     + virt.get(&line).map_or(0, |r| r.above.len() + r.below.len())
             } else {
                 1
@@ -1390,13 +1391,13 @@ fn cursor_band_row(
     wrap: bool,
     width: usize,
     tabstop: usize,
-    wp: unicode::WrapPrefix,
+    wo: unicode::WrapOpts,
 ) -> usize {
     let above = buf
         .virt_lines_by_line()
         .get(&cursor_line)
         .map_or(0, |r| r.above.len());
-    screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop, wp) + above
+    screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop, wo) + above
 }
 
 /// The placeholder text a closed fold shows on its single collapsed row.
@@ -1441,7 +1442,7 @@ fn row_skeleton(
     wrap: bool,
     width: usize,
     tabstop: usize,
-    wp: unicode::WrapPrefix,
+    wo: unicode::WrapOpts,
     eob: char,
     folds: &[Fold],
 ) -> Vec<RenderRow> {
@@ -1508,8 +1509,8 @@ fn row_skeleton(
             // full width). The prefix is baked onto the continuation row text here, so
             // the client paints it as leading text — `render_rows` shifts this line's
             // overlays right by the prefix width to keep them aligned.
-            let (prefix, indent) = unicode::break_prefix(&text, tabstop, width, wp);
-            let segs = unicode::wrap_segments_indented(&text, tabstop, width, indent);
+            let (prefix, indent) = unicode::break_prefix(&text, tabstop, width, wo);
+            let segs = unicode::wrap_segments_indented(&text, tabstop, width, indent, wo.linebreak);
             for (i, seg) in segs.iter().enumerate() {
                 if rows.len() >= height {
                     break;
@@ -1589,14 +1590,14 @@ fn render_rows(
     width: usize,
     wrap: bool,
     tabstop: usize,
-    wp: unicode::WrapPrefix,
+    wo: unicode::WrapOpts,
     eob: char,
     folds: &[Fold],
     cursor: Cursor,
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
     let mut rows = row_skeleton(
-        ed, buf, base, height, line_count, wrap, width, tabstop, wp, eob, folds,
+        ed, buf, base, height, line_count, wrap, width, tabstop, wo, eob, folds,
     );
     if !focused {
         return rows;

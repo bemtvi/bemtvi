@@ -15,8 +15,19 @@ dofile(DIR .. "/init.lua")
 local function open(t)
   t:cmd("e " .. DIR .. "/sample.txt")
   t:cmd("e!")
-  t:cmd("set wrap breakindent showbreak=↪ breakindentopt=sbr")
+  t:cmd("set wrap linebreak breakindent showbreak=↪ breakindentopt=sbr")
   t:feed("gg")
+end
+
+--- The painted rows buffer line `line` occupies, in order.
+local function rows_of(t, line)
+  local screen, out = t:screen(), {}
+  for row, number in ipairs(t:view().numbers) do
+    if number == line then
+      out[#out + 1] = screen[row]
+    end
+  end
+  return out
 end
 
 --- How many painted rows buffer line `line` occupies.
@@ -31,9 +42,10 @@ local function rows_for(t, line)
 end
 
 btv.test.describe("examples/word-wrap", function()
-  btv.test.it("the config turns on all four settings", function(t)
+  btv.test.it("the config turns on all five settings", function(t)
     t:cmd("e " .. DIR .. "/sample.txt")
     btv.test.expect(btv.wo.wrap).to_be(true)
+    btv.test.expect(btv.wo.linebreak).to_be(true)
     btv.test.expect(btv.wo.breakindent).to_be(true)
     btv.test.expect(btv.o.showbreak).to_be("↪")
     btv.test.expect(btv.o.breakindentopt).to_be("sbr")
@@ -181,6 +193,37 @@ btv.test.describe("examples/word-wrap", function()
     btv.test.expect(second_row():sub(1, 4)).to_be("    ")
     t:cmd("setlocal nobreakindent")
     btv.test.expect(second_row():sub(1, 1)).never.to_be(" ")
+  end)
+
+  -- ":set nolinebreak — let a row fill to the last cell, splitting the word that
+  --  straddles it; `:set linebreak` folds it back whole"
+  btv.test.it("'linebreak' never cuts a word in half", function(t)
+    open(t)
+    t:cmd("enew!")
+    t:cmd("setlocal wrap nolinebreak nobreakindent showbreak= breakindentopt=")
+    -- The window's text width, read off a row that fills it edge to edge.
+    t:feed("i" .. string.rep("x", 400) .. "<Esc>")
+    local width = #rows_of(t, 1)[1]
+    btv.test.expect(width > 10).to_be(true)
+
+    -- A line whose last word straddles the edge: it starts one cell short of it.
+    t:cmd("enew!")
+    t:feed("i" .. string.rep("a", width - 2) .. " word<Esc>")
+    local rows = rows_of(t, 1)
+    btv.test.expect(rows[1]:sub(width - 1, width)).to_be(" w")
+    btv.test.expect(rows[2]:sub(1, 3)).to_be("ord")
+
+    -- With `'linebreak'` the whole word moves down; the blank it broke on stays.
+    t:cmd("setlocal linebreak")
+    rows = rows_of(t, 1)
+    btv.test.expect(rows[1]:sub(width - 2, width - 1)).to_be("a ")
+    btv.test.expect(rows[2]:sub(1, 4)).to_be("word")
+
+    -- A word too long to fit a row on its own still breaks at the edge, so it
+    -- fills its rows rather than leaving them blank.
+    t:cmd("enew!")
+    t:feed("i" .. string.rep("z", width * 2) .. "<Esc>")
+    btv.test.expect(#rows_of(t, 1)[1]).to_be(width)
   end)
 
   -- ":set wrap? — query the current value" / ":WrapReport — the same from Lua"

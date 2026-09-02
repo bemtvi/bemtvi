@@ -1491,7 +1491,8 @@ impl Editor {
 
     /// Set a boolean window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`). Recognizes `number` / `relativenumber` /
-    /// `cursorline` / `foldenable` / `wrap` / `breakindent` / `scrollanim`; a no-op
+    /// `cursorline` / `foldenable` / `wrap` / `linebreak` / `breakindent` /
+    /// `scrollanim`; a no-op
     /// for any other name or an unknown id. `0` is resolved to the focused window by
     /// the caller.
     pub fn set_window_option_bool(&mut self, id: WindowId, name: &str, value: bool) {
@@ -1505,6 +1506,7 @@ impl Editor {
             "cursorline" => w.options.cursorline = value,
             "foldenable" => w.options.foldenable = value,
             "wrap" => w.options.wrap = value,
+            "linebreak" => w.options.linebreak = value,
             "breakindent" => w.options.breakindent = value,
             // A per-window override of the global `'scrollanim'` (see
             // [`WindowOptions::scrollanim`]); `Some(value)` shadows the global until unset.

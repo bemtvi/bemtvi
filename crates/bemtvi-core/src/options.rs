@@ -846,6 +846,13 @@ pub struct WindowOptions {
     /// horizontally. `false` (bemtvi's historical `nowrap`) keeps one screen row per
     /// line and pans with `leftcol`. When on, `leftcol` is forced to 0.
     pub wrap: bool,
+    /// `'linebreak'` (abbrev `lbr`): break a soft-wrapped line at a blank rather than
+    /// at whatever grapheme happens to sit on the last cell, so a word is never cut in
+    /// half across two rows. Only takes effect with [`wrap`] on; off by default (vim's
+    /// default too). bemtvi breaks on **WORD** boundaries — spaces and tabs only —
+    /// where vim consults its `'breakat'` set and also splits at `-`, `.`, `/`, `,` …
+    /// inside a word; a word too long to fit a row on its own still breaks at the edge.
+    pub linebreak: bool,
     /// `'breakindent'`: indent each soft-wrap continuation row to match the start of
     /// the wrapped line, so the wrapped text reads as a hanging block under the
     /// line's own indent rather than starting at the window's left edge. Only takes
@@ -959,10 +966,11 @@ impl WindowOptions {
         self.breakindentopt.split(',').any(|f| f.trim() == "sbr")
     }
 
-    /// The soft-wrap continuation-prefix config bundled for the wrap helpers (borrows
-    /// `showbreak`). One place builds it from the window-local options.
-    pub fn wrap_prefix(&self) -> crate::unicode::WrapPrefix<'_> {
-        crate::unicode::WrapPrefix {
+    /// The soft-wrap config bundled for the wrap helpers (borrows `showbreak`). One
+    /// place builds it from the window-local options.
+    pub fn wrap_opts(&self) -> crate::unicode::WrapOpts<'_> {
+        crate::unicode::WrapOpts {
+            linebreak: self.linebreak,
             breakindent: self.breakindent,
             showbreak: self.showbreak.as_str(),
             sbr: self.breakindent_sbr(),
@@ -1058,8 +1066,10 @@ impl Default for WindowOptions {
             // bemtvi has historically been `nowrap`-only; wrap is opt-in (`:set wrap`)
             // so the existing horizontal-scroll behavior is the default.
             wrap: false,
-            // Wrap polish, all off / empty by default (continuation rows start at the
-            // left edge with no marker, matching vim's out-of-the-box look).
+            // Wrap polish, all off / empty by default (continuation rows break at the
+            // last cell that fits and start at the left edge with no marker, matching
+            // vim's out-of-the-box look).
+            linebreak: false,
             breakindent: false,
             showbreak: String::new(),
             breakindentopt: String::new(),
@@ -1734,6 +1744,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Window,
             doc: "When to draw the sign column: auto, yes, no, or number.",
+        },
+        OptionInfo {
+            name: "linebreak",
+            abbrev: Some("lbr"),
+            kind: Bool,
+            scope: Window,
+            doc: "Wrap long lines at a blank instead of cutting a word in half.",
         },
         OptionInfo {
             name: "breakindent",

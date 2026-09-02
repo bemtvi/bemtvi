@@ -330,13 +330,13 @@ impl Editor {
         }
         let tab = self.tabstop();
         let opts = &self.windows.cur().options;
-        let wp = opts.wrap_prefix();
+        let wo = opts.wrap_opts();
         let buf = self.buffer();
         // Segment a line with the window's `'breakindent'`/`'showbreak'` continuation
         // indent, so gj/gk step the same display rows the window renders.
         let segs_of = |text: &str| {
-            let indent = unicode::cont_indent(text, tab, width, wp);
-            unicode::wrap_segments_indented(text, tab, width, indent)
+            let indent = unicode::cont_indent(text, tab, width, wo);
+            unicode::wrap_segments_indented(text, tab, width, indent, wo.linebreak)
         };
         let seg_count = |line: usize| segs_of(&buf.line_cow(line)).len();
 
@@ -408,8 +408,9 @@ impl Editor {
         } else {
             let tab = self.tabstop();
             let opts = &self.windows.cur().options;
-            let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
-            let segs = unicode::wrap_segments_indented(&text, tab, width, indent);
+            let wo = opts.wrap_opts();
+            let indent = unicode::cont_indent(&text, tab, width, wo);
+            let segs = unicode::wrap_segments_indented(&text, tab, width, indent, wo.linebreak);
             let seg = segs
                 .iter()
                 .rposition(|s| self.cursor.col >= s.start_byte)

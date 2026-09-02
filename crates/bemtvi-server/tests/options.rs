@@ -1301,6 +1301,7 @@ async fn vim_opt_reaches_the_remaining_window_options() {
         r#"vim.opt.foldcolumn = 3
            vim.opt.foldlevel = 2
            vim.opt.foldenable = false
+           vim.opt.linebreak = true
            vim.opt.breakindent = true
            vim.opt.showbreak = "> "
            vim.opt.breakindentopt = "sbr"
@@ -1313,6 +1314,7 @@ async fn vim_opt_reaches_the_remaining_window_options() {
         ("foldcolumn?", "foldcolumn=3"),
         ("foldlevel?", "foldlevel=2"),
         ("foldenable?", "nofoldenable"),
+        ("linebreak?", "linebreak"),
         ("breakindent?", "breakindent"),
         ("showbreak?", "showbreak=> "),
         ("breakindentopt?", "breakindentopt=sbr"),
@@ -1340,7 +1342,7 @@ async fn the_window_mirror_carries_every_routed_window_option() {
     let (rpc, _incoming) = start().await;
     command(
         &rpc,
-        "set foldcolumn=3 foldlevel=2 nofoldenable breakindent",
+        "set foldcolumn=3 foldlevel=2 nofoldenable linebreak breakindent",
     )
     .await;
     // An escaped space keeps the marker's trailing blank in one `:set` token.
@@ -1356,7 +1358,8 @@ async fn the_window_mirror_carries_every_routed_window_option() {
         r#"local w = btv.win.current()
            return table.concat({
              tostring(btv.wo[w].foldcolumn), tostring(btv.wo[w].foldlevel),
-             tostring(btv.wo[w].foldenable), tostring(btv.wo[w].breakindent),
+             tostring(btv.wo[w].foldenable), tostring(btv.wo[w].linebreak),
+             tostring(btv.wo[w].breakindent),
              btv.wo[w].showbreak, btv.wo[w].breakindentopt,
              tostring(btv.wo[w].sidescroll), tostring(btv.wo[w].sidescrolloff),
              btv.wo[w].winhighlight,
@@ -1365,7 +1368,7 @@ async fn the_window_mirror_carries_every_routed_window_option() {
     .await;
     assert_eq!(
         out.as_str().unwrap_or_default(),
-        "3|2|false|true|> |sbr|7|4|Normal:NormalSB"
+        "3|2|false|true|true|> |sbr|7|4|Normal:NormalSB"
     );
 }
 

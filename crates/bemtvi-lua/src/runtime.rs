@@ -103,6 +103,9 @@ pub struct WindowMirror {
     /// `'fillchars'` as the raw `key:char` list string (empty ⇒ vim's default
     /// look), for `vim.wo`/`vim.o` read-back.
     pub fillchars: String,
+    /// `'linebreak'` — whether a soft-wrapped row breaks at a blank instead of
+    /// mid-word (so `vim.wo`/`vim.o` read it back).
+    pub linebreak: bool,
     /// `'breakindent'` — whether soft-wrap continuation rows keep the wrapped line's
     /// indent (so `vim.wo`/`vim.o` read it back).
     pub breakindent: bool,
@@ -523,6 +526,7 @@ pub struct WoGlobalMirror {
     pub relativenumber: bool,
     pub cursorline: bool,
     pub wrap: bool,
+    pub linebreak: bool,
     pub breakindent: bool,
     pub foldenable: bool,
     pub scrolloff: usize,

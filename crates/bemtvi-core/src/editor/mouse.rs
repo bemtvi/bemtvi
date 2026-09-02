@@ -2583,7 +2583,7 @@ impl Editor {
         let wrap = opts.wrap;
         let (text_width, _) = self.window_text_area(win)?;
         let width = text_width.saturating_sub(gutter);
-        let wp = opts.wrap_prefix();
+        let wo = opts.wrap_opts();
         let virt = buf.virt_lines_by_line();
 
         // Walk display rows from `top`, counting each buffer line's `virt_lines`
@@ -2599,7 +2599,7 @@ impl Editor {
                 // A cell below the last line lands on the last line's last segment
                 // (vim's "click past the buffer end" behavior).
                 line = line_count.saturating_sub(1);
-                let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wp);
+                let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wo);
                 seg = *segs.last().expect("wrap_segs is never empty");
                 indent = if seg.start_col > 0 { ci } else { 0 };
                 break;
@@ -2612,7 +2612,7 @@ impl Editor {
                 return Some((line, 0));
             }
             remaining -= above;
-            let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wp);
+            let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wo);
             if remaining < segs.len() {
                 seg = segs[remaining];
                 indent = if seg.start_col > 0 { ci } else { 0 };
@@ -2777,12 +2777,12 @@ fn wrap_segs(
     tabstop: usize,
     width: usize,
     wrap: bool,
-    wp: crate::unicode::WrapPrefix,
+    wo: crate::unicode::WrapOpts,
 ) -> (Vec<crate::unicode::WrapSeg>, usize) {
     if wrap && width > 0 {
-        let indent = crate::unicode::cont_indent(text, tabstop, width, wp);
+        let indent = crate::unicode::cont_indent(text, tabstop, width, wo);
         (
-            crate::unicode::wrap_segments_indented(text, tabstop, width, indent),
+            crate::unicode::wrap_segments_indented(text, tabstop, width, indent, wo.linebreak),
             indent,
         )
     } else {

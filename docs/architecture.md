@@ -769,7 +769,7 @@ cell (past a dock's title prefix) to a `(layer, tab)`. (Design:
 Already on `WindowOptions`: the number gutter (`number`/`relativenumber`/
 `numberwidth`), the
 cursor-line highlight (`cursorline`), soft word-wrap (`wrap`, with its `gj`/`gk`
-display motions, `breakindent`/`showbreak`), the horizontal-scroll options, and
+display motions, `linebreak`/`breakindent`/`showbreak`), the horizontal-scroll options, and
 the later arrivals — `scrolloff`, `signcolumn`, `colorcolumn`, `foldcolumn`,
 `fillchars`, `winhighlight`.
 Still pending: the long tail of vim's window-local options beyond those.
@@ -1318,7 +1318,7 @@ screen," and that is exactly the shape of these tests.
 - A broad options surface. `:set` exists and honors the search booleans, the
   **window-local** number-gutter options `number` / `relativenumber`, the
   cursor-line highlight `cursorline`, and soft word-wrap `wrap`
-  (`breakindent`/`showbreak`) (also via `:setlocal` / `vim.wo` /
+  (`linebreak`/`breakindent`/`showbreak`) (also via `:setlocal` / `vim.wo` /
   `nvim_win_{get,set}_option`) and the window-local
   horizontal-scroll options `sidescroll` / `sidescrolloff` (via `:set`), and the
   **buffer-local** indentation options `tabstop` / `shiftwidth` / `softtabstop` /

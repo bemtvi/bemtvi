@@ -14,6 +14,10 @@
 --   wrap         soft-wrap long lines onto continuation rows (`:set wrap` /
 --                `:set nowrap`). On by default here; off restores horizontal
 --                scrolling.
+--   linebreak    break a continuation row at a blank instead of at whatever
+--                character lands on the last cell, so a word is never cut in
+--                half. bemtvi breaks on WORD boundaries (spaces and tabs); a word
+--                too long to fit a row on its own still breaks at the edge.
 --   breakindent  indent each continuation row to match the wrapped line's own
 --                indent, so the folded text reads as a hanging block.
 --   showbreak    a marker drawn at the start of every continuation row.
@@ -35,6 +39,8 @@
 --                    within-row siblings of gj/gk), unlike 0/$ which act on the
 --                    whole buffer line
 --   g^               first non-blank of the display row
+--   :set nolinebreak     let a row fill to the last cell, splitting the word
+--                    that straddles it; `:set linebreak` folds it back whole
 --   :set nobreakindent   drop the hanging indent on continuation rows
 --   :set showbreak=     clear the continuation marker (set it with e.g.
 --                    `:set showbreak=↪`). `showbreak` is a STRING option, so
@@ -45,11 +51,14 @@
 --   <C-d> / <C-u>    half-page scroll — wrapped lines slide smoothly with the rest
 --   :WrapReport      re-run the query from Lua
 
--- `wrap` and its polish (`breakindent` / `showbreak`) live on the focused window
--- and are set through the `:set` ex path. Turn them on out of the box so the
--- sample's long paragraphs fold — indented, with a marker — immediately.
+-- `wrap` and its polish (`linebreak` / `breakindent` / `showbreak`) live on the
+-- focused window and are set through the `:set` ex path. Turn them on out of the
+-- box so the sample's long paragraphs fold — indented, with a marker, and never
+-- through the middle of a word — immediately.
 -- (`vim.cmd` queues the ex command into the core, the same route `:set` takes.)
 vim.cmd("set wrap")
+-- Fold whole words down instead of cutting one across two rows.
+vim.cmd("set linebreak")
 vim.cmd("set breakindent")
 vim.cmd("set showbreak=↪")
 -- `sbr`: keep the wrapped text aligned under the line's indent (the marker is drawn

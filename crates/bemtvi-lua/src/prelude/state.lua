@@ -1343,6 +1343,7 @@ local WIN_OPT_DEFAULT = {
   relativenumber = true,
   cursorline = false,
   wrap = false,
+  linebreak = false,
   scrolloff = 0,
   colorcolumn = "",
   scrollanim = true, -- resolved default before the mirror lands (global default is on)

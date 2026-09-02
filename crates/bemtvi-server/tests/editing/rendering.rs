@@ -1969,3 +1969,94 @@ async fn wo_wrap_funnel_actually_wraps_not_just_stores() {
     assert_eq!(lines[1].chars().count(), 80, "second wrap segment");
     assert_eq!(lines[2], "a".repeat(40), "remainder on the third row");
 }
+
+#[tokio::test]
+async fn linebreak_wraps_at_word_boundaries_instead_of_mid_word() {
+    // `:set linebreak` breaks a soft-wrapped row at a blank rather than at whatever
+    // grapheme lands on the last cell, so a word is never cut in half. The blanks stay
+    // on the row they ended (vim's behavior) and the whole word moves down together.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    // 20 × "alpha " = 120 cells in an 80-cell text area. Thirteen words fill 78 cells,
+    // so a plain wrap splits the fourteenth after its "al".
+    feed(&rpc, "i");
+    feed(&rpc, &"alpha ".repeat(20));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let lines = view_lines(&map);
+    assert_eq!(
+        &lines[0][..],
+        &format!("{}al", "alpha ".repeat(13)),
+        "without linebreak the row fills to the last cell, splitting a word"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, ":set linebreak<CR>").await;
+    let lines = view_lines(&map);
+    assert_eq!(
+        &lines[0][..],
+        &"alpha ".repeat(13),
+        "the split word moves down whole; its trailing blank stays on this row"
+    );
+    assert_eq!(
+        &lines[1][..],
+        &"alpha ".repeat(7),
+        "the continuation row starts at the word, not mid-word"
+    );
+
+    // The cursor's display-row math follows the same breaks: `gj` from the line start
+    // lands on the second display row, at the byte the wrapped word begins.
+    feed(&rpc, "gg0");
+    let map = redraw_after(&rpc, &mut incoming, "gj").await;
+    assert_eq!(view_u64(&map, "cursor_row"), 1, "second display row");
+    assert_eq!(
+        view_u64(&map, "cursor_col"),
+        78,
+        "at the start of the word that wrapped, not at cell 80"
+    );
+    assert_eq!(view_u64(&map, "cursor_screen_col"), 0);
+}
+
+#[tokio::test]
+async fn linebreak_hard_breaks_a_word_too_long_for_a_row() {
+    // A word with no blank before it in the row has nothing to back up to, so
+    // `'linebreak'` still breaks it at the window edge — an over-long token (a URL, a
+    // base64 blob) fills its rows instead of leaving them blank.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>:set linebreak<CR>",
+    );
+    feed(&rpc, "i");
+    feed(&rpc, &format!("hi {}", "z".repeat(200)));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let lines = view_lines(&map);
+    assert_eq!(
+        &lines[0][..],
+        "hi ",
+        "the over-long word starts its own row"
+    );
+    assert_eq!(
+        lines[1].chars().count(),
+        80,
+        "with no blank to break on the word fills the row edge to edge"
+    );
+    assert_eq!(
+        lines[1..4].iter().map(|l| l.chars().count()).sum::<usize>(),
+        200,
+        "nothing clipped off the right edge"
+    );
+
+    // Same for a word an *indent* alone precedes: backing up to it would leave a row
+    // holding nothing but the indent, so the row fills instead.
+    feed(&rpc, "o");
+    feed(&rpc, &format!("    {}", "z".repeat(200)));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let lines = view_lines(&map);
+    assert_eq!(
+        &lines[4][..],
+        &format!("    {}", "z".repeat(76)),
+        "the indent keeps its row; the word breaks at the edge"
+    );
+}

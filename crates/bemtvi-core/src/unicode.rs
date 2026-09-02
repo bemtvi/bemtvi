@@ -133,14 +133,18 @@ pub struct WrapSeg {
 /// documented v1 limitation. Leading indentation, the common case, sits on the
 /// first segment and is unaffected.)
 pub fn wrap_segments(line: &str, tabstop: usize, width: usize) -> Vec<WrapSeg> {
-    wrap_segments_indented(line, tabstop, width, 0)
+    wrap_segments_indented(line, tabstop, width, 0, false)
 }
 
-/// A window's soft-wrap continuation-prefix config — `'breakindent'`,
-/// `'showbreak'`, and the `'breakindentopt'` `sbr` flag — bundled so the wrap
-/// helpers thread one `Copy` value. Borrows the showbreak string.
+/// A window's soft-wrap config — where a row may break (`'linebreak'`) and the
+/// continuation prefix drawn once it does (`'breakindent'`, `'showbreak'`, and the
+/// `'breakindentopt'` `sbr` flag) — bundled so the wrap helpers thread one `Copy`
+/// value. Borrows the showbreak string.
 #[derive(Clone, Copy, Default)]
-pub struct WrapPrefix<'a> {
+pub struct WrapOpts<'a> {
+    /// `'linebreak'`: break a wrapped row at a blank rather than mid-word (see
+    /// [`wrap_segments_indented`]).
+    pub linebreak: bool,
     /// `'breakindent'`: indent continuation rows to the wrapped line's own indent.
     pub breakindent: bool,
     /// `'showbreak'`: the marker drawn at the start of each continuation row.
@@ -161,12 +165,12 @@ pub struct WrapPrefix<'a> {
 /// text aligns exactly under the indent. The total width is clamped to `width - 1` so
 /// a continuation row always keeps at least one text cell. Returns `("", 0)` when
 /// neither option applies (the common case), so callers add no prefix.
-pub fn break_prefix(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) -> (String, usize) {
-    if width == 0 || (!wp.breakindent && wp.showbreak.is_empty()) {
+pub fn break_prefix(line: &str, tabstop: usize, width: usize, wo: WrapOpts) -> (String, usize) {
+    if width == 0 || (!wo.breakindent && wo.showbreak.is_empty()) {
         return (String::new(), 0);
     }
-    let sbr_w = display_width(wp.showbreak);
-    let indent = if wp.breakindent {
+    let sbr_w = display_width(wo.showbreak);
+    let indent = if wo.breakindent {
         // Display width of the line's leading whitespace (the breakindent amount).
         let fnb = line.len() - line.trim_start_matches([' ', '\t']).len();
         virtcol(line, fnb, tabstop)
@@ -174,7 +178,7 @@ pub fn break_prefix(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) ->
         0
     };
     // vim's `bri`: the breakindent amount, reduced by the marker width under `sbr`.
-    let bri = if wp.sbr {
+    let bri = if wo.sbr {
         indent.saturating_sub(sbr_w)
     } else {
         indent
@@ -185,12 +189,12 @@ pub fn break_prefix(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) ->
     }
     // The marker fitted to at most `total` cells (truncated if it alone overflows),
     // and the breakindent spaces filling the rest.
-    let marker = truncate_to_width(wp.showbreak, tabstop, total);
+    let marker = truncate_to_width(wo.showbreak, tabstop, total);
     let marker_w = display_width(&marker);
     let spaces = " ".repeat(total - marker_w);
     // Draw order (see the doc / `drawline.c`): `sbr` → marker then indent; default →
     // indent then marker (the marker sits right before the wrapped text).
-    let prefix = if wp.sbr {
+    let prefix = if wo.sbr {
         format!("{marker}{spaces}")
     } else {
         format!("{spaces}{marker}")
@@ -215,11 +219,13 @@ fn truncate_to_width(s: &str, tabstop: usize, width: usize) -> String {
 
 /// The continuation-indent width [`wrap_segments_indented`] takes — the prefix cells
 /// reserved on each continuation row (see [`break_prefix`]).
-pub fn cont_indent(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) -> usize {
-    break_prefix(line, tabstop, width, wp).1
+pub fn cont_indent(line: &str, tabstop: usize, width: usize, wo: WrapOpts) -> usize {
+    break_prefix(line, tabstop, width, wo).1
 }
 
-/// [`wrap_segments`] with a `'breakindent'` / `'showbreak'` **continuation indent**:
+/// [`wrap_segments`] with a `'breakindent'` / `'showbreak'` **continuation indent**
+/// and vim's `'linebreak'` word-aware breaking.
+///
 /// `cont_indent` leading cells of every continuation row are reserved for the
 /// indent / marker prefix, so a continuation segment wraps into `width -
 /// cont_indent` text cells rather than the full `width`. The first segment keeps the
@@ -227,11 +233,21 @@ pub fn cont_indent(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) -> 
 /// row always keeps at least one text cell. `start_col` stays the segment's column
 /// in the original line grid (the prefix is not part of it — the caller bakes the
 /// prefix onto the row text and shifts overlays by `cont_indent` separately).
+///
+/// With `linebreak`, a row that would break mid-word backs up to the start of that
+/// word instead: the break lands right after the last **blank** run (space / tab) of
+/// the row, so the blanks stay on the row they ended and the whole word moves down
+/// together. bemtvi breaks on WORD boundaries — blanks only — where vim consults its
+/// `'breakat'` set (which also splits on `-`, `.`, `/`, … mid-word); a word with no
+/// blank before it in the row still hard-breaks at the edge, so an over-long word
+/// (a URL, a path) — or one that an indent alone precedes — fills its rows rather
+/// than leaving them empty.
 pub fn wrap_segments_indented(
     line: &str,
     tabstop: usize,
     width: usize,
     cont_indent: usize,
+    linebreak: bool,
 ) -> Vec<WrapSeg> {
     if width == 0 {
         return vec![WrapSeg {
@@ -247,6 +263,17 @@ pub fn wrap_segments_indented(
     let mut seg_start_col = 0;
     let mut col = 0;
     let mut byte = 0;
+    // `'linebreak'` bookkeeping, maintained as the walk goes so a break costs O(1)
+    // instead of re-scanning the row backwards (a long line wraps into many rows, and
+    // a backwards scan per row would make laying one out quadratic in its length):
+    // `word_start` is the first grapheme of the row's last word — the byte/column a
+    // break backs up to — `after_blank` remembers that the previous grapheme was a
+    // blank, so the *next* non-blank opens a new word, and `seen_word` gates the
+    // candidate on the row already holding a word, so backing up never leaves a row
+    // of nothing but the line's indent.
+    let mut word_start: Option<(usize, usize)> = None;
+    let mut after_blank = false;
+    let mut seen_word = false;
     for g in line.graphemes(true) {
         let w = grapheme_width(g, col, tabstop);
         // The current row's usable width: full for the first segment, reduced by the
@@ -259,13 +286,33 @@ pub fn wrap_segments_indented(
         // Break *before* a grapheme that would overflow the current row, but never
         // emit an empty row (so an over-wide grapheme still occupies its own row).
         if col + w > seg_start_col + avail && byte > seg_start_byte {
+            // Under `'linebreak'`, back the break up to the start of the word being
+            // split — but only when that word actually started inside this row, else
+            // there is nothing to move down and the row breaks at the edge.
+            let (brk_byte, brk_col) = match word_start {
+                Some(ws) if linebreak && ws.0 > seg_start_byte => ws,
+                _ => (byte, col),
+            };
             segs.push(WrapSeg {
                 start_byte: seg_start_byte,
-                end_byte: byte,
+                end_byte: brk_byte,
                 start_col: seg_start_col,
             });
-            seg_start_byte = byte;
-            seg_start_col = col;
+            seg_start_byte = brk_byte;
+            seg_start_col = brk_col;
+            // The word that moved down starts the new row, so it is no longer a break
+            // candidate; the next blank run opens the next one.
+            word_start = None;
+            seen_word = false;
+        }
+        if is_blank(g) {
+            after_blank = true;
+        } else {
+            if after_blank && seen_word {
+                word_start = Some((byte, col));
+            }
+            after_blank = false;
+            seen_word = true;
         }
         col += w;
         byte += g.len();
@@ -276,6 +323,12 @@ pub fn wrap_segments_indented(
         start_col: seg_start_col,
     });
     segs
+}
+
+/// Whether `g` is a blank — a space or a tab, vim's WORD separators. Judged on the
+/// grapheme's first char, so a space carrying combining marks still separates.
+fn is_blank(g: &str) -> bool {
+    matches!(g.chars().next(), Some(' ') | Some('\t'))
 }
 
 /// A byte-offset → virtual-column mapper for a single line that answers a

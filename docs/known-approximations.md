@@ -92,7 +92,7 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   **search** booleans (`ignorecase` / `smartcase` / `wrapscan` / `hlsearch` /
   `incsearch`); the **window-local rendering** options (`number` /
   `relativenumber` / `cursorline` / `numberwidth` / `signcolumn` / `wrap` /
-  `breakindent` / `showbreak` / `sidescroll` / `sidescrolloff` / `winhighlight` /
+  `linebreak` / `breakindent` / `showbreak` / `sidescroll` / `sidescrolloff` / `winhighlight` /
   `fillchars`); the **fold** options (`foldmethod` / `foldenable` / `foldcolumn` /
   `foldlevel`); the **buffer-local indentation** options (`tabstop` / `shiftwidth`
   / `softtabstop` / `expandtab` / `commentstring`); the **editing-feedback** pair

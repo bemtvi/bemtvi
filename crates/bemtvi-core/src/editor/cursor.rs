@@ -521,8 +521,9 @@ impl Editor {
         }
         let text = buf.line_cow(line);
         let tab = buf.options.effective_tabstop();
-        let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
-        unicode::wrap_segments_indented(&text, tab, width, indent).len()
+        let wo = opts.wrap_opts();
+        let indent = unicode::cont_indent(&text, tab, width, wo);
+        unicode::wrap_segments_indented(&text, tab, width, indent, wo.linebreak).len()
     }
 
     /// Which soft-wrap segment the cursor's column falls in (its display-row offset
@@ -539,8 +540,9 @@ impl Editor {
         let buf = self.buffer();
         let text = buf.line_cow(self.cursor.line);
         let tab = buf.options.effective_tabstop();
-        let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
-        let segs = unicode::wrap_segments_indented(&text, tab, width, indent);
+        let wo = opts.wrap_opts();
+        let indent = unicode::cont_indent(&text, tab, width, wo);
+        let segs = unicode::wrap_segments_indented(&text, tab, width, indent, wo.linebreak);
         segs.iter()
             .rposition(|s| self.cursor.col >= s.start_byte)
             .unwrap_or(0)

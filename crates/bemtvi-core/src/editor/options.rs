@@ -377,6 +377,7 @@ impl Editor {
             "cursorline" => Some(|o| &mut o.cursorline),
             "foldenable" => Some(|o| &mut o.foldenable),
             "wrap" => Some(|o| &mut o.wrap),
+            "linebreak" => Some(|o| &mut o.linebreak),
             "breakindent" => Some(|o| &mut o.breakindent),
             _ => None,
         };

@@ -67,19 +67,28 @@ pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-/// The number of display **rows** `lines` occupy when soft-wrapped to `width` columns:
-/// each line takes `ceil(display_width / width)` rows (at least one, so a blank line
-/// still costs a row), summed. This is the height a `wrap`ped float needs to show the
-/// content without clipping — a single long line (a reflowed markdown paragraph) spans
-/// several rows. With `wrap` off, or a zero width, it is just the line count (each line
-/// truncates to one row).
-pub fn wrapped_row_count(lines: &[String], width: usize, wrap: bool) -> usize {
+/// The number of display **rows** `lines` occupy when soft-wrapped to `width` columns
+/// — the height a `wrap`ped float needs to show the content without clipping, since a
+/// single long line (a reflowed markdown paragraph) spans several rows. Each line is
+/// segmented by [`wrap_segments_indented`], the same function that lays the rows out,
+/// so the count matches the paint exactly: `tabstop` expands tabs as the window will,
+/// and under `linebreak` a row that ends early to keep a word whole is still a row.
+/// (Counting `ceil(cells / width)` instead would under-count every such row and clip
+/// the tail of the float.) A blank line still costs its row. With `wrap` off, or a
+/// zero width, it is just the line count — each line truncates to one row.
+pub fn wrapped_row_count(
+    lines: &[String],
+    width: usize,
+    tabstop: usize,
+    wrap: bool,
+    linebreak: bool,
+) -> usize {
     if !wrap || width == 0 {
         return lines.len();
     }
     lines
         .iter()
-        .map(|l| display_width(l).max(1).div_ceil(width))
+        .map(|l| wrap_segments_indented(l, tabstop, width, 0, linebreak).len())
         .sum()
 }
 

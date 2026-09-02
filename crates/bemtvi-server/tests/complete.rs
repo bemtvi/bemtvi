@@ -1486,6 +1486,57 @@ btv.complete.setup {{ sources = {{ {{ 'doc' }} }} }}"
     );
 }
 
+/// A wrapped docs float wraps as **prose**: `'linebreak'` rides with the configured
+/// `docs_wrap`, so a docstring paragraph folds at the blanks instead of leaving half a
+/// word against the border, and the float is tall enough for the rows that costs.
+#[tokio::test]
+async fn a_wrapped_docs_float_breaks_at_word_boundaries() {
+    let dir = temp_dir("complete_docs_linebreak");
+    // 20 × "wombat " of one paragraph. Seven-cell words divide neither the 60-cell cap
+    // nor the narrower widths a tight screen leaves, so any row that ends mid-word is
+    // the wrap cutting one — not an artifact of the float's width.
+    let para = "wombat ".repeat(20);
+    let init = format!(
+        "\
+btv.complete.source {{\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push {{ text = 'hello', doc = '{para}' }}\n\
+    end\n\
+  end,\n\
+}}\n\
+btv.complete.setup {{ sources = {{ {{ 'doc' }} }} }}"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.contains("wombat"))
+    })
+    .await
+    .expect("docs float appears");
+
+    let body: Vec<String> = win_lines(&win)
+        .into_iter()
+        .filter(|l| l.contains("wombat"))
+        .collect();
+    for row in &body {
+        assert!(
+            row.split_whitespace().all(|w| w == "wombat"),
+            "every row holds whole words, got {row:?}"
+        );
+    }
+    assert_eq!(
+        body.iter()
+            .map(|r| r.split_whitespace().count())
+            .sum::<usize>(),
+        20,
+        "and every word is on screen — the float is sized to those rows: {body:?}"
+    );
+}
+
 /// `btv.complete.setup { docs_wrap = false }` is accepted (the configurable-wrap knob)
 /// and the docs float still opens beside the popup.
 #[tokio::test]

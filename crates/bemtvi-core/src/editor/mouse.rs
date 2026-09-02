@@ -2114,7 +2114,11 @@ impl Editor {
         // `docs_w` (a reflowed markdown paragraph is one long line) spans several rows, so
         // sizing to the raw line count would leave the body one row tall with the rest
         // clipped. Clamped to the cap and to the room below the float's top.
-        let docs_h = crate::unicode::wrapped_row_count(content_lines, docs_w, wrap)
+        // Counted with the settings the float itself carries — its scratch buffer's
+        // tabstop, and `linebreak` alongside `wrap` (a row that ends early to keep a word
+        // whole is still a row), so the box is as tall as what it paints.
+        let tabstop = self.doc_float_tabstop(super::float::COMPLETION_DOC_FLOAT);
+        let docs_h = crate::unicode::wrapped_row_count(content_lines, docs_w, tabstop, wrap, wrap)
             .min(MAX_DOCS_H)
             .min(bound_h.saturating_sub(content_row).saturating_sub(2).max(1));
         // The outer box (border included) sits one row/col out from the content, so the

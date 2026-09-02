@@ -171,6 +171,53 @@ fn win_rect(win: &[(Value, Value)], key: &str) -> u64 {
     }
 }
 
+/// The hover float wraps as **prose**: `'linebreak'` rides with `'wrap'`, so a
+/// paragraph folds at the blanks and never leaves half a word on the border. The float
+/// is sized to those rows too — keeping a word whole ends a row early, so a
+/// cell-count division under-counts the height and would clip the tail.
+#[tokio::test]
+async fn hover_wraps_at_word_boundaries_and_is_sized_to_those_rows() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_hover_linebreak");
+    // 45 × "wombat " = 315 cells of one paragraph in the 80-cell float: 11 whole words
+    // (77 cells) per row, so the rows break mid-word without `'linebreak'` — and there
+    // are 5 of them, one more than the 4 a `ceil(315 / 80)` height would reserve.
+    let long = "wombat ".repeat(45);
+    arm_mock(
+        &dir,
+        &format!(
+            r##"{{ "hover": {{ "contents": {{ "kind": "markdown", "value": "{long}" }} }} }}"##
+        ),
+    );
+    let (rpc, mut incoming) = open_rust(&dir).await;
+    exec_lua(
+        &rpc,
+        r#"
+        btv.lsp.config("mock", { cmd = { "placeholder" }, filetypes = { "rust" } })
+        btv.lsp.enable("mock")
+        "#,
+    )
+    .await;
+    let (lines, _) = await_hover(&rpc, &mut incoming, "wombat").await;
+
+    let body: Vec<&String> = lines.iter().filter(|l| l.contains("wombat")).collect();
+    for row in &body {
+        assert!(
+            row.split_whitespace().all(|w| w == "wombat"),
+            "every row holds whole words, got {row:?}"
+        );
+    }
+    assert_eq!(
+        body.iter()
+            .map(|r| r.split_whitespace().count())
+            .sum::<usize>(),
+        45,
+        "and the float is tall enough for all of them — nothing clipped: {body:?}"
+    );
+
+    std::env::remove_var("BEMTVI_LSP_CMD");
+}
+
 /// The hover float **wraps** (a long paragraph — one reflowed line, since markdown
 /// collapses its soft breaks — reads fully instead of truncating), and so it does NOT
 /// scroll horizontally: a horizontal wheel over it is a no-op (`leftcol` stays 0).

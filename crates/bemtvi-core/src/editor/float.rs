@@ -683,12 +683,16 @@ impl Editor {
             .max()
             .unwrap_or(1)
             .clamp(1, MAX_W) as u16;
-        // Height counts the **wrapped** display rows (`wrap` is on below): a line wider
-        // than the float — a reflowed markdown paragraph is one long line — spans several
-        // rows, so sizing to the raw line count would leave the body one row tall with
-        // the rest clipped. Clamp so a huge popup scrolls rather than filling the screen.
-        let height =
-            crate::unicode::wrapped_row_count(lines, width as usize, true).clamp(1, MAX_H) as u16;
+        // Height counts the **wrapped** display rows (`wrap` and `linebreak` are both on
+        // below): a line wider than the float — a reflowed markdown paragraph is one long
+        // line — spans several rows, so sizing to the raw line count would leave the body
+        // one row tall with the rest clipped. Counted with the float's own wrap settings,
+        // since `linebreak` ends a row early to keep a word whole and so needs *more*
+        // rows than a cell-count division would predict. Clamp so a huge popup scrolls
+        // rather than filling the screen.
+        let tabstop = self.doc_float_tabstop(name);
+        let height = crate::unicode::wrapped_row_count(lines, width as usize, tabstop, true, true)
+            .clamp(1, MAX_H) as u16;
         let cfg = FloatConfig {
             relative: FloatRelative::Cursor,
             anchor: FloatAnchor::NW,
@@ -711,8 +715,11 @@ impl Editor {
         // Wrap a line wider than the float within it (so a long hover paragraph — one
         // reflowed line since markdown collapses its soft breaks — reads fully) rather
         // than truncating at the edge; `wrap` also disables horizontal scroll, so the
-        // wheel only moves it vertically.
+        // wheel only moves it vertically. `linebreak` with it: prose is what these floats
+        // hold, and a hover paragraph cut mid-word at the border is what a reader trips
+        // over. The height above is counted with the same two settings.
         self.set_window_option_bool(win, "wrap", true);
+        self.set_window_option_bool(win, "linebreak", true);
         self.doc_float_wins.push((name.to_string(), win));
     }
 
@@ -813,7 +820,11 @@ impl Editor {
         self.load_str_into(buf, Some(CMDLINE_DOC_FLOAT.to_string()), &lines.join("\n"));
         self.buffers.get_mut(buf).buffer.options.modifiable = false;
         self.set_filetype(buf, "");
-        let height = lines.len().clamp(1, max_height.max(1)) as u16;
+        // Wrapped rows, not raw lines: with `wrap` on, a help line wider than the float
+        // spans several rows, and sizing to the line count would clip its tail.
+        let tabstop = self.doc_float_tabstop(CMDLINE_DOC_FLOAT);
+        let height = crate::unicode::wrapped_row_count(&lines, width as usize, tabstop, wrap, wrap)
+            .clamp(1, max_height.max(1)) as u16;
         self.place_doc_float_at(CMDLINE_DOC_FLOAT, buf, row, col, width, height, wrap);
     }
 
@@ -825,8 +836,9 @@ impl Editor {
     /// Open a doc float at an **absolute** editor cell (`FloatRelative::Editor`), the
     /// positioned twin of [`place_doc_float`](Self::place_doc_float) (which is
     /// cursor-relative). `row`/`col` are windows-area cells; `place_float` still clamps
-    /// the box fully on-screen. `wrap` sets the window's `wrap` option so a long line
-    /// wraps within the float rather than truncating.
+    /// the box fully on-screen. `wrap` sets the window's `wrap` (and `linebreak`)
+    /// options so a long line wraps within the float — at a blank, never mid-word —
+    /// rather than truncating.
     #[allow(clippy::too_many_arguments)]
     fn place_doc_float_at(
         &mut self,
@@ -851,6 +863,10 @@ impl Editor {
         };
         let win = self.open_float_window(buf, cfg, false);
         self.set_window_option_bool(win, "wrap", wrap);
+        // Wrapping these floats means wrapping them as prose: a docs paragraph reads
+        // worse cut mid-word than one row longer. Inert when `wrap` is off, and the
+        // callers' height math counts rows under the same pair.
+        self.set_window_option_bool(win, "linebreak", wrap);
         // The docs floats (completion / cmdline) render as ordinary float windows, so
         // they inherit the standard `NormalFloat`/`FloatBorder` chrome — the same look as
         // the LSP hover float, rather than the old `menu.docs` sidebar's cmp-specific
@@ -879,6 +895,19 @@ impl Editor {
         let id = self.add_buffer(Buffer::empty());
         self.doc_float_buffers.push((name.to_string(), id));
         id
+    }
+
+    /// The `'tabstop'` a doc float's scratch buffer expands tabs at — what the wrapped
+    /// **row count** must measure with, so the height a float is sized to is the height
+    /// it paints. Falls back to the global buffer-option tier for a surface whose buffer
+    /// has not been minted yet — which is exactly the tier it will be born from.
+    pub(crate) fn doc_float_tabstop(&self, name: &str) -> usize {
+        self.doc_float_buffers
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, b)| self.buffer_of(*b))
+            .map(|b| b.options.effective_tabstop())
+            .unwrap_or_else(|| self.buf_opts_global.effective_tabstop())
     }
 
     /// Close the doc-float window for surface `name` if open; the scratch buffer is

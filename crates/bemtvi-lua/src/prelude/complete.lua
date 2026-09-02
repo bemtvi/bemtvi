@@ -295,9 +295,9 @@ function btv.complete.setup(opts)
   if docs == nil then
     docs = true
   end
-  -- The docs float wraps a long doc line within itself by default; `docs_wrap = false`
-  -- truncates long lines at the float's edge instead. The wheel still scrolls it
-  -- vertically either way.
+  -- The docs float wraps a long doc line within itself by default — as prose, folding
+  -- at a blank rather than cutting a word in half; `docs_wrap = false` truncates long
+  -- lines at the float's edge instead. The wheel still scrolls it vertically either way.
   local docs_wrap = opts.docs_wrap
   if docs_wrap == nil then
     docs_wrap = true

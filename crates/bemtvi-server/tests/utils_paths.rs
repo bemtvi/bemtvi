@@ -8,11 +8,14 @@
 //! `btv.fs.which` settles OFF the editor tick (like every `btv.fs` op), so those tests
 //! queue the chain and poll the global it sets.
 
+#[cfg(unix)]
 use std::time::Duration;
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{exec_lua, start_attached, temp_dir};
+#[cfg(unix)]
+use bemtvi_test_harness::temp_dir;
+use bemtvi_test_harness::{exec_lua, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -27,6 +30,7 @@ async fn lua_str(rpc: &Rpc, code: &str) -> Option<String> {
 /// Poll a `return`-style chunk until it yields a non-nil value (~3s). An off-tick
 /// `btv.fs` op settles on a later tick, so the global its chain sets is nil until the
 /// loop processes the actor's result.
+#[cfg(unix)]
 async fn poll_settled(rpc: &Rpc, code: &str) -> rmpv::Value {
     for _ in 0..150 {
         let v = exec_lua(rpc, code).await;
@@ -243,6 +247,7 @@ async fn which_accepts_an_explicit_path_only_when_it_is_executable() {
 }
 
 /// A Lua single-quoted string literal for `path` (test paths have no quotes).
+#[cfg(unix)]
 fn lua_quote(s: &str) -> String {
     format!("'{s}'")
 }

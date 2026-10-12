@@ -151,6 +151,7 @@ fn a_checkout_does_not_delete_through_a_dotdot_index_path() {
 /// The same guard for an **absolute** index path: `/tmp/...` joined onto the
 /// worktree root is, in Rust's `Path::join`, simply the absolute path — the
 /// worktree root disappears entirely.
+#[cfg(unix)]
 #[test]
 fn a_checkout_does_not_delete_through_an_absolute_index_path() {
     let Some((base, repo, target)) = fixture("absolute") else {

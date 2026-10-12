@@ -24,6 +24,7 @@
 //! discipline holds the reply back — and it must run *before* the input
 //! `EventStream` exists, or the two race for the same bytes.
 
+#[cfg(unix)]
 use std::time::Duration;
 
 /// What the terminal said it can do — the answers to one round of questions.
@@ -118,6 +119,7 @@ pub(crate) fn probe() -> TermCaps {
 /// Konsole's sixel is buggy), so ratatui-image blacklists both — mirror that here,
 /// both to skip asking and to discard the device-attribute answer that arrives
 /// anyway (one `CSI c` answers the clipboard question too, so it is always sent).
+#[cfg(unix)]
 pub(crate) fn graphics_query_suppressed() -> bool {
     let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty());
     set("WEZTERM_EXECUTABLE") || set("KONSOLE_VERSION")

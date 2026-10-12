@@ -8,6 +8,9 @@
 //! deliberately crashing) "language server" script whose spawn count is the
 //! observable — each spawn appends one line to a log file.
 
+// Every case drives a shell-script "server" — unix only.
+#![cfg(unix)]
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -60,7 +63,6 @@ async fn settled_spawn_count(log: &Path) -> usize {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_given_up_server_is_respawned_by_a_later_start() {
     let dir = temp_dir("lsp-respawn");

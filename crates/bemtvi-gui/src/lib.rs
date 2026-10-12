@@ -1163,6 +1163,15 @@ impl App {
             // typing arriving as one string, not a paste, so it drives insert mode
             // normally (auto-pairs and the rest) rather than going in literally.
             SurfaceInput::Text(_) => self.send_keys(input),
+            // An input method's composition in progress: the surface is ours to draw,
+            // so the platform can't show it — paint it at the cursor until it's
+            // committed (a `Text`) or cancelled (an empty one).
+            SurfaceInput::Preedit { text, cursor } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_preedit(text, *cursor);
+                }
+                self.request_redraw();
+            }
             _ => {}
         }
     }

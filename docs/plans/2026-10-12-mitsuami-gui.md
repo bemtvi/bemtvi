@@ -93,7 +93,7 @@ here (no Qt). mitsuami's docs say so, as its rules ask.
 
 mitsuami's text input isn't in a release yet (crates.io has 1.1.0), so the root
 `Cargo.toml` takes it from GitHub, pinned to its commit on the pushed
-`gpu-surface-text-input` branch (`rev = "f0b571c…"`). Move to an exact `=x.y.z` once a
+`gpu-surface-text-input` branch (`rev = "751ae82…"`). Move to an exact `=x.y.z` once a
 release has it.
 
 ## Still open

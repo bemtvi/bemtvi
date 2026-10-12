@@ -376,6 +376,11 @@ pub struct Renderer {
     /// candidate window at the caret instead of the window origin.
     cursor_px: Option<(f32, f32)>,
 
+    /// An input method's composition in progress (the kana typed so far, the
+    /// candidate it would convert to) and its own caret, in bytes: painted at the
+    /// text cursor until it's committed or cancelled. See [`Renderer::set_preedit`].
+    preedit: Option<(String, Option<usize>)>,
+
     /// Reusable per-frame draw lists, kept across frames so their heap capacity
     /// survives instead of reallocating the lists from scratch each paint (a
     /// continuously-repainting scroll animation would otherwise re-grow them every
@@ -509,6 +514,7 @@ impl Renderer {
             line_height,
             scale,
             cursor_px: None,
+            preedit: None,
             frame_quads: Vec::new(),
             frame_items: Vec::new(),
             frame_overlay_quads: Vec::new(),
@@ -1103,6 +1109,62 @@ impl Renderer {
 
         // The global command / message line on the reserved bottom row.
         self.build_cmdline(view, cmd_row, quads, items);
+
+        // An input method's composition, over everything at the cursor it was
+        // captured at above (the window's, or the command line's).
+        self.build_preedit(view, overlay_quads, overlay_items);
+    }
+
+    /// Paint the input method's composition at the text cursor, as a text field
+    /// shows it until it's committed: its text over the cells there on `Normal`'s
+    /// background, underlined, with its own caret. The editor never sees it — the
+    /// committed text arrives as typed input — so nothing in the buffer moves. Kept
+    /// on screen, shifted left if it would run off the right edge. Nothing while no
+    /// cursor is shown (a picker or panel owns it).
+    fn build_preedit(&mut self, view: &View, quads: &mut Vec<Quad>, items: &mut Vec<TextItem>) {
+        let Some((text, cursor)) = self.preedit.clone() else {
+            return;
+        };
+        let Some((x, y)) = self.cursor_px else {
+            return;
+        };
+        let (cell_w, cell_h) = (self.cell_w, self.cell_h);
+        let width = text.width().max(1) as f32 * cell_w;
+        let x = x.min(self.config.width as f32 - width).max(0.0);
+        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+        let bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
+        let line = (cell_h / 16.0).round().max(1.0);
+        quads.push(Quad {
+            x,
+            y,
+            w: width,
+            h: cell_h,
+            color: srgb_to_color_rgba(bg, 1.0),
+        });
+        quads.push(Quad {
+            x,
+            y: y + cell_h - line,
+            w: width,
+            h: line,
+            color: srgb_to_color_rgba(fg, 1.0),
+        });
+        if let Some(at) = cursor.filter(|&at| text.is_char_boundary(at)) {
+            quads.push(Quad {
+                x: x + text[..at].width() as f32 * cell_w,
+                y,
+                w: line * 2.0,
+                h: cell_h,
+                color: srgb_to_color_rgba(fg, 1.0),
+            });
+        }
+        let bounds = self.full_bounds();
+        self.push_plain(items, &text, (x, y), fg, bounds);
+    }
+
+    /// Set (or, with empty `text`, clear) the input method's composition painted at
+    /// the text cursor; `cursor` is its own caret, in bytes into `text`.
+    pub fn set_preedit(&mut self, text: &str, cursor: Option<usize>) {
+        self.preedit = (!text.is_empty()).then(|| (text.to_owned(), cursor));
     }
 
     /// `'colorcolumn'` rulers: a 1-cell vertical tint behind the text body at each

@@ -997,6 +997,7 @@ pub fn sweep_stale_temp_roots() -> usize {
 /// permission checks without delivering a signal; `EPERM` means the process
 /// exists but belongs to someone else, which still counts as alive (and means
 /// its root is not ours to remove).
+#[cfg(unix)]
 fn process_is_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -1005,6 +1006,35 @@ fn process_is_alive(pid: i32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether `pid` names a live process, on Windows: a process that can be opened
+/// and hasn't exited (`STILL_ACTIVE`). Access denied means it exists but belongs
+/// to someone else, which still counts as alive, as `EPERM` does above.
+#[cfg(windows)]
+fn process_is_alive(pid: i32) -> bool {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ACCESS_DENIED: i32 = 5;
+    const STILL_ACTIVE: u32 = 259;
+    if pid <= 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if process.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(ACCESS_DENIED);
+    }
+    let mut code = 0;
+    let alive = unsafe { GetExitCodeProcess(process, &mut code) } != 0 && code == STILL_ACTIVE;
+    unsafe { CloseHandle(process) };
+    alive
 }
 
 /// A unique suffix (`<pid>_<n>_<rand>`) for temp paths, stable within a test

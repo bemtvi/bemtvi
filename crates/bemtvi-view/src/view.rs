@@ -1148,6 +1148,18 @@ impl View {
         self.mode_label == "REPLACE" || self.pending_replace
     }
 
+    /// Whether keys type text right now rather than run commands: insert, replace,
+    /// select and terminal modes, the command line, and a picker's query. A GUI
+    /// turns the platform's input methods on only then: in normal mode a Japanese
+    /// IME would turn `hjkl` into kana.
+    pub fn types_text(&self) -> bool {
+        matches!(
+            self.mode_label.as_str(),
+            "INSERT" | "REPLACE" | "SELECT" | "TERMINAL"
+        ) || self.command_mode
+            || self.menu.as_ref().is_some_and(|m| m.query.is_some())
+    }
+
     /// Whether the editor is in multi-cursor *placement* mode, mirrored from the
     /// server's `mode_label`. The renderer recolors the active (primary) cursor
     /// while it's here, signaling that motions drop cursors rather than edit.

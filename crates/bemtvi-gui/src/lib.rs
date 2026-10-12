@@ -728,10 +728,12 @@ struct App {
     redraw: Rc<tokio::sync::Notify>,
     /// The window's own state, made in its reactive scope: whether it's open (closing
     /// it ends the app), the pointer's cursor over the surface (a resize arrow over a
-    /// split separator) and the caret the input method's candidate window opens by.
+    /// split separator), the caret the input method's candidate window opens by, and
+    /// whether input methods are on (only while keys type text: [`View::types_text`]).
     open: Option<Signal<bool>>,
     cursor: Option<Signal<Cursor>>,
     caret: Option<Signal<Option<Rect>>>,
+    input_method: Option<Signal<bool>>,
     /// The modifiers held with the latest input — a wheel or button carries its own,
     /// and `send_mouse` reports them.
     mods: Modifiers,
@@ -830,6 +832,7 @@ impl App {
                 open: None,
                 cursor: None,
                 caret: None,
+                input_method: None,
                 mods: Modifiers::default(),
                 scale: 1.0,
                 cursor_px: (0.0, 0.0),
@@ -862,11 +865,13 @@ impl App {
         let open = signal(true);
         let cursor = signal(Cursor::Default);
         let caret = signal(None::<Rect>);
+        let input_method = signal(false);
         {
             let mut app = this.borrow_mut();
             app.open = Some(open);
             app.cursor = Some(cursor);
             app.caret = Some(caret);
+            app.input_method = Some(input_method);
         }
         let app = this.clone();
         spawn_local(async move {
@@ -904,8 +909,11 @@ impl App {
                         .node_ref(surface)
                         .size(100.pct(), 100.pct())
                         // Text as a text field takes it: layouts, dead keys, AltGr and
-                        // input methods (composed accents, CJK) all type.
+                        // input methods (composed accents, CJK) all type — input methods
+                        // only while keys type text, not in normal mode, where they're
+                        // commands.
                         .text_input(true)
+                        .input_method(input_method)
                         .text_cursor(caret)
                         .cursor(cursor)
                         .on_ready(move |handle| ready.borrow_mut().surface = Some(handle))
@@ -1022,6 +1030,7 @@ impl App {
         match event {
             UserEvent::Redraw(view) => {
                 self.view = *view;
+                self.update_input_method();
                 // A changed `guifont` re-shapes the renderer (and re-reports the
                 // grid) before this frame paints.
                 if self.view.guifont != self.applied_guifont {
@@ -1328,6 +1337,25 @@ impl App {
                 app.arm_flush_deadline();
             }
         });
+    }
+
+    /// Turn the platform's input methods on while keys type text (insert mode, the
+    /// command line, a picker's query) and off while they're commands. A composition
+    /// still showing as they go off is dropped.
+    fn update_input_method(&mut self) {
+        let Some(input_method) = self.input_method else {
+            return;
+        };
+        let on = self.view.types_text();
+        if input_method.get_untracked() == on {
+            return;
+        }
+        input_method.set(on);
+        if !on {
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_preedit("", None);
+            }
+        }
     }
 
     /// Set the just-painted caret rect as the surface's caret, so the platform opens

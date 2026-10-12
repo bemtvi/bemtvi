@@ -511,6 +511,11 @@ pub struct View {
     /// right instead of being shrunk into its own. Empty means the client's own setting.
     /// Frontend-agnostic — the TUI ignores it (the terminal draws its own glyphs).
     pub guiglyphoverflow: String,
+    /// `'imdisable'`, relayed from the server: whether a GUI keeps the platform's
+    /// input method (IME) off. Off by default, so input methods compose in every
+    /// mode until a config turns them off. The TUI ignores it (the terminal owns
+    /// the IME).
+    pub imdisable: bool,
     /// `'timeout'` — whether an ambiguous mapped prefix resolves on idle (the
     /// client arms its `timeoutlen` flush timer) or waits forever for the next key
     /// (`notimeout` → the client never arms it, so a which-key popup stays up).
@@ -922,6 +927,7 @@ impl View {
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
         self.guiglyphoverflow = map_str(map, "guiglyphoverflow");
+        self.imdisable = map_get(map, "imdisable").and_then(Value::as_bool) == Some(true);
         // The mapping-timeout config drives the client's idle-flush timer (below).
         // An older server omits these — fall back to vim's defaults (timeout on,
         // 1000ms) so the flush still fires; `notimeout` (false) disarms it entirely.
@@ -1146,18 +1152,6 @@ impl View {
     /// cursor shape, matching vim's replace/operator-pending feedback.
     pub fn is_replace(&self) -> bool {
         self.mode_label == "REPLACE" || self.pending_replace
-    }
-
-    /// Whether keys type text right now rather than run commands: insert, replace,
-    /// select and terminal modes, the command line, and a picker's query. A GUI
-    /// turns the platform's input methods on only then: in normal mode a Japanese
-    /// IME would turn `hjkl` into kana.
-    pub fn types_text(&self) -> bool {
-        matches!(
-            self.mode_label.as_str(),
-            "INSERT" | "REPLACE" | "SELECT" | "TERMINAL"
-        ) || self.command_mode
-            || self.menu.as_ref().is_some_and(|m| m.query.is_some())
     }
 
     /// Whether the editor is in multi-cursor *placement* mode, mirrored from the

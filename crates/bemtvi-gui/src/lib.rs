@@ -729,7 +729,7 @@ struct App {
     /// The window's own state, made in its reactive scope: whether it's open (closing
     /// it ends the app), the pointer's cursor over the surface (a resize arrow over a
     /// split separator), the caret the input method's candidate window opens by, and
-    /// whether input methods are on (only while keys type text: [`View::types_text`]).
+    /// whether input methods are on (unless `'imdisable'`: [`View::imdisable`]).
     open: Option<Signal<bool>>,
     cursor: Option<Signal<Cursor>>,
     caret: Option<Signal<Option<Rect>>>,
@@ -865,7 +865,7 @@ impl App {
         let open = signal(true);
         let cursor = signal(Cursor::Default);
         let caret = signal(None::<Rect>);
-        let input_method = signal(false);
+        let input_method = signal(true);
         {
             let mut app = this.borrow_mut();
             app.open = Some(open);
@@ -910,8 +910,7 @@ impl App {
                         .size(100.pct(), 100.pct())
                         // Text as a text field takes it: layouts, dead keys, AltGr and
                         // input methods (composed accents, CJK) all type — input methods
-                        // only while keys type text, not in normal mode, where they're
-                        // commands.
+                        // unless a config sets `'imdisable'`.
                         .text_input(true)
                         .input_method(input_method)
                         .text_cursor(caret)
@@ -1339,14 +1338,13 @@ impl App {
         });
     }
 
-    /// Turn the platform's input methods on while keys type text (insert mode, the
-    /// command line, a picker's query) and off while they're commands. A composition
-    /// still showing as they go off is dropped.
+    /// Turn the platform's input methods off while `'imdisable'` is set, and back on
+    /// as it's unset. A composition still showing as they go off is dropped.
     fn update_input_method(&mut self) {
         let Some(input_method) = self.input_method else {
             return;
         };
-        let on = self.view.types_text();
+        let on = !self.view.imdisable;
         if input_method.get_untracked() == on {
             return;
         }

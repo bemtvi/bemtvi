@@ -1039,7 +1039,9 @@ the TUI is the client. [mitsuami](https://mitsuami.roboport.com.br) shows the wi
 with each platform's own toolkit (AppKit, WinUI 3, GTK 4 or Kirigami), its whole content
 a `GpuSurface` that wgpu presents to; the surface reports keys (where they are, what they
 typed through the platform's text input — layouts, dead keys, AltGr, input methods), the
-pointer, and takes the cursor and the IME caret. mitsuami owns the main thread, so the RPC
+pointer, and takes the cursor and the IME caret. Input methods are on unless the relayed
+`'imdisable'` is set; a config turns them off from a keymap or a `ModeChanged` autocmd
+(`examples/input-method`). mitsuami owns the main thread, so the RPC
 runs on a separate IO thread that decodes each `redraw` into a `View` and sends it over a
 channel a UI-thread task drains, while input goes the other way on a cloned `Rpc` handle
 (`notify` is synchronous, no runtime). Rendering is a monospace

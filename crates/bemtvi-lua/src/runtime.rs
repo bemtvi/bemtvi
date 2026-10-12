@@ -571,6 +571,9 @@ pub struct GoMirror {
     /// `'guiglyphoverflow'` — when a square one-cell glyph may render over the cell to
     /// its right. Backs `vim.o.guiglyphoverflow` / `btv.o.guiglyphoverflow`.
     pub guiglyphoverflow: String,
+    /// `'imdisable'` — whether the GUI keeps its input method (IME) off. Backs
+    /// `vim.o.imdisable` / `btv.o.imdisable`.
+    pub imdisable: bool,
     /// The `'regexsyntax'` dialect (`"pcre"`/`"vim"`) backing `vim.o.regexsyntax`.
     pub regexsyntax: String,
     /// The `'fileencodings'` read-detection list (comma-separated) backing

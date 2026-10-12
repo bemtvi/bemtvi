@@ -1,0 +1,7 @@
+Try the input method here.
+
+  first line
+  second line
+  third line
+
+日本語のテキスト

@@ -4073,7 +4073,7 @@ dependencies = [
 [[package]]
 name = "mitsuami"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "mitsuami-appkit",
  "mitsuami-core",
@@ -4087,7 +4087,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-appkit"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "block2",
  "dispatch2",
@@ -4105,7 +4105,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-core"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "fluent-bundle",
  "fluent-langneg",
@@ -4120,7 +4120,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-gtk"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -4133,7 +4133,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-linux"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "mitsuami-core",
  "wayland-backend",
@@ -4145,7 +4145,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-macros"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "fluent-syntax",
  "proc-macro2",
@@ -4157,7 +4157,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-reactive"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "slotmap",
 ]
@@ -4165,7 +4165,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-widgets"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "mitsuami-core",
  "mitsuami-reactive",
@@ -4174,7 +4174,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-winui"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=3bf962d3f5f61727c4ccedc776f2a868408199f2#3bf962d3f5f61727c4ccedc776f2a868408199f2"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=2d0fe2106237f4382e55413540d8dded4bf6d193#2d0fe2106237f4382e55413540d8dded4bf6d193"
 dependencies = [
  "mitsuami-core",
  "mitsuami-widgets",

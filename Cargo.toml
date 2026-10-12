@@ -132,9 +132,10 @@ base64 = "=0.22.1"
 # `glyphon::`). glyphon 0.11 builds against wgpu 29 — bump the two together (glyphon
 # 0.12 wants wgpu 30 but is newer than our 2-week-old dependency floor). `pollster`
 # blocks on wgpu's async device/adapter requests while the surface is set up.
-# mitsuami 1.2.0 (text input on a `GpuSurface`) isn't released yet: see the
-# `[patch.crates-io]` at the end of this file.
-mitsuami = "=1.2.0"
+# mitsuami's `GpuSurface` text input isn't in a release yet (crates.io has 1.1.0), so
+# it's pinned to the commit on its `gpu-surface-text-input` branch; move to `=x.y.z`
+# once a release has it.
+mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "e9d906b9b767d4492becc77f4f1156248cdf8f2a" }
 wgpu = "=29.0.4"
 glyphon = "=0.11.0"
 # Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:
@@ -288,10 +289,3 @@ split-debuginfo = "unpacked"
 lto = "thin"
 codegen-units = 1
 strip = true
-
-# TEMPORARY: mitsuami 1.2.0, with the `GpuSurface` text input bemtvi-gui needs, isn't
-# on crates.io yet, so it comes from a local checkout. This path only exists on the
-# maintainer's machine: CI and other machines can't build the workspace until the
-# release is out and this patch is removed (docs/plans/2026-10-12-mitsuami-gui.md).
-[patch.crates-io]
-mitsuami = { path = "C:/Users/david/work/mitsuami/crates/mitsuami" }

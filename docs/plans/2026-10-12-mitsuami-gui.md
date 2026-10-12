@@ -91,10 +91,10 @@ here (no Qt). mitsuami's docs say so, as its rules ask.
 
 ## Dependency
 
-mitsuami 1.2.0 (with text input) isn't on crates.io (it has 1.1.0), so the root
-`Cargo.toml` pins `mitsuami = "=1.2.0"` and a `[patch.crates-io]` points it at the local
-checkout. That path exists only on the maintainer's machine: CI and other machines can't
-build the workspace until the release is published and the patch removed.
+mitsuami's text input isn't in a release yet (crates.io has 1.1.0), so the root
+`Cargo.toml` takes it from GitHub, pinned to its commit on the pushed
+`gpu-surface-text-input` branch (`rev = "e9d906b…"`). Move to an exact `=x.y.z` once a
+release has it.
 
 ## Still open
 

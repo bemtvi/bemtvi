@@ -90,7 +90,7 @@ subsystems:
 | `bemtvi-lsp`     | `lsp/`                                                | The native **LSP client**: protocol, transport, manager — bemtvi's own stdio spawning, driving the in-core editing features. `bemtvi-server/src/lsp/` is the editing-loop glue on top. |
 | `bemtvi-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C (engine-global mutex): Lua's `vim.regex` / `vim.fn.substitute`, and `/` search + `:s` under `:set regexsyntax=vim`. |
 | `bemtvi-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
-| `bemtvi-gui`     | (a GUI frontend)                                     | The native GUI **client** on winit + wgpu + glyphon; the GUI sibling of `bemtvi-tui`, consuming the same `View`. |
+| `bemtvi-gui`     | (a GUI frontend)                                     | The native GUI **client** on mitsuami + wgpu + glyphon; the GUI sibling of `bemtvi-tui`, consuming the same `View`. |
 | `bemtvi-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
 | `bemtvi-width`   | —                                                    | `unicode-segmentation` + `unicode-width` as a bare ~70 KB wasm module, so the web client's DOM renderer measures grapheme clusters with the **same crates and pinned versions** the server's `unicode::virtcol` does. That renderer runs on the main thread while the edit-host runs in a Worker, so it cannot call the editor; before this it mirrored the width tables in JS, which could drift on a dependency bump. Loaded by `web/width.js`, built by `bemtvi-edithost/build.sh`. |
 | `bemtvi-test-harness` | —                                               | The shared black-box integration-test harness (a `publish = false` dev-dependency of `bemtvi` and `bemtvi-server`): spawns a real server over an in-process RPC pipe and drives it as a UI client would. See [*Testing philosophy*](#testing-philosophy). |
@@ -1028,17 +1028,21 @@ notably a non-terminal GUI on Windows — is just another client crate consuming
 the same `View` protocol, with zero changes to the server or core.
 
 That claim is now load-bearing: **`bemtvi-gui` is a native GUI client**
-([`crates/bemtvi-gui`](../crates/bemtvi-gui)) on **winit + wgpu + glyphon**. It is
+([`crates/bemtvi-gui`](../crates/bemtvi-gui)) on **mitsuami + wgpu + glyphon**. It is
 the GUI sibling of `bemtvi-tui` and reuses the same frontend-neutral
 [`bemtvi-view`](../crates/bemtvi-view) decode/input layer (`View`, `Style`, `Key`,
 `notation`, `encode_text`, `encode_paste`) — the seam the view crate was extracted
 for. The
 `bemtvi-gui` *binary* embeds a server on its own thread exactly like the default
 `bemtvi` binary, joined by the same in-process duplex RPC; the only difference from
-the TUI is the client. winit owns the main thread (its loop is not async), so the RPC runs on a
-separate IO thread that decodes each `redraw` into a `View` and forwards it to
-the event loop via an `EventLoopProxy`, while input goes the other way on a cloned
-`Rpc` handle (`notify` is synchronous, no runtime). Rendering is a monospace
+the TUI is the client. [mitsuami](https://mitsuami.roboport.com.br) shows the window
+with each platform's own toolkit (AppKit, WinUI 3, GTK 4 or Kirigami), its whole content
+a `GpuSurface` that wgpu presents to; the surface reports keys (where they are, what they
+typed through the platform's text input — layouts, dead keys, AltGr, input methods), the
+pointer, and takes the cursor and the IME caret. mitsuami owns the main thread, so the RPC
+runs on a separate IO thread that decodes each `redraw` into a `View` and sends it over a
+channel a UI-thread task drains, while input goes the other way on a cloned `Rpc` handle
+(`notify` is synchronous, no runtime). Rendering is a monospace
 **cell grid**: a tiny solid-quad wgpu pipeline paints the backgrounds, selection,
 search, status bars and cursor, with a glyphon text layer (syntax-colored from the
 server's resolved `styles`) on top; the cell size is measured once from the font.
@@ -1056,8 +1060,8 @@ the inserted width, the GUI analogue of the TUI's inline splice), the secondary
 multi-cursors, and the text style attributes (bold/italic via bold and
 italic faces, underline/strikethrough/reverse as quads) — plus **pixel-smooth
 scrolling**: the focused window slides the server's scroll-gesture band at a
-fractional (sub-pixel) line offset driven by the client clock, paced per frame from
-winit's `about_to_wait` (where the TUI animates at whole-row granularity, the GPU
+fractional (sub-pixel) line offset driven by the client clock, repainted every frame
+by the client's paint loop while it runs (where the TUI animates at whole-row granularity, the GPU
 client interpolates `top` without rounding). Input reaches parity too:
 vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse**
 — left click / drag-select / release, wheel scroll, right-click
@@ -1069,7 +1073,7 @@ landed too (CJK cell-snapping, an emoji mask/scale pass that keeps the grid). St
 deferred: undercurl is drawn as a plain underline.
 Because the GUI can't be black-box
 tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
-frontend-specific translation layers have Tier-1 tests — the winit→notation input
+frontend-specific translation layers have Tier-1 tests — the surface key→notation input
 (`crates/bemtvi-gui/tests/keys.rs`), the pointer math
 (`crates/bemtvi-gui/tests/mouse.rs`), and the `:connect` target / `bemtvi://` URI / SSH
 askpass parsing (`crates/bemtvi-gui/tests/remote.rs`); the rendered frame, and the live

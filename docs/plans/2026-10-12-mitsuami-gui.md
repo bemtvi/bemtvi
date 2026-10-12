@@ -25,7 +25,7 @@ bemtvi.
 | `Ime::Commit` (dead keys, CJK input methods) | — | **yes** |
 | `set_ime_allowed` / `set_ime_cursor_area` | — | **yes** |
 | `rfd` open/save dialogs (blocking, unparented) | `open_file` / `save_file` services (async, on the window) | — |
-| `arboard` clipboard read | unchanged (not winit) | — |
+| `arboard` clipboard read | `clipboard_text` service | — |
 
 So the one gap is **text input on a `GpuSurface`** — mitsuami's own docs list it as "Not
 yet" (ARCHITECTURE.md §13.26). Its surface reports keys only by where they are on the
@@ -68,26 +68,39 @@ here (no Qt). mitsuami's docs say so, as its rules ask.
 - Repaints are coalesced: `request_redraw()` sets a flag and queues one paint task; the
   scroll slide re-requests every 8 ms while it runs; the `timeoutlen` flush and the
   drag auto-scroll are `sleep` tasks re-armed by each event.
-- Keys: named keys from `KeyCode`; typed text from `text` (fed through `encode_key`'s
-  single-char path, so `<` and specials stay escaped); chords (Control / Alt, Option on
+- Keys: named keys from `KeyCode`; typed text from `text` (one character through
+  `notation`, so `<` stays escaped, several through `encode_text`); chords (Control / Alt, Option on
   macOS) from `unmodified`; AltGr is a key that typed text with Control+Alt held
   (Windows), so it types. IME commits (`SurfaceInput::Text`) go through `encode_text`.
-- Native open/save dialogs move from `rfd` to mitsuami's (async, parented). `rfd` stays
-  only for the ssh askpass helper, which runs before any window exists.
+- Native open/save dialogs move from `rfd` to mitsuami's (async, parented), and the
+  paste gesture reads mitsuami's clipboard instead of `arboard`; both crates leave the
+  workspace (the ssh askpass helper shells out to the platform's prompt tools).
+- On Windows the renderer asks wgpu for Direct3D 12 unless `WGPU_BACKEND` says otherwise:
+  the surface is a child window, where mitsuami saw Vulkan on NVIDIA stall on resizes.
 - Tier-1 tests (`tests/keys.rs`, `tests/mouse.rs`) move from winit types to mitsuami's.
-- Docs: architecture.md's GUI section; the crate description.
+- Docs: architecture.md's GUI section, the README, the crate description, CI's Linux
+  GUI build deps (`libgtk-4-dev`, `libadwaita-1-dev`).
 
 ## Phases
 
 1. **mitsuami: text input on `GpuSurface`** — core, widgets, headless, test kit, all four
-   backends, tests, docs. Committed in the mitsuami repo. *Pause for review.*
+   backends, tests, docs. Committed in the mitsuami repo (`gpu-surface-text-input`).
+   *Done; reviewed.*
 2. **bemtvi-gui on mitsuami** — the port above, depending on the local mitsuami. Committed
    in bemtvi. *Pause for review.*
 
-## Open questions
+## Dependency
 
-- How bemtvi depends on mitsuami until a release has text input: crates.io has 1.1.0;
-  the work needs the local tree. A `[patch.crates-io]` to the checkout works locally but
-  not in CI.
-- Linux packaging: GTK 4.10+ and libadwaita 1.4+ (or Qt 6.5 + Kirigami) become build and
-  run-time requirements of the AppImage. Windows needs the Windows App Runtime 2.4+.
+mitsuami 1.2.0 (with text input) isn't on crates.io (it has 1.1.0), so the root
+`Cargo.toml` pins `mitsuami = "=1.2.0"` and a `[patch.crates-io]` points it at the local
+checkout. That path exists only on the maintainer's machine: CI and other machines can't
+build the workspace until the release is published and the patch removed.
+
+## Still open
+
+- The Linux AppImage: GTK 4.10+ and libadwaita 1.4+ are now run-time requirements, and
+  linuxdeploy may need its GTK plugin; CI's glibc-floor build (`cargo-zigbuild`) against
+  the system GTK hasn't been tried. Windows needs the Windows App Runtime 2.4+.
+- Verified here on Windows only (WinUI): the window, rendering at 1.5× scale, typing
+  (including an input method's commit), `:wq` and exit. macOS and Linux builds of
+  bemtvi-gui haven't been built.

@@ -1,184 +1,299 @@
-//! Tier 1: the winit `Key` + modifiers -> vim key-notation translation, tested
-//! as the public function the client uses. Black-box, no window, no GPU — the
-//! GUI analogue of `bemtvi-tui`'s `keys` test.
+//! Tier 1: the surface's key events (mitsuami's `SurfaceInput`) -> vim key-notation
+//! translation, tested as the public function the client uses. Black-box, no
+//! window, no GPU — the GUI analogue of `bemtvi-tui`'s `keys` test.
 
 use bemtvi_gui::{
-    altgr_composed, dialog_action, encode_key, encode_paste, encode_text, is_paste,
-    open_dialog_verb, open_path_command, parse_guifont, save_dialog_needed, DialogAction,
-    GuiConfig,
+    dialog_action, encode_input, encode_paste, encode_text, is_paste, open_dialog_verb,
+    open_path_command, parse_guifont, save_dialog_needed, DialogAction, GuiConfig,
 };
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use mitsuami::prelude::{KeyCode, Modifiers, SurfaceInput};
 
-fn note(key: Key, mods: ModifiersState) -> Option<String> {
-    encode_key(&key, mods)
+const NONE: Modifiers = Modifiers {
+    shift: false,
+    control: false,
+    alt: false,
+    meta: false,
+};
+const SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ..NONE
+};
+const CONTROL: Modifiers = Modifiers {
+    control: true,
+    ..NONE
+};
+const ALT: Modifiers = Modifiers { alt: true, ..NONE };
+const META: Modifiers = Modifiers { meta: true, ..NONE };
+const CONTROL_ALT: Modifiers = Modifiers {
+    control: true,
+    alt: true,
+    ..NONE
+};
+
+/// A key going down at `code`, which typed `text` (as the platform's text input
+/// gave it) and types `unmodified` with no modifiers in the keyboard's layout.
+fn press(
+    code: KeyCode,
+    text: Option<&str>,
+    unmodified: Option<char>,
+    mods: Modifiers,
+) -> SurfaceInput {
+    SurfaceInput::Key {
+        code,
+        native: 0,
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+        text: text.map(str::to_owned),
+        unmodified,
+    }
 }
 
-fn ch(c: &str) -> Key {
-    Key::Character(c.into())
+fn note(input: SurfaceInput) -> Option<String> {
+    encode_input(&input, false)
+}
+
+/// A key that types no character (Escape, an arrow, …).
+fn named(code: KeyCode, mods: Modifiers) -> Option<String> {
+    note(press(code, None, None, mods))
 }
 
 #[test]
 fn plain_char_is_itself() {
-    assert_eq!(note(ch("a"), ModifiersState::empty()).as_deref(), Some("a"));
+    assert_eq!(
+        note(press(KeyCode::KeyA, Some("a"), Some('a'), NONE)).as_deref(),
+        Some("a")
+    );
 }
 
 #[test]
 fn shifted_char_passes_through() {
-    // winit folds Shift into the character payload, so it arrives uppercased and
-    // is sent literally (no separate modifier).
-    assert_eq!(note(ch("A"), ModifiersState::SHIFT).as_deref(), Some("A"));
+    // The platform folds Shift into the text, so it arrives uppercased and is sent
+    // literally (no separate modifier).
+    assert_eq!(
+        note(press(KeyCode::KeyA, Some("A"), Some('a'), SHIFT)).as_deref(),
+        Some("A")
+    );
+    assert_eq!(
+        note(press(KeyCode::Digit1, Some("!"), Some('1'), SHIFT)).as_deref(),
+        Some("!")
+    );
 }
 
 #[test]
 fn special_keys_use_angle_notation() {
+    assert_eq!(named(KeyCode::Escape, NONE).as_deref(), Some("<Esc>"));
+    assert_eq!(named(KeyCode::Enter, NONE).as_deref(), Some("<CR>"));
+    assert_eq!(named(KeyCode::NumpadEnter, NONE).as_deref(), Some("<CR>"));
+    assert_eq!(named(KeyCode::Backspace, NONE).as_deref(), Some("<BS>"));
+    assert_eq!(named(KeyCode::Tab, NONE).as_deref(), Some("<Tab>"));
     assert_eq!(
-        note(Key::Named(NamedKey::Escape), ModifiersState::empty()).as_deref(),
-        Some("<Esc>")
-    );
-    assert_eq!(
-        note(Key::Named(NamedKey::Enter), ModifiersState::empty()).as_deref(),
-        Some("<CR>")
-    );
-    assert_eq!(
-        note(Key::Named(NamedKey::Backspace), ModifiersState::empty()).as_deref(),
-        Some("<BS>")
-    );
-    assert_eq!(
-        note(Key::Named(NamedKey::Tab), ModifiersState::empty()).as_deref(),
-        Some("<Tab>")
-    );
-    assert_eq!(
-        note(Key::Named(NamedKey::Space), ModifiersState::empty()).as_deref(),
+        note(press(KeyCode::Space, Some(" "), Some(' '), NONE)).as_deref(),
         Some(" ")
     );
 }
 
 #[test]
 fn shift_tab_is_s_tab_notation() {
-    // winit reports Shift+Tab as `Tab` with the SHIFT modifier (it doesn't fold a
-    // named key the way it folds a character). Shift must be notated for named keys
-    // so it reaches the server as `<S-Tab>` (the cmdline wildmenu / snippet tabstop
-    // backward key); previously the GUI dropped the modifier and sent a plain `<Tab>`.
-    assert_eq!(
-        note(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).as_deref(),
-        Some("<S-Tab>")
-    );
+    // Shift+Tab types nothing: it's `Tab` with Shift held. Shift must be notated for
+    // named keys so it reaches the server as `<S-Tab>` (the cmdline wildmenu /
+    // snippet tabstop backward key), not a plain `<Tab>`.
+    assert_eq!(named(KeyCode::Tab, SHIFT).as_deref(), Some("<S-Tab>"));
 }
 
 #[test]
 fn ctrl_and_alt_get_prefixed() {
+    // A chord types nothing; its character is the key's own in the layout.
     assert_eq!(
-        note(ch("w"), ModifiersState::CONTROL).as_deref(),
+        note(press(KeyCode::KeyW, None, Some('w'), CONTROL)).as_deref(),
         Some("<C-w>")
     );
-    assert_eq!(note(ch("x"), ModifiersState::ALT).as_deref(), Some("<A-x>"));
+    assert_eq!(
+        note(press(KeyCode::KeyX, None, Some('x'), ALT)).as_deref(),
+        Some("<A-x>")
+    );
+    // The layout's character, not the key's US place: the key right of Tab is `z`
+    // on a German keyboard, so Ctrl+that key is `<C-z>`.
+    assert_eq!(
+        note(press(KeyCode::KeyY, None, Some('z'), CONTROL)).as_deref(),
+        Some("<C-z>")
+    );
+    // Shift with a chord is its own modifier (`<C-S-c>`), as the TUI's kitty path has it.
+    assert_eq!(
+        note(press(
+            KeyCode::KeyC,
+            None,
+            Some('c'),
+            Modifiers {
+                shift: true,
+                ..CONTROL
+            }
+        ))
+        .as_deref(),
+        Some("<C-S-c>")
+    );
+}
+
+#[test]
+fn alt_chord_ignores_text_the_toolkit_reports_with_it() {
+    // Some toolkits (Qt) report the letter as text with Alt held. Alt+x is still the
+    // `<A-x>` chord, not typing.
+    assert_eq!(
+        note(press(KeyCode::KeyX, Some("x"), Some('x'), ALT)).as_deref(),
+        Some("<A-x>")
+    );
 }
 
 #[test]
 fn ctrl_chords_that_alias_a_named_key_stay_ctrl_chords() {
-    // winit reports Ctrl+I / Ctrl+M / Ctrl+[ / Ctrl+H as the base `Character` +
-    // CONTROL — distinct from `NamedKey::Tab`/`Enter`/`Escape`/`Backspace` — so the
-    // GUI sends `<C-i>` &c., not the named twin. A native window always disambiguates,
-    // and the client declares the keyboard protocol active at attach, so the server
-    // keeps these apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>` (see the keymap tests).
-    assert_eq!(
-        note(ch("i"), ModifiersState::CONTROL).as_deref(),
-        Some("<C-i>")
-    );
-    assert_eq!(
-        note(ch("m"), ModifiersState::CONTROL).as_deref(),
-        Some("<C-m>")
-    );
-    assert_eq!(
-        note(ch("["), ModifiersState::CONTROL).as_deref(),
-        Some("<C-[>")
-    );
-    assert_eq!(
-        note(ch("h"), ModifiersState::CONTROL).as_deref(),
-        Some("<C-h>")
-    );
+    // Ctrl+I / Ctrl+M / Ctrl+[ / Ctrl+H are their own keys with Control, distinct from
+    // Tab/Enter/Escape/Backspace — so the GUI sends `<C-i>` &c., not the named twin. A
+    // native window always disambiguates, and the client declares the keyboard
+    // protocol active at attach, so the server keeps these apart from
+    // `<Tab>`/`<CR>`/`<Esc>`/`<BS>` (see the keymap tests).
+    for (code, c, want) in [
+        (KeyCode::KeyI, 'i', "<C-i>"),
+        (KeyCode::KeyM, 'm', "<C-m>"),
+        (KeyCode::BracketLeft, '[', "<C-[>"),
+        (KeyCode::KeyH, 'h', "<C-h>"),
+    ] {
+        assert_eq!(
+            note(press(code, None, Some(c), CONTROL)).as_deref(),
+            Some(want)
+        );
+    }
     // ...while the named keys themselves are still their own notation.
+    assert_eq!(named(KeyCode::Tab, NONE).as_deref(), Some("<Tab>"));
+}
+
+#[test]
+fn several_typed_characters_are_sent_literally() {
+    // A dead key that doesn't compose with the next key types both (`´` then `x`
+    // types `´x`): the whole text must reach the server verbatim — not be silently
+    // truncated to the first char.
     assert_eq!(
-        note(Key::Named(NamedKey::Tab), ModifiersState::empty()).as_deref(),
-        Some("<Tab>")
+        note(press(KeyCode::KeyX, Some("´x"), Some('x'), NONE)).as_deref(),
+        Some("´x")
+    );
+    // `<` is still escaped so several characters can't smuggle a `<...>` form.
+    assert_eq!(
+        note(press(KeyCode::KeyA, Some("a<b"), Some('a'), NONE)).as_deref(),
+        Some("a<lt>b")
     );
 }
 
 #[test]
-fn multi_char_character_is_sent_literally() {
-    // Some layouts / compose fallbacks deliver several characters in one keystroke
-    // (winit's `Key::Character` is a string, not a char). The whole payload must
-    // reach the server verbatim — not be silently truncated to the first char.
+fn dead_keys_type_once_composed() {
+    // The dead key itself types nothing; the next key types the composed letter.
     assert_eq!(
-        note(ch("日本"), ModifiersState::empty()).as_deref(),
-        Some("日本")
+        note(press(KeyCode::BracketLeft, None, Some('´'), NONE)),
+        None
     );
-    // `<` is still escaped so a multi-char payload can't smuggle a `<...>` form.
     assert_eq!(
-        note(ch("a<b"), ModifiersState::empty()).as_deref(),
-        Some("a<lt>b")
+        note(press(KeyCode::KeyE, Some("é"), Some('e'), NONE)).as_deref(),
+        Some("é")
     );
 }
 
 #[test]
 fn literal_less_than_is_escaped() {
     assert_eq!(
-        note(ch("<"), ModifiersState::empty()).as_deref(),
+        note(press(KeyCode::Comma, Some("<"), Some(','), SHIFT)).as_deref(),
         Some("<lt>")
     );
 }
 
 #[test]
 fn navigation_keys_use_angle_notation() {
+    assert_eq!(named(KeyCode::ArrowLeft, NONE).as_deref(), Some("<Left>"));
     assert_eq!(
-        note(Key::Named(NamedKey::ArrowLeft), ModifiersState::empty()).as_deref(),
-        Some("<Left>")
-    );
-    assert_eq!(
-        note(Key::Named(NamedKey::PageDown), ModifiersState::empty()).as_deref(),
+        named(KeyCode::PageDown, NONE).as_deref(),
         Some("<PageDown>")
     );
-}
-
-#[test]
-fn altgr_composition_is_typing_not_a_chord() {
-    // Windows reports AltGr as Ctrl+Alt: `AltGr+E` on a European layout arrives as
-    // `Character("€")` with CONTROL|ALT set. The layout *composed* the key
-    // (logical ≠ un-modified base), so it is typing — the client must send the €,
-    // not the `<C-A-e>` chord that would swallow it.
-    let ca = ModifiersState::CONTROL | ModifiersState::ALT;
-    assert!(altgr_composed(&ch("€"), &ch("e"), ca));
-    assert!(altgr_composed(&ch("@"), &ch("q"), ca)); // AltGr+Q on German layouts
-
-    // A real Ctrl+Alt chord composes nothing: logical == base → chord behavior.
-    assert!(!altgr_composed(&ch("e"), &ch("e"), ca));
-    // Shift folds into the logical character ("#" from "3"), so a difference under
-    // Ctrl+Alt+Shift proves nothing — the chord keeps chord behavior.
-    assert!(!altgr_composed(
-        &ch("#"),
-        &ch("3"),
-        ca | ModifiersState::SHIFT
-    ));
-    // CapsLock uppercases the logical key; a case-only difference isn't composition.
-    assert!(!altgr_composed(&ch("A"), &ch("a"), ca));
-    // Ctrl-only / Alt-only combos are never AltGr.
-    assert!(!altgr_composed(&ch("€"), &ch("e"), ModifiersState::CONTROL));
-    assert!(!altgr_composed(&ch("€"), &ch("e"), ModifiersState::ALT));
-    // Named keys can't be composed characters.
-    assert!(!altgr_composed(
-        &Key::Named(NamedKey::Tab),
-        &Key::Named(NamedKey::Tab),
-        ca
-    ));
-}
-
-#[test]
-fn bare_modifier_is_dropped() {
-    // A lone modifier key (Control pressed by itself) has no editor meaning.
     assert_eq!(
-        note(Key::Named(NamedKey::Control), ModifiersState::empty()),
-        None
+        named(KeyCode::ArrowLeft, CONTROL).as_deref(),
+        Some("<C-Left>")
     );
+}
+
+#[test]
+fn altgr_typing_is_typing_not_a_chord() {
+    // Windows reports AltGr as Ctrl+Alt: `AltGr+E` on a European layout arrives with
+    // CONTROL|ALT set — but the platform says it *typed* `€`. That's typing: the
+    // client must send the €, not the `<C-A-e>` chord that would swallow it.
+    assert_eq!(
+        note(press(KeyCode::KeyE, Some("€"), Some('e'), CONTROL_ALT)).as_deref(),
+        Some("€")
+    );
+    // AltGr+Q on ABNT2 types `/`; with Shift too (AltGr+Shift) it's still typing.
+    assert_eq!(
+        note(press(KeyCode::KeyQ, Some("/"), Some('q'), CONTROL_ALT)).as_deref(),
+        Some("/")
+    );
+    assert_eq!(
+        note(press(
+            KeyCode::KeyQ,
+            Some("Q"),
+            Some('q'),
+            Modifiers {
+                shift: true,
+                ..CONTROL_ALT
+            }
+        ))
+        .as_deref(),
+        Some("Q")
+    );
+    // A real Ctrl+Alt chord types nothing → chord behavior.
+    assert_eq!(
+        note(press(KeyCode::KeyE, None, Some('e'), CONTROL_ALT)).as_deref(),
+        Some("<C-A-e>")
+    );
+}
+
+#[test]
+fn macos_option_makes_chords() {
+    // On macOS Option composes (Option+C types `ç`), but `<A-c>` bindings must work
+    // there too: with `option_chords`, Option is a chord of the key's own character.
+    let option_c = press(KeyCode::KeyC, Some("ç"), Some('c'), ALT);
+    assert_eq!(encode_input(&option_c, true).as_deref(), Some("<A-c>"));
+    // Elsewhere a Ctrl+Alt key that typed text is AltGr typing; on macOS Control+
+    // Option is a chord too.
+    let control_option = press(KeyCode::KeyE, Some("´"), Some('e'), CONTROL_ALT);
+    assert_eq!(
+        encode_input(&control_option, true).as_deref(),
+        Some("<C-A-e>")
+    );
+}
+
+#[test]
+fn input_method_commits_are_typed() {
+    assert_eq!(
+        note(SurfaceInput::Text("日本".to_owned())).as_deref(),
+        Some("日本")
+    );
+    assert_eq!(
+        note(SurfaceInput::Text("<".to_owned())).as_deref(),
+        Some("<lt>")
+    );
+}
+
+#[test]
+fn bare_modifier_release_and_command_chords_are_dropped() {
+    // A lone modifier key (Control pressed by itself) has no editor meaning.
+    assert_eq!(named(KeyCode::ControlLeft, CONTROL), None);
+    // Nor does a release.
+    let release = SurfaceInput::Key {
+        code: KeyCode::KeyA,
+        native: 0,
+        pressed: false,
+        repeat: false,
+        modifiers: NONE,
+        text: None,
+        unmodified: Some('a'),
+    };
+    assert_eq!(note(release), None);
+    // Command (macOS) / Super chords type nothing and aren't vim keys.
+    assert_eq!(note(press(KeyCode::KeyC, None, Some('c'), META)), None);
 }
 
 #[test]
@@ -310,29 +425,29 @@ fn config_font_takes_a_comma_separated_fallback_list() {
 #[test]
 fn paste_gestures_are_recognized_and_dont_shadow_ctrl_v() {
     // Cmd+V (macOS), Ctrl+Shift+V (Linux/Windows), and Shift+Insert all paste.
-    assert!(is_paste(&ch("v"), ModifiersState::SUPER));
+    assert!(is_paste(KeyCode::KeyV, Some('v'), META));
     assert!(is_paste(
-        &ch("V"),
-        ModifiersState::CONTROL | ModifiersState::SHIFT
+        KeyCode::KeyV,
+        Some('v'),
+        Modifiers {
+            shift: true,
+            ..CONTROL
+        }
     ));
-    assert!(is_paste(
-        &Key::Named(NamedKey::Insert),
-        ModifiersState::SHIFT
-    ));
+    assert!(is_paste(KeyCode::Insert, None, SHIFT));
+    // V is the layout's: on Dvorak it's where US has `.`.
+    assert!(is_paste(KeyCode::Period, Some('v'), META));
     // Plain `v`, vim's `<C-v>` (literal-insert / blockwise visual), and a bare
     // Insert must NOT be treated as paste.
-    assert!(!is_paste(&ch("v"), ModifiersState::empty()));
-    assert!(!is_paste(&ch("v"), ModifiersState::CONTROL));
-    assert!(!is_paste(
-        &Key::Named(NamedKey::Insert),
-        ModifiersState::empty()
-    ));
+    assert!(!is_paste(KeyCode::KeyV, Some('v'), NONE));
+    assert!(!is_paste(KeyCode::KeyV, Some('v'), CONTROL));
+    assert!(!is_paste(KeyCode::Insert, None, NONE));
 }
 
 #[test]
 fn ime_committed_text_encodes_multibyte_verbatim() {
-    // Composed/non-ASCII input (dead-key accents, AltGr, CJK) arrives as an
-    // `Ime::Commit`, which the GUI feeds through `encode_text`. The committed
+    // Several typed characters (a dead key that didn't compose, an input method's
+    // commit, CJK) go through `encode_text`. The committed
     // characters — including multibyte ones — must reach the server byte-for-byte,
     // not be stripped to a base key or mangled.
     assert_eq!(encode_text("é"), "é");

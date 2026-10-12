@@ -39,11 +39,15 @@ prerelease built from `main`). Binaries are published for five targets:
 | macOS   | `x86_64` / `aarch64` (`.pkg`, signed & notarized) | `x86_64` / `aarch64` (`.dmg`)   |
 | Windows | `x86_64` (`.zip`)               | `x86_64` (`.zip`)                |
 
+The GUI uses each platform's own toolkit through [mitsuami](https://mitsuami.roboport.com.br):
+on Linux it needs GTK 4.10+ and libadwaita 1.4+, and on Windows the
+[Windows App Runtime](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) 2.4+.
+
 Then run it on a file (the argument is optional):
 
 ```sh
 bemtvi file.txt        # terminal editor
-bemtvi-gui file.txt    # native GUI (winit + wgpu)
+bemtvi-gui file.txt    # native GUI (mitsuami + wgpu)
 ```
 
 Downloads ship with checksums and SLSA build provenance — see
@@ -311,7 +315,7 @@ is [**Beyond vim: what bemtvi adds**](docs/features.md); the highlights:
   keeps the placed cursors and returns to Normal, where motions and edits act on
   **every** cursor at once; a second `<Esc>` collapses back to one. Cursors are
   extmarks, so they stay correct across edits and ride undo/redo for free.
-- **A native GUI client.** `bemtvi-gui` (winit + wgpu) is a first-party GPU
+- **A native GUI client.** `bemtvi-gui` (mitsuami + wgpu) is a first-party GPU
   client — not a third-party frontend — rendering the same `View` the terminal
   client does. It wires the OS's **native file dialogs** into the command line
   (a GUI-only affordance; the server stays unaware):
@@ -433,7 +437,7 @@ The short version:
 | `bemtvi-lsp`      | The native LSP client (protocol, transport, manager) — bemtvi's own stdio spawning. |
 | `bemtvi-regex`    | The vendored vim regexp engine (`regexp.c` as C), shared by search and `:s`. |
 | `bemtvi-tui`      | The terminal UI client (ratatui + crossterm). Owns no editor state.         |
-| `bemtvi-gui`      | Native GUI client (winit + wgpu + glyphon).                                 |
+| `bemtvi-gui`      | Native GUI client (mitsuami + wgpu + glyphon).                              |
 | `bemtvi-edithost` | Fully client-side WebAssembly build of the whole editor (core + Lua + server tick, in a Web Worker; no server). Excluded from the workspace. |
 | `bemtvi-view`     | Frontend-neutral decode/input layer shared by the native clients.           |
 | `bemtvi`          | The `nvim`-style entry point: wires an embedded server + the TUI client.    |

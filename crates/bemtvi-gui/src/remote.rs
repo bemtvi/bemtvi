@@ -274,7 +274,7 @@ pub fn ssh_daemon_command(spec: &RemoteSpec) -> Command {
 // `run_askpass_if_invoked` first thing: in helper mode it pops a native dialog and
 // exits, never starting the editor. This makes host-key acceptance and
 // password/passphrase entry work from a desktop launch with no controlling terminal —
-// the dialogs shell out to the platform's prompt tool (no winit), so the helper process
+// the dialogs shell out to the platform's prompt tool (no window toolkit), so the helper process
 // needs no GPU/window.
 
 /// Env var `ssh_daemon_command` sets on the spawned `ssh`, inherited by the askpass

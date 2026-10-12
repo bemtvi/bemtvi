@@ -14,11 +14,11 @@ use crate::view::{View, WindowRegion};
 /// The cursor a client shows over a draggable separator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeCursor {
-    /// A vertical divider — dragging it resizes widths (CSS `col-resize`, winit
-    /// `EwResize`).
+    /// A vertical divider — dragging it resizes widths (CSS `col-resize`, the
+    /// GUI's `ResizeEastWest` cursor).
     Col,
-    /// A horizontal divider — dragging it resizes heights (CSS `row-resize`, winit
-    /// `NsResize`).
+    /// A horizontal divider — dragging it resizes heights (CSS `row-resize`, the
+    /// GUI's `ResizeNorthSouth` cursor).
     Row,
 }
 

@@ -26,7 +26,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use bemtvi_view::{
     doc_box, elide_middle, fit_row, gutter_cell, pmenu_row, pmenu_start, row_head_col,
@@ -39,10 +38,10 @@ use glyphon::{
     fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
+use mitsuami::prelude::{SurfaceHandle, SurfaceSize};
 use unicode_script::Script;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use winit::window::Window;
 
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
 use crate::{GlyphOverflow, GuiConfig};
@@ -391,24 +390,35 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Build the renderer for `window`, rendering with `config`'s font family and
-    /// size. Blocks on wgpu's async adapter/device requests via `pollster` (we are
-    /// on the synchronous winit setup path).
+    /// Build the renderer for the editor's `surface` (mitsuami's `GpuSurface`) at
+    /// `size`, rendering with `config`'s font family and size. Blocks on wgpu's async
+    /// adapter/device requests via `pollster` (the surface is set up on the UI thread,
+    /// which is outside any async runtime).
     pub fn new(
-        window: Arc<Window>,
+        surface: SurfaceHandle,
+        size: SurfaceSize,
         cfg: &GuiConfig,
         fetch_tx: tokio::sync::mpsc::UnboundedSender<crate::ImageFetch>,
         decode_tx: tokio::sync::mpsc::UnboundedSender<crate::DecodeReq>,
     ) -> anyhow::Result<Self> {
-        let size = window.inner_size();
-        let scale = window.scale_factor() as f32;
+        let scale = if size.scale > 0.0 { size.scale } else { 1.0 };
 
         // wgpu 29's `InstanceDescriptor` gained a `display` handle field and lost its
         // `Default` impl; `new_without_display_handle_from_env()` is the equivalent of
         // the old `::default()` — no display handle, backend picked from the env.
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let surface = instance.create_surface(window)?;
+        #[allow(unused_mut)]
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        // On Windows the surface is a child window of the WinUI window. Vulkan on NVIDIA
+        // sometimes drops a child window's surface to 2 frames a second on fast resizes,
+        // which Direct3D 12 never did (mitsuami's ARCHITECTURE.md §13.26), so it's
+        // Direct3D 12 unless `WGPU_BACKEND` asks for another.
+        #[cfg(windows)]
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            descriptor.backends = wgpu::Backends::DX12;
+        }
+        let instance = wgpu::Instance::new(descriptor);
+        // The handle keeps the native surface alive for as long as the wgpu surface.
+        let surface = instance.create_surface(surface)?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
@@ -585,8 +595,9 @@ impl Renderer {
     }
 
     /// The absolute screen cell `(col, row)` a physical-pixel pointer position
-    /// falls in, using the measured cell size. The event loop turns winit's
-    /// `CursorMoved` pixels into the cell the server's mouse hit-test expects.
+    /// falls in, using the measured cell size. The client turns the surface's
+    /// pointer moves (points × scale) into the cell the server's mouse hit-test
+    /// expects.
     pub fn cell_at(&self, x: f64, y: f64) -> (u16, u16) {
         crate::mouse::cell_at(x, y, self.cell_w, self.cell_h)
     }
@@ -615,7 +626,7 @@ impl Renderer {
 
     /// The text cursor's cell rect in physical pixels `(x, y, w, h)` from the last
     /// painted frame, or `None` when no cursor was shown. The client feeds this to
-    /// `Window::set_ime_cursor_area` so the IME candidate window opens at the caret.
+    /// the surface's `text_cursor` so the IME candidate window opens at the caret.
     pub fn ime_cursor_area(&self) -> Option<(f32, f32, f32, f32)> {
         self.cursor_px
             .map(|(x, y)| (x, y, self.cell_w, self.cell_h))
@@ -630,8 +641,8 @@ impl Renderer {
         }
         let (w, h) = (width.min(self.max_dim), height.min(self.max_dim));
         if (w, h) == (self.config.width, self.config.height) {
-            return; // unchanged — skip the swapchain reconfigure (winit can
-                    // re-report the same size on focus/DPI churn)
+            return; // unchanged — skip the swapchain reconfigure (a scale change
+                    // can re-report the same size)
         }
         self.config.width = w;
         self.config.height = h;

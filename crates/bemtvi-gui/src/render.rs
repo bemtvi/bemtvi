@@ -2378,7 +2378,7 @@ impl Renderer {
         let mut col = x0;
         if !title.is_empty() && col < right {
             let text = format!(" {title} ");
-            let w = text.chars().count() as u16;
+            let w = cells(&text) as u16;
             let pos = self.cell_px(col, row);
             self.push_plain(items, &text, pos, colors.inactive_fg, clip);
             col = col.saturating_add(w);
@@ -2394,7 +2394,7 @@ impl Renderer {
             };
             let modified = if tab.modified { "+" } else { "" };
             let text = format!(" {count}{}{modified} ", tab.label);
-            let w = text.chars().count() as u16;
+            let w = cells(&text) as u16;
             // A cell's background is a quad (unscissored), so clamp its width to the
             // strip edge. The active cell always fills (`TabLineSel`); an inactive
             // cell fills only when `TabLine` carries its own bg, else the bar fill
@@ -2484,10 +2484,8 @@ impl Renderer {
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
-        let mut col = ox;
         let full = self.full_bounds();
-        for (text, style) in segments {
-            let w = text.chars().count() as u16;
+        for ((text, style), (col, w)) in segments.iter().zip(segment_columns(segments, ox)) {
             if let Some(bg) = style.as_ref().and_then(|s| s.bg) {
                 if w > 0 {
                     self.fill_cells(quads, col, row, w, bg);
@@ -2496,7 +2494,6 @@ impl Renderer {
             let fg = style.as_ref().and_then(|s| s.fg).unwrap_or(base_fg);
             let pos = self.cell_px(col, row);
             self.push_plain(items, text, pos, fg, full);
-            col = col.saturating_add(w);
         }
     }
 
@@ -2615,8 +2612,8 @@ impl Renderer {
         // splits the fill on both sides of the title (the picker box); otherwise the
         // title is left-aligned (floats).
         if top {
-            let title_s = title.map(|t| format!(" {t} ").chars().take(inner_w).collect::<String>());
-            let title_len = title_s.as_deref().map_or(0, |s| s.chars().count());
+            let title_s = title.map(|t| take_cells(&format!(" {t} "), inner_w));
+            let title_len = title_s.as_deref().map_or(0, cells);
             let total_fill = inner_w - title_len;
             let lfill = if center_title { total_fill / 2 } else { 0 };
             let rfill = total_fill - lfill;
@@ -3165,7 +3162,7 @@ impl Renderer {
                     let tail: String = text.chars().skip(end).collect();
                     self.push_plain(items, &head, self.cell_px(cx, row), hl_fg, full);
                     if !tail.is_empty() {
-                        let at = cx + head.chars().count() as u16;
+                        let at = cx + cells(&head) as u16;
                         self.push_plain(items, &tail, self.cell_px(at, row), row_fg, full);
                     }
                 }
@@ -3180,24 +3177,23 @@ impl Renderer {
                     };
                     // Start column = right edge minus the kind's width, clamped so it
                     // never overlaps the label region.
-                    let kind_w = k.chars().count() as u16;
+                    let kind_w = cells(k) as u16;
                     let kind_x = list_w.saturating_sub(kind_w).max(kc);
                     self.push_plain(items, k, self.cell_px(cx + kind_x, row), kind_fg, full);
                 }
             }
-            // Overdraw the matched characters in the accent color (monospace, so
-            // char `i` sits at column `cx + i`).
+            // Overdraw the matched characters in the accent color. The spans count
+            // chars; each char sits past the cells of the ones before it (a wide
+            // CJK char takes two).
+            let mut col = cx;
             for (i, ch) in label.chars().enumerate() {
                 let ci = i as u16;
+                let mut buf = [0; 4];
+                let ch = &*ch.encode_utf8(&mut buf);
                 if spans.iter().any(|(s, e)| ci >= *s && ci < *e) {
-                    self.push_plain(
-                        items,
-                        &ch.to_string(),
-                        self.cell_px(cx + ci, row),
-                        match_fg,
-                        list_bounds,
-                    );
+                    self.push_plain(items, ch, self.cell_px(col, row), match_fg, list_bounds);
                 }
+                col = col.saturating_add(cells(ch) as u16);
             }
         }
 
@@ -4202,16 +4198,36 @@ pub fn query_caret_col(query: &str, cursor_chars: usize) -> u16 {
 /// so a wide CJK/emoji char gets two cells of background. Empty segments yield
 /// nothing.
 pub fn seg_bg_spans(segments: &[Seg], start_col: u16) -> Vec<(u16, u16, u32)> {
+    run_columns(segments.iter().map(|s| s.text.as_str()), start_col)
+        .into_iter()
+        .zip(segments)
+        .filter_map(|((col, w), seg)| (w > 0).then_some((col, w, seg.bg?)))
+        .collect()
+}
+
+/// Where each `%`-format segment of a status row or tabline lands, laid end to end
+/// from cell `ox`: `(col, width)`.
+pub fn segment_columns(segments: &[StatusSegment], ox: u16) -> Vec<(u16, u16)> {
+    run_columns(segments.iter().map(|(t, _)| t.as_str()), ox)
+}
+
+/// Where each of a run of `texts`, laid end to end from cell `start_col`, lands:
+/// `(col, width)` in display cells ([`cells`]), the way the shaper lays the glyphs
+/// down — a wide CJK/emoji char takes two. Saturates at the grid's edge.
+pub fn run_columns<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    start_col: u16,
+) -> Vec<(u16, u16)> {
     let mut col = start_col;
-    let mut spans = Vec::new();
-    for seg in segments {
-        let w = cells(&seg.text) as u16;
-        if let (Some(bg), true) = (seg.bg, w > 0) {
-            spans.push((col, w, bg));
-        }
-        col += w;
-    }
-    spans
+    texts
+        .into_iter()
+        .map(|t| {
+            let w = cells(t).min(u16::MAX as usize) as u16;
+            let at = col;
+            col = col.saturating_add(w);
+            (at, w)
+        })
+        .collect()
 }
 
 /// Display width of `s` in screen cells — the ONE column metric the row pipeline

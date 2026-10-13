@@ -60,8 +60,8 @@ pub use session::{
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
 pub use render::{
-    inlay_shift, seg_bg_spans, splice_inlay, split_at_char, virt_inline_shift, with_preedit, Seg,
-    DEFAULT_INLAY,
+    inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay, split_at_char,
+    virt_inline_shift, with_preedit, Seg, DEFAULT_INLAY,
 };
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.

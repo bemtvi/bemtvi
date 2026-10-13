@@ -87,7 +87,7 @@ fn typed(text: &str) -> Option<String> {
 pub fn is_paste(code: KeyCode, unmodified: Option<char>, mods: Modifiers) -> bool {
     let is_v = unmodified.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
     let shift_insert = code == KeyCode::Insert && mods.shift;
-    (is_v && mods.meta && !mods.control) || (is_v && mods.control && mods.shift) || shift_insert
+    (is_v && ((mods.meta && !mods.control) || (mods.control && mods.shift))) || shift_insert
 }
 
 /// The neutral [`VimKey`] for a key that types no character, by where it is.

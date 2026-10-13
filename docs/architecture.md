@@ -1041,7 +1041,9 @@ a `GpuSurface` that wgpu presents to; the surface reports keys (where they are, 
 typed through the platform's text input — layouts, dead keys, AltGr, input methods), the
 pointer, and takes the cursor and the IME caret. Input methods are on unless the relayed
 `'imdisable'` is set; a config turns them off from a keymap or a `ModeChanged` autocmd
-(`examples/input-method`). mitsuami owns the main thread, so the RPC
+(`examples/input-method`). An input method's composition is spliced in at the cursor
+like inline virtual text (its own cells, the rest of the line pushed right), painted with
+bemtvi's `BtvImePreedit` group, which falls back to `Visual`. mitsuami owns the main thread, so the RPC
 runs on a separate IO thread that decodes each `redraw` into a `View` and sends it over a
 channel a UI-thread task drains, while input goes the other way on a cloned `Rpc` handle
 (`notify` is synchronous, no runtime). Rendering is a monospace

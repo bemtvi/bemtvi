@@ -84,4 +84,11 @@ btv.test.describe("examples/input-method", function()
     t:cmd("set noimd")
     btv.test.expect(btv.o.imdisable).to_be(false)
   end)
+
+  -- §4. "It's painted with `BtvImePreedit` … unless a config defines it, as this one does"
+  btv.test.it("§4 — the composition's colour is the config's", function()
+    local hl = btv.hl.get(0, { name = "BtvImePreedit" })
+    btv.test.expect(hl.fg).to_be(0x1e1e2e)
+    btv.test.expect(hl.bg).to_be(0xf9e2af)
+  end)
 end)

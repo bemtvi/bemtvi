@@ -1447,6 +1447,10 @@ const CHROME: &[(&str, &str)] = &[
     ("float_border", "FloatBorder"),
     ("normal_float", "NormalFloat"),
     ("float_title", "FloatTitle"),
+    // An input method's composition, which a GUI splices in at the cursor until
+    // it's committed. bemtvi's own group; it falls back to `Visual` (see
+    // `builtin_default_link`).
+    ("preedit", "BtvImePreedit"),
 ];
 
 /// The tree-sitter capture names the browser highlighter colors, keyed exactly as

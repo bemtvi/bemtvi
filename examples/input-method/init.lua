@@ -87,3 +87,18 @@ end, { desc = "keep the input method to the modes that type text" })
 -- Start with §3 on.
 btv.g.ime_auto = true
 follow("n")
+
+--------------------------------------------------------------------------------
+-- 4. The composition's colour.
+--
+-- While the IME composes, the GUI draws the composition at the cursor the way
+-- inline virtual text is drawn: it takes its own cells and pushes the rest of
+-- the line right, underlined, with its own caret, until it's committed. It's
+-- painted with `BtvImePreedit`, which follows the theme's `Visual` unless a
+-- config (or a colorscheme) defines it, as this one does.
+--
+-- Type-this:  jjI  then  nihon   (don't commit it yet)
+-- See-that:   にほん in dark-on-yellow at the start of "first line", which has
+--             moved right to make room; <Space> converts it, <CR> commits it.
+--------------------------------------------------------------------------------
+btv.hl.define(0, "BtvImePreedit", { fg = "#1e1e2e", bg = "#f9e2af" })

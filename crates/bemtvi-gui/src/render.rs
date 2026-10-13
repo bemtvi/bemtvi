@@ -1110,19 +1110,20 @@ impl Renderer {
         // The global command / message line on the reserved bottom row.
         self.build_cmdline(view, cmd_row, quads, items);
 
-        // An input method's composition, over everything at the cursor it was
-        // captured at above (the window's, or the command line's).
-        self.build_preedit(view, overlay_quads, overlay_items);
+        // An input method's composition's underline and caret, over everything at
+        // the cursor it was captured at above (the window's, or the command line's).
+        self.build_preedit(view, overlay_quads);
     }
 
-    /// Paint the input method's composition at the text cursor, as a text field
-    /// shows it until it's committed: its text over the cells there on `Normal`'s
-    /// background, underlined, with its own caret. The editor never sees it — the
-    /// committed text arrives as typed input — so nothing in the buffer moves. Kept
-    /// on screen, shifted left if it would run off the right edge. Nothing while no
-    /// cursor is shown (a picker or panel owns it).
-    fn build_preedit(&mut self, view: &View, quads: &mut Vec<Quad>, items: &mut Vec<TextItem>) {
-        let Some((text, cursor)) = self.preedit.clone() else {
+    /// Underline the input method's composition and draw its caret, as a text field
+    /// shows it until it's committed. The text itself was spliced in at the cursor
+    /// it was captured at above, in `BtvImePreedit` — into the cursor row like
+    /// inline `virt_text`, or into the command line — so it starts at that cursor
+    /// and pushes the text after it right. The editor never sees it: the committed
+    /// text arrives as typed input. Nothing while no cursor is shown (a picker or
+    /// panel owns it).
+    fn build_preedit(&mut self, view: &View, quads: &mut Vec<Quad>) {
+        let Some((text, cursor)) = self.preedit.as_ref() else {
             return;
         };
         let Some((x, y)) = self.cursor_px else {
@@ -1130,17 +1131,10 @@ impl Renderer {
         };
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
         let width = text.width().max(1) as f32 * cell_w;
-        let x = x.min(self.config.width as f32 - width).max(0.0);
-        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
-        let bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
+        let fg = style_fg(&view.preedit)
+            .or_else(|| style_fg(&view.normal))
+            .unwrap_or(DEFAULT_FG);
         let line = (cell_h / 16.0).round().max(1.0);
-        quads.push(Quad {
-            x,
-            y,
-            w: width,
-            h: cell_h,
-            color: srgb_to_color_rgba(bg, 1.0),
-        });
         quads.push(Quad {
             x,
             y: y + cell_h - line,
@@ -1148,7 +1142,7 @@ impl Renderer {
             h: line,
             color: srgb_to_color_rgba(fg, 1.0),
         });
-        if let Some(at) = cursor.filter(|&at| text.is_char_boundary(at)) {
+        if let Some(at) = (*cursor).filter(|&at| text.is_char_boundary(at)) {
             quads.push(Quad {
                 x: x + text[..at].width() as f32 * cell_w,
                 y,
@@ -1157,8 +1151,6 @@ impl Renderer {
                 color: srgb_to_color_rgba(fg, 1.0),
             });
         }
-        let bounds = self.full_bounds();
-        self.push_plain(items, &text, (x, y), fg, bounds);
     }
 
     /// Set (or, with empty `text`, clear) the input method's composition painted at
@@ -1295,7 +1287,8 @@ impl Renderer {
                 && !view.command_mode
                 && !picker_open
                 && !view.is_insert()
-                && !view.is_replace();
+                && !view.is_replace()
+                && self.preedit.is_none();
             block.then(|| {
                 let (_, glyph) = block_cursor_colors(
                     style_fg(&view.cursor),
@@ -1304,6 +1297,23 @@ impl Renderer {
                     style_bg(&win.normal(view)).unwrap_or(DEFAULT_BG),
                 );
                 glyph
+            })
+        };
+        // An input method's composition, spliced into the cursor row at the cursor
+        // as one more inline `virt_text` — so it takes its cells and pushes the rest
+        // of the line right, like any inline virtual text — painted `BtvImePreedit`.
+        // Only where the text cursor is: the focused window, with neither the
+        // command line nor a picker holding it.
+        let preedit_row = {
+            let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
+            let here = win.focused && !view.command_mode && !picker_open;
+            self.preedit.as_ref().filter(|_| here).map(|(text, _)| {
+                let row = win
+                    .virt_text
+                    .get(win.cursor_row as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                with_preedit(row, win.cursor_screen_col, text, preedit_style_id(view))
             })
         };
         match scroll {
@@ -1660,7 +1670,10 @@ impl Renderer {
                     // The row's inline `virt_text` (e.g. the `:s` diff's replacement
                     // side) shifts every cell-keyed overlay below — selection, search,
                     // underline, strike — right, exactly as it shifts the glyphs.
-                    let vtext = win.virt_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    let vtext = match &preedit_row {
+                        Some(row) if i == win.cursor_row as usize => row.as_slice(),
+                        _ => win.virt_text.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                    };
 
                     // Selection band(s) for this row.
                     if let Some(Some(span)) = win.selection.get(i) {
@@ -2046,7 +2059,14 @@ impl Renderer {
                 None => (oy + win.cursor_row.min(last_row)) as f32 * self.cell_h,
             };
             // Anchor the IME candidate window at the caret (read after the frame).
+            // The shift above leaves out a composition in progress, so this is
+            // where it starts.
             self.cursor_px = Some((px, py));
+            // While composing, the composition's own caret is the cursor
+            // ([`Self::build_preedit`]).
+            if self.preedit.is_some() {
+                return;
+            }
             // In MultiCursor placement mode the active (primary) cursor wears the
             // multi-cursor accent, distinct from the secondaries, so it reads as
             // "the one dropping cursors" — mirroring the TUI.
@@ -2227,7 +2247,24 @@ impl Renderer {
             (String::new(), style_fg(&view.normal).unwrap_or(DEFAULT_FG))
         };
         let full = self.full_bounds();
-        self.push_plain(items, &text, pos, fg, full);
+        match self.preedit.as_ref().filter(|_| view.command_mode) {
+            // An input method's composition, spliced in at the command-line caret
+            // in `BtvImePreedit`, pushing the typed text after the caret right —
+            // the command-line form of the window's inline splice.
+            Some((composing, _)) => {
+                let (before, after) = split_at_char(&view.cmdline, view.cmdline_cursor);
+                let prompt_len = text.len() - view.cmdline.len();
+                let segs = [
+                    Seg::plain(format!("{}{before}", &text[..prompt_len]), fg),
+                    virt_chunk_seg(composing, preedit_style_id(view), &view.styles, fg),
+                    Seg::plain(after.to_string(), fg),
+                ];
+                let right_px = self.config.width as f32;
+                self.push_seg_backgrounds(quads, &segs, 0, cmd_row as usize, right_px);
+                self.push_text(items, &segs, pos, fg, full);
+            }
+            None => self.push_plain(items, &text, pos, fg, full),
+        }
 
         // The `'showcmd'` corner — the partly-typed command, or the size of the live
         // selection — right-aligned on this same row, as vim does. It owns its own
@@ -2256,6 +2293,11 @@ impl Renderer {
             // Composing accented/CJK text in the command line or search: anchor the
             // IME candidate window at the command-line caret, not the window origin.
             self.cursor_px = Some((px, py));
+            // While composing, the composition's own caret is the cursor
+            // ([`Self::build_preedit`]).
+            if self.preedit.is_some() {
+                return;
+            }
             let cursor_color = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
             let c = srgb_to_color_rgba(cursor_color, 0.5);
             quads.push(Quad {
@@ -3617,25 +3659,18 @@ impl Renderer {
         row: usize,
         right_px: f32,
     ) {
-        let mut col = start_col;
-        for seg in segments {
-            let w = seg.text.chars().count() as u16;
-            if let Some(bg) = seg.bg {
-                if w > 0 {
-                    let (px, py) = self.cell_px(col, row as u16);
-                    let right = (px + self.cell_w * w as f32).min(right_px);
-                    if right > px {
-                        quads.push(Quad {
-                            x: px,
-                            y: py,
-                            w: right - px,
-                            h: self.cell_h,
-                            color: color_to_rgba(srgb_to_color(bg)),
-                        });
-                    }
-                }
+        for (col, w, bg) in seg_bg_spans(segments, start_col) {
+            let (px, py) = self.cell_px(col, row as u16);
+            let right = (px + self.cell_w * w as f32).min(right_px);
+            if right > px {
+                quads.push(Quad {
+                    x: px,
+                    y: py,
+                    w: right - px,
+                    h: self.cell_h,
+                    color: color_to_rgba(srgb_to_color(bg)),
+                });
             }
-            col += w;
         }
     }
 
@@ -4161,6 +4196,24 @@ pub fn query_caret_col(query: &str, cursor_chars: usize) -> u16 {
     2 + cells_before(query, cursor_chars)
 }
 
+/// The background fills of a run of `segments` laid out from cell `start_col`:
+/// `(col, width, bg)` for each segment whose group set a `bg`, its columns
+/// measured in display cells ([`cells`]), the way the shaper lays the glyphs down,
+/// so a wide CJK/emoji char gets two cells of background. Empty segments yield
+/// nothing.
+pub fn seg_bg_spans(segments: &[Seg], start_col: u16) -> Vec<(u16, u16, u32)> {
+    let mut col = start_col;
+    let mut spans = Vec::new();
+    for seg in segments {
+        let w = cells(&seg.text) as u16;
+        if let (Some(bg), true) = (seg.bg, w > 0) {
+            spans.push((col, w, bg));
+        }
+        col += w;
+    }
+    spans
+}
+
 /// Display width of `s` in screen cells — the ONE column metric the row pipeline
 /// walks, and the one the server measures every wire column in.
 ///
@@ -4669,6 +4722,46 @@ fn virt_overlay_fg(chunk_fg: u32, under_fg: u32, mode: u8) -> u32 {
     } else {
         chunk_fg
     }
+}
+
+/// The cursor row's `virt_text` with an input method's composition `text` added as
+/// one more inline placement at the cursor's screen column `col`, painted with
+/// palette entry `style` (`BtvImePreedit`). Pushed last, so at a column it shares
+/// with an extmark's inline text it sits after it — where the cursor is — and the
+/// row's splice and every column-keyed shift ([`virt_inline_shift`]) treat it like
+/// any inline virtual text: it takes its own cells and pushes the rest right.
+pub fn with_preedit(
+    row: &[VirtPlacement],
+    col: u16,
+    text: &str,
+    style: Option<usize>,
+) -> Vec<VirtPlacement> {
+    let mut row = row.to_vec();
+    row.push(VirtPlacement {
+        pos: VIRT_POS_INLINE,
+        col,
+        hl_mode: 0,
+        chunks: vec![(text.to_string(), style)],
+    });
+    row
+}
+
+/// The palette entry for `BtvImePreedit`, which the server interned into this
+/// frame's `styles` along with the rest of the chrome (so it's always there when
+/// the group resolved at all).
+fn preedit_style_id(view: &View) -> Option<usize> {
+    let style = view.preedit?;
+    view.styles.iter().position(|s| *s == style)
+}
+
+/// `line` split at char offset `cursor_chars` (the command line's caret, which the
+/// wire counts in chars), clamped to its end.
+pub fn split_at_char(line: &str, cursor_chars: usize) -> (&str, &str) {
+    let at = line
+        .char_indices()
+        .nth(cursor_chars)
+        .map_or(line.len(), |(i, _)| i);
+    line.split_at(at)
 }
 
 /// The combined cell width of the inline `virt_text` placements on a row before

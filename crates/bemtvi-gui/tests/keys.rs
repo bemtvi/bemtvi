@@ -277,6 +277,16 @@ fn input_method_commits_are_typed() {
     );
 }
 
+/// An input method taking back what keys typed (macOS's accents, offered as a
+/// key is held, replace the letter it typed) deletes it around the cursor.
+#[test]
+fn input_method_replacements_delete_what_they_replace() {
+    let delete = |before, after| note(SurfaceInput::DeleteSurrounding { before, after });
+    assert_eq!(delete(1, 0).as_deref(), Some("<BS>"));
+    assert_eq!(delete(2, 1).as_deref(), Some("<BS><BS><Del>"));
+    assert_eq!(delete(0, 0), None);
+}
+
 #[test]
 fn bare_modifier_release_and_command_chords_are_dropped() {
     // A lone modifier key (Control pressed by itself) has no editor meaning.

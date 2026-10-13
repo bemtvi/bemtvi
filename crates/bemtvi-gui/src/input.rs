@@ -34,6 +34,9 @@ use mitsuami::prelude::{KeyCode, Modifiers, SurfaceInput};
 ///   truncated — still typing, so not `encode_paste`.
 /// - **An input method's commit** ([`SurfaceInput::Text`]) is typed text too
 ///   (composed accents, CJK).
+/// - **An input method taking back typed text** ([`SurfaceInput::DeleteSurrounding`],
+///   macOS's accents replacing the letter a held key typed) is `<BS>`s before the
+///   cursor and `<Del>`s after it.
 pub fn encode_input(input: &SurfaceInput, option_chords: bool) -> Option<String> {
     let (code, text, unmodified, mods) = match input {
         SurfaceInput::Key {
@@ -45,6 +48,10 @@ pub fn encode_input(input: &SurfaceInput, option_chords: bool) -> Option<String>
             ..
         } => (*code, text.as_deref(), *unmodified, *modifiers),
         SurfaceInput::Text(text) => return typed(text),
+        SurfaceInput::DeleteSurrounding { before, after } => {
+            let keys = "<BS>".repeat(*before) + &"<Del>".repeat(*after);
+            return Some(keys).filter(|k| !k.is_empty());
+        }
         _ => return None,
     };
     if let Some(key) = named(code) {

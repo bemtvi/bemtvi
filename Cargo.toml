@@ -135,7 +135,7 @@ base64 = "=0.22.1"
 # mitsuami's `GpuSurface` text input isn't in a release yet (crates.io has 1.1.0), so
 # it's pinned to the commit on its `gpu-surface-text-input` branch; move to `=x.y.z`
 # once a release has it.
-mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "2d0fe2106237f4382e55413540d8dded4bf6d193" }
+mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "cb543682b172c5498be6d7d26f58cef6124e9428" }
 wgpu = "=29.0.4"
 glyphon = "=0.11.0"
 # Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:

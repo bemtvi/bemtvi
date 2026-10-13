@@ -86,7 +86,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -97,7 +97,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1438,7 +1438,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1935,7 +1935,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps 9.0.0",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2307,7 +2307,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a791e6620676a875f362f3156ed213e73ca099a09bf992c18812abe65cc37b1"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -4073,7 +4073,7 @@ dependencies = [
 [[package]]
 name = "mitsuami"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "mitsuami-appkit",
  "mitsuami-core",
@@ -4087,7 +4087,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-appkit"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "block2",
  "dispatch2",
@@ -4105,7 +4105,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-core"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "fluent-bundle",
  "fluent-langneg",
@@ -4120,7 +4120,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-gtk"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -4133,7 +4133,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-linux"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "mitsuami-core",
  "wayland-backend",
@@ -4145,7 +4145,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-macros"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "fluent-syntax",
  "proc-macro2",
@@ -4157,7 +4157,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-reactive"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "slotmap",
 ]
@@ -4165,7 +4165,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-widgets"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "mitsuami-core",
  "mitsuami-reactive",
@@ -4174,7 +4174,7 @@ dependencies = [
 [[package]]
 name = "mitsuami-winui"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=cb543682b172c5498be6d7d26f58cef6124e9428#cb543682b172c5498be6d7d26f58cef6124e9428"
+source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
 dependencies = [
  "mitsuami-core",
  "mitsuami-widgets",
@@ -5733,7 +5733,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5792,7 +5792,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6172,7 +6172,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6385,7 +6385,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6407,7 +6407,7 @@ dependencies = [
  "parking_lot",
  "rustix 1.1.4",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7548,7 +7548,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

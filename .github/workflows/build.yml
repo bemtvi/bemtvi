@@ -369,12 +369,27 @@ jobs:
           # libxkbcommon, glibc). That is exactly what the wgpu GUI needs:
           # wgpu must dlopen the *host's* Vulkan/GL drivers at runtime — bundling
           # mesa would break on NVIDIA and any mismatched driver stack.
-          for tool in linuxdeploy linuxdeploy-plugin-appimage; do
-            f="${tool}-${ARCH}.AppImage"
+          #
+          # Each tool is pinned to a tagged release and checked against its hash
+          # (not the moving `continuous` build): it runs inside the release job
+          # and shapes the AppImage we ship. Bump the tag and hashes together.
+          fetch() { # <repo> <tag> <sha256>
+            local f="$1-${ARCH}.AppImage"
             curl -fsSLo "$f" \
-              "https://github.com/linuxdeploy/${tool}/releases/download/continuous/${f}"
+              "https://github.com/linuxdeploy/$1/releases/download/$2/${f}"
+            echo "$3  $f" | sha256sum -c -
             chmod +x "$f"
-          done
+          }
+          case "$ARCH" in
+            x86_64)
+              fetch linuxdeploy 1-alpha-20251107-1 c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+              fetch linuxdeploy-plugin-appimage 1-alpha-20250213-1 992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3
+              ;;
+            aarch64)
+              fetch linuxdeploy 1-alpha-20251107-1 620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
+              fetch linuxdeploy-plugin-appimage 1-alpha-20250213-1 83c292149274965a865dcd44c135cfca8ba28c6b7de3eb628d4b8b5f248af17c
+              ;;
+          esac
           # mitsuami's GTK 4 backend: linuxdeploy copies libgtk-4/libadwaita as
           # plain libraries, but GTK also needs its runtime data next to them —
           # the compiled GSettings schemas (the file chooser aborts without its

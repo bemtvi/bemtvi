@@ -513,3 +513,117 @@ async fn wiping_the_current_file_stamps_where_the_cursor_was() {
     feed(&rpc, "gg`\"");
     assert_eq!(cursor(&rpc).await.0, 4);
 }
+
+// ----- `btv.pos.get` / `btv.line`: the visual anchor and the mark positions -----
+
+/// Run `chunk` and decode its `{bufnr, lnum, col, off}` (or any int array) reply.
+async fn lua_ints(rpc: &Rpc, chunk: &str) -> Vec<i64> {
+    match exec_lua(rpc, chunk).await {
+        Value::Array(a) => a.iter().map(|v| v.as_i64().expect("an integer")).collect(),
+        other => panic!("expected an integer array from `{chunk}`, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pos_get_v_is_the_visual_anchor_not_the_cursor() {
+    let (rpc, _incoming) = start(None).await;
+    // A visual-mode map records what a plugin sees mid-selection: the anchor (`v`),
+    // the cursor (`.`), and `line("v")`.
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('x', 'Q', function() \
+           local v, c = btv.pos.get('v'), btv.pos.get('.') \
+           _G.__seen = { v[2], v[3], c[2], c[3], btv.line('v') } \
+         end)",
+    )
+    .await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // Anchor on line 2 col 2 (`t` of "beta"), cursor two lines down on line 4.
+    feed(&rpc, "ggjllvjjQ");
+    assert_eq!(
+        lua_ints(&rpc, "return _G.__seen").await,
+        vec![2, 3, 4, 3, 2],
+        "`v` must be the anchor (line 2), `.` the cursor (line 4)"
+    );
+    // The same reads straight from a chunk while the selection is still live.
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get('v')").await,
+        vec![0, 2, 3, 0]
+    );
+    assert_eq!(lua_ints(&rpc, "return { btv.line('v') }").await, vec![2]);
+    // Outside Visual mode `v` is the cursor, as in vim.
+    feed(&rpc, "<Esc>");
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get('v')").await,
+        vec![0, 4, 3, 0]
+    );
+    assert_eq!(lua_ints(&rpc, "return { btv.line('v') }").await, vec![4]);
+}
+
+#[tokio::test]
+async fn pos_get_visual_marks_are_the_last_selection_bounds() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // Select backwards (anchor below the cursor) so `'<` must be the *earlier* end.
+    feed(&rpc, "gg2jlvkl<Esc>G0");
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'<\")").await,
+        vec![0, 2, 3, 0]
+    );
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'>\")").await,
+        vec![0, 3, 2, 0]
+    );
+    // The cursor moved on to line 4; the marks did not follow it.
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get('.')").await,
+        vec![0, 4, 1, 0]
+    );
+    assert_eq!(
+        lua_ints(&rpc, "return { btv.line(\"'<\"), btv.line(\"'>\") }").await,
+        vec![2, 3]
+    );
+}
+
+#[tokio::test]
+async fn pos_get_reads_lowercase_and_global_marks_and_unset_is_zero() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>");
+    feed(&rpc, "ggjlmajlmBgg");
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'a\")").await,
+        vec![0, 2, 2, 0]
+    );
+    // A global mark reports its buffer, like vim's `getpos("'A")`.
+    let buf = match exec_lua(&rpc, "return btv.buf.current()").await {
+        Value::Integer(n) => n.as_i64().unwrap(),
+        other => panic!("expected a bufnr, got {other:?}"),
+    };
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'B\")").await,
+        vec![buf, 3, 3, 0]
+    );
+    // A valid but never-set mark is vim's all-zero position, not an error.
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'z\")").await,
+        vec![0, 0, 0, 0]
+    );
+    assert_eq!(lua_ints(&rpc, "return { btv.line(\"'z\") }").await, vec![0]);
+}
+
+#[tokio::test]
+async fn pos_get_unsupported_expr_fails_loud() {
+    let (rpc, _incoming) = start(None).await;
+    for expr in ["w0", "bogus", "'!"] {
+        let chunk =
+            format!("local ok, err = pcall(btv.pos.get, {expr:?}); return {{ ok, tostring(err) }}");
+        match exec_lua(&rpc, &chunk).await {
+            Value::Array(a) => {
+                assert_eq!(a[0], Value::Boolean(false), "`{expr}` must raise");
+                let msg = a[1].as_str().unwrap_or_default();
+                assert!(msg.contains(expr), "the error names `{expr}`: {msg}");
+            }
+            other => panic!("expected {{ok, err}}, got {other:?}"),
+        }
+    }
+}

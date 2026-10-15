@@ -4509,6 +4509,23 @@ impl LuaRuntime {
         set.call((screenrow, screencol, winid, winrow, wincol, line, column))
     }
 
+    /// Refresh `btv._cur_visual_anchor`, the live selection's fixed end that
+    /// `btv.pos.get("v")` / `btv.line("v")` read: `{ row, col }` (1-based row, 0-based
+    /// byte col, the `btv._cur_cursor` convention) while a selection mode is active,
+    /// `nil` otherwise. Pushed beside the cursor mirror.
+    pub fn set_visual_anchor(&self, anchor: Option<(u64, u64)>) -> mlua::Result<()> {
+        let btv = self.btv()?;
+        match anchor {
+            Some((row, col)) => {
+                let t = self.lua.create_table()?;
+                t.set("row", row)?;
+                t.set("col", col)?;
+                btv.set("_cur_visual_anchor", t)
+            }
+            None => btv.set("_cur_visual_anchor", mlua::Value::Nil),
+        }
+    }
+
     pub fn set_screen_cursor(&self, row: u64, col: u64) -> mlua::Result<()> {
         let btv = self.btv()?;
         btv.set("_cur_screenrow", row)?;

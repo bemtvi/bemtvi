@@ -7,18 +7,62 @@ local vim = vim
 local fn = vim.fn
 btv = btv or {}
 
--- `btv.line(expr)` [alias `vim.fn.line`]: a buffer line number. `"."` is the cursor line
--- (1-based), `"$"` the last line (the line count). The window-relative forms
--- (`"w0"`/`"w$"`) need the scroll position, which the mirror doesn't carry yet, so they
--- error loud.
-function btv.line(expr)
+-- The marks `btv.pos.get` / `btv.line` resolve, keyed by name: the automatic specials,
+-- `a`–`z`, `A`–`Z` and `0`–`9` — exactly the set the `btv._marks` mirror can carry.
+local POS_MARKS = {}
+for c in ([["'`.^[]<>]]):gmatch(".") do
+  POS_MARKS[c] = true
+end
+for _, range in ipairs({ { "a", "z" }, { "A", "Z" }, { "0", "9" } }) do
+  for b = range[1]:byte(), range[2]:byte() do
+    POS_MARKS[string.char(b)] = true
+  end
+end
+
+-- Resolve a position expression to `{ bufnr, lnum, col, off }` (1-based lnum/col), or
+-- `nil` when `expr` is not one bemtvi models. Shared by `btv.pos.get` and `btv.line`.
+local function resolve_pos(expr)
   if expr == "." then
-    return (btv._cur_cursor or {}).row or 1
+    local c = btv._cur_cursor or { row = 1, col = 0 }
+    return { 0, c.row, c.col + 1, 0 }
+  elseif expr == "v" then
+    -- The selection's fixed end while one is live, else the cursor (vim's rule).
+    local a = btv._cur_visual_anchor or btv._cur_cursor or { row = 1, col = 0 }
+    return { 0, a.row, a.col + 1, 0 }
   elseif expr == "$" then
     local buf = btv._bufs[btv._resolve_bufnr(0)]
-    return (buf and buf.lines) and #buf.lines or 1
+    return { 0, (buf and buf.lines) and #buf.lines or 1, 0, 0 }
   end
-  error("line(): unsupported expression '" .. tostring(expr) .. "'", 2)
+  local name = type(expr) == "string" and #expr == 2 and expr:match("^['`](.)$")
+  if not (name and POS_MARKS[name]) then
+    return nil
+  end
+  if name == "`" then
+    name = "'" -- `` ` `` and `'` name the same mark (the previous-context mark)
+  end
+  for _, m in ipairs(btv._marks or {}) do
+    if m.name == name then
+      -- Like vim, a file mark (`A`–`Z`, `0`–`9`) reports its buffer; a buffer-local
+      -- mark reports `0` (it always means the current buffer).
+      local bufnr = name:match("[%u%d]") and m.bufnr or 0
+      return { bufnr, m.line + 1, m.col + 1, 0 }
+    end
+  end
+  return { 0, 0, 0, 0 } -- a valid mark that is not set
+end
+
+-- `btv.line(expr)` [alias `vim.fn.line`]: a buffer line number (1-based). `"."` is the
+-- cursor line, `"$"` the last line (the line count), `"v"` the fixed end of the live
+-- Visual selection (the cursor line outside Visual mode), and `"'x"` the line of mark
+-- `x` (`0` when it is not set) — the same expressions `btv.pos.get` takes. The
+-- window-relative forms (`"w0"`/`"w$"`) are not modelled and raise an error naming the
+-- expression.
+function btv.line(expr)
+  local pos = resolve_pos(expr)
+  if pos == nil then
+    error("line(): unsupported expression '" .. tostring(expr) .. "'", 2)
+  end
+  return pos[2]
 end
 vim.fn.line = btv.line
 
@@ -147,18 +191,32 @@ function btv.jumplist.get(winnr, _tabnr)
 end
 fn.getjumplist = btv.jumplist.get
 
--- `btv.pos.get(expr)` [alias `vim.fn.getpos`]: a position as `{bufnr, lnum, col, off}`
--- (1-based lnum/col). `"."` is the cursor; `"'<"` / `"'>"` are the visual-selection
--- corners — bemtvi doesn't mirror those marks to `vim.fn` yet, so they fall back to the
--- cursor (a grep-from-selection plugin then greps the cursor word, a graceful
--- degradation rather than an error). Backs a plugin's visual-selection range read.
 btv.pos = btv.pos or {}
+-- `btv.pos.get(expr)` [alias `vim.fn.getpos`]: a position as `{ bufnr, lnum, col, off }`
+-- (1-based `lnum`/`col`, `off` always `0`). `expr` is one of:
+--
+-- ```
+-- "."     the cursor
+-- "v"     the fixed end of the live Visual selection (the cursor is the other
+--         end); outside Visual mode, the cursor
+-- "$"     the last line, with col 0
+-- "'<"    start of the last Visual selection (after leaving Visual mode)
+-- "'>"    end of the last Visual selection
+-- "'x"    mark x: a-z, A-Z, 0-9, or one of " ' ` . ^ [ ]
+-- ```
+--
+-- A buffer-local mark reports `bufnr` `0`; a file mark (`A`–`Z`, `0`–`9`) reports the
+-- buffer it points into. A mark that is not set yields `{ 0, 0, 0, 0 }`, as in vim. Any
+-- other expression (`"w0"`, `"w$"`, an invalid mark name) raises an error naming it.
+-- Reads the server-pushed cursor, selection-anchor and marks mirrors. To read a
+-- visual selection from a Visual-mode mapping, pair `"v"` with `"."`; `"'<"` / `"'>"`
+-- only update once the selection is left.
 function btv.pos.get(expr)
-  local c = btv._cur_cursor or { row = 1, col = 0 }
-  if expr == "." or expr == "'<" or expr == "'>" or expr == "v" then
-    return { 0, c.row, c.col + 1, 0 }
+  local pos = resolve_pos(expr)
+  if pos == nil then
+    error("getpos(): unsupported expression '" .. tostring(expr) .. "'", 2)
   end
-  return { 0, 0, 0, 0 }
+  return pos
 end
 fn.getpos = btv.pos.get
 

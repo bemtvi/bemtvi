@@ -3042,6 +3042,16 @@ impl Editor {
         self.visual_anchor
     }
 
+    /// The live selection's fixed end as `(line, col)` (0-based line, byte col) —
+    /// vim's `getpos("v")` — or `None` outside a selection mode (Visual, V-Line,
+    /// Select), where the anchor is stale and `v` means the cursor instead. Mirrored
+    /// to Lua so a visual-mode mapping can read the whole selection, not just the
+    /// cursor end.
+    pub fn visual_anchor_pos(&self) -> Option<(usize, usize)> {
+        (self.mode.is_visual() || self.mode == Mode::Select)
+            .then_some((self.visual_anchor.line, self.visual_anchor.col))
+    }
+
     /// The live selection's extent as `(start_row, start_col, end_row, end_col)` —
     /// 0-based rows, **byte** columns, end-**exclusive** (the `btv.win.select_range`
     /// convention) — or `None` when nothing is selected. Charwise ([`Mode::Visual`] /

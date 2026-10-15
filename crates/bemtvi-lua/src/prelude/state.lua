@@ -1659,6 +1659,9 @@ end
 btv._bufs = btv._bufs or {}
 btv._cur_cursor = btv._cur_cursor or { row = 1, col = 0 }
 btv._cur_win = btv._cur_win or 1000
+-- The live Visual selection's fixed end, `{ row, col }` like `btv._cur_cursor`, or `nil`
+-- outside a selection mode. Refreshed beside the cursor; read by `btv.pos.get("v")`.
+btv._cur_visual_anchor = btv._cur_visual_anchor or nil
 -- The editor's current mode() short code (`"n"`/`"i"`/`"v"`/…), refreshed alongside
 -- the buffer mirror so `vim.fn.mode`() (and a %{} statusline expression calling it)
 -- reflects the live mode.

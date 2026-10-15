@@ -2539,6 +2539,15 @@ impl EditHost {
             self.editor.mode.short_code(),
             self.editor.cmdline_type(),
         );
+        // The live selection's fixed end (`getpos("v")`), beside the cursor it pairs
+        // with, so a visual-mode mapping reads the whole selection rather than only
+        // the cursor end. `None` outside a selection mode. The `'<`/`'>` marks of the
+        // last selection ride the marks mirror below.
+        let _ = self.lua.set_visual_anchor(
+            self.editor
+                .visual_anchor_pos()
+                .map(|(line, col)| ((line + 1) as u64, col as u64)),
+        );
         // The alternate file name (`#`), the twin of the `%` name in the current-buffer
         // snapshot — refreshed here so `vim.fn.expand("#")` tracks the same `#` the
         // ex-command token expands to.

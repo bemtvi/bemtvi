@@ -4286,8 +4286,8 @@ fn encode_config_bundle(
 ) -> Value {
     let path_str = |p: PathBuf| Value::from(p.to_string_lossy().into_owned());
     Value::Array(vec![
-        config_dir.map_or(Value::Nil, &path_str),
-        Value::Array(runtimepath.into_iter().map(&path_str).collect()),
+        config_dir.map_or(Value::Nil, path_str),
+        Value::Array(runtimepath.into_iter().map(path_str).collect()),
         Value::Array(
             files
                 .into_iter()
@@ -4295,9 +4295,9 @@ fn encode_config_bundle(
                 .collect(),
         ),
         Value::Array(ts_languages.into_iter().map(Value::from).collect()),
-        cwd.map_or(Value::Nil, &path_str),
+        cwd.map_or(Value::Nil, path_str),
         path_str(state_dir),
-        home.map_or(Value::Nil, &path_str),
+        home.map_or(Value::Nil, path_str),
     ])
 }
 

@@ -89,6 +89,13 @@ pub struct Options {
     /// glyphs). Empty (the default) means the client's own setting, i.e. its
     /// `--glyph-overflow` flag.
     pub guiglyphoverflow: String,
+    /// Whether the platform's input method (a Japanese, Chinese or Korean IME) is
+    /// kept off (`'imdisable'`, vim's option; default `false`). Like `'guifont'` the
+    /// core doesn't use it — it relays it to a GUI client, which turns its input
+    /// method off while it's set. Off by default, so input methods compose in every
+    /// mode; a config turns them off from a keymap (`:set imdisable!`) or per mode
+    /// from a `ModeChanged` autocmd. The TUI can't — the terminal owns the IME.
+    pub imdisable: bool,
     /// Which modes mouse input is acted on (`'mouse'`): a set of mode chars —
     /// `n`ormal, `v`isual, `i`nsert, `c`mdline, `a`ll, plus `r`/`h` (unused yet).
     /// A gesture is honored only if the current mode's char (or `a`) is present;
@@ -331,6 +338,7 @@ impl Options {
             ("relativesplits", Bool(b)) => self.relative_splits = *b,
             ("relativedocks", Bool(b)) => self.relative_docks = *b,
             ("equalalways", Bool(b)) => self.equalalways = *b,
+            ("imdisable", Bool(b)) => self.imdisable = *b,
             ("showcmd", Bool(b)) => self.showcmd = *b,
             ("workspacepersistunnamed", Bool(b)) => self.workspace_persist_unnamed = *b,
             // Clamped rather than wrapped as a last line of defense — an out-of-range
@@ -394,6 +402,7 @@ impl Options {
             "relativesplits" => Bool(self.relative_splits),
             "relativedocks" => Bool(self.relative_docks),
             "equalalways" => Bool(self.equalalways),
+            "imdisable" => Bool(self.imdisable),
             "showcmd" => Bool(self.showcmd),
             "workspacepersistunnamed" => Bool(self.workspace_persist_unnamed),
             "showtabline" => Num(self.showtabline as i64),
@@ -555,6 +564,8 @@ impl Default for Options {
             // No custom GUI font by default — the client uses its own.
             guifont: String::new(),
             guiglyphoverflow: String::new(),
+            // Input methods stay on until a config turns them off (vim's default).
+            imdisable: false,
             // Mouse defaults match neovim exactly. `mouse` is `"nvi"` (not `"a"`):
             // cmdline-mode mouse is off by default. `mousemodel` is `popup_setpos`,
             // so right-click pops a menu and `<S-LeftMouse>` is the extend gesture.
@@ -2126,6 +2137,13 @@ static OPTIONS: &[OptionInfo] = {
             scope: Global,
             doc: "When a square one-cell glyph (a Nerd Font icon) may render at full \
                   size over the next cell: never, always, when-followed-by-space.",
+        },
+        OptionInfo {
+            name: "imdisable",
+            abbrev: Some("imd"),
+            kind: Bool,
+            scope: Global,
+            doc: "Keep the GUI's input method (IME) off.",
         },
         OptionInfo {
             name: "mouse",

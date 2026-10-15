@@ -256,6 +256,10 @@ impl Highlights {
                 // `nvim_set_hl` of the same name lands in `groups` and wins above, and
                 // `iter`/`get` (the `nvim_get_hl` mirror) read only the real tables, so
                 // this stays a pure render-time fallback.
+                if let Some(link) = builtin_default_link(current) {
+                    current = link;
+                    continue;
+                }
                 return builtin_default_style(current);
             };
             if let Some(link) = &def.link {
@@ -310,6 +314,18 @@ impl Highlights {
             None => capture,
         };
         self.resolve_ns(0, legacy_group(major)?)
+    }
+}
+
+/// The built-in link for an btv-internal highlight group no colorscheme knows of,
+/// so it takes the theme's look for the nearest standard group instead of a fixed
+/// colour: `BtvImePreedit` (an input method's composition, before it's committed)
+/// follows `Visual`, the theme's marked-text look. Like [`builtin_default_style`],
+/// a real definition of the name wins, and this is a closed list.
+fn builtin_default_link(name: &str) -> Option<&'static str> {
+    match name {
+        "BtvImePreedit" => Some("Visual"),
+        _ => None,
     }
 }
 

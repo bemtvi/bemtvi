@@ -1,22 +1,29 @@
-//! The native (winit + wgpu) GUI client.
+//! The native (mitsuami + wgpu) GUI client.
 //!
 //! A thin RPC client that owns no editor state — the GUI sibling of `bemtvi-tui`.
 //! It attaches to the server, sends keystrokes as vim key-notation
 //! (`btv_input`), and paints the server's [`View`] (the same `redraw` model the
 //! TUI consumes) onto a GPU surface as a monospace cell grid.
 //!
-//! **Threading.** winit owns the main thread (its event loop is not async), so
-//! the RPC lives on a separate IO thread running a current-thread tokio runtime:
-//! it drives [`bemtvi_rpc::connect`], decodes each `redraw` into a [`View`], and
-//! forwards it to the event loop as a [`UserEvent`] via an
-//! [`winit::event_loop::EventLoopProxy`]. Input flows the other way without a
-//! runtime — [`bemtvi_rpc::Rpc`] is `Clone + Send` and its `notify` is synchronous,
-//! so the winit thread fires `btv_input` / `nvim_ui_*` directly on a cloned
+//! **Windowing.** [mitsuami](https://mitsuami.roboport.com.br) shows the window with
+//! the platform's own toolkit (AppKit, WinUI 3, GTK 4 or Kirigami); its whole content
+//! is a `GpuSurface`, a native surface the wgpu renderer presents to. The surface
+//! reports keys (where they are, what they typed through the platform's text input,
+//! input methods' commits) and the pointer, and takes the cursor and the caret the
+//! input method's candidate window opens by.
+//!
+//! **Threading.** mitsuami owns the main thread (its UI thread runs the platform's
+//! loop), so the RPC lives on a separate IO thread running a current-thread tokio
+//! runtime: it drives [`bemtvi_rpc::connect`], decodes each `redraw` into a [`View`],
+//! and sends it to the UI thread as a [`UserEvent`] over a channel, which a UI-thread
+//! task drains (mitsuami's executor wakes the UI thread for it). Input flows the other
+//! way without a runtime — [`bemtvi_rpc::Rpc`] is `Clone + Send` and its `notify` is
+//! synchronous, so the UI thread fires `btv_input` / `nvim_ui_*` directly on a cloned
 //! handle.
 //!
 //! The focused window scrolls pixel-smoothly: a redraw's scroll gesture arms a
-//! [`ScrollAnim`] the client clock interpolates, and `about_to_wait` paces the
-//! per-frame repaint. See [`render`] for the rendering scope.
+//! [`ScrollAnim`] the client clock interpolates, and the paint loop repaints every
+//! frame while it runs. See [`render`] for the rendering scope.
 //!
 //! **Native file dialogs.** Pressing `<CR>` over certain `:` command lines pops a
 //! system dialog instead of running the command as typed — a GUI-only affordance;
@@ -39,20 +46,23 @@ pub mod remote;
 mod render;
 mod session;
 
-pub use input::{altgr_composed, encode_key, is_paste};
+pub use input::{encode_input, is_paste};
 pub use mouse::{
     button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action,
 };
 // The neutral text-insertion encoder, re-exported so the Tier-1 key test can cover
-// the path IME-committed text takes (composed accents, CJK) — the GUI feeds an
-// `Ime::Commit` through this exactly as it does a clipboard paste.
+// the path several typed characters take (a dead key that didn't compose, an input
+// method's commit).
 pub use bemtvi_view::{encode_paste, encode_text};
 pub use session::{
     parse_connect_uri, spawn_session, spawn_stdio_daemon_session, spawn_workspace_session, Session,
 };
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
-pub use render::{inlay_shift, splice_inlay, virt_inline_shift, Seg, DEFAULT_INLAY};
+pub use render::{
+    inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay, split_at_char,
+    virt_inline_shift, with_preedit, Seg, DEFAULT_INLAY,
+};
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
 pub use render::{
@@ -83,7 +93,9 @@ pub use render::physical_font_size;
 // `color` test can pin the channel order without a GPU.
 pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,19 +104,20 @@ use bemtvi_rpc::{connect, Incoming, Rpc};
 use bemtvi_view::{arm_scroll, ResizeCursor, View};
 // Re-exported for the Tier-1 band data-contract tests (`tests/scroll_band.rs`).
 pub use bemtvi_view::ScrollAnim;
+use mitsuami::prelude::{
+    clipboard_text, node_ref, open_file, save_file, signal, sleep, spawn_local, Column, Cursor,
+    ElementBuilder, GpuSurface, KeyCode, LengthExt, Modifiers, MouseButton, OpenFile, Point, Rect,
+    SaveFile, ScrollDelta, Signal, Size, SurfaceHandle, SurfaceInput, SurfaceSize, SystemCursor,
+    Window,
+};
 use rmpv::Value;
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{CursorIcon, Window, WindowId};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use render::Renderer;
 pub use render::ScrollFrame;
 
 /// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
-/// auto-scrolling (≈25 lines/sec). winit only re-reports a drag (a `CursorMoved`
+/// auto-scrolling (≈25 lines/sec). The surface only reports a drag (a pointer move
 /// while the button is held) on pointer motion, so without this repeat a
 /// selection dragged to the edge and held still would stop scrolling; this paces
 /// the continuous scroll the server does a line at a time per drag event.
@@ -290,7 +303,7 @@ pub enum SessionRequest {
     Workspace(PathBuf),
 }
 
-/// Events the IO thread injects into the winit event loop.
+/// Events the IO thread sends the UI thread.
 pub enum UserEvent {
     /// A decoded `redraw`: replace the view and repaint.
     Redraw(Box<View>),
@@ -319,13 +332,14 @@ pub enum UserEvent {
     /// The server asked the UI to exit (`bemtvi_exit`), or the connection closed.
     Exit,
     /// A fatal signal (`kill`, SIGHUP, SIGINT) asked the process to stop. Delivered
-    /// from [`bemtvi_view::signals`]' watchdog thread through the event-loop proxy, so
-    /// the shutdown runs on the UI thread like any other quit.
+    /// from [`bemtvi_view::signals`]' watchdog thread over the same channel, so the
+    /// shutdown runs on the UI thread like any other quit.
     Shutdown,
 }
 
 /// Run the GUI client until the window closes or the server disconnects, rendering with
-/// `config`'s font. Must be called on the main thread (winit's requirement).
+/// `config`'s font. Must be called on the main thread (the platform's UI toolkits'
+/// requirement).
 ///
 /// `initial` is the already-built startup [`Session`] (its server thread is running) —
 /// embedded local, or a daemon session if launched with `--connect-daemon` / a
@@ -343,12 +357,11 @@ pub fn run(
     open_dir: Option<PathBuf>,
     config_source: bemtvi_server::ConfigSource,
 ) -> Result<()> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
-    let proxy = event_loop.create_proxy();
+    let (proxy, events) = tokio::sync::mpsc::unbounded_channel::<UserEvent>();
 
     // Be killable without losing the session. There is no terminal to hand back here
     // — a window is not a tty — so this client takes only the *graceful* half: a
-    // `kill` / SIGHUP / SIGINT wakes the UI thread through the proxy and the editor
+    // `kill` / SIGHUP / SIGINT wakes the UI thread through the channel and the editor
     // quits itself properly (see `UserEvent::Shutdown`), with the watchdog in
     // `bemtvi_view::signals` still guaranteeing the process dies if that goes nowhere.
     {
@@ -357,13 +370,13 @@ pub fn run(
             restore_sequence: Vec::new(),
             restore_termios: false,
             on_shutdown: Box::new(move || {
-                let _ = proxy.send_event(UserEvent::Shutdown);
+                let _ = proxy.send(UserEvent::Shutdown);
             }),
         });
     }
 
-    // Shutdown signal: when the event loop exits — the window's close button, or a
-    // server-sent `bemtvi_exit` — the main thread notifies the IO thread so it drops the
+    // Shutdown signal: when the UI's run loop ends — the window closed after a `:qa`,
+    // or a server-sent `bemtvi_exit` — the main thread notifies the IO thread so it drops the
     // RPC connection. The IO thread (not `run`) owns the stream, so unless it closes
     // that, the server never sees EOF, never winds down, and the join below hangs
     // forever — the close-button freeze.
@@ -371,7 +384,7 @@ pub fn run(
     let io_shutdown = shutdown.clone();
 
     // Hand the `Rpc` handle from the IO thread back to the main thread once the
-    // (first) connection is up, so the winit side can fire input synchronously.
+    // (first) connection is up, so the UI side can fire input synchronously.
     let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Rpc>();
     // `:connect <target>` / `:workspace <dir>` from the App request a switch to a new
     // (daemon or local-workspace) session.
@@ -425,7 +438,7 @@ pub fn run(
                         rpc: Box::new(rpc.clone()),
                         remote: next_remote,
                     };
-                    if proxy.send_event(event).is_err() {
+                    if proxy.send(event).is_err() {
                         break 'session; // event loop gone
                     }
                 }
@@ -438,12 +451,12 @@ pub fn run(
                             Some(Incoming::Notification { method, params }) => match method.as_str() {
                                 "redraw" => {
                                     let view = View::from_redraw(&params);
-                                    if proxy.send_event(UserEvent::Redraw(Box::new(view))).is_err() {
+                                    if proxy.send(UserEvent::Redraw(Box::new(view))).is_err() {
                                         break 'session; // event loop gone
                                     }
                                 }
                                 "bemtvi_exit" => {
-                                    let _ = proxy.send_event(UserEvent::Exit);
+                                    let _ = proxy.send(UserEvent::Exit);
                                     break 'session;
                                 }
                                 // `btv.session.reconnect(spec)` from inside the VM (§B): a
@@ -567,7 +580,7 @@ pub fn run(
                                     )
                                     .await,
                                 );
-                                let _ = proxy.send_event(UserEvent::ImageBytes {
+                                let _ = proxy.send(UserEvent::ImageBytes {
                                     path,
                                     version,
                                     result,
@@ -583,7 +596,7 @@ pub fn run(
                             tokio::task::spawn_blocking(move || {
                                 let (path, version, decoded) =
                                     req.decode(bemtvi_view::images::MAX_EDGE);
-                                let _ = proxy.send_event(UserEvent::ImageDecoded {
+                                let _ = proxy.send(UserEvent::ImageDecoded {
                                     path,
                                     version,
                                     decoded,
@@ -612,7 +625,7 @@ pub fn run(
             // `rpc`/`incoming` closes the current stream — the EOF that lets the current
             // server wind down. Join every server thread (current + retired), surfacing a
             // panic so a crashed server is a non-zero exit, not a silent clean quit.
-            let _ = proxy.send_event(UserEvent::Exit);
+            let _ = proxy.send(UserEvent::Exit);
             let mut panicked = false;
             for handle in current_handle.into_iter().chain(retired) {
                 match handle.join() {
@@ -634,7 +647,7 @@ pub fn run(
             return Err(anyhow::anyhow!("client IO thread exited before connecting"));
         }
     };
-    let mut app = App::new(
+    let app = App::new(
         rpc,
         config,
         open_dir,
@@ -643,7 +656,15 @@ pub fn run(
         fetch_tx,
         decode_tx,
     );
-    let run_result = event_loop.run_app(&mut app);
+    // Runs until the window closes. The app id matches the installed `.desktop` file's
+    // basename (its `StartupWMClass`), so Linux desktops associate the AppImage's icon
+    // with the window; it's also an unpackaged Windows build's AppUserModelID.
+    let ui_app = app.clone();
+    mitsuami::App::new()
+        .id("bemtvi")
+        .name("bemtvi")
+        .open(move || App::window(ui_app, events))
+        .run();
 
     // Leak the renderer instead of dropping it. wgpu's GLES/EGL backend segfaults inside
     // `eglTerminate` when its `Instance` drops on Wayland + Mesa — an upstream wgpu/Mesa
@@ -652,12 +673,11 @@ pub fn run(
     // SIGSEGV). wgpu instantiates the GL/EGL backend even when Vulkan is the chosen
     // adapter, so restricting the adapter wouldn't dodge it. `run` only ever returns as
     // the process is about to exit (see `main` — every path tail-calls it), so forgetting
-    // the renderer — and with it every wgpu handle plus the surface's `Arc<Window>` — is
-    // safe: the OS reclaims the GPU/driver resources at exit anyway. Everything else in
-    // `app` (the RPC handle, the channel senders) still drops normally, so the IO thread's
-    // shutdown handshake below is unaffected. Done before `?` so an errored run leaks too.
-    std::mem::forget(app.renderer.take());
-    run_result?;
+    // the renderer — and with it every wgpu handle plus the surface it holds — is safe:
+    // the OS reclaims the GPU/driver resources at exit anyway. Everything else in `app`
+    // (the RPC handle, the channel senders) still drops normally, so the IO thread's
+    // shutdown handshake below is unaffected.
+    std::mem::forget(app.borrow_mut().renderer.take());
 
     // The UI is done: stop the IO thread and wait for it, so the streams are dropped
     // (servers see EOF) and their threads are joined before returning.
@@ -691,36 +711,58 @@ fn report_session_error(rpc: &Rpc, label: &str, err: &anyhow::Error) {
     );
 }
 
-/// The winit application: holds the window, the renderer, and the latest view.
+/// What the UI-thread side of the window holds: the window's own reactive state, the
+/// renderer, and the latest view. Shared (`Rc<RefCell<…>>`) by the surface's handlers
+/// and the UI-thread tasks — the paint loop, the IO thread's event pump and the timers
+/// — which all run on mitsuami's UI thread, one at a time.
 struct App {
+    /// This app itself, for the tasks its methods start (timers, dialogs, paste).
+    me: Weak<RefCell<App>>,
     rpc: Rpc,
-    window: Option<Arc<Window>>,
+    /// The editor's surface, once mitsuami made it. The renderer is built on it at its
+    /// first non-empty size.
+    surface: Option<SurfaceHandle>,
     renderer: Option<Renderer>,
     view: View,
-    /// The in-flight scroll slide, if any (drives the per-frame repaint loop).
+    /// The in-flight scroll slide, if any (keeps the paint loop going).
     scroll: Option<ScrollAnim>,
-    mods: ModifiersState,
-    /// Latest pointer position in physical pixels (winit's button and wheel events
-    /// don't carry it, so `CursorMoved` is tracked here for the next press/wheel).
+    /// Wakes the paint loop: [`Self::request_redraw`] coalesces any number of requests
+    /// into one paint.
+    redraw: Rc<tokio::sync::Notify>,
+    /// The window's own state, made in its reactive scope: whether it's open (closing
+    /// it ends the app), the pointer's cursor over the surface (a resize arrow over a
+    /// split separator), the caret the input method's candidate window opens by, and
+    /// whether input methods are on (unless `'imdisable'`: [`View::imdisable`]).
+    open: Option<Signal<bool>>,
+    cursor: Option<Signal<Cursor>>,
+    caret: Option<Signal<Option<Rect>>>,
+    input_method: Option<Signal<bool>>,
+    /// The modifiers held with the latest input — a wheel or button carries its own,
+    /// and `send_mouse` reports them.
+    mods: Modifiers,
+    /// The surface's scale (pixels per point): the surface reports the pointer in
+    /// points, the renderer works in pixels.
+    scale: f32,
+    /// Latest pointer position in physical pixels (a wheel event carries none, so
+    /// pointer moves are tracked here for the next wheel).
     cursor_px: (f64, f64),
-    /// Whether the left mouse button is held — winit has no "drag" event, so a
-    /// `CursorMoved` while this is set synthesizes one (server extends the Visual
-    /// selection from the press anchor).
+    /// Whether the left mouse button is held — a pointer move while it's set is a
+    /// drag (the server extends the Visual selection from the press anchor).
     mouse_down: bool,
     /// The cell the last left-drag was reported at, so motion within one cell is
     /// coalesced to a single drag (the server works in cells, not pixels).
     last_drag_cell: Option<(u16, u16)>,
     /// The resize cursor currently shown (over a draggable separator / dock edge),
-    /// or `None` for the default arrow. Tracked so a hover only calls winit's
-    /// `set_cursor` when the shape actually changes, not on every pointer move.
+    /// or `None` for the default arrow. Tracked so a hover only sets the cursor when
+    /// the shape actually changes, not on every pointer move.
     resize_hint: Option<ResizeCursor>,
     /// While the left button is held with the pointer in the top/bottom edge band,
     /// the cell to re-issue the drag at so the buffer keeps auto-scrolling without
     /// further pointer motion. `None` when not at an edge or the button is up.
     autoscroll: Option<(u16, u16)>,
-    /// When the next auto-scroll drag repeat is due (paced by [`AUTOSCROLL_INTERVAL`]);
-    /// drives a `WaitUntil` in [`Self::about_to_wait`], like [`Self::flush_deadline`].
-    autoscroll_deadline: Option<Instant>,
+    /// Whether the auto-scroll repeat task is running (it stops once `autoscroll`
+    /// clears), so arming it again doesn't start a second one.
+    autoscrolling: bool,
     /// Fractional wheel remainder per axis `(horizontal, vertical)`, so a
     /// pixel-precise trackpad still scrolls one whole line at a time (see
     /// [`mouse::drain_notches`]).
@@ -729,11 +771,12 @@ struct App {
     /// no-op resize notifications.
     reported: (u16, u16),
     /// When set, fire one `bemtvi_input_flush` once this instant passes with no
-    /// further input — the GUI's `timeoutlen` timer (see [`TIMEOUT_LEN`]). Armed by
-    /// each keystroke and re-armed by the next, so it measures idle-since-last-key.
+    /// further input — the GUI's `timeoutlen` timer. Armed by each keystroke and
+    /// re-armed by the next, so it measures idle-since-last-key; each arming starts a
+    /// timer task, which does nothing if a later key moved the deadline.
     flush_deadline: Option<Instant>,
-    /// The last IME cursor rect `(x, y, w, h)` pushed to the window, so a frame that
-    /// didn't move the caret skips the redundant platform call.
+    /// The last IME cursor rect `(x, y, w, h)` set as the surface's caret, so a frame
+    /// that didn't move the caret leaves it alone.
     ime_area: Option<(f32, f32, f32, f32)>,
     /// Font config (CLI flags / environment) used as the renderer's startup default
     /// and the fallback for any field a `guifont` doesn't set.
@@ -747,9 +790,9 @@ struct App {
     /// "keep what `--glyph-overflow` / the env set".
     applied_glyph_overflow: String,
     /// A directory passed on the command line (`bemtvi-gui somedir`), if any. Popped
-    /// as the native file picker (anchored there) once the window exists, instead of
-    /// the server's in-window listing — see [`Self::resumed`]. Taken on first use so
-    /// it fires exactly once.
+    /// as the native file picker (anchored there) once the renderer exists, instead of
+    /// the server's in-window listing — see [`Self::init_renderer`]. Taken on first
+    /// use so it fires exactly once.
     open_dir: Option<PathBuf>,
     /// Whether this is an edit-host (daemon) session — buffers live on the daemon's
     /// fs, not the local disk. Suppresses the native open/save file dialogs (see
@@ -779,33 +822,468 @@ impl App {
         reconnect: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
         fetch_tx: tokio::sync::mpsc::UnboundedSender<ImageFetch>,
         decode_tx: tokio::sync::mpsc::UnboundedSender<DecodeReq>,
-    ) -> Self {
-        Self {
-            rpc,
-            window: None,
-            renderer: None,
-            view: View::default(),
-            scroll: None,
-            mods: ModifiersState::empty(),
-            cursor_px: (0.0, 0.0),
-            mouse_down: false,
-            last_drag_cell: None,
-            resize_hint: None,
-            autoscroll: None,
-            autoscroll_deadline: None,
-            wheel_accum: (0.0, 0.0),
-            reported: (0, 0),
-            flush_deadline: None,
-            ime_area: None,
-            config,
-            applied_guifont: String::new(),
-            applied_glyph_overflow: String::new(),
-            open_dir,
-            remote,
-            reconnect,
-            fetch_tx,
-            decode_tx,
+    ) -> Rc<RefCell<Self>> {
+        Rc::new_cyclic(|me| {
+            RefCell::new(Self {
+                me: me.clone(),
+                rpc,
+                surface: None,
+                renderer: None,
+                view: View::default(),
+                scroll: None,
+                redraw: Rc::new(tokio::sync::Notify::new()),
+                open: None,
+                cursor: None,
+                caret: None,
+                input_method: None,
+                mods: Modifiers::default(),
+                scale: 1.0,
+                cursor_px: (0.0, 0.0),
+                mouse_down: false,
+                last_drag_cell: None,
+                resize_hint: None,
+                autoscroll: None,
+                autoscrolling: false,
+                wheel_accum: (0.0, 0.0),
+                reported: (0, 0),
+                flush_deadline: None,
+                ime_area: None,
+                config,
+                applied_guifont: String::new(),
+                applied_glyph_overflow: String::new(),
+                open_dir,
+                remote,
+                reconnect,
+                fetch_tx,
+                decode_tx,
+            })
+        })
+    }
+
+    /// The window: titled `bemtvi`, 960×640 points, its whole content the editor's
+    /// surface, focused so keys go to it from the start. Built in mitsuami's app scope,
+    /// where it starts the UI-thread tasks: the pump for the IO thread's `events`, and
+    /// the paint loop.
+    fn window(this: Rc<RefCell<Self>>, mut events: UnboundedReceiver<UserEvent>) -> Window {
+        let open = signal(true);
+        let cursor = signal(Cursor::Default);
+        let caret = signal(None::<Rect>);
+        let input_method = signal(true);
+        {
+            let mut app = this.borrow_mut();
+            app.open = Some(open);
+            app.cursor = Some(cursor);
+            app.caret = Some(caret);
+            app.input_method = Some(input_method);
         }
+        let app = this.clone();
+        spawn_local(async move {
+            while let Some(event) = events.recv().await {
+                app.borrow_mut().user_event(event);
+            }
+        });
+        spawn_local(Self::paint_loop(this.clone()));
+
+        let closing = this.clone();
+        let content = this.clone();
+        Window::new("bemtvi")
+            .size(Size::new(960.0, 640.0))
+            .open(open)
+            // Don't close on the close button directly — that would discard a modified
+            // buffer silently. Route through the server's `:qa`, which quits a clean
+            // editor (it then sends `bemtvi_exit`, arriving as `UserEvent::Exit`) but
+            // refuses with `E37` when a buffer is unsaved, keeping the window open.
+            // `btv_command` runs the ex-command regardless of the current mode (unlike
+            // injecting `:qa<CR>` keys). mitsuami routes the platform's Quit (macOS's
+            // app menu, the Dock, a logout) here too.
+            .on_close_request(move || {
+                closing
+                    .borrow()
+                    .rpc
+                    .notify("btv_command", vec![Value::from("qa")]);
+            })
+            .content(move || {
+                let surface = node_ref();
+                surface.focus();
+                let (ready, resized, input) = (content.clone(), content.clone(), content.clone());
+                Column::new().size(100.pct(), 100.pct()).child(
+                    GpuSurface::new()
+                        .label("bemtvi")
+                        .node_ref(surface)
+                        .size(100.pct(), 100.pct())
+                        // Text as a text field takes it: layouts, dead keys, AltGr and
+                        // input methods (composed accents, CJK) all type — input methods
+                        // unless a config sets `'imdisable'`.
+                        .text_input(true)
+                        .input_method(input_method)
+                        .text_cursor(caret)
+                        .cursor(cursor)
+                        .on_ready(move |handle| ready.borrow_mut().surface = Some(handle))
+                        .on_resize(move |size| resized.borrow_mut().resized(size))
+                        .on_input(move |event| input.borrow_mut().input(&event)),
+                )
+            })
+    }
+
+    /// Paints whenever a repaint was asked for (any number of requests, one paint),
+    /// and every 8 ms while a scroll slide runs: `present` (Fifo vsync) then paces the
+    /// actual paint to the display refresh.
+    async fn paint_loop(this: Rc<RefCell<Self>>) {
+        let wake = this.borrow().redraw.clone();
+        loop {
+            wake.notified().await;
+            while this.borrow_mut().paint() {
+                sleep(Duration::from_millis(8)).await;
+            }
+        }
+    }
+
+    /// Paint one frame; whether a slide is still running. A finished slide settles
+    /// first, so the final frame is the live (destination) view rather than a clamped
+    /// band.
+    fn paint(&mut self) -> bool {
+        if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
+            self.scroll = None;
+        }
+        let frame = self.scroll.as_ref().map(ScrollFrame::of);
+        if let Some(r) = self.renderer.as_mut() {
+            if let Err(e) = r.render(&self.view, frame.as_ref()) {
+                eprintln!("bemtvi-gui: render error: {e}");
+            }
+        }
+        self.update_ime_area();
+        self.scroll.is_some()
+    }
+
+    fn request_redraw(&self) {
+        self.redraw.notify_one();
+    }
+
+    /// The surface's size in pixels, or its scale, changed. The first non-empty size
+    /// builds the renderer on the surface.
+    fn resized(&mut self, size: SurfaceSize) {
+        if size.is_empty() {
+            return;
+        }
+        if self.renderer.is_none() {
+            self.init_renderer(size);
+            return;
+        }
+        if size.scale > 0.0 && size.scale != self.scale {
+            // The renderer's cell metrics are device pixels (`points × scale`), so a
+            // DPI change — dragging the window onto a different-scale monitor — must
+            // re-derive them, or the glyphs keep the old monitor's pixel size (wrong
+            // physical size + a wrong grid). Re-applying the current font at the new
+            // scale re-measures the cell, re-reports the grid, and repaints.
+            self.scale = size.scale;
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_scale(size.scale);
+            }
+            self.apply_guifont();
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.resize(size.width, size.height);
+        }
+        self.report_size(false);
+        self.request_redraw();
+    }
+
+    /// Build the renderer on the surface at its first size, attach the UI, and apply
+    /// what arrived before it existed.
+    fn init_renderer(&mut self, size: SurfaceSize) {
+        let Some(surface) = self.surface.clone() else {
+            return;
+        };
+        self.scale = if size.scale > 0.0 { size.scale } else { 1.0 };
+        match Renderer::new(
+            surface,
+            size,
+            &self.config,
+            self.fetch_tx.clone(),
+            self.decode_tx.clone(),
+        ) {
+            Ok(r) => self.renderer = Some(r),
+            Err(e) => {
+                // Fail loud: without a renderer there's nothing to show, so quit the
+                // session (the server answers with `bemtvi_exit`) rather than leave a
+                // blank window up.
+                eprintln!("bemtvi-gui: failed to init renderer: {e}");
+                self.rpc.notify("btv_command", vec![Value::from("qall!")]);
+                return;
+            }
+        }
+        self.report_size(true);
+        // Apply any `guifont` already received before the renderer existed (a redraw
+        // can beat the surface); a no-op for the default empty value.
+        self.apply_guifont();
+        // Same for `'guiglyphoverflow'`, which an `init.lua` will have set before the
+        // first frame; empty leaves the renderer on the CLI/env mode it was built with.
+        self.apply_glyph_overflow();
+        self.request_redraw();
+        // A directory given on the command line opens the native file picker there
+        // (taken so it fires once).
+        if let Some(dir) = self.open_dir.take() {
+            self.pick_open_at("e", &dir.to_string_lossy());
+        }
+    }
+
+    /// Something from the IO thread.
+    fn user_event(&mut self, event: UserEvent) {
+        match event {
+            UserEvent::Redraw(view) => {
+                self.view = *view;
+                self.update_input_method();
+                // A changed `guifont` re-shapes the renderer (and re-reports the
+                // grid) before this frame paints.
+                if self.view.guifont != self.applied_guifont {
+                    self.apply_guifont();
+                }
+                // A changed `'guiglyphoverflow'` re-sizes off-grid glyphs from this
+                // frame on (placement only — nothing to re-shape).
+                if self.view.guiglyphoverflow != self.applied_glyph_overflow {
+                    self.apply_glyph_overflow();
+                }
+                // (Re)arm or clear the scroll slide from this frame's gesture.
+                self.scroll = arm_scroll(&self.view, self.scroll.take());
+                self.request_redraw();
+            }
+            // A remote preview's bytes arrived (or the read failed): hand them to the
+            // image store and repaint, so the picture replaces its loading placeholder.
+            UserEvent::ImageBytes {
+                path,
+                version,
+                result,
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.deliver_image(path, version, result);
+                    self.request_redraw();
+                }
+            }
+            // An off-paint decode finished (or failed): hand the outcome to the image
+            // store — which drops it if a newer version superseded it — and repaint,
+            // so the picture replaces its loading placeholder.
+            UserEvent::ImageDecoded {
+                path,
+                version,
+                decoded,
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.deliver_image_decode(path, version, decoded);
+                    self.request_redraw();
+                }
+            }
+            // A `:connect` brought up a new server: swap to its RPC handle (dropping the
+            // old one — the App's last clone, which lets the old connection wind down),
+            // update remote-ness, and re-attach the UI. Clearing `reported` forces
+            // `report_size` to send a fresh `btv_ui_attach`; resetting the view avoids
+            // painting the old server's buffer until the new one's first redraw arrives.
+            UserEvent::Connected { rpc, remote } => {
+                self.rpc = *rpc;
+                self.remote = remote;
+                self.view = View::default();
+                self.scroll = None;
+                // The new session's files are unrelated to the old one's paths; drop
+                // the cached textures and any fetched remote bytes so a stale image
+                // can't bleed across the swap.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.clear_images();
+                }
+                self.reported = (0, 0);
+                self.report_size(true);
+                self.apply_guifont();
+                // The reset view carries no `'guiglyphoverflow'` either: back to the
+                // CLI/env mode until the new server's first redraw says otherwise.
+                self.apply_glyph_overflow();
+                self.request_redraw();
+            }
+            // Closing the last window ends mitsuami's run loop, and `run`'s teardown.
+            UserEvent::Exit => {
+                if let Some(open) = self.open {
+                    open.set(false);
+                }
+            }
+            // Killed. Quit the session the way `:qall!` does rather than letting the
+            // process be torn down mid-tick: the exit sequence runs
+            // (QuitPre/ExitPre/VimLeavePre/VimLeave, so plugins persist their state)
+            // and the server's clean-exit shada flush lands. The bang is deliberate —
+            // nobody is there to answer an E37 prompt — and so is the missing `w`:
+            // writing files the user never asked to write would be worse than losing
+            // the edits. The server answers with `bemtvi_exit`, which arrives back here
+            // as `UserEvent::Exit` and closes the window; `run`'s tail then re-raises
+            // the signal so the kill still looks like a kill.
+            UserEvent::Shutdown => {
+                self.rpc.notify("btv_command", vec![Value::from("qall!")]);
+            }
+        }
+    }
+
+    /// Keys, typed text and the pointer on the surface.
+    fn input(&mut self, input: &SurfaceInput) {
+        match input {
+            SurfaceInput::PointerMoved {
+                position,
+                modifiers,
+            } => {
+                self.mods = *modifiers;
+                self.cursor_px = self.pixels(*position);
+                // While the left button is held, a move into a new cell is a drag.
+                self.mouse_drag();
+                self.update_resize_cursor();
+            }
+            SurfaceInput::Button {
+                button,
+                pressed,
+                position,
+                modifiers,
+            } => {
+                self.mods = *modifiers;
+                self.cursor_px = self.pixels(*position);
+                match (button, pressed) {
+                    (MouseButton::Primary, true) => self.mouse_left_press(),
+                    (MouseButton::Primary, false) => self.mouse_left_release(),
+                    // Right / middle clicks have no client-owned overlay affordance,
+                    // so they forward straight to the server at the pointer cell — the
+                    // `'mousemodel'` right-click branch and middle-click paste live
+                    // there. Only the press is meaningful (the server no-ops
+                    // right/middle drag + release), mirroring the TUI.
+                    (button, true) => {
+                        if let (Some(name), Some((col, row))) =
+                            (mouse::button_name(*button), self.pointer_cell())
+                        {
+                            self.send_mouse(name, "press", col, row);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SurfaceInput::Scroll { delta, modifiers } => {
+                self.mods = *modifiers;
+                self.mouse_wheel(*delta);
+            }
+            SurfaceInput::Key {
+                code,
+                pressed: true,
+                unmodified,
+                modifiers,
+                ..
+            } => {
+                self.mods = *modifiers;
+                self.key_press(input, *code, *unmodified, *modifiers);
+            }
+            // Text an input method committed (composed accents, CJK, …): the user's own
+            // typing arriving as one string, not a paste, so it drives insert mode
+            // normally (auto-pairs and the rest) rather than going in literally.
+            SurfaceInput::Text(_) => self.send_keys(input),
+            // An input method taking back what keys typed, to replace it (macOS's
+            // accents replace the letter a held key typed): delete it in the buffer.
+            SurfaceInput::DeleteSurrounding { .. } => self.send_keys(input),
+            // An input method's composition in progress: the surface is ours to draw,
+            // so the platform can't show it — paint it at the cursor until it's
+            // committed (a `Text`) or cancelled (an empty one).
+            SurfaceInput::Preedit { text, cursor } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_preedit(text, *cursor);
+                }
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    /// A key went down (or repeats).
+    fn key_press(
+        &mut self,
+        input: &SurfaceInput,
+        code: KeyCode,
+        unmodified: Option<char>,
+        mods: Modifiers,
+    ) {
+        // Paste from the system clipboard (Cmd+V / Ctrl+Shift+V / Shift+Insert), fed
+        // through the same `encode_paste` the TUI uses for terminal bracketed paste.
+        // Claimed before key encoding so the gesture's base key isn't also typed.
+        if input::is_paste(code, unmodified, mods) {
+            self.paste_clipboard();
+            return;
+        }
+        // `<CR>` over a dialog-triggering `:` command line pops a native file dialog
+        // and runs the real command with the chosen path, in place of the keystroke.
+        // Only for a true `:` ex command (not a search or a `vim.ui.input` prompt).
+        if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)
+            && self.view.command_mode
+            && self.view.cmdline_prefix == ':'
+            && self.view.cmdline_prompt.is_empty()
+            // …but NOT while a completion picker (`btv.picker`, e.g. the cmdline file
+            // completer) floats over the still-open command line: there `<CR>` belongs
+            // to the picker so it can descend into a directory or paste the chosen
+            // path. Intercepting it here would pop the native dialog / submit instead,
+            // copying every directory into the line and running the last one (the
+            // GUI-only divergence from the TUI, where every key reaches the server's
+            // picker untouched).
+            && self.view.menu.is_none()
+        {
+            // `:workspace [dir]` swaps this window onto a fresh local session rooted at
+            // the directory. It is a client affordance, *also* registered server-side
+            // as a no-op virtual command (see [`session::CLIENT_INIT_LUA`]) so it gets
+            // completion, help, and history. So request the swap here, but DON'T
+            // swallow the `<CR>`: let it fall through and submit the command line
+            // normally, which records it in `:` history and runs the harmless no-op
+            // body. The swap then arrives async (see `UserEvent::Connected`).
+            //
+            // `:connect` is NOT intercepted here: it is a real prelude command (§C)
+            // that routes through the VM so a connector can claim it, then swaps via a
+            // `btv_session_reconnect` (provider) or `btv_connect_fallback` (direct
+            // dial) notification handled in [`crate::run`].
+            if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
+                let _ = self
+                    .reconnect
+                    .send(SessionRequest::Workspace(PathBuf::from(dir)));
+            }
+            let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
+            // `dialog_action` returns `None` in a remote (daemon) session, so the
+            // native local-fs picker never fires for remote buffers — the command runs
+            // as typed and the server/daemon handles it. Each `pick_*` swallows the
+            // `<CR>` (it aborts the command line and re-issues the real command with
+            // the chosen path), so `return` before the key is encoded below.
+            match dialog_action(&self.view.cmdline, unnamed, self.remote) {
+                Some(DialogAction::Open { base }) => {
+                    self.pick_open(base);
+                    return;
+                }
+                // Opening a *directory* (`:e somedir`): pop the picker there instead
+                // of letting the server show its netrw listing. A file argument runs
+                // as typed (the server opens it).
+                Some(DialogAction::OpenPath { base, arg }) if Path::new(arg).is_dir() => {
+                    let arg = arg.to_owned();
+                    self.pick_open_at(base, &arg);
+                    return;
+                }
+                Some(DialogAction::Save) => {
+                    self.pick_save();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.send_keys(input);
+    }
+
+    /// Encode a key press or committed text and feed it to the server, arming the
+    /// `timeoutlen` flush (the next key re-arms it, so it measures idle-since-last-key).
+    /// macOS composes Option(Alt)+key into a character (Option+c types `ç`), but
+    /// `<A-c>`-style bindings (multi-cursor) want the chord there too, so on macOS
+    /// Option makes chords (see [`input::encode_input`]).
+    fn send_keys(&mut self, input: &SurfaceInput) {
+        if let Some(notation) = input::encode_input(input, cfg!(target_os = "macos")) {
+            self.rpc
+                .notify("btv_input", vec![Value::from(notation.as_str())]);
+            self.arm_flush_deadline();
+        }
+    }
+
+    /// A point on the surface in physical pixels.
+    fn pixels(&self, at: Point) -> (f64, f64) {
+        let scale = f64::from(self.scale);
+        (f64::from(at.x) * scale, f64::from(at.y) * scale)
     }
 
     /// Compute the grid, and if it changed since last time, tell the server. The
@@ -826,14 +1304,14 @@ impl App {
         } else {
             "btv_ui_try_resize"
         };
-        // A native window always has full key disambiguation (winit reports Ctrl+I as
-        // `Character("i")` + control, distinct from `Tab`), so declare the keyboard
-        // protocol active at attach — the server then keeps `<C-i>`/`<C-m>`/`<C-[>`/
-        // `<C-h>` apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`. It also paints 24-bit color
-        // natively, so declare `truecolor` too — the server then defaults in the
-        // bundled `bemtvi` colorscheme (giving `Normal` a real background, not just the
-        // renderer's syntax fallback) when the config hasn't chosen one. The map is
-        // read only at attach; a resize passes an empty one.
+        // A native window always has full key disambiguation (a key is reported by
+        // where it is, so Ctrl+I is `KeyI` + control, distinct from `Tab`), so declare
+        // the keyboard protocol active at attach — the server then keeps
+        // `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`. It
+        // also paints 24-bit color natively, so declare `truecolor` too — the server
+        // then defaults in the bundled `bemtvi` colorscheme (giving `Normal` a real
+        // background, not just the renderer's syntax fallback) when the config hasn't
+        // chosen one. The map is read only at attach; a resize passes an empty one.
         let caps = if attach {
             Value::Map(vec![
                 (Value::from("keyboard_protocol"), Value::Boolean(true)),
@@ -846,36 +1324,58 @@ impl App {
             .notify(method, vec![Value::from(cols), Value::from(win_rows), caps]);
     }
 
-    /// Read the system clipboard and feed it to the server as one `btv_input` via
-    /// [`encode_paste`] — the GUI analogue of the TUI's bracketed paste (one
-    /// notify, one redraw, no per-character trickle). A missing, empty, or
-    /// non-text clipboard is a silent no-op (nothing to paste).
+    /// Read the system clipboard (the platform's, through mitsuami) and feed it to the
+    /// server as one `btv_input` via [`encode_paste`] — the GUI analogue of the TUI's
+    /// bracketed paste (one notify, one redraw, no per-character trickle). A missing,
+    /// empty, or non-text clipboard is a silent no-op (nothing to paste).
     fn paste_clipboard(&self) {
-        let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) else {
+        let me = self.me.clone();
+        spawn_local(async move {
+            let Some(text) = clipboard_text().await else {
+                return;
+            };
+            let notation = encode_paste(&text);
+            if let (false, Some(app)) = (notation.is_empty(), me.upgrade()) {
+                let mut app = app.borrow_mut();
+                app.rpc
+                    .notify("btv_input", vec![Value::from(notation.as_str())]);
+                app.arm_flush_deadline();
+            }
+        });
+    }
+
+    /// Turn the platform's input methods off while `'imdisable'` is set, and back on
+    /// as it's unset. A composition still showing as they go off is dropped.
+    fn update_input_method(&mut self) {
+        let Some(input_method) = self.input_method else {
             return;
         };
-        let notation = encode_paste(&text);
-        if !notation.is_empty() {
-            self.rpc
-                .notify("btv_input", vec![Value::from(notation.as_str())]);
+        let on = !self.view.imdisable;
+        if input_method.get_untracked() == on {
+            return;
+        }
+        input_method.set(on);
+        if !on {
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_preedit("", None);
+            }
         }
     }
 
-    /// Push the just-painted caret rect to the window as the IME cursor area, so the
-    /// platform opens the IME candidate window at the caret instead of the window
-    /// origin. The renderer reports the rect in physical pixels (`None` when a
-    /// picker/panel owns the cursor); only a changed rect is forwarded, since the
-    /// platform call is a no-op-but-not-free per frame.
+    /// Set the just-painted caret rect as the surface's caret, so the platform opens
+    /// the IME candidate window at the caret instead of the window origin. The renderer
+    /// reports the rect in physical pixels (`None` when a picker/panel owns the
+    /// cursor); the surface takes points. Only a changed rect is set.
     fn update_ime_area(&mut self) {
         let area = self.renderer.as_ref().and_then(Renderer::ime_cursor_area);
         if area == self.ime_area {
             return;
         }
         self.ime_area = area;
-        if let (Some(w), Some((x, y, cw, ch))) = (self.window.as_ref(), area) {
-            w.set_ime_cursor_area(
-                winit::dpi::PhysicalPosition::new(x, y),
-                winit::dpi::PhysicalSize::new(cw, ch),
+        let scale = self.scale;
+        if let Some(caret) = self.caret {
+            caret.set(
+                area.map(|(x, y, w, h)| Rect::new(x / scale, y / scale, w / scale, h / scale)),
             );
         }
     }
@@ -885,7 +1385,7 @@ impl App {
     /// and re-report the grid (the cell size changed). Called whenever `guifont`
     /// changes — including its first non-empty value from `init.lua` — so a
     /// `:set guifont=…` takes effect live. A no-op before the renderer exists; it's
-    /// applied from `resumed` once the renderer is built.
+    /// applied from [`Self::init_renderer`] once the renderer is built.
     fn apply_guifont(&mut self) {
         let (families, size) = parse_guifont(&self.view.guifont);
         // The `guifont` families win; with none set, fall back to the CLI/env list.
@@ -903,9 +1403,7 @@ impl App {
         // The cell size changed, so the grid in cells did too — re-report it (the
         // server re-lays out for the new dimensions) and repaint.
         self.report_size(false);
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
-        }
+        self.request_redraw();
     }
 
     /// Apply the relayed `'guiglyphoverflow'` to the renderer — whether a square
@@ -935,51 +1433,57 @@ impl App {
             return;
         };
         renderer.set_glyph_overflow(mode);
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
-        }
+        self.request_redraw();
     }
 
     /// Pop the native **open** dialog for an `…o` open command, then run `<base>
-    /// <file>` with the chosen path. Returns `true` once it has handled the `<CR>`
-    /// (so the caller swallows the key).
+    /// <file>` with the chosen path. The caller swallows the `<CR>`.
     ///
     /// On a pick it aborts the half-typed command line (`<Esc>`) and runs the base
     /// command; on cancel it just aborts. bemtvi's `:edit`-family parser takes the
     /// whole argument tail as the filename (no backslash unescaping, unlike vim),
     /// so the path is passed **raw** — a leading `fnameescape` would wrongly bake
-    /// its `\ ` escapes into the name. The dialog is modal on the main thread
-    /// (winit's requirement; on Linux rfd blocks on the portal call via pollster,
-    /// safe here since the winit thread is outside the tokio runtime), which
-    /// briefly blocks the event loop — fine for a file picker.
-    fn pick_open(&self, base: &str) -> bool {
-        let picked = rfd::FileDialog::new().set_title("Open").pick_file();
-        self.run_picked(base, picked);
-        true
+    /// its `\ ` escapes into the name. The dialog is the platform's own, on the window
+    /// (a sheet on macOS), and doesn't block the UI thread: the command runs when it
+    /// answers.
+    fn pick_open(&self, base: &'static str) {
+        self.pick(base, OpenFile::new().title("Open"));
     }
 
     /// Like [`Self::pick_open`] but opens the dialog **anchored at `dir`** — the GUI's
     /// answer to opening a *directory* (`:e somedir`, or `bemtvi-gui somedir`). Rather
     /// than the server's in-window netrw listing, the user gets the system file picker
     /// already browsing that directory, and the picked file is opened with `base`.
-    /// Same key-swallowing and raw-path contract as [`Self::pick_open`]; a relative
-    /// `dir` resolves against the process cwd, exactly as the server's listing would.
-    fn pick_open_at(&self, base: &str, dir: &str) -> bool {
-        let picked = rfd::FileDialog::new()
-            .set_title("Open")
-            .set_directory(dir)
-            .pick_file();
-        self.run_picked(base, picked);
-        true
+    /// Same contract and raw-path rationale as [`Self::pick_open`]; a relative `dir`
+    /// resolves against the process cwd, exactly as the server's listing would.
+    fn pick_open_at(&self, base: &'static str, dir: &str) {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir));
+        self.pick(base, OpenFile::new().title("Open").start_folder(dir));
+    }
+
+    fn pick(&self, base: &'static str, request: OpenFile) {
+        let me = self.me.clone();
+        spawn_local(async move {
+            let picked = open_file(request)
+                .await
+                .and_then(|paths| paths.into_iter().next());
+            if let Some(app) = me.upgrade() {
+                app.borrow().run_picked(base, picked);
+            }
+        });
     }
 
     /// Pop the native **save** dialog for `:wo` / a bare `:w` on an unnamed buffer,
     /// then `:w <file>` to the chosen path (which also binds the buffer to it).
-    /// Same key-swallowing contract and raw-path rationale as [`Self::pick_open`].
-    fn pick_save(&self) -> bool {
-        let picked = rfd::FileDialog::new().set_title("Save As").save_file();
-        self.run_picked("w", picked);
-        true
+    /// Same contract and raw-path rationale as [`Self::pick_open`].
+    fn pick_save(&self) {
+        let me = self.me.clone();
+        spawn_local(async move {
+            let picked = save_file(SaveFile::new().title("Save As")).await;
+            if let Some(app) = me.upgrade() {
+                app.borrow().run_picked("w", picked);
+            }
+        });
     }
 
     /// Abort the half-typed command line, then run `<verb> <path>` for a picked
@@ -1005,10 +1509,27 @@ impl App {
     /// (the which-key "wait forever" behavior). Called after every keystroke / paste,
     /// so it always measures idle-since-the-last-key with the current config.
     fn arm_flush_deadline(&mut self) {
-        self.flush_deadline = self
-            .view
-            .timeout
-            .then(|| Instant::now() + Duration::from_millis(self.view.timeoutlen));
+        if !self.view.timeout {
+            self.flush_deadline = None;
+            return;
+        }
+        let wait = Duration::from_millis(self.view.timeoutlen);
+        self.flush_deadline = Some(Instant::now() + wait);
+        let me = self.me.clone();
+        spawn_local(async move {
+            sleep(wait).await;
+            let Some(app) = me.upgrade() else {
+                return;
+            };
+            let mut app = app.borrow_mut();
+            // Idle `timeoutlen` reached (a later key moved the deadline on, and its own
+            // timer fires then): nudge the server to resolve any withheld mapped prefix
+            // (harmless when nothing is pending), and disarm.
+            if app.flush_deadline.is_some_and(|d| Instant::now() >= d) {
+                app.rpc.notify("bemtvi_input_flush", vec![]);
+                app.flush_deadline = None;
+            }
+        });
     }
 
     /// Fire one `btv_input_mouse(button, action, modifier, grid=0, row, col)` —
@@ -1045,25 +1566,45 @@ impl App {
     }
 
     /// Arm or disarm continuous drag auto-scroll for a press/drag now at `cell`:
-    /// armed (with a fresh repeat deadline) when the cell sits in the top/bottom
-    /// edge band, cleared otherwise. [`Self::about_to_wait`] then re-issues the
-    /// drag every [`AUTOSCROLL_INTERVAL`] while it stays armed, so the buffer keeps
-    /// scrolling even though winit reports a drag only on actual pointer motion.
+    /// armed when the cell sits in the top/bottom edge band, cleared otherwise. While
+    /// it stays armed a task re-issues the drag every [`AUTOSCROLL_INTERVAL`], so the
+    /// buffer keeps scrolling even though a drag is only reported on pointer motion.
     fn arm_autoscroll(&mut self, cell: (u16, u16)) {
         let rows = self.renderer.as_ref().map_or(0, |r| r.grid_size().1);
-        if in_scroll_zone(cell.1, rows) {
-            self.autoscroll = Some(cell);
-            self.autoscroll_deadline = Some(Instant::now() + AUTOSCROLL_INTERVAL);
-        } else {
+        if !in_scroll_zone(cell.1, rows) {
             self.autoscroll = None;
-            self.autoscroll_deadline = None;
+            return;
         }
+        self.autoscroll = Some(cell);
+        if std::mem::replace(&mut self.autoscrolling, true) {
+            return; // the running task picks the new cell up
+        }
+        let me = self.me.clone();
+        spawn_local(async move {
+            loop {
+                sleep(AUTOSCROLL_INTERVAL).await;
+                let Some(app) = me.upgrade() else {
+                    return;
+                };
+                let mut app = app.borrow_mut();
+                // The server scrolls the focused window one line per drag it lands
+                // past the text body and re-extends the selection.
+                match app.autoscroll {
+                    Some((col, row)) => app.send_mouse("left", "drag", col, row),
+                    None => {
+                        app.autoscrolling = false;
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     /// Update the pointer shape on hover: a resize cursor over a draggable split
     /// separator or dock edge, the default arrow elsewhere. A no-op while a button
-    /// is held (a drag in progress keeps its grab cursor) and only touches winit
-    /// when the shape changes, so an ordinary move over text costs nothing.
+    /// is held (a drag in progress keeps its grab cursor) and only sets the
+    /// surface's cursor when the shape changes, so an ordinary move over text costs
+    /// nothing.
     fn update_resize_cursor(&mut self) {
         if self.mouse_down {
             return;
@@ -1076,17 +1617,16 @@ impl App {
             return;
         }
         self.resize_hint = hint;
-        if let Some(window) = self.window.as_ref() {
-            let icon = match hint {
-                Some(ResizeCursor::Col) => CursorIcon::EwResize,
-                Some(ResizeCursor::Row) => CursorIcon::NsResize,
-                None => CursorIcon::Default,
-            };
-            window.set_cursor(icon);
+        if let Some(cursor) = self.cursor {
+            cursor.set(match hint {
+                Some(ResizeCursor::Col) => Cursor::System(SystemCursor::ResizeEastWest),
+                Some(ResizeCursor::Row) => Cursor::System(SystemCursor::ResizeNorthSouth),
+                None => Cursor::Default,
+            });
         }
     }
 
-    /// A `CursorMoved` while the left button is held: extend the Visual selection
+    /// A pointer move while the left button is held: extend the Visual selection
     /// by reporting a drag, but only when the pointer crosses into a new cell (the
     /// server works in cells, so within-cell motion is noise).
     fn mouse_drag(&mut self) {
@@ -1113,7 +1653,6 @@ impl App {
         self.mouse_down = false;
         self.last_drag_cell = None;
         self.autoscroll = None; // release ends the drag, so stop scrolling
-        self.autoscroll_deadline = None;
         if let Some((col, row)) = self.pointer_cell() {
             self.send_mouse("left", "release", col, row);
         }
@@ -1121,16 +1660,16 @@ impl App {
 
     /// The mouse wheel. Every notch is forwarded to the server, which hit-tests it
     /// to the window — or the overlay (the completion popup, a picker) — under the
-    /// pointer; nothing scrolls client-side. A trackpad's fractional pixels
-    /// accumulate into whole lines.
-    fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
+    /// pointer; nothing scrolls client-side. A trackpad's points accumulate into
+    /// whole lines.
+    fn mouse_wheel(&mut self, delta: ScrollDelta) {
         let Some(r) = self.renderer.as_ref() else {
             return;
         };
         let (cell_w, cell_h) = r.cell_size();
         let (ax, ay) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (x, y),
-            MouseScrollDelta::PixelDelta(p) => (p.x as f32 / cell_w, p.y as f32 / cell_h),
+            ScrollDelta::Lines { x, y } => (x, y),
+            ScrollDelta::Points { x, y } => (x * self.scale / cell_w, y * self.scale / cell_h),
         };
         let hnotch = mouse::drain_notches(ax, &mut self.wheel_accum.0);
         let vnotch = mouse::drain_notches(ay, &mut self.wheel_accum.1);
@@ -1138,9 +1677,7 @@ impl App {
             return;
         };
 
-        // Cap the per-event repeat so a flung trackpad can't flood the server. Every
-        // notch is forwarded to the server, which hit-tests it to the window — or the
-        // overlay (the completion popup, a picker) — under the pointer.
+        // Cap the per-event repeat so a flung trackpad can't flood the server.
         const MAX_STEPS: i32 = 10;
         if let Some(action) = mouse::vertical_action(vnotch) {
             let steps = vnotch.unsigned_abs().min(MAX_STEPS as u32);
@@ -1278,431 +1815,4 @@ pub fn parse_guifont(guifont: &str) -> (Vec<String>, Option<f32>) {
         (pt.is_finite() && pt > 0.0).then_some(pt)
     });
     (families, size)
-}
-
-impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return; // already initialized (e.g. resumed after suspend)
-        }
-        let attrs = Window::default_attributes()
-            .with_title("bemtvi")
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
-        // On Wayland/X11 the window's app_id / WM_CLASS must match the
-        // installed .desktop file's basename (its `StartupWMClass`) for the
-        // desktop environment to associate our icon — packaged in the AppImage
-        // as `assets/bemtvi.desktop` — with the window. Without it the AppImage
-        // ships an icon the compositor never attaches to the running window.
-        #[cfg(all(
-            unix,
-            not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-        ))]
-        let attrs = {
-            use winit::platform::wayland::WindowAttributesExtWayland as _;
-            attrs.with_name("bemtvi", "bemtvi")
-        };
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                eprintln!("bemtvi-gui: failed to create window: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-        match Renderer::new(
-            window.clone(),
-            &self.config,
-            self.fetch_tx.clone(),
-            self.decode_tx.clone(),
-        ) {
-            Ok(r) => self.renderer = Some(r),
-            Err(e) => {
-                eprintln!("bemtvi-gui: failed to init renderer: {e}");
-                event_loop.exit();
-                return;
-            }
-        }
-        // Enable IME so composed/non-ASCII text input works: dead-key accent
-        // sequences (Option+e e → "é"), AltGr characters, and full IME composition
-        // (CJK, …) reach us as `WindowEvent::Ime(Ime::Commit(..))`. On macOS this is
-        // mandatory — without it dead-key sequences are never combined and the
-        // composed character is dropped, so non-ASCII typing simply doesn't work.
-        // Plain ASCII keys still arrive as `KeyboardInput` (winit only suppresses it
-        // mid-preedit), so this doesn't double-input ordinary keys.
-        window.set_ime_allowed(true);
-        self.window = Some(window);
-        self.report_size(true);
-        // Apply any `guifont` already received before the renderer existed (a
-        // redraw can beat `resumed`); a no-op for the default empty value.
-        self.apply_guifont();
-        // Same for `'guiglyphoverflow'`, which an `init.lua` will have set before the
-        // first frame; empty leaves the renderer on the CLI/env mode it was built with.
-        self.apply_glyph_overflow();
-        // A directory given on the command line opens the native file picker there
-        // (taken so it fires once — `resumed` early-returns on later wake-ups).
-        if let Some(dir) = self.open_dir.take() {
-            self.pick_open_at("e", &dir.to_string_lossy());
-        }
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        match event {
-            UserEvent::Redraw(view) => {
-                self.view = *view;
-                // A changed `guifont` re-shapes the renderer (and re-reports the
-                // grid) before this frame paints.
-                if self.view.guifont != self.applied_guifont {
-                    self.apply_guifont();
-                }
-                // A changed `'guiglyphoverflow'` re-sizes off-grid glyphs from this
-                // frame on (placement only — nothing to re-shape).
-                if self.view.guiglyphoverflow != self.applied_glyph_overflow {
-                    self.apply_glyph_overflow();
-                }
-                // (Re)arm or clear the scroll slide from this frame's gesture.
-                self.scroll = arm_scroll(&self.view, self.scroll.take());
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-            }
-            // A remote preview's bytes arrived (or the read failed): hand them to the
-            // image store and repaint, so the picture replaces its loading placeholder.
-            UserEvent::ImageBytes {
-                path,
-                version,
-                result,
-            } => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.deliver_image(path, version, result);
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
-                }
-            }
-            // An off-paint decode finished (or failed): hand the outcome to the image
-            // store — which drops it if a newer version superseded it — and repaint,
-            // so the picture replaces its loading placeholder.
-            UserEvent::ImageDecoded {
-                path,
-                version,
-                decoded,
-            } => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.deliver_image_decode(path, version, decoded);
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
-                }
-            }
-            // A `:connect` brought up a new server: swap to its RPC handle (dropping the
-            // old one — the App's last clone, which lets the old connection wind down),
-            // update remote-ness, and re-attach the UI. Clearing `reported` forces
-            // `report_size` to send a fresh `btv_ui_attach`; resetting the view avoids
-            // painting the old server's buffer until the new one's first redraw arrives.
-            UserEvent::Connected { rpc, remote } => {
-                self.rpc = *rpc;
-                self.remote = remote;
-                self.view = View::default();
-                self.scroll = None;
-                // The new session's files are unrelated to the old one's paths; drop
-                // the cached textures and any fetched remote bytes so a stale image
-                // can't bleed across the swap.
-                if let Some(r) = self.renderer.as_mut() {
-                    r.clear_images();
-                }
-                self.reported = (0, 0);
-                self.report_size(true);
-                self.apply_guifont();
-                // The reset view carries no `'guiglyphoverflow'` either: back to the
-                // CLI/env mode until the new server's first redraw says otherwise.
-                self.apply_glyph_overflow();
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-            }
-            UserEvent::Exit => event_loop.exit(),
-            // Killed. Quit the session the way `:qall!` does rather than letting the
-            // process be torn down mid-tick: the exit sequence runs
-            // (QuitPre/ExitPre/VimLeavePre/VimLeave, so plugins persist their state)
-            // and the server's clean-exit shada flush lands. The bang is deliberate —
-            // nobody is there to answer an E37 prompt — and so is the missing `w`:
-            // writing files the user never asked to write would be worse than losing
-            // the edits. The server answers with `bemtvi_exit`, which arrives back here
-            // as `UserEvent::Exit` and ends the loop; `run`'s tail then re-raises the
-            // signal so the kill still looks like a kill.
-            UserEvent::Shutdown => {
-                self.rpc.notify("btv_command", vec![Value::from("qall!")]);
-            }
-        }
-    }
-
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            // Don't exit on the close button directly — that would discard a
-            // modified buffer silently. Route through the server's `:qa`, which
-            // quits a clean editor (it then sends `bemtvi_exit`, arriving as
-            // `UserEvent::Exit`) but refuses with `E37` when a buffer is unsaved,
-            // keeping the window open. `btv_command` runs the ex-command
-            // regardless of the current mode (unlike injecting `:qa<CR>` keys).
-            WindowEvent::CloseRequested => {
-                self.rpc.notify("btv_command", vec![Value::from("qa")]);
-            }
-            WindowEvent::Resized(size) => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.resize(size.width, size.height);
-                }
-                self.report_size(false);
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-            }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // The renderer's cell metrics are device pixels (`points × scale`),
-                // so a DPI change — dragging the window onto a different-scale
-                // monitor — must re-derive them; the following `Resized` only
-                // reconfigures the surface, so without this the glyphs keep the old
-                // monitor's pixel size (wrong physical size + a wrong grid).
-                // Re-applying the current font at the new scale re-measures the
-                // cell, re-reports the grid, and repaints.
-                if let Some(r) = self.renderer.as_mut() {
-                    r.set_scale(scale_factor as f32);
-                    self.apply_guifont();
-                }
-            }
-            WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
-            // Track the pointer (winit's button/wheel events carry no position) and,
-            // while the left button is held, synthesize a drag when the cell changes.
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_px = (position.x, position.y);
-                self.mouse_drag();
-                self.update_resize_cursor();
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => match state {
-                ElementState::Pressed => self.mouse_left_press(),
-                ElementState::Released => self.mouse_left_release(),
-            },
-            // Right / middle clicks have no client-owned overlay affordance, so
-            // they forward straight to the server at the pointer cell — the
-            // `'mousemodel'` right-click branch and middle-click paste live there.
-            // Only the press is meaningful (the server no-ops right/middle drag +
-            // release), mirroring the TUI.
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } => {
-                if let (Some(name), Some((col, row))) =
-                    (mouse::button_name(button), self.pointer_cell())
-                {
-                    self.send_mouse(name, "press", col, row);
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
-            // Composed text from the IME (dead-key accents, AltGr characters, CJK
-            // composition, …) lands here as one commit rather than as `KeyboardInput`
-            // — see `set_ime_allowed` in `resumed`. Feed it through `encode_text` (one
-            // notify, `<` escaped) so the committed characters reach the buffer
-            // exactly as typed. Deliberately NOT `encode_paste`: a commit is the user's
-            // own typing arriving as one string, not a paste, so it drives insert mode
-            // normally (auto-pairs and the rest) rather than going in literally. The
-            // empty `Preedit` winit sends right before each commit, and any
-            // in-progress preedit, are ignored: macOS draws its own candidate window,
-            // and the final text is what the commit carries.
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                let notation = encode_text(&text);
-                if !notation.is_empty() {
-                    self.rpc
-                        .notify("btv_input", vec![Value::from(notation.as_str())]);
-                    self.arm_flush_deadline();
-                }
-            }
-            // `is_synthetic` presses are winit's focus-gain enumeration of keys
-            // already held (X11/Windows) — state bookkeeping, not typing. Feeding
-            // them through would inject a spurious keystroke every time the window
-            // regains focus while a key is down (e.g. the `w` of an Alt-Tab still
-            // held). Real key events arrive with `is_synthetic == false`.
-            WindowEvent::KeyboardInput {
-                event,
-                is_synthetic: false,
-                ..
-            } if event.state == ElementState::Pressed => {
-                // Paste from the system clipboard (Cmd+V / Ctrl+Shift+V /
-                // Shift+Insert), fed through the same `encode_paste` the TUI uses
-                // for terminal bracketed paste. Claimed before key encoding so the
-                // gesture's base key isn't also typed.
-                if input::is_paste(&event.logical_key, self.mods) {
-                    self.paste_clipboard();
-                    self.arm_flush_deadline();
-                    return;
-                }
-                // `<CR>` over a dialog-triggering `:` command line pops a native
-                // file dialog and runs the real command with the chosen path, in
-                // place of the keystroke. Only for a true `:` ex command (not a
-                // search or a `vim.ui.input` prompt). A `pick_*` returns `true` when
-                // it handled the key (so it is swallowed); otherwise the keystroke
-                // is encoded as usual.
-                if matches!(event.logical_key, Key::Named(NamedKey::Enter))
-                    && self.view.command_mode
-                    && self.view.cmdline_prefix == ':'
-                    && self.view.cmdline_prompt.is_empty()
-                    // …but NOT while a completion picker (`btv.picker`, e.g. the
-                    // cmdline file completer) floats over the still-open command
-                    // line: there `<CR>` belongs to the picker so it can descend
-                    // into a directory or paste the chosen path. Intercepting it
-                    // here would pop the native dialog / submit instead, copying
-                    // every directory into the line and running the last one (the
-                    // GUI-only divergence from the TUI, where every key reaches the
-                    // server's picker untouched).
-                    && self.view.menu.is_none()
-                {
-                    // `:workspace [dir]` swaps this window onto a fresh local session rooted
-                    // at the directory. It is a client affordance, *also* registered
-                    // server-side as a no-op virtual command (see [`session::CLIENT_INIT_LUA`])
-                    // so it gets completion, help, and history. So request the swap here, but
-                    // DON'T swallow the `<CR>`: let it fall through and submit the command line
-                    // normally, which records it in `:` history and runs the harmless no-op
-                    // body. The swap then arrives async (see `UserEvent::Connected`).
-                    //
-                    // `:connect` is NOT intercepted here: it is a real prelude command (§C)
-                    // that routes through the VM so a connector can claim it, then swaps via a
-                    // `btv_session_reconnect` (provider) or `btv_connect_fallback` (direct dial)
-                    // notification handled in [`crate::run`].
-                    if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
-                        let _ = self
-                            .reconnect
-                            .send(SessionRequest::Workspace(PathBuf::from(dir)));
-                    }
-                    let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
-                    // `dialog_action` returns `None` in a remote (daemon) session, so
-                    // the native local-fs picker never fires for remote buffers — the
-                    // command runs as typed and the server/daemon handles it.
-                    // Each `pick_*` swallows the `<CR>` (it aborts the command line and
-                    // re-issues the real command with the chosen path), so `return`
-                    // before the key is encoded below.
-                    match dialog_action(&self.view.cmdline, unnamed, self.remote) {
-                        Some(DialogAction::Open { base }) => {
-                            self.pick_open(base);
-                            return;
-                        }
-                        // Opening a *directory* (`:e somedir`): pop the picker there
-                        // instead of letting the server show its netrw listing. A file
-                        // argument runs as typed (the server opens it).
-                        Some(DialogAction::OpenPath { base, arg }) if Path::new(arg).is_dir() => {
-                            self.pick_open_at(base, arg);
-                            return;
-                        }
-                        Some(DialogAction::Save) => {
-                            self.pick_save();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // macOS composes Option(Alt)+key into a character — Option+c yields
-                // `logical_key` "ç", not "c" — so a `<A-c>`-style binding (e.g.
-                // multi-cursor) would otherwise arrive as `<A-ç>` and never match.
-                // For a ctrl/alt combo take `key_without_modifiers`, the un-composed
-                // base key (it also drops Shift, fine for a chord like `<A-c>`); plain
-                // typing keeps `logical_key`, where the platform has folded Shift into
-                // the character so `A` stays `A`.
-                //
-                // Exception: Windows reports **AltGr** as Ctrl+Alt, so `AltGr+E` (€ on
-                // European layouts) arrives as Ctrl+Alt+`Character("€")`. That's
-                // *typing*, not a chord — sending `<C-A-e>` would swallow the € — so
-                // when the layout composed the logical key into a different character
-                // than the base ([`altgr_composed`]), pass the composed character
-                // through with no modifier prefix. Skipped on macOS, where Option-only
-                // composition is deliberately mapped to `<A-…>` chords (above).
-                let altgr = !cfg!(target_os = "macos")
-                    && input::altgr_composed(
-                        &event.logical_key,
-                        &event.key_without_modifiers(),
-                        self.mods,
-                    );
-                let (key, mods) = if altgr {
-                    (event.logical_key.clone(), ModifiersState::empty())
-                } else if self.mods.control_key() || self.mods.alt_key() {
-                    (event.key_without_modifiers(), self.mods)
-                } else {
-                    (event.logical_key.clone(), self.mods)
-                };
-                if let Some(notation) = input::encode_key(&key, mods) {
-                    self.rpc
-                        .notify("btv_input", vec![Value::from(notation.as_str())]);
-                    // Arm the `timeoutlen` flush; the next key re-arms it, so it
-                    // measures idle-since-last-key (see `about_to_wait`).
-                    self.arm_flush_deadline();
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                // Settle a finished slide before painting, so the final frame is
-                // the live (destination) view rather than a clamped band.
-                if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
-                    self.scroll = None;
-                }
-                let frame = self.scroll.as_ref().map(ScrollFrame::of);
-                if let Some(r) = self.renderer.as_mut() {
-                    if let Err(e) = r.render(&self.view, frame.as_ref()) {
-                        eprintln!("bemtvi-gui: render error: {e}");
-                    }
-                }
-                self.update_ime_area();
-            }
-            _ => {}
-        }
-    }
-
-    /// Between event batches, drive the slide and the `timeoutlen` flush. While a
-    /// slide is active, wake on a short timer and request a frame; `present` (Fifo
-    /// vsync) then paces the actual paint to the display refresh. `WaitUntil` (not
-    /// `Poll`) means we don't busy-spin if the OS withholds `RedrawRequested` (e.g.
-    /// an occluded or off-screen window) — and the time-based `done` check here is
-    /// the backstop that clears the slide even if no frame ever paints. When no
-    /// slide is running but a flush is armed, wake at the flush deadline instead.
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Idle `timeoutlen` reached: nudge the server to resolve any withheld
-        // mapped prefix (harmless when nothing is pending), and disarm.
-        if self.flush_deadline.is_some_and(|d| Instant::now() >= d) {
-            self.rpc.notify("bemtvi_input_flush", vec![]);
-            self.flush_deadline = None;
-        }
-        // Continuous mouse drag-scroll: re-issue the held drag at its edge cell each
-        // interval so the buffer keeps scrolling while the pointer is held still.
-        // The server scrolls the focused window one line per drag it lands past the
-        // text body and re-extends the selection.
-        if let (Some((col, row)), Some(deadline)) = (self.autoscroll, self.autoscroll_deadline) {
-            if Instant::now() >= deadline {
-                self.send_mouse("left", "drag", col, row);
-                self.autoscroll_deadline = Some(Instant::now() + AUTOSCROLL_INTERVAL);
-            }
-        }
-        if self.scroll.as_ref().is_some_and(ScrollAnim::done) {
-            self.scroll = None;
-            if let Some(w) = self.window.as_ref() {
-                w.request_redraw(); // settle to the live view
-            }
-        }
-        // The soonest pending timer wakeup (auto-scroll repeat, then the flush).
-        let timer = match (self.autoscroll_deadline, self.flush_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        if self.scroll.is_some() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(8),
-            ));
-            if let Some(w) = self.window.as_ref() {
-                w.request_redraw();
-            }
-        } else if let Some(deadline) = timer {
-            // No slide, but a timer is pending: sleep exactly until it's due.
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
-    }
 }

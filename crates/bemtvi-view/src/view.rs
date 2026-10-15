@@ -511,6 +511,11 @@ pub struct View {
     /// right instead of being shrunk into its own. Empty means the client's own setting.
     /// Frontend-agnostic — the TUI ignores it (the terminal draws its own glyphs).
     pub guiglyphoverflow: String,
+    /// `'imdisable'`, relayed from the server: whether a GUI keeps the platform's
+    /// input method (IME) off. Off by default, so input methods compose in every
+    /// mode until a config turns them off. The TUI ignores it (the terminal owns
+    /// the IME).
+    pub imdisable: bool,
     /// `'timeout'` — whether an ambiguous mapped prefix resolves on idle (the
     /// client arms its `timeoutlen` flush timer) or waits forever for the next key
     /// (`notimeout` → the client never arms it, so a which-key popup stays up).
@@ -582,6 +587,10 @@ pub struct View {
     pub float_border: Option<Style>,
     pub normal_float: Option<Style>,
     pub float_title: Option<Style>,
+    /// The `BtvImePreedit` look — an input method's composition, which a GUI
+    /// splices into the line at the cursor until it's committed. The server falls
+    /// back to `Visual` when no theme defines it; `None` only when neither is.
+    pub preedit: Option<Style>,
     /// The single global status line (`laststatus=3`) as rendered segments,
     /// spanning the full editor width and showing the focused window's facts.
     /// Empty for modes 0/1/2 (status lines are per-window, or hidden); when
@@ -922,6 +931,7 @@ impl View {
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
         self.guiglyphoverflow = map_str(map, "guiglyphoverflow");
+        self.imdisable = map_get(map, "imdisable").and_then(Value::as_bool) == Some(true);
         // The mapping-timeout config drives the client's idle-flush timer (below).
         // An older server omits these — fall back to vim's defaults (timeout on,
         // 1000ms) so the flush still fires; `notimeout` (false) disarms it entirely.
@@ -960,6 +970,7 @@ impl View {
         self.float_border = chrome("float_border");
         self.normal_float = chrome("normal_float");
         self.float_title = chrome("float_title");
+        self.preedit = chrome("preedit");
         // The window list (the multi-window form), or a single window built from
         // the legacy flat top-level fields (the synthetic paint fixtures).
         self.windows = match map_get(map, "windows") {

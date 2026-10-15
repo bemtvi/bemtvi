@@ -1,119 +1,131 @@
-//! winit key events → vim key-notation.
+//! Surface keys → vim key-notation.
 //!
-//! The GUI's analogue of the TUI's `encode_key`: it maps a winit
-//! [`winit::keyboard::Key`] + the active [`ModifiersState`] onto the
-//! toolkit-neutral [`bemtvi_view::Key`], then hands it to
-//! [`bemtvi_view::notation`] for the `<...>` spelling the server's `btv_input`
-//! expects. A key with no mapping (a bare modifier, a dead key) yields `None`
-//! and is dropped — the same contract the TUI follows.
+//! The GUI's analogue of the TUI's `encode_key`. mitsuami reports each key on the
+//! editor's surface three ways: where it is on the keyboard ([`KeyCode`]), what it
+//! typed through the platform's text input (`text`: Shift, AltGr, Option and dead
+//! keys already composed in), and the character it types with no modifiers in the
+//! keyboard's layout (`unmodified`). This maps a press onto the toolkit-neutral
+//! [`bemtvi_view::Key`] and hands it to [`bemtvi_view::notation`] for the `<...>`
+//! spelling the server's `btv_input` expects. A key with no editor meaning (a bare
+//! modifier, a dead key) yields `None` and is dropped — the same contract the TUI
+//! follows.
 
 use bemtvi_view::{encode_text, notation, Key as VimKey};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use mitsuami::prelude::{KeyCode, Modifiers, SurfaceInput};
 
-/// Encode a winit logical key + modifiers as vim key-notation, or `None` for a
-/// key with no editor meaning (bare modifiers, dead/unidentified keys).
+/// Encode a surface input as vim key-notation, or `None` for one with no editor
+/// meaning: a key release, a bare modifier, a dead key, a Command/Super chord.
+/// `option_chords` is macOS's policy (below).
 ///
-/// Shift is already folded into the `Character` payload winit reports (`A` for
-/// Shift+a), so for a printable key it adds no separate modifier — `notation` only
-/// notates shift for **named** keys (`<S-Tab>`), where winit *does* report it as a
-/// modifier (Shift+Tab arrives as `Tab` + `shift_key()`, not a folded character).
-/// A control combo still arrives as the base character (`Ctrl+w` → `Character("w")`
-/// + `control_key()`), which yields `<C-w>`.
-pub fn encode_key(logical: &Key, mods: ModifiersState) -> Option<String> {
-    // A multi-character payload (some layouts / compose fallbacks emit several
-    // characters for one keystroke — winit's `Key::Character` is a string, not a
-    // char) can't be a `<...>` chord; feed it through the literal-text encoder
-    // (the IME-commit path) rather than silently truncating to the first char. Not
-    // `encode_paste`: this is still the user typing, so it must not open a
-    // bracketed-paste span.
-    if let Key::Character(s) = logical {
-        if s.chars().count() > 1 {
-            let text = encode_text(s);
-            return (!text.is_empty()).then_some(text);
+/// - **Named keys** (Escape, Enter, arrows, F-keys, …) come from where the key is,
+///   with their modifiers notated (`<S-Tab>`, `<C-Left>`).
+/// - **A chord** (Control or Alt held) is the key's layout character with the
+///   modifiers: `<C-w>`, `<A-x>`. Control+I/M/[/H stay `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>`,
+///   apart from Tab/Enter/Escape/Backspace, since those are named by their key.
+///   On macOS Option composes a character (Option+C types `ç`); `option_chords`
+///   makes it `<A-c>` instead, so `<A-…>` bindings work there too.
+/// - **AltGr typing.** Windows reports AltGr as Control+Alt, so `AltGr+E` (`€` on
+///   European layouts) arrives with both held — but it *typed* `€`, which the
+///   platform says in `text`, while a real Control+Alt chord types nothing. So a key
+///   that typed text with Control and Alt held types it, unmodified.
+/// - **Anything else** sends what it typed: Shift is already folded in (`A`, `!`),
+///   and a dead key's accent with it (`é`). Several characters (a dead key that
+///   didn't compose, `´x`) go through the literal-text encoder rather than being
+///   truncated — still typing, so not `encode_paste`.
+/// - **An input method's commit** ([`SurfaceInput::Text`]) is typed text too
+///   (composed accents, CJK).
+/// - **An input method taking back typed text** ([`SurfaceInput::DeleteSurrounding`],
+///   macOS's accents replacing the letter a held key typed) is `<BS>`s before the
+///   cursor and `<Del>`s after it.
+pub fn encode_input(input: &SurfaceInput, option_chords: bool) -> Option<String> {
+    let (code, text, unmodified, mods) = match input {
+        SurfaceInput::Key {
+            code,
+            pressed: true,
+            text,
+            unmodified,
+            modifiers,
+            ..
+        } => (*code, text.as_deref(), *unmodified, *modifiers),
+        SurfaceInput::Text(text) => return typed(text),
+        SurfaceInput::DeleteSurrounding { before, after } => {
+            let keys = "<BS>".repeat(*before) + &"<Del>".repeat(*after);
+            return Some(keys).filter(|k| !k.is_empty());
         }
+        _ => return None,
+    };
+    if let Some(key) = named(code) {
+        return Some(notation(mods.control, mods.alt, mods.shift, key));
     }
-    let key = translate(logical)?;
-    Some(notation(
-        mods.control_key(),
-        mods.alt_key(),
-        mods.shift_key(),
-        key,
-    ))
+    let altgr = !option_chords && mods.control && mods.alt;
+    if let Some(text) = text.filter(|_| altgr || !(mods.control || mods.alt)) {
+        return typed(text);
+    }
+    if mods.control || mods.alt {
+        // The key's own character, Shift carried as `S-` (`<C-S-c>`).
+        let base = unmodified.or_else(|| code.us_char())?;
+        return Some(notation(
+            mods.control,
+            mods.alt,
+            mods.shift,
+            VimKey::Char(base),
+        ));
+    }
+    None
 }
 
-/// Whether a keystroke that arrived with **Ctrl+Alt** held is actually *AltGr
-/// typing*, not a `<C-A-…>` chord. Windows reports AltGr as Ctrl+Alt, so `AltGr+E`
-/// on a European layout arrives as `Character("€")` + `control_key()` +
-/// `alt_key()` — encoding that as a chord of the un-composed base key sends
-/// `<C-A-e>` and the typed `€` never reaches the buffer. The tell is the layout
-/// having *composed* the logical key into a different character than the
-/// unmodified base key (`logical` vs winit's `key_without_modifiers`).
-///
-/// Deliberately conservative:
-/// - Shift held ⇒ `false` — Shift folds into the logical character (`#` from `3`),
-///   so a difference proves nothing; a `<C-A-S-…>` chord keeps chord behavior.
-/// - A case-only difference ⇒ `false` — that's CapsLock, not composition.
-/// - Anything but Ctrl+Alt on two `Character` keys ⇒ `false`.
-///
-/// The caller additionally skips this on macOS, where Option composes on its own
-/// and is deliberately mapped to `<A-…>` chords via `key_without_modifiers`.
-pub fn altgr_composed(logical: &Key, base: &Key, mods: ModifiersState) -> bool {
-    if !mods.control_key() || !mods.alt_key() || mods.shift_key() || mods.super_key() {
-        return false;
-    }
-    match (logical, base) {
-        (Key::Character(l), Key::Character(b)) => l.to_lowercase() != b.to_lowercase(),
-        _ => false,
+/// Encode text the user typed (one key's characters, or an input method's commit):
+/// a single character through [`notation`] (so `<` is `<lt>`), several through the
+/// literal-text encoder. `None` for nothing typed.
+fn typed(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => None,
+        (Some(c), None) => Some(notation(false, false, false, VimKey::Char(c))),
+        _ => Some(encode_text(text)).filter(|t| !t.is_empty()),
     }
 }
 
-/// Whether `logical` + `mods` is a "paste from system clipboard" gesture: Cmd+V
-/// (macOS), Ctrl+Shift+V (Linux/Windows terminals), or Shift+Insert (universal).
-/// None of these collide with vim's `<C-v>` (literal-insert / blockwise visual),
-/// so the client can claim them without shadowing an editor key. The client reads
-/// the clipboard and feeds it through [`bemtvi_view::encode_paste`].
-pub fn is_paste(logical: &Key, mods: ModifiersState) -> bool {
-    let is_v = matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("v"));
-    let shift_insert = matches!(logical, Key::Named(NamedKey::Insert)) && mods.shift_key();
-    (is_v && mods.super_key()) || (is_v && mods.control_key() && mods.shift_key()) || shift_insert
+/// Whether a key press is a "paste from system clipboard" gesture: Cmd+V (macOS),
+/// Ctrl+Shift+V (Linux/Windows terminals), or Shift+Insert (universal). None of these
+/// collide with vim's `<C-v>` (literal-insert / blockwise visual), so the client can
+/// claim them without shadowing an editor key. `V` is the layout's, not the key's
+/// place (`unmodified`), as a shortcut names it.
+pub fn is_paste(code: KeyCode, unmodified: Option<char>, mods: Modifiers) -> bool {
+    let is_v = unmodified.is_some_and(|c| c.eq_ignore_ascii_case(&'v'));
+    let shift_insert = code == KeyCode::Insert && mods.shift;
+    (is_v && ((mods.meta && !mods.control) || (mods.control && mods.shift))) || shift_insert
 }
 
-/// Map a winit logical key onto the neutral [`VimKey`], or `None` if it has no
-/// editor meaning.
-fn translate(logical: &Key) -> Option<VimKey> {
-    match logical {
-        // A typed character (already shifted by the platform layout).
-        Key::Character(s) => s.chars().next().map(VimKey::Char),
-        Key::Named(named) => match named {
-            NamedKey::Space => Some(VimKey::Char(' ')),
-            NamedKey::Escape => Some(VimKey::Esc),
-            NamedKey::Enter => Some(VimKey::Enter),
-            NamedKey::Backspace => Some(VimKey::Backspace),
-            NamedKey::Tab => Some(VimKey::Tab),
-            NamedKey::Delete => Some(VimKey::Delete),
-            NamedKey::ArrowLeft => Some(VimKey::Left),
-            NamedKey::ArrowRight => Some(VimKey::Right),
-            NamedKey::ArrowUp => Some(VimKey::Up),
-            NamedKey::ArrowDown => Some(VimKey::Down),
-            NamedKey::Home => Some(VimKey::Home),
-            NamedKey::End => Some(VimKey::End),
-            NamedKey::PageUp => Some(VimKey::PageUp),
-            NamedKey::PageDown => Some(VimKey::PageDown),
-            // Function keys F1-F12 (winit names each variant individually).
-            NamedKey::F1 => Some(VimKey::Function(1)),
-            NamedKey::F2 => Some(VimKey::Function(2)),
-            NamedKey::F3 => Some(VimKey::Function(3)),
-            NamedKey::F4 => Some(VimKey::Function(4)),
-            NamedKey::F5 => Some(VimKey::Function(5)),
-            NamedKey::F6 => Some(VimKey::Function(6)),
-            NamedKey::F7 => Some(VimKey::Function(7)),
-            NamedKey::F8 => Some(VimKey::Function(8)),
-            NamedKey::F9 => Some(VimKey::Function(9)),
-            NamedKey::F10 => Some(VimKey::Function(10)),
-            NamedKey::F11 => Some(VimKey::Function(11)),
-            NamedKey::F12 => Some(VimKey::Function(12)),
-            _ => None,
-        },
-        _ => None,
-    }
+/// The neutral [`VimKey`] for a key that types no character, by where it is.
+fn named(code: KeyCode) -> Option<VimKey> {
+    use KeyCode::*;
+    Some(match code {
+        Escape => VimKey::Esc,
+        Enter | NumpadEnter => VimKey::Enter,
+        Backspace => VimKey::Backspace,
+        Tab => VimKey::Tab,
+        Delete => VimKey::Delete,
+        ArrowLeft => VimKey::Left,
+        ArrowRight => VimKey::Right,
+        ArrowUp => VimKey::Up,
+        ArrowDown => VimKey::Down,
+        Home => VimKey::Home,
+        End => VimKey::End,
+        PageUp => VimKey::PageUp,
+        PageDown => VimKey::PageDown,
+        F1 => VimKey::Function(1),
+        F2 => VimKey::Function(2),
+        F3 => VimKey::Function(3),
+        F4 => VimKey::Function(4),
+        F5 => VimKey::Function(5),
+        F6 => VimKey::Function(6),
+        F7 => VimKey::Function(7),
+        F8 => VimKey::Function(8),
+        F9 => VimKey::Function(9),
+        F10 => VimKey::Function(10),
+        F11 => VimKey::Function(11),
+        F12 => VimKey::Function(12),
+        _ => return None,
+    })
 }

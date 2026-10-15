@@ -16,9 +16,13 @@ use image::DynamicImage;
 use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::Picker;
+#[cfg(unix)]
+use ratatui_image::picker::ProtocolType;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{FontSize, StatefulImage};
+#[cfg(unix)]
+use ratatui_image::FontSize;
+use ratatui_image::StatefulImage;
 use tokio::sync::mpsc::UnboundedSender;
 
 // The fetch request / remote byte cache / bounded decode helpers are the

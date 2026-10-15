@@ -1,9 +1,8 @@
 //! Mouse gestures → server RPC, the GUI analogue of the TUI's mouse handling.
 //!
-//! winit reports the pointer in physical pixels and never bundles the modifiers
-//! or position into the button/wheel events, so the [`crate::App`] event loop
-//! tracks the latest cursor pixel and the live [`ModifiersState`] and feeds them
-//! here. These helpers are the *pure* part — pixel→cell conversion math, the
+//! mitsuami reports the pointer in points over the editor's surface, with the
+//! modifiers held; the client scales it to pixels and tracks the latest one (a
+//! wheel event carries no position) and feeds them here. These helpers are the *pure* part — pixel→cell conversion math, the
 //! `btv_input_mouse` modifier string, the overlay hit-test rectangles, and the
 //! wheel-notch accumulator — kept toolkit-light and unit-tested in
 //! `tests/mouse.rs`. The actual `rpc.notify` wiring lives in `lib`.
@@ -13,29 +12,28 @@
 //! buffer position (`grid` is always 0 — bemtvi is single-grid), and subtracts the
 //! tabline itself, exactly as it does for the TUI's raw terminal cells.
 
-use winit::event::MouseButton;
-use winit::keyboard::ModifiersState;
+use mitsuami::prelude::{Modifiers, MouseButton};
 
-/// The `btv_input_mouse` button name for a winit button, or `None` for one the
+/// The `btv_input_mouse` button name for a pointer button, or `None` for one the
 /// server has no gesture for (back/forward/other). `"left"` carries the
 /// focus-follows-click + selection machinery; `"right"` is the `'mousemodel'`
 /// branch (extend / popup-setpos); `"middle"` pastes the `"*` register. Mirrors
 /// the TUI, which forwards the same three names.
 pub fn button_name(button: MouseButton) -> Option<&'static str> {
     match button {
-        MouseButton::Left => Some("left"),
-        MouseButton::Right => Some("right"),
+        MouseButton::Primary => Some("left"),
+        MouseButton::Secondary => Some("right"),
         MouseButton::Middle => Some("middle"),
         _ => None,
     }
 }
 
 /// The `btv_input_mouse` modifier string for the live modifier state — the shared
-/// [`bemtvi_view::mouse_modifier`] over winit's flags. (Shift is a real chord
-/// here, unlike key input where winit folds it into the character — a mouse
+/// [`bemtvi_view::mouse_modifier`] over mitsuami's flags. (Shift is a real chord
+/// here, unlike typed text where the platform folds it into the character — a mouse
 /// event carries no character to fold it into.)
-pub fn mouse_modifier(mods: ModifiersState) -> String {
-    bemtvi_view::mouse_modifier(mods.control_key(), mods.shift_key(), mods.alt_key())
+pub fn mouse_modifier(mods: Modifiers) -> String {
+    bemtvi_view::mouse_modifier(mods.control, mods.shift, mods.alt)
 }
 
 /// The cell `(col, row)` a physical-pixel position falls in, for cell size
@@ -61,25 +59,26 @@ pub fn drain_notches(amount: f32, accum: &mut f32) -> i32 {
     whole as i32
 }
 
-/// The `btv_input_mouse` wheel **action** for a vertical notch count: `"up"`
-/// when positive, `"down"` when negative. winit's positive delta means the
-/// content moves down (revealing earlier lines), i.e. a scroll *up* — see
-/// [`MouseScrollDelta`](winit::event::MouseScrollDelta). `None` for zero.
+/// The `btv_input_mouse` wheel **action** for a vertical notch count: `"down"`
+/// when positive, `"up"` when negative. mitsuami's positive scroll goes towards
+/// the end of the content (later lines), with the user's scrolling direction
+/// already applied — see [`ScrollDelta`](mitsuami::prelude::ScrollDelta). `None`
+/// for zero.
 pub fn vertical_action(notches: i32) -> Option<&'static str> {
     match notches.signum() {
-        1 => Some("up"),
-        -1 => Some("down"),
+        1 => Some("down"),
+        -1 => Some("up"),
         _ => None,
     }
 }
 
-/// The `btv_input_mouse` wheel **action** for a horizontal notch count: `"left"`
-/// when positive, `"right"` when negative (winit's positive-x reveals content to
-/// the left). `None` for zero.
+/// The `btv_input_mouse` wheel **action** for a horizontal notch count: `"right"`
+/// when positive, `"left"` when negative (mitsuami's positive x goes towards the
+/// content's right end). `None` for zero.
 pub fn horizontal_action(notches: i32) -> Option<&'static str> {
     match notches.signum() {
-        1 => Some("left"),
-        -1 => Some("right"),
+        1 => Some("right"),
+        -1 => Some("left"),
         _ => None,
     }
 }

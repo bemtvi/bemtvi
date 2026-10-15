@@ -43,11 +43,12 @@ jobs:
           - { target: x86_64-apple-darwin,        runner: macos-15-intel,    os: macos,   kind: tui, suffix: x86_64-macos,        ext: pkg }
           - { target: aarch64-apple-darwin,       runner: macos-14,          os: macos,   kind: tui, suffix: aarch64-macos,       ext: pkg }
           - { target: x86_64-pc-windows-msvc,     runner: windows-latest,    os: windows, kind: tui, suffix: x86_64-windows,      ext: zip }
-          # ── GUI (`bemtvi-gui`, winit + wgpu) ──────────────────────────────
+          # ── GUI (`bemtvi-gui`, mitsuami + wgpu) ───────────────────────────
           # Linux: glibc (gnu) — the graphics stack won't link against static
-          # musl, so the GUI ships dynamically linked (needs X11/Wayland at
-          # runtime). macOS: signed + notarized + stapled .app inside a .dmg.
-          # Windows: bare .exe in a zip.
+          # musl, so the GUI ships dynamically linked (needs GTK 4.10+ and
+          # libadwaita 1.4+, on X11 or Wayland, at runtime). macOS: signed +
+          # notarized + stapled .app inside a .dmg. Windows: bare .exe in a zip
+          # (needs the Windows App Runtime 2.4+, for mitsuami's WinUI 3 backend).
           - { target: x86_64-unknown-linux-gnu,   runner: ubuntu-latest,    os: linux,   kind: gui, suffix: x86_64-linux,        ext: tar.gz }
           - { target: aarch64-unknown-linux-gnu,  runner: ubuntu-24.04-arm,  os: linux,   kind: gui, suffix: aarch64-linux,       ext: tar.gz }
           - { target: x86_64-apple-darwin,        runner: macos-15-intel,    os: macos,   kind: gui, suffix: x86_64-macos,        ext: dmg }
@@ -93,10 +94,12 @@ jobs:
         if: matrix.os == 'linux' && matrix.kind == 'gui'
         run: |
           sudo apt-get update
-          # winit (X11 + Wayland) + wgpu/glyphon graphics stack. Most of these
-          # are dlopen'd at runtime, but the -dev packages cover any -sys crate
-          # that wants headers at build time.
+          # mitsuami's GTK backend (GTK 4.10+, libadwaita 1.4+) + the
+          # wgpu/glyphon graphics stack. The graphics libs are mostly dlopen'd
+          # at runtime, but the -dev packages cover any -sys crate that wants
+          # headers at build time.
           sudo apt-get install -y \
+            libgtk-4-dev libadwaita-1-dev \
             libwayland-dev libxkbcommon-dev libxcb1-dev \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
             libgl1-mesa-dev libegl1-mesa-dev \
@@ -360,7 +363,7 @@ jobs:
           # linuxdeploy bundles the app's direct dependencies, but the community
           # excludelist it applies deliberately omits the GPU/driver and core
           # display libs (libGL, libEGL, libvulkan, libdrm, libwayland-*, libxcb,
-          # libxkbcommon, glibc). That is exactly what the wgpu/winit GUI needs:
+          # libxkbcommon, glibc). That is exactly what the wgpu GUI needs:
           # wgpu must dlopen the *host's* Vulkan/GL drivers at runtime — bundling
           # mesa would break on NVIDIA and any mismatched driver stack.
           for tool in linuxdeploy linuxdeploy-plugin-appimage; do

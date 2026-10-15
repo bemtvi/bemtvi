@@ -1,6 +1,6 @@
 [package]
 name = "bemtvi-gui"
-description = "Native (winit + wgpu) GUI client for bemtvi (a thin RPC client; renders the server's View)."
+description = "Native (mitsuami + wgpu) GUI client for bemtvi (a thin RPC client; renders the server's View)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,7 +21,8 @@ anyhow.workspace = true
 clap.workspace = true
 rmpv.workspace = true
 tokio.workspace = true
-winit.workspace = true
+# The window, its run loop and input, the platform's own (see the root Cargo.toml).
+mitsuami.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
 # Direct dep only to turn on cosmic-text's `monospace_fallback` feature (see the
@@ -53,10 +54,6 @@ image.workspace = true
 # builds when bemtvi-server is also a build target (e.g. `cargo test --workspace`),
 # which silently turns its default `native` on via feature unification.
 bemtvi-server = { workspace = true, features = ["native"] }
-arboard.workspace = true
-# Native open/save dialog for the `:eo`/`:wn`/… pickers, on all three desktop
-# platforms (no GTK — see the rfd note in the workspace Cargo.toml).
-rfd.workspace = true
 
 # Windows host only: embeds the app icon into bemtvi-gui.exe (see build.rs). Gated
 # on the *host* (build scripts run on the host) — our CI builds Windows natively,

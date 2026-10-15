@@ -8,6 +8,9 @@
 //! a log on each spawn. The log — spawn count and the args each spawn saw — is the
 //! observable.
 
+// Every case drives a shell-script "server" — unix only.
+#![cfg(unix)]
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -50,7 +53,6 @@ async fn wait_for_lines(log: &Path, n: usize) -> Vec<String> {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn restart_respawns_the_server_with_the_latest_config() {
     let dir = temp_dir("lsp-restart");
@@ -112,7 +114,6 @@ async fn restart_respawns_the_server_with_the_latest_config() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn restart_is_a_noop_when_nothing_is_running() {
     let dir = temp_dir("lsp-restart-noop");
@@ -128,7 +129,6 @@ async fn restart_is_a_noop_when_nothing_is_running() {
 /// script server: after a stop, a *restart* has nothing left to respawn, so the log
 /// stops growing. That's the observable that distinguishes a real shutdown from
 /// `btv.lsp.disable`, which only closes the gate on future starts.
-#[cfg(unix)]
 #[tokio::test]
 async fn stop_shuts_the_server_down_so_a_restart_has_nothing_to_respawn() {
     let dir = temp_dir("lsp-stop");
@@ -190,7 +190,6 @@ async fn stop_shuts_the_server_down_so_a_restart_has_nothing_to_respawn() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn stop_resolves_zero_when_nothing_is_running() {
     let dir = temp_dir("lsp-stop-noop");

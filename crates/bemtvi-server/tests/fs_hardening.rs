@@ -14,15 +14,18 @@
 //! - a **non-finite timestamp** handed to the fs seam, which `Duration`'s
 //!   constructor turns into a panic rather than an error.
 
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
-use bemtvi_test_harness::{
-    command, exec_lua, lines, message_after, poll_true, start_attached, temp_dir,
-};
+use bemtvi_test_harness::{command, exec_lua, poll_true, start_attached, temp_dir};
+#[cfg(unix)]
+use bemtvi_test_harness::{lines, message_after};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -31,6 +34,7 @@ async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
 
 /// `mkfifo(3)` — a named pipe with no writer. Opening one for reading *blocks*
 /// until a writer arrives, which is the whole point of the test.
+#[cfg(unix)]
 fn mkfifo(path: &Path) {
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
     // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
@@ -47,6 +51,7 @@ fn mkfifo(path: &Path) {
 ///
 /// So the read path refuses anything that isn't a regular file, loudly. Without
 /// the check this test does not fail — it hangs, which is exactly the bug.
+#[cfg(unix)]
 #[tokio::test]
 async fn opening_a_fifo_fails_loudly_instead_of_blocking_the_editor() {
     let dir = temp_dir("fs_hardening_fifo");
@@ -78,6 +83,7 @@ async fn opening_a_fifo_fails_loudly_instead_of_blocking_the_editor() {
 /// A regular file reached *through* a symlink still opens — the check is on the
 /// resolved metadata, not on the link. (`metadata` follows; `symlink_metadata`
 /// would not, and would have broken every symlinked file in a repo.)
+#[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_to_a_regular_file_still_opens() {
     let dir = temp_dir("fs_hardening_symlink_read");
@@ -102,6 +108,7 @@ async fn a_symlink_to_a_regular_file_still_opens() {
 /// The temp name now carries CSPRNG bytes and is created with `O_EXCL`, so the
 /// planted path is never the one opened. This test plants exactly the old
 /// predictable name and asserts the victim is untouched.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_save_does_not_write_through_a_planted_temp_symlink() {
     let dir = temp_dir("fs_hardening_temp_symlink");
@@ -174,6 +181,7 @@ async fn a_save_leaves_no_temp_file_behind() {
 /// An existing file's permissions survive the save — the temp is created fresh
 /// (with `create_new`'s default mode), so the mode has to be carried over
 /// explicitly or every save silently re-permissions the file.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_save_preserves_the_files_permissions() {
     use std::os::unix::fs::PermissionsExt;
@@ -274,11 +282,11 @@ async fn an_ordinary_recursive_remove_still_works() {
         &format!(
             r#"
             _G.rm_done = nil
-            btv.fs.remove("{}", {{ recursive = true }})
+            btv.fs.remove({:?}, {{ recursive = true }})
               :next(function() _G.rm_done = "ok" end)
               :catch(function(e) _G.rm_done = "ERR: " .. tostring(e.message or e) end)
             "#,
-            tree.display()
+            tree
         ),
     )
     .await;

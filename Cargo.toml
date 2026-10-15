@@ -125,13 +125,17 @@ libc = "=0.2.186"
 # OSC 52 clipboard payloads (`crates/bemtvi-server/src/clipboard.rs`) — the escape
 # carries its text base64-encoded.
 base64 = "=0.22.1"
-# Native GUI client stack (`bemtvi-gui`). winit owns the window + input event loop,
-# wgpu the GPU surface, and glyphon the text rendering (it re-exports cosmic-text,
-# so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through `glyphon::`). glyphon
-# 0.11 builds against wgpu 29 — bump the two together (glyphon 0.12 wants wgpu 30
-# but is newer than our 2-week-old dependency floor). `pollster` blocks on wgpu's
-# async device/adapter requests from the synchronous winit setup path.
-winit = "=0.30.13"
+# Native GUI client stack (`bemtvi-gui`). mitsuami owns the window, its run loop and
+# input (AppKit / WinUI 3 / GTK 4 or Kirigami, each the platform's own), and hands
+# the GUI a `GpuSurface`; wgpu presents to it, and glyphon renders the text (it
+# re-exports cosmic-text, so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through
+# `glyphon::`). glyphon 0.11 builds against wgpu 29 — bump the two together (glyphon
+# 0.12 wants wgpu 30 but is newer than our 2-week-old dependency floor). `pollster`
+# blocks on wgpu's async device/adapter requests while the surface is set up.
+# mitsuami's `GpuSurface` text input isn't in a release yet (crates.io has 1.1.0), so
+# it's pinned to the commit on its `gpu-surface-text-input` branch; move to `=x.y.z`
+# once a release has it.
+mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "a89907f7fac4dd272a4236b1f49bc1b9487031bb" }
 wgpu = "=29.0.4"
 glyphon = "=0.11.0"
 # Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:
@@ -141,19 +145,6 @@ glyphon = "=0.11.0"
 # glyph to a whole number of cells. Version must match glyphon's `cosmic-text` (0.18).
 cosmic-text = { version = "=0.18.2", features = ["monospace_fallback"] }
 pollster = "=0.4.0"
-# Native system file dialog for the GUI's `:eo`/`:wn`/… pickers — all three
-# desktop platforms, no GTK: NSOpenPanel on macOS, the Win32 `IFileDialog` on
-# Windows, and the XDG desktop portal (over D-Bus) on Linux/BSD. `xdg-portal` (not
-# the default `gtk3`) selects the portal backend and is a no-op on macOS/Windows;
-# `default-features = false` also drops rfd's `wayland` feature, so the Linux build
-# needs no system Wayland/GTK libraries (the dialog just isn't parented to the
-# window on Wayland — it's still a normal top-level). The portal backend needs a
-# running `xdg-desktop-portal` service at runtime, standard on modern desktops.
-rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
-# Cross-platform system-clipboard access for the GUI's Cmd+V paste (NSPasteboard /
-# Win32 / X11+Wayland, all pure-Rust backends, no GTK), so unlike rfd it's a normal
-# dependency. Text only — no image support.
-arboard = { version = "=3.6.1", default-features = false }
 # Build-dependency (Windows host only): embeds the app icon + version info into
 # the bemtvi-gui.exe via the Windows SDK's rc.exe. See crates/bemtvi-gui/build.rs.
 winresource = "=0.1.31"

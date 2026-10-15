@@ -1,7 +1,7 @@
 //! Input key-notation encoding, shared by every client.
 //!
-//! Each frontend decodes its own native key events (crossterm for the TUI, winit
-//! for a GUI), maps them to the toolkit-neutral [`Key`] enum, and calls
+//! Each frontend decodes its own native key events (crossterm for the TUI, mitsuami
+//! for the GUI), maps them to the toolkit-neutral [`Key`] enum, and calls
 //! [`notation`] to get the vim key-notation string the server's `btv_input`
 //! expects (`"i"`, `"<Esc>"`, `"<C-w>"`, …). [`encode_paste`] is fully neutral —
 //! it turns a bracketed-paste payload into one notation string directly.

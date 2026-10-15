@@ -609,7 +609,7 @@ impl Keymaps {
         let bucket = scope.bucket();
         while !self.pending.is_empty() {
             let before = self.pending.len();
-            let buffered: Vec<Key> = self.pending.drain(..).collect();
+            let buffered: Vec<Key> = std::mem::take(&mut self.pending);
             if self.tries.contains_key(&bucket) {
                 // No next key on the flush path, so the break-path oracle does not
                 // apply here: a trailing live-prefix replays raw and the editor
@@ -650,14 +650,14 @@ impl Keymaps {
         match classify {
             Classify::Prefix => {} // hold: wait for the next key
             Classify::Complete(mapping) => {
-                let lhs: Vec<Key> = self.pending.drain(..).collect();
+                let lhs: Vec<Key> = std::mem::take(&mut self.pending);
                 self.fire(scope, mapping, &lhs, steps);
             }
             Classify::None => {
                 // This key broke every live prefix. Resolve the previously
                 // buffered keys (without this key), then re-process this key fresh.
                 self.pending.pop();
-                let buffered: Vec<Key> = self.pending.drain(..).collect();
+                let buffered: Vec<Key> = std::mem::take(&mut self.pending);
                 if buffered.is_empty() {
                     // The key on its own starts no mapping: straight to the editor.
                     steps.push(Step::Editor(key));

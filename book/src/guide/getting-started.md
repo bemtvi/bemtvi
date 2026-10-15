@@ -15,7 +15,7 @@ Then run it on a file (the argument is optional):
 
 ```sh
 bemtvi file.txt        # terminal editor
-bemtvi-gui file.txt    # native GUI (winit + wgpu)
+bemtvi-gui file.txt    # native GUI (mitsuami + wgpu)
 ```
 
 Downloads ship with checksums and SLSA build provenance — see

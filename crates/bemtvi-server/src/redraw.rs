@@ -171,6 +171,8 @@ impl EditHost {
         // client size their off-grid glyphs with it (the TUI has no say — the terminal
         // draws them). Empty (the default) leaves the client on its own setting.
         let guiglyphoverflow = global_opts.guiglyphoverflow;
+        // `'imdisable'`, relayed for a GUI to turn its input method off while set.
+        let imdisable = global_opts.imdisable;
         // The `'timeout'` / `'timeoutlen'` mapping-timeout config, relayed so each
         // client runs its own idle-flush timer to match: skip arming when `timeout`
         // is off (`notimeout` → a withheld mapped prefix waits forever, which is how
@@ -463,6 +465,7 @@ impl EditHost {
                 Value::from("guiglyphoverflow"),
                 Value::from(guiglyphoverflow.as_str()),
             ),
+            (Value::from("imdisable"), Value::from(imdisable)),
             (Value::from("timeout"), Value::from(timeout)),
             (Value::from("timeoutlen"), Value::from(timeoutlen)),
             // The current buffer's identity + edit version, so the browser Worker ships
@@ -1444,6 +1447,10 @@ const CHROME: &[(&str, &str)] = &[
     ("float_border", "FloatBorder"),
     ("normal_float", "NormalFloat"),
     ("float_title", "FloatTitle"),
+    // An input method's composition, which a GUI splices in at the cursor until
+    // it's committed. bemtvi's own group; it falls back to `Visual` (see
+    // `builtin_default_link`).
+    ("preedit", "BtvImePreedit"),
 ];
 
 /// The tree-sitter capture names the browser highlighter colors, keyed exactly as

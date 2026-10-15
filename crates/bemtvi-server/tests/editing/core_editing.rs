@@ -554,6 +554,7 @@ async fn arm_onto_an_unwatchable_file(rpc: &Rpc, path: &std::path::Path) -> Opti
 }
 
 /// How many `redraw` notifications the server pushed over `window` of complete idle.
+#[cfg(unix)]
 async fn redraws_while_idle(
     incoming: &mut UnboundedReceiver<Incoming>,
     window: std::time::Duration,

@@ -1,5 +1,5 @@
 //! `bemtvi-gui` entry point — the GUI binary is a **client only**. It opens a native
-//! winit + wgpu window ([`bemtvi_gui::run`]) onto a local editor server (a headless
+//! mitsuami + wgpu window ([`bemtvi_gui::run`]) onto a local editor server (a headless
 //! server on its own thread, joined over an in-process duplex — the same msgpack-RPC the
 //! TUI binary uses). The editor (core + Lua + the keystroke path) always runs local; a
 //! session can point its fs/process/watch/LSP host seams at a remote `--daemon` (the
@@ -42,8 +42,8 @@ use clap::Parser;
 #[command(
     name = "bemtvi-gui",
     version,
-    about = "A modal, vim-style editor: the native (winit + wgpu) GUI client.",
-    long_about = "A modal, vim-style editor: the native (winit + wgpu) GUI client. With no \
+    about = "A modal, vim-style editor: the native (mitsuami + wgpu) GUI client.",
+    long_about = "A modal, vim-style editor: the native (mitsuami + wgpu) GUI client. With no \
         role flag, bemtvi-gui opens the given file (or an empty buffer) in a window onto a \
         local editor server. A directory argument opens the system file picker there."
 )]

@@ -53,3 +53,42 @@ async fn the_cursor_group_reaches_the_frame_chrome() {
         "the `Cursor` group must reach the client that paints the cursor"
     );
 }
+
+/// `BtvImePreedit` is the look of an input method's composition (the kana typed so
+/// far, before it's converted and committed). The GUI splices the composition into
+/// the line at the cursor like inline virtual text, painted with this entry.
+#[tokio::test]
+async fn the_ime_preedit_group_reaches_the_frame_chrome() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "btv.hl.define(0, 'BtvImePreedit', { fg = '#112233', bg = '#445566' })",
+    )
+    .await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(
+        chrome_colors(&frame, "preedit"),
+        Some((Some(0x11_22_33), Some(0x44_55_66))),
+        "the `BtvImePreedit` group must reach the client that paints the composition"
+    );
+}
+
+/// No colorscheme defines `BtvImePreedit` (it's bemtvi's own), so it falls back to
+/// `Visual` — a theme's marked-text look — rather than to nothing.
+#[tokio::test]
+async fn the_ime_preedit_group_falls_back_to_visual() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "btv.hl.define(0, 'Visual', { fg = '#abcdef', bg = '#fedcba' })",
+    )
+    .await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(
+        chrome_colors(&frame, "preedit"),
+        Some((Some(0xab_cd_ef), Some(0xfe_dc_ba))),
+        "an undefined `BtvImePreedit` must take the theme's `Visual`"
+    );
+}

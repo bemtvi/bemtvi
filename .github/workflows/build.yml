@@ -380,9 +380,13 @@ jobs:
           # the compiled GSettings schemas (the file chooser aborts without its
           # schema), the gdk-pixbuf loaders, and the GIO modules — plus the env
           # pointing GTK at them. The gtk plugin (a shell script, arch-neutral)
-          # bundles those and installs the AppRun hook that sets the env.
+          # bundles those and installs the AppRun hook that sets the env. Pinned
+          # to a commit and checked against its hash, since what it writes ends
+          # up inside the released AppImage.
+          GTK_PLUGIN_REV=7a3fbc31a9e5075073ff8790f26effbac5f84453
           curl -fsSLo linuxdeploy-plugin-gtk.sh \
-            "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+            "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/${GTK_PLUGIN_REV}/linuxdeploy-plugin-gtk.sh"
+          echo "b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171  linuxdeploy-plugin-gtk.sh" | sha256sum -c -
           chmod +x linuxdeploy-plugin-gtk.sh
           export DEPLOY_GTK_VERSION=4
 

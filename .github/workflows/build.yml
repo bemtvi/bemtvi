@@ -72,7 +72,7 @@ jobs:
             echo "ASSET=$PREFIX-${{ inputs.version }}-${{ matrix.suffix }}.${{ matrix.ext }}"
           } >> "$GITHUB_ENV"
           # The Linux GUI ships a second asset alongside the bare-binary tarball:
-          # a single-file AppImage (desktop-integrated, runs on old glibc).
+          # a single-file AppImage (desktop-integrated, GTK 4 bundled in).
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.kind }}" = "gui" ]; then
             echo "APPIMAGE_ASSET=$PREFIX-${{ inputs.version }}-${{ matrix.suffix }}.AppImage" >> "$GITHUB_ENV"
           fi
@@ -136,6 +136,9 @@ jobs:
       # older than the runner's own glibc. cargo-zigbuild consumes the `.2.17`
       # suffix to retarget the linker only; Cargo still writes to
       # target/<triple>/release, so every downstream packaging path is unchanged.
+      # The GUI's real floor is higher regardless: it links the runner's GTK 4 /
+      # libadwaita, which themselves need a modern glibc (GTK 4.10+ ships only on
+      # glibc 2.37+ distros), so the pin matters mostly for the TUI.
       - name: Build with pinned glibc floor (Linux)
         if: matrix.os == 'linux'
         shell: bash
@@ -372,6 +375,16 @@ jobs:
               "https://github.com/linuxdeploy/${tool}/releases/download/continuous/${f}"
             chmod +x "$f"
           done
+          # mitsuami's GTK 4 backend: linuxdeploy copies libgtk-4/libadwaita as
+          # plain libraries, but GTK also needs its runtime data next to them —
+          # the compiled GSettings schemas (the file chooser aborts without its
+          # schema), the gdk-pixbuf loaders, and the GIO modules — plus the env
+          # pointing GTK at them. The gtk plugin (a shell script, arch-neutral)
+          # bundles those and installs the AppRun hook that sets the env.
+          curl -fsSLo linuxdeploy-plugin-gtk.sh \
+            "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+          chmod +x linuxdeploy-plugin-gtk.sh
+          export DEPLOY_GTK_VERSION=4
 
           # Rasterize the source SVG to the 256×256 PNG linuxdeploy installs into
           # the AppDir hicolor theme (stem must match the .desktop Icon= key).
@@ -384,6 +397,7 @@ jobs:
               --executable "target/${{ matrix.target }}/release/bemtvi-gui" \
               --desktop-file crates/bemtvi-gui/assets/bemtvi.desktop \
               --icon-file bemtvi.png \
+              --plugin gtk \
               --output appimage
           test -f "dist/$APPIMAGE_ASSET"
 

@@ -132,10 +132,7 @@ base64 = "=0.22.1"
 # `glyphon::`). glyphon 0.11 builds against wgpu 29 — bump the two together (glyphon
 # 0.12 wants wgpu 30 but is newer than our 2-week-old dependency floor). `pollster`
 # blocks on wgpu's async device/adapter requests while the surface is set up.
-# mitsuami's `GpuSurface` text input isn't in a release yet (crates.io has 1.1.0), so
-# it's pinned to the commit on its `gpu-surface-text-input` branch; move to `=x.y.z`
-# once a release has it.
-mitsuami = { git = "https://github.com/Roboport-Tecnologia/mitsuami", rev = "a89907f7fac4dd272a4236b1f49bc1b9487031bb" }
+mitsuami = "=1.2.0"
 wgpu = "=29.0.4"
 glyphon = "=0.11.0"
 # Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:

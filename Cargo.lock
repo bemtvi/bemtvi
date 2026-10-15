@@ -1438,7 +1438,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1935,7 +1935,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps 9.0.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4073,7 +4073,8 @@ dependencies = [
 [[package]]
 name = "mitsuami"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9860e724ad012e5942efc92262ddfcf0120cd8cd5b1871a398cde450630beb33"
 dependencies = [
  "mitsuami-appkit",
  "mitsuami-core",
@@ -4087,7 +4088,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-appkit"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0090b508548faac04fae3ba2df096a0cf32c6c6dea8c2884948241e015c5df7"
 dependencies = [
  "block2",
  "dispatch2",
@@ -4105,7 +4107,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-core"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47f977abb2f3c7fe165a691a03bfab581e57986b5d641be04d1fe8dad9499282"
 dependencies = [
  "fluent-bundle",
  "fluent-langneg",
@@ -4120,7 +4123,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-gtk"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92427c7e4abbac52dc022f0b6d35a7aa57192bfd50afab8daa1f416750ceea76"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -4133,7 +4137,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-linux"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f3d7bcdc2951771858ad45e44c64642a72dab6aa8810c1a7211d541ea35bb68"
 dependencies = [
  "mitsuami-core",
  "wayland-backend",
@@ -4145,7 +4150,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-macros"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87f114eea068ddf6c2aadce10900b96dc82a4d2a72af1be3a6b24897f1ffe8ca"
 dependencies = [
  "fluent-syntax",
  "proc-macro2",
@@ -4157,7 +4163,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-reactive"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e1211ae70a152e08560c8d84b7c1ae1acfeba328b18a7befd449474085eb9e"
 dependencies = [
  "slotmap",
 ]
@@ -4165,7 +4172,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-widgets"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1aaecf3a71d445331a06803be365e57f1ece910201fe19925204c16cdad66b"
 dependencies = [
  "mitsuami-core",
  "mitsuami-reactive",
@@ -4174,7 +4182,8 @@ dependencies = [
 [[package]]
 name = "mitsuami-winui"
 version = "1.2.0"
-source = "git+https://github.com/Roboport-Tecnologia/mitsuami?rev=a89907f7fac4dd272a4236b1f49bc1b9487031bb#a89907f7fac4dd272a4236b1f49bc1b9487031bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6166e240620b7798c442b5411efc4d1e785fe24a499df26065441ff0044c188"
 dependencies = [
  "mitsuami-core",
  "mitsuami-widgets",
@@ -5733,7 +5742,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5792,7 +5801,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6385,7 +6394,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7548,7 +7557,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

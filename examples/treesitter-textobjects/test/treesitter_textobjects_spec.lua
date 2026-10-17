@@ -76,20 +76,23 @@ btv.test.describe("examples/treesitter-textobjects", function()
     btv.test.expect(alast).to_be(20)
   end)
 
-  -- "Cursor on the nested closure, `vif` → the closure; `2vif` → `distance`."
+  -- "Cursor in the nested closure's body, `vif` → the closure body; `v2if` →
+  --  `distance`'s." The closure half needs the example's own
+  --  `after/queries/rust/textobjects.scm`.
   btv.test.it("a count reaches the enclosing function", function(t)
     open(t)
     if not has_grammar(t) then
       return
     end
     t:feed("17G")
-    t:feed("f{l")
+    t:feed("f*")
     t:feed("vif")
-    local _, inner_last = selection(t)
+    local inner_first, inner_last = selection(t)
+    btv.test.expect(inner_first).to_be(17)
     btv.test.expect(inner_last).to_be(17)
     t:feed("17G")
-    t:feed("f{l")
-    t:feed("2vif")
+    t:feed("f*")
+    t:feed("v2if")
     local _, outer_last = selection(t)
     btv.test.expect(outer_last > 17).to_be(true)
   end)
@@ -101,7 +104,7 @@ btv.test.describe("examples/treesitter-textobjects", function()
       return
     end
     t:feed("36G")
-    t:feed("f target")
+    t:feed("/target<CR>")
     t:feed("dia")
     btv.test.expect(t:line(36)).to_contain("distance(origin")
     btv.test.expect(t:line(36)).never.to_contain("target")
@@ -152,7 +155,7 @@ btv.test.describe("examples/treesitter-textobjects", function()
     btv.test.expect(last <= 28).to_be(true)
     -- `vak` on the `distance(…)` call takes the whole call.
     t:feed("27G")
-    t:feed("f di")
+    t:feed("fd")
     t:feed("vak")
     local kfirst, klast = selection(t)
     btv.test.expect(kfirst).to_be(27)
@@ -172,6 +175,6 @@ btv.test.describe("examples/treesitter-textobjects", function()
     vim.notify, btv.notify = prev_vim, prev_btv
     btv.test.expect(got).to_contain("f function")
     btv.test.expect(got).to_contain("l loop")
-    btv.test.expect(got).to_contain("2vif")
+    btv.test.expect(got).to_contain("v2if")
   end)
 end)

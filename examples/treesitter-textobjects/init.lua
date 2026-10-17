@@ -20,7 +20,8 @@
 --        enum, impl, …)
 --
 -- A count reaches an *enclosing* scope: with the cursor in a nested function,
--- `vif` grabs the inner one and `2vif` the function around it.
+-- `vif` grabs the inner one and `v2if` the function around it. The count goes
+-- after `v` (or after an operator: `d2if`), as for any vim text object.
 --
 -- These read the buffer's `textobjects.scm` query, so they need the language's
 -- grammar installed. The sample is Rust; install it once (needs a network
@@ -29,7 +30,11 @@
 --     :TSInstall rust
 --
 -- `:TSInstall` also fetches the text-object query, so nothing else is needed —
--- open `sample.rs` and the objects work immediately.
+-- open `sample.rs` and the objects work immediately. That query has no function
+-- object for a Rust closure, so this example adds one in
+-- `after/queries/rust/textobjects.scm` (a `;; extends` file: it adds to the
+-- installed query instead of replacing it). Any config can extend a query the
+-- same way.
 
 --------------------------------------------------------------------------------
 -- Nothing to configure: tree-sitter text objects are built in and on whenever the
@@ -76,7 +81,7 @@ vim.api.nvim_create_user_command("TextObjects", function()
     "tree-sitter text objects — i=inside a=around:\n"
       .. "  built-in:  f function   a argument   c comment   t type\n"
       .. "  custom:    l loop   k call   r return   (via btv.textobject.map)\n"
-      .. "try: vif  vaf  dia  cic  vit  2vif  vil  vak   (needs :TSInstall rust)"
+      .. "try: vif  vaf  dia  cic  vit  v2if  vil  vak   (needs :TSInstall rust)"
   )
 end, {})
 
@@ -85,7 +90,8 @@ end, {})
 --
 --   * Cursor inside `distance`'s body, `vif`  → selects the function body.
 --     `vaf` → selects the whole `fn distance … }` including the signature.
---   * Cursor on the nested closure, `vif` → the closure; `2vif` → `distance`.
+--   * Cursor on the closure's `v * v`, `vif` → the closure body; `v2if` →
+--     `distance`'s body (closures come from this example's `after/queries`).
 --   * Cursor on `target` in `main`, `dia` → deletes just that argument;
 --     `cia` → changes it (type the replacement, then <Esc>).
 --   * Cursor on the `struct Point` block, `vit` → the type; `dat` → deletes it.

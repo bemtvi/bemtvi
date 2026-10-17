@@ -13,7 +13,7 @@ fn distance(a: Point, b: Point) -> f64 {
     let dx = (a.x - b.x) as f64;
     let dy = (a.y - b.y) as f64;
 
-    // A nested closure: from here, `vif` grabs the closure, `2vif` the outer fn.
+    // A nested closure: on `v * v`, `vif` grabs its body, `v2if` the outer fn's.
     let square = |v: f64| -> f64 { v * v };
 
     (square(dx) + square(dy)).sqrt()
@@ -23,7 +23,7 @@ fn distance(a: Point, b: Point) -> f64 {
 fn total(points: &[Point]) -> f64 {
     let mut sum = 0.0;
     for p in points {
-        // Cursor here, `vil` selects inside the for-loop; `vik` selects the call.
+        // Here `vil` selects inside the loop; on `distance`, `vak` selects the call.
         sum += distance(Point { x: 0, y: 0 }, Point { x: p.x, y: p.y });
     }
     sum

@@ -341,3 +341,56 @@ fn file_level_setup_survives_into_every_test() {
     assert!(ok, "the baseline was not preserved; stdout:\n{stdout}");
     assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
 }
+
+/// A spec that loads a plugin through `btv.plugins{ dir = … }` at file level (what an
+/// example's `init.lua` does) gets that plugin's `plugin/` scripts in its baseline.
+/// The manager sources them asynchronously, so a baseline taken the moment the spec
+/// files finished sourcing missed the commands and keymaps they register, and the
+/// restore before each test deleted them as if a test had added them.
+#[test]
+fn plugin_scripts_loaded_by_the_spec_join_the_baseline() {
+    let dir = fixture_dir("pluginload");
+    let plug = dir.join("vendored");
+    std::fs::create_dir_all(plug.join("plugin")).unwrap();
+    std::fs::write(
+        plug.join("plugin/vendored.lua"),
+        r#"
+        btv.command("VendoredCmd", function() btv.g.vendored_ran = true end, { desc = "fixture" })
+        btv.keymap.set("n", "<leader>vv", "ivv<Esc>", { desc = "fixture" })
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("test/pluginload_spec.lua"),
+        r#"
+        local root = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+        btv.plugins({ { name = "vendored", dir = root .. "/vendored" } })
+
+        local function has_map()
+          for _, m in ipairs(btv.keymap.get("n") or {}) do
+            if (m.lhs or ""):find("vv") then return true end
+          end
+          return false
+        end
+
+        btv.test.describe("plugin load", function()
+          btv.test.it("the plugin's command is there", function(t)
+            btv.test.expect(btv.user_command.get().VendoredCmd).to_be_truthy()
+            t:cmd("VendoredCmd")
+            btv.test.expect(btv.g.vendored_ran).to_be(true)
+          end)
+          btv.test.it("and its keymap", function()
+            btv.test.expect(has_map()).to_be(true)
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(
+        ok,
+        "the plugin's scripts missed the baseline; stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("2 passed, 0 failed"), "stdout:\n{stdout}");
+}

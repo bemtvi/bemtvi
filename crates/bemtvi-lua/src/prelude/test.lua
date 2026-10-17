@@ -1186,11 +1186,20 @@ function M._run()
   M._results = nil
   M._done = false
   local cases = flatten()
-  -- Taken here, after every spec file has been sourced: a file's load-time setup
-  -- belongs to the baseline, a test's changes do not.
-  M._baseline = snapshot()
   btv
     .async(function()
+      -- Taken here, after every spec file has been sourced: a file's load-time setup
+      -- belongs to the baseline, a test's changes do not. A spec that declares
+      -- plugins (`btv.plugins{ … }`, as an example's `init.lua` does) is not set up
+      -- until the manager has sourced their `plugin/` scripts, which it does
+      -- asynchronously, so wait for those loads to land first.
+      if btv.plugins and btv.plugins._idle then
+        btv.await(btv.wait_for(btv.plugins._idle, {
+          tries = 2000,
+          message = "btv.test: plugins declared by the spec files never finished loading",
+        }))
+      end
+      M._baseline = snapshot()
       local results = {}
       for _, case in ipairs(cases) do
         local ctx = setmetatable({}, Ctx)

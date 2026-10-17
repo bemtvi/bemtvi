@@ -508,6 +508,22 @@ function M.load(name)
   end)
 end
 
+-- Whether no plugin load is in flight: no eager activation pending and no `M.load`
+-- between its start and its `:finally`. `btv.test` waits on this before taking its
+-- baseline, so a spec that declares plugins at file level gets their `plugin/`
+-- scripts and `config` in the state every test starts from.
+function M._idle()
+  if M._eager_pending > 0 then
+    return false
+  end
+  for _, busy in pairs(M._loading) do
+    if busy then
+      return false
+    end
+  end
+  return true
+end
+
 -- `btv.plugins.on_loaded(name, fn)` — run `fn` once `name` is fully loaded (its
 -- `plugin/` scripts sourced and its `config` finished, an async `config` awaited).
 -- `fn` is called with the plugin name. Returns an unsubscribe function.

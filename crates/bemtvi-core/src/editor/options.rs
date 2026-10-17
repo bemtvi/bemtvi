@@ -960,6 +960,24 @@ impl Editor {
             }
             return;
         }
+        // `background` takes exactly `light` or `dark`, as in vim. A change reloads the
+        // loaded colorscheme; the server notices it through `take_background_change`.
+        if name == "background" {
+            match op {
+                StrOp::Set(value) => {
+                    if value == "light" || value == "dark" {
+                        self.set_global_option_str("background", &value);
+                    } else {
+                        self.echo(format!("E474: Invalid argument: background={value}"));
+                    }
+                }
+                StrOp::Reset => {
+                    self.set_global_option_str("background", "dark");
+                }
+                StrOp::Query => self.echo(format!("background={}", self.options.background)),
+            }
+            return;
+        }
         // The verbatim window-local string options, living on the focused window's
         // options rather than a global string slot (like `wrap`):
         // - `showbreak` (`:set sbr=↪`) — the wrapped-line marker; `breakindentopt`

@@ -1671,3 +1671,135 @@ async fn a_multi_option_query_reports_every_option() {
         "an E518 among the reports still lights the line red"
     );
 }
+
+/// `'background'` is a real global option: `:set` takes `light` / `dark`, rejects
+/// anything else with E474, resets with `&`, and reads back through `btv.o` — the
+/// same value whichever surface wrote it. It used to live only in the Lua catch-all
+/// store, so `:set background=light` answered E518.
+#[tokio::test]
+async fn background_is_a_settable_option() {
+    let (rpc, mut incoming) = start().await;
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "background?").await,
+        "background=dark"
+    );
+    set_message(&rpc, &mut incoming, "background=light").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.background").await.as_str(),
+        Some("light")
+    );
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "bg?").await,
+        "background=light"
+    );
+    let msg = set_message(&rpc, &mut incoming, "bg=blue").await;
+    assert!(
+        msg.contains("E474"),
+        "an invalid value is loud, got {msg:?}"
+    );
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "bg?").await,
+        "background=light"
+    );
+    set_message(&rpc, &mut incoming, "bg&").await;
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "bg?").await,
+        "background=dark"
+    );
+
+    // The Lua write reaches the core option, not a Lua-only store.
+    exec_lua(&rpc, "btv.o.background = 'light'").await;
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "bg?").await,
+        "background=light"
+    );
+    // …and is as strict about the value as `:set`.
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() btv.o.background = 'blue' end) return tostring(e)",
+    )
+    .await;
+    assert!(
+        err.as_str().is_some_and(|e| e.contains("E474")),
+        "got {err:?}"
+    );
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "bg?").await,
+        "background=light"
+    );
+}
+
+/// Changing `'background'` reloads the loaded colorscheme, as in vim, so a scheme that
+/// picks its palette from `'background'` follows the change. The scheme's own write
+/// of `'background'` while loading is not a change to react to (no reload loop).
+#[tokio::test]
+async fn changing_background_reloads_the_colorscheme() {
+    let dir = bemtvi_test_harness::temp_dir("bg_reload");
+    std::fs::create_dir_all(dir.join("colors")).unwrap();
+    std::fs::write(
+        dir.join("colors/flip.lua"),
+        r##"
+        btv.g.flip_loads = (btv.g.flip_loads or 0) + 1
+        btv.g.colors_name = "flip"
+        btv.hl.define(0, "Normal", { bg = btv.o.background == "light" and "#ffffff" or "#000000" })
+        btv.o.background = btv.o.background
+        "##,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("colors/darkonly.lua"),
+        r#"
+        btv.g.dark_loads = (btv.g.dark_loads or 0) + 1
+        btv.o.background = "dark"
+        "#,
+    )
+    .unwrap();
+    let init = ServerInit {
+        runtimepath: vec![dir.clone()],
+        ..ServerInit::default()
+    };
+    let (rpc, mut incoming) = start_attached(init, 80, 24).await;
+    let normal_bg = "return btv.hl.get(0, { name = 'Normal' }).bg";
+
+    command(&rpc, "colorscheme flip").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.g.flip_loads").await.as_u64(),
+        Some(1)
+    );
+    assert_eq!(exec_lua(&rpc, normal_bg).await.as_u64(), Some(0x000000));
+
+    set_message(&rpc, &mut incoming, "background=light").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.g.flip_loads").await.as_u64(),
+        Some(2)
+    );
+    assert_eq!(exec_lua(&rpc, normal_bg).await.as_u64(), Some(0xffffff));
+
+    // Through `btv.o` too.
+    exec_lua(&rpc, "btv.o.background = 'dark'").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.g.flip_loads").await.as_u64(),
+        Some(3)
+    );
+    assert_eq!(exec_lua(&rpc, normal_bg).await.as_u64(), Some(0x000000));
+
+    // Setting the value it already has is not a change.
+    set_message(&rpc, &mut incoming, "background=dark").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.g.flip_loads").await.as_u64(),
+        Some(3)
+    );
+
+    // A scheme that pins its own background is reloaded once and wins; it is not
+    // reloaded again by its own write.
+    command(&rpc, "colorscheme darkonly").await;
+    set_message(&rpc, &mut incoming, "background=light").await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.g.dark_loads").await.as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        set_message(&rpc, &mut incoming, "bg?").await,
+        "background=dark"
+    );
+}

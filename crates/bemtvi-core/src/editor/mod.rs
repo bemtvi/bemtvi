@@ -1637,6 +1637,10 @@ pub struct Editor {
     /// panel so the printed value is visible. Drained right after [`lua_queue`].
     pub open_messages_after_lua: bool,
 
+    /// The `'background'` value the loaded colorscheme was last (re)loaded for —
+    /// what [`Editor::take_background_change`] compares the live option against.
+    background_applied: String,
+
     /// Command lines queued for the server to run after the tick, in order — see
     /// [`DeferredCmd`] for the two kinds. Keeps the core ignorant of the Lua command
     /// table while still routing typed `:Foo` and `vim.cmd.Foo()` through one place.
@@ -2320,6 +2324,7 @@ impl Editor {
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
             open_messages_after_lua: false,
+            background_applied: "dark".to_string(),
             pending_sleep: None,
             syntax: None,
             sandbox: None,

@@ -762,6 +762,21 @@ impl EditHost {
         let r = self.lua.fire_autocmd("ColorScheme", name);
         self.report_autocmd_err("ColorScheme", r);
         self.apply_lua_effects();
+        // A scheme commonly sets `'background'` to the palette it just loaded. That
+        // is the scheme describing itself, not a change to reload for.
+        self.editor.take_background_change();
+    }
+
+    /// Reload the loaded colorscheme after `'background'` changed, as vim does, so a
+    /// scheme that picks its palette from `'background'` follows the change. Without
+    /// a loaded scheme (`g:colors_name` unset) there is nothing to reload.
+    pub(crate) fn sync_background(&mut self) {
+        if !self.editor.take_background_change() {
+            return;
+        }
+        if let Some(name) = self.lua.get_global_var("colors_name") {
+            self.set_colorscheme(&name);
+        }
     }
 
     /// `:source {file}` — run a script file. A `.lua` file executes through the

@@ -218,6 +218,11 @@ pub struct Options {
     /// (the per-namespace store) and/or `global` (the shared store), or the lone token
     /// `none` to persist no history. The server reads it to route the shada flush/load.
     pub persisthistory: String,
+    /// Whether the colorscheme should use its light or dark palette (vim's
+    /// `'background'`; `"light"` or `"dark"`, default `"dark"`). The core draws nothing
+    /// from it: colorschemes read it, and changing it reloads the loaded scheme (see
+    /// [`crate::Editor::take_background_change`]).
+    pub background: String,
     /// The scanf-style `'errorformat'` used to parse `:make`/`:grep`/`:cbuffer`
     /// output into quickfix entries (see [`crate::editor::quickfix`]). A
     /// comma-separated list of format parts; default [`DFLT_EFM`]. Global-only for
@@ -361,6 +366,7 @@ impl Options {
             ("httpport", Num(n)) => self.httpport = (*n).clamp(0, u16::MAX as i64) as u16,
             ("history", Num(n)) => self.history = (*n).clamp(0, i64::MAX) as usize,
             ("persisthistory", Str(s)) => self.persisthistory = s.clone(),
+            ("background", Str(s)) => self.background = s.clone(),
             ("statusline", Str(s)) => self.statusline = s.clone(),
             ("tabline", Str(s)) => self.tabline = s.clone(),
             ("guifont", Str(s)) => self.guifont = s.clone(),
@@ -416,6 +422,7 @@ impl Options {
             "httpport" => Num(self.httpport as i64),
             "history" => Num(self.history as i64),
             "persisthistory" => Str(self.persisthistory.clone()),
+            "background" => Str(self.background.clone()),
             "statusline" => Str(self.statusline.clone()),
             "tabline" => Str(self.tabline.clone()),
             "guifont" => Str(self.guifont.clone()),
@@ -605,6 +612,7 @@ impl Default for Options {
             scrollback: 10_000,
             history: 10_000,
             persisthistory: "workspace,global".to_string(),
+            background: "dark".to_string(),
             // The compiled-in gcc/make-aware errorformat.
             errorformat: DFLT_EFM.to_string(),
             // bemtvi default: a jump to a buffer already shown in another tab switches
@@ -2228,6 +2236,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Global,
             doc: "Where command-line / search history persists: none, workspace, global (comma list).",
+        },
+        OptionInfo {
+            name: "background",
+            abbrev: Some("bg"),
+            kind: Str,
+            scope: Global,
+            doc: "Whether the colorscheme uses its light or dark palette; changing it reloads the scheme.",
         },
         OptionInfo {
             name: "errorformat",

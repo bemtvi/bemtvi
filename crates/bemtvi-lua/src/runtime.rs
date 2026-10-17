@@ -607,6 +607,9 @@ pub struct GoMirror {
     /// `'persisthistory'` — where history persists (`none`/`workspace`/`global`, comma
     /// list). Backs `vim.o.persisthistory` / `btv.o.persisthistory`.
     pub persisthistory: String,
+    /// `'background'` — `"light"` or `"dark"`, the palette a colorscheme picks. Backs
+    /// `vim.o.background` / `btv.o.background`.
+    pub background: String,
     /// `'timeout'` — whether a mapped sequence waits `timeoutlen` to resolve (on) or
     /// is held forever for the next key (off). Backs `vim.o.timeout` / `btv.o.timeout`.
     pub timeout: bool,

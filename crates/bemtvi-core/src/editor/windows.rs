@@ -1820,6 +1820,19 @@ impl Editor {
         handled
     }
 
+    /// Whether `'background'` changed since the last call, recording the new value as
+    /// seen. Any path that writes the option (`:set`, `btv.o`, a workspace override)
+    /// counts. The server reloads the loaded colorscheme on `true`, as vim does, and
+    /// calls this once more after a colorscheme load so the scheme's own write of
+    /// `'background'` is not taken for a change.
+    pub fn take_background_change(&mut self) -> bool {
+        if self.options.background == self.background_applied {
+            return false;
+        }
+        self.background_applied = self.options.background.clone();
+        true
+    }
+
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).
     pub fn global_options(&self) -> Options {
         self.options.clone()

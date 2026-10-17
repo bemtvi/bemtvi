@@ -2728,6 +2728,7 @@ impl EditHost {
             scrollback: go.scrollback as u64,
             history: go.history as u64,
             persisthistory: go.persisthistory.clone(),
+            background: go.background.clone(),
             timeout: go.timeout,
             timeoutlen: go.timeoutlen as u64,
             columns: columns as u64,
@@ -4400,6 +4401,9 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            // A `'background'` change (`:set bg=light`, `btv.o.background = …`) reloads
+            // the colorscheme, as in vim.
+            self.sync_background();
             // `:={expr}` / `:lua= {expr}` queued a `vim.print` chunk above (its output
             // has now landed in `:messages` via `apply_lua_effects`); pop the messages
             // panel so the printed value is visible. Ordered after the drain so the

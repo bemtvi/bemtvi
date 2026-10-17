@@ -77,7 +77,7 @@ vim.b = btv.b
 --     wrapscan / hlsearch /
 --     incsearch / showtabline       -> global (`btv._go_mirror` + the
 --                                      `btv._set_global_option` Rust bridge)
--- Any other option (termguicolors, background, winblend, pumblend, …) lands in
+-- Any other option (termguicolors, winblend, pumblend, …) lands in
 -- the plain Lua store `btv._o_store`: observable read/write, not yet honored.
 --
 -- `btv.wo` / `btv.bo` are defined later in this chunk; `btv.o` only touches them from
@@ -167,6 +167,8 @@ local O_GLOBAL = {
   hi = "history",
   persisthistory = "persisthistory",
   phisto = "persisthistory",
+  background = "background",
+  bg = "background",
   timeout = "timeout",
   to = "timeout",
   timeoutlen = "timeoutlen",
@@ -219,6 +221,7 @@ local O_GLOBAL_DEFAULT = {
   scrollback = 10000,
   history = 10000,
   persisthistory = "workspace,global",
+  background = "dark",
   timeout = true,
   timeoutlen = 1000,
   columns = 80,
@@ -307,10 +310,9 @@ end
 
 -- Arbitrary (Lua-only) global options plugins set via `vim.o`; the wired options
 -- live in their scope (`vim.wo` / `vim.bo` / `btv._go_mirror`) instead. Seeded with
--- the few defaults colorschemes read (termguicolors / background / *blend).
+-- the few defaults colorschemes read (termguicolors / *blend).
 btv._o_store = btv._o_store
   or {
-    background = "dark",
     termguicolors = false,
     winblend = 0,
     pumblend = 0,
@@ -334,7 +336,7 @@ btv._o_store = btv._o_store
 
 -- The seeded store keys are options bemtvi *does* model (read-mostly: it keeps a
 -- value but the core doesn't act on it). Writing one is expected — colorschemes
--- set `background` / `termguicolors`, plugins set `winblend` — so it must store
+-- set `termguicolors`, plugins set `winblend` — so it must store
 -- silently, unlike a genuinely-unknown name (a typo) which warns once. Snapshot
 -- the seed keys now, before any catch-all write grows the store.
 btv._o_known = btv._o_known
@@ -457,6 +459,12 @@ local function o_set(k, v)
   end
   local canon = O_GLOBAL[k]
   if canon then
+    -- `background` takes exactly `light` or `dark`; `:set` answers E474 for anything
+    -- else, and so does this (a stored typo would hand every colorscheme a palette
+    -- name it can't look up).
+    if canon == "background" and v ~= "light" and v ~= "dark" then
+      error("E474: Invalid argument: background=" .. tostring(v), 3)
+    end
     -- Queue the change for the core and write through the mirror so a
     -- read-after-write within this chunk is consistent (the server overwrites it
     -- on the next push).
@@ -464,7 +472,7 @@ local function o_set(k, v)
     btv._go_mirror[canon] = v
     return
   end
-  -- A seeded read-mostly option (background, termguicolors, winblend, …) is
+  -- A seeded read-mostly option (termguicolors, winblend, …) is
   -- modeled — store it silently. Warn only for a name bemtvi has never seen.
   if not btv._o_known[k] then
     warn_unknown_opt(k)

@@ -619,6 +619,17 @@ impl EditHost {
                 Sequenced::QfSet(op) => self.apply_qf_set_op(op),
                 Sequenced::NamedList(NamedListOp::Show(name)) => self.editor.named_list_show(&name),
                 Sequenced::NamedList(NamedListOp::Drop(name)) => self.editor.named_list_drop(&name),
+                Sequenced::SetMark {
+                    bufnr,
+                    name,
+                    line,
+                    col,
+                } => {
+                    let buf = (bufnr != 0).then_some(BufferId(bufnr));
+                    if let Err(e) = self.editor.api_set_mark(buf, name, line, col) {
+                        self.editor.echo_err(e);
+                    }
+                }
             }
         }
         // `btv._cmdline_set_arg(path)`: the file picker confirm pasting a chosen path

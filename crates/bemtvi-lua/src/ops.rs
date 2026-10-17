@@ -1591,6 +1591,15 @@ pub enum Sequenced {
     QfSet(QfSetOp),
     /// A `btv.qf.show` / `btv.qf.drop` on a named list.
     NamedList(NamedListOp),
+    /// `btv.pos.set("'x", pos)` — set mark `name` in buffer `bufnr` (`0` = current)
+    /// at the 0-based `(line, col)`. Program-ordered so the common
+    /// `setpos("'<") setpos("'>") cmd("normal! gv")` sees its marks.
+    SetMark {
+        bufnr: u64,
+        name: char,
+        line: usize,
+        col: usize,
+    },
 }
 
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the

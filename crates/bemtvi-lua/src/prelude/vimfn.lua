@@ -19,6 +19,19 @@ for _, range in ipairs({ { "a", "z" }, { "A", "Z" }, { "0", "9" } }) do
   end
 end
 
+-- The marks `btv.pos.set` writes: the named marks and the specials vim's `setpos` takes.
+-- `.` and `^` are the editor's own record of the last change / insert, and the numbered
+-- marks come from shada, so neither is settable.
+local SET_MARKS = {}
+for c in ([["'`[]<>]]):gmatch(".") do
+  SET_MARKS[c] = true
+end
+for _, range in ipairs({ { "a", "z" }, { "A", "Z" } }) do
+  for b = range[1]:byte(), range[2]:byte() do
+    SET_MARKS[string.char(b)] = true
+  end
+end
+
 -- Resolve a position expression to `{ bufnr, lnum, col, off }` (1-based lnum/col), or
 -- `nil` when `expr` is not one bemtvi models. Shared by `btv.pos.get` and `btv.line`.
 local function resolve_pos(expr)
@@ -220,15 +233,67 @@ function btv.pos.get(expr)
 end
 fn.getpos = btv.pos.get
 
--- `btv.pos.set(expr, pos)` [alias `vim.fn.setpos`]: move the cursor when `expr` is `"."`
--- (the only settable position bemtvi models); `pos` is `{bufnr, lnum, col, off}`.
--- Other marks are accepted but not stored (no writable-mark mirror), returning 0.
+-- `btv.pos.set(expr, pos)` [alias `vim.fn.setpos`]: move the cursor or set a mark.
+-- `pos` is `{ bufnr, lnum, col, off }` (1-based `lnum`/`col`; `off` is ignored), and
+-- the call returns `0`. `expr` is one of:
+--
+-- ```
+-- "."     the cursor (in the current window; `bufnr` is ignored)
+-- "'x"    mark x: a-z, A-Z, or one of ' ` " [ ] < >
+-- ```
+--
+-- A mark goes into buffer `bufnr`, `0` meaning the current one; an uppercase mark
+-- remembers that buffer as its file. The column is clamped to the line. The mark is
+-- written in order with `btv.cmd`, so `btv.cmd("normal! gv")` after setting `"'<"` and
+-- `"'>"` selects the new range. Any other expression (`"'."`, a numbered mark, `"w0"`)
+-- raises an error naming it, and so does a line outside the buffer.
 function btv.pos.set(expr, pos)
+  if type(pos) ~= "table" then
+    error("setpos(): pos must be a list { bufnr, lnum, col, off }", 2)
+  end
   if expr == "." then
     -- The mutating `vim.api.nvim_win_set_cursor` is intentionally nil in Lua
     -- (ADR 0002); move the cursor through the supported `btv._win_set_cursor`
     -- bridge instead (0-based line, 0-based col).
     btv._win_set_cursor(0, math.max(0, (pos[2] or 1) - 1), math.max(0, (pos[3] or 1) - 1))
+    return 0
+  end
+  local name = type(expr) == "string" and #expr == 2 and expr:match("^['`](.)$")
+  if not (name and SET_MARKS[name]) then
+    error("setpos(): unsupported expression '" .. tostring(expr) .. "'", 2)
+  end
+  local bufnr, lnum, col = pos[1] or 0, pos[2], pos[3] or 1
+  for _, n in ipairs({ lnum, col }) do
+    if type(n) ~= "number" or n % 1 ~= 0 then
+      error("setpos(): lnum and col must be integers", 2)
+    end
+  end
+  lnum, col = math.floor(lnum), math.floor(col)
+  local cur = btv._resolve_bufnr(0)
+  local target = bufnr == 0 and cur or bufnr
+  local buf = btv._bufs[target]
+  local count = buf and buf.lines and #buf.lines
+  if lnum < 1 or (count and lnum > count) then
+    error("setpos(): E19: Mark has invalid line number: " .. tostring(lnum), 2)
+  end
+  if name == "`" then
+    name = "'" -- `` ` `` and `'` name the same mark
+  end
+  btv._set_mark(bufnr, name, lnum - 1, math.max(0, col - 1))
+  -- Write through to the marks mirror (the current buffer's marks and the file marks)
+  -- so a `btv.pos.get` later in this chunk reads the new position. The server's next
+  -- push replaces it with the core's own, clamped value.
+  if target == cur or name:match("%u") then
+    local row = { name = name, bufnr = target, line = lnum - 1, col = math.max(0, col - 1) }
+    local marks = btv._marks or {}
+    for i, m in ipairs(marks) do
+      if m.name == name then
+        marks[i] = row
+        return 0
+      end
+    end
+    marks[#marks + 1] = row
+    btv._marks = marks
   end
   return 0
 end

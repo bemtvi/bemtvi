@@ -51,10 +51,20 @@ fn buffer_mark_key(name: char) -> char {
 /// reopened file lands where it was left.
 const SPECIAL_MARKS: [char; 8] = ['"', '\'', '.', '^', '[', ']', '<', '>'];
 
+/// The 0-based column `'>` reports after a linewise selection: vim's `MAXCOL`
+/// (`2147483647`) once the reader adds 1, so `getpos("'>")` matches vim's answer and
+/// still fits a 32-bit Lua integer (the wasm build's).
+const VISUAL_LINE_END_COL: usize = i32::MAX as usize - 1;
+
 /// Where a mark points: which buffer and the cursor within it. A buffer-local
 /// lowercase mark resolves into the *current* buffer; a global `A`–`Z` mark
 /// resolves into the buffer it was set in, which may differ from the current one
 /// (the cross-buffer jump in [`Editor::execute`] keys off exactly that).
+enum VisualMarkEnd {
+    Start,
+    End,
+}
+
 pub(crate) struct MarkLocation {
     pub(crate) buf: BufferId,
     pub(crate) cursor: Cursor,
@@ -78,6 +88,48 @@ impl Editor {
                 .marks
                 .insert(name, (cursor.line, cursor.col));
         }
+    }
+
+    /// Set mark `name` in buffer `buf` (`None` = the current buffer) to the 0-based
+    /// `(line, col)` — vim's `setpos("'x", …)`, behind `btv.pos.set`. Settable are
+    /// the named marks `a`–`z` / `A`–`Z` and the specials vim lets `setpos` write:
+    /// `'` (`` ` `` is the same mark), `"`, `[`, `]`, `<` and `>`. An uppercase mark
+    /// records `buf` as its file, so a jump crosses to it; the column is clamped to
+    /// the line. Fails loud on any other name, a buffer that is not open, or a line
+    /// past the end (vim's `E19`), never storing a mark nothing can jump to.
+    pub fn api_set_mark(
+        &mut self,
+        buf: Option<BufferId>,
+        name: char,
+        line: usize,
+        col: usize,
+    ) -> Result<(), String> {
+        let settable =
+            name.is_ascii_alphabetic() || matches!(name, '\'' | '`' | '"' | '[' | ']' | '<' | '>');
+        if !settable {
+            return Err(format!("setpos(): mark '{name}' cannot be set"));
+        }
+        let id = buf.unwrap_or_else(|| self.cur_buffer());
+        let Some(b) = self.buffer_of(id) else {
+            return Err(format!("setpos(): invalid buffer id: {}", id.0));
+        };
+        if line >= b.line_count() {
+            return Err(format!("E19: Mark has invalid line number: {}", line + 1));
+        }
+        let len = b.line(line).trim_end_matches(['\n', '\r']).len();
+        let cursor = Cursor {
+            line,
+            col: col.min(len.saturating_sub(1)),
+        };
+        if name.is_ascii_uppercase() {
+            self.pending_global_marks.remove(&name);
+            self.global_marks.insert(name, (id, cursor));
+        } else {
+            let b = self.buffer_of_mut(id).expect("checked above");
+            b.marks
+                .insert(buffer_mark_key(name), (cursor.line, cursor.col));
+        }
+        Ok(())
     }
 
     /// Record the pre-jump cursor into the previous-context mark (`` `` `` / `''`)
@@ -240,10 +292,35 @@ impl Editor {
                 .then_some(MarkLocation { buf, cursor })
         } else {
             let &(line, col) = self.buffer().marks.get(&buffer_mark_key(name))?;
+            // After a linewise selection `` `< `` lands on the first line's start and
+            // `` `> `` on the last line's final character, as in vim; the stored columns
+            // are where the ends were typed, which `gv` still needs.
+            let col = match self.linewise_visual_mark(name) {
+                Some(VisualMarkEnd::Start) => 0,
+                Some(VisualMarkEnd::End) => {
+                    let text = self.buffer().line(line.min(self.last_line()));
+                    let text = text.trim_end_matches(['\n', '\r']);
+                    text.char_indices().last().map_or(0, |(i, _)| i)
+                }
+                None => col,
+            };
             Some(MarkLocation {
                 buf: self.cur_buffer(),
                 cursor: Cursor { line, col },
             })
+        }
+    }
+
+    /// Which end of a **linewise** selection mark `name` is, or `None` when it is not
+    /// `<` / `>` or the current buffer's last selection was not linewise.
+    fn linewise_visual_mark(&self, name: char) -> Option<VisualMarkEnd> {
+        if self.buffer().last_visual != Some(Mode::VisualLine) {
+            return None;
+        }
+        match name {
+            '<' => Some(VisualMarkEnd::Start),
+            '>' => Some(VisualMarkEnd::End),
+            _ => None,
         }
     }
 
@@ -328,6 +405,13 @@ impl Editor {
         // Buffer-local marks (specials first, then a–z): line/col + the line text.
         for name in SPECIAL_MARKS.iter().copied().chain('a'..='z') {
             if let Some(&(line, col)) = self.buffer().marks.get(&name) {
+                // A linewise selection spans whole lines: report column 0 and vim's
+                // `MAXCOL`, which is what `getpos("'<")` / `getpos("'>")` answer there.
+                let col = match self.linewise_visual_mark(name) {
+                    Some(VisualMarkEnd::Start) => 0,
+                    Some(VisualMarkEnd::End) => VISUAL_LINE_END_COL,
+                    None => col,
+                };
                 let text = self
                     .buffer()
                     .line(line.min(self.last_line()))

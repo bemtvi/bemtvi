@@ -627,3 +627,122 @@ async fn pos_get_unsupported_expr_fails_loud() {
         }
     }
 }
+
+#[tokio::test]
+async fn linewise_visual_marks_span_whole_lines() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // A linewise selection started mid-line on line 2 and ended mid-line on line 3.
+    feed(&rpc, "ggjllVjh<Esc>");
+    // Vim reports column 1 for `'<` and MAXCOL for `'>`: a linewise selection covers
+    // whole lines, whatever columns its ends were typed at.
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'<\")").await,
+        vec![0, 2, 1, 0]
+    );
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'>\")").await,
+        vec![0, 3, 2147483647, 0]
+    );
+    // Jumping lands on the start of the first line and the end of the last.
+    feed(&rpc, "G`<");
+    assert_eq!(cursor(&rpc).await, (2, 0));
+    feed(&rpc, "`>");
+    assert_eq!(cursor(&rpc).await, (3, 4));
+    // `gv` still restores the selection the way it was made, cursor column included.
+    feed(&rpc, "gggv");
+    assert_eq!(
+        exec_lua(&rpc, "return btv.mode_str()").await.as_str(),
+        Some("V")
+    );
+    assert_eq!(cursor(&rpc).await, (3, 1));
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get('v')").await,
+        vec![0, 2, 3, 0]
+    );
+    // A charwise selection afterwards reports its real columns again.
+    feed(&rpc, "<Esc>ggjlvjl<Esc>");
+    assert_eq!(
+        lua_ints(
+            &rpc,
+            "return { btv.pos.get(\"'<\")[3], btv.pos.get(\"'>\")[3] }"
+        )
+        .await,
+        vec![2, 3]
+    );
+}
+
+#[tokio::test]
+async fn pos_set_writes_marks() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>gg");
+    assert_eq!(
+        lua_ints(&rpc, "return { btv.pos.set(\"'a\", { 0, 2, 3, 0 }) }").await,
+        vec![0]
+    );
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'a\")").await,
+        vec![0, 2, 3, 0]
+    );
+    feed(&rpc, "`a");
+    assert_eq!(cursor(&rpc).await, (2, 2));
+
+    // A file mark, in the current buffer when `bufnr` is 0.
+    exec_lua(&rpc, "btv.pos.set(\"'Q\", { 0, 4, 2, 0 })").await;
+    feed(&rpc, "gg`Q");
+    assert_eq!(cursor(&rpc).await, (4, 1));
+
+    // The visual marks, then `gv` in the same chunk: the marks land first.
+    exec_lua(
+        &rpc,
+        "btv.pos.set(\"'<\", { 0, 1, 2, 0 }) \
+         btv.pos.set(\"'>\", { 0, 3, 4, 0 }) \
+         btv.cmd('normal! gv')",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return btv.mode_str()").await.as_str(),
+        Some("v")
+    );
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get('v')").await,
+        vec![0, 1, 2, 0]
+    );
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get('.')").await,
+        vec![0, 3, 4, 0]
+    );
+}
+
+#[tokio::test]
+async fn pos_set_rejects_what_it_cannot_store() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>");
+    for (expr, pos) in [
+        ("'.", "{ 0, 1, 1, 0 }"), // the last-change mark is the editor's to write
+        ("'5", "{ 0, 1, 1, 0 }"), // numbered marks come from shada only
+        ("w0", "{ 0, 1, 1, 0 }"),
+        ("'a", "{ 0, 9, 1, 0 }"), // past the last line
+        ("'a", "{ 0, 0, 1, 0 }"),
+    ] {
+        let chunk = format!(
+            "local ok, e = pcall(btv.pos.set, \"{expr}\", {pos}) return {{ ok, tostring(e) }}"
+        );
+        let Value::Array(r) = exec_lua(&rpc, &chunk).await else {
+            panic!("expected a pair")
+        };
+        assert_eq!(
+            r[0].as_bool(),
+            Some(false),
+            "setpos({expr}, {pos}) must raise"
+        );
+        assert!(
+            r[1].as_str().unwrap_or("").contains("setpos()"),
+            "the error names the call: {r:?}"
+        );
+    }
+    assert_eq!(
+        lua_ints(&rpc, "return btv.pos.get(\"'a\")").await,
+        vec![0, 0, 0, 0]
+    );
+}

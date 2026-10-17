@@ -2577,6 +2577,27 @@ pub(crate) fn install_runtime_api(
     )?;
     let sh = shared.clone();
     btv.set(
+        "_set_mark",
+        lua.create_function(
+            move |_, (bufnr, name, line, col): (u64, String, usize, usize)| {
+                let mut chars = name.chars();
+                let (Some(name), None) = (chars.next(), chars.next()) else {
+                    return Err(mlua::Error::runtime(format!(
+                        "btv._set_mark: mark name must be one character, got {name:?}"
+                    )));
+                };
+                sh.borrow_mut().sequenced.push(Sequenced::SetMark {
+                    bufnr,
+                    name,
+                    line,
+                    col,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    let sh = shared.clone();
+    btv.set(
         "_win_set_cursor",
         lua.create_function(move |_, (win, line, col): (u64, usize, usize)| {
             sh.borrow_mut()

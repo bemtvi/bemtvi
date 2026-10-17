@@ -647,6 +647,49 @@ async fn a_failed_watch_arm_is_retried_and_recovers() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A change that lands while a watch is still being armed is not lost.
+///
+/// The server dispatches an arm and the loop actor gets to it some time later, so the
+/// re-check that runs alongside the arm (`checktime` in `sync_buffer_watches`) can run
+/// before the watch exists. A write in that gap fires no event and slips past the
+/// re-check, and the buffer kept the old text for good. Under a loaded test run that
+/// is what made `a_failed_watch_arm_is_retried_and_recovers` flaky: its own write fell
+/// into the gap of the retry's arm. `$BEMTVI_WATCH_ARM_DELAY` holds the gap open.
+#[tokio::test]
+async fn a_change_while_the_watch_is_arming_still_reloads() {
+    let _g = serial_lock().lock().await;
+
+    let path = temp_path("watch-arm-gap");
+    std::fs::write(&path, "one\ntwo\n").unwrap();
+    let key = path.to_string_lossy().into_owned();
+    // SAFETY: serial_lock keeps the other env-touching watch tests out, and the hook
+    // only ever matches this test's own path.
+    unsafe { std::env::set_var("BEMTVI_WATCH_ARM_DELAY", format!("600:{key}")) };
+    let (rpc, _incoming) = start(Some(key)).await;
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+
+    // The startup arm (and its re-check) has gone out; the actor is still holding it.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+    let mut got = vec![];
+    for _ in 0..60 {
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        got = lines(&rpc).await;
+        if got == vec!["one", "two", "three"] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    unsafe { std::env::remove_var("BEMTVI_WATCH_ARM_DELAY") };
+    assert_eq!(
+        got,
+        vec!["one", "two", "three"],
+        "a write that landed before the watch was up must still autoreload"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 /// A permanently unwatchable file exhausts the retry budget rather than trying forever,
 /// and says so — with the watch down, nothing autoreloads that file and nothing warns
 /// when it changes underneath the buffer, so leaving it looking watched would be the

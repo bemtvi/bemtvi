@@ -3403,6 +3403,22 @@ fn watch_retry_base_ms() -> u64 {
         .unwrap_or(100)
 }
 
+/// A test hook that holds the loop actor before it arms the internal watch on one path:
+/// `$BEMTVI_WATCH_ARM_DELAY` = `<ms>:<path>`. An arm is never instant — the server
+/// dispatches it and the actor gets to it some time later — and under load that gap is
+/// wide enough for an external write to fall into. This widens it on demand, so the
+/// test that guards it fails every time rather than once in a few full-suite runs.
+/// Keyed to one exact path so a parallel test's watches are never slowed.
+#[cfg(feature = "native")]
+pub(crate) fn watch_arm_delay(path: &str) -> Option<std::time::Duration> {
+    let spec = std::env::var("BEMTVI_WATCH_ARM_DELAY").ok()?;
+    let (ms, want) = spec.split_once(':')?;
+    if want != path {
+        return None;
+    }
+    ms.parse().ok().map(std::time::Duration::from_millis)
+}
+
 /// Whether `event` is a per-buffer watch arm-retry wake (vs. the fixed-id editor timers
 /// or a real Lua timer). See [`WATCH_RETRY_TIMER_BASE`] for why `>=` classifies it.
 #[cfg(feature = "native")]

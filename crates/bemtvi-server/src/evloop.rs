@@ -676,6 +676,9 @@ async fn run_evloop(
                 // BASE) wants coalesced `{kind, paths}` batches, so it arms the
                 // debouncing variant.
                 let armed = if id >= crate::INTERNAL_WATCH_BASE {
+                    if let Some(delay) = crate::watch_arm_delay(&path) {
+                        tokio::time::sleep(delay).await;
+                    }
                     start_fs_watch(id, &path, recursive, event_tx.clone())
                 } else {
                     start_fs_watch_coalesced(id, &path, recursive, event_tx.clone())
@@ -683,6 +686,19 @@ async fn run_evloop(
                 match armed {
                     Ok(watcher) => {
                         fs_watchers.insert(id, watcher);
+                        // An internal watch reports that it is up, as one change event.
+                        // The server re-checks the file when it dispatches the arm, but
+                        // that runs before this point, and a write between the two
+                        // fires nothing. The consumer re-stats on any event, so this
+                        // costs one stat and catches whatever landed in the gap.
+                        if id >= crate::INTERNAL_WATCH_BASE {
+                            let _ = event_tx.send(LoopEvent::FsEvent {
+                                id,
+                                error: None,
+                                kind: None,
+                                paths: Vec::new(),
+                            });
+                        }
                     }
                     Err(e) => {
                         // The watch couldn't arm (path missing, watch limit). The

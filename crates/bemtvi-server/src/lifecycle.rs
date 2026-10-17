@@ -1365,6 +1365,11 @@ impl EditHost {
                 // *change* (open, reload, save), the check is one stat, and it queues a
                 // reload only when the file really did move — after which the key
                 // matches and the next pass arms nothing.
+                //
+                // This check runs at dispatch, before the actor has the watch up, so a
+                // write between the two would still slip by. The actor closes that gap:
+                // it reports a successful arm as one change event, which re-checks once
+                // more with the watch live.
                 self.editor.checktime_buffer(*id);
             }
         }

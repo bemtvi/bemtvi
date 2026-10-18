@@ -1,8 +1,137 @@
 # bemtvi
 
-bemtvi (pronounced ben-tee-vee) is a modal, vim-style editor **100% vibe-coded**
-using Claude Code — modal editing, Lua plugins, treesitter highlighting, and LSP,
+bemtvi (pronounced ben-tee-vee) is a modal, vim-style editor architected from
+scratch — modal editing, Lua plugins, treesitter highlighting, and LSP,
 built on a fully async, client-server design.
+
+
+## Why another editor
+
+You may be thinking: why another editor instead of using or improving neovim?
+
+Neovim is amazing. It was my main editor for a while, and bemtvi owes it a lot:
+the client-server split, Lua as the config language, built-in treesitter and
+LSP. But some of neovim's limits come from decisions built into its core, and
+rewriting parts of it in faster C or Rust won't remove them. I tried working
+around them. In the end, fixing them meant starting again from a clean slate.
+
+### 1. Lua runs inside the frame
+
+The problem isn't that Lua is slow. LuaJIT is fast. The problem is *where*
+neovim runs it. Plugin Lua runs on the editor's main loop and reads and changes
+live editor state directly. Some of it runs *during* redraw: decoration
+providers and `%!` statusline expressions are called while the screen is being
+drawn. Some of it blocks: `vim.wait` pumps the event loop, `getcharstr()` waits
+for a key. So one slow plugin, or one big decoration pass, delays every frame
+and every keystroke. Neovim can't change this without breaking the plugins that
+depend on it.
+
+bemtvi turns this around:
+
+- **No Lua runs at frame time.** The server owns every UI surface (picker,
+  completion menu, statusline, docks, floats) and native Rust code draws them.
+  Plugins are async *providers*: they supply data and behavior, and never draw.
+- **Reads are snapshots and writes are queued effects.** Lua never changes the
+  editor in the middle of an operation. Its changes are applied at a settle
+  point, and a late async reply is dropped by a generation token instead of
+  overwriting newer state.
+- **The UI runs on its own thread.** It never waits for the editor, and the
+  editor never waits for it.
+
+### 2. Remote editing that doesn't lag
+
+Neovim doesn't separate its core from **file and process I/O**. Over the network you have two options. Run neovim on the remote
+machine (with ssh or `--remote-ui`), and every keystroke makes a round trip.
+Or edit locally over `scp://`/sshfs, and you lose the remote's LSP, terminals,
+and project tools. A VS Code Remote-style experience has been a top community
+request for years ([neovim#21635](https://github.com/neovim/neovim/issues/21635));
+the proposed route is still a remote UI, because editing locally against a
+remote host would need a VFS layer the core doesn't have.
+
+bemtvi has an **edit-host / daemon split**. The editor, your config, and your
+plugins run locally, so typing is always instant. `bemtvi --daemon` on the
+remote machine provides the file system, processes, terminals, LSP servers, and
+file watching. `:connect user@host` starts that daemon over ssh. A dropped link
+reconnects without losing the session. The web build uses the same split from a
+browser tab. Remote is a first-class target: anything that works locally works
+over the wire.
+
+### 3. A UI model built for rich interfaces
+
+Vim was designed for a grid of terminal cells. Neovim has added a lot since
+then: floating windows, extmarks, virtual text, and `ext_*` UI events. But the
+basic unit a plugin works with is still *a buffer in a window*. Every picker,
+popup menu, file tree, and dashboard is a scratch buffer in a float, with
+borders, padding, and icons drawn out of text and highlight groups, and plugins
+each re-solve the same layout, focus, and teardown problems.
+
+In bemtvi, rich UI is part of the editor. The picker (with preview), completion
+menu, statusline segments, tree docks, and `btv.ui.input`/`select`/`confirm`
+are server-owned widgets. Clients receive a semantic `View` (not a raw cell
+grid), so a terminal and a native GPU GUI can each render the same frame well.
+
+### 4. No historical baggage
+
+Neovim has removed a lot of vim's legacy, but its compatibility with vim is
+deliberate: Vimscript, the huge `vim.fn` inventory, vim regex, and decades of
+option semantics all have to keep working, because users and plugins rely on
+them. That's a reasonable commitment for neovim. It also limits what neovim can
+change.
+
+bemtvi keeps vim's *keystrokes* (modes, motions, operators, ex-commands, and
+options behave the way your fingers expect) and drops everything else.
+There's no Vimscript. Config and plugins use one designed Lua API, `btv.*`,
+with a small list of `vim.*` aliases for muscle memory. Search uses PCRE syntax
+by default, and vim-flavored regex is opt-in.
+
+### 5. Windows is a first-class platform
+
+Neovim officially supports Windows, but the ecosystem assumes a Unix machine.
+Plugins shell out to POSIX tools and quoting rules. Grammar installers expect a
+C compiler on `PATH`. Many features silently depend on `git`, `make`, `rg`, or
+`sh`. Everything *can* work on Windows, but getting there takes a pile of
+workarounds.
+
+bemtvi avoids depending on external tools in the first place:
+
+- Git integration uses a pure-Rust git library, so no `git` binary is needed.
+- `:TSInstall` builds grammars with a pinned, checksum-verified Zig toolchain
+  that bemtvi downloads itself, so no C compiler is needed.
+- `:terminal` runs on ConPTY.
+- File watching is native.
+- There's a native GPU GUI client, so you don't depend on the terminal
+  emulator at all.
+
+The same binary and the same config behave the same way on Windows, macOS, and
+Linux.
+
+### 6. A plugin ecosystem built for AI agents
+
+Neovim's plugin ecosystem is excellent, but it has limits of its own. Writing a
+good neovim plugin is hard: you have to know the API, the `vim.fn` inventory,
+the event model, and a lot of undocumented edge cases.
+Plugin authors often don't shy away 
+from breaking compatibility, so a config that worked last month can break after an
+update, and keeping a setup working takes regular effort.
+
+bemtvi plugins are designed so that an AI agent can write them. There's one
+extensive, documented API (`btv.*`). [The book](https://bemtvi.github.io/bemtvi/)
+documents every function, and [`examples/`](examples) has over a hundred
+runnable, tested examples. Plugins test themselves with the built-in `btv.test`
+runner (`bemtvi --test-plugin <dir>`), so an agent can check that what it wrote
+actually works. With all of that, any AI agent can build almost any plugin you
+might want in a couple of hours, made 100% according to your needs.
+
+### Conclusion
+
+I'm very grateful to neovim. It's an awesome piece of software, and bemtvi
+wouldn't exist without the path it opened. But these are structural issues, not
+missing features. Sometimes the only real fix is a clean slate, built with
+everything neovim taught us.
+
+---
+
+## What is it
 
 bemtvi is a headless, asynchronous editor **server** with thin UI **clients**
 talking over msgpack-RPC. The editor logic lives in one place; the
@@ -553,26 +682,25 @@ as a whole one. You can enumerate exactly what a given config trips at runtime.
 I started this project on a whim just to test the limits of current day vibe-coding.
 I wanted to see how far I could go, but I didn't expect the answer to turn out to be
 as far as I wanted. I got so excited I decided to speed run it for enough features
-to use it as my daily driver. I love neovim and I use(d?) it as my daily driver, so
+to use it as my daily driver. I love neovim and I used it as my daily driver, so
 bemtvi is heavily inspired by it and my favorite plugins.
 
-I've been using Claude Code with Opus 4.8 on the high effort most of the time and the
-experience has been pretty frustration free. Claude only ever got stuck in one specific
-feature, but I switched to max effort and asked it to refine the plan, then it
-managed to advance. Of course Claude didn't do all of it by itself, I'm a pretty
+I've been using mainly Claude Code and the
+experience has been pretty frustration free. Of course Claude didn't do all of it by itself, I'm a pretty
 seasoned software engineer, so I constantly steered it in the "right" direction and
 I also made all architecture decisions, although with Claude's help. I also didn't
 review the code, apart from skimming it while it was being generated as a coarse
 sanity check, and interrupting and correcting Claude on egregious mistakes. At times
 I had 4 Claude Code instances implementing 4 features in parallel, thankfully Claude
-doesn't care about conflicts. lol. I had to signup for the Max 20x plan and almost
-maxed out the weekly limit, that's how fast I was going.
+doesn't care about conflicts. lol. It's frankly insane how fast I could get to a
+fully working editor.
 
 I intend to keep this code-base entirely 100% free of human written code. Create an
 issue if you have feature requests or bug reports. Claude doesn't care about the quality of
 your message, so write whatever you want. lol
 
-I won't accept PRs, only feature requests and bug reports by text description.
+I won't accept PRs, only feature requests and bug reports by text description. As
+I can have a better quality control this way.
 
 ---
 

@@ -1458,6 +1458,51 @@ async fn built_in_recommended_pins_first_party_plugins_to_a_release() {
         Some(""),
         "every first-party plugin in the built-in set must be pinned to a release tag"
     );
+
+    // ...and the pin survives into the plugins.lua the user is handed.
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_default_pins").await;
+    exec_lua(
+        &rpc,
+        "btv.plugins._persist_recommended(btv.plugins._default_recommended)",
+    )
+    .await;
+    let file = cfg.join("lua").join("plugins.lua");
+    let mut written = String::new();
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            written = text;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let first_party: Vec<&str> = written
+        .lines()
+        .filter(|l| l.trim_start().starts_with("{ \"bemtvi/"))
+        .collect();
+    assert_eq!(
+        first_party.len(),
+        n_first_party(&rpc).await,
+        "got: {written:?}"
+    );
+    for line in first_party {
+        assert!(
+            line.contains("tag = \"v"),
+            "a first-party spec was written out without its pin: {line}"
+        );
+    }
+}
+
+async fn n_first_party(rpc: &Rpc) -> usize {
+    let n = exec_lua(
+        rpc,
+        "local n = 0\n\
+         for _, s in ipairs(btv.plugins._default_recommended) do\n\
+           if s[1]:match('^bemtvi/') then n = n + 1 end\n\
+         end\n\
+         return n",
+    )
+    .await;
+    n.as_u64().expect("count") as usize
 }
 
 // The default is OFF unless opted in: the headless harness (ServerInit::default,

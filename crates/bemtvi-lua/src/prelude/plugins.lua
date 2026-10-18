@@ -2204,6 +2204,11 @@ M.RECOMMENDED_DOC_URL = "https://bemtvi.github.io/bemtvi/guide/recommended-plugi
 -- any plugin skips the welcome. Tests never opt in, so it can't disrupt the headless
 -- suites. String-form hooks only (the chosen subset is serialized into plugins.lua).
 --
+-- Each of bemtvi's own plugins is pinned to its release tag, so a fresh setup installs
+-- the version this core was tested against rather than whatever its default branch
+-- holds that day. The pin goes into the user's `plugins.lua` with the rest of the spec,
+-- and `:PluginUpdate` leaves it alone until the user moves it.
+--
 -- A spec carries `config` only when the plugin needs one: the plugins that ship a
 -- `plugin/` file (help, snippets, editorconfig, markdown-preview) register themselves
 -- off the runtimepath, so a `setup()` line here would only repeat what they already do.
@@ -2213,61 +2218,73 @@ M.RECOMMENDED_DOC_URL = "https://bemtvi.github.io/bemtvi/guide/recommended-plugi
 M._default_recommended = {
   {
     "bemtvi/catppuccin-bemtvi",
+    tag = "v1.0.0",
     name = "catppuccin",
     desc = "Soothing pastel colorscheme",
     config = [[ vim.cmd("colorscheme catppuccin") ]],
   },
   {
     "bemtvi/bemtvi-line",
+    tag = "v1.0.0",
     desc = "Configurable statusline (lualine)",
     config = [[ require("bemtvi-line").setup() ]],
   },
   {
     "bemtvi/bemtvi-tree",
+    tag = "v1.0.0",
     desc = "File explorer sidebar (<leader>e)",
     keys = { "<leader>e" },
     config = [[ require("bemtvi-tree").setup() ]],
   },
   {
     "bemtvi/bemtvi-keys-helper",
+    tag = "v1.0.0",
     desc = "Popup of available keybindings as you type (which-key)",
     config = [[ require("bemtvi-keys-helper").setup() ]],
   },
   {
     "bemtvi/bemtvi-help",
+    tag = "v1.0.0",
     desc = "Vim-style :help, with the plugins' own docs",
   },
   {
     "bemtvi/bemtvi-lspconfig",
+    tag = "v1.0.0",
     desc = "Ready-made configs for the built-in LSP client",
     config = [[ require("bemtvi-lspconfig").setup() ]],
   },
   {
     "bemtvi/bemtvi-efmls-configs",
+    tag = "v1.0.0",
     desc = "Linters & formatters over efm-langserver",
     config = [[ require("bemtvi-efmls-configs").setup({ languages = "*defaults" }) ]],
   },
   {
     "bemtvi/bemtvi-snippets",
+    tag = "v1.0.0",
     desc = "Snippet engine + the friendly-snippets collection",
     dependencies = { "rafamadriz/friendly-snippets" },
   },
   {
     "bemtvi/bemtvi-editorconfig",
+    tag = "v1.0.0",
     desc = "Apply a project's .editorconfig to its buffers",
   },
   {
     "bemtvi/bemtvi-diff",
+    tag = "v1.0.0",
     desc = "Diff & merge-conflict visualizer (:DiffGit)",
     cmd = { "DiffGit", "DiffConflict" },
     config = [[ require("bemtvi-diff").setup({}) ]],
   },
   {
     "bemtvi/bemtvi-markdown-preview",
+    tag = "v1.0.0",
     desc = "Live markdown preview in your browser (:MarkdownPreview)",
   },
   {
     "bemtvi/bemtvi-dap",
+    tag = "v1.0.0",
     desc = "Debugger front end — breakpoints, stepping, REPL (<F5>, <leader>db)",
     keys = { "<F5>", "<leader>db" },
     cmd = { "DapContinue", "DapToggleBreakpoint" },

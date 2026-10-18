@@ -31,6 +31,11 @@ Whatever you accept is written to a managed `lua/plugins.lua` next to your `init
 as ordinary [`btv.plugins`](plugin-authoring.md) specs. From then on it is **your** config:
 edit, extend, or delete any of it by hand.
 
+Each bemtvi plugin in the set is pinned to a release (`tag = "v1.0.0"`), so a fresh setup
+gets the version this editor was tested against, not whatever the plugin's default branch
+holds that day. `:PluginUpdate` leaves a pinned plugin where it is. To move to a newer
+release, change its `tag`. To follow the default branch instead, delete the `tag` line.
+
 ## The set
 
 Every one of these is a first-party plugin built on the public `btv.*` API — no

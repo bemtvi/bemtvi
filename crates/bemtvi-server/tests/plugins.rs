@@ -1435,6 +1435,31 @@ async fn built_in_default_recommended_offers_when_config_registers_none() {
     .await;
 }
 
+// The built-in set installs RELEASES of bemtvi's own plugins, not whatever their
+// default branch holds today: a fresh setup gets the version the core was checked
+// against, and the pin is written into the user's plugins.lua with the rest of the
+// spec. (Third-party dependencies such as friendly-snippets are not ours to tag.)
+#[tokio::test]
+async fn built_in_recommended_pins_first_party_plugins_to_a_release() {
+    let (rpc, _i) = start().await;
+    let unpinned = exec_lua(
+        &rpc,
+        "local bad = {}\n\
+         for _, s in ipairs(btv.plugins._default_recommended) do\n\
+           if s[1]:match('^bemtvi/') and not (type(s.tag) == 'string' and s.tag:match('^v%d')) then\n\
+             bad[#bad + 1] = s[1]\n\
+           end\n\
+         end\n\
+         return table.concat(bad, ', ')",
+    )
+    .await;
+    assert_eq!(
+        unpinned.as_str(),
+        Some(""),
+        "every first-party plugin in the built-in set must be pinned to a release tag"
+    );
+}
+
 // The default is OFF unless opted in: the headless harness (ServerInit::default,
 // offer_default_recommended=false) keeps an empty recommended set, so no test ever
 // trips the first-run welcome.

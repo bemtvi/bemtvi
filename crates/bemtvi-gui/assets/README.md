@@ -1,49 +1,40 @@
 # bemtvi-gui assets
 
-Brand assets for the native GUI client. The **single source of truth is
-`bemtvi.svg`** — still the old "NX" monogram on a dark rounded square (the
-artwork has not been redrawn for the bemtvi name yet). Everything else is
-derived from it, by platform:
+Brand assets for the native GUI client. The app icon is a bem-te-vi in **pixel
+art**. The hand-drawn sources are the files every other size comes from:
 
-| File            | Platform | Produced by | When |
-|-----------------|----------|-------------|------|
-| `bemtvi.svg`     | source   | hand-edited | — |
-| `bemtvi.desktop` | Linux    | hand-edited | — |
-| `bemtvi.png`     | Linux (AppImage) | `rsvg-convert` at package time | CI |
-| `bemtvi.icns`    | macOS (.app)     | `rsvg-convert` + `iconutil` at package time | CI |
-| `bemtvi.ico`     | Windows (.exe)   | **committed binary** (see below) | manual |
+| File                   | Role | Produced by |
+|------------------------|------|-------------|
+| `icon16.png`, `icon24.png`, `icon32.png` | sources | hand-drawn |
+| `icons/bemtvi-<N>.png` | 16, 24, 32, 48, 64 … 1024 | `gen-icons.py` |
+| `bemtvi.ico`           | Windows (.exe), embedded by `build.rs` | `gen-icons.py` |
+| `bemtvi.desktop`       | Linux desktop entry | hand-edited |
 
-The Linux PNG and macOS `.icns` are generated fresh from the SVG during the
-release build (`.github/workflows/build.yml`), so they are not committed. The
-Windows `.ico` **is** committed, because it is embedded by `build.rs` at compile
-time (including local `cargo build` on Windows) and CI runners have no SVG
-rasterizer on Windows.
+Each larger size is a **nearest-neighbour integer upscale** of the largest
+source that divides it: 48 is `icon24.png` ×2, and 64 … 1024 are `icon32.png`
+×2 … ×32. A filtered resize would blur the pixel edges, and so would a
+fractional scale. The scaled art is centred on its canvas: `icon24.png` draws
+in its top-left 23×23, so its ×2 lands 1px right and 1px down in the 48. The
+sizes below 48 are separate drawings because a downscale
+cannot keep pixel art legible. `gen-icons.py` copies every `icon<N>.png` as is,
+so a new hand-drawn size only needs the file (plus an entry in `UPSCALES` /
+`ICO_SIZES` for any size it newly makes reachable). The 24 and 48px sizes go only
+into the `.ico`, since macOS iconsets have no slot for them.
 
-## Regenerating `bemtvi.ico` after editing `bemtvi.svg`
+Every derived file is committed. CI only copies them:
 
-The `.ico` is the only derived asset that can drift from the SVG. Regenerate it
-whenever the brand changes. With `rsvg-convert` (librsvg) + Python 3:
+- **Linux AppImage**: `icons/bemtvi-256.png` (`.github/workflows/build.yml`).
+- **macOS `.app`**: `iconutil` packs the `.icns` from `icons/` at package time.
+- **Windows `.exe`**: `build.rs` embeds `bemtvi.ico` at compile time, including
+  a local `cargo build` on Windows.
+
+## Regenerating after the art changes
+
+Edit the `icon<N>.png` sources (the layered working files are
+`docs/icon.xcf` and `docs/icon16.xcf`), then run (needs Pillow):
 
 ```sh
-cd crates/bemtvi-gui/assets
-tmp=$(mktemp -d)
-for s in 16 24 32 48 64 128 256; do
-  rsvg-convert -w "$s" -h "$s" bemtvi.svg -o "$tmp/$s.png"
-done
-python3 - "$tmp" <<'PY'
-import struct, sys
-tmp = sys.argv[1]
-sizes = [16, 24, 32, 48, 64, 128, 256]
-imgs = [(s, open(f"{tmp}/{s}.png", "rb").read()) for s in sizes]
-off = 6 + 16 * len(imgs)
-entries = data = b""
-for s, png in imgs:
-    d = 0 if s >= 256 else s  # 0 encodes 256 in the ICO dir entry
-    entries += struct.pack("<BBBBHHII", d, d, 0, 0, 1, 32, len(png), off)
-    data += png; off += len(png)
-open("bemtvi.ico", "wb").write(struct.pack("<HHH", 0, 1, len(imgs)) + entries + data)
-PY
+python3 crates/bemtvi-gui/assets/gen-icons.py
 ```
 
-(On macOS without `rsvg-convert`, `qlmanage -t -s 1024 -o "$tmp" bemtvi.svg` then
-`sips -z $s $s` per size is a workable substitute for the per-size renders.)
+It rewrites `icons/` and `bemtvi.ico`. Commit them with the source change.

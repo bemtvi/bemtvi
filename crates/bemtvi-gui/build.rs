@@ -1,11 +1,11 @@
 //! Build script for the GUI client. On Windows it embeds the app icon (and the
 //! version/product info winresource derives from Cargo) into `bemtvi-gui.exe`, so
-//! Explorer, the taskbar, and Alt-Tab show the BTV mark instead of the generic
+//! Explorer, the taskbar, and Alt-Tab show the bemtvi icon instead of the generic
 //! executable icon. On every other platform this is a no-op.
 //!
-//! The icon is the same `assets/bemtvi.ico` brand mark as the Linux AppImage
-//! (`assets/bemtvi.svg` → `bemtvi.png`) and the macOS `.icns`; regenerate the
-//! `.ico` from the SVG if the brand changes (see `assets/README.md`).
+//! `assets/bemtvi.ico` is generated from the same pixel-art sources as the Linux
+//! AppImage and macOS `.icns` icons (`assets/icons/`); rerun `assets/gen-icons.py`
+//! after the art changes (see `assets/README.md`).
 
 fn main() {
     // `#[cfg(windows)]` here is the *host* (build scripts compile for the host).

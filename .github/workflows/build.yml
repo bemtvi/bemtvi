@@ -102,8 +102,7 @@ jobs:
             libgtk-4-dev libadwaita-1-dev \
             libwayland-dev libxkbcommon-dev libxcb1-dev \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            librsvg2-bin  # rsvg-convert: rasterizes the app icon for the AppImage
+            libgl1-mesa-dev libegl1-mesa-dev
 
       # Zig is the cross-linker cargo-zigbuild drives to pin an ancient glibc
       # floor (see the Linux build step). Every Linux build — TUI and GUI — goes
@@ -252,26 +251,24 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "target/${{ matrix.target }}/release/bemtvi-gui" "$APP/Contents/MacOS/bemtvi-gui"
 
-          # Build the .icns app icon from the same source SVG as the AppImage.
-          # macOS does not mask app icons (unlike iOS), so the SVG's own rounded
-          # square is the final shape. rsvg-convert (librsvg) renders each grid
-          # size; iconutil packs the .iconset. Generated before codesign so it is
-          # sealed into the bundle.
-          brew install --quiet librsvg
-          SVG=crates/bemtvi-gui/assets/bemtvi.svg
+          # Build the .icns app icon from the committed pixel-art PNGs (see
+          # crates/bemtvi-gui/assets/README.md). macOS does not mask app icons
+          # (unlike iOS), so the art is the final shape. iconutil packs the
+          # .iconset. Generated before codesign so it is sealed into the bundle.
+          ICONS=crates/bemtvi-gui/assets/icons
           ICONSET="$RUNNER_TEMP/bemtvi.iconset"
           mkdir -p "$ICONSET"
-          render() { rsvg-convert -w "$1" -h "$1" "$SVG" -o "$ICONSET/$2"; }
-          render 16   icon_16x16.png
-          render 32   icon_16x16@2x.png
-          render 32   icon_32x32.png
-          render 64   icon_32x32@2x.png
-          render 128  icon_128x128.png
-          render 256  icon_128x128@2x.png
-          render 256  icon_256x256.png
-          render 512  icon_256x256@2x.png
-          render 512  icon_512x512.png
-          render 1024 icon_512x512@2x.png
+          put() { cp "$ICONS/bemtvi-$1.png" "$ICONSET/$2"; }
+          put 16   icon_16x16.png
+          put 32   icon_16x16@2x.png
+          put 32   icon_32x32.png
+          put 64   icon_32x32@2x.png
+          put 128  icon_128x128.png
+          put 256  icon_128x128@2x.png
+          put 256  icon_256x256.png
+          put 512  icon_256x256@2x.png
+          put 512  icon_512x512.png
+          put 1024 icon_512x512@2x.png
           iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/bemtvi.icns"
 
           cat > "$APP/Contents/Info.plist" <<PLIST
@@ -405,9 +402,9 @@ jobs:
           chmod +x linuxdeploy-plugin-gtk.sh
           export DEPLOY_GTK_VERSION=4
 
-          # Rasterize the source SVG to the 256×256 PNG linuxdeploy installs into
-          # the AppDir hicolor theme (stem must match the .desktop Icon= key).
-          rsvg-convert -w 256 -h 256 crates/bemtvi-gui/assets/bemtvi.svg -o bemtvi.png
+          # The 256×256 PNG linuxdeploy installs into the AppDir hicolor theme
+          # (stem must match the .desktop Icon= key).
+          cp crates/bemtvi-gui/assets/icons/bemtvi-256.png bemtvi.png
 
           mkdir -p dist
           OUTPUT="dist/$APPIMAGE_ASSET" VERSION="$PKG_VERSION" \

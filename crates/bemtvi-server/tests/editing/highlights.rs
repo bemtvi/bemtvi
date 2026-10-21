@@ -704,8 +704,8 @@ async fn builtin_bemtvi_colorscheme_loads_with_no_runtime_file() {
         ("fg", "#e2e8e8"),
         ("muted", "#8d929d"),
         ("red", "#f08a7e"),
-        // `green` is the string hue, which this scheme draws in cornflower.
-        ("green", "#83a7ea"),
+        // `green` is the "added" hue: the scheme's green, though its strings are blue.
+        ("green", "#b6d98b"),
         ("yellow", "#f4e472"),
         // `blue` is the function hue, which this scheme draws in orange.
         ("blue", "#fb8c3c"),
@@ -1160,6 +1160,39 @@ async fn hl_palette_follows_the_active_scheme_and_its_links() {
     let _ = redraw_after(&rpc, &mut incoming, ":colorscheme neutral<CR>").await;
     assert_eq!(palette_slot(&rpc, "bg").await, "#282c34");
     assert_eq!(palette_slot(&rpc, "green").await, "#98c379");
+}
+
+#[tokio::test]
+async fn hl_palette_green_is_the_added_colour_before_the_string_colour() {
+    // A plugin asks for `green` to mark something added (a new file, an insert). A
+    // theme that colours its strings some other hue still has an "added" green, so
+    // the slot reads `Added` first and falls back to `String` only without one.
+    let dir = temp_dir("hl_palette_green_added");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("bluestrings.lua"),
+        "vim.api.nvim_set_hl(0, 'String', { fg = '#6aa6e6' })\n\
+         vim.api.nvim_set_hl(0, 'Added',  { fg = '#a6e3a1' })\n",
+    )
+    .expect("write colorscheme");
+    std::fs::write(
+        dir.join("colors").join("noadded.lua"),
+        "vim.api.nvim_set_hl(0, 'String', { fg = '#6aa6e6' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bluestrings<CR>").await;
+    assert_eq!(
+        palette_slot(&rpc, "green").await,
+        "#a6e3a1",
+        "the added colour wins over a non-green string colour"
+    );
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme noadded<CR>").await;
+    assert_eq!(
+        palette_slot(&rpc, "green").await,
+        "#6aa6e6",
+        "with no `Added`, the slot falls back to the string colour"
+    );
 }
 
 #[tokio::test]

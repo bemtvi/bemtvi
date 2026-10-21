@@ -1505,7 +1505,10 @@ local PALETTE_SLOTS = {
     { { "DiagnosticError", "fg" }, { "ErrorMsg", "fg" }, { "Exception", "fg" } },
     "#f08a7e",
   },
-  { "green", { { "String", "fg" }, { "DiagnosticOk", "fg" } }, "#83a7ea" },
+  -- `green` marks something added (a new file, insert mode), so it reads the "added"
+  -- diff colour first: a theme can draw its strings in another hue (`bemtvi`'s are
+  -- blue) and still have a green for "added".
+  { "green", { { "Added", "fg" }, { "String", "fg" }, { "DiagnosticOk", "fg" } }, "#b6d98b" },
   { "yellow", { { "Type", "fg" }, { "DiagnosticWarn", "fg" }, { "WarningMsg", "fg" } }, "#f4e472" },
   { "blue", { { "Function", "fg" }, { "Directory", "fg" }, { "Title", "fg" } }, "#fb8c3c" },
   { "purple", { { "Keyword", "fg" }, { "Statement", "fg" }, { "PreProc", "fg" } }, "#5fa86c" },
@@ -1523,7 +1526,7 @@ local PALETTE_SLOTS = {
 -- that hue, most specific first, falling back to the built-in `bemtvi` colorscheme's
 -- value when the active theme defines none of them — the editor's default look, so a
 -- bare session still lands on the editor's own colors. The slot names are the
--- *roles* (`purple` is the keyword hue, `green` the string hue), whatever colour the
+-- *roles* (`purple` is the keyword hue, `green` the "added" hue), whatever colour the
 -- running theme gives them:
 --
 -- ```
@@ -1537,7 +1540,7 @@ local PALETTE_SLOTS = {
 --   muted          Comment.fg -> LineNr.fg -> NonText.fg   (guides, dimmed entries)
 -- ACCENTS
 --   red            DiagnosticError.fg -> ErrorMsg.fg -> Exception.fg
---   green          String.fg -> DiagnosticOk.fg
+--   green          Added.fg -> String.fg -> DiagnosticOk.fg
 --   yellow         Type.fg -> DiagnosticWarn.fg -> WarningMsg.fg
 --   blue           Function.fg -> Directory.fg -> Title.fg
 --   purple         Keyword.fg -> Statement.fg -> PreProc.fg

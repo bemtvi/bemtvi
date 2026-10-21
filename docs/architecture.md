@@ -504,6 +504,12 @@ forked below them. Node timestamps are **monotonic** seconds since the editor's 
 base, not wall clock, so ages are rendered relative (`"3 minutes ago"`) rather than as
 the clock time vim prints for older entries.
 
+The *steps* are not vim's: an insert session commits a node at each word end, line
+break, typing/deleting switch, pause, or cursor move (`Editor::before_typed_edit` in
+`editor/undo.rs`), while a paste, a mapping's output and a replay stay one node. The
+server brackets mapping output with `begin_undo_atomic`/`end_undo_atomic`, since only
+it knows which keys a mapping produced. See [Undo steps](features/undo.md).
+
 ---
 
 ## Buffers

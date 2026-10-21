@@ -2,8 +2,10 @@
 
 *2026-10-21*
 
-Status: **planned**. First of two plans: the non-modal (GUI/web-only) mode
-follows this one and depends on it.
+Status: **done**. All four phases landed (`22005f8c`, `bb30fa6e`, `27433bc4`,
+and the docs commit). See [Outcome](#outcome) for where reality differed from
+the sketch. First of two plans: the non-modal (GUI/web-only) mode follows this
+one and depends on it.
 
 ## The gap
 
@@ -171,3 +173,29 @@ Cases to keep in mind:
   non-modal mode; it is a separate change and belongs to that plan.
 - Ctrl-Z / Ctrl-Shift-Z bindings. They belong to the non-modal plan's key
   layout.
+
+## Outcome
+
+- **No `undo_atomic` counter for replays.** Dot-repeat, macros, `:normal`, `:g`
+  and paste spans are recognised from flags the editor already had
+  (`replaying_change`, `macro_executing`, `normal_depth`, `in_global`,
+  `paste_active`). The counter exists only for mapping spans (Phase 3).
+- **Mapping spans break lazily.** The span's first edit closes the typing step
+  before it, not the span's opening, so a mapping that changes nothing doesn't
+  split a word. Runs of untyped fed keys are spans too; typed feeds (`t:feed`)
+  are not.
+- **Register inserts are steps of their own**, like a paste: `<C-r>{reg}`,
+  `<C-r><C-w>` and `<C-r>=` all go through `insert_text_session`, which owns
+  the before/after hooks.
+- **Three bugs predating this work, fixed along the way.**
+  - An insert's `<Esc>` closed the step a `:g` or ranged `:normal` batch held
+    open, so those undid one line at a time (`undo_batch_depth`).
+  - Typing over a snippet placeholder joined the expansion's step, so `u`
+    removed the whole snippet (`begin_replacing_step`).
+  - The wasm edit host never stamped `now_ms`.
+- **Perf.** A commit snapshots the extmark store. With 5000 marks a word-end
+  commit costs under 2ms. The same guard shows an existing cost of ~30ms per
+  `<BS>` or separator keystroke in a mark-heavy buffer, with no undo involved.
+  That is not addressed here.
+- **Not done:** the note in the `bemtvi-from-neovim` skill. It lives in the
+  separate `bemtvi-plugin-skills` repo.

@@ -59,6 +59,9 @@ pub use session::{
 };
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
+// The block-element geometry (`▀`, `█`, …), drawn as rectangles rather than glyphs, so
+// the Tier-1 `blocks` test can check it without a GPU.
+pub use render::{block_element_rects, split_block_elements};
 pub use render::{
     inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay, split_at_char,
     virt_inline_shift, with_preedit, Seg, DEFAULT_BG, DEFAULT_ERROR_MSG, DEFAULT_FG,

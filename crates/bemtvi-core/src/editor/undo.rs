@@ -959,20 +959,20 @@ impl Editor {
     /// Restore the current buffer to `snap` (the state numbered `seq`): swap in the
     /// text, cursor, extmarks and marks, and recompute `modified`.
     fn restore_snapshot(&mut self, mut snap: Snapshot, seq: u64) {
-        // Decoration-provider marks (`btv.decor`) are ephemeral viewport state —
-        // republished off-tick on every viewport/edit change — not document history, so
-        // undo must not swap them out. Move the LIVE marks for each ephemeral namespace
-        // into the snapshot store we're about to install (below), *before* `mark_resync`
-        // clears the live store. Without this, undoing to a state captured before a
-        // provider first ran — notably the root node, snapshotted at buffer load — wipes
-        // the live marks for one frame until the re-dispatch republishes them: a visible
-        // flash that the user only sees on the first undo back to that root state.
-        let ephemeral = self.ephemeral_extmark_namespaces();
-        if !ephemeral.is_empty() {
-            let live = &mut self.buffer_mut().extmarks;
-            for ns in ephemeral {
-                live.move_namespace_into(ns, &mut snap.extmarks);
-            }
+        // Undo restores where marks sit, not which marks exist (see
+        // `ExtmarkStore::adopt_positions_from`): keep the LIVE store, taken before
+        // `mark_resync` clears it, and move each mark back to its position in the
+        // snapshot. Two kinds are left out of that. Decoration-provider marks
+        // (`btv.decor`) are ephemeral viewport state, republished off-tick on every
+        // viewport/edit change, so they keep their live positions. The multi-cursor
+        // marks are history: the cursor set rides back as captured, below.
+        use crate::extmark::{ANCHOR_NS, CURSOR_NS};
+        let mut skip = self.ephemeral_extmark_namespaces();
+        skip.extend([CURSOR_NS, ANCHOR_NS]);
+        let mut extmarks = std::mem::take(&mut self.buffer_mut().extmarks);
+        extmarks.adopt_positions_from(&snap.extmarks, snap.text.len(), &skip);
+        for ns in [CURSOR_NS, ANCHOR_NS] {
+            snap.extmarks.move_namespace_into(ns, &mut extmarks);
         }
         let ob = self.cur_mut();
         ob.buffer.text = snap.text;
@@ -983,10 +983,9 @@ impl Editor {
         self.cursor = snap.cursor;
         self.buffer_mut().mark_resync();
         // `mark_resync` clears extmarks and `a`–`z` marks (correct for a destructive
-        // reload); undo is not a reload, so restore all as captured with this history
-        // point — extmarks (including the multi-cursor marks), `a`–`z` marks, and the
-        // cursor ride back to where they were in the state we return to.
-        self.buffer_mut().extmarks = snap.extmarks;
+        // reload); undo is not a reload, so put them back: the extmarks merged above,
+        // and the `a`–`z` marks and the cursor as captured with this history point.
+        self.buffer_mut().extmarks = extmarks;
         self.buffer_mut().marks = snap.marks;
         let (changelist, changelistidx) = snap.changelist;
         self.buffer_mut().changelist = changelist;

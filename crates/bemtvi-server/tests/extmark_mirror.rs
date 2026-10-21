@@ -363,3 +363,82 @@ async fn an_extmark_placed_after_load_survives_the_first_undo() {
         "the mark rode back to the line it was on, rather than being wiped"
     );
 }
+
+/// Undo restores text and where marks sit, not which marks exist: the set of marks is
+/// the plugins' to manage. A mark a plugin deleted after an edit stays deleted when
+/// the edit is undone — undo used to swap in the whole mark store it snapshotted, so
+/// it came back (a cleared diagnostic, a dismissed intro screen).
+#[tokio::test]
+async fn an_extmark_deleted_after_an_edit_stays_deleted_through_undo() {
+    let (rpc, _incoming) = open("alpha\nbravo\ncharlie\n").await;
+    exec_lua(
+        &rpc,
+        r#"_G.ns = vim.api.nvim_create_namespace("undo_deleted")
+           vim.api.nvim_buf_set_extmark(0, _G.ns, 1, 0, { virt_text = { { "note" } } })"#,
+    )
+    .await;
+    // The plugin clears its mark as the user types — inside the very change that
+    // undo then reverts.
+    exec_lua(
+        &rpc,
+        "btv.on('TextChangedI', function() vim.api.nvim_buf_clear_namespace(0, _G.ns, 0, -1) end)",
+    )
+    .await;
+    feed(&rpc, "ggOtyped<Esc>");
+    let count = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {})",
+    )
+    .await;
+    assert_eq!(
+        count.as_i64(),
+        Some(0),
+        "precondition: typing cleared the mark"
+    );
+    feed(&rpc, "u");
+    let count = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {})",
+    )
+    .await;
+    assert_eq!(
+        count.as_i64(),
+        Some(0),
+        "undo must not resurrect a deleted mark"
+    );
+    // Redo neither.
+    feed(&rpc, "<C-r>");
+    let count = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {})",
+    )
+    .await;
+    assert_eq!(count.as_i64(), Some(0), "redo must not resurrect it either");
+}
+
+/// The other half: a mark a plugin placed after an edit survives undoing that edit
+/// (undo used to restore the snapshot from before it existed, wiping it).
+#[tokio::test]
+async fn an_extmark_added_after_an_edit_survives_undo() {
+    let (rpc, _incoming) = open("alpha\nbravo\ncharlie\n").await;
+    feed(&rpc, "ggO<Esc>");
+    exec_lua(
+        &rpc,
+        r#"_G.ns = vim.api.nvim_create_namespace("undo_added")
+           vim.api.nvim_buf_set_extmark(0, _G.ns, 3, 0, { virt_text = { { "note" } } })"#,
+    )
+    .await;
+    feed(&rpc, "u");
+    let lines = exec_lua(&rpc, "return btv.buf.line_count(0)").await;
+    assert_eq!(lines.as_u64(), Some(3), "the edit is undone");
+    let count = exec_lua(
+        &rpc,
+        "return #vim.api.nvim_buf_get_extmarks(0, _G.ns, 0, -1, {})",
+    )
+    .await;
+    assert_eq!(
+        count.as_i64(),
+        Some(1),
+        "undo must not wipe a mark placed after the edit"
+    );
+}

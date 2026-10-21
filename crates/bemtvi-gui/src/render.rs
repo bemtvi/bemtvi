@@ -101,6 +101,10 @@ struct CacheEntry {
     /// rest of the line off-grid (see [`Renderer::push_text`]). Empty for the common
     /// all-narrow line.
     nonsnapped: Vec<(usize, usize)>,
+    /// The line's block elements (`▀`, `▄`, `█`, …), which are drawn as rectangles
+    /// rather than glyphs (see [`block_element_rects`]): each one's cell offset from the
+    /// run origin, its character and its foreground. They are spaces in `buffer`.
+    blocks: Vec<(u16, char, u32)>,
 }
 
 /// One styled run within a shaped line: its text, foreground color, and the bold
@@ -809,6 +813,9 @@ impl Renderer {
             &mut overlay_items,
             &mut image_draws,
         );
+        // Each layer's block elements, as rectangles over that layer's backgrounds.
+        self.push_block_quads(&items, &mut quads);
+        self.push_block_quads(&overlay_items, &mut overlay_quads);
         // Build this frame's textured quads from the decoded cache.
         let (sw, sh) = (self.config.width as f32, self.config.height as f32);
         self.image_store
@@ -3724,6 +3731,39 @@ impl Renderer {
         *items = out;
     }
 
+    /// The block elements of every text item in `items`, as quads in `quads`: each
+    /// one's rectangles (see [`block_element_rects`]) placed in its cell and clipped
+    /// to the item's bounds. Drawing them as geometry is what makes a run of half
+    /// blocks tile without seams: the cell is taller than the font's em (the line
+    /// spacing), and a font's `▀` fills half of its em, not half of the cell.
+    fn push_block_quads(&self, items: &[TextItem], quads: &mut Vec<Quad>) {
+        for it in items {
+            let Some(entry) = self.cache.get(&it.key) else {
+                continue;
+            };
+            let (cw, ch) = (self.cell_w * it.scale, self.cell_h * it.scale);
+            let b = it.bounds;
+            for &(col, c, fg) in &entry.blocks {
+                let x0 = it.x + col as f32 * cw;
+                for (l, t, r, bt, coverage) in block_element_rects(c) {
+                    let left = (x0 + l * cw).max(b.left as f32);
+                    let top = (it.y + t * ch).max(b.top as f32);
+                    let right = (x0 + r * cw).min(b.right as f32);
+                    let bottom = (it.y + bt * ch).min(b.bottom as f32);
+                    if right > left && bottom > top {
+                        quads.push(Quad {
+                            x: left,
+                            y: top,
+                            w: right - left,
+                            h: bottom - top,
+                            color: srgb_to_color_rgba(fg, coverage),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// The whole-surface clip rect (static text never needs tighter clipping).
     fn full_bounds(&self) -> TextBounds {
         TextBounds {
@@ -3987,8 +4027,11 @@ impl Renderer {
             e.used = self.gen;
             return (key, e.nonsnapped.is_empty());
         }
-        let buffer = self.shape_segments(segments);
-        let full: String = segments.iter().map(|s| s.text.as_str()).collect();
+        // Block elements are drawn as rectangles filling their cells, so the font never
+        // sees them: they shape as spaces, keeping every column where it was.
+        let (shaped, blocks) = split_block_elements(segments);
+        let buffer = self.shape_segments(&shaped);
+        let full: String = shaped.iter().map(|s| s.text.as_str()).collect();
         let nonsnapped = nonsnapped_clusters(&buffer, self.cell_w, &full);
         let snapped = nonsnapped.is_empty();
         self.cache.insert(
@@ -3997,6 +4040,7 @@ impl Renderer {
                 buffer,
                 used: self.gen,
                 nonsnapped,
+                blocks,
             },
         );
         (key, snapped)
@@ -4263,6 +4307,96 @@ pub fn run_columns<'a>(
 /// grid has to follow the server, not the crate.
 pub fn cells(s: &str) -> usize {
     s.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+/// The rectangles a Unicode block element (U+2580–U+259F) fills, as fractions of its
+/// cell — `(left, top, right, bottom, coverage)` — or nothing for any other character.
+/// `coverage` is `1.0` for a solid fill and the shade's density for `░▒▓`.
+///
+/// The GUI draws these as geometry instead of glyphs, the way terminals do: the cell is
+/// taller than the font's em (the line spacing), so a font's half block covers half of
+/// the em and leaves a seam, and a fallback font's glyph lands wherever its metrics put
+/// it. Rectangles tile exactly, so pixel art made of `▀`/`▄` (the intro logo) and bars
+/// of `█` read as solid.
+pub fn block_element_rects(c: char) -> Vec<(f32, f32, f32, f32, f32)> {
+    let eighth = |n: u32| n as f32 / 8.0;
+    let full = |l, t, r, b| vec![(l, t, r, b, 1.0)];
+    // The quadrants, as (upper left, upper right, lower left, lower right).
+    let quads = |ul: bool, ur: bool, ll: bool, lr: bool| {
+        let mut out = Vec::new();
+        for (on, l, t) in [
+            (ul, 0.0, 0.0),
+            (ur, 0.5, 0.0),
+            (ll, 0.0, 0.5),
+            (lr, 0.5, 0.5),
+        ] {
+            if on {
+                out.push((l, t, l + 0.5, t + 0.5, 1.0));
+            }
+        }
+        out
+    };
+    match c as u32 {
+        0x2580 => full(0.0, 0.0, 1.0, 0.5),
+        // Lower one eighth … lower seven eighths, then the full block.
+        n @ 0x2581..=0x2588 => full(0.0, 1.0 - eighth(n - 0x2580), 1.0, 1.0),
+        // Left seven eighths … left one eighth.
+        n @ 0x2589..=0x258F => full(0.0, 0.0, eighth(8 - (n - 0x2588)), 1.0),
+        0x2590 => full(0.5, 0.0, 1.0, 1.0),
+        0x2591 => vec![(0.0, 0.0, 1.0, 1.0, 0.25)],
+        0x2592 => vec![(0.0, 0.0, 1.0, 1.0, 0.5)],
+        0x2593 => vec![(0.0, 0.0, 1.0, 1.0, 0.75)],
+        0x2594 => full(0.0, 0.0, 1.0, eighth(1)),
+        0x2595 => full(eighth(7), 0.0, 1.0, 1.0),
+        0x2596 => quads(false, false, true, false),
+        0x2597 => quads(false, false, false, true),
+        0x2598 => quads(true, false, false, false),
+        0x2599 => quads(true, false, true, true),
+        0x259A => quads(true, false, false, true),
+        0x259B => quads(true, true, true, false),
+        0x259C => quads(true, true, false, true),
+        0x259D => quads(false, true, false, false),
+        0x259E => quads(false, true, true, false),
+        0x259F => quads(false, true, true, true),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `c` is a block element, drawn by [`block_element_rects`].
+fn is_block_element(c: char) -> bool {
+    ('\u{2580}'..='\u{259F}').contains(&c)
+}
+
+/// `segments` with every block element replaced by a space, plus each one's cell
+/// offset from the run's start, its character and its segment's foreground: the
+/// split [`Renderer::ensure`] shapes and draws from. Offsets count cells, so a wide
+/// character before a block moves it by two.
+pub fn split_block_elements(segments: &[Seg]) -> (Vec<Seg>, Vec<(u16, char, u32)>) {
+    let mut blocks = Vec::new();
+    if !segments
+        .iter()
+        .any(|s| s.text.chars().any(is_block_element))
+    {
+        return (segments.to_vec(), blocks);
+    }
+    let mut col: u16 = 0;
+    let mut shaped = Vec::with_capacity(segments.len());
+    for s in segments {
+        let mut text = String::with_capacity(s.text.len());
+        for g in s.text.graphemes(true) {
+            let mut chars = g.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if is_block_element(c) => {
+                    blocks.push((col, c, s.fg));
+                    text.push(' ');
+                }
+                _ => text.push_str(g),
+            }
+            col = col.saturating_add(UnicodeWidthStr::width(g) as u16);
+        }
+        shaped.push(Seg { text, ..s.clone() });
+    }
+    (shaped, blocks)
 }
 
 /// `s` truncated to at most `max` screen cells, cut on a grapheme-cluster boundary

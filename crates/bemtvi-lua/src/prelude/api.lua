@@ -162,6 +162,17 @@ function btv.win.height(win)
   return w and w.height or 0
 end
 
+-- `btv.win.textoff(win)` -> the number of cells the window's left gutter takes before
+-- its text: the fold column, the sign column and the number column together (what
+-- neovim reports as `getwininfo()[1].textoff`). `btv.win.width(win)` includes the
+-- gutter, so the text area is `btv.win.width(win) - btv.win.textoff(win)` wide, the
+-- width to centre content in. `0` for an unknown window.
+function btv.win.textoff(win)
+  win = resolve_win(win)
+  local w = (btv._wins or {})[win]
+  return w and w.textoff or 0
+end
+
 -- `nvim_win_call(win, fn)` / `nvim_buf_call(buf, fn)`: run `fn` as if `win`/`buf`
 -- were current, returning fn's result. In neovim these temporarily switch the
 -- editor's current window/buffer for the duration of the callback; in bemtvi the

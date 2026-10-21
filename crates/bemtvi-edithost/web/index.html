@@ -76,6 +76,8 @@
   .seccur { background: #ebf3f3; color: #1e1e24; }
   .cur-mc { background: var(--accent); color: #121216; font-weight: 700; }
   .cmdline { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); color: var(--fg); }
+  /* A block element drawn as a box (see `blockElementHtml`): one cell, one full row. */
+  .blk { display: inline-block; width: var(--cw); height: var(--ch); vertical-align: top; }
   .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   .inlay { color: #636773; font-style: italic; }
   .pmenu { position: absolute; background: #18181d; z-index: 10; white-space: pre; }
@@ -249,6 +251,7 @@
       ch = Math.round(FONT_PX * LINE);
       gridEl.style.fontSize = FONT_PX + "px";
       gridEl.style.setProperty("--ch", ch + "px");
+      gridEl.style.setProperty("--cw", cw + "px");
     }
     function layout() {
       const rect = gridEl.getBoundingClientRect();
@@ -257,7 +260,38 @@
       editorRows = totalRows - 1; // reserve the command row, like the TUI client
     }
     function escapeHtml(s) {
-      return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+      return s.replace(/[&<>\u2580-\u259f]/g, (c) =>
+        c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : blockElementHtml(c));
+    }
+
+    // A block element (U+2580–U+259F: `▀`, `▄`, `█`, …) as an exactly cell-sized box
+    // painted with gradients in the text colour, instead of the font's glyph. The row is
+    // taller than the font's em (the line height), so a glyph's half block covers half
+    // the em and pixel art built from them (the intro logo) showed seams and offsets
+    // between rows. The box inherits its parent span's background, so the empty half of
+    // a `▀` keeps the cell's colour. Mirrors the GUI's `block_element_rects`.
+    const BLOCK_RECTS = (() => {
+      const e = (n) => n / 8;
+      const quads = (ul, ur, ll, lr) => [[ul, 0, 0], [ur, 0.5, 0], [ll, 0, 0.5], [lr, 0.5, 0.5]]
+        .filter(([on]) => on).map(([, l, t]) => [l, t, l + 0.5, t + 0.5, 1]);
+      const t = { 0x2580: [[0, 0, 1, 0.5, 1]], 0x2590: [[0.5, 0, 1, 1, 1]],
+        0x2591: [[0, 0, 1, 1, 0.25]], 0x2592: [[0, 0, 1, 1, 0.5]], 0x2593: [[0, 0, 1, 1, 0.75]],
+        0x2594: [[0, 0, 1, e(1), 1]], 0x2595: [[e(7), 0, 1, 1, 1]],
+        0x2596: quads(0, 0, 1, 0), 0x2597: quads(0, 0, 0, 1), 0x2598: quads(1, 0, 0, 0),
+        0x2599: quads(1, 0, 1, 1), 0x259a: quads(1, 0, 0, 1), 0x259b: quads(1, 1, 1, 0),
+        0x259c: quads(1, 1, 0, 1), 0x259d: quads(0, 1, 0, 0), 0x259e: quads(0, 1, 1, 0),
+        0x259f: quads(0, 1, 1, 1) };
+      for (let n = 0x2581; n <= 0x2588; n++) t[n] = [[0, 1 - e(n - 0x2580), 1, 1, 1]];
+      for (let n = 0x2589; n <= 0x258f; n++) t[n] = [[0, 0, e(8 - (n - 0x2588)), 1, 1]];
+      return t;
+    })();
+    function blockElementHtml(c) {
+      const layers = (BLOCK_RECTS[c.codePointAt(0)] || []).map(([l, t, r, b, cov]) => {
+        const color = cov === 1 ? "currentColor" : `color-mix(in srgb, currentColor ${cov * 100}%, transparent)`;
+        return `linear-gradient(${color},${color}) no-repeat calc(var(--cw)*${l}) calc(var(--ch)*${t})`
+          + ` / calc(var(--cw)*${r - l}) calc(var(--ch)*${b - t})`;
+      });
+      return `<span class="blk" style="background:${layers.join(",")};background-color:inherit"> </span>`;
     }
 
     // Shorten `s` to at most `width` chars, keeping its head and tail and dropping the

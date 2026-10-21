@@ -1110,6 +1110,9 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     // Worker sources `init.lua` (`eh_source_lua`), so a config's own
     // `btv.cmdline_complete.setup{ ... }` still wins (last config drains last).
     host.enable_cmdline_complete();
+    // Arm the intro screen, the serverless analogue of the native `show_intro`: same
+    // ordering, so a config's `btv.g.intro = false` still opts out.
+    host.enable_intro();
     host.attach_ui(DEFAULT_COLS, DEFAULT_ROWS);
     Box::into_raw(Box::new(WasmEditHost { host, sink }))
 }

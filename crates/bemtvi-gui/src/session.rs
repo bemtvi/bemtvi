@@ -438,6 +438,8 @@ async fn server_init(
         // alike) — loaded before init.lua, so a connector persists across a session swap.
         system_plugins: bemtvi_server::discover_system_plugins(),
         cmdline_complete_default: true,
+        // The interactive editor shows the intro screen when started with no file.
+        show_intro: true,
         // Interactive: `print` shows on the message line, not stdout.
         lua_stdio: false,
         ts_autoinstall,

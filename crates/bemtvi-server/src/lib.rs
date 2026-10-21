@@ -475,6 +475,13 @@ pub struct ServerInit {
     /// `btv.cmdline_complete.setup{ ... }` (e.g. toggling the `docs` preview pane)
     /// still wins. Mirrors `offer_default_recommended`.
     pub cmdline_complete_default: bool,
+    /// Whether to show the intro screen (`btv.intro`) when the session starts with no
+    /// file: the logo, name and first commands, drawn on the empty startup buffer.
+    /// `false` (the default) keeps headless runs and the test suites free of it; the
+    /// interactive binaries set it `true`, which arms the intro BEFORE `init.lua`, so
+    /// a config's `btv.g.intro = false` still opts out. Mirrors
+    /// `offer_default_recommended`.
+    pub show_intro: bool,
     /// Route captured Lua message output (`print` / `nvim_echo` / `btv.err_write*`) to the
     /// process's real stdout / stderr instead of the (absent) message line. `false` (the
     /// default) keeps the normal in-editor routing; the `bemtvi --lua CODE` one-shot sets it
@@ -1859,6 +1866,12 @@ pub struct EditHost {
     /// same pairs ride the `btv_ui_attach` capabilities map instead. Wasm only.
     #[cfg(not(feature = "native"))]
     key_labels: Vec<(String, String)>,
+    /// Whether [`boot_finish`](EditHost::boot_finish) has run: from then on a re-attach
+    /// (the page's resize) runs the pending work a native resize does (`WinResized`,
+    /// the Lua mirrors). The first attach, in `eh_new`, comes before the config and the
+    /// startup events, so it only sizes the editor. Wasm only.
+    #[cfg(not(feature = "native"))]
+    booted: bool,
 }
 
 impl EditHost {
@@ -2140,6 +2153,8 @@ impl EditHost {
             ts_installed: std::collections::BTreeSet::new(),
             #[cfg(not(feature = "native"))]
             key_labels: Vec::new(),
+            #[cfg(not(feature = "native"))]
+            booted: false,
         }
     }
 }
@@ -2158,6 +2173,11 @@ impl EditHost {
     /// resize path — a re-attach at a new size repaints.
     pub fn attach_ui(&mut self, width: usize, height: usize) {
         self.ui = Some((width, height));
+        // Size the core's windows, as the native attach and resize do. Projecting a
+        // frame at the new size alone paints right, but leaves every window's own size
+        // (what `WinResized`, the Lua window mirror and the decor providers read) at the
+        // old one until the next input.
+        self.editor.resize(width, height);
         // A browser delivers Ctrl+I distinct from Tab (keydown `code` + `ctrlKey`),
         // like a native window — so the serverless edit host always has full keyboard
         // disambiguation. Declare it so `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` stay apart from
@@ -2171,6 +2191,12 @@ impl EditHost {
         // subscribing to it wouldn't exist yet; `boot_finish` fires it once startup is
         // done, which is the native order (config, `VimEnter`, then the UI is known).
         let _ = self.lua.set_ui_caps(true, true, false, &self.key_labels);
+        // After boot, run what a native resize runs before its repaint: `WinResized`, the
+        // mirror push, the decor providers' redispatch. Before boot (the first attach, in
+        // `eh_new`) there is no config yet and the startup events have not fired.
+        if self.booted {
+            self.run_pending();
+        }
         self.redraw();
     }
 
@@ -2267,6 +2293,7 @@ impl EditHost {
     /// `v:vim_did_enter`. Run after [`boot_begin`](Self::boot_begin) and the optional
     /// `init.lua` sourcing ([`source_config`](Self::source_config)).
     pub fn boot_finish(&mut self) {
+        self.booted = true;
         // Rebuild the layout `import_persist` held back, in `run_io`'s order: after the
         // config (so restored windows inherit its window-local options — the whole reason
         // the layout is held back) and before the lifecycle seed below. A no-op when the
@@ -2781,6 +2808,17 @@ impl EditHost {
     /// build never enables the engine and `:`+`<Tab>` does nothing.
     pub fn enable_cmdline_complete(&mut self) {
         let _ = self.lua.exec("btv.cmdline_complete.setup{}");
+    }
+
+    /// Arm the intro screen (`btv.intro`), the wasm analogue of the native binary's
+    /// `show_intro` opt-in. Called by the cdylib in `eh_new` with the same ordering as
+    /// [`enable_cmdline_complete`](Self::enable_cmdline_complete): after
+    /// [`boot_begin`](Self::boot_begin), before the optional `init.lua`, so a config's
+    /// `btv.g.intro = false` still opts out. It shows at the `UIEnter`
+    /// [`boot_finish`](Self::boot_finish) fires, when the page started on the empty
+    /// unnamed buffer.
+    pub fn enable_intro(&mut self) {
+        let _ = self.lua.exec("btv.intro._arm()");
     }
 
     /// Apply a finished off-tick OPFS **file** read the Worker fetched for `buffer` (the
@@ -4554,6 +4592,12 @@ where
     // or the first keypress's) — well before any `:`+<Tab> can be typed.
     if init.cmdline_complete_default {
         let _ = host.lua.exec("btv.cmdline_complete.setup{}");
+    }
+    // Arm the intro screen for the interactive binary — BEFORE init.lua, so a config's
+    // `btv.g.intro = false` still wins. It decides at the first `UIEnter` whether the
+    // session started with no file. Tests leave this off and stay hermetic.
+    if init.show_intro {
+        let _ = host.lua.exec("btv.intro._arm()");
     }
     // Run the client's startup Lua (the GUI registers its `:connect` / `:workspace`
     // virtual commands here) — BEFORE init.lua, so a config can still override it. A

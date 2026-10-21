@@ -73,6 +73,10 @@ pub struct WindowMirror {
     /// 0-based cursor column.
     pub col: u64,
     pub width: u64,
+    /// The cells the left gutter takes before the text: the fold column, the sign
+    /// column and the number gutter (`getwininfo().textoff` in neovim), so
+    /// `width - textoff` is the text area a plugin can centre content in.
+    pub textoff: u64,
     /// Text rows (the rect height minus the status line).
     pub height: u64,
     pub number: bool,
@@ -861,6 +865,15 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "bemtvi:prelude/plugins_ui",
         include_str!("prelude/plugins_ui.lua"),
     ),
+    // The intro screen (`btv.intro`): the logo, name and first commands an editor
+    // started with no file shows. `intro_logo.lua` is its pixel data (generated from
+    // the icon by gen-icons.py); intro.lua builds on btv.on / btv.buf / btv.hl / btv.ui,
+    // all above. Inert until the interactive binary arms it (`ServerInit.show_intro`).
+    (
+        "bemtvi:prelude/intro_logo",
+        include_str!("prelude/intro_logo.lua"),
+    ),
+    ("bemtvi:prelude/intro", include_str!("prelude/intro.lua")),
 ];
 
 /// A generated stub declaring the two root globals bemtvi injects from **Rust**

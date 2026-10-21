@@ -271,6 +271,13 @@ pub struct Extmark {
     /// from an empty range as the user types into it — the case fixed gravity can't
     /// express.
     pub end_right_gravity: bool,
+    /// Which placement this is: a store-wide counter value assigned by every
+    /// [`set`](ExtmarkStore::set), never by [`shift`](ExtmarkStore::shift). An id
+    /// re-used for a new placement (a mark deleted and placed again, or moved by
+    /// setting its id) gets a new serial, so undo can tell "the mark it snapshotted,
+    /// since moved by edits" from "a different placement under the same id". See
+    /// [`ExtmarkStore::adopt_positions_from`].
+    serial: u64,
 }
 
 /// Marks within one namespace, plus that namespace's monotonic id allocator and
@@ -285,8 +292,8 @@ pub struct Extmark {
 /// maintenance measured 59x slower in round 3). The `gen` counter, bumped by
 /// every structural mutation and untouched by shifts, lets a caller prove the
 /// marks are the ones *it* placed (see the diagnostics anchor-trust guard in
-/// `bemtvi-server`): an undo that restores an older snapshot of the store
-/// restores its older `gen` too.
+/// `bemtvi-server`). Undo keeps the live store (see
+/// [`ExtmarkStore::adopt_positions_from`]), so `gen` survives it too.
 #[derive(Debug, Default, Clone)]
 struct NsMarks {
     marks: BTreeMap<u64, Extmark>,
@@ -323,6 +330,9 @@ pub struct ExtmarkStore {
     /// in O(1) instead of filtering every mark. [`shift`](Self::shift) never changes
     /// it: it moves anchors, not payloads.
     virt_lines_marks: usize,
+    /// The next [`Extmark::serial`] to hand out. Store-wide and monotonic, carried by
+    /// every clone, so a snapshot's serials never collide with later placements.
+    next_serial: u64,
 }
 
 /// Whether `m` carries `virt_lines` rows, the one payload
@@ -390,6 +400,7 @@ impl ExtmarkStore {
                 id
             }
         };
+        self.next_serial += 1;
         let mark = Extmark {
             id,
             start,
@@ -399,6 +410,7 @@ impl ExtmarkStore {
             decor,
             right_gravity,
             end_right_gravity,
+            serial: self.next_serial,
         };
         let gained = has_virt_lines(&mark);
         let replaced = slot.marks.insert(id, mark);
@@ -504,6 +516,48 @@ impl ExtmarkStore {
                 dst.by_ns.remove(&ns);
             }
         }
+    }
+
+    /// Take an undo/redo history point's mark **positions** without changing which
+    /// marks exist: every mark `self` shares with `snap` (the same placement: same
+    /// namespace, id and [`serial`](Extmark::serial)) moves back to where `snap` had
+    /// it, and every other mark of `self` keeps its place, clamped into the restored
+    /// text (`text_len` bytes). Namespaces in `skip` are left alone.
+    ///
+    /// This is neovim's model: undo restores the text and where marks sit in it, but
+    /// the set of marks is the plugins' to manage. A mark deleted through the API
+    /// after a history point stays deleted when undo returns to it, and one added
+    /// after it survives. Swapping in the whole snapshotted store did neither: it
+    /// resurrected a cleared diagnostic or a dismissed intro screen, and wiped a mark
+    /// a plugin had just placed. Text edits never delete a mark (they only
+    /// [`shift`](Self::shift) it), so membership changes here only through the API.
+    /// A mark placed again under the same id after the history point (diagnostics
+    /// re-anchoring a new set, a plugin moving its mark) is a new placement: it keeps
+    /// its live position, as neovim's undo would, which only reverses text edits.
+    pub fn adopt_positions_from(&mut self, snap: &ExtmarkStore, text_len: usize, skip: &[u32]) {
+        for (ns, slot) in &mut self.by_ns {
+            if skip.contains(ns) {
+                continue;
+            }
+            let theirs = snap.by_ns.get(ns);
+            for (id, m) in &mut slot.marks {
+                match theirs
+                    .and_then(|s| s.marks.get(id))
+                    .filter(|then| then.serial == m.serial)
+                {
+                    Some(then) => {
+                        m.start = then.start;
+                        m.end = then.end;
+                    }
+                    None => {
+                        m.start = m.start.min(text_len);
+                        m.end = m.end.map(|e| e.min(text_len).max(m.start));
+                    }
+                }
+            }
+        }
+        // Positions moved wholesale: have the Lua mirror re-read the store.
+        self.generation += 1;
     }
 
     /// Every mark across all namespaces (order across namespaces is unspecified;

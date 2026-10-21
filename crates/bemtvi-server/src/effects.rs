@@ -2463,6 +2463,7 @@ impl EditHost {
                     // window's status row are not (matches what's drawn).
                     width: cw as u64,
                     height: ch as u64,
+                    textoff: self.editor.window_textoff(id).unwrap_or(0) as u64,
                     number: opts.number,
                     relativenumber: opts.relativenumber,
                     cursorline: opts.cursorline,

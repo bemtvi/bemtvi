@@ -380,3 +380,77 @@ async fn a_register_insert_is_one_step_of_its_own() {
         "the register text, whole"
     );
 }
+
+// ----- mappings ------------------------------------------------------------------
+//
+// One key the user pressed is one step, however much text its mapping produces:
+// a string RHS, an `<expr>` RHS, a Lua RHS that feeds keys. And the typing after
+// it is a step of its own, like after a paste.
+
+#[tokio::test]
+async fn a_string_mapping_is_one_step() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(&rpc, "btv.keymap.set('i', '<F5>', 'foo bar')").await;
+    feed(&rpc, "ix<F5>y<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["xfoo bary"]));
+
+    assert_eq!(
+        undo(&rpc).await,
+        v(&["xfoo bar"]),
+        "typing after the mapping"
+    );
+    assert_eq!(undo(&rpc).await, v(&["x"]), "the whole RHS, as one step");
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn an_expr_mapping_is_one_step() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('i', '<F6>', function() return 'one two' end, { expr = true })",
+    )
+    .await;
+    feed(&rpc, "i<F6><Esc>");
+    assert_eq!(lines(&rpc).await, v(&["one two"]));
+
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn keys_a_lua_mapping_feeds_are_one_step() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(
+        &rpc,
+        "btv.keymap.set('i', '<F7>', function() btv._feedkeys('one two', false, false) end)",
+    )
+    .await;
+    // Fed keys drain after the batch that fired the mapping, so the `<Esc>` goes
+    // in a batch of its own.
+    feed_sync(&rpc, "i<F7>").await;
+    feed_sync(&rpc, "<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["one two"]));
+
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn keys_fed_as_typed_still_break_on_words() {
+    // `typed` feeds are the keyboard (the `btv.test` runner's `t:feed`), so they
+    // undo the way typing does.
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(&rpc, "btv._feedkeys('ione two<Esc>', false, false, true)").await;
+    assert_eq!(lines(&rpc).await, v(&["one two"]));
+
+    assert_eq!(undo(&rpc).await, v(&["one"]));
+}
+
+#[tokio::test]
+async fn a_mapping_that_changes_nothing_does_not_split_a_word() {
+    let (rpc, _incoming) = start(None).await;
+    exec_lua(&rpc, "btv.keymap.set('i', '<F8>', function() end)").await;
+    feed(&rpc, "ifo<F8>o<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["foo"]));
+
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}

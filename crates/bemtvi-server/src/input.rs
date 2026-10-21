@@ -279,7 +279,19 @@ impl EditHost {
         // hit the real maps); pick that up before feeding.
         self.refresh_keymaps();
         let mut budget = 10_000usize;
+        // A run of untyped fed keys is one undo step (a plugin typing `foo bar` for
+        // you), opened at its first key and closed at a typed key or the end. Typed
+        // keys — the `btv.test` runner's keyboard — undo the way typing does.
+        let mut atomic = false;
         while let Some((key, remap, typed)) = self.feed_buffer.pop_front() {
+            if atomic == typed {
+                atomic = !typed;
+                if atomic {
+                    self.editor.begin_undo_atomic();
+                } else {
+                    self.editor.end_undo_atomic();
+                }
+            }
             if budget == 0 {
                 self.editor
                     .echo("E132: feedkeys recursion limit exceeded".to_string());
@@ -310,6 +322,9 @@ impl EditHost {
             if !typed {
                 self.macro_suppress -= 1;
             }
+        }
+        if atomic {
+            self.editor.end_undo_atomic();
         }
         // …and any macro one of those keys asked to play. A `<F3>a` arriving through
         // the typeahead — which is how the `btv.test` harness types, and how a plugin
@@ -583,10 +598,14 @@ impl EditHost {
         // recorded the LHS that got us here (`apply_step`), so everything the fire
         // produces must stay out of the recording.
         self.macro_suppress += 1;
+        // …and it is one undo step, however much text it produces: the user pressed
+        // one key.
+        self.editor.begin_undo_atomic();
         match (expr, rhs) {
             (true, MappingRhs::Lua(id)) => self.fire_expr(id),
             (_, rhs) => self.fire_mapping_inner(rhs),
         }
+        self.editor.end_undo_atomic();
         self.macro_suppress -= 1;
         if let Some(message) = restore {
             self.editor.message = message;

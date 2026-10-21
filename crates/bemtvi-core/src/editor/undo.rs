@@ -820,12 +820,41 @@ impl Editor {
     /// Whether the keys reaching the insert path are a replay of one operation —
     /// a paste span, a dot-repeat, a macro, `:normal`, `:g` — which undoes as a
     /// single step, so typing inside it never opens a new one.
-    fn typing_undo_suppressed(&self) -> bool {
+    fn replaying_one_change(&self) -> bool {
         self.paste_active
             || self.replaying_change
             || self.normal_depth > 0
             || self.in_global
             || self.macro_executing.is_some()
+    }
+
+    /// Whether typing rules stand down: a replay (see
+    /// [`replaying_one_change`](Self::replaying_one_change)) or an atomic span.
+    fn typing_undo_suppressed(&self) -> bool {
+        self.replaying_one_change() || self.undo_atomic > 0
+    }
+
+    /// Open a span of keys the user did not type one by one — a fired mapping's
+    /// RHS, keys a plugin fed — which undoes as **one** step however much text it
+    /// produces, like a paste: the span's first edit closes the typing step before
+    /// it, no typing rule breaks inside it, and (when it changed the text) the
+    /// typing after it starts a new step. A span that edits nothing leaves the
+    /// typing around it alone. Spans nest; only the outermost one acts. The server
+    /// brackets them, since only it knows which keys came from a mapping.
+    pub fn begin_undo_atomic(&mut self) {
+        if self.undo_atomic == 0 {
+            self.undo_atomic_tick = self.buffer().changedtick;
+            self.undo_atomic_opened = false;
+        }
+        self.undo_atomic += 1;
+    }
+
+    /// Close a span opened by [`Self::begin_undo_atomic`].
+    pub fn end_undo_atomic(&mut self) {
+        self.undo_atomic = self.undo_atomic.saturating_sub(1);
+        if self.undo_atomic == 0 && self.buffer().changedtick != self.undo_atomic_tick {
+            self.owe_typing_step();
+        }
     }
 
     /// Called by the insert path just before a typed key edits the text: open a
@@ -836,7 +865,11 @@ impl Editor {
     /// has moved since the last typed edit. Runs once per key, before the
     /// multi-cursor sweep, so one step spans every cursor.
     pub(crate) fn before_typed_edit(&mut self, kind: EditKind, ch: Option<char>) {
-        if self.typing_undo_suppressed() {
+        if self.undo_atomic > 0 {
+            self.open_atomic_step();
+            return;
+        }
+        if self.replaying_one_change() {
             return;
         }
         let t = self.typing_undo;
@@ -868,13 +901,32 @@ impl Editor {
 
     /// End the current typing step (when it changed anything) before something
     /// that is a step of its own lands in the insert session: a paste or register
-    /// insert, an `i_CTRL-O` command. The typing that follows is owed a new step too — see
-    /// [`Self::owe_typing_step`].
+    /// insert, an `i_CTRL-O` command. The typing that follows is owed a new step
+    /// too — see [`Self::owe_typing_step`].
     pub(crate) fn end_typing_step(&mut self) {
-        if !self.mode.is_insert() || self.typing_undo_suppressed() {
+        if self.undo_atomic > 0 {
+            self.open_atomic_step();
+            return;
+        }
+        if !self.mode.is_insert() || self.replaying_one_change() {
             return;
         }
         if self.buffer().changedtick != self.typing_undo.tick {
+            self.break_undo_step();
+        }
+    }
+
+    /// The first edit inside an atomic span: close the typing step before it, once,
+    /// so the span's text undoes on its own. Later edits in the span join it.
+    fn open_atomic_step(&mut self) {
+        if self.undo_atomic_opened {
+            return;
+        }
+        self.undo_atomic_opened = true;
+        if self.mode.is_insert()
+            && !self.replaying_one_change()
+            && self.buffer().changedtick != self.typing_undo.tick
+        {
             self.break_undo_step();
         }
     }

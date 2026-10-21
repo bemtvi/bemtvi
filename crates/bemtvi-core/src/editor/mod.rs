@@ -1404,6 +1404,15 @@ pub struct Editor {
     /// Inside one, an insert's `<Esc>` leaves `snapshot_taken` set: the batch owns
     /// the step and closes it, not each insert the batch's keys open and close.
     undo_batch_depth: u32,
+    /// How many atomic key spans (a mapping's RHS, untyped fed keys) are open —
+    /// see [`Editor::begin_undo_atomic`]. Typing rules don't break inside one.
+    undo_atomic: u32,
+    /// The buffer's `changedtick` when the outermost atomic span opened, so a span
+    /// that changed nothing doesn't owe the typing after it a new step.
+    undo_atomic_tick: u64,
+    /// Whether the outermost atomic span has made its first edit (and closed the
+    /// typing step before it) — see [`Editor::begin_undo_atomic`].
+    undo_atomic_opened: bool,
     /// The line an auto-indent (`o`/`O`/`<CR>`) just filled with indentation that
     /// the cursor still sits in, *untouched* — vim's `did_ai`. Any content key
     /// clears it (the next `handle_insert` takes it); if it survives to `<Esc>`
@@ -2298,6 +2307,9 @@ impl Editor {
             snapshot_taken: false,
             typing_undo: undo::TypingUndo::default(),
             undo_batch_depth: 0,
+            undo_atomic: 0,
+            undo_atomic_tick: 0,
+            undo_atomic_opened: false,
             ai_open_line: None,
             paste_active: false,
             now_mono: 0,

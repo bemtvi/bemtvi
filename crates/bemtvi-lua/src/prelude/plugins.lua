@@ -2218,13 +2218,13 @@ M.RECOMMENDED_DOC_URL = "https://bemtvi.github.io/bemtvi/guide/recommended-plugi
 M._default_recommended = {
   {
     "bemtvi/bemtvi-line",
-    tag = "v1.0.0",
+    tag = "v1.0.1",
     desc = "Configurable statusline (lualine)",
     config = [[ require("bemtvi-line").setup() ]],
   },
   {
     "bemtvi/bemtvi-tree",
-    tag = "v1.0.0",
+    tag = "v1.0.1",
     desc = "File explorer sidebar (<leader>e)",
     keys = { "<leader>e" },
     config = [[ require("bemtvi-tree").setup() ]],

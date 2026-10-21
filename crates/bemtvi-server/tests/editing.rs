@@ -116,5 +116,7 @@ mod statusline;
 mod text_objects;
 #[path = "editing/undo.rs"]
 mod undo;
+#[path = "editing/undo_grouping.rs"]
+mod undo_grouping;
 #[path = "editing/visual_replace.rs"]
 mod visual_replace;

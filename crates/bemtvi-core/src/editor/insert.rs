@@ -1,6 +1,7 @@
 //! Insert and Replace mode key handling, including soft-tab expansion and the
 //! soft-tab-aware backspace.
 
+use super::undo::EditKind;
 use super::*;
 use crate::editor::syntax::indent_width;
 use crate::input::{Key, KeyCode};
@@ -245,6 +246,15 @@ impl Editor {
         // key clears it, only `<Esc>` acts on it. `<CR>` clears it here and then
         // re-arms it for the line it opens (`insert_newline`).
         let ai_open = self.ai_open_line.take();
+        // Word-sized undo: an edit that should start a new step (a word ended, a
+        // line broke, typing turned into deleting) commits the one before it.
+        match key.code {
+            KeyCode::Char(c) if !key.ctrl => self.before_typed_edit(EditKind::Insert, Some(c)),
+            KeyCode::Enter => self.before_typed_edit(EditKind::Insert, Some('\n')),
+            KeyCode::Tab => self.before_typed_edit(EditKind::Insert, Some('\t')),
+            KeyCode::Backspace | KeyCode::Delete => self.before_typed_edit(EditKind::Delete, None),
+            _ => {}
+        }
         match key.code {
             KeyCode::Esc => {
                 // Leaving Insert ends any snippet session (its tabstops are dropped).
@@ -286,7 +296,11 @@ impl Editor {
                 if self.mode.is_helix() {
                     self.helix_collapse_to_cursor();
                 }
-                self.snapshot_taken = false;
+                // Leaving Insert ends its undo step — unless a `:g` / ranged
+                // `:normal` batch fed this insert, whose single step outlives it.
+                if self.undo_batch_depth == 0 {
+                    self.snapshot_taken = false;
+                }
             }
             // `Enter` and `Backspace`, like a typed `Char`, run at every cursor via
             // `for_each_cursor` (the insert session already holds the undo snapshot,
@@ -669,7 +683,9 @@ impl Editor {
             self.redo_recording.push(Key::new(KeyCode::PasteEnd));
         }
 
+        self.before_paste();
         self.insert_text_session(text);
+        self.after_paste();
         // A paste into an active tabstop replaces its value — mirror it out.
         if self.snippet_active() {
             self.snippet_sync();

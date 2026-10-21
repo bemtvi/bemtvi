@@ -276,6 +276,45 @@ async fn typing_in_a_mark_heavy_buffer_does_not_scale_with_the_marks() {
 }
 
 #[tokio::test]
+async fn word_sized_undo_steps_stay_cheap_in_a_mark_heavy_buffer() {
+    // Typing commits an undo node at each step boundary, and a node snapshots the
+    // extmark store — O(marks) per commit. `z<BS>` flips between typing and
+    // deleting on every key, so this run commits 300 nodes over 5000 marks.
+    //
+    // Measured by ablation: these keys take ~10s here *without* any commits (a
+    // `<BS>` or separator in a mark-heavy buffer has a cost of its own, unrelated
+    // to undo), and the 300 commits add ~0.5s on top. The bound catches a commit
+    // growing to ~30ms — a snapshot that stopped being cheap.
+    let (rpc, _inc) = open(&sample(5_000)).await;
+    ns(&rpc).await;
+    exec_lua(
+        &rpc,
+        "for i = 0, 4999 do
+           btv.buf.set_extmark(0, _G.ns, i, 0, { hl_group = 'Comment', end_row = i, end_col = 4 })
+         end",
+    )
+    .await;
+
+    feed(&rpc, "2500GI");
+    let _ = exec_lua(&rpc, "return 1").await;
+    let started = std::time::Instant::now();
+    for _ in 0..150 {
+        feed(&rpc, "z<BS>");
+    }
+    let _ = exec_lua(&rpc, "return 1").await;
+    let elapsed = started.elapsed();
+    let seq = exec_lua(&rpc, "return btv.undotree.get().seq_last").await;
+    assert!(
+        seq.as_u64().unwrap_or(0) >= 300,
+        "the run did not break into undo steps: seq_last {seq:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "300 keystrokes (300 undo steps) with 5000 extmarks took {elapsed:?}",
+    );
+}
+
+#[tokio::test]
 async fn a_row_preserving_batch_that_shrinks_the_buffer_does_not_crash() {
     // The exact shape that crashed `lsp_features` (a formatter applying several edits
     // in one tick). Queued buffer ops drain together, so their byte offsets are each

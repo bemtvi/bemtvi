@@ -577,12 +577,12 @@ async fn substitute_confirm_all_skipped_pushes_no_undo() {
     feed(&rpc, "n"); // skip #2 -> prompt ends, nothing changed
     assert_eq!(lines(&rpc).await, vec!["", "foo foo"], "buffer untouched");
     // The skipped substitute pushed no undo entry, so `u` reverts the prior edit
-    // (the `o` insert) — not a phantom no-op snapshot.
+    // (the last word the `o` insert typed) — not a phantom no-op snapshot.
     feed(&rpc, "u");
     assert_eq!(
         lines(&rpc).await,
-        vec![""],
-        "u undoes the insert, not the :s"
+        vec!["", "foo"],
+        "u undoes the insert's last word, not the :s"
     );
 }
 

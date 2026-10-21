@@ -14,6 +14,43 @@
 
 use super::*;
 
+/// What a typed key is about to do to the text. An undo step never mixes the two:
+/// typing then `<BS>` undoes as two steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditKind {
+    Insert,
+    Delete,
+}
+
+/// Where an insert session's typing stands, for word-sized undo steps (see
+/// [`Editor::before_typed_edit`]). Reset whenever an insert session opens.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TypingUndo {
+    /// The kind of the last typed edit; `None` until the session's first one.
+    kind: Option<EditKind>,
+    /// The last character typed, when the last edit inserted one.
+    last: Option<char>,
+    /// The buffer's `changedtick` when the current step opened. A step that has
+    /// not changed the text is never committed, so a no-op key (`<BS>` at the
+    /// start of the buffer) can't leave an empty step behind.
+    tick: u64,
+    /// The next typed edit opens a new step whatever it is — set after a paste,
+    /// so typing that follows one undoes on its own.
+    force: bool,
+}
+
+/// Whether typing `next` right after `last` starts a new undo step: the first
+/// separator after a word (it goes with the word that follows), or the first
+/// character after a line break (the break went with the line it ended).
+fn starts_typing_step(last: Option<char>, next: Option<char>) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    match (last, next) {
+        (Some('\n'), Some(_)) => true,
+        (Some(p), Some(n)) => is_word(p) && !is_word(n) && n != '\n',
+        _ => false,
+    }
+}
+
 impl UndoTree {
     /// A fresh tree whose only node is the original buffer state at seq 0.
     pub(crate) fn new(buffer: &Buffer) -> Self {
@@ -759,6 +796,81 @@ impl Editor {
         self.refresh_undo_cursor_marks(id);
         let now = self.now_mono;
         self.cur_mut().undo.mark_dirty(now);
+    }
+
+    /// Open a fresh typing state for the insert session that just began: no step
+    /// boundary is owed until the session's own typing creates one.
+    pub(crate) fn reset_typing_undo(&mut self) {
+        self.typing_undo = TypingUndo {
+            tick: self.buffer().changedtick,
+            ..TypingUndo::default()
+        };
+    }
+
+    /// Whether the keys reaching the insert path are a replay of one operation —
+    /// a paste span, a dot-repeat, a macro, `:normal`, `:g` — which undoes as a
+    /// single step, so typing inside it never opens a new one.
+    fn typing_undo_suppressed(&self) -> bool {
+        self.paste_active
+            || self.replaying_change
+            || self.normal_depth > 0
+            || self.in_global
+            || self.macro_executing.is_some()
+    }
+
+    /// Called by the insert path just before a typed key edits the text: open a
+    /// new undo step when this edit should start one, so an insert session undoes
+    /// a word at a time instead of all at once. A step ends at a word's end, after
+    /// a line break, and where typing turns into deleting or back (see
+    /// [`starts_typing_step`]). Runs once per key, before the multi-cursor sweep,
+    /// so one step spans every cursor.
+    pub(crate) fn before_typed_edit(&mut self, kind: EditKind, ch: Option<char>) {
+        if self.typing_undo_suppressed() {
+            return;
+        }
+        let t = self.typing_undo;
+        let changed = self.buffer().changedtick != t.tick;
+        let starts = t.force
+            || t.kind.is_some_and(|k| k != kind)
+            || (kind == EditKind::Insert
+                && t.kind == Some(EditKind::Insert)
+                && starts_typing_step(t.last, ch));
+        if changed && starts {
+            self.break_undo_step();
+        }
+        self.typing_undo.kind = Some(kind);
+        self.typing_undo.last = ch;
+        self.typing_undo.force = false;
+    }
+
+    /// End the current step before a paste lands in an insert session (when it
+    /// changed anything), so the paste is a step of its own. The typing that
+    /// follows the paste is owed a new step too — see [`Self::after_paste`].
+    pub(crate) fn before_paste(&mut self) {
+        if !self.mode.is_insert() || self.typing_undo_suppressed() {
+            return;
+        }
+        if self.buffer().changedtick != self.typing_undo.tick {
+            self.break_undo_step();
+        }
+    }
+
+    /// Owe the next typed edit a new step: what follows a paste never joins it.
+    pub(crate) fn after_paste(&mut self) {
+        self.typing_undo.force = true;
+    }
+
+    /// Commit the pending step as its own node and open the next one, *without*
+    /// leaving the insert session (`snapshot_taken` stays set). The cursor marks
+    /// are baked into the committed node, so undoing the next step puts the cursor
+    /// back where it began.
+    fn break_undo_step(&mut self) {
+        let id = self.cur_buffer();
+        self.commit_undo(id);
+        self.refresh_undo_cursor_marks(id);
+        let now = self.now_mono;
+        self.cur_mut().undo.mark_dirty(now);
+        self.typing_undo.tick = self.buffer().changedtick;
     }
 
     /// Update the current undo node's snapshot so its cursor and multi-cursor marks

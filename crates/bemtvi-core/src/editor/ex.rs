@@ -2087,6 +2087,7 @@ impl Editor {
         self.snapshot_taken = false;
         self.push_undo();
         self.snapshot_taken = true;
+        self.undo_batch_depth += 1;
         self.in_global = true;
         // `'report'`: the per-line commands run silent (`in_global` gates
         // `report_line_delta`) and the whole run reports its total below — vim's
@@ -2107,6 +2108,7 @@ impl Editor {
             offset += self.buffer().line_count() as i64 - before;
         }
         self.in_global = false;
+        self.undo_batch_depth -= 1;
         self.snapshot_taken = false;
         self.buffer_mut().normalize();
         self.clamp_cursor();
@@ -2153,6 +2155,7 @@ impl Editor {
             self.snapshot_taken = false;
             self.push_undo();
             self.snapshot_taken = true;
+            self.undo_batch_depth += 1;
             let mut offset: i64 = 0;
             for t in range.lo..=range.hi {
                 let line = t as i64 + offset;
@@ -2167,6 +2170,7 @@ impl Editor {
                 }
                 offset += self.buffer().line_count() as i64 - before;
             }
+            self.undo_batch_depth -= 1;
             self.snapshot_taken = false;
             self.buffer_mut().normalize();
             self.clamp_cursor();

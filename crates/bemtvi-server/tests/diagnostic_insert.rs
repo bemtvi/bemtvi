@@ -312,8 +312,9 @@ async fn a_held_diagnostic_follows_the_text_it_flags() {
         "the diagnostic rides the two inserted lines down"
     );
 
-    // Undo puts the text back where it was, and the diagnostic with it.
-    feed(&rpc, "<Esc>u");
+    // Undo puts the text back where it was, and the diagnostic with it. Each typed
+    // line is its own undo step, so two `u`s take back the whole insertion.
+    feed(&rpc, "<Esc>uu");
     assert_eq!(
         painted_rows(&rpc, &mut incoming).await,
         vec![1],

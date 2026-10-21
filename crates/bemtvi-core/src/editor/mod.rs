@@ -1396,6 +1396,14 @@ pub struct Editor {
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
+    /// Where the insert session's typing stands, so it undoes a word at a time
+    /// rather than as one step (see [`Editor::before_typed_edit`]). Reset when an
+    /// insert session opens, in [`Editor::input`].
+    typing_undo: undo::TypingUndo,
+    /// How many single-undo-step batches (`:g`, a ranged `:normal`) are running.
+    /// Inside one, an insert's `<Esc>` leaves `snapshot_taken` set: the batch owns
+    /// the step and closes it, not each insert the batch's keys open and close.
+    undo_batch_depth: u32,
     /// The line an auto-indent (`o`/`O`/`<CR>`) just filled with indentation that
     /// the cursor still sits in, *untouched* — vim's `did_ai`. Any content key
     /// clears it (the next `handle_insert` takes it); if it survives to `<Esc>`
@@ -2073,6 +2081,13 @@ impl Editor {
         if on {
             self.close_completion();
         }
+        // A paste is one undo step of its own, inside an insert session too. The
+        // server closes the span after every batch, so act only on a real change.
+        if on && !self.paste_active {
+            self.before_paste();
+        } else if !on && self.paste_active {
+            self.after_paste();
+        }
         self.paste_active = on;
     }
 
@@ -2281,6 +2296,8 @@ impl Editor {
             insert_text: String::new(),
             pending_visual: None,
             snapshot_taken: false,
+            typing_undo: undo::TypingUndo::default(),
+            undo_batch_depth: 0,
             ai_open_line: None,
             paste_active: false,
             now_mono: 0,
@@ -2651,6 +2668,7 @@ impl Editor {
         // `handle_insert` calls grow `insert_text` from empty.
         if matches!(self.mode, Mode::Insert | Mode::Replace) && !was_insert {
             self.insert_text.clear();
+            self.reset_typing_undo();
         }
 
         // `i_CTRL-O`: resume the interrupted insert session once the one-shot Normal

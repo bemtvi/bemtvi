@@ -281,3 +281,102 @@ async fn ranged_normal_with_an_insert_undoes_as_one_step() {
 
     assert_eq!(undo(&rpc).await, v(&["a", "b", "c"]));
 }
+
+// ----- pauses and cursor moves -------------------------------------------------
+
+#[tokio::test]
+async fn a_pause_in_typing_starts_a_new_step() {
+    let (rpc, clock, _incoming) = start_clocked().await;
+    clock.set_ms(1_000);
+    feed_sync(&rpc, "ifoo").await;
+    // A word is still going: a pause inside it splits it anyway.
+    clock.set_ms(2_500);
+    feed_sync(&rpc, "bar<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["foobar"]));
+
+    assert_eq!(undo(&rpc).await, v(&["foo"]), "the typing after the pause");
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn typing_without_a_pause_does_not_split_a_word() {
+    let (rpc, clock, _incoming) = start_clocked().await;
+    clock.set_ms(1_000);
+    feed_sync(&rpc, "ifoo").await;
+    // Under the pause threshold: the word keeps going.
+    clock.set_ms(1_900);
+    feed_sync(&rpc, "bar<Esc>").await;
+
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn moving_the_cursor_with_an_arrow_starts_a_new_step() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoobar<Left><Left><Left>X<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["fooXbar"]));
+
+    assert_eq!(
+        undo(&rpc).await,
+        v(&["foobar"]),
+        "the edit made somewhere else"
+    );
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn home_and_end_start_a_new_step() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Home>X<End>Y<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["XfooY"]));
+
+    assert_eq!(undo(&rpc).await, v(&["Xfoo"]));
+    assert_eq!(undo(&rpc).await, v(&["foo"]));
+    assert_eq!(undo(&rpc).await, v(&[""]));
+}
+
+#[tokio::test]
+async fn a_cursor_moved_from_lua_starts_a_new_step() {
+    // Anything that moves the cursor between two typed edits counts, not only the
+    // keys this mode knows about: a plugin jump, a click.
+    let (rpc, _incoming) = start_with_file("abc\n").await;
+    feed_sync(&rpc, "A1").await;
+    exec_lua(&rpc, "btv.win.set_cursor(0, 1, 0)").await;
+    feed_sync(&rpc, "2<Esc>").await;
+    assert_eq!(lines(&rpc).await, v(&["2abc1"]));
+
+    assert_eq!(undo(&rpc).await, v(&["abc1"]));
+    assert_eq!(undo(&rpc).await, v(&["abc"]));
+}
+
+#[tokio::test]
+async fn a_ctrl_o_command_is_its_own_step() {
+    // `<C-o>x` runs one Normal command mid-insert; it doesn't move the cursor, but
+    // it is a separate change from the typing on either side of it.
+    let (rpc, _incoming) = start_with_file("Z\n").await;
+    feed(&rpc, "ifoo<C-o>xbar<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["foobar"]));
+
+    assert_eq!(undo(&rpc).await, v(&["foo"]), "the typing after `<C-o>x`");
+    assert_eq!(undo(&rpc).await, v(&["fooZ"]), "the `x`");
+    assert_eq!(undo(&rpc).await, v(&["Z"]));
+}
+
+#[tokio::test]
+async fn a_register_insert_is_one_step_of_its_own() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione two<Esc>yy");
+    feed(&rpc, "oab<C-r>0cd<Esc>");
+    assert_eq!(lines(&rpc).await, v(&["one two", "abone two", "cd"]));
+
+    assert_eq!(
+        undo(&rpc).await,
+        v(&["one two", "abone two", ""]),
+        "the typing after"
+    );
+    assert_eq!(
+        undo(&rpc).await,
+        v(&["one two", "ab"]),
+        "the register text, whole"
+    );
+}

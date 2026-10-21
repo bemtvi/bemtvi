@@ -2645,6 +2645,9 @@ impl EditHost {
     /// natively.
     pub fn set_clock(&mut self, now_ms: u64) {
         self.clock_ms = now_ms;
+        // The millisecond clock too (native stamps it per message in `handle()`):
+        // the undo pause rule and the terminal `<Esc>` chord read it.
+        self.editor.set_now_ms(now_ms);
         let secs = (now_ms / 1000) as i64;
         self.editor.set_now_mono(secs);
         let _ = self.lua.set_mono_secs(secs);

@@ -83,10 +83,15 @@ async fn line_lnum_and_col_are_in_scope() {
 async fn the_whole_computed_insert_undoes_as_one_change() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "iabc<Esc>");
-    // The prompt runs inside the insert session, so its undo snapshot still covers
-    // the typing on either side of the computed text.
+    // The prompt runs inside the insert session, and its result lands as one undo
+    // step of its own — like a register insert or a paste — between the typing on
+    // either side of it.
     feed(&rpc, "A-<C-r>=2*2<CR>-<Esc>");
     assert_eq!(lines(&rpc).await, vec!["abc-4-"]);
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["abc-4"], "the typing after it");
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["abc-"], "the computed text, whole");
     feed(&rpc, "u");
     assert_eq!(lines(&rpc).await, vec!["abc"]);
 }

@@ -2084,9 +2084,9 @@ impl Editor {
         // A paste is one undo step of its own, inside an insert session too. The
         // server closes the span after every batch, so act only on a real change.
         if on && !self.paste_active {
-            self.before_paste();
+            self.end_typing_step();
         } else if !on && self.paste_active {
-            self.after_paste();
+            self.owe_typing_step();
         }
         self.paste_active = on;
     }

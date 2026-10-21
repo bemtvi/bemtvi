@@ -34,10 +34,20 @@ pub(crate) struct TypingUndo {
     /// not changed the text is never committed, so a no-op key (`<BS>` at the
     /// start of the buffer) can't leave an empty step behind.
     tick: u64,
-    /// The next typed edit opens a new step whatever it is — set after a paste,
-    /// so typing that follows one undoes on its own.
+    /// The next typed edit opens a new step whatever it is — set after a paste
+    /// or an `i_CTRL-O` command, so typing that follows one undoes on its own.
     force: bool,
+    /// [`Editor::now_ms`] at the last typed edit, for the pause rule.
+    last_ms: u64,
+    /// Where the cursor was left by the last typed edit (`(line, col)`). If it is
+    /// somewhere else when the next one arrives — an arrow, a click, a jump, a
+    /// plugin moving it — that edit starts a new step.
+    at: Option<(usize, usize)>,
 }
+
+/// How long typing may pause, in milliseconds, before the next edit starts a new
+/// undo step even mid-word.
+const UNDO_PAUSE_MS: u64 = 1000;
 
 /// Whether typing `next` right after `last` starts a new undo step: the first
 /// separator after a word (it goes with the word that follows), or the first
@@ -821,16 +831,22 @@ impl Editor {
     /// Called by the insert path just before a typed key edits the text: open a
     /// new undo step when this edit should start one, so an insert session undoes
     /// a word at a time instead of all at once. A step ends at a word's end, after
-    /// a line break, and where typing turns into deleting or back (see
-    /// [`starts_typing_step`]). Runs once per key, before the multi-cursor sweep,
-    /// so one step spans every cursor.
+    /// a line break (see [`starts_typing_step`]), where typing turns into deleting
+    /// or back, after a pause longer than [`UNDO_PAUSE_MS`], and when the cursor
+    /// has moved since the last typed edit. Runs once per key, before the
+    /// multi-cursor sweep, so one step spans every cursor.
     pub(crate) fn before_typed_edit(&mut self, kind: EditKind, ch: Option<char>) {
         if self.typing_undo_suppressed() {
             return;
         }
         let t = self.typing_undo;
         let changed = self.buffer().changedtick != t.tick;
+        let moved =
+            t.at.is_some_and(|at| at != (self.cursor.line, self.cursor.col));
+        let paused = t.kind.is_some() && self.now_ms.saturating_sub(t.last_ms) > UNDO_PAUSE_MS;
         let starts = t.force
+            || moved
+            || paused
             || t.kind.is_some_and(|k| k != kind)
             || (kind == EditKind::Insert
                 && t.kind == Some(EditKind::Insert)
@@ -841,12 +857,20 @@ impl Editor {
         self.typing_undo.kind = Some(kind);
         self.typing_undo.last = ch;
         self.typing_undo.force = false;
+        self.typing_undo.last_ms = self.now_ms;
     }
 
-    /// End the current step before a paste lands in an insert session (when it
-    /// changed anything), so the paste is a step of its own. The typing that
-    /// follows the paste is owed a new step too — see [`Self::after_paste`].
-    pub(crate) fn before_paste(&mut self) {
+    /// Called by the insert path once a typed key's edit is done: remember where
+    /// it left the cursor, so the next edit can tell whether the cursor moved.
+    pub(crate) fn after_typed_edit(&mut self) {
+        self.typing_undo.at = Some((self.cursor.line, self.cursor.col));
+    }
+
+    /// End the current typing step (when it changed anything) before something
+    /// that is a step of its own lands in the insert session: a paste or register
+    /// insert, an `i_CTRL-O` command. The typing that follows is owed a new step too — see
+    /// [`Self::owe_typing_step`].
+    pub(crate) fn end_typing_step(&mut self) {
         if !self.mode.is_insert() || self.typing_undo_suppressed() {
             return;
         }
@@ -855,8 +879,23 @@ impl Editor {
         }
     }
 
-    /// Owe the next typed edit a new step: what follows a paste never joins it.
-    pub(crate) fn after_paste(&mut self) {
+    /// Select mode's type-over is a step of its own: close the step that is open
+    /// (a snippet expansion's, whose placeholder is being typed over) before the
+    /// selection is deleted, so undo puts the placeholder's default back. The
+    /// deletion and the typing that replaces it then share one step.
+    pub(crate) fn begin_replacing_step(&mut self) {
+        if self.snapshot_taken
+            && !self.typing_undo_suppressed()
+            && self.buffer().changedtick != self.typing_undo.tick
+        {
+            self.break_undo_step();
+        }
+        self.reset_typing_undo();
+    }
+
+    /// Owe the next typed edit a new step: what follows a paste or register
+    /// insert, an `i_CTRL-O` command or a snippet expansion never joins it.
+    pub(crate) fn owe_typing_step(&mut self) {
         self.typing_undo.force = true;
     }
 

@@ -248,12 +248,15 @@ impl Editor {
         let ai_open = self.ai_open_line.take();
         // Word-sized undo: an edit that should start a new step (a word ended, a
         // line broke, typing turned into deleting) commits the one before it.
-        match key.code {
-            KeyCode::Char(c) if !key.ctrl => self.before_typed_edit(EditKind::Insert, Some(c)),
-            KeyCode::Enter => self.before_typed_edit(EditKind::Insert, Some('\n')),
-            KeyCode::Tab => self.before_typed_edit(EditKind::Insert, Some('\t')),
-            KeyCode::Backspace | KeyCode::Delete => self.before_typed_edit(EditKind::Delete, None),
-            _ => {}
+        let typed = match key.code {
+            KeyCode::Char(c) if !key.ctrl => Some((EditKind::Insert, Some(c))),
+            KeyCode::Enter => Some((EditKind::Insert, Some('\n'))),
+            KeyCode::Tab => Some((EditKind::Insert, Some('\t'))),
+            KeyCode::Backspace | KeyCode::Delete => Some((EditKind::Delete, None)),
+            _ => None,
+        };
+        if let Some((kind, ch)) = typed {
+            self.before_typed_edit(kind, ch);
         }
         match key.code {
             KeyCode::Esc => {
@@ -358,6 +361,10 @@ impl Editor {
             // current insert position, and an EOL-append column survives via the
             // `insert_normal` allowance in `clamp_cursor`.
             KeyCode::Char('o') if key.ctrl => {
+                // The one-shot command is a change of its own, apart from the
+                // typing before and after it.
+                self.end_typing_step();
+                self.owe_typing_step();
                 self.end_snippet();
                 self.close_completion();
                 self.insert_normal = Some(self.mode);
@@ -414,6 +421,12 @@ impl Editor {
         // Keep the active tabstop's mirrors in sync with whatever was just typed.
         if self.snippet_active() {
             self.snippet_sync();
+        }
+
+        // Last, once nothing else will move the cursor for this key (a mirror
+        // landing before it shifts it): the moved-cursor rule compares against this.
+        if typed.is_some() {
+            self.after_typed_edit();
         }
     }
 
@@ -683,9 +696,7 @@ impl Editor {
             self.redo_recording.push(Key::new(KeyCode::PasteEnd));
         }
 
-        self.before_paste();
         self.insert_text_session(text);
-        self.after_paste();
         // A paste into an active tabstop replaces its value — mirror it out.
         if self.snippet_active() {
             self.snippet_sync();
@@ -695,14 +706,17 @@ impl Editor {
     }
 
     /// Insert `text` at every cursor as part of the current insert session — the
-    /// shared body of `<C-r>{register}` and `<C-r><C-w>`. Records the text once in
-    /// the `".` last-insert accumulator (not once per cursor), matching how a
-    /// typed character is recorded.
+    /// shared body of `<C-r>{register}`, `<C-r><C-w>`, `<C-r>=` and a paste.
+    /// Records the text once in the `".` last-insert accumulator (not once per
+    /// cursor), matching how a typed character is recorded. The text is one undo
+    /// step of its own, and the typing after it starts another.
     pub(super) fn insert_text_session(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
+        self.end_typing_step();
         self.for_each_cursor(|ed| ed.insert_register_text(text));
+        self.owe_typing_step();
         self.insert_text.push_str(text); // `".` last-insert register
     }
 

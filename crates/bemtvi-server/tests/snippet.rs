@@ -103,6 +103,21 @@ async fn two_defaulted_mirrors_sync_across_multiple_keystrokes() {
     assert_eq!(lines(&rpc).await, vec!["local yz = yz".to_string()]);
 }
 
+/// Typing a word into a mirrored tabstop is one undo step: the mirror updates that
+/// follow each key are part of the edit, not a cursor move that starts a new step.
+#[tokio::test]
+async fn a_word_typed_into_a_mirrored_tabstop_undoes_as_one_step() {
+    let dir = temp_dir("snippet-mirror-undo");
+    let (rpc, _incoming) = start(&dir, "btv.snippet.setup{}").await;
+
+    expand(&rpc, "local ${1:x} = ${1:x}").await;
+    feed(&rpc, "yzw<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["local yzw = yzw".to_string()]);
+
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["local x = x".to_string()]);
+}
+
 /// Landing on a placeholder enters Select mode over its default, and `<Esc>` keeps
 /// the default (continuing in Insert) while `<Tab>` skips to the next stop keeping it.
 #[tokio::test]
@@ -402,4 +417,21 @@ async fn a_multibyte_choice_alternative_round_trips() {
         .await
         .expect("choice dropdown opens");
     assert_eq!(menu_items(&map), vec!["café", "tea"]);
+}
+
+/// A tabstop with no default is typed into straight from Insert (no Select type-over):
+/// the typing is still a step apart from the expansion.
+#[tokio::test]
+async fn typing_into_a_bare_tabstop_undoes_apart_from_the_expansion() {
+    let dir = temp_dir("snippet-bare-undo");
+    let (rpc, _incoming) = start(&dir, "btv.snippet.setup{}").await;
+
+    expand(&rpc, "foo($1)").await;
+    feed(&rpc, "ab<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["foo(ab)".to_string()]);
+
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["foo()".to_string()]);
+    feed(&rpc, "u");
+    assert_eq!(lines(&rpc).await, vec!["".to_string()]);
 }

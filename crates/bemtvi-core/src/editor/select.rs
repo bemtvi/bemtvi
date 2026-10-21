@@ -163,14 +163,15 @@ impl Editor {
 
     /// The delete-and-enter-Insert transition shared by every replacing key: stamp
     /// the `` `< ``/`` `> `` marks, then reuse the change operator (`c`) over the
-    /// selection as one undo step (folding into an already-open insert group when one
-    /// exists, per the P1 grouping rule). Charwise deletes the span and lands in
+    /// selection as one undo step (after closing an already-open insert group — a
+    /// snippet expansion's — so the replacement undoes on its own). Charwise deletes the span and lands in
     /// Insert at its start; linewise (`gH`) replaces whole lines with a fresh indented
     /// line, exactly like `S`/`cc`.
     fn select_replace(&mut self) {
         let linewise = self.select_linewise;
         let (lo, hi, first_line) = self.visual_range_lw(linewise);
         self.record_visual_marks();
+        self.begin_replacing_step();
         self.push_undo();
         self.snapshot_taken = true;
         self.apply_operator_to_range('c', lo, hi, linewise, first_line);

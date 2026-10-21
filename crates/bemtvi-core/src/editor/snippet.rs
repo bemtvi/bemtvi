@@ -172,6 +172,8 @@ impl Editor {
                 self.snippet_place_current();
             }
         }
+        // Typing into the expanded snippet is a change of its own.
+        self.owe_typing_step();
         self.ensure_visible();
     }
 

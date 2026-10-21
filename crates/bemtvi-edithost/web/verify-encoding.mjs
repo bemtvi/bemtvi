@@ -129,14 +129,15 @@ try {
   check("wasm redraw: special_key carries the token's display columns",
     Array.isArray(sk) && sk.length === 1 && sk[0][0] === 1 && sk[0][1] === 3,
     `special_key[0]=${JSON.stringify(sk)}`);
-  // The rendered DOM paints the token in the SpecialKey colour (#d787ff = rgb(215,135,255)).
+  // The rendered DOM paints the token in the SpecialKey colour: the `bemtvi` scheme's pink,
+  // #ebaab9 = rgb(235,170,185).
   const skColored = await page.evaluate(() => {
-    const want = "rgb(215, 135, 255)";
+    const want = "rgb(235, 170, 185)";
     return [...document.querySelectorAll("#grid span")].some(
       (s) => s.textContent.includes("^A") && getComputedStyle(s).color === want);
   });
   check("wasm paint: the ^A token is coloured as SpecialKey", skColored,
-    "no #grid span with text ^A and color rgb(215, 135, 255)");
+    "no #grid span with text ^A and color rgb(235, 170, 185)");
 
   await browser.close();
 } finally {

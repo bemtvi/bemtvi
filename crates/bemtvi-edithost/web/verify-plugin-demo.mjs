@@ -1,14 +1,15 @@
-// Playwright verifier for the python demo's first-party plugin set + catppuccin + demo
+// Playwright verifier for the python demo's first-party plugin set + the demo
 // init.lua (Phase 6 of docs/plans/2026-06-23-web-python-demo.md). Runs against the assembled
 // **demo** site (build-demo.sh → demo-site/), where build-config flips `plugins: true` so the
 // Worker fetches + sources the vendored amalgamated bundle (build-plugins.sh →
 // web/vendor/plugins/plugins-bundle.lua) at boot. We seed the committed web/demo-init.lua into
 // OPFS as /init.lua (Phase 7 will auto-seed it) and assert, after a fresh boot:
 //
-//   - every first-party module (catppuccin + the five bemtvi-* plugins) loaded from the bundle
+//   - every first-party module (the bemtvi-* plugins) loaded from the bundle
 //     (package.loaded) — proving the amalgamated require()s resolved and init.lua ran them;
-//   - catppuccin (mocha) applied — the Normal highlight carries the mocha palette
-//     (fg #cdd6f4 / bg #1e1e2e), read back from the real highlight registry;
+//   - the bundled `bemtvi` colorscheme applied (the config picks none) — the Normal
+//     highlight carries its palette (fg #e2e8e8 / bg #1e1e24), read back from the real
+//     highlight registry;
 //   - the statusline RENDERS — bemtvi-line projected styled status segments into the redraw
 //     frame, including the "NORMAL" mode label (its lualine_a mode component);
 //   - the python LSP is configured + enabled — btv.lsp has basedpyright with its cmd.
@@ -86,7 +87,7 @@ try {
     page.evaluate((c) => window.__bemtvi.execLua(c).then((r) => r.result), code).then(unwrap);
 
   // 1. Every first-party module loaded from the bundle (package.loaded set by the require()s).
-  const PLUGINS = ["catppuccin", "bemtvi-keys-helper", "bemtvi-tree", "bemtvi-line", "bemtvi-lspconfig", "bemtvi-diff",
+  const PLUGINS = ["bemtvi-keys-helper", "bemtvi-tree", "bemtvi-line", "bemtvi-lspconfig", "bemtvi-diff",
     "bemtvi-snippets", "bemtvi-markdown-preview"];
   const loaded = await luaResult(
     `local r = {} for _, n in ipairs({${PLUGINS.map((p) => `"${p}"`).join(",")}}) do ` +
@@ -94,12 +95,13 @@ try {
   check("demo: all first-party plugins loaded from the bundle",
     PLUGINS.every((p) => loaded.includes(`${p}=true`)), `loaded=${loaded}`);
 
-  // 2. catppuccin mocha applied — Normal highlight carries the mocha palette.
+  // 2. The demo config picks no colorscheme, so the editor's own `bemtvi` scheme applies —
+  //    Normal carries its palette.
   const normal = await luaResult(
     'local h = vim.api.nvim_get_hl(0, { name = "Normal" }); ' +
     'return string.format("%06x/%06x", h.fg or 0, h.bg or 0)');
-  check("demo: catppuccin (mocha) applied — Normal = #cdd6f4 / #1e1e2e",
-    /cdd6f4\/1e1e2e/.test(normal), `Normal fg/bg=${normal}`);
+  check("demo: the bundled bemtvi scheme applied — Normal = #e2e8e8 / #1e1e24",
+    /e2e8e8\/1e1e24/.test(normal), `Normal fg/bg=${normal}`);
 
   // 3. The statusline renders — bemtvi-line projected styled status segments (incl. the NORMAL
   //    mode label) into the redraw frame the client paints.
@@ -224,6 +226,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — first-party plugin set + catppuccin amalgamated, sourced in the demo build, demo init.lua loads all plugins, theme applies, statusline renders, python LSP configured"
+  ? "\nALL PASS — first-party plugin set amalgamated, sourced in the demo build, demo init.lua loads all plugins, theme applies, statusline renders, python LSP configured"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

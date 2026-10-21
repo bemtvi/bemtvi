@@ -586,9 +586,6 @@ impl EditHost {
         // directory / `*Cmd`-matched open to the explorer's `BufReadCmd` handler. Cheap:
         // a version check that only rebuilds when the registry changed.
         self.refresh_au_events();
-        for hl in self.lua.take_highlights() {
-            self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
-        }
         // The two quickfix sandbox surfaces, drained **before** the list writes
         // below: both configure how those writes are parsed and rendered, so a
         // single chunk that installs one and then populates a list has to see its
@@ -605,9 +602,9 @@ impl EditHost {
         if let Some(src) = self.lua.take_qf_text() {
             self.editor.set_qf_text(src);
         }
-        // The program-ordered queue: the `vim.cmd` ex-commands, the `setqflist` /
-        // `setloclist` writes, and the named-list show/drop ops, replayed in the order
-        // the chunk wrote them. They share one queue because their relative order is
+        // The program-ordered queue: the `vim.cmd` ex-commands, the highlight-group
+        // definitions, the `setqflist` / `setloclist` writes, and the named-list
+        // show/drop ops, replayed in the order the chunk wrote them. They share one queue because their relative order is
         // load-bearing in both directions — a chunk that fills a list and *then* opens
         // it (`vim.fn.setloclist(0, …)` then `vim.cmd("lopen")`) needs the write first,
         // and one that closes a window and *then* re-shows a named list needs the
@@ -616,6 +613,9 @@ impl EditHost {
         for effect in self.lua.take_sequenced() {
             match effect {
                 Sequenced::Command(cmd) => self.editor.command(&cmd),
+                Sequenced::Highlight(hl) => {
+                    self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl))
+                }
                 Sequenced::QfSet(op) => self.apply_qf_set_op(op),
                 Sequenced::NamedList(NamedListOp::Show(name)) => self.editor.named_list_show(&name),
                 Sequenced::NamedList(NamedListOp::Drop(name)) => self.editor.named_list_drop(&name),
@@ -4891,10 +4891,9 @@ impl EditHost {
 
         // A segment's `render` may DEFINE highlight groups and reference them in the
         // cells it just published — a powerline statusline (bemtvi-line) lazily creates
-        // its separator/transition groups this way. `take_highlights` ran at the top of
-        // `run_pending`, before these renders, so those defines are still queued; fold
-        // them now so the redraw that projects these cells resolves their colours on the
-        // first frame. Without this they resolve to the base look for one tick — an
+        // its separator/transition groups this way. The effects drain ran before these
+        // renders, so those defines are still queued; fold just them now so the redraw
+        // that projects these cells resolves their colours on the first frame. Without this they resolve to the base look for one tick — an
         // uncoloured-separator flicker until the next tick folds them.
         for hl in self.lua.take_highlights() {
             self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));

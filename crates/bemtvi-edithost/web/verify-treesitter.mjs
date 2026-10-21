@@ -167,10 +167,10 @@ try {
     }
     return { foo: null, bar: null };
   })();
-  // colorFor: variable → #abb2bf, type → #e5c07b.
+  // colorFor under the default `bemtvi` scheme: variable → #e2e8e8, type → #f4e472.
   check(
     "lua-match: TitleCase identifier is a type, lowercase stays a variable",
-    idColors.bar === "#e5c07b" && idColors.foo === "#abb2bf",
+    idColors.bar === "#f4e472" && idColors.foo === "#e2e8e8",
     JSON.stringify(idColors),
   );
 

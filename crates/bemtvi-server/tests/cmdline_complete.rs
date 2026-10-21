@@ -1054,8 +1054,9 @@ async fn colorscheme_arg_completes_scheme_names() {
     let items = menu_items(&map);
     // The runtimepath scheme (discovered via the `colors/*.lua` glob)…
     assert!(items.contains(&"mytheme".to_string()), "items: {items:?}");
-    // …and the scheme bundled in the binary (injected as `btv._builtin_colorschemes`).
+    // …and the schemes bundled in the binary (injected as `btv._builtin_colorschemes`).
     assert!(items.contains(&"bemtvi".to_string()), "items: {items:?}");
+    assert!(items.contains(&"neutral".to_string()), "items: {items:?}");
     // Context switched — no command names.
     assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
 

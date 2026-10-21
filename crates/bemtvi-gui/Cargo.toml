@@ -62,6 +62,11 @@ bemtvi-server = { workspace = true, features = ["native"] }
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true
 
+[dev-dependencies]
+# The shared black-box test harness: `tests/fallback_palette.rs` starts a real server
+# and loads the `bemtvi` colorscheme, to check the GUI's built-in colours against it.
+bemtvi-test-harness.workspace = true
+
 # `kill(2)` in the signal e2e test: the killed binary must still run its exit
 # sequence (`tests/signal_exit.rs`).
 [target.'cfg(unix)'.dev-dependencies]

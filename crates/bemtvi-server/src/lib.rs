@@ -2301,8 +2301,12 @@ impl EditHost {
         // Then `UIEnter`, in the native order (startup first, the client second). The
         // browser's UI is already attached — `eh_new` did it before the config was
         // sourced — so firing it here is what gives a config or plugin the same chance
-        // to subscribe that it has natively.
+        // to subscribe that it has natively. The default colorscheme lands just before
+        // it, as on a native truecolor attach: the config has been sourced by now, so
+        // a scheme it chose has already won, and a canvas always paints 24-bit color.
         if self.ui.is_some() {
+            self.apply_default_colorscheme();
+            self.run_pending();
             self.fire_ui_enter();
         }
     }

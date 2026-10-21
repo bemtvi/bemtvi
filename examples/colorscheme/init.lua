@@ -5,16 +5,19 @@
 --     BEMTVI_CONFIG=examples/colorscheme \
 --       cargo run -p bemtvi -- examples/colorscheme/sample.rs
 --
--- bemtvi ships its own One Dark colorscheme — the truecolor sibling of the look
--- the GUI and the browser edit-host paint by default — so a plain terminal can
--- reach the same colors with no plugin, no download, and no config at all.
+-- bemtvi ships its own colorscheme, drawn from the app icon: a bem-te-vi's charcoal
+-- cap is the background, its lemon belly marks the chrome (the mode badge, the
+-- current search match), and the syntax roles follow catppuccin's (mauve keywords,
+-- blue functions, green strings, yellow types). It needs no plugin, no download, and
+-- no config at all.
 --
--- ON A TRUECOLOR TERMINAL IT LOADS AUTOMATICALLY. When the terminal advertises
--- 24-bit color (via `COLORTERM=truecolor`/`24bit`, which every modern terminal
--- exports), bemtvi defaults the `bemtvi` scheme in at startup — you get real
--- colors on a fresh install with an empty config. Your config still wins: set
--- `vim.cmd.colorscheme('...')` in `init.lua` and that scheme is used instead,
--- never overridden. A 256-color / legacy terminal keeps its own tuned palette
+-- IT LOADS AUTOMATICALLY, in the GUI, in the browser, and on a truecolor terminal:
+-- every client gets the same default from the same place, the editor loading this
+-- bundled scheme when the config picks none. A terminal counts as truecolor when it
+-- advertises 24-bit color (via `COLORTERM=truecolor`/`24bit`, which every modern
+-- terminal exports) — you get real colors on a fresh install with an empty config.
+-- Your config still wins: set `vim.cmd.colorscheme('...')` in `init.lua` and that
+-- scheme is used instead, never overridden. A 256-color / legacy terminal keeps its own tuned palette
 -- (a downgraded truecolor scheme reads worse than the terminal's ANSI set).
 --
 -- So the line below is REDUNDANT on a truecolor terminal — it's here only to
@@ -27,10 +30,13 @@
 -- on a fresh install. A user `colors/bemtvi.lua` on the runtimepath still wins,
 -- so you can fork the palette by dropping your own file there.
 --
+-- A second scheme ships alongside it: `neutral`, a One Dark palette.
+--
 -- TRY IT interactively:
 --   :colorscheme bemtvi        load it live
 --   :hi clear                 strip it back to the terminal's own colors
 --   :colorscheme bemtvi        bring it back
+--   :colorscheme neutral       switch to the bundled One Dark scheme
 --
 -- The scheme needs a treesitter grammar installed to light up syntax; install
 -- the Rust parser once with `:TSInstall rust` (see examples/ts-install) so the

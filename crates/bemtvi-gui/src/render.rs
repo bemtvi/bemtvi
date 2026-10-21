@@ -46,30 +46,45 @@ use unicode_width::UnicodeWidthStr;
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
 use crate::{GlyphOverflow, GuiConfig};
 
-/// Fallback colors when no colorscheme resolved a style — a light grey on a
-/// near-black ground, the GUI's equivalent of the TUI's built-in default theme.
-const DEFAULT_FG: u32 = 0xc0_c0_c0;
-const DEFAULT_BG: u32 = 0x10_10_10;
-/// Dim grey for the number gutter when the theme leaves `LineNr` unset.
-const DEFAULT_LINE_NR: u32 = 0x60_60_60;
-/// Built-in diagnostic underline colors by severity (1=error … 4=hint), used when
-/// the colorscheme leaves the `DiagnosticUnderline*` groups unset — the GUI
-/// truecolor analogue of the TUI's ANSI severity fallbacks.
-const DIAG_ERROR: u32 = 0xe0_6c_75;
-const DIAG_WARN: u32 = 0xe5_c0_7b;
-const DIAG_INFO: u32 = 0x56_b6_c2;
-const DIAG_HINT: u32 = 0x80_80_80;
-/// Built-in inlay-hint color when the colorscheme leaves `LspInlayHint` unset — a
-/// dim grey (neovim links `LspInlayHint` to a comment-like dimming by default).
-/// The GUI truecolor analogue of the TUI's `Color::DarkGray` fallback.
-pub const DEFAULT_INLAY: u32 = 0x80_80_80;
+// The built-in colours, for a group the colorscheme leaves unset: the `bemtvi`
+// colorscheme's own values (crates/bemtvi-server/runtime/colors/bemtvi.lua), the
+// editor's default, which the server also loads when the config picks no scheme. Each
+// constant names the group it stands in for; `tests/fallback_palette.rs` resolves that
+// group through the real scheme and fails when the two disagree, so a colour changed
+// in the scheme cannot quietly drift here.
+
+/// `Normal` fg.
+pub const DEFAULT_FG: u32 = 0xe2_e8_e8;
+/// `Normal` bg.
+pub const DEFAULT_BG: u32 = 0x1e_1e_24;
+/// `LineNr` fg: the number gutter.
+pub const DEFAULT_LINE_NR: u32 = 0x4f_52_5d;
+/// `DiagnosticUnderline{Error,Warn,Info,Hint}` sp, by severity (1=error … 4=hint).
+pub const DIAG_ERROR: u32 = 0xf0_8a_7e;
+pub const DIAG_WARN: u32 = 0xf4_e4_72;
+pub const DIAG_INFO: u32 = 0x8e_d3_e3;
+pub const DIAG_HINT: u32 = 0x94_d7_c0;
+/// `LspInlayHint` fg.
+pub const DEFAULT_INLAY: u32 = 0x63_67_73;
+/// `WinSeparator` fg: the split lines.
+pub const DEFAULT_WIN_SEPARATOR: u32 = 0x121216;
+/// `Visual` bg: the selection.
+pub const DEFAULT_VISUAL_BG: u32 = 0x47_32_29;
+/// `Search` bg: every `hlsearch` match.
+pub const DEFAULT_SEARCH_BG: u32 = 0x58_48_25;
+/// `IncSearch` bg: the live match while typing a search.
+pub const DEFAULT_INCSEARCH_BG: u32 = 0xf9_e9_31;
+/// `ErrorMsg` fg.
+pub const DEFAULT_ERROR_MSG: u32 = 0xf0_8a_7e;
+/// `StatusLine` bg: the status and tab bars.
+pub const DEFAULT_STATUS_BG: u32 = 0x18_18_1d;
 /// Line height as a multiple of the font size.
 const LINE_SPACING: f32 = 1.30;
-/// The multi-cursor accent (a warm amber): the active (primary) cursor's color in
-/// MultiCursor placement mode, and the secondary cursors' underline tint in
-/// insert/replace mode, so every multi-cursor decoration reads as one family.
-/// Mirrors the TUI's `MULTICURSOR_ACCENT`.
-const MULTICURSOR_ACCENT: u32 = 0xe5_c0_7b;
+/// The multi-cursor accent: the active (primary) cursor's color in MultiCursor
+/// placement mode, and the secondary cursors' underline tint in insert/replace mode,
+/// so every multi-cursor decoration reads as one family. It is the current-match
+/// colour (`CurSearch` bg, the `bemtvi` lemon), like the web client's `--accent`.
+pub const MULTICURSOR_ACCENT: u32 = 0xf9_e9_31;
 /// The width of a picker filter row's `include` / `exclude` label, including its
 /// trailing gap — the column that box's text and caret start at. The TUI and web
 /// clients use the same width so the three look alike.
@@ -1026,7 +1041,7 @@ impl Renderer {
             style_fg(&view.win_separator)
                 .or_else(|| style_bg(&view.win_separator))
                 .or_else(|| style_bg(&view.status_line))
-                .unwrap_or(0x40_40_40),
+                .unwrap_or(DEFAULT_WIN_SEPARATOR),
         );
         let mut line = |px: f32, py: f32, w: f32, h: f32| {
             quads.push(Quad {
@@ -1354,9 +1369,9 @@ impl Renderer {
                         });
                     }
                 }
-                let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
-                let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
-                let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
+                let sel_bg = style_bg(&view.visual).unwrap_or(DEFAULT_VISUAL_BG);
+                let search_bg = style_bg(&view.search_style).unwrap_or(DEFAULT_SEARCH_BG);
+                let inc_bg = style_bg(&view.incsearch_style).unwrap_or(DEFAULT_INCSEARCH_BG);
                 // The cursor's band row tracks the interpolated slide, so relative
                 // numbers stay in step with the moving text and the selection's
                 // moving edge clips to it (see `sel_clip`). `numbers` at that band
@@ -1587,8 +1602,8 @@ impl Renderer {
                 // dragged to its minimum) then truncates instead of bleeding its line
                 // numbers over the separator and the neighbouring region.
                 let win_clip = self.text_bounds(ox, oy, wcols, text_rows);
-                let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
-                let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
+                let sel_bg = style_bg(&view.visual).unwrap_or(DEFAULT_VISUAL_BG);
+                let search_bg = style_bg(&view.search_style).unwrap_or(DEFAULT_SEARCH_BG);
                 // This window's `'winhighlight'` override of `Normal` (else global),
                 // so a dock with `winhighlight = 'Normal:NormalSB'` paints its own bg.
                 let normal_bg = style_bg(&win.normal(view)).unwrap_or(DEFAULT_BG);
@@ -1722,7 +1737,8 @@ impl Renderer {
                     }
                     // The live incsearch preview match rides on top of `hlsearch`.
                     if let Some(Some(span)) = win.incsearch.get(i) {
-                        let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
+                        let inc_bg =
+                            style_bg(&view.incsearch_style).unwrap_or(DEFAULT_INCSEARCH_BG);
                         self.push_span_quad(
                             quads,
                             text_x0,
@@ -2227,10 +2243,10 @@ impl Renderer {
                     .unwrap_or(DEFAULT_FG),
             )
         } else if !view.message.is_empty() {
-            // An error message paints with the theme's `ErrorMsg` foreground (a plain
-            // red when the colorscheme leaves it undefined); else the default fg.
+            // An error message paints with the theme's `ErrorMsg` foreground (the
+            // built-in one when the colorscheme leaves it undefined); else the default fg.
             let fg = if view.message_error {
-                style_fg(&view.error_msg).unwrap_or(0xff_55_55)
+                style_fg(&view.error_msg).unwrap_or(DEFAULT_ERROR_MSG)
             } else {
                 style_fg(&view.normal).unwrap_or(DEFAULT_FG)
             };
@@ -4530,16 +4546,18 @@ pub fn apply_search_fg(
     out
 }
 
-/// Built-in syntax color for a treesitter capture `group` when no colorscheme
+/// Built-in syntax style for a treesitter capture `group` when no colorscheme
 /// resolved it (`style_id` is `None`) — the GUI's truecolor analogue of the TUI's
 /// `group_style`, so a buffer highlights even with no colorscheme loaded. Keys off
-/// the group's major component (before the first `.`), in One Dark hues that match
-/// the `DIAG_*` fallbacks already used here. An unmapped group returns the default
-/// [`Style`] (everything unset), which leaves the run on the editor's own `fg`.
+/// the group's major component (before the first `.`), in the `bemtvi` colorscheme's
+/// own colours like the constants above: each arm is what that scheme resolves the
+/// capture to (`tests/fallback_palette.rs` checks it). An unmapped group returns the
+/// default [`Style`] (everything unset), which leaves the run on the editor's own `fg`.
 ///
 /// Returning a `Style` rather than a colour pair is what lets the caller treat a
 /// resolved colorscheme style and this fallback as the same thing — and what lets
-/// an arm carry an attribute (`SpecialKey`'s bold) the way `group_style` does.
+/// an arm carry an attribute (a comment's italic, `SpecialKey`'s bold) the way
+/// `group_style` does.
 pub fn group_fallback(group: &str) -> Style {
     // A leading `@` comes off first: a span carries the highlight *group* a capture
     // is painted through (`@keyword.import`), and the families below are the captures.
@@ -4548,36 +4566,33 @@ pub fn group_fallback(group: &str) -> Style {
         .split('.')
         .next()
         .unwrap_or(group);
+    let styled = |fg: u32, italic: bool, bold: bool| Style {
+        fg: Some(fg),
+        italic,
+        bold,
+        ..Default::default()
+    };
     let fg = match major {
         "keyword" | "conditional" | "repeat" | "include" | "exception" | "keyword_operator" => {
-            0xc6_78_dd
-        } // purple
-        "function" | "method" => 0x61_af_ef, // blue
-        "constructor" | "type" | "namespace" | "module" => 0xe5_c0_7b, // yellow
-        "string" | "character" => 0x98_c3_79, // green
-        "number" | "boolean" | "float" | "constant" => 0x56_b6_c2, // cyan
-        "attribute" | "label" | "property" | "field" => 0x56_b6_c2, // cyan
-        "comment" => {
-            return Style {
-                fg: Some(0x5c_63_70), // grey, italic
-                italic: true,
-                ..Default::default()
-            };
-        }
-        "tag" => 0xe0_6c_75,                      // red
-        "operator" | "punctuation" => 0xab_b2_bf, // grey
+            0x5f_a8_6c
+        } // forest
+        "function" | "method" | "tag" => 0xfb_8c_3c, // orange
+        "constructor" | "type" => 0xf4_e4_72,        // yellow
+        "namespace" | "module" => return styled(0xf4_e4_72, true, false),
+        "string" => 0x83_a7_ea,    // cornflower
+        "character" => 0x94_d7_c0, // teal
+        "number" | "boolean" | "float" | "constant" | "attribute" => 0xf0_b3_5c, // peach
+        "label" => 0x7f_be_df,     // sapphire
+        "property" | "field" => 0xdc_a0_7a, // maroon
+        "comment" => return styled(0x8d_92_9d, true, false),
+        "operator" => 0x8e_d3_e3,    // sky
+        "punctuation" => 0x8d_92_9d, // overlay2
         // The `^X` / `<xx>` overlay on an unprintable control char, when no
         // colorscheme defines `SpecialKey`: a standout bold foreground so the token
         // reads as "this isn't ordinary text" (vim's `SpecialKey` look, and what the
         // bundled colorscheme paints it). The TUI's `group_style` has the same arm —
         // without it here the same buffer read as plain text in the GUI only.
-        "SpecialKey" => {
-            return Style {
-                fg: Some(0xd6_5d_ff), // bright magenta, bold
-                bold: true,
-                ..Default::default()
-            };
-        }
+        "SpecialKey" => return styled(0xeb_aa_b9, false, true),
         _ => return Style::default(),
     };
     Style {
@@ -5549,7 +5564,7 @@ fn status_bar_colors(view: &View, focused: bool) -> (u32, u32) {
     };
     let bg = style_bg(bar)
         .or_else(|| style_bg(&view.status_line))
-        .unwrap_or(0x2a_2a_2a);
+        .unwrap_or(DEFAULT_STATUS_BG);
     let fg = style_fg(bar)
         .or_else(|| style_fg(&view.status_line))
         .unwrap_or(DEFAULT_FG);
@@ -5558,7 +5573,7 @@ fn status_bar_colors(view: &View, focused: bool) -> (u32, u32) {
 
 impl TablineColors {
     fn resolve(view: &View) -> Self {
-        let status_bg = style_bg(&view.status_line).unwrap_or(0x1a_1a_1a);
+        let status_bg = style_bg(&view.status_line).unwrap_or(DEFAULT_STATUS_BG);
         let status_fg = style_fg(&view.status_line).unwrap_or(DEFAULT_FG);
         Self {
             fill_bg: style_bg(&view.tabline_fill).unwrap_or(status_bg),

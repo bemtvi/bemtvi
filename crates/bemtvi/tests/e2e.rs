@@ -450,7 +450,7 @@ fn catppuccin_repaints_the_editor_in_truecolor() {
 }
 
 /// The zero-config payoff: on a **truecolor** terminal, with an *empty* config,
-/// bemtvi defaults its bundled `bemtvi` One Dark colorscheme in at startup — the
+/// bemtvi defaults its bundled `bemtvi` colorscheme in at startup — the
 /// client detects 24-bit support (`COLORTERM=truecolor`), reports it on attach, and
 /// the server auto-loads the scheme, so plain text paints in the theme's `Normal`.
 /// Fully hermetic (the scheme is baked into the binary — no plugin checkout): the
@@ -477,9 +477,9 @@ fn truecolor_terminal_defaults_in_the_bemtvi_colorscheme() {
         24,
     );
 
-    // bemtvi One Dark: Normal foreground #abb2bf, background #282c34.
-    let text_fg = vt100::Color::Rgb(0xab, 0xb2, 0xbf);
-    let base_bg = vt100::Color::Rgb(0x28, 0x2c, 0x34);
+    // bemtvi: Normal foreground #e2e8e8, background #1e1e24.
+    let text_fg = vt100::Color::Rgb(0xe2, 0xe8, 0xe8);
+    let base_bg = vt100::Color::Rgb(0x1e, 0x1e, 0x24);
     let themed = |scr: &vt100::Screen| {
         (0..80).any(|col| {
             scr.cell(0, col).is_some_and(|c| {

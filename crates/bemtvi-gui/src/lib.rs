@@ -61,7 +61,10 @@ pub use session::{
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
 pub use render::{
     inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay, split_at_char,
-    virt_inline_shift, with_preedit, Seg, DEFAULT_INLAY,
+    virt_inline_shift, with_preedit, Seg, DEFAULT_BG, DEFAULT_ERROR_MSG, DEFAULT_FG,
+    DEFAULT_INCSEARCH_BG, DEFAULT_INLAY, DEFAULT_LINE_NR, DEFAULT_SEARCH_BG, DEFAULT_STATUS_BG,
+    DEFAULT_VISUAL_BG, DEFAULT_WIN_SEPARATOR, DIAG_ERROR, DIAG_HINT, DIAG_INFO, DIAG_WARN,
+    MULTICURSOR_ACCENT,
 };
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.

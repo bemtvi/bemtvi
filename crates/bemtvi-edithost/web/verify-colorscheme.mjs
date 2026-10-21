@@ -6,7 +6,8 @@
 // capture groups via `view.theme` (fed to the JS highlighter). This drives the real
 // wasm edit-host in headless Chromium and asserts both halves recolor when a scheme is
 // loaded — using `nvim_set_hl` directly, so it tests the colorscheme-agnostic mechanism
-// (the same path `require("catppuccin").load()` drives).
+// (the same path any colorscheme drives). A fresh session must already be on the bundled
+// `bemtvi` scheme, the default every client gets from the server.
 //
 //   node verify-colorscheme.mjs
 import { chromium } from "playwright";
@@ -71,16 +72,22 @@ try {
   await page.evaluate(() => window.__bemtvi.feed(":e demo.rs<CR>"));
   await page.evaluate(() => window.__bemtvi.feed("ggdGifn main() {}<Esc>"));
 
-  // ---- 1. Before any colorscheme: the built-in One Dark family ----
+  // ---- 1. With no colorscheme chosen: the server's bundled `bemtvi` scheme ----
+  // The same default every client gets: a config that picks no scheme lands on
+  // runtime/colors/bemtvi.lua, loaded server-side, not on the page's own CSS.
   const kwBefore = await tokenColor(page, "fn");
   const fnBefore = await tokenColor(page, "main");
-  check("default: `fn` is One Dark keyword (#c678dd)", kwBefore === "#c678dd", kwBefore);
-  check("default: `main` is One Dark function (#61afef)", fnBefore === "#61afef", fnBefore);
+  check("default: `fn` is the bemtvi keyword green (#5fa86c)", kwBefore === "#5fa86c", kwBefore);
+  check("default: `main` is the bemtvi function orange (#fb8c3c)", fnBefore === "#fb8c3c", fnBefore);
   const bgBefore = await page.evaluate(() => getComputedStyle(document.getElementById("grid")).backgroundColor);
-  check("default: editor bg is the One Dark default (#1e2127)", bgBefore === "rgb(30, 33, 39)", bgBefore);
+  check("default: editor bg is the bemtvi base (#1e1e24)", bgBefore === "rgb(30, 30, 36)", bgBefore);
+  const scheme = await page.evaluate(() => window.__bemtvi.execLua("return vim.g.colors_name").then((r) => r.result));
+  check("default: g:colors_name records the bundled scheme", /bemtvi/.test(String(scheme)), String(scheme));
 
   // ---- 2. Load a colorscheme (the catppuccin-mocha-ish palette, set directly) ----
+  // `:hi clear` first, so this palette replaces the default instead of layering on it.
   await page.evaluate(() => window.__bemtvi.execLua(
+    "vim.cmd('hi clear')\n" +
     "vim.api.nvim_set_hl(0, 'Normal',    { fg = '#cdd6f4', bg = '#1e1e2e' })\n" +
     "vim.api.nvim_set_hl(0, 'Visual',    { bg = '#414155' })\n" +
     "vim.api.nvim_set_hl(0, '@keyword',  { fg = '#cba6f7' })\n" +   // mauve

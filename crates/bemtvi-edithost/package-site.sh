@@ -74,7 +74,7 @@ export const BUILD = {
   demoSeed: true,
 };
 EOF
-  # The recommended first-party plugin set + catppuccin, amalgamated into one preload bundle
+  # The recommended first-party plugin set, amalgamated into one preload bundle
   # (built from source — cloned at pinned commits; see build-plugins.sh). Idempotent: skipped
   # when already vendored. The blanket web/vendor copy above ships it.
   "$here/build-plugins.sh"

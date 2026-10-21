@@ -44,8 +44,8 @@ btv.test.describe("examples/colorscheme", function()
 
   btv.test.it("it defines real truecolor groups", function(t)
     open(t)
-    -- One Dark: a dark background and the syntax groups a scheme owes.
-    btv.test.expect(hl("Normal").bg).never.to_be_nil()
+    -- The icon's charcoal cap as the background, and the syntax groups a scheme owes.
+    btv.test.expect(hl("Normal").bg).to_be(0x1e1e24)
     for _, group in ipairs({ "Comment", "String", "Statement", "Type", "Identifier" }) do
       local def = hl(group)
       btv.test.expect(def.fg or def.bg or def.link).never.to_be_nil()
@@ -68,6 +68,14 @@ btv.test.describe("examples/colorscheme", function()
     t:cmd("colorscheme bemtvi")
     btv.test.expect(hl("Comment").fg).never.to_be_nil()
     btv.test.expect(btv.g.colors_name).to_be("bemtvi")
+  end)
+
+  -- ":colorscheme neutral  -> switch to the bundled One Dark scheme"
+  btv.test.it("try-it — :colorscheme neutral switches to One Dark", function(t)
+    open(t)
+    t:cmd("colorscheme neutral")
+    btv.test.expect(btv.g.colors_name).to_be("neutral")
+    btv.test.expect(hl("Normal").bg).to_be(0x282c34)
   end)
 
   -- "Your config still wins: set `vim.cmd.colorscheme('...')` and that scheme is

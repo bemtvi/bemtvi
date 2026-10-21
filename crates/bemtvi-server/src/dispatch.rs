@@ -123,15 +123,13 @@ impl EditHost {
                 let kbd = cap("keyboard_protocol");
                 self.keyboard_protocol = kbd;
                 self.keymaps.set_keyboard_protocol(kbd);
-                // `truecolor = true` says the terminal can show 24-bit color, so
-                // default in the bundled `bemtvi` colorscheme — a rich terminal reaches
-                // real colors with zero config. Only when the user's config hasn't
-                // already chosen a scheme (`g:colors_name`), so `:colorscheme foo` in
-                // `init.lua` (sourced before attach) still wins; and once we set it,
-                // `colors_name` is `"bemtvi"`, so a reconnect's re-attach won't reapply.
-                // A non-truecolor / 256-color terminal keeps its own tuned palette.
-                if cap("truecolor") && self.lua.get_global_var("colors_name").is_none() {
-                    self.set_colorscheme("bemtvi");
+                // `truecolor = true` says the client can show 24-bit color, so it gets
+                // the default colorscheme (see `apply_default_colorscheme`, shared with
+                // the browser's boot). A non-truecolor / 256-color terminal keeps its
+                // own tuned palette: the scheme is 24-bit, and a downgraded truecolor
+                // palette reads worse than the terminal's ANSI set.
+                if cap("truecolor") {
+                    self.apply_default_colorscheme();
                 }
                 // `osc52 = true` says the client's terminal accepts OSC 52 clipboard
                 // writes (it probed for them). That makes the terminal itself a usable

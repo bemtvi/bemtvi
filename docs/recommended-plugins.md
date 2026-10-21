@@ -10,7 +10,7 @@ On a brand-new setup bemtvi offers this set once, at startup:
 ╭──  Welcome to bemtvi  ────────────────────────────────────────╮
 │  bemtvi ships minimal by design — no bundled plugins.         │
 │                                                              │
-│  Install the recommended set? 12 plugins from github.com/…   │
+│  Install the recommended set? 11 plugins from github.com/…   │
 │                                                              │
 │    <CR>    Install all of them                               │
 │    c       Customize — see every plugin and pick individually │
@@ -45,7 +45,6 @@ the same docs are in the editor as `:help <plugin-name>`.
 
 | Plugin | What you get | Loaded |
 | ------ | ------------ | ------ |
-| [catppuccin](https://github.com/bemtvi/catppuccin-bemtvi) | The Catppuccin colorscheme, four flavours | at startup |
 | [bemtvi-line](https://github.com/bemtvi/bemtvi-line) | A lualine-style statusline | at startup |
 | [bemtvi-tree](https://github.com/bemtvi/bemtvi-tree) | The file-explorer sidebar | on `<leader>e` |
 | [bemtvi-keys-helper](https://github.com/bemtvi/bemtvi-keys-helper) | A which-key popup of what can follow the keys you typed | at startup |
@@ -63,11 +62,9 @@ press the key or run the command that triggers them.
 
 ### Appearance
 
-**[catppuccin](https://github.com/bemtvi/catppuccin-bemtvi)** — a native port of
-[catppuccin/nvim](https://github.com/catppuccin/nvim): the upstream palettes and
-highlight groups, rewritten against `btv.*`. Installed with
-`colorscheme catppuccin` already set; `:colorscheme` switches away any time. (bemtvi also
-runs unmodified **neovim** colorschemes, so this is a starting point, not a lock-in.)
+The colours need no plugin. bemtvi's own colorscheme, `bemtvi`, is built in and loads by
+default in the GUI, the browser and any truecolor terminal; `:colorscheme neutral` switches
+to the bundled One Dark, and any scheme a plugin installs is a `:colorscheme` away.
 
 **[bemtvi-line](https://github.com/bemtvi/bemtvi-line)** — configure it the way you'd
 configure `lualine.nvim`: sections `a`–`z`, a component library (mode, branch, diff,

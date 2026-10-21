@@ -617,19 +617,19 @@ async fn a_loaded_colorscheme_paints_resolved_styles_truecolor() {
     );
 }
 
-// One Dark hex values the bundled `:colorscheme bemtvi` sets, mirrored here as
+// One Dark hex values the bundled `:colorscheme neutral` sets, mirrored here as
 // the RGB the painted cells must carry once it loads (the same palette the GUI
 // and edit-host ship — proving the terminal reaches color parity).
 const ONEDARK_BG: Color = Color::Rgb(0x28, 0x2c, 0x34);
 const ONEDARK_KEYWORD: Color = Color::Rgb(0xc6, 0x78, 0xdd); // purple
 const ONEDARK_STRING: Color = Color::Rgb(0x98, 0xc3, 0x79); // green
 
-/// The bundled scheme, end to end through the real TUI: `:colorscheme bemtvi`
+/// A bundled scheme, end to end through the real TUI: `:colorscheme neutral`
 /// needs *no* runtimepath fixture (it's embedded in the binary), yet the real
 /// client paints the resolved One Dark styles — keyword foreground, string
 /// foreground, and the editor background.
 #[tokio::test]
-async fn the_builtin_bemtvi_colorscheme_paints_one_dark_in_the_terminal() {
+async fn the_builtin_neutral_colorscheme_paints_one_dark_in_the_terminal() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
     // `fn` is a keyword; `"hi"` is a string — both on row 0.
@@ -643,7 +643,7 @@ async fn the_builtin_bemtvi_colorscheme_paints_one_dark_in_the_terminal() {
         hl.first().is_some_and(|row| !row.is_empty())
     })
     .await;
-    feed(&rpc, ":colorscheme bemtvi<CR>");
+    feed(&rpc, ":colorscheme neutral<CR>");
 
     const GUTTER: u16 = 4; // hybrid number column, width 4 → text at col 4
     let (params, buf) = paint_until(&rpc, &mut incoming, |buf| {

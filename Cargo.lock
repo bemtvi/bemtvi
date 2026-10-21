@@ -436,6 +436,7 @@ dependencies = [
  "bemtvi-core",
  "bemtvi-rpc",
  "bemtvi-server",
+ "bemtvi-test-harness",
  "bemtvi-view",
  "clap",
  "cosmic-text",

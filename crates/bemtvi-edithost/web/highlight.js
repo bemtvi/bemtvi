@@ -75,51 +75,53 @@ const LINE_BACKGROUND_CAPTURES = new Set(['markup.raw.block']);
 // a `manifest.json` listing what's installed.
 const TS_DIR = ['.bemtvi', 'treesitter'];
 
-// Capture group → CSS, in the One Dark family the demo's chrome already uses. Keys
-// are matched most-specific first, then by trimming dotted suffixes (`function.call`
-// → `function`), so only the distinctive sub-cases need their own entry.
+// Capture group → CSS: the built-in `bemtvi` colorscheme (the editor's default,
+// crates/bemtvi-server/runtime/colors/bemtvi.lua), which the server also loads when the
+// config chooses no scheme. This is that scheme's copy for the moments the page has
+// none of its own: before the first frame, and for a capture the active scheme
+// doesn't colour. Every entry must be what `bemtvi` resolves the capture to, and a
+// capture `bemtvi` leaves plain has no entry; the server test `web_fallback_palette`
+// checks both. Keys are matched most-specific first, then by trimming dotted suffixes
+// (`function.call` → `function`), so only the distinctive sub-cases need their own entry.
 const FG = {
-  comment: '#5c6370',
-  keyword: '#c678dd', conditional: '#c678dd', repeat: '#c678dd', exception: '#c678dd', include: '#c678dd',
-  operator: '#56b6c2', 'keyword.operator': '#c678dd',
-  string: '#98c379', character: '#98c379', escape: '#56b6c2', 'string.escape': '#56b6c2', 'string.special': '#56b6c2',
-  number: '#d19a66', float: '#d19a66', boolean: '#d19a66',
-  constant: '#d19a66', 'constant.builtin': '#d19a66',
-  function: '#61afef', 'function.builtin': '#56b6c2', 'function.macro': '#56b6c2',
-  constructor: '#e5c07b',
-  type: '#e5c07b', 'type.builtin': '#e5c07b',
-  property: '#e06c75', field: '#e06c75', 'variable.member': '#e06c75',
-  variable: '#abb2bf', 'variable.parameter': '#abb2bf', parameter: '#abb2bf', 'variable.builtin': '#e06c75',
-  label: '#61afef',
-  punctuation: '#abb2bf', 'punctuation.bracket': '#abb2bf', 'punctuation.delimiter': '#abb2bf', 'punctuation.special': '#e06c75',
-  attribute: '#e5c07b', annotation: '#e5c07b',
-  namespace: '#e5c07b', module: '#e5c07b',
-  tag: '#e06c75', 'tag.attribute': '#d19a66', 'tag.delimiter': '#abb2bf',
-  'keyword.directive': '#c678dd',
+  comment: '#8d929d',
+  keyword: '#5fa86c', conditional: '#5fa86c', repeat: '#5fa86c', exception: '#5fa86c', include: '#5fa86c',
+  operator: '#8ed3e3', 'keyword.operator': '#5fa86c',
+  string: '#83a7ea', character: '#94d7c0', 'string.escape': '#ebaab9', 'string.special': '#83a7ea',
+  number: '#f0b35c', float: '#f0b35c', boolean: '#f0b35c',
+  constant: '#f0b35c', 'constant.builtin': '#f0b35c',
+  function: '#fb8c3c', 'function.builtin': '#f0b35c', 'function.macro': '#ebaab9',
+  constructor: '#f4e472',
+  type: '#f4e472', 'type.builtin': '#5fa86c',
+  property: '#dca07a', field: '#dca07a', 'variable.member': '#dca07a',
+  variable: '#e2e8e8', 'variable.parameter': '#e3787f', 'variable.builtin': '#f08a7e',
+  label: '#7fbedf',
+  punctuation: '#8d929d', 'punctuation.bracket': '#8d929d', 'punctuation.delimiter': '#8d929d', 'punctuation.special': '#ebaab9',
+  attribute: '#f0b35c',
+  namespace: '#f4e472', module: '#f4e472',
+  tag: '#fb8c3c', 'tag.attribute': '#f4e472', 'tag.delimiter': '#94d7c0',
+  'keyword.directive': '#5fa86c',
   // Markup captures — a markdown buffer (the block grammar plus everything the
-  // markdown_inline injection adds), mirroring the built-in colorscheme's `@markup.*`
-  // (crates/bemtvi-server/runtime/colors/bemtvi.lua) in the One Dark family above.
-  // Heading levels are spelled out rather than left to the `markup.heading` fallback so
-  // they step blue → cyan → green the way the real theme does. Emphasis is a *color*
-  // here: these spans carry a foreground and nothing else, so the bold/italic the theme
-  // uses for `@markup.strong` / `@markup.italic` can't render — they get distinct hues
-  // instead. `markup.raw.block` is deliberately ABSENT (see LINE_BACKGROUND_CAPTURES).
-  'markup.heading': '#61afef',
-  'markup.heading.1': '#61afef', 'markup.heading.2': '#61afef',
-  'markup.heading.3': '#56b6c2', 'markup.heading.4': '#56b6c2',
-  'markup.heading.5': '#98c379', 'markup.heading.6': '#98c379',
-  'markup.strong': '#e5c07b', 'markup.italic': '#c678dd', 'markup.strikethrough': '#5c6370',
-  'markup.raw': '#98c379',
-  'markup.link': '#56b6c2', 'markup.link.label': '#61afef', 'markup.link.url': '#56b6c2',
-  'markup.list': '#d19a66', 'markup.list.checked': '#98c379', 'markup.list.unchecked': '#5c6370',
-  'markup.quote': '#5c6370',
+  // markdown_inline injection adds). Heading levels are spelled out because the scheme
+  // gives each its own colour. Emphasis is a *color* here: these spans carry a
+  // foreground and nothing else, so the bold/italic the scheme adds can't render.
+  // `markup.raw.block` is deliberately ABSENT (see LINE_BACKGROUND_CAPTURES).
+  'markup.heading': '#fb8c3c',
+  'markup.heading.1': '#f4e472', 'markup.heading.2': '#f0b35c',
+  'markup.heading.3': '#b6d98b', 'markup.heading.4': '#7fbedf',
+  'markup.heading.5': '#dca07a', 'markup.heading.6': '#c9a6e4',
+  'markup.strong': '#dca07a', 'markup.italic': '#dca07a',
+  'markup.raw': '#83a7ea',
+  'markup.link': '#dca07a', 'markup.link.label': '#dca07a', 'markup.link.url': '#fb8c3c',
+  'markup.list': '#94d7c0', 'markup.list.checked': '#b6d98b', 'markup.list.unchecked': '#787d89',
+  'markup.quote': '#d8c2a8',
 };
 
 // The active colorscheme's syntax palette (`capture-name → CSS color`), bridged from
 // the core's highlight registry on the wasm build (server `theme` map → `index.html`
 // → here). Consulted by `colorFor` BEFORE the static `FG` fallback, so loading a
-// colorscheme (catppuccin, …) recolors code to match. `null` until a frame carries a
-// theme; an unthemed capture falls through to `FG` (the built-in One Dark family).
+// colorscheme recolors code to match. `null` until a frame carries a theme; an
+// unthemed capture falls through to `FG` (the built-in `bemtvi` scheme).
 let runtimeTheme = null;
 
 // Install the colorscheme syntax palette (or `null` to clear). The keys mirror `FG`'s

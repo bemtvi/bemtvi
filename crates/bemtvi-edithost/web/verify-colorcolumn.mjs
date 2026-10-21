@@ -75,8 +75,8 @@ try {
 
   // (The ruler colour comes from the `--colorcolumn` CSS var, which `applyChrome`
   // drives from the `ColorColumn` group on a colorscheme change — the same shared
-  // path as `--cursorline`, covered by verify-catppuccin. Unthemed, the ruler shows
-  // the built-in One Dark fallback tint asserted above.)
+  // path as `--cursorline`, covered by verify-colorscheme. Here it is the default
+  // `bemtvi` scheme's tint asserted above.)
 
   // Clearing the option removes the rulers.
   await page.evaluate(() => window.__bemtvi.execLua("vim.opt.colorcolumn = ''"));

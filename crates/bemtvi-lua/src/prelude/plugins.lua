@@ -2217,13 +2217,6 @@ M.RECOMMENDED_DOC_URL = "https://bemtvi.github.io/bemtvi/guide/recommended-plugi
 -- selene: allow(mixed_table)
 M._default_recommended = {
   {
-    "bemtvi/catppuccin-bemtvi",
-    tag = "v1.0.0",
-    name = "catppuccin",
-    desc = "Soothing pastel colorscheme",
-    config = [[ vim.cmd("colorscheme catppuccin") ]],
-  },
-  {
     "bemtvi/bemtvi-line",
     tag = "v1.0.0",
     desc = "Configurable statusline (lualine)",

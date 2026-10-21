@@ -81,15 +81,16 @@ try {
     frame.virt.some((v) => Array.isArray(v) && String(v[0]).includes("boom") && v[1] === 1),
     `frame.diagnostics_virt=${JSON.stringify(frame.virt)}`);
 
-  // (c) DOM: a span actually paints the wavy underline in the error colour (#e06c75).
+  // (c) DOM: a span actually paints the wavy underline in the error colour, the
+  //     default `bemtvi` scheme's `DiagnosticUnderlineError` (#f08a7e).
   const decos = await page.evaluate(() =>
     [...document.querySelectorAll("#grid .win .row span[style]")]
       .map((s) => s.getAttribute("style").toLowerCase())
       .filter((st) => st.includes("underline") && st.includes("wavy")));
   check("diag: the squiggle (underline wavy) painted in the DOM",
     decos.length >= 1, `wavy spans=${JSON.stringify(decos)}`);
-  check("diag: the squiggle used the Error severity colour (#e06c75)",
-    decos.some((st) => st.includes("#e06c75")), `wavy spans=${JSON.stringify(decos)}`);
+  check("diag: the squiggle used the Error severity colour (#f08a7e)",
+    decos.some((st) => st.includes("#f08a7e")), `wavy spans=${JSON.stringify(decos)}`);
 
   // (d) DOM: the trailing virtual-text message actually rendered.
   const texts = await page.evaluate(() =>

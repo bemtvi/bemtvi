@@ -1477,12 +1477,14 @@ function vim.fn.hlexists(name)
   return btv.hl.exists(name) and 1 or 0
 end
 
--- The slot -> source-group chain `btv.hl.palette` resolves, and the One Dark literal
--- each chain ends in. The literals ARE the built-in `bemtvi` colorscheme's palette, so
--- a session with no colorscheme loaded still reads as the editor's own theme rather
--- than as some foreign plugin default. Kept above the docstring so the generated book
--- page stays attached to the function (the generator takes the comment block
--- immediately above a definition).
+-- The slot -> source-group chain `btv.hl.palette` resolves, and the literal each chain
+-- ends in. The literals ARE what the built-in `bemtvi` colorscheme gives each chain (the
+-- editor's default, and the look every client paints when no colorscheme is loaded), so
+-- such a session still reads as the editor's own theme rather than as some foreign
+-- plugin default. The server test `hl_palette_with_no_scheme_is_the_bemtvi_palette`
+-- keeps the two equal. Kept above the docstring so the generated book page stays
+-- attached to the function (the generator takes the comment block immediately above a
+-- definition).
 --
 -- A chain lists the canonical groups that carry that hue in vim's own group
 -- vocabulary, most specific first. `Error` is deliberately absent from `red`: vim's
@@ -1490,25 +1492,25 @@ end
 -- accent derived from it.
 local PALETTE_SLOTS = {
   -- surfaces
-  { "bg", { { "Normal", "bg" } }, "#282c34" },
-  { "bg_alt", { { "NormalFloat", "bg" }, { "StatusLine", "bg" } }, "#21252b" },
-  { "bg_cursorline", { { "CursorLine", "bg" } }, "#2c313a" },
-  { "bg_sel", { { "Visual", "bg" } }, "#3e4451" },
+  { "bg", { { "Normal", "bg" } }, "#1e1e24" },
+  { "bg_alt", { { "NormalFloat", "bg" }, { "StatusLine", "bg" } }, "#18181d" },
+  { "bg_cursorline", { { "CursorLine", "bg" } }, "#28282f" },
+  { "bg_sel", { { "Visual", "bg" } }, "#473229" },
   -- text
-  { "fg", { { "Normal", "fg" } }, "#abb2bf" },
-  { "muted", { { "Comment", "fg" }, { "LineNr", "fg" }, { "NonText", "fg" } }, "#5c6370" },
+  { "fg", { { "Normal", "fg" } }, "#e2e8e8" },
+  { "muted", { { "Comment", "fg" }, { "LineNr", "fg" }, { "NonText", "fg" } }, "#8d929d" },
   -- accents
   {
     "red",
     { { "DiagnosticError", "fg" }, { "ErrorMsg", "fg" }, { "Exception", "fg" } },
-    "#e06c75",
+    "#f08a7e",
   },
-  { "green", { { "String", "fg" }, { "DiagnosticOk", "fg" } }, "#98c379" },
-  { "yellow", { { "Type", "fg" }, { "DiagnosticWarn", "fg" }, { "WarningMsg", "fg" } }, "#e5c07b" },
-  { "blue", { { "Function", "fg" }, { "Directory", "fg" }, { "Title", "fg" } }, "#61afef" },
-  { "purple", { { "Keyword", "fg" }, { "Statement", "fg" }, { "PreProc", "fg" } }, "#c678dd" },
-  { "cyan", { { "Operator", "fg" }, { "Special", "fg" }, { "DiagnosticInfo", "fg" } }, "#56b6c2" },
-  { "orange", { { "Constant", "fg" }, { "Number", "fg" }, { "Boolean", "fg" } }, "#d19a66" },
+  { "green", { { "String", "fg" }, { "DiagnosticOk", "fg" } }, "#83a7ea" },
+  { "yellow", { { "Type", "fg" }, { "DiagnosticWarn", "fg" }, { "WarningMsg", "fg" } }, "#f4e472" },
+  { "blue", { { "Function", "fg" }, { "Directory", "fg" }, { "Title", "fg" } }, "#fb8c3c" },
+  { "purple", { { "Keyword", "fg" }, { "Statement", "fg" }, { "PreProc", "fg" } }, "#5fa86c" },
+  { "cyan", { { "Operator", "fg" }, { "Special", "fg" }, { "DiagnosticInfo", "fg" } }, "#8ed3e3" },
+  { "orange", { { "Constant", "fg" }, { "Number", "fg" }, { "Boolean", "fg" } }, "#f0b35c" },
 }
 
 -- `btv.hl.palette()` -> the ACTIVE colorscheme's semantic palette, as a table of
@@ -1518,9 +1520,11 @@ local PALETTE_SLOTS = {
 -- same one) is loaded.
 --
 -- Each slot resolves through a chain of the canonical vim/treesitter groups that carry
--- that hue, most specific first, falling back to the built-in `bemtvi` (One Dark)
--- value when the active theme defines none of them — so a bare session with no
--- colorscheme still lands on the editor's own colors:
+-- that hue, most specific first, falling back to the built-in `bemtvi` colorscheme's
+-- value when the active theme defines none of them — the editor's default look, so a
+-- bare session still lands on the editor's own colors. The slot names are the
+-- *roles* (`purple` is the keyword hue, `green` the string hue), whatever colour the
+-- running theme gives them:
 --
 -- ```
 -- SURFACES

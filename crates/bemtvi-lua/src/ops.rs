@@ -1577,16 +1577,19 @@ pub enum NamedListOp {
 }
 
 /// One queued effect whose position relative to the others in this queue is
-/// **program order**: an ex-command from `vim.cmd`, a `setqflist`/`setloclist`
-/// write, or a named-list show/drop. The three used to be separate buckets drained
-/// one after another, which silently reordered the chunk that wrote them — the
-/// natural "fill a list, then open it" (`vim.fn.setloclist(0, …)` then
-/// `vim.cmd("lopen")`) ran the open *first*, against an empty list, and the write
-/// then landed on the freshly-focused display window. Sharing one queue makes the
-/// order they were written in the order they run.
+/// **program order**: an ex-command from `vim.cmd`, a highlight-group definition, a
+/// `setqflist`/`setloclist` write, or a named-list show/drop. These used to be
+/// separate buckets drained one after another, which silently reordered the chunk
+/// that wrote them — the natural "fill a list, then open it"
+/// (`vim.fn.setloclist(0, …)` then `vim.cmd("lopen")`) ran the open *first*, against
+/// an empty list, and a colorscheme's `vim.cmd("hi clear")` ran *after* the
+/// `nvim_set_hl` calls that follow it, wiping every group the scheme had just defined.
+/// Sharing one queue makes the order they were written in the order they run.
 pub enum Sequenced {
     /// An ex-command requested via `vim.cmd(...)`.
     Command(String),
+    /// A highlight-group definition from `nvim_set_hl` / `btv.hl.define`.
+    Highlight(HlSet),
     /// A `setqflist` / `setloclist` write.
     QfSet(QfSetOp),
     /// A `btv.qf.show` / `btv.qf.drop` on a named list.

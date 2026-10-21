@@ -23,10 +23,8 @@ vim.opt.colorcolumn = "80,120"
 vim.opt.autopairs = true
 vim.opt.numberwidth = 6
 
--- Colorscheme: catppuccin mocha. `load()` applies it directly — the runtimepath
--- `colors/catppuccin.lua` a browser can't source is itself just `require("catppuccin").load()`.
-require("catppuccin").setup({ flavour = "mocha" })
-require("catppuccin").load("mocha")
+-- No colorscheme line: with none chosen, the editor loads its own `bemtvi` scheme, the
+-- same default the terminal and the GUI get. `:colorscheme neutral` switches to One Dark.
 
 -- which-key-style popup over the pending-key oracle.
 require("bemtvi-keys-helper").setup({})
@@ -37,7 +35,7 @@ require("bemtvi-tree").setup({
   open_on_start = true,
 })
 
--- Statusline; `theme = "auto"` derives the palette from the active colorscheme (catppuccin).
+-- Statusline; `theme = "auto"` derives the palette from the active colorscheme.
 require("bemtvi-line").setup({ options = { theme = "auto" } })
 
 -- An empty bottom tray (a permanent edge dock on a scratch buffer). `autohide = true`

@@ -20,11 +20,17 @@
 <title>bemtvi — wasm edit-host</title>
 <link rel="icon" href="data:," />
 <style>
+  /* The built-in look is the `bemtvi` colorscheme's (crates/bemtvi-server/runtime/colors/
+     bemtvi.lua), the editor's default, which the server also loads when the config
+     picks no scheme: these are its colours for the moments the page has none of its
+     own, before the first frame and for groups the active scheme leaves undefined.
+     Every colour on this page comes from that scheme's palette; the server test
+     `web_fallback_palette` checks it. */
   :root {
-    --bg: #1e2127; --fg: #abb2bf; --gutter: #4b5263; --gutter-cur: #e5c07b;
-    --sel: #3e4451; --search: #e5c07b; --status-bg: #2c313a; --status-fg: #9da5b4;
-    --cursor: #61afef; --eob: #4b5263; --accent: #e5c07b; --cursorline: #2c313a;
-    --colorcolumn: #2c313a;
+    --bg: #1e1e24; --fg: #e2e8e8; --gutter: #4f525d; --gutter-cur: #f4e472;
+    --sel: #473229; --search: #584825; --status-bg: #18181d; --status-fg: #e2e8e8;
+    --cursor: #ebf3f3; --eob: #3f414b; --accent: #f9e931; --cursorline: #28282f;
+    --colorcolumn: #28282f;
   }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   #grid {
@@ -39,15 +45,15 @@
   .colorcolumn { position: absolute; top: 0; background: var(--colorcolumn); }
   .win { position: absolute; overflow: hidden; }
   /* A floating window's opaque chrome box (blocks the tiled windows beneath). */
-  .float-win { background: #21252b; }
+  .float-win { background: #18181d; }
   .gutter { color: var(--gutter); }
   .gutter-cur { color: var(--gutter-cur); }
   .eob { color: var(--eob); }
   .sel { background: var(--sel); }
-  .search { background: var(--search); color: #1e2127; }
-  .incsearch { background: #ffd866; color: #1e2127; }
+  .search { background: var(--search); color: var(--fg); }
+  .incsearch { background: #f9e931; color: #121216; }
   .statusline { background: var(--status-bg); color: var(--status-fg); }
-  .statusline.focused { color: #e6e6e6; }
+  .statusline.focused { color: #e2e8e8; }
   /* An unfocused window's bar takes StatusLineNC (vim's active-split cue), falling
      back to the StatusLine vars when the theme leaves that group undefined — so a
      theme modelling only StatusLine keeps both bars themed, as in the TUI/GUI. Only
@@ -61,38 +67,38 @@
   /* The split/dock separator: the `WinSeparator` glyph (`--win-sep`, falling back to
      the gutter colour) on the editor background (`--bg`) so the cell tracks the theme
      rather than a hardcoded dark strip that stays dark under a light colorscheme. */
-  .sep { background: var(--bg, #181a1f); color: var(--win-sep, var(--gutter)); position: absolute; }
+  .sep { background: var(--bg, #1e1e24); color: var(--win-sep, var(--gutter)); position: absolute; }
   /* Cursor shapes. Block reverses the cell; bar/underline are thin overlays. */
   .cur-block { background: var(--cursor); color: var(--bg); }
   .cur-bar { box-shadow: inset 2px 0 0 0 var(--cursor); }
   .cur-underline { box-shadow: inset 0 -2px 0 0 var(--cursor); }
   /* Multi-cursor: placed cursors are reverse-video; the active one is amber. */
-  .seccur { background: #d7dae0; color: #1e2127; }
-  .cur-mc { background: var(--accent); color: #1e2127; font-weight: 700; }
+  .seccur { background: #ebf3f3; color: #1e1e24; }
+  .cur-mc { background: var(--accent); color: #121216; font-weight: 700; }
   .cmdline { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); color: var(--fg); }
   .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
-  .inlay { color: #5c6370; font-style: italic; }
-  .pmenu { position: absolute; background: #21252b; z-index: 10; white-space: pre; }
+  .inlay { color: #636773; font-style: italic; }
+  .pmenu { position: absolute; background: #18181d; z-index: 10; white-space: pre; }
   /* The opaque chrome box behind a popup, carrying its box-drawing glyph border. */
-  .popup-chrome { position: absolute; background: #21252b; z-index: 10; white-space: pre; }
+  .popup-chrome { position: absolute; background: #18181d; z-index: 10; white-space: pre; }
   /* `#grid`-scoped so these beat `#grid .row` (line above), whose `position:absolute`
      would otherwise win on ID specificity and collapse every popup row to the box top
      (`top:auto`) — leaving the items overlaid instead of stacked down the float. */
   #grid .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
   /* Box-drawing border glyphs + title for content floats (btv.ui.float). */
-  .float-border { color: #5c6370; }
+  .float-border { color: #636773; }
   .float-title { color: var(--fg); }
-  .pmenu-sel { background: var(--sel); color: #e6e6e6; }
-  .pmenu-match { color: #e5c07b; font-weight: bold; }
-  .pmenu-prompt { color: #abb2bf; }
+  .pmenu-sel { background: var(--sel); color: #e2e8e8; }
+  .pmenu-match { color: #f0b35c; font-weight: bold; }
+  .pmenu-prompt { color: #f9e931; }
   /* The right-aligned completion kind column ("Snippet", "Function", …): dimmed so
      it recedes behind the label. Overridden inline when the theme carries a fg. */
   .pmenu-kind { opacity: 0.6; }
-  .pmenu-doc { position: absolute; background: #21252b; z-index: 10; white-space: pre; color: var(--status-fg); }
+  .pmenu-doc { position: absolute; background: #18181d; z-index: 10; white-space: pre; color: var(--status-fg); }
   #grid .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
   #status { position: fixed; right: 6px; bottom: 4px; font-size: 11px; opacity: .4;
-            color: #5c6370; pointer-events: none; z-index: 5; }
+            color: #636773; pointer-events: none; z-index: 5; }
   /* Input proxy. The grid is a non-editable <div>, and Firefox only fires
      `paste`/`copy`/`cut` on an *editable* focused element — so the real keyboard + clipboard
      target is this always-focused textarea (the xterm.js "helper textarea" pattern).
@@ -150,7 +156,7 @@
         // Say what is missing, on the page and not just in the console — otherwise a
         // deploy that dropped `dist/bemtvi_width.wasm` just sits on "booting…" forever.
         const el = document.getElementById("status");
-        el.style.color = "#e06c75";
+        el.style.color = "#f08a7e";
         el.textContent = `bemtvi: column-math module failed to load (dist/bemtvi_width.wasm) — ${e.message || e}`;
         throw e;
       });
@@ -879,7 +885,7 @@
 
     let statusHideTimer = null;
     // Briefly show a transient message in the corner indicator (picker errors, etc.).
-    function flashStatus(text, color = "#e5c07b") {
+    function flashStatus(text, color = "#f4e472") {
       clearTimeout(statusHideTimer);
       statusEl.style.display = "";
       statusEl.style.opacity = "1";
@@ -958,8 +964,8 @@
       // A runtime `:connect bemtvi://…` finished dialing — flash the outcome (the fs/watch seam
       // is now on the wire on success; on failure the editor stays on serverless OPFS).
       if (msg.type === "connected") {
-        if (msg.ok) { daemonMode = true; flashStatus("connected to daemon", "#98c379"); }
-        else flashStatus("connect failed: " + (msg.error || "unknown"), "#e06c75");
+        if (msg.ok) { daemonMode = true; flashStatus("connected to daemon", "#b6d98b"); }
+        else flashStatus("connect failed: " + (msg.error || "unknown"), "#f08a7e");
         return;
       }
       // Reply to an out-of-band image-preview byte fetch routed through the Worker (a daemon
@@ -974,7 +980,7 @@
       }
       if (msg.type === "fatal") {
         statusEl.style.opacity = "1";
-        statusEl.style.color = "#e06c75";
+        statusEl.style.color = "#f08a7e";
         statusEl.textContent = "FATAL: " + msg.error;
         console.error("edit-host worker fatal:", msg.error);
         return;
@@ -985,7 +991,7 @@
         clearTimeout(statusHideTimer);
         statusEl.style.display = "";
         statusEl.style.opacity = "1";
-        statusEl.style.color = "#e5c07b";
+        statusEl.style.color = "#f4e472";
         statusEl.textContent = "init.lua error: " + msg.error;
         console.error("bemtvi init.lua:", msg.error);
         return;
@@ -1098,7 +1104,7 @@
       }
       setHlTheme(map);
       // `view` is already this frame (setFrame). Re-theme the chrome vars from the
-      // colorscheme that just loaded/changed (One Dark defaults stay for absent groups).
+      // colorscheme that just loaded/changed (the built-in `bemtvi` look stays for absent groups).
       applyChrome();
     }
 
@@ -1429,7 +1435,7 @@
         wrap.appendChild(img);
       } else if (entry && entry.error) {
         const msg = document.createElement("div");
-        msg.style.cssText = "color:#e06c75;font:inherit;padding:0 4px;text-align:center;";
+        msg.style.cssText = "color:#f08a7e;font:inherit;padding:0 4px;text-align:center;";
         msg.textContent = `[image: cannot read ${im.path}: ${entry.error}]`;
         wrap.appendChild(msg);
       } // else: fetch in flight → blank until it lands (then a re-render paints it)
@@ -1768,7 +1774,7 @@
       // spans). LightMagenta, matching the native fallback when no colorscheme
       // resolves the group.
       const special = w.special_key?.[row] || [];
-      const SPECIAL_KEY = "#d787ff";
+      const SPECIAL_KEY = "#ebaab9";
       // Server-sourced highlight overlay (extmark / `btv.decor` / LSP semantic tokens),
       // per screen row in display columns. The wasm build can't reproduce these JS-side,
       // so the server ships them (see `overlay_highlights_for`) and we paint them over the
@@ -1796,7 +1802,7 @@
       const diagCssAt = (c) => {
         for (const [s, e, sev, id] of diagSpans) {
           if (c >= s && c < e) {
-            const sp = (id != null && paletteStyle(id)?.sp) || severityColor(sev);
+            const sp = (id != null && cssColor(paletteStyle(id)?.sp)) || severityColor(sev);
             return `text-decoration:underline wavy;text-decoration-color:${sp};text-underline-offset:2px;`;
           }
         }
@@ -2038,7 +2044,7 @@
     // Drive the chrome CSS variables (`:root`) from the active colorscheme's resolved
     // groups. Each chrome key arrives as a palette id (`view.chrome`), resolved here via
     // `chromeStyle()`; a var is overridden only when its group resolves, so a build with
-    // no colorscheme keeps the built-in One Dark CSS defaults. Runs on the server-styled
+    // no colorscheme keeps the built-in `bemtvi` CSS defaults. Runs on the server-styled
     // `:connect` path (`render`) and, on the wasm build, whenever the colorscheme changes
     // (`syncHlTheme`) — neither flips `serverStyled`, so JS highlighting stays on.
     function applyChrome() {
@@ -2074,7 +2080,7 @@
       }
       for (const [s, e, sev, id] of diagSpans) {
         if (col >= s && col < e) {
-          const sp = (id != null && paletteStyle(id)?.sp) || severityColor(sev);
+          const sp = (id != null && cssColor(paletteStyle(id)?.sp)) || severityColor(sev);
           css += `text-decoration:underline wavy;text-decoration-color:${sp};text-underline-offset:2px;`;
           break;
         }
@@ -2082,7 +2088,7 @@
       return css;
     }
     function severityColor(sev) {
-      return sev === 1 ? "#e06c75" : sev === 2 ? "#e5c07b" : sev === 4 ? "#56b6c2" : "#61afef";
+      return sev === 1 ? "#f08a7e" : sev === 2 ? "#f4e472" : sev === 4 ? "#94d7c0" : "#8ed3e3";
     }
     function renderLineServer(w, row, gutterW, rect) {
       const line = w.lines[row] ?? "";
@@ -2578,7 +2584,9 @@
           promptText = promptText.slice(0, room).padEnd(room) + right;
         }
         promptEl = document.createElement("div");
-        promptEl.className = "row" + (sPrompt ? "" : " pmenu-prompt");
+        // `pmenu-prompt` always: it is the row's stable hook (the list readers skip it),
+        // and its colour is only the fallback an inline theme colour overrides.
+        promptEl.className = "row pmenu-prompt";
         if (sPrompt && sPrompt.fg != null) promptEl.style.color = cssColor(sPrompt.fg);
         promptEl.style.width = listW * cw + "px";
         promptEl.style.fontWeight = "bold";
@@ -2588,7 +2596,7 @@
         if (filterRows) {
           for (const name of ["include", "exclude"]) {
             const el = document.createElement("div");
-            el.className = "row" + (sPrompt ? "" : " pmenu-prompt");
+            el.className = "row pmenu-prompt";
             if (sPrompt && sPrompt.fg != null) el.style.color = cssColor(sPrompt.fg);
             el.style.width = listW * cw + "px";
             el.innerHTML = editableRow(name.padEnd(8), filters[name], focus === name);
@@ -3033,7 +3041,7 @@
         // absent, so fall back to a plain red.
         if (view.message_error) {
           const css = chromeCss(chromeStyle("error_msg"));
-          el.style.cssText += css || "color:#e06c75;";
+          el.style.cssText += css || "color:#f08a7e;";
         }
       } else if (view.hidden_docks && view.hidden_docks.length) {
         // Idle row: collapsed (hidden) docks shown as `▸{label}` chips — the only
@@ -3166,7 +3174,7 @@
       return (f.windows || []).find((w) => w.focused) || f.windows?.[0] || null;
     }
     function pickerUnavailable(what) {
-      flashStatus(`${what}: this browser has no File System Access API (try Chrome/Edge)`, "#e06c75");
+      flashStatus(`${what}: this browser has no File System Access API (try Chrome/Edge)`, "#f08a7e");
     }
     // The absolute editor path a picker-chosen file will get, so the `bind` key matches the
     // path the off-tick read/write actually requests. A picker only hands us a bare basename
@@ -3225,7 +3233,7 @@
       feedOp("<Esc>"); // dismiss the command line regardless of the argument's validity
       const arg = parts[1] || "";
       if (!arg.startsWith("bemtvi://")) {
-        flashStatus(":connect needs an bemtvi:// daemon URI", "#e06c75");
+        flashStatus(":connect needs an bemtvi:// daemon URI", "#f08a7e");
         return true;
       }
       connectOp(arg);
@@ -3246,7 +3254,7 @@
         fsHandles.set(path, handle);
         bindOp(path);
         runExCommand(`${verb} ${path}`);
-      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("open failed: " + (e?.message || e), "#e06c75"); });
+      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("open failed: " + (e?.message || e), "#f08a7e"); });
     }
 
     // Pop the save picker, then `:w <name>` the buffer to the chosen file. bemtvi's
@@ -3262,7 +3270,7 @@
         fsHandles.set(path, handle);
         bindOp(path);
         runExCommand(`w ${path}`);
-      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("save failed: " + (e?.message || e), "#e06c75"); });
+      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("save failed: " + (e?.message || e), "#f08a7e"); });
     }
 
     // Pop the open picker for a `.lua` file, then run it through the live effects path
@@ -3283,18 +3291,18 @@
       self.showOpenFilePicker(opts).then(async ([handle]) => {
         const res = await realFsRead(handle); // { kind: 0, bytes } | { kind: 3, text }
         if (res.kind !== 0 || !res.bytes) {
-          flashStatus(`source ${handle.name}: ${res.text || "read failed"}`, "#e06c75");
+          flashStatus(`source ${handle.name}: ${res.text || "read failed"}`, "#f08a7e");
           return;
         }
         const code = new TextDecoder().decode(res.bytes); // Lua source is UTF-8
         // execLuaOp resolves with { frame, lines, result }; result is "ok:…" / "err:…".
         const rendered = (await execLuaOp(code))?.result;
         if (typeof rendered === "string" && rendered.startsWith("err:")) {
-          flashStatus(`source ${handle.name}: ${rendered.slice(4)}`, "#e06c75");
+          flashStatus(`source ${handle.name}: ${rendered.slice(4)}`, "#f08a7e");
         } else {
-          flashStatus(`sourced ${handle.name}`, "#98c379");
+          flashStatus(`sourced ${handle.name}`, "#b6d98b");
         }
-      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("source failed: " + (e?.message || e), "#e06c75"); });
+      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("source failed: " + (e?.message || e), "#f08a7e"); });
     }
 
     // Read a bound file's real bytes for the Worker (off-tick `:e`): { kind, bytes } where

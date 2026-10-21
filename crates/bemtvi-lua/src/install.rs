@@ -687,7 +687,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             // reads a stale, empty `Normal` and errors. Mirrors the write-through
             // `btv.o` / `setreg` already do for the same reason.
             write_hl_mirror_row(lua, &def)?;
-            sh.borrow_mut().highlights.push(def);
+            sh.borrow_mut().sequenced.push(Sequenced::Highlight(def));
             Ok(())
         })?;
     // `btv.hl` is the canonical highlight namespace (alias: `nvim_set_hl`); the Lua

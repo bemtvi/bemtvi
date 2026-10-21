@@ -75,15 +75,16 @@ try {
     frame.signs.some((c) => Array.isArray(c) && c[0] === "E" && c[1] === 1),
     `diagnostics_signs=${JSON.stringify(frame.signs)}`);
 
-  // (b) DOM: a gutter span actually paints the 'E' glyph in the Error colour (#e06c75).
+  // (b) DOM: a gutter span actually paints the 'E' glyph in the Error colour (#f08a7e, the
+  //     default `bemtvi` scheme's DiagnosticError).
   const gutter = await page.evaluate(() =>
     [...document.querySelectorAll("#grid .win .row span[style]")]
       .map((s) => ({ text: s.textContent, style: s.getAttribute("style").toLowerCase() }))
       .filter((s) => s.text.includes("E")));
   check("gutter: an 'E' sign glyph painted in the DOM",
     gutter.length >= 1, `E-bearing styled spans=${JSON.stringify(gutter)}`);
-  check("gutter: the sign glyph used the Error severity colour (#e06c75)",
-    gutter.some((s) => s.style.includes("#e06c75")), `E-bearing styled spans=${JSON.stringify(gutter)}`);
+  check("gutter: the sign glyph used the Error severity colour (#f08a7e)",
+    gutter.some((s) => s.style.includes("#f08a7e")), `E-bearing styled spans=${JSON.stringify(gutter)}`);
 
   await browser.close();
 } finally {

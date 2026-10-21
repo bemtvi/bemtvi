@@ -102,7 +102,7 @@ try {
       && /^=======/m.test(shapes) && /^>>>>>>> /m.test(shapes),
     `shapes=${JSON.stringify(shapes?.slice(0, 40))}`);
   check("seed: the tour + init.lua are present in OPFS",
-    !!tour && /Welcome to bemtvi/.test(tour) && !!init && /catppuccin/.test(init),
+    !!tour && /Welcome to bemtvi/.test(tour) && !!init && /bemtvi-tree/.test(init),
     `tour=${JSON.stringify(tour?.slice(0, 30))}`);
 
   // 2. The guided tour opened as the startup buffer (init.lua's `edit /TOUR.md`; the content

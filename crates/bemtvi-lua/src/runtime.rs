@@ -933,9 +933,6 @@ pub(crate) struct Shared {
     /// (`btv.err_write*`), each carrying whether it was an error so the server can
     /// route it through the red `echo_err` path.
     pub(crate) output: Vec<OutputLine>,
-    /// Highlight-group definitions from `nvim_set_hl`, applied to the core
-    /// registry after the chunk drains (so the core stays the sole mutator).
-    pub(crate) highlights: Vec<HlSet>,
     /// Dock requests from `btv.dock.*`, applied to the core after the chunk.
     pub(crate) dock_ops: Vec<DockOp>,
     /// Layer crosses from `btv.open` / `btv.layer.*`, applied to the core after the
@@ -1240,7 +1237,6 @@ impl Shared {
         let Shared {
             sequenced,
             output,
-            highlights,
             dock_ops,
             layer_ops,
             session_reconnects,
@@ -1320,7 +1316,6 @@ impl Shared {
         } = self;
         *sequenced = Default::default();
         *output = Default::default();
-        *highlights = Default::default();
         *dock_ops = Default::default();
         *layer_ops = Default::default();
         *session_reconnects = Default::default();
@@ -2015,10 +2010,23 @@ impl LuaRuntime {
         take_output -> Vec<OutputLine> = output
     }
 
-    take_queue! {
-        /// Take the highlight-group definitions queued by `nvim_set_hl` since the
-        /// last drain, for the server to apply to the core registry.
-        take_highlights -> Vec<HlSet> = highlights
+    /// Take only the highlight-group definitions out of the program-ordered queue,
+    /// leaving every other queued effect where it is for the next full drain. For a
+    /// pass that must resolve colours *now* without running anything else a render
+    /// queued (the statusline re-render, whose segments define their own groups).
+    pub fn take_highlights(&self) -> Vec<HlSet> {
+        let mut shared = self.shared.borrow_mut();
+        let (highlights, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut shared.sequenced)
+            .into_iter()
+            .partition(|effect| matches!(effect, Sequenced::Highlight(_)));
+        shared.sequenced = rest;
+        highlights
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Sequenced::Highlight(hl) => Some(hl),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The **global-namespace** group names queued by `nvim_set_hl` and not yet
@@ -2030,10 +2038,12 @@ impl LuaRuntime {
     pub fn peek_global_highlight_names(&self) -> Vec<String> {
         self.shared
             .borrow()
-            .highlights
+            .sequenced
             .iter()
-            .filter(|hl| hl.ns == 0)
-            .map(|hl| hl.name.clone())
+            .filter_map(|effect| match effect {
+                Sequenced::Highlight(hl) if hl.ns == 0 => Some(hl.name.clone()),
+                _ => None,
+            })
             .collect()
     }
 

@@ -129,7 +129,7 @@ try {
   // DOM: the gutter glyph actually painted, again with no extra keystroke.
   const gutterPainted = await page.evaluate(() =>
     [...document.querySelectorAll("#grid .win .row span[style]")]
-      .some((s) => s.textContent.includes("E") && s.getAttribute("style").toLowerCase().includes("#e06c75")));
+      .some((s) => s.textContent.includes("E") && s.getAttribute("style").toLowerCase().includes("#f08a7e")));
   check("NO-NUDGE: the Error gutter glyph painted in the DOM after :eo", gutterPainted);
 
   // Control: a harmless cursor nudge must NOT be what makes them appear. If the no-nudge
@@ -141,7 +141,7 @@ try {
     await sleep(200);
     const afterNudge = await page.evaluate(() =>
       [...document.querySelectorAll("#grid .win .row span[style]")]
-        .some((s) => s.textContent.includes("E") && s.getAttribute("style").toLowerCase().includes("#e06c75")));
+        .some((s) => s.textContent.includes("E") && s.getAttribute("style").toLowerCase().includes("#f08a7e")));
     console.log(`  [diagnostic] gutter painted AFTER a keystroke nudge: ${afterNudge}` +
       (afterNudge ? "  → confirms an off-tick redraw race (shows only after input)" : ""));
   }

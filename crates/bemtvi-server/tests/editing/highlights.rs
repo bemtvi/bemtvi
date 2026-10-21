@@ -64,25 +64,33 @@ fn contrast(a: u64, b: u64) -> f64 {
 }
 
 #[tokio::test]
-async fn bemtvi_scheme_completion_match_is_visible_on_the_selected_row() {
-    // Regression: in the built-in `bemtvi` scheme the fuzzy-match accent must stay
+async fn bundled_schemes_completion_match_is_visible_on_the_selected_row() {
+    // Regression: in every bundled scheme the fuzzy-match accent must stay
     // readable on a *selected* completion/picker row. The clients paint the
     // selected row with `PmenuSel`'s bg and overdraw the matched characters with
     // the match accent (the `CmpItemAbbrMatch` → `Special` chain, resolving to
     // `Special` here). If those two colors have near-identical luminance the
     // matched letters vanish into the selection background.
-    let dir = temp_dir("bemtvi_scheme_match");
-    let (rpc, _incoming) = start_with_config(&dir, "vim.cmd.colorscheme('bemtvi')\n").await;
+    for scheme in ["bemtvi", "neutral"] {
+        let dir = temp_dir(&format!("{scheme}_scheme_match"));
+        let init = format!("vim.cmd.colorscheme('{scheme}')\n");
+        let (rpc, _incoming) = start_with_config(&dir, &init).await;
 
-    let sel_bg = hl_color(&get_hl(&rpc, "PmenuSel").await, "bg").expect("PmenuSel bg");
-    let match_fg = hl_color(&get_hl(&rpc, "Special").await, "fg").expect("match (Special) fg");
+        let sel_bg = hl_color(&get_hl(&rpc, "PmenuSel").await, "bg").expect("PmenuSel bg");
+        // The completion popup's match accent: `CmpItemAbbrMatch`, else `Special`.
+        let mut accent = get_hl(&rpc, "CmpItemAbbrMatch").await;
+        if accent.is_empty() {
+            accent = get_hl(&rpc, "Special").await;
+        }
+        let match_fg = hl_color(&accent, "fg").expect("match accent fg");
 
-    let ratio = contrast(match_fg, sel_bg);
-    assert!(
-        ratio >= 2.0,
-        "matched chars (fg {match_fg:06x}) must stand out from the selected-row bg \
-         ({sel_bg:06x}); WCAG contrast was only {ratio:.2}"
-    );
+        let ratio = contrast(match_fg, sel_bg);
+        assert!(
+            ratio >= 2.0,
+            "{scheme}: matched chars (fg {match_fg:06x}) must stand out from the \
+             selected-row bg ({sel_bg:06x}); WCAG contrast was only {ratio:.2}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -585,22 +593,54 @@ async fn colorscheme_missing_file_reports_e185() {
 }
 
 #[tokio::test]
-async fn builtin_bemtvi_colorscheme_loads_with_no_runtime_file() {
-    // `:colorscheme bemtvi` must work with an empty config dir — the scheme is
+async fn hi_clear_then_set_hl_in_one_chunk_keeps_the_new_groups() {
+    // A colorscheme opens with `hi clear` and defines its groups right after, in the
+    // same chunk. The clear must land before the definitions, not after them: the
+    // groups the chunk defines are what stays.
+    let dir = temp_dir("hi_clear_then_set");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_hl(0, 'Comment', { fg = '#abcdef' })\n\
+         return 1",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "vim.cmd('hi clear')\n\
+         vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#123456' })\n\
+         return 1",
+    )
+    .await;
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(
+        hl_color(&normal, "bg"),
+        Some(hex("123456")),
+        "a group defined after `hi clear` in the same chunk survives the clear"
+    );
+    assert!(
+        get_hl(&rpc, "Comment").await.is_empty(),
+        "the clear still drops what was defined before it"
+    );
+}
+
+#[tokio::test]
+async fn builtin_neutral_colorscheme_loads_with_no_runtime_file() {
+    // `:colorscheme neutral` must work with an empty config dir — the scheme is
     // bundled in the binary, not sourced off the runtimepath. It populates the
     // registry (One Dark palette) and fires the ColorScheme autocmd like any
     // file-backed scheme.
-    let dir = temp_dir("builtin_bemtvi");
+    let dir = temp_dir("builtin_neutral");
     let (rpc, mut incoming) = start_with_config(
         &dir,
         "vim.api.nvim_create_autocmd('ColorScheme', \
-           { pattern = 'bemtvi', callback = function(o) print('themed:' .. o.match) end })\n",
+           { pattern = 'neutral', callback = function(o) print('themed:' .. o.match) end })\n",
     )
     .await;
-    let map = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    let map = redraw_after(&rpc, &mut incoming, ":colorscheme neutral<CR>").await;
     assert_eq!(
         field(&map, "message").and_then(Value::as_str),
-        Some("themed:bemtvi"),
+        Some("themed:neutral"),
         "the bundled scheme should fire the ColorScheme autocmd"
     );
     // Editor chrome (One Dark base) and a couple of syntax groups resolve.
@@ -626,13 +666,70 @@ async fn builtin_bemtvi_colorscheme_loads_with_no_runtime_file() {
 }
 
 #[tokio::test]
-async fn builtin_bemtvi_colorscheme_shows_eob_tildes() {
+async fn builtin_bemtvi_colorscheme_loads_with_no_runtime_file() {
+    // `:colorscheme bemtvi`, the scheme drawn from the app icon, must work with an
+    // empty config dir: it is bundled in the binary, not sourced off the runtimepath,
+    // and fires the ColorScheme autocmd like any file-backed scheme.
+    let dir = temp_dir("builtin_bemtvi");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.api.nvim_create_autocmd('ColorScheme', \
+           { pattern = 'bemtvi', callback = function(o) print('themed:' .. o.match) end })\n",
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("themed:bemtvi"),
+        "the bundled scheme should fire the ColorScheme autocmd"
+    );
+    // The cap's charcoal shadow is the background; the lemon belly marks the mode badge.
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("1e1e24")));
+    assert_eq!(hl_color(&normal, "fg"), Some(hex("e2e8e8")));
+    let mode = get_hl(&rpc, "StatusLineMode").await;
+    assert_eq!(hl_color(&mode, "bg"), Some(hex("f9e931")));
+    // A link resolves through to its target.
+    let float = resolve_capture(&rpc, "number.float")
+        .await
+        .expect("@number.float resolves under bemtvi");
+    assert_eq!(hl_color(&float, "fg"), Some(hex("f0b35c")));
+    // Every `btv.hl.palette()` slot reads the scheme's own hue, so plugins deriving
+    // their colours from the theme follow it.
+    for (slot, want) in [
+        ("bg", "#1e1e24"),
+        ("bg_alt", "#18181d"),
+        ("bg_cursorline", "#28282f"),
+        ("bg_sel", "#473229"),
+        ("fg", "#e2e8e8"),
+        ("muted", "#8d929d"),
+        ("red", "#f08a7e"),
+        // `green` is the string hue, which this scheme draws in cornflower.
+        ("green", "#83a7ea"),
+        ("yellow", "#f4e472"),
+        // `blue` is the function hue, which this scheme draws in orange.
+        ("blue", "#fb8c3c"),
+        // `purple` is the keyword hue, which this scheme draws in forest green.
+        ("purple", "#5fa86c"),
+        ("cyan", "#8ed3e3"),
+        ("orange", "#f0b35c"),
+    ] {
+        assert_eq!(
+            palette_slot(&rpc, slot).await,
+            want,
+            "palette slot `{slot}` under :colorscheme bemtvi"
+        );
+    }
+}
+
+#[tokio::test]
+async fn builtin_neutral_colorscheme_shows_eob_tildes() {
     // The `~` end-of-buffer fillers must stay visible under the bundled scheme:
     // `EndOfBuffer` is highlighted like `NonText` (vim's default), so its fg is
     // the gutter colour, *not* the Normal background (which would hide them).
-    let dir = temp_dir("eob_bemtvi");
+    let dir = temp_dir("eob_neutral");
     let (rpc, mut incoming) = start_with_config(&dir, "").await;
-    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme neutral<CR>").await;
     let eob = get_hl(&rpc, "EndOfBuffer").await;
     assert_eq!(
         hl_color(&eob, "fg"),
@@ -647,16 +744,16 @@ async fn builtin_bemtvi_colorscheme_shows_eob_tildes() {
 }
 
 #[tokio::test]
-async fn builtin_bemtvi_colorscheme_themes_the_tabline() {
+async fn builtin_neutral_colorscheme_themes_the_tabline() {
     // The bundled scheme themed `StatusLine` but not the tabline groups, so the
     // tabline row fell back to the terminal default with a reverse-video active
     // cell — visibly unthemed against the rest of the frame in the TUI. The bar
     // now carries its own One Dark look: the active tab reads as the editor
     // background (a real "front" tab), inactive tabs and the fill sit on the
     // darker chrome background the status line uses.
-    let dir = temp_dir("tabline_bemtvi");
+    let dir = temp_dir("tabline_neutral");
     let (rpc, mut incoming) = start_with_config(&dir, "").await;
-    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme neutral<CR>").await;
 
     let tabline = get_hl(&rpc, "TabLine").await;
     assert_eq!(hl_color(&tabline, "fg"), Some(hex("5c6370")));
@@ -680,9 +777,9 @@ async fn builtin_bemtvi_colorscheme_themes_the_tabline() {
 #[tokio::test]
 async fn truecolor_attach_defaults_in_the_bemtvi_colorscheme() {
     // A client that declares truecolor support (`truecolor = true` in the attach
-    // capabilities) with no config-chosen scheme lands on the bundled `bemtvi` One
-    // Dark palette automatically — a rich terminal reaches real colors with zero
-    // config. Nothing was typed; the default is applied at attach.
+    // capabilities) with no config-chosen scheme lands on the bundled `bemtvi`
+    // palette automatically — a rich terminal reaches real colors with zero config.
+    // Nothing was typed; the default is applied at attach.
     let dir = temp_dir("truecolor_default");
     std::fs::write(dir.join("init.lua"), "").expect("write init.lua");
     let (rpc, _incoming) = spawn(ServerInit {
@@ -694,10 +791,10 @@ async fn truecolor_attach_defaults_in_the_bemtvi_colorscheme() {
     let normal = get_hl(&rpc, "Normal").await;
     assert_eq!(
         hl_color(&normal, "fg"),
-        Some(hex("abb2bf")),
+        Some(hex("e2e8e8")),
         "a truecolor attach defaults in the bemtvi scheme's Normal fg"
     );
-    assert_eq!(hl_color(&normal, "bg"), Some(hex("282c34")));
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("1e1e24")));
     // `g:colors_name` records the auto-loaded scheme, so a re-attach won't reapply
     // and tooling (statusline, etc.) sees the active theme.
     assert_eq!(
@@ -933,9 +1030,9 @@ async fn colorscheme_compiles_to_bytecode_then_reuses_the_cache() {
 async fn a_new_colorscheme_drops_the_previous_scheme_groups() {
     // Loading a colorscheme must leave the *selected* scheme's palette on screen,
     // not a blend with whatever was loaded before. Without this, the schemes stack:
-    // the bundled `bemtvi` One Dark that a truecolor attach defaults in survives
+    // the bundled scheme that a truecolor attach defaults in survives
     // *underneath* the scheme the user's config picks, and every group the new
-    // scheme leaves undefined keeps One Dark's warmer value — muted browns bleeding
+    // scheme leaves undefined keeps the default's value — muted browns bleeding
     // through the theme that was actually chosen. (The reported symptom: catppuccin
     // "looks browner" whenever the attach wins the race against the config's
     // `:colorscheme`, which startup timing — inside tmux vs not — decides.)
@@ -954,7 +1051,7 @@ async fn a_new_colorscheme_drops_the_previous_scheme_groups() {
     let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
     assert_eq!(
         hl_color(&get_hl(&rpc, "Comment").await, "fg"),
-        Some(hex("5c6370")),
+        Some(hex("8d929d")),
         "precondition: the built-in scheme defines Comment"
     );
     // A group a *plugin* owns, defined outside any colorscheme.
@@ -996,12 +1093,12 @@ async fn palette_slot(rpc: &Rpc, slot: &str) -> String {
 #[tokio::test]
 async fn hl_palette_derives_the_builtin_scheme_hues() {
     // `btv.hl.palette()` is how a plugin picks default colors without hardcoding one
-    // theme's hex values. Under `:colorscheme bemtvi` every accent slot must resolve
-    // to the built-in One Dark palette, read off the canonical groups the scheme
+    // theme's hex values. Under `:colorscheme neutral` every accent slot must resolve
+    // to its One Dark palette, read off the canonical groups the scheme
     // defines (String -> green, Type -> yellow, Function -> blue, …).
     let dir = temp_dir("hl_palette_builtin");
     let (rpc, mut incoming) = start_with_config(&dir, "").await;
-    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme neutral<CR>").await;
     for (slot, want) in [
         ("bg", "#282c34"),
         ("bg_alt", "#21252b"),
@@ -1020,7 +1117,7 @@ async fn hl_palette_derives_the_builtin_scheme_hues() {
         assert_eq!(
             palette_slot(&rpc, slot).await,
             want,
-            "palette slot `{slot}` under :colorscheme bemtvi"
+            "palette slot `{slot}` under :colorscheme neutral"
         );
     }
 }
@@ -1029,7 +1126,7 @@ async fn hl_palette_derives_the_builtin_scheme_hues() {
 async fn hl_palette_follows_the_active_scheme_and_its_links() {
     // The point of the palette is that it tracks whatever theme is loaded — including
     // a group defined as a LINK, which must resolve to the concrete definition. A slot
-    // whose whole chain the theme leaves undefined falls back to the built-in bemtvi
+    // whose whole chain the theme leaves undefined falls back to the built-in `bemtvi`
     // value, so a partial theme never strands a plugin on a missing colour.
     let dir = temp_dir("hl_palette_active");
     std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
@@ -1055,14 +1152,54 @@ async fn hl_palette_follows_the_active_scheme_and_its_links() {
     // `NormalFloat`/`StatusLine` are unstyled by this theme, so `bg_alt` falls back.
     assert_eq!(
         palette_slot(&rpc, "bg_alt").await,
-        "#21252b",
+        "#18181d",
         "an unmodelled slot falls back to the built-in bemtvi value"
     );
 
     // Switching schemes re-derives: the same call now reports One Dark.
-    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme neutral<CR>").await;
     assert_eq!(palette_slot(&rpc, "bg").await, "#282c34");
     assert_eq!(palette_slot(&rpc, "green").await, "#98c379");
+}
+
+#[tokio::test]
+async fn hl_palette_with_no_scheme_is_the_bemtvi_palette() {
+    // `bemtvi` is the default and the fallback: a session with no colorscheme loaded
+    // must report exactly the palette that scheme gives, slot for slot, so a plugin
+    // deriving its colours before any theme loads lands on the editor's own look.
+    let dir = temp_dir("hl_palette_no_scheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let slots = [
+        "bg",
+        "bg_alt",
+        "bg_cursorline",
+        "bg_sel",
+        "fg",
+        "muted",
+        "red",
+        "green",
+        "yellow",
+        "blue",
+        "purple",
+        "cyan",
+        "orange",
+    ];
+    assert!(
+        get_hl(&rpc, "Normal").await.is_empty(),
+        "precondition: no scheme is loaded"
+    );
+    let mut fallback = Vec::new();
+    for slot in slots {
+        fallback.push(palette_slot(&rpc, slot).await);
+    }
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme bemtvi<CR>").await;
+    for (slot, unthemed) in slots.iter().zip(&fallback) {
+        assert_eq!(
+            &palette_slot(&rpc, slot).await,
+            unthemed,
+            "palette slot `{slot}` with no scheme must be the bemtvi value"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1100,10 +1237,10 @@ async fn hl_fallback_yields_to_a_theme_but_replaces_its_own_stale_default() {
     )
     .await;
 
-    // With no theme, the default derives from the built-in bemtvi palette.
+    // With no theme, the default derives from the built-in `bemtvi` palette.
     assert_eq!(
         hl_color(&get_hl(&rpc, "PlugDim").await, "fg"),
-        Some(hex("5c6370")),
+        Some(hex("8d929d")),
         "the plugin default derives from the built-in palette"
     );
 

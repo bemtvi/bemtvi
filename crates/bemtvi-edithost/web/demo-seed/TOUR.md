@@ -47,6 +47,6 @@ plugins all run in this tab.
 - `geometry.py`  — a small typed module (a `Circle` dataclass + helpers)
 - `shapes.py`    — a `Triangle` with an unresolved merge conflict (`:DiffConflict`)
 - `TOUR.md`      — this file; `:MarkdownPreview` renders it
-- `init.lua`     — this editor's config (catppuccin, the plugins, the LSP)
+- `init.lua`     — this editor's config (the plugins, the LSP)
 
 Edit anything — your changes persist in the browser across reloads.

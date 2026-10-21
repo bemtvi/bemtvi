@@ -1,5 +1,5 @@
 // A small Rust sample so `:colorscheme bemtvi` has something colorful to paint:
-// keywords, strings, numbers, types, and comments all get their One Dark hue.
+// keywords, strings, numbers, types, and comments all get their own hue.
 
 /// Greet someone by name, the classic way.
 fn greet(name: &str) -> String {

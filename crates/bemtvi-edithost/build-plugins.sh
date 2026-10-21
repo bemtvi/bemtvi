@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Clone the recommended first-party plugin set + the catppuccin colorscheme at pinned
-# commits and amalgamate them into ONE Lua bundle for the python demo (Phase 6 of
-# docs/plans/2026-06-23-web-python-demo.md).
+# Clone the recommended first-party plugin set at pinned commits and amalgamate them into
+# ONE Lua bundle for the python demo (Phase 6 of docs/plans/2026-06-23-web-python-demo.md).
 #
 # The browser Lua VM has no filesystem/runtimepath, so a multi-file plugin can't load
 # through package.path. amalgamate-plugins.mjs concatenates every plugin's lua/ tree into a
 # single chunk registering package.preload[...]; sourcing it (worker.mjs, demo build) makes
 # require("bemtvi-line")-class resolve from memory. The demo init.lua then calls each
-# plugin's setup()/load() (it also stands in for the plugin/ auto-load scripts and the
-# colors/ colorscheme file, neither of which a runtimepath-less browser would source).
+# plugin's setup() (it also stands in for the plugin/ auto-load scripts, which a
+# runtimepath-less browser would not source). The colorscheme needs no plugin: the
+# editor's own `bemtvi` scheme is built in.
 #
 # The clones (.plugins-src) and the bundle (web/vendor/plugins) are gitignored — regenerated,
 # not committed. Idempotent: re-running skips when the bundle is present; pass --force to
@@ -23,8 +23,8 @@ SRC="$here/.plugins-src"               # gitignored clones
 OUT="$here/web/vendor/plugins"         # vendored bundle destination (gitignored; copied by package-site)
 BUNDLE="$OUT/plugins-bundle.lua"
 
-# repo<TAB>pinned-commit — the recommended set (first-recommended-plugin-keys-helper) plus the
-# catppuccin colorscheme (the sole neovim-plugin surface). Keep pins in lock-step with the demo.
+# repo<TAB>pinned-commit — the recommended set (first-recommended-plugin-keys-helper). Keep
+# pins in lock-step with the demo.
 PLUGINS=(
   "bemtvi/bemtvi-keys-helper	22f53cb5cb958131e7c30157370e4ee9bf0bd6f1"
   "bemtvi/bemtvi-tree	646bd021a0799fd6fd7dfcc1397099c803bd47de"
@@ -33,7 +33,6 @@ PLUGINS=(
   "bemtvi/bemtvi-diff	2ef31659a66e4df6e4ea868ccc75a99ca1c86e92"
   "bemtvi/bemtvi-snippets	23ccb05aa59c312f926859ecf1fb9f048c4e6f78"
   "bemtvi/bemtvi-markdown-preview	28dc6962b668739f44021a3eafe8a5097c04a0b8"
-  "bemtvi/catppuccin-bemtvi	3c8c29b94a89dd68c3db02bfa421dac9b98098c5"
 )
 
 force=0

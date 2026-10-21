@@ -672,6 +672,20 @@ impl EditHost {
         }
     }
 
+    /// The default colorscheme every client starts on: the bundled `bemtvi` scheme
+    /// (`runtime/colors/bemtvi.lua`), loaded here when the config chose none. This
+    /// is the one place the default comes from: the terminal and the GUI reach it
+    /// when they attach (`btv_ui_attach`), the browser when its boot finishes
+    /// (`boot_finish`), so all three paint the same palette and none of them keeps
+    /// a default of its own. It runs after the config has been sourced, so a
+    /// `:colorscheme` in `init.lua` has already set `g:colors_name` and wins; once
+    /// this loads, `g:colors_name` is `"bemtvi"`, so a re-attach does not reload it.
+    pub(crate) fn apply_default_colorscheme(&mut self) {
+        if self.lua.get_global_var("colors_name").is_none() {
+            self.set_colorscheme("bemtvi");
+        }
+    }
+
     /// Load a colorscheme by name: source `colors/<name>.lua` off the
     /// runtimepath (whose body populates the highlight registry via
     /// `nvim_set_hl`), settle `g:colors_name`, and fire the `ColorScheme`
@@ -714,9 +728,9 @@ impl EditHost {
         // Drop the groups the *previous* scheme owned before sourcing this one, so
         // the two palettes replace rather than stack. Without this every group the
         // incoming scheme leaves undefined keeps the outgoing scheme's value — most
-        // visibly when a truecolor attach defaults in the bundled `bemtvi` (One Dark)
-        // and the user's config picks its own theme a moment later: the theme paints
-        // what it models and One Dark shows through everywhere else, so the result is
+        // visibly when a truecolor attach defaults in the bundled `bemtvi` scheme and
+        // the user's config picks its own theme a moment later: the theme paints what
+        // it models and `bemtvi` shows through everywhere else, so the result is
         // a blend of two palettes that shifts with startup timing. Only the scheme's
         // own groups go; a plugin's stay (and a plugin restyling on `ColorScheme`
         // re-registers below anyway). Blank definitions are how the registry removes.
@@ -843,8 +857,10 @@ impl EditHost {
 /// (the server hands the names to Lua as `btv._builtin_colorschemes`) — add a scheme
 /// here and both pick it up. They ship embedded so `:colorscheme <name>` works with
 /// no user config (and on the wasm build, which has no filesystem).
-pub(crate) const BUILTIN_COLORSCHEMES: &[(&str, &str)] =
-    &[("bemtvi", include_str!("../runtime/colors/bemtvi.lua"))];
+pub(crate) const BUILTIN_COLORSCHEMES: &[(&str, &str)] = &[
+    ("bemtvi", include_str!("../runtime/colors/bemtvi.lua")),
+    ("neutral", include_str!("../runtime/colors/neutral.lua")),
+];
 
 /// The Lua source of a colorscheme bundled in the binary, by name, or `None`
 /// for an unknown name. A user file on the runtimepath shadows these — the

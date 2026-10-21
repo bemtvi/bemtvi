@@ -41,11 +41,11 @@ function check(label, ok, detail) {
   if (!ok) { if (detail !== undefined) console.log(`        ${detail}`); failures++; }
 }
 
-// The colours `web/highlight.js`'s built-in `FG` table gives these captures (no colorscheme
-// is loaded in this test, so the static fallback is what paints).
-const HEADING1 = "#61afef";
-const STRONG = "#e5c07b";
-const KEYWORD = "#c678dd";
+// The colours the default `bemtvi` scheme gives these captures (the server loads it
+// when the config picks none, and `web/highlight.js`'s built-in `FG` table is the same).
+const HEADING1 = "#f4e472";
+const STRONG = "#dca07a";
+const KEYWORD = "#5fa86c";
 
 const DOC = [
   "# Title",

@@ -23,16 +23,18 @@ SRC="$here/.plugins-src"               # gitignored clones
 OUT="$here/web/vendor/plugins"         # vendored bundle destination (gitignored; copied by package-site)
 BUNDLE="$OUT/plugins-bundle.lua"
 
-# repo<TAB>pinned-commit — the recommended set (first-recommended-plugin-keys-helper). Keep
-# pins in lock-step with the demo.
+# repo<TAB>pinned-commit — the recommended set (first-recommended-plugin-keys-helper), each at
+# the commit of the release tag the core's recommended set pins (btv.plugins
+# `_default_recommended`), so the demo runs the versions a fresh setup installs. Move a pin
+# when its tag moves there.
 PLUGINS=(
-  "bemtvi/bemtvi-keys-helper	22f53cb5cb958131e7c30157370e4ee9bf0bd6f1"
-  "bemtvi/bemtvi-tree	646bd021a0799fd6fd7dfcc1397099c803bd47de"
-  "bemtvi/bemtvi-line	7c5a7d33d303cc5bc0128ccb891172a1db4de279"
-  "bemtvi/bemtvi-lspconfig	8c4282dbb3775acbe6ed11dc6bd8d9a45361e135"
-  "bemtvi/bemtvi-diff	2ef31659a66e4df6e4ea868ccc75a99ca1c86e92"
-  "bemtvi/bemtvi-snippets	23ccb05aa59c312f926859ecf1fb9f048c4e6f78"
-  "bemtvi/bemtvi-markdown-preview	28dc6962b668739f44021a3eafe8a5097c04a0b8"
+  "bemtvi/bemtvi-keys-helper	2f9e1060cea16ad0a4c15bcfebc5d15e25cb17ab"
+  "bemtvi/bemtvi-tree	20338af5add9cf7e48a80358b80319b59ea5842e"
+  "bemtvi/bemtvi-line	b6ab2f6a6bc47fefbfd1b48f0114840821dfb6d1"
+  "bemtvi/bemtvi-lspconfig	deafc538b71140646acc9b4bf0eaa302f669267c"
+  "bemtvi/bemtvi-diff	05bb889a91e21a317efa7dcd089833215284b24d"
+  "bemtvi/bemtvi-snippets	ad5eff3ed906efd6057fe9cedab1bd838424b9fd"
+  "bemtvi/bemtvi-markdown-preview	f192efbd789e4a8240dbb59ef0dcd1c9e00be627"
 )
 
 force=0

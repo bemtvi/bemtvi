@@ -250,21 +250,19 @@ impl PosScope {
 
 /// The byte window an edit batch can have moved marks within, for [`PosScope`].
 ///
-/// Only a **single-edit** batch is bounded, and that restriction is load-bearing
-/// rather than conservatism. Each edit's byte offsets are expressed in the buffer as
-/// it stood before *that* edit, so across a batch they live in different coordinate
-/// spaces: an earlier edit's `new_end_byte` can point past the final rope (resolving
-/// it panics), and — the quieter bug — a batch whose row changes *cancel out* to zero
-/// still moved every mark between the two edits, so bounding on the net delta would
-/// silently stale them. Folding that soundly needs the same forward/non-overlapping
-/// mapping [`fold_mirror_edits`] does; until something shows multi-edit batches are
-/// hot, refreshing all of a buffer's marks is the correct answer for them.
+/// The batch folds into one replaced row span with [`fold_mirror_edits`], the same
+/// fold the lines mirror splices with. Each edit's offsets are expressed in the
+/// buffer as it stood before *that* edit, so they can't be compared directly: an
+/// earlier edit's `new_end_byte` can point past the final rope, and two edits whose
+/// row changes cancel out still moved every mark between them. The fold maps each
+/// edit back through the ones before it, which is sound only while the batch moves
+/// forward without overlapping. For any other batch it gives up and so does this.
 ///
-/// For the single edit that the typing path actually produces: `lo` is the start of
-/// its line (a mark anywhere on that line can have its column changed), and `hi`
-/// closes at the next line's start when the edit did not change the line count —
-/// every mark beyond keeps both row and column. An edit that adds or removes lines
-/// shifts every later row, so the window stays open.
+/// From the span `(start, old_end, new_end)`: `lo` is the start of row `start` (a
+/// mark anywhere on that row can have its column changed, and no earlier row
+/// moved). `hi` closes at the start of the row after `new_end` when the batch left
+/// the line count alone, since every mark beyond keeps both row and column. A batch
+/// that adds or removes lines shifts every later row, so the window stays open.
 ///
 /// `None` ⇒ refresh everything.
 fn extmark_dirty_window(
@@ -274,18 +272,14 @@ fn extmark_dirty_window(
     if batch.resync {
         return None;
     }
-    let [edit] = &batch.edits[..] else {
-        return None;
-    };
-    // Nothing ahead of an edit's start moves, so this offset means the same thing
-    // before and after it — but clamp anyway rather than trust it against the rope.
-    let lo_byte = edit.start_byte.min(buf.len_bytes());
-    let lo = buf.line_start(buf.byte_to_line(lo_byte));
-    let hi = if edit.new_end_point.0 == edit.old_end_point.0 {
-        let last = edit.new_end_byte.min(buf.len_bytes());
-        let row = buf.byte_to_line(last);
-        // Start of the following line, or unbounded if the edit touched the last one.
-        (row + 1 < buf.line_count()).then(|| buf.line_start(row + 1))
+    let (start, old_end, new_end) = fold_mirror_edits(&batch.edits)?;
+    // Rows before `start` didn't move, so it names the same row now. Clamp anyway
+    // rather than trust it against the rope.
+    let last_row = buf.line_count().saturating_sub(1);
+    let lo = buf.line_start(start.min(last_row));
+    let hi = if old_end == new_end {
+        // Start of the following row, or unbounded if the batch reached the last one.
+        (new_end + 1 < buf.line_count()).then(|| buf.line_start(new_end + 1))
     } else {
         None
     };

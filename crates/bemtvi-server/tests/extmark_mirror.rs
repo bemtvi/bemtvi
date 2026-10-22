@@ -276,15 +276,89 @@ async fn typing_in_a_mark_heavy_buffer_does_not_scale_with_the_marks() {
 }
 
 #[tokio::test]
+async fn several_keys_in_one_message_do_not_scale_with_the_marks() {
+    // Every key in one input message lands in one mirror batch, so a client that
+    // coalesces fast typing (or a mapping, or `.`) hands the mirror several edits at
+    // once. Those batches used to refresh every mark's position: ~67ms per two-key
+    // message with 5000 marks, against ~3ms for a single key. Folding the batch into
+    // one row span keeps it bounded like a single edit. The bound has ~3x margin
+    // against the old cost.
+    let (rpc, _inc) = open(&sample(5_000)).await;
+    ns(&rpc).await;
+    exec_lua(
+        &rpc,
+        "for i = 0, 4999 do
+           btv.buf.set_extmark(0, _G.ns, i, 0, { hl_group = 'Comment', end_row = i, end_col = 4 })
+         end",
+    )
+    .await;
+
+    feed(&rpc, "2500GI");
+    let _ = exec_lua(&rpc, "return 1").await;
+    let started = std::time::Instant::now();
+    for _ in 0..450 {
+        feed(&rpc, "ab");
+    }
+    let _ = exec_lua(&rpc, "return 1").await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "450 two-key messages with 5000 extmarks took {elapsed:?}: a multi-edit \
+         batch is refreshing every mark again",
+    );
+}
+
+#[tokio::test]
+async fn a_batch_that_adds_a_line_moves_the_marks_on_and_below_it() {
+    // Three edits in one message: `a`, a line break, `b`. The mark after the break
+    // point rides onto the new line, and every later mark shifts down.
+    let (rpc, _inc) = open(&sample(200)).await;
+    ns(&rpc).await;
+    let on = mark(&rpc, 5, 3, "").await;
+    let before = mark(&rpc, 5, 0, "").await;
+    let below = mark(&rpc, 100, 2, "").await;
+    feed(&rpc, "6G0llia<CR>b<Esc>");
+    let text = exec_lua(&rpc, "return table.concat(btv.buf.lines(0, 5, 7), '|')").await;
+    assert_eq!(text.as_str(), Some("lia|bne 5"));
+    assert_eq!(pos(&rpc, before).await, (5, 0));
+    assert_eq!(pos(&rpc, on).await, (6, 2));
+    assert_eq!(pos(&rpc, below).await, (101, 2));
+    assert_matches_full_rebuild(&rpc).await;
+}
+
+#[tokio::test]
+async fn a_batch_over_two_rows_moves_the_columns_on_both() {
+    // Edits on rows 5 and 9 in one batch, no row change: the marks on both rows
+    // move their columns, and the marks around and past them stay put. Queued Lua
+    // edits drain together; typed keys would not, because leaving Insert pushes
+    // the mirror in between.
+    let (rpc, _inc) = open(&sample(200)).await;
+    ns(&rpc).await;
+    let first = mark(&rpc, 5, 3, "").await;
+    let between = mark(&rpc, 7, 3, "").await;
+    let last = mark(&rpc, 9, 3, "").await;
+    let past = mark(&rpc, 10, 3, "").await;
+    let spanning = mark(&rpc, 2, 0, "end_row = 9, end_col = 4").await;
+    exec_lua(
+        &rpc,
+        "btv.buf.set_text(0, 5, 0, 5, 0, { 'x' }) btv.buf.set_text(0, 9, 0, 9, 0, { 'yy' })",
+    )
+    .await;
+    assert_eq!(pos(&rpc, first).await, (5, 4));
+    assert_eq!(pos(&rpc, between).await, (7, 3));
+    assert_eq!(pos(&rpc, last).await, (9, 5));
+    assert_eq!(pos(&rpc, past).await, (10, 3));
+    assert_eq!(detail(&rpc, spanning, "end_col").await, "6");
+    assert_matches_full_rebuild(&rpc).await;
+}
+
+#[tokio::test]
 async fn word_sized_undo_steps_stay_cheap_in_a_mark_heavy_buffer() {
     // Typing commits an undo node at each step boundary, and a node snapshots the
-    // extmark store — O(marks) per commit. `z<BS>` flips between typing and
-    // deleting on every key, so this run commits 300 nodes over 5000 marks.
-    //
-    // Measured by ablation: these keys take ~10s here *without* any commits (a
-    // `<BS>` or separator in a mark-heavy buffer has a cost of its own, unrelated
-    // to undo), and the 300 commits add ~0.5s on top. The bound catches a commit
-    // growing to ~30ms — a snapshot that stopped being cheap.
+    // extmark store, O(marks) per commit. `z<BS>` flips between typing and
+    // deleting on every key, so this run commits 300 nodes over 5000 marks. The
+    // run takes ~1s, of which the commits are ~0.5s. The bound catches a commit
+    // growing to ~30ms: a snapshot that stopped being cheap.
     let (rpc, _inc) = open(&sample(5_000)).await;
     ns(&rpc).await;
     exec_lua(
@@ -309,7 +383,7 @@ async fn word_sized_undo_steps_stay_cheap_in_a_mark_heavy_buffer() {
         "the run did not break into undo steps: seq_last {seq:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(20),
+        elapsed < std::time::Duration::from_secs(10),
         "300 keystrokes (300 undo steps) with 5000 extmarks took {elapsed:?}",
     );
 }

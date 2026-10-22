@@ -194,8 +194,9 @@ Cases to keep in mind:
     removed the whole snippet (`begin_replacing_step`).
   - The wasm edit host never stamped `now_ms`.
 - **Perf.** A commit snapshots the extmark store. With 5000 marks a word-end
-  commit costs under 2ms. The same guard shows an existing cost of ~30ms per
-  `<BS>` or separator keystroke in a mark-heavy buffer, with no undo involved.
-  That is not addressed here.
+  commit costs under 2ms. The guard first seemed to show `<BS>` and separators
+  costing ~30ms each in a mark-heavy buffer. The real cost was per *message*:
+  any input message carrying two or more keys refreshed every extmark's position
+  in the Lua mirror. Fixed separately in the mirror's dirty window.
 - **Not done:** the note in the `bemtvi-from-neovim` skill. It lives in the
   separate `bemtvi-plugin-skills` repo.

@@ -10,7 +10,8 @@
 --
 -- Armed only by the interactive binaries (`ServerInit.show_intro` natively, `eh_new` on
 -- the web), so headless runs and the test suites never see it. A config opts out with
--- `btv.g.intro = false`.
+-- `btv.g.intro = false`. `:intro` (`btv.intro.show()`) draws it on demand, as vim's
+-- does, on any empty buffer.
 
 btv.intro = btv.intro or {}
 
@@ -243,12 +244,9 @@ local function dismiss()
   state.subs, state.buf = {}, nil
 end
 
--- Whether this is a session the intro belongs to: started with no file, still on the
--- untouched unnamed buffer, and not opted out by the config.
-local function wanted(buf)
-  if btv.g.intro == false or #btv.argv() > 0 then
-    return false
-  end
+-- Whether `buf` is a buffer the intro can be drawn on: unnamed, unmodified, and a
+-- single empty line, so the intro sits beside nothing.
+local function untouched(buf)
   if btv.buf.name(buf) ~= "" or btv.bo[buf].modified then
     return false
   end
@@ -267,11 +265,9 @@ local function windows_showing(buf)
   return n
 end
 
-local function show()
-  local buf, win = state.start_buf, state.start_win
-  if not buf or btv.win.buf(win) ~= buf or not wanted(buf) then
-    return
-  end
+-- Show the intro in `win` on `buf` and subscribe what redraws and dismisses it.
+local function start(buf, win)
+  dismiss()
   btv.hl.fallback("BtvIntroTitle", { link = "Title" })
   btv.hl.fallback("BtvIntroText", { link = "Comment" })
   btv.hl.fallback("BtvIntroKey", { link = "Special" })
@@ -303,6 +299,39 @@ local function show()
   }
 end
 
+-- The startup intro, at the first client attach: in the startup window, when the
+-- session started with no file, the buffer is untouched and the config didn't opt out.
+local function show_at_startup()
+  local buf, win = state.start_buf, state.start_win
+  if btv.g.intro == false or #btv.argv() > 0 then
+    return
+  end
+  if buf and btv.win.buf(win) == buf and untouched(buf) then
+    start(buf, win)
+  end
+end
+
+-- `btv.intro.show()` — draw the intro screen in the current window, as `:intro`
+-- does. It works in any session, and `btv.g.intro = false` only stops the one drawn
+-- at startup.
+--
+-- The window must show an empty, unnamed, unmodified buffer (`:enew` gives one): the
+-- intro is drawn below that buffer's single line, never over text, so on any other
+-- buffer this raises. It goes the ways the startup intro goes: the first edit,
+-- another buffer in the window, `:e file`, or a split showing the buffer twice.
+function btv.intro.show()
+  local buf, win = btv.buf.current(), btv.win.current()
+  if not untouched(buf) then
+    error("the intro needs an empty, unnamed buffer (:enew gives one)", 0)
+  end
+  start(buf, win)
+end
+
+-- `btv.intro.dismiss()` — clear the intro screen, if it shows.
+function btv.intro.dismiss()
+  dismiss()
+end
+
 -- Arm the intro for this session: it shows at the first client attach (`UIEnter`), the
 -- first point the window size and the client's colours are known. Called by the
 -- interactive binaries before `init.lua`, so a config can still set `btv.g.intro = false`.
@@ -315,6 +344,13 @@ function btv.intro._arm()
   local id
   id = btv.on("UIEnter", function()
     btv.off(id)
-    show()
+    show_at_startup()
   end)
 end
+
+btv.command("intro", function()
+  local ok, err = pcall(btv.intro.show)
+  if not ok then
+    btv.notify(":intro: " .. tostring(err), vim.log.levels.ERROR)
+  end
+end, { desc = "Show the intro screen (on an empty buffer)" })

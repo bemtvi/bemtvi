@@ -1,0 +1,48 @@
+-- ~~~ bemtvi's intro screen: the logo, drawn in the terminal ~~~
+--
+-- Run it (from the repo root) with NO file, which is when the intro shows:
+--
+--     BEMTVI_CONFIG=examples/intro cargo run -p bemtvi
+--
+-- Started with no file, bemtvi greets you the way vim and neovim do: the app icon,
+-- the name and version, and the commands a newcomer needs. The icon is not an
+-- image: it is the 23x23 pixel art drawn with text, two pixels per cell using the
+-- half block characters `▀` and `▄` (the foreground is one pixel, the background
+-- the other). It needs a truecolor terminal; on any other only the text is shown.
+--
+-- The intro is virtual lines beside the empty `[No Name]` buffer, so the buffer is
+-- never touched, and it goes for good the moment the editor is used.
+
+--------------------------------------------------------------------------------
+-- 1. The colours follow the scheme. The name, the text and the commands use the
+--    groups `BtvIntroTitle`, `BtvIntroText` and `BtvIntroKey`, which link to
+--    `Title`, `Comment` and `Special` unless something defines them. Here the
+--    commands are drawn in the lemon yellow of the bird's eye ring.
+--------------------------------------------------------------------------------
+btv.hl.define(0, "BtvIntroKey", { fg = "#f9e931", bold = true })
+
+--------------------------------------------------------------------------------
+-- 2. To never see it at startup, a config says so:
+--
+--        btv.g.intro = false
+--
+--    (`:intro` still draws it on demand, try-it 4.)
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- Try it:
+--
+-- 1. The bird sits centred in the window, with `bemtvi`, the version, and
+--    `:q<Enter>` / `:Plugins<Enter>` below it, the commands in yellow (section 1).
+--    The cursor is on line 1, above it.
+--
+-- 2. Resize the terminal: the intro re-centres. `:set colorcolumn=40` draws a
+--    ruler down the window, but not through the intro, which is a solid box.
+--
+-- 3. `ihello<Esc>`: the intro is gone. `u` empties the buffer again, and the
+--    intro stays gone. The same happens on `:e examples/intro/sample.txt`, or a
+--    `:split`.
+--
+-- 4. `:enew`, then `:intro`: the screen is back, as vim's `:intro` brings it back.
+--    In a buffer with text, `:intro` refuses and says to `:enew` first.
+--------------------------------------------------------------------------------

@@ -1,0 +1,5 @@
+A file to open from the intro screen (try-it 3).
+
+Opening it replaces the empty startup buffer, and the intro goes with it.
+From here, `:intro` refuses: the intro is drawn on an empty buffer, never over text.
+`:enew` gives you one, and `:intro` there brings the screen back.

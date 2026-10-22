@@ -387,3 +387,64 @@ async fn the_intro_is_a_solid_box_in_the_editor_background() {
         "every row of the box is as wide: {widths:?}"
     );
 }
+
+/// A session not armed for the startup intro, as `:intro` finds it in a test or after
+/// the startup one was dismissed.
+async fn start_unarmed(tag: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let dir = temp_dir(tag);
+    let (rpc, incoming) = spawn(ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir],
+        ..Default::default()
+    });
+    attach_truecolor(&rpc, 100, 30).await;
+    (rpc, incoming)
+}
+
+#[tokio::test]
+async fn intro_shows_it_on_an_empty_buffer() {
+    // vim's `:intro`: the screen on demand, whether or not the session started with it.
+    let (rpc, mut incoming) = start_unarmed("intro_cmd").await;
+    assert!(intro_rows(&rpc, &mut incoming).await.is_empty());
+    feed(&rpc, ":intro<CR>");
+    let rows = intro_rows(&rpc, &mut incoming).await;
+    assert!(has_logo(&rows), "{rows:#?}");
+    assert!(row_with(&rows, ":q<Enter>").is_some(), "{rows:#?}");
+    // It goes the way the startup one does.
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello".to_string()]);
+    assert!(intro_rows(&rpc, &mut incoming).await.is_empty());
+}
+
+#[tokio::test]
+async fn intro_shows_it_even_when_the_config_opted_out_of_the_startup_one() {
+    let (rpc, mut incoming) = start("intro_cmd_optout", "btv.g.intro = false", true, 100, 30).await;
+    assert!(intro_rows(&rpc, &mut incoming).await.is_empty());
+    feed(&rpc, ":intro<CR>");
+    assert!(has_logo(&intro_rows(&rpc, &mut incoming).await));
+}
+
+#[tokio::test]
+async fn intro_on_a_buffer_with_text_fails_loud() {
+    let (rpc, mut incoming) = start_unarmed("intro_cmd_text").await;
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello".to_string()]);
+    let map = redraw_after(&rpc, &mut incoming, ":intro<CR>").await;
+    assert!(
+        message(&map).contains(":enew"),
+        "says why and what to do: {:?}",
+        message(&map)
+    );
+    assert!(intro_rows(&rpc, &mut incoming).await.is_empty());
+}
+
+#[tokio::test]
+async fn intro_twice_draws_it_once() {
+    let (rpc, mut incoming) = start("intro_cmd_twice", "", true, 100, 30).await;
+    let once = intro_rows(&rpc, &mut incoming).await;
+    feed(&rpc, ":intro<CR>");
+    assert_eq!(intro_rows(&rpc, &mut incoming).await, once);
+    // And one dismissal still clears it: no second set of subscriptions left behind.
+    feed(&rpc, "ix<Esc>");
+    assert!(intro_rows(&rpc, &mut incoming).await.is_empty());
+}

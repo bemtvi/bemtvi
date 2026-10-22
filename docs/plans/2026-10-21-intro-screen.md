@@ -1,6 +1,6 @@
 # The intro screen
 
-**Status:** Phase 1 done, Phase 2 next · **Date:** 2026-10-21
+**Status:** Done (both phases) · **Date:** 2026-10-21
 
 Goal: start bemtvi with no file and see an intro screen, the way vim and neovim do: the
 app icon drawn in the terminal, the name and version, and the few commands a newcomer
@@ -54,6 +54,11 @@ It is drawn in the startup window, recorded when the intro is armed (before `ini
 not in whatever has focus at `UIEnter`: on a first run the plugin offer is a focused float
 by then, and the intro sits behind it.
 
+`:intro` (`btv.intro.show()`) draws it on demand, as vim's `:intro` does, in any
+session and despite `btv.g.intro = false`, but only on an empty, unnamed buffer: it is
+drawn below that buffer's line, never over text, so elsewhere it refuses and points at
+`:enew`. `btv.intro.dismiss()` clears it.
+
 It is cleared, for good, when the buffer changes, when another buffer takes the window,
 when `:e file` reuses the startup buffer (`BufReadPost` / `BufNewFile` / `BufFilePost`),
 or when a split shows the startup buffer twice. A float or a dock showing its own buffer
@@ -88,6 +93,9 @@ the active scheme's (`Title`, `Comment`, `Special`), so they follow any colorsch
    draws, centres, dismisses and re-centres. Server integration tests: shown with no file,
    absent with a file argument, absent with `btv.g.intro = false`, cleared on an edit and on
    `:e other`, the text-only variant without truecolor, re-centred on resize.
-2. **Example, docs, and every client.** `examples/intro/` with its spec, a docs page, and a
-   visual check in the TUI, the GUI and the browser build (the web's `▀` width depends on
-   its font).
+2. **Example, docs, and every client.** `:intro` and `btv.intro.show()` / `dismiss()`
+   (the example's spec needs the intro on demand: the test runner never arms the startup
+   one), `examples/intro/` with its spec, a section in the configuration guide, and a
+   visual check in the TUI, the GUI and the browser build. The GUI and the web drew `▀`
+   as a font glyph, which left seams between rows (their cells are taller than the em);
+   both now draw block elements as rectangles filling the cell (landed with phase 1).

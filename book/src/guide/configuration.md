@@ -87,6 +87,27 @@ Copying needs a clipboard to copy *to*: a host tool (`wl-copy` / `pbcopy` / `xcl
 a terminal that speaks OSC 52 (the ssh case), or the browser's `navigator.clipboard`.
 With none of them a copy says so rather than quietly going nowhere.
 
+## The intro screen
+
+Started with no file, bemtvi shows an intro screen the way vim and neovim do: the
+app icon, the name and version, and the commands to quit and to manage plugins. The
+icon is drawn with text, two pixels per cell in half block characters (`▀` / `▄`),
+so it needs a truecolor terminal; elsewhere only the text is shown. It sits beside
+the empty `[No Name]` buffer without touching it, and goes for good on the first
+edit, on `:e file`, or when a split shows the buffer twice.
+
+To start without it:
+
+```lua
+btv.g.intro = false
+```
+
+`:intro` (or `btv.intro.show()`) draws it on demand in any empty, unnamed buffer;
+`:enew` gives you one. Its colours come from `BtvIntroTitle`, `BtvIntroText` and
+`BtvIntroKey`, which link to `Title`, `Comment` and `Special` unless your config or
+colorscheme defines them. [`examples/intro`](https://github.com/bemtvi/bemtvi/tree/main/examples/intro)
+walks through it.
+
 
 ## Option scopes — which buffers a setting reaches
 

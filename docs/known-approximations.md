@@ -99,7 +99,7 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   `showcmd` / `report` and the undo bound `undolevels`; and a set of
   **bemtvi-native** options (`scrollanim` / `scrollanimduration`, `qfdock`,
   `imagepreview`, `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
-  `laststatus` / `showtabline`, `guiglyphoverflow`, …).
+  `laststatus` / `showtabline`, `guiglyphoverflow`, `guiopacity` / `guihlopacity`, …).
   Buffer- and window-local options are **global-local**, as in vim: each carries a
   global value (`:setglobal` / `vim.go` / `vim.opt_global`) alongside the per-instance
   one, `:set` / `vim.opt` write both, and a new buffer is born from the global value —

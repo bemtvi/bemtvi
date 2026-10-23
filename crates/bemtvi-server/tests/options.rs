@@ -186,6 +186,110 @@ async fn guiglyphoverflow_rejects_an_unknown_mode() {
     );
 }
 
+/// The redraw's `guiopacity` field, which a GUI clears its `Normal` background with.
+fn guiopacity_field(frame: &[(rmpv::Value, rmpv::Value)]) -> Option<u64> {
+    field(frame, "guiopacity").and_then(rmpv::Value::as_u64)
+}
+
+#[tokio::test]
+async fn guiopacity_defaults_opaque_and_reaches_the_redraw() {
+    let (rpc, mut incoming) = start().await;
+
+    // Unset, the background is solid: the read-back and the relayed value are 100.
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guiopacity").await.as_u64(),
+        Some(100)
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(guiopacity_field(&frame), Some(100));
+
+    // `btv.o.guiopacity = …` (the init.lua form) reaches the core, reads back through
+    // both surfaces, and is relayed for the GUI to clear with.
+    exec_lua(&rpc, "btv.o.guiopacity = 80").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.guiopacity").await.as_u64(),
+        Some(80)
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(guiopacity_field(&frame), Some(80));
+
+    // The ex path writes the same state, and the query echoes it.
+    let msg = set_message(&rpc, &mut incoming, "guiopacity=0").await;
+    assert!(msg.is_empty(), "a valid set is silent, got {msg:?}");
+    let msg = set_message(&rpc, &mut incoming, "guiopacity?").await;
+    assert_eq!(msg, "guiopacity=0");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(guiopacity_field(&frame), Some(0));
+}
+
+#[tokio::test]
+async fn guihlopacity_is_its_own_option_and_reaches_the_redraw() {
+    let (rpc, mut incoming) = start().await;
+
+    // Unset, every other background is solid too.
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guihlopacity").await.as_u64(),
+        Some(100)
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(
+        field(&frame, "guihlopacity").and_then(rmpv::Value::as_u64),
+        Some(100)
+    );
+
+    // Set alongside `'guiopacity'` in one `:set`, each lands in its own slot and is
+    // relayed separately — the GUI paints `Normal` and the rest by different values.
+    let msg = set_message(&rpc, &mut incoming, "guiopacity=0 guihlopacity=40").await;
+    assert!(msg.is_empty(), "a valid set is silent, got {msg:?}");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.guihlopacity").await.as_u64(),
+        Some(40)
+    );
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(guiopacity_field(&frame), Some(0));
+    assert_eq!(
+        field(&frame, "guihlopacity").and_then(rmpv::Value::as_u64),
+        Some(40)
+    );
+
+    // The same range check as `'guiopacity'`: loud, and the value stays put.
+    let msg = set_message(&rpc, &mut incoming, "guihlopacity=101").await;
+    assert!(
+        msg.contains("E474") && msg.contains("guihlopacity=101"),
+        "above 100 must fail loud naming it, got {msg:?}"
+    );
+    let msg = set_message(&rpc, &mut incoming, "guihlopacity?").await;
+    assert_eq!(msg, "guihlopacity=40");
+}
+
+#[tokio::test]
+async fn guiopacity_rejects_out_of_range() {
+    // A percentage: past either end fails loud and keeps the previous value, rather
+    // than silently clamping a typo (`150`) to a fully solid window.
+    let (rpc, mut incoming) = start().await;
+    set_message(&rpc, &mut incoming, "guiopacity=70").await;
+    let msg = set_message(&rpc, &mut incoming, "guiopacity=150").await;
+    assert!(
+        msg.contains("E474") && msg.contains("150"),
+        "above 100 must fail loud naming it, got {msg:?}"
+    );
+    let msg = set_message(&rpc, &mut incoming, "guiopacity=-1").await;
+    assert!(
+        msg.contains("E487"),
+        "a negative must fail loud, got {msg:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return btv.o.guiopacity").await.as_u64(),
+        Some(70),
+        "the rejected writes left the previous value alone"
+    );
+}
+
 #[tokio::test]
 async fn timeout_and_timeoutlen_default_and_reach_the_redraw() {
     // The mapping-timeout config is on with a 1000ms wait by default (vim's), reads

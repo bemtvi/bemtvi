@@ -97,7 +97,7 @@ pub use render::menu_box_origin;
 pub use render::physical_font_size;
 // The sRGB→linear color conversions feeding the quad pipeline, exported so the Tier-1
 // `color` test can pin the channel order without a GPU.
-pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};
+pub use render::{clear_color, color_to_rgba, srgb_to_color, srgb_to_color_rgba};
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -795,6 +795,11 @@ struct App {
     /// value). Empty is both the initial state and the option's default — which means
     /// "keep what `--glyph-overflow` / the env set".
     applied_glyph_overflow: String,
+    /// The last `(view.guiopacity, view.guihlopacity)` applied to the renderer, so a
+    /// redraw only re-applies (and only re-reports a refusal) when one actually
+    /// changed. `None` is both the initial state and a view no server has filled in
+    /// yet: fully opaque.
+    applied_opacity: (Option<u8>, Option<u8>),
     /// A directory passed on the command line (`bemtvi-gui somedir`), if any. Popped
     /// as the native file picker (anchored there) once the renderer exists, instead of
     /// the server's in-window listing — see [`Self::init_renderer`]. Taken on first
@@ -857,6 +862,7 @@ impl App {
                 config,
                 applied_guifont: String::new(),
                 applied_glyph_overflow: String::new(),
+                applied_opacity: (None, None),
                 open_dir,
                 remote,
                 reconnect,
@@ -1025,6 +1031,8 @@ impl App {
         // Same for `'guiglyphoverflow'`, which an `init.lua` will have set before the
         // first frame; empty leaves the renderer on the CLI/env mode it was built with.
         self.apply_glyph_overflow();
+        // And the opacities (`'guiopacity'` / `'guihlopacity'`), set by an `init.lua` too.
+        self.apply_opacity();
         self.request_redraw();
         // A directory given on the command line opens the native file picker there
         // (taken so it fires once).
@@ -1048,6 +1056,10 @@ impl App {
                 // frame on (placement only — nothing to re-shape).
                 if self.view.guiglyphoverflow != self.applied_glyph_overflow {
                     self.apply_glyph_overflow();
+                }
+                // A changed opacity repaints the backgrounds from this frame on.
+                if (self.view.guiopacity, self.view.guihlopacity) != self.applied_opacity {
+                    self.apply_opacity();
                 }
                 // (Re)arm or clear the scroll slide from this frame's gesture.
                 self.scroll = arm_scroll(&self.view, self.scroll.take());
@@ -1100,6 +1112,8 @@ impl App {
                 // The reset view carries no `'guiglyphoverflow'` either: back to the
                 // CLI/env mode until the new server's first redraw says otherwise.
                 self.apply_glyph_overflow();
+                // Nor the opacities: opaque until the new server relays its values.
+                self.apply_opacity();
                 self.request_redraw();
             }
             // Closing the last window ends mitsuami's run loop, and `run`'s teardown.
@@ -1439,6 +1453,35 @@ impl App {
             return;
         };
         renderer.set_glyph_overflow(mode);
+        self.request_redraw();
+    }
+
+    /// Apply the relayed `'guiopacity'` and `'guihlopacity'` to the renderer — how
+    /// opaque the `Normal` background, and every other background, paint over the
+    /// window's backdrop. `None` (no server value yet) is fully opaque. A surface that
+    /// can't show its backdrop refuses anything below `100`, and that's reported in the
+    /// message line as an error (`:echoerr`, as [`report_session_error`] does), not left
+    /// looking set while the window stays solid. A no-op before the renderer exists;
+    /// [`Self::init_renderer`] applies it.
+    ///
+    /// Cheap — the next frame just paints differently — so it only repaints.
+    fn apply_opacity(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let (normal, hl) = (self.view.guiopacity, self.view.guihlopacity);
+        self.applied_opacity = (normal, hl);
+        let results = [
+            renderer.set_opacity(normal.unwrap_or(100)),
+            renderer.set_hl_opacity(hl.unwrap_or(100)),
+        ];
+        for e in results.into_iter().filter_map(Result::err) {
+            let escaped = e.replace('\'', "''");
+            self.rpc.notify(
+                "btv_command",
+                vec![Value::from(format!("echoerr '{escaped}'"))],
+            );
+        }
         self.request_redraw();
     }
 

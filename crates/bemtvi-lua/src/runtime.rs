@@ -575,6 +575,12 @@ pub struct GoMirror {
     /// `'guiglyphoverflow'` — when a square one-cell glyph may render over the cell to
     /// its right. Backs `vim.o.guiglyphoverflow` / `btv.o.guiglyphoverflow`.
     pub guiglyphoverflow: String,
+    /// `'guiopacity'` — how opaque (`0`–`100`) the GUI paints the `Normal` background.
+    /// Backs `vim.o.guiopacity` / `btv.o.guiopacity`.
+    pub guiopacity: u8,
+    /// `'guihlopacity'` — how opaque (`0`–`100`) the GUI paints every other
+    /// background, floats included. Backs `vim.o.guihlopacity` / `btv.o.guihlopacity`.
+    pub guihlopacity: u8,
     /// `'imdisable'` — whether the GUI keeps its input method (IME) off. Backs
     /// `vim.o.imdisable` / `btv.o.imdisable`.
     pub imdisable: bool,

@@ -511,6 +511,17 @@ pub struct View {
     /// right instead of being shrunk into its own. Empty means the client's own setting.
     /// Frontend-agnostic — the TUI ignores it (the terminal draws its own glyphs).
     pub guiglyphoverflow: String,
+    /// `'guiopacity'`, relayed from the server: how opaque (`0`–`100`) the native GUI
+    /// paints the `Normal` background, letting the window's backdrop (Windows' Mica)
+    /// show through below `100`. The TUI and the web client ignore it — neither has a
+    /// backdrop behind its cells. `None` until a server relays it (and from an older
+    /// server that doesn't), which a client paints fully opaque.
+    pub guiopacity: Option<u8>,
+    /// `'guihlopacity'`, relayed from the server: how opaque the native GUI paints
+    /// every background other than `Normal` — selections, status lines, line tints,
+    /// floats and popups (a float clears what's under it, so below `100` only the
+    /// backdrop shows behind its text). `None` until a server relays it: opaque.
+    pub guihlopacity: Option<u8>,
     /// `'imdisable'`, relayed from the server: whether a GUI keeps the platform's
     /// input method (IME) off. Off by default, so input methods compose in every
     /// mode until a config turns them off. The TUI ignores it (the terminal owns
@@ -931,6 +942,12 @@ impl View {
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
         self.guiglyphoverflow = map_str(map, "guiglyphoverflow");
+        self.guiopacity = map_get(map, "guiopacity")
+            .and_then(Value::as_u64)
+            .map(|v| v.min(100) as u8);
+        self.guihlopacity = map_get(map, "guihlopacity")
+            .and_then(Value::as_u64)
+            .map(|v| v.min(100) as u8);
         self.imdisable = map_get(map, "imdisable").and_then(Value::as_bool) == Some(true);
         // The mapping-timeout config drives the client's idle-flush timer (below).
         // An older server omits these — fall back to vim's defaults (timeout on,

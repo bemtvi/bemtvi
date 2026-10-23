@@ -89,6 +89,20 @@ pub struct Options {
     /// glyphs). Empty (the default) means the client's own setting, i.e. its
     /// `--glyph-overflow` flag.
     pub guiglyphoverflow: String,
+    /// The `'guiopacity'` percentage (`0`–`100`): how opaque a GUI paints the `Normal`
+    /// background. Below `100` the window's backdrop shows through — on Windows that's
+    /// the window's Mica — while explicit backgrounds (selections, status lines,
+    /// floats, a dock's own `Normal`) and the text stay opaque. Like `'guifont'` the
+    /// core doesn't use it — it relays it to the native GUI, the client that has a
+    /// backdrop to show (the TUI and the browser have none). Default `100`.
+    pub guiopacity: u8,
+    /// The `'guihlopacity'` percentage (`0`–`100`): the `'guiopacity'` of every
+    /// *other* background — selections, search matches, the cursor line, line tints,
+    /// syntax-group and status-line backgrounds, a dock's own `Normal`, and floats and
+    /// popups. A float clears what's under it first, so below `100` only the backdrop
+    /// and the float's own (thinned) background are behind its text. Relayed to the
+    /// native GUI like `'guiopacity'`. Default `100`.
+    pub guihlopacity: u8,
     /// Whether the platform's input method (a Japanese, Chinese or Korean IME) is
     /// kept off (`'imdisable'`, vim's option; default `false`). Like `'guifont'` the
     /// core doesn't use it — it relays it to a GUI client, which turns its input
@@ -364,6 +378,8 @@ impl Options {
             }
             ("scrollback", Num(n)) => self.scrollback = (*n).clamp(0, i64::MAX) as usize,
             ("httpport", Num(n)) => self.httpport = (*n).clamp(0, u16::MAX as i64) as u16,
+            ("guiopacity", Num(n)) => self.guiopacity = (*n).clamp(0, 100) as u8,
+            ("guihlopacity", Num(n)) => self.guihlopacity = (*n).clamp(0, 100) as u8,
             ("history", Num(n)) => self.history = (*n).clamp(0, i64::MAX) as usize,
             ("persisthistory", Str(s)) => self.persisthistory = s.clone(),
             ("background", Str(s)) => self.background = s.clone(),
@@ -420,6 +436,8 @@ impl Options {
             "scrollanimduration" => Num(self.scrollanimduration as i64),
             "scrollback" => Num(self.scrollback as i64),
             "httpport" => Num(self.httpport as i64),
+            "guiopacity" => Num(self.guiopacity as i64),
+            "guihlopacity" => Num(self.guihlopacity as i64),
             "history" => Num(self.history as i64),
             "persisthistory" => Str(self.persisthistory.clone()),
             "background" => Str(self.background.clone()),
@@ -571,6 +589,9 @@ impl Default for Options {
             // No custom GUI font by default — the client uses its own.
             guifont: String::new(),
             guiglyphoverflow: String::new(),
+            // A solid background until a config asks for the backdrop to show through.
+            guiopacity: 100,
+            guihlopacity: 100,
             // Input methods stay on until a config turns them off (vim's default).
             imdisable: false,
             // Mouse defaults match neovim exactly. `mouse` is `"nvi"` (not `"a"`):
@@ -2145,6 +2166,20 @@ static OPTIONS: &[OptionInfo] = {
             scope: Global,
             doc: "When a square one-cell glyph (a Nerd Font icon) may render at full \
                   size over the next cell: never, always, when-followed-by-space.",
+        },
+        OptionInfo {
+            name: "guiopacity",
+            abbrev: None,
+            kind: Num,
+            scope: Global,
+            doc: "Opacity (0-100) of the GUI's Normal background; below 100 the                   window's backdrop (Windows' Mica) shows through.",
+        },
+        OptionInfo {
+            name: "guihlopacity",
+            abbrev: None,
+            kind: Num,
+            scope: Global,
+            doc: "Opacity (0-100) of the GUI's other backgrounds (selections, status                   lines, floats, ...); a float shows only the backdrop behind it.",
         },
         OptionInfo {
             name: "imdisable",

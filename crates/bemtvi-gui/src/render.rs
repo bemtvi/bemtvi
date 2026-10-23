@@ -375,6 +375,16 @@ pub struct Renderer {
     /// its natural size instead of shrinking (see [`overflow_cells`]), from
     /// [`GuiConfig::glyph_overflow`].
     glyph_overflow: GlyphOverflow,
+    /// Whether the surface composites premultiplied alpha, i.e. whether anything below
+    /// full [`Self::opacity`] can show the window's backdrop.
+    premultiplied: bool,
+    /// The `'guiopacity'` percentage the `Normal` background clears with (see
+    /// [`clear_color`]). `100` until [`Self::set_opacity`] says otherwise.
+    opacity: u8,
+    /// The `'guihlopacity'` percentage every other background paints with — through
+    /// [`Self::bg_rgba`], and [`Self::fill_popup`] for a float's. `100` until
+    /// [`Self::set_hl_opacity`] says otherwise.
+    hl_opacity: u8,
     /// Which characters italic may be applied to, and how — see [`ItalicFace`] and
     /// [`Renderer::shape_segments`]. Re-derived whenever the font changes.
     italic_face: ItalicFace,
@@ -440,6 +450,17 @@ impl Renderer {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             descriptor.backends = wgpu::Backends::DX12;
         }
+        // Present through a DirectComposition visual rather than straight to the child
+        // window: only that swapchain has an alpha channel the compositor honours, so
+        // it's what lets `'guiopacity'` show the window's Mica through the `Normal`
+        // background. Always, not only when the option is set — the option arrives in
+        // a redraw after the surface exists, and the swapchain kind can't change then.
+        // (RenderDoc can't capture these swapchains; `WGPU_BACKEND=vulkan` to debug.)
+        #[cfg(windows)]
+        {
+            descriptor.backend_options.dx12.presentation_system =
+                wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        }
         let instance = wgpu::Instance::new(descriptor);
         // The handle keeps the native surface alive for as long as the wgpu surface.
         let surface = instance.create_surface(surface)?;
@@ -469,13 +490,31 @@ impl Renderer {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
+        // A premultiplied surface lets the clear's alpha (`'guiopacity'`) through to the
+        // window's backdrop; at full opacity it paints exactly as an opaque one. Only
+        // where the compositor is known to honour it: Direct3D 12 presenting through
+        // the composition visual set up above. A swapchain straight on the child
+        // window — Vulkan's, which *advertises* `PreMultiplied` on Windows — has its
+        // alpha ignored, so trusting the capability alone would leave the option
+        // looking set on a solid window. Everywhere else the surface stays as it was,
+        // and `set_opacity` refuses anything below 100.
+        let premultiplied = cfg!(windows)
+            && adapter.get_info().backend == wgpu::Backend::Dx12
+            && caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
+        let alpha_mode = if premultiplied {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            caps.alpha_modes[0]
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.clamp(1, max_dim),
             height: size.height.clamp(1, max_dim),
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -523,6 +562,9 @@ impl Renderer {
             fonts,
             emoji_scale: cfg.emoji_scale,
             glyph_overflow: cfg.glyph_overflow,
+            premultiplied,
+            opacity: 100,
+            hl_opacity: 100,
             italic_face,
             cache: HashMap::new(),
             gen: 0,
@@ -582,6 +624,48 @@ impl Renderer {
     /// repaints.
     pub fn set_glyph_overflow(&mut self, mode: GlyphOverflow) {
         self.glyph_overflow = mode;
+    }
+
+    /// Set how opaque the `Normal` background paints, backing `'guiopacity'`
+    /// (`0`–`100`). Below `100` the window's backdrop shows through it; explicit
+    /// backgrounds and text are untouched. Fails, leaving the background opaque, when
+    /// the surface can't composite alpha — the caller reports that rather than let the
+    /// option look set and do nothing. The caller repaints.
+    pub fn set_opacity(&mut self, percent: u8) -> Result<(), String> {
+        self.opacity = self.checked_opacity("guiopacity", percent)?;
+        Ok(())
+    }
+
+    /// Set how opaque every background *other* than `Normal` paints, backing
+    /// `'guihlopacity'` (`0`–`100`): selections, search matches, the cursor line, line
+    /// tints, syntax-group and status-line backgrounds, a dock's own `Normal`, floats
+    /// and popups. Cursors, underlines and other marks are ink, not backgrounds, and
+    /// stay solid. Refused below `100` where [`Self::set_opacity`] is. The caller
+    /// repaints.
+    pub fn set_hl_opacity(&mut self, percent: u8) -> Result<(), String> {
+        self.hl_opacity = self.checked_opacity("guihlopacity", percent)?;
+        Ok(())
+    }
+
+    /// `percent` (clamped to `100`) if the surface can show it, else an error naming
+    /// the option `name` — a surface that can't show its backdrop must not look as
+    /// though it took the value.
+    fn checked_opacity(&self, name: &str, percent: u8) -> Result<u8, String> {
+        let percent = percent.min(100);
+        if percent < 100 && !self.premultiplied {
+            return Err(format!(
+                "{name}={percent}: needs Direct3D 12 on Windows; the background stays solid"
+            ));
+        }
+        Ok(percent)
+    }
+
+    /// A background colour (packed sRGB) at the `'guihlopacity'` alpha, for a quad
+    /// that blends over what's under it — the cursor line over the `Normal` clear, a
+    /// selection over a float. Every background quad takes its colour from here; marks
+    /// (cursors, underlines, separators) take theirs directly and stay solid.
+    fn bg_rgba(&self, bg: u32) -> [f32; 4] {
+        srgb_to_color_rgba(bg, self.hl_opacity as f32 / 100.0)
     }
 
     /// Update the window's scale factor (device pixels per logical pixel) after a
@@ -876,7 +960,7 @@ impl Renderer {
                 label: Some("bemtvi-gui"),
             });
         {
-            let clear = srgb_u32_to_linear(bg);
+            let clear = clear_color(bg, self.opacity);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("bemtvi-gui pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -888,7 +972,7 @@ impl Renderer {
                             r: clear[0] as f64,
                             g: clear[1] as f64,
                             b: clear[2] as f64,
-                            a: 1.0,
+                            a: clear[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1057,6 +1141,7 @@ impl Renderer {
                 w,
                 h,
                 color: color_to_rgba(sep),
+                punch: false,
             });
         };
         for s in &view.separators {
@@ -1163,6 +1248,7 @@ impl Renderer {
             w: width,
             h: line,
             color: srgb_to_color_rgba(fg, 1.0),
+            punch: false,
         });
         if let Some(at) = (*cursor).filter(|&at| text.is_char_boundary(at)) {
             quads.push(Quad {
@@ -1171,6 +1257,7 @@ impl Renderer {
                 w: line * 2.0,
                 h: cell_h,
                 color: srgb_to_color_rgba(fg, 1.0),
+                punch: false,
             });
         }
     }
@@ -1372,7 +1459,8 @@ impl Renderer {
                             y: top,
                             w: (clip.right - clip.left) as f32,
                             h: bottom - top,
-                            color: color_to_rgba(srgb_to_color(bg)),
+                            color: self.bg_rgba(bg),
+                            punch: false,
                         });
                     }
                 }
@@ -2133,6 +2221,7 @@ impl Renderer {
                     w: self.cell_w,
                     h,
                     color: c,
+                    punch: false,
                 });
                 return;
             }
@@ -2142,6 +2231,7 @@ impl Renderer {
                 w,
                 h: self.cell_h,
                 color: c,
+                punch: false,
             });
         }
     }
@@ -2196,6 +2286,7 @@ impl Renderer {
                     w,
                     h: self.cell_h,
                     color: accent,
+                    punch: false,
                 });
             } else if view.is_replace() {
                 // Replace → a bottom underline, like the primary replace cursor.
@@ -2206,6 +2297,7 @@ impl Renderer {
                     w: self.cell_w,
                     h,
                     color: accent,
+                    punch: false,
                 });
             } else {
                 // Normal/visual → a half-transparent foreground block (the glyph
@@ -2217,6 +2309,7 @@ impl Renderer {
                     w: self.cell_w,
                     h: self.cell_h,
                     color: c,
+                    punch: false,
                 });
             }
         }
@@ -2329,6 +2422,7 @@ impl Renderer {
                 w: self.cell_w,
                 h: self.cell_h,
                 color: c,
+                punch: false,
             });
         }
     }
@@ -2546,15 +2640,8 @@ impl Renderer {
         // Prefer the colorscheme's float chrome (`NormalFloat` bg) when defined,
         // else the historical fallback: a slightly lightened `Normal` background.
         let bg = float_bg(view, 0x10);
-        // Opaque fill over the whole float rect.
-        let (px, py) = self.cell_px(ox, oy);
-        quads.push(Quad {
-            x: px,
-            y: py,
-            w: self.cell_w * r.width as f32,
-            h: self.cell_h * r.height as f32,
-            color: color_to_rgba(srgb_to_color(bg)),
-        });
+        // Clear the whole float rect to its own background (see `fill_popup`).
+        self.fill_popup(quads, ox, oy, r.width, r.height, bg);
 
         let inner = match win.border {
             Some(border) => {
@@ -2702,8 +2789,8 @@ impl Renderer {
         }
     }
 
-    /// Fill a `w`×`h`-cell rect at `(x, y)` with `bg` (no border) — the opaque backing
-    /// behind a glyph-bordered popup (the glyph border draws over it).
+    /// Fill a `w`×`h`-cell rect at `(x, y)` with the background `bg` (no border),
+    /// blended over what's under it — a dock's own `Normal`, a `'colorcolumn'` ruler.
     fn fill_rect(&self, quads: &mut Vec<Quad>, x: u16, y: u16, w: u16, h: u16, bg: u32) {
         let (px, py) = self.cell_px(x, y);
         quads.push(Quad {
@@ -2711,7 +2798,27 @@ impl Renderer {
             y: py,
             w: self.cell_w * w as f32,
             h: self.cell_h * h as f32,
-            color: color_to_rgba(srgb_to_color(bg)),
+            color: self.bg_rgba(bg),
+            punch: false,
+        });
+    }
+
+    /// Fill a float's or popup's `w`×`h`-cell rect at `(x, y)` with its background
+    /// `bg`, *replacing* whatever the frame holds there rather than blending over it
+    /// (see [`Quad::punch`]): the editor text and backgrounds under the float are
+    /// cleared, so at `'guihlopacity'` below `100` only the window's backdrop and the
+    /// float's own thinned background are behind its text. At `100` it's the plain
+    /// opaque backing it always was. The float's border, selection and text draw on
+    /// top.
+    fn fill_popup(&self, quads: &mut Vec<Quad>, x: u16, y: u16, w: u16, h: u16, bg: u32) {
+        let (px, py) = self.cell_px(x, y);
+        quads.push(Quad {
+            x: px,
+            y: py,
+            w: self.cell_w * w as f32,
+            h: self.cell_h * h as f32,
+            color: clear_color(bg, self.hl_opacity),
+            punch: true,
         });
     }
 
@@ -2792,7 +2899,7 @@ impl Renderer {
         let by = wy + pmenu.row;
         let box_w = pmenu.width + 2;
         let box_h = pmenu.height + 2;
-        self.fill_rect(quads, bx, by, box_w, box_h, popup_bg);
+        self.fill_popup(quads, bx, by, box_w, box_h, popup_bg);
         self.draw_glyph_border(
             items,
             Border::Single,
@@ -2832,7 +2939,7 @@ impl Renderer {
         // either side of the popup, in which case nothing is drawn.
         let popup_rect = CellRect::new(bx, by, box_w, box_h);
         if let Some(d) = doc_box(text_area, popup_rect, &pmenu.doc) {
-            self.fill_rect(quads, d.x, d.y, d.w, d.h, popup_bg);
+            self.fill_popup(quads, d.x, d.y, d.w, d.h, popup_bg);
             self.draw_glyph_border(
                 items,
                 Border::Single,
@@ -2954,7 +3061,7 @@ impl Renderer {
         // completion-style popup (`!border_top`) its top edge, a bordered select/picker
         // keeps all four.
         let (border_top, border_bottom) = (menu.border_top || menu.cmdline, !menu.cmdline);
-        self.fill_rect(quads, bx, by, box_w, box_h, popup_bg);
+        self.fill_popup(quads, bx, by, box_w, box_h, popup_bg);
         self.draw_glyph_border(
             items,
             Border::Single,
@@ -3088,6 +3195,7 @@ impl Renderer {
                 w: self.cell_w * 0.15,
                 h: self.cell_h,
                 color: c,
+                punch: false,
             });
         }
 
@@ -3346,14 +3454,7 @@ impl Renderer {
             // so the border *style* reads — rounded corners look rounded — and the
             // title rides the top edge, integrated with the line like the TUI's
             // `title_top`. Same path as a window float (`draw_float_border`).
-            let (px, py) = self.cell_px(bx, by);
-            quads.push(Quad {
-                x: px,
-                y: py,
-                w: self.cell_w * bw as f32,
-                h: self.cell_h * bh as f32,
-                color: color_to_rgba(srgb_to_color(popup_bg)),
-            });
+            self.fill_popup(quads, bx, by, bw, bh, popup_bg);
             self.draw_float_border(
                 items,
                 border_style,
@@ -3413,7 +3514,8 @@ impl Renderer {
             y: py,
             w: self.cell_w * count as f32,
             h: self.cell_h,
-            color: color_to_rgba(srgb_to_color(color)),
+            color: self.bg_rgba(color),
+            punch: false,
         });
     }
 
@@ -3496,6 +3598,7 @@ impl Renderer {
             w: self.cell_w * (end - start) as f32,
             h,
             color: color_to_rgba(srgb_to_color(color)),
+            punch: false,
         });
     }
 
@@ -3525,6 +3628,7 @@ impl Renderer {
             w: self.cell_w * (end - start) as f32,
             h,
             color: color_to_rgba(srgb_to_color(color)),
+            punch: false,
         });
     }
 
@@ -3624,7 +3728,8 @@ impl Renderer {
             y: py,
             w: self.cell_w * (end - start) as f32,
             h: self.cell_h,
-            color: color_to_rgba(srgb_to_color(color)),
+            color: self.bg_rgba(color),
+            punch: false,
         });
     }
 
@@ -3660,7 +3765,8 @@ impl Renderer {
             y: top,
             w: self.cell_w * (end - start) as f32,
             h: bottom - top,
-            color: color_to_rgba(srgb_to_color(color)),
+            color: self.bg_rgba(color),
+            punch: false,
         });
     }
 
@@ -3687,7 +3793,8 @@ impl Renderer {
                     y: py,
                     w: right - px,
                     h: self.cell_h,
-                    color: color_to_rgba(srgb_to_color(bg)),
+                    color: self.bg_rgba(bg),
+                    punch: false,
                 });
             }
         }
@@ -3757,6 +3864,7 @@ impl Renderer {
                             w: right - left,
                             h: bottom - top,
                             color: srgb_to_color_rgba(fg, coverage),
+                            punch: false,
                         });
                     }
                 }
@@ -5741,30 +5849,52 @@ pub fn color_to_rgba(c: Color) -> [f32; 4] {
     [lin[0], lin[1], lin[2], a as f32 / 255.0]
 }
 
+/// The frame's clear colour: the `Normal` background `bg` (packed sRGB) at `opacity`
+/// percent, as the linear RGBA the render pass takes. Premultiplied, as the compositor
+/// reads the surface — and premultiplied in the *stored* (sRGB-encoded) space, so each
+/// channel is scaled before it's decoded to linear, not after: the surface re-encodes
+/// on store, and what the compositor must see is `srgb × alpha`. At `100` it's exactly
+/// the opaque background.
+///
+/// Pure, so it's tested in `tests/color.rs`.
+pub fn clear_color(bg: u32, opacity: u8) -> [f32; 4] {
+    let a = opacity.min(100) as f32 / 100.0;
+    let f = |b: u8| srgb_to_linear(b as f32 / 255.0 * a);
+    [f((bg >> 16) as u8), f((bg >> 8) as u8), f(bg as u8), a]
+}
+
+/// Decode one sRGB-encoded channel (`0.0`–`1.0`) to linear.
+fn srgb_to_linear(s: f32) -> f32 {
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Convert a packed sRGB color to linear-space RGB floats (alpha handled by the
 /// caller). The surface is sRGB, so clear/quad colors must be linear.
 fn srgb_u32_to_linear(c: u32) -> [f32; 3] {
-    let f = |b: u8| {
-        let s = b as f32 / 255.0;
-        if s <= 0.04045 {
-            s / 12.92
-        } else {
-            ((s + 0.055) / 1.055).powf(2.4)
-        }
-    };
+    let f = |b: u8| srgb_to_linear(b as f32 / 255.0);
     [f((c >> 16) as u8), f((c >> 8) as u8), f(c as u8)]
 }
 
 // --- solid-color quad pipeline ---------------------------------------------
 
-/// A rectangle to fill, in device pixels (origin top-left), with a premultiplied
-/// linear-space RGBA color.
+/// A rectangle to fill, in device pixels (origin top-left), with a linear-space RGBA
+/// color.
 struct Quad {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+    /// Straight alpha, blended over what's under the quad — or, for a `punch` quad,
+    /// the premultiplied value written in its place ([`clear_color`]'s form).
     color: [f32; 4],
+    /// Replace the frame's pixels instead of blending over them: a float's or popup's
+    /// backing ([`Renderer::fill_popup`]), which clears the editor beneath it so a
+    /// translucent float shows the window's backdrop rather than the text under it.
+    punch: bool,
 }
 
 /// A minimal pipeline that draws solid-color rectangles. Vertices are built on
@@ -5772,6 +5902,12 @@ struct Quad {
 /// one growable vertex buffer — enough for the handful of fills a frame needs.
 struct RectPipeline {
     pipeline: wgpu::RenderPipeline,
+    /// The same rectangles written over the frame with no blending — for
+    /// [`Quad::punch`] quads.
+    replace: wgpu::RenderPipeline,
+    /// The uploaded vertices as `(start, end, punch)` runs, in draw order, so each
+    /// run is drawn with its pipeline and the layering between them is kept.
+    runs: Vec<(u32, u32, bool)>,
     buffer: wgpu::Buffer,
     capacity: u64,
     /// Vertices in the base layer (drawn first); they occupy `0..base_vertices`.
@@ -5812,46 +5948,53 @@ impl RectPipeline {
             bind_group_layouts: &[],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("bemtvi-gui rect pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: VERTEX_BYTES,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 8,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make = |label: &str, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: VERTEX_BYTES,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 8,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make(
+            "bemtvi-gui rect pipeline",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
+        let replace = make("bemtvi-gui rect replace pipeline", None);
         let capacity = VERTEX_BYTES * 6 * 256;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bemtvi-gui rect vertices"),
@@ -5861,6 +6004,8 @@ impl RectPipeline {
         });
         Self {
             pipeline,
+            replace,
+            runs: Vec::new(),
             buffer,
             capacity,
             base_vertices: 0,
@@ -5893,7 +6038,13 @@ impl RectPipeline {
                 bytes.extend_from_slice(&ch.to_ne_bytes());
             }
         };
-        for q in base.iter().chain(overlay) {
+        self.runs.clear();
+        for (i, q) in base.iter().chain(overlay).enumerate() {
+            let at = (i * 6) as u32;
+            match self.runs.last_mut() {
+                Some(run) if run.2 == q.punch => run.1 = at + 6,
+                _ => self.runs.push((at, at + 6, q.punch)),
+            }
             let (x0, y0, x1, y1) = (q.x, q.y, q.x + q.w, q.y + q.h);
             push(x0, y0, q.color);
             push(x1, y0, q.color);
@@ -5929,14 +6080,19 @@ impl RectPipeline {
         self.draw_range(pass, self.base_vertices, self.vertices);
     }
 
-    /// Draw vertices `[start, end)` from the shared buffer (a no-op for an empty
-    /// range).
+    /// Draw vertices `[start, end)` from the shared buffer, each run with its own
+    /// pipeline (a no-op for an empty range).
     fn draw_range(&self, pass: &mut wgpu::RenderPass<'_>, start: u32, end: u32) {
         if end <= start {
             return;
         }
-        pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.buffer.slice(..));
-        pass.draw(start..end, 0..1);
+        for &(s, e, punch) in &self.runs {
+            let (s, e) = (s.max(start), e.min(end));
+            if s < e {
+                pass.set_pipeline(if punch { &self.replace } else { &self.pipeline });
+                pass.draw(s..e, 0..1);
+            }
+        }
     }
 }

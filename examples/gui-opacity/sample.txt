@@ -1,0 +1,11 @@
+'guiopacity' — the window's Mica, through the editor's background.
+
+This line sits on the Normal background: below 100 the wallpaper's tint
+shows through behind it.
+
+Select a few lines with V and they stay solid: a selection has a background of
+its own, so only Normal is see-through.
+
+Search for /solid and the matches stay solid too.
+
+The status line below keeps its own background as well.

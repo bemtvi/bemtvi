@@ -1745,6 +1745,23 @@ impl Editor {
             self.recompute_effective_options();
             return;
         }
+        // `'guiopacity'` / `'guihlopacity'` are percentages: bounded like `'httpport'`,
+        // and with nothing to re-lay out (the GUI repaints from the relayed value).
+        // Validated rather than clamped, so `150` is an error, not a silent `100`.
+        if name == "guiopacity" || name == "guihlopacity" {
+            if value < 0 {
+                self.echo(format!("E487: Argument must be positive: {name}={value}"));
+                return;
+            }
+            if value > 100 {
+                self.echo(format!("E474: Invalid argument: {name}={value}"));
+                return;
+            }
+            self.global_base
+                .set_scalar(name, &crate::options::OptionScalar::Num(value));
+            self.recompute_effective_options();
+            return;
+        }
         // `mousetime` is an unbounded non-negative millisecond count — it doesn't
         // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
         // so handle it before the bounded block. `pummaxwidth` joins them: a column

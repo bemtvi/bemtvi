@@ -171,6 +171,11 @@ impl EditHost {
         // client size their off-grid glyphs with it (the TUI has no say — the terminal
         // draws them). Empty (the default) leaves the client on its own setting.
         let guiglyphoverflow = global_opts.guiglyphoverflow;
+        // `'guiopacity'`, relayed for the native GUI to paint its `Normal` background
+        // that opaque (the window's backdrop shows through the rest).
+        let guiopacity = global_opts.guiopacity;
+        // `'guihlopacity'`, the same for every other background (floats included).
+        let guihlopacity = global_opts.guihlopacity;
         // `'imdisable'`, relayed for a GUI to turn its input method off while set.
         let imdisable = global_opts.imdisable;
         // The `'timeout'` / `'timeoutlen'` mapping-timeout config, relayed so each
@@ -465,6 +470,8 @@ impl EditHost {
                 Value::from("guiglyphoverflow"),
                 Value::from(guiglyphoverflow.as_str()),
             ),
+            (Value::from("guiopacity"), Value::from(guiopacity)),
+            (Value::from("guihlopacity"), Value::from(guihlopacity)),
             (Value::from("imdisable"), Value::from(imdisable)),
             (Value::from("timeout"), Value::from(timeout)),
             (Value::from("timeoutlen"), Value::from(timeoutlen)),

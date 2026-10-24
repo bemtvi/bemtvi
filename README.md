@@ -467,17 +467,18 @@ is [**Beyond vim: what bemtvi adds**](docs/features.md); the highlights:
   moves: the glyph still *occupies* one cell, so every column the server computes
   is untouched.
 
-  On Windows the native GUI can let the window's **Mica** show through the
-  editor: `btv.o.guiopacity` (`0`–`100`, default `100`) is how opaque it paints
+  The native GUI can let the window's backdrop show through the editor — its
+  **Mica** on Windows, the desktop through **vibrancy** on macOS:
+  `btv.o.guiopacity` (`0`–`100`, default `100`) is how opaque it paints
   the colorscheme's `Normal` background. Every other background — selections,
   search matches, the cursor line, line tints, status lines, a dock's own
   `Normal`, floats and popups — follows `btv.o.guihlopacity` instead (same range,
   same default); cursors, underlines and the text itself always stay solid. A
   float *clears* the editor beneath it rather than blending over it, so below
-  `100` its text sits on the Mica and its own thinned background, never on the
-  buffer underneath. Both need Direct3D 12 (the GUI's default on Windows); with
-  `WGPU_BACKEND=vulkan`, or on another platform, a value below `100` is an error
-  in the message line and the backgrounds stay solid. The TUI and the browser
+  `100` its text sits on the backdrop and its own thinned background, never on
+  the buffer underneath. Both need Direct3D 12 on Windows (the GUI's default) or
+  Metal on macOS; with `WGPU_BACKEND=vulkan`, or on Linux, a value below `100` is
+  an error in the message line and the backgrounds stay solid. The TUI and the browser
   have no backdrop and ignore both. See `examples/gui-opacity`.
 
 ---

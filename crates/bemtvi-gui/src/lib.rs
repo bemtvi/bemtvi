@@ -757,12 +757,14 @@ struct App {
     redraw: Rc<tokio::sync::Notify>,
     /// The window's own state, made in its reactive scope: whether it's open (closing
     /// it ends the app), the pointer's cursor over the surface (a resize arrow over a
-    /// split separator), the caret the input method's candidate window opens by, and
-    /// whether input methods are on (unless `'imdisable'`: [`View::imdisable`]).
+    /// split separator), the caret the input method's candidate window opens by,
+    /// whether input methods are on (unless `'imdisable'`: [`View::imdisable`]), and
+    /// whether the window's backdrop is under the surface (an opacity below `100`).
     open: Option<Signal<bool>>,
     cursor: Option<Signal<Cursor>>,
     caret: Option<Signal<Option<Rect>>>,
     input_method: Option<Signal<bool>>,
+    transparent: Option<Signal<bool>>,
     /// The modifiers held with the latest input — a wheel or button carries its own,
     /// and `send_mouse` reports them.
     mods: Modifiers,
@@ -881,6 +883,7 @@ impl App {
                 cursor: None,
                 caret: None,
                 input_method: None,
+                transparent: None,
                 mods: Modifiers::default(),
                 scale: 1.0,
                 cursor_px: (0.0, 0.0),
@@ -920,12 +923,14 @@ impl App {
         let cursor = signal(Cursor::Default);
         let caret = signal(None::<Rect>);
         let input_method = signal(true);
+        let transparent = signal(false);
         {
             let mut app = this.borrow_mut();
             app.open = Some(open);
             app.cursor = Some(cursor);
             app.caret = Some(caret);
             app.input_method = Some(input_method);
+            app.transparent = Some(transparent);
         }
         let app = this.clone();
         spawn_local(async move {
@@ -968,6 +973,9 @@ impl App {
                         // unless a config sets `'imdisable'`.
                         .text_input(true)
                         .input_method(input_method)
+                        // The window's backdrop under it, for `'guiopacity'` to show
+                        // (macOS's vibrancy; Windows' Mica is always there).
+                        .transparent(transparent)
                         .text_cursor(caret)
                         .cursor(cursor)
                         .on_ready(move |handle| ready.borrow_mut().surface = Some(handle))
@@ -1577,7 +1585,9 @@ impl App {
     /// window's backdrop. `None` (no server value yet) is fully opaque. A surface that
     /// can't show its backdrop refuses anything below `100`, and that's reported in the
     /// message line as an error (`:echoerr`, as [`report_session_error`] does), not left
-    /// looking set while the window stays solid. A no-op before the renderer exists;
+    /// looking set while the window stays solid. Taken, a value below `100` puts the
+    /// backdrop under the surface (and `100` takes it away again: macOS's vibrancy
+    /// isn't free while nothing shows it). A no-op before the renderer exists;
     /// [`Self::init_renderer`] applies it.
     ///
     /// Cheap — the next frame just paints differently — so it only repaints.
@@ -1587,10 +1597,11 @@ impl App {
         };
         let (normal, hl) = (self.view.guiopacity, self.view.guihlopacity);
         self.applied_opacity = (normal, hl);
-        let results = [
-            renderer.set_opacity(normal.unwrap_or(100)),
-            renderer.set_hl_opacity(hl.unwrap_or(100)),
-        ];
+        let (normal, hl) = (normal.unwrap_or(100), hl.unwrap_or(100));
+        let results = [renderer.set_opacity(normal), renderer.set_hl_opacity(hl)];
+        if let Some(transparent) = self.transparent {
+            transparent.set(results.iter().all(Result::is_ok) && (normal < 100 || hl < 100));
+        }
         for e in results.into_iter().filter_map(Result::err) {
             let escaped = e.replace('\'', "''");
             self.rpc.notify(

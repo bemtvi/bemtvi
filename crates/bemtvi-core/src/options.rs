@@ -90,8 +90,8 @@ pub struct Options {
     /// `--glyph-overflow` flag.
     pub guiglyphoverflow: String,
     /// The `'guiopacity'` percentage (`0`–`100`): how opaque a GUI paints the `Normal`
-    /// background. Below `100` the window's backdrop shows through — on Windows that's
-    /// the window's Mica — while explicit backgrounds (selections, status lines,
+    /// background. Below `100` the window's backdrop shows through — the window's Mica
+    /// on Windows, behind-window vibrancy on macOS — while explicit backgrounds (selections, status lines,
     /// floats, a dock's own `Normal`) and the text stay opaque. Like `'guifont'` the
     /// core doesn't use it — it relays it to the native GUI, the client that has a
     /// backdrop to show (the TUI and the browser have none). Default `100`.
@@ -2189,7 +2189,7 @@ static OPTIONS: &[OptionInfo] = {
             abbrev: None,
             kind: Num,
             scope: Global,
-            doc: "Opacity (0-100) of the GUI's Normal background; below 100 the                   window's backdrop (Windows' Mica) shows through.",
+            doc: "Opacity (0-100) of the GUI's Normal background; below 100 the                   window's backdrop (Mica, macOS vibrancy) shows through.",
         },
         OptionInfo {
             name: "guihlopacity",

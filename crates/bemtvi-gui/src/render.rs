@@ -427,24 +427,30 @@ impl Renderer {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
-        // A premultiplied surface lets the clear's alpha (`'guiopacity'`) through to the
-        // window's backdrop; at full opacity it paints exactly as an opaque one. Only
-        // where the compositor is known to honour it: Direct3D 12 presenting through
-        // the composition visual set up above. A swapchain straight on the child
-        // window — Vulkan's, which *advertises* `PreMultiplied` on Windows — has its
-        // alpha ignored, so trusting the capability alone would leave the option
-        // looking set on a solid window. Everywhere else the surface stays as it was,
-        // and `set_opacity` refuses anything below 100.
-        let premultiplied = cfg!(windows)
-            && adapter.get_info().backend == wgpu::Backend::Dx12
-            && caps
-                .alpha_modes
-                .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
-        let alpha_mode = if premultiplied {
-            wgpu::CompositeAlphaMode::PreMultiplied
+        // A surface that composites alpha lets the clear's (`'guiopacity'`) through to
+        // the window's backdrop; at full opacity it paints exactly as an opaque one.
+        // Only where the compositor is known to honour it. On Windows that's Direct3D 12
+        // presenting through the composition visual set up above, `PreMultiplied`: a
+        // swapchain straight on the child window — Vulkan's, which *advertises*
+        // `PreMultiplied` there — has its alpha ignored, so trusting the capability
+        // alone would leave the option looking set on a solid window. On macOS it's
+        // Metal's `PostMultiplied`, the one mode besides `Opaque` it has, which makes
+        // the layer non-opaque; Core Animation reads a layer's contents as
+        // premultiplied whatever wgpu calls the mode, so the frame is premultiplied
+        // either way, and mitsuami's backdrop (`GpuSurface::transparent`) is under it.
+        // Everywhere else the surface stays as it was, and `set_opacity` refuses
+        // anything below 100.
+        let backend = adapter.get_info().backend;
+        let composite = if cfg!(windows) && backend == wgpu::Backend::Dx12 {
+            Some(wgpu::CompositeAlphaMode::PreMultiplied)
+        } else if cfg!(target_os = "macos") && backend == wgpu::Backend::Metal {
+            Some(wgpu::CompositeAlphaMode::PostMultiplied)
         } else {
-            caps.alpha_modes[0]
-        };
+            None
+        }
+        .filter(|mode| caps.alpha_modes.contains(mode));
+        let premultiplied = composite.is_some();
+        let alpha_mode = composite.unwrap_or(caps.alpha_modes[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -585,7 +591,7 @@ impl Renderer {
         let percent = percent.min(100);
         if percent < 100 && !self.premultiplied {
             return Err(format!(
-                "{name}={percent}: needs Direct3D 12 on Windows; the background stays solid"
+                "{name}={percent}: needs Direct3D 12 on Windows or Metal on macOS; the background stays solid"
             ));
         }
         Ok(percent)

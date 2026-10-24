@@ -599,8 +599,8 @@ pub struct View {
     /// Frontend-agnostic — the TUI ignores it (the terminal draws its own glyphs).
     pub guiglyphoverflow: String,
     /// `'guiopacity'`, relayed from the server: how opaque (`0`–`100`) the native GUI
-    /// paints the `Normal` background, letting the window's backdrop (Windows' Mica)
-    /// show through below `100`. The TUI and the web client ignore it — neither has a
+    /// paints the `Normal` background, letting the window's backdrop (Windows' Mica,
+    /// macOS's vibrancy) show through below `100`. The TUI and the web client ignore it — neither has a
     /// backdrop behind its cells. `None` until a server relays it (and from an older
     /// server that doesn't), which a client paints fully opaque.
     pub guiopacity: Option<u8>,

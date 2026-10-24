@@ -1,13 +1,15 @@
 --------------------------------------------------------------------------------
 -- 'guiopacity' — let the window's backdrop show through the background.
 --
--- Run (the native GUI on Windows 11 — the window's backdrop is its Mica):
+-- Run (the native GUI on Windows 11, where the window's backdrop is its Mica,
+-- or on macOS, where it's the desktop through vibrancy):
 --   BEMTVI_CONFIG=examples/gui-opacity \
 --     cargo run -p bemtvi-gui -- examples/gui-opacity/sample.txt
 --
 -- The option is how opaque, in percent, the GUI paints the colorscheme's
--- `Normal` background. Below 100 the rest is Mica: Windows' material, tinted by
--- your wallpaper, the same one behind the title bar.
+-- `Normal` background. Below 100 the rest is the backdrop: on Windows Mica, its
+-- material tinted by your wallpaper, the same one behind the title bar; on macOS
+-- the windows and desktop behind, blurred, as a sidebar shows them.
 --
 -- Only the `Normal` background thins. Everything that has a background of its
 -- own — a selection, the status line, a search match, the cursor line, a float,
@@ -28,7 +30,7 @@ btv.o.guiopacity = 85
 btv.o.cursorline = true
 
 --------------------------------------------------------------------------------
--- 2. All the way: pure Mica behind the text.
+-- 2. All the way: pure backdrop behind the text.
 --
 -- Type-this:  :set guiopacity=0<CR>
 -- See-that:   the editor area is the same material as the title bar, edge to
@@ -57,22 +59,22 @@ btv.o.cursorline = true
 --
 -- Type-this:  :set guiopacity=0 guihlopacity=50<CR>
 -- See-that:   the cursor line and the status line are half-tinted bands over
---             the Mica.
+--             the backdrop.
 --
 -- Type-this:  <Space>f
 -- See-that:   a float opens under the cursor, over the text, and NONE of that text
 --             shows through: a float clears what's beneath it, so behind its own
---             lines there's only Mica and its half-strength background.
+--             lines there's only the backdrop and its half-strength background.
 --
 -- Type-this:  :set guihlopacity=0<CR>  then  <Space>f  again
--- See-that:   the float's text sits on pure Mica, still with nothing of the
+-- See-that:   the float's text sits on pure backdrop, still with nothing of the
 --             buffer behind it (moving the cursor closes the float).
 --------------------------------------------------------------------------------
 btv.keymap.set("n", "<Space>f", function()
   btv.ui.float({
     "A float clears the editor under it:",
     "behind these lines there's only the",
-    "window's Mica and the float's own",
+    "window's backdrop and the float's own",
     "background, at 'guihlopacity'.",
   }, { title = " guihlopacity " })
 end, { desc = "Open a float over the text" })
@@ -90,11 +92,11 @@ end, { desc = "Open a float over the text" })
 --------------------------------------------------------------------------------
 -- 6. Where it can't.
 --
--- Showing the backdrop takes a Direct3D 12 swapchain the compositor reads alpha
--- from, which the GUI only has on Windows so far. Anywhere else — or on Windows
--- with `WGPU_BACKEND=vulkan` — anything below 100 (in either option) is an error
--- in the message line and the backgrounds stay solid; it never looks set while
--- doing nothing:
+-- Showing the backdrop takes a surface the compositor reads alpha from: a
+-- Direct3D 12 composition swapchain on Windows, a Metal layer on macOS. On Linux
+-- — or on Windows with `WGPU_BACKEND=vulkan` — anything below 100 (in either
+-- option) is an error in the message line and the backgrounds stay solid; it
+-- never looks set while doing nothing:
 --     WGPU_BACKEND=vulkan BEMTVI_CONFIG=examples/gui-opacity \
 --       cargo run -p bemtvi-gui -- examples/gui-opacity/sample.txt
 --

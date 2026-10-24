@@ -1874,6 +1874,26 @@ impl Renderer {
                         style_fg(&view.search_style),
                         style_fg(&view.incsearch_style),
                     );
+                    // Selection / search win over a span's own background (inline
+                    // `code`, a fenced block's tint): drop that bg under the overlay
+                    // spans, else its quad — pushed after theirs — paints over them.
+                    let overlay: Vec<(u16, u16)> = win
+                        .selection
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .into_iter()
+                        .chain(
+                            win.secondary_selection
+                                .get(i)
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        )
+                        .chain(win.search.get(i).into_iter().flatten().copied())
+                        .chain(win.incsearch.get(i).copied().flatten())
+                        .collect();
+                    segments = clear_bg_under(segments, &overlay, win.leftcol);
                     // The glyph under the block cursor, inverted so it reads against
                     // the opaque quad. Last of the base-space recolors, so it wins over
                     // a search match on the same cell — the cursor is on top of it.
@@ -4704,6 +4724,54 @@ pub fn apply_search_fg(
                 }),
             }
             col += cells(g) as u16;
+        }
+    }
+    out
+}
+
+/// Drop the span's own background from every cell an overlay span covers — the
+/// `Visual` selection (primary + secondary) and the `hlsearch` / `incsearch`
+/// matches — so the overlay's quad shows there. A run whose highlight group carries
+/// a `bg` (markdown inline `code`, a fenced block's `@markup.raw.block`) pushes its
+/// own quad *after* the overlay quads (see [`Renderer::push_seg_backgrounds`]), so
+/// without this it painted over the selection and selecting such text showed no
+/// highlight. Vim gives `Visual` / `Search` precedence over a syntax background the
+/// same way. `spans` are half-open `[start, end)` in `base`'s column space (the
+/// pre-inlay/virt-splice space, starting at `leftcol`), like [`apply_search_fg`].
+/// Returns `segments` untouched when no span or no background is involved.
+pub fn clear_bg_under(segments: Vec<Seg>, spans: &[(u16, u16)], leftcol: u16) -> Vec<Seg> {
+    if spans.is_empty() || segments.iter().all(|s| s.bg.is_none()) {
+        return segments;
+    }
+    let covered = |col: u16| spans.iter().any(|&(s, e)| col >= s && col < e);
+    let mut out: Vec<Seg> = Vec::with_capacity(segments.len());
+    let mut col = leftcol;
+    for seg in segments {
+        if seg.bg.is_none() {
+            col = col.saturating_add(cells(&seg.text).min(u16::MAX as usize) as u16);
+            out.push(seg);
+            continue;
+        }
+        for g in seg.text.graphemes(true) {
+            let bg = if covered(col) { None } else { seg.bg };
+            match out.last_mut() {
+                Some(last)
+                    if last.fg == seg.fg
+                        && last.bg == bg
+                        && last.bold == seg.bold
+                        && last.italic == seg.italic =>
+                {
+                    last.text.push_str(g);
+                }
+                _ => out.push(Seg {
+                    text: g.to_string(),
+                    fg: seg.fg,
+                    bg,
+                    bold: seg.bold,
+                    italic: seg.italic,
+                }),
+            }
+            col = col.saturating_add(cells(g) as u16);
         }
     }
     out

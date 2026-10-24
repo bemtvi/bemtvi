@@ -50,10 +50,22 @@ pub struct SystemClipboard {
 }
 
 impl SystemClipboard {
-    /// The first *usable* clipboard tool on this host, or `None` when none is
-    /// found — the editor then falls back to OSC 52 if the client can do it, and
-    /// otherwise has no `"+` provider and errors loudly on use.
-    pub fn detect() -> Option<SystemClipboard> {
+    /// The first *usable* clipboard on this host, or `None` when none is found —
+    /// the editor then falls back to OSC 52 if the client can do it, and otherwise
+    /// has no `"+` provider and errors loudly on use. Windows uses the Win32 API
+    /// ([`WindowsClipboard`]) rather than a tool.
+    pub fn detect() -> Option<Box<dyn Clipboard>> {
+        #[cfg(windows)]
+        {
+            // Over ssh the Win32 clipboard is the remote session's, which the user
+            // never sees — leave that case to OSC 52, as the display gating does
+            // on Linux.
+            if env_is_set("SSH_CONNECTION") {
+                return None;
+            }
+            return Some(Box::new(WindowsClipboard));
+        }
+        #[allow(unreachable_code)]
         let candidates: &[Tool] = if cfg!(target_os = "macos") {
             &[Tool {
                 set: &["pbcopy"],
@@ -95,9 +107,11 @@ impl SystemClipboard {
         candidates
             .iter()
             .find(|t| t.needs_env.is_none_or(env_is_set) && tool_exists(t.set[0]))
-            .map(|t| SystemClipboard {
-                set: t.set,
-                get: t.get,
+            .map(|t| {
+                Box::new(SystemClipboard {
+                    set: t.set,
+                    get: t.get,
+                }) as Box<dyn Clipboard>
             })
     }
 }
@@ -146,6 +160,112 @@ fn tool_exists(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+// ===== Windows ==============================================================
+
+/// The Windows clipboard, through the Win32 API as `CF_UNICODETEXT`. Windows
+/// line breaks are `\r\n` on the clipboard and `\n` in the editor, translated
+/// both ways so a linewise yank still reads back linewise.
+#[cfg(windows)]
+struct WindowsClipboard;
+
+#[cfg(windows)]
+impl WindowsClipboard {
+    /// Open the clipboard, retrying briefly: another process may hold it for a
+    /// moment (a clipboard manager reading what we just wrote). `false` if it
+    /// stays busy.
+    fn open() -> bool {
+        use windows_sys::Win32::System::DataExchange::OpenClipboard;
+        for _ in 0..10 {
+            // SAFETY: a null owner window is allowed; paired with `CloseClipboard`.
+            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+}
+
+#[cfg(windows)]
+impl Clipboard for WindowsClipboard {
+    fn get(&self) -> Option<(String, bool)> {
+        use windows_sys::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        };
+        use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+        use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+        // SAFETY: the checks below guard every pointer; the handle is owned by the
+        // clipboard and only read between `GlobalLock`/`GlobalUnlock` while open.
+        unsafe {
+            if IsClipboardFormatAvailable(CF_UNICODETEXT.into()) == 0 || !Self::open() {
+                return None;
+            }
+            let mut text = None;
+            let handle = GetClipboardData(CF_UNICODETEXT.into());
+            if !handle.is_null() {
+                let ptr = GlobalLock(handle) as *const u16;
+                if !ptr.is_null() {
+                    let mut len = 0;
+                    while *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    let wide = std::slice::from_raw_parts(ptr, len);
+                    text = Some(String::from_utf16_lossy(wide).replace("\r\n", "\n"));
+                    GlobalUnlock(handle);
+                }
+            }
+            CloseClipboard();
+            text.map(|t| {
+                let linewise = t.ends_with('\n');
+                (t, linewise)
+            })
+        }
+    }
+
+    fn set(&self, text: &str, _linewise: bool) {
+        use windows_sys::Win32::Foundation::GlobalFree;
+        use windows_sys::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, SetClipboardData,
+        };
+        use windows_sys::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        };
+        use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+        let wide: Vec<u16> = text
+            .replace('\n', "\r\n")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: the allocation is sized for `wide` and written only while locked;
+        // on a successful `SetClipboardData` the clipboard owns it, otherwise it
+        // is freed here.
+        unsafe {
+            let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
+            if mem.is_null() {
+                return;
+            }
+            let ptr = GlobalLock(mem) as *mut u16;
+            if ptr.is_null() {
+                GlobalFree(mem);
+                return;
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+            GlobalUnlock(mem);
+            if !Self::open() {
+                GlobalFree(mem);
+                return;
+            }
+            EmptyClipboard();
+            if SetClipboardData(CF_UNICODETEXT.into(), mem).is_null() {
+                GlobalFree(mem);
+            }
+            CloseClipboard();
+        }
+    }
 }
 
 /// Whether environment variable `name` is set to something non-empty — the

@@ -124,6 +124,15 @@ base64 = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# The Windows host clipboard behind `"+` / `"*` (`clipboard.rs::WindowsClipboard`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }
+
 [dev-dependencies]
 # The daemon **dial** test exercises the handoff race between the link thread and the
 # caller's first seam op — a window a few instructions wide, which only opens under true

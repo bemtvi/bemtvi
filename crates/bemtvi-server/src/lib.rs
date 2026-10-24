@@ -4301,7 +4301,7 @@ where
     let mut osc52: Option<clipboard::Osc52Handle> = None;
     match init.clipboard {
         ClipboardProvider::System => match clipboard::SystemClipboard::detect() {
-            Some(cb) => editor.set_clipboard(Box::new(cb)),
+            Some(cb) => editor.set_clipboard(cb),
             // Nothing on this host can reach a clipboard the user would see — a
             // bare server, or (the common case) an ssh session, where a tool would
             // only ever set the *remote* machine's clipboard. Fall back to asking

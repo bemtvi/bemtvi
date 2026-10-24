@@ -125,6 +125,10 @@ libc = "=0.2.186"
 # OSC 52 clipboard payloads (`crates/bemtvi-server/src/clipboard.rs`) — the escape
 # carries its text base64-encoded.
 base64 = "=0.22.1"
+# The Windows host clipboard (`crates/bemtvi-server/src/clipboard.rs`): Win32 has no
+# clipboard CLI that can both read and write Unicode, so `"+` talks to the API
+# directly. Already in the tree transitively; pinned to the resolved version.
+windows-sys = "=0.61.2"
 # Native GUI client stack (`bemtvi-gui`). mitsuami owns the window, its run loop and
 # input (AppKit / WinUI 3 / GTK 4 or Kirigami, each the platform's own), and hands
 # the GUI a `GpuSurface`; wgpu presents to it, and glyphon renders the text (it

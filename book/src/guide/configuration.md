@@ -83,7 +83,7 @@ btv.keymap.set("n", "<C-v>", function() end)  -- disable the normal-mode paste
 btv.keymap.set("v", "<C-x>", '"+d')           -- add a cut to match the copy
 ```
 
-Copying needs a clipboard to copy *to*: a host tool (`wl-copy` / `pbcopy` / `xclip`),
+Copying needs a clipboard to copy *to*: the host clipboard (Windows', or a tool: `wl-copy` / `pbcopy` / `xclip`),
 a terminal that speaks OSC 52 (the ssh case), or the browser's `navigator.clipboard`.
 With none of them a copy says so rather than quietly going nowhere.
 

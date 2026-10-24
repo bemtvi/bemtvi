@@ -198,9 +198,9 @@ Downloads ship with checksums and SLSA build provenance — see
 > kitty protocol, not xterm's older `modifyOtherKeys`.) Force the decision either way
 > with `BEMTVI_KITTY_KEYBOARD=1` / `=0`.
 
-> **The clipboard works over ssh.** `"+y` / `"*y` use a real host clipboard tool
-> when one can actually reach you (`pbcopy`, `wl-copy`, `xclip`/`xsel` with a
-> display, `tmux`). On a remote machine none can — so bemtvi asks your *terminal*
+> **The clipboard works over ssh.** `"+y` / `"*y` use the real host clipboard
+> when it can actually reach you (the Windows clipboard, `pbcopy`, `wl-copy`,
+> `xclip`/`xsel` with a display, `tmux`). On a remote machine none can — so bemtvi asks your *terminal*
 > to set its own clipboard with an [OSC
 > 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Operating-System-Commands)
 > escape, which travels back down the ssh connection. It is used only when the

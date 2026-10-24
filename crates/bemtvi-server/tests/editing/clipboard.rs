@@ -331,3 +331,35 @@ async fn registers_listing_omits_an_empty_clipboard() {
         "an empty clipboard must not be listed, got {shown:?}"
     );
 }
+
+/// On Windows the real host clipboard (`ClipboardProvider::System`, what the GUI and
+/// TUI pass) must back `"+`: a yank reaches the OS clipboard and `"+p` reads it back.
+/// Detection used to know only macOS/Linux tools, so on Windows `"+y` (the GUI's
+/// `<C-c>`) failed with "No provider". Ignored by default: it overwrites the
+/// developer's real clipboard. Run with `--ignored` on Windows.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "writes the real host clipboard"]
+async fn system_clipboard_round_trips_on_windows() {
+    let (rpc, _incoming) = start_with(ServerInit {
+        clipboard: bemtvi_server::ClipboardProvider::System,
+        ..Default::default()
+    })
+    .await;
+    feed(&rpc, "ihéllo wörld ✓<Esc>");
+    feed(&rpc, "0\"+yiW");
+    let _ = lines(&rpc).await; // barrier: the yank has been processed
+                               // The OS clipboard now holds the text — read it independently of bemtvi.
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw",
+        ])
+        .output()
+        .expect("run powershell Get-Clipboard");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "héllo");
+    // And `"+p` reads it back through the provider.
+    feed(&rpc, "o<Esc>\"+p");
+    assert_eq!(lines(&rpc).await, vec!["héllo wörld ✓", "héllo"]);
+}

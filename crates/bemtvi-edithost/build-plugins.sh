@@ -30,7 +30,7 @@ BUNDLE="$OUT/plugins-bundle.lua"
 PLUGINS=(
   "bemtvi/bemtvi-keys-helper	2f9e1060cea16ad0a4c15bcfebc5d15e25cb17ab"
   "bemtvi/bemtvi-tree	20338af5add9cf7e48a80358b80319b59ea5842e"
-  "bemtvi/bemtvi-line	b6ab2f6a6bc47fefbfd1b48f0114840821dfb6d1"
+  "bemtvi/bemtvi-line	f772220f2c5d46482f306a427412cfbc69bd86a0"
   "bemtvi/bemtvi-lspconfig	deafc538b71140646acc9b4bf0eaa302f669267c"
   "bemtvi/bemtvi-diff	05bb889a91e21a317efa7dcd089833215284b24d"
   "bemtvi/bemtvi-snippets	ad5eff3ed906efd6057fe9cedab1bd838424b9fd"

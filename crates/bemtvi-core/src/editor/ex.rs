@@ -2146,6 +2146,19 @@ impl Editor {
             self.echo("E192: Recursive use of :normal too deep".to_string());
             return;
         }
+        // `:normal` runs its keys from Normal mode, as vim does, even when it is
+        // called from Insert (an Insert mapping's `<Cmd>`, a plugin, a modeless
+        // session resting in Insert). The typing step closes first, as for
+        // `i_CTRL-O`, and Insert resumes afterwards if the keys finished back at a
+        // clean Normal.
+        let resume = self.mode.is_insert().then_some(self.mode);
+        if resume.is_some() {
+            self.end_typing_step();
+            self.owe_typing_step();
+            self.end_snippet();
+            self.close_completion();
+            self.mode = Mode::Normal;
+        }
         self.normal_depth += 1;
 
         if range.explicit {
@@ -2181,6 +2194,18 @@ impl Editor {
         }
 
         self.normal_depth -= 1;
+        if let Some(mode) = resume {
+            if self.mode == Mode::Normal && self.pending.is_clean() {
+                // Keys that left Insert themselves closed its undo snapshot; the
+                // resumed session needs one of its own.
+                if !self.snapshot_taken {
+                    self.push_undo();
+                    self.snapshot_taken = true;
+                }
+                self.mode = mode;
+                self.clamp_cursor();
+            }
+        }
     }
 
     /// `:[range]d[elete]` — delete the range's lines (default: the current line),

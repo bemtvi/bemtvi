@@ -1,0 +1,125 @@
+-- The example's own test suite, in pure Lua against a real editor.
+--
+--   bemtvi --test-plugin examples/modeless
+--
+-- Each numbered note in init.lua, typed as written. `t:feed` is the keyboard.
+
+local DIR = debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]+$")
+
+dofile(DIR .. "/init.lua")
+
+--- Open the sample fresh, at the start of line 1.
+local function open(t)
+  t:cmd("e " .. DIR .. "/sample.txt")
+  t:cmd("e!")
+  t:feed("<C-Home>")
+end
+
+btv.test.describe("examples/modeless", function()
+  btv.test.it("1 — the file opens in Insert, and <Esc> keeps you typing", function(t)
+    open(t)
+    btv.test.expect(t:mode()).to_be("i")
+    t:feed("Hello <Esc>!")
+    btv.test.expect(t:line(1)).to_be("Hello !The quick brown fox jumps over the lazy dog.")
+  end)
+
+  btv.test.it("2 — <C-z> undoes a word at a time, <C-S-z> redoes", function(t)
+    open(t)
+    t:feed("<End> and more words")
+    t:feed("<C-z>")
+    btv.test.expect(t:line(1)).to_be("The quick brown fox jumps over the lazy dog. and more")
+    t:feed("<C-z><C-z>")
+    btv.test.expect(t:line(1)).to_be("The quick brown fox jumps over the lazy dog.")
+    t:feed("<C-S-z>")
+    btv.test.expect(t:line(1)).to_be("The quick brown fox jumps over the lazy dog. and")
+  end)
+
+  btv.test.it("3 — Shift selects and typing replaces", function(t)
+    open(t)
+    t:feed("<C-S-Right>A")
+    btv.test.expect(t:line(1)).to_be("A quick brown fox jumps over the lazy dog.")
+    t:feed("<C-z>")
+    btv.test.expect(t:line(1)).to_be("The quick brown fox jumps over the lazy dog.")
+    btv.test.expect(t:mode()).to_be("s")
+    t:feed("A")
+    btv.test.expect(t:line(1)).to_be("A quick brown fox jumps over the lazy dog.")
+    t:feed("<S-End>.")
+    btv.test.expect(t:line(1)).to_be("A.")
+  end)
+
+  -- The runner's clipboard is an in-memory one (`btv.test.clipboard`), so note 4
+  -- runs as written.
+  btv.test.it("4 — <C-c> copies the line, <C-v> pastes it above, <C-x> cuts", function(t)
+    open(t)
+    t:feed("<C-c>")
+    btv.test
+      .expect(btv.test.clipboard.peek())
+      .to_be("The quick brown fox jumps over the lazy dog.\n")
+    -- Down to `first` (line 4) and paste: the whole-line copy goes in above it.
+    t:feed("<Down><Down><Down><C-v>")
+    btv.test.expect(t:line(4)).to_be("The quick brown fox jumps over the lazy dog.")
+    btv.test.expect(t:line(5)).to_be("first")
+    -- The caret rode down with its line, so it is on `first`: select the word, cut it.
+    t:feed("<Home><C-S-Right><C-x>")
+    btv.test.expect(t:line(5)).to_be("")
+    btv.test.expect(btv.test.clipboard.peek()).to_be("first")
+  end)
+
+  btv.test.it("5 — <C-f> finds and selects, <C-g> / <C-S-g> move through matches", function(t)
+    open(t)
+    t:feed("<C-f>fox<CR>")
+    btv.test.expect(t:mode()).to_be("s")
+    t:feed("FOX")
+    btv.test.expect(t:line(1)).to_be("The quick brown FOX jumps over the lazy dog.")
+    t:feed("<C-g>1")
+    btv.test.expect(t:line(2)).to_be("1 is the word to find, and fox again here.")
+    t:feed("<C-g>2")
+    btv.test.expect(t:line(2)).to_be("1 is the word to find, and 2 again here.")
+  end)
+
+  btv.test.it("6 — lines move, duplicate, and indent as a block", function(t)
+    open(t)
+    t:feed("<C-End><Up>")
+    btv.test.expect(t:line(5)).to_be("second")
+    t:feed("<A-Up>")
+    btv.test.expect(t:line(4)).to_be("second")
+    btv.test.expect(t:line(5)).to_be("first")
+    t:feed("<A-Down><C-S-d>")
+    btv.test.expect(t:line(5)).to_be("second")
+    btv.test.expect(t:line(6)).to_be("second")
+    t:cmd("set shiftwidth=2 expandtab")
+    t:feed("<C-End><Up><Up><Up><Home><S-Down><S-Down><S-End><Tab>")
+    btv.test.expect(t:line(4)).to_be("  first")
+    btv.test.expect(t:line(5)).to_be("  second")
+    btv.test.expect(t:line(6)).to_be("  second")
+    t:feed("<S-Tab>")
+    btv.test.expect(t:line(4)).to_be("first")
+  end)
+
+  btv.test.it("7 — the palette runs a command, <C-;> opens the : line", function(t)
+    open(t)
+    t:feed("<C-S-p>")
+    t:wait_for(function()
+      return t:menu() ~= nil
+    end, { message = "the palette never opened" })
+    t:feed("split")
+    t:wait_for(function()
+      local m = t:menu()
+      return m and #m.items > 0 and m.items[1]:find("^split")
+    end, { message = "split is not the top row" })
+    t:feed("<CR>")
+    t:wait_for(function()
+      return #btv.win.list() == 2
+    end, { message = "split never ran" })
+    t:feed("<C-;>")
+    btv.test.expect(t:mode()).to_be("c")
+    t:feed("<Esc>")
+    btv.test.expect(t:mode()).to_be("i")
+  end)
+
+  btv.test.it("8 — a map in the modeless layer: <C-e> selects to the line's end", function(t)
+    open(t)
+    t:feed("<C-Right><C-e>!")
+    btv.test.expect(t:line(1)).to_be("The!")
+  end)
+end)

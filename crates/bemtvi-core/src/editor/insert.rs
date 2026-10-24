@@ -242,6 +242,21 @@ impl Editor {
             }
             return;
         }
+        // A modeless session navigates with caret semantics (`<Right>` crosses to
+        // the next line, `<C-Right>` jumps a word) and selects with `<S-…>`.
+        if !self.paste_active && self.modeless_nav(key) {
+            return;
+        }
+        // …and `<S-Tab>` outdents the caret's line.
+        if !self.paste_active
+            && key.code == KeyCode::Tab
+            && key.shift
+            && self.rests_in_insert()
+            && !self.typing_undo_suppressed()
+        {
+            let _ = self.apply_modeless_action("outdent");
+            return;
+        }
         // The did_ai arm (an untouched auto-indent) is consumed by *this* key: any
         // key clears it, only `<Esc>` acts on it. `<CR>` clears it here and then
         // re-arms it for the line it opens (`insert_newline`).
@@ -259,6 +274,17 @@ impl Editor {
             self.before_typed_edit(kind, ch);
         }
         match key.code {
+            // A modeless session never leaves Insert on a typed `<Esc>`: it closes
+            // what is open over the text and stops there. Replace falls back to
+            // Insert, the mode the session rests in.
+            KeyCode::Esc if self.esc_keeps_insert() => {
+                self.end_snippet();
+                self.close_completion();
+                if self.signature_session {
+                    self.end_signature_session();
+                }
+                self.mode = Mode::Insert;
+            }
             KeyCode::Esc => {
                 // Leaving Insert ends any snippet session (its tabstops are dropped).
                 self.end_snippet();

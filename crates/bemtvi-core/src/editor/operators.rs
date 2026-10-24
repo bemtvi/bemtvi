@@ -14,7 +14,8 @@ use std::cmp::{max, min};
 /// Echoed when a `"+` / `"*` yank/delete/paste finds no clipboard provider
 /// installed (a headless box whose platform backend failed, or a bare-core
 /// test). vim prints a similar `clipboard: No provider` warning.
-const CLIPBOARD_UNAVAILABLE: &str = "clipboard: No provider available for register '+'/'*'";
+pub(crate) const CLIPBOARD_UNAVAILABLE: &str =
+    "clipboard: No provider available for register '+'/'*'";
 
 impl Editor {
     pub(crate) fn apply_operator(&mut self, op: char, m: MotionResult) {
@@ -248,7 +249,7 @@ impl Editor {
     /// A run that moves nothing (`<` over lines already at column 0, or a range of
     /// only blank lines) leaves undo and `'modified'` alone — see
     /// [`reindent_lines`](Self::reindent_lines) for the same rule under `=`.
-    fn shift_lines(&mut self, first: usize, last: usize, right: bool, count: usize) {
+    pub(crate) fn shift_lines(&mut self, first: usize, last: usize, right: bool, count: usize) {
         let last = last.min(self.last_line());
         let opts = self.buffer().options;
         let amount = opts.effective_shiftwidth() * count;
@@ -1373,7 +1374,7 @@ impl Editor {
     /// the unnamed register too — vim sets `""` on any yank/delete regardless of
     /// the explicit target — so a plain `p` still works after `"+y`. With no
     /// provider installed, errors loudly rather than silently dropping the text.
-    fn clipboard_write(&mut self, text: String, kind: RegKind) {
+    pub(crate) fn clipboard_write(&mut self, text: String, kind: RegKind) {
         let Some(clipboard) = self.clipboard.as_ref() else {
             self.echo(CLIPBOARD_UNAVAILABLE);
             return;

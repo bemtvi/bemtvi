@@ -28,9 +28,6 @@ glyphon.workspace = true
 # Direct dep only to turn on cosmic-text's `monospace_fallback` feature (see the
 # workspace dep note); glyphon still owns the actual text-render types we use.
 cosmic-text.workspace = true
-# `unicode_script::Script` types the `Fallback::script_fallback` impl in render.rs;
-# must be the same crate version cosmic-text (via glyphon) uses (see workspace dep).
-unicode-script.workspace = true
 # Cell-width accounting for the wide-glyph / emoji renderer (render.rs): how many
 # grid cells a cluster occupies, matching the server's column model.
 unicode-width.workspace = true
@@ -38,6 +35,8 @@ unicode-width.workspace = true
 # whole cluster's shaped advance against its display width, so a base char + its VS16
 # / combining marks (e.g. `❤️`) are weighed as one unit, not per glyph.
 unicode-segmentation.workspace = true
+# A font's character map, for the font list's per-character resolution (fontchain.rs).
+ttf-parser.workspace = true
 pollster.workspace = true
 bemtvi-rpc.workspace = true
 bemtvi-view.workspace = true

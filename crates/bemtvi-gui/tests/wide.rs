@@ -315,6 +315,24 @@ fn leaves_a_powerline_separator_in_its_cell() {
 }
 
 #[test]
+fn leaves_a_separator_in_its_cell_at_a_small_size_too() {
+    // At 13px the separator's ink rasterises to 10x14 whole pixels, a ratio of 0.714,
+    // just inside the square band, though the glyph is the same narrow wedge as at 15px
+    // (0.647). Whole-pixel rounding mustn't make a separator an icon.
+    let sep = Some((13.0, ink(-1.0, 10.0, 14.0)));
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, sep, 8.0, true),
+        0.0
+    );
+    // A real icon at that size still is one.
+    let icon = Some((13.0, ink(0.0, 13.0, 13.0)));
+    assert_eq!(
+        overflow_cells(GlyphOverflow::Always, 1.0, icon, 8.0, true),
+        1.0
+    );
+}
+
+#[test]
 fn leaves_a_box_drawing_rule_in_its_cell() {
     // The mirror case: `─` inks the full cell width and barely any height. Also not
     // square, also tiles with its neighbours.

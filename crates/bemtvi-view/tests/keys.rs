@@ -63,3 +63,25 @@ fn bare_shifted_char_stays_baked() {
     // (`Shift+a` → `A`), so it carries no `S-` and is sent literally.
     assert_eq!(notation(false, false, true, Key::Char('A')), "A");
 }
+
+#[test]
+fn command_is_d_and_carries_shift_on_a_letter() {
+    use bemtvi_view::notation_cmd;
+    assert_eq!(
+        notation_cmd(false, false, true, false, Key::Char('z')),
+        "<D-z>"
+    );
+    assert_eq!(
+        notation_cmd(false, false, true, true, Key::Char('Z')),
+        "<D-S-z>"
+    );
+    assert_eq!(
+        notation_cmd(true, false, true, false, Key::Left),
+        "<C-D-Left>"
+    );
+    // Without Command it is plain `notation`.
+    assert_eq!(
+        notation_cmd(true, false, false, false, Key::Char('w')),
+        notation(true, false, false, Key::Char('w'))
+    );
+}

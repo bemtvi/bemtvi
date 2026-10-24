@@ -72,10 +72,10 @@ pub struct Options {
     /// (`mouse`/`mousemodel`/`mousescroll`/`mousetime`) follow this block. A whole-line
     /// `%!v:lua.…()` is the usual form. Global by nature (there is one tabline).
     pub tabline: String,
-    /// The `'guifont'` value (`"Fira Code:h14"`, neovim/neovide syntax). The core
-    /// doesn't use it — fonts are a pixel concern the server has no notion of — but
-    /// it's stored here so `:set guifont=…` / `vim.o.guifont` are accepted and the
-    /// value is relayed to a GUI client (which parses and applies it). Empty means
+    /// The `'guifont'` value (`"Fira Code,Symbols Nerd Font:h14"`, a fallback list in
+    /// neovim/Neovide syntax, with per-font options in brackets — see
+    /// [`crate::guifont`]). The core draws no fonts, but it owns the syntax: a value is
+    /// checked on the way in and relayed parsed to the clients that draw. Empty means
     /// the client's own default font.
     pub guifont: String,
     /// The `'guiglyphoverflow'` mode: when a *square* one-cell glyph (a Nerd Font icon)
@@ -183,6 +183,13 @@ pub struct Options {
     /// [`crate::view::ImageView`] the client renders as a picture. When off, an
     /// image file opens as ordinary (binary) text, exactly as before.
     pub imagepreview: bool,
+    /// Edit the way a GUI editor does (bemtvi's `'modeless'`, not a standard vim
+    /// option): typing inserts, there is no Normal mode to fall into, and `<Esc>`
+    /// stays in Insert. A modifiable buffer rests in Insert; a read-only one (a
+    /// view, the quickfix list, help) keeps resting in Normal, where its keys are.
+    /// Off by default, and refused while a terminal client is attached: it is a GUI
+    /// and web model. See [`crate::Editor::settle_modeless`].
+    pub modeless: bool,
     /// The interface `btv.http.mount` binds its listener on (bemtvi's `'httphost'`, not
     /// a standard vim option). `"127.0.0.1"` (the default) is **loopback only** — the
     /// mounts a plugin serves are reachable from this machine and nowhere else.
@@ -350,6 +357,7 @@ impl Options {
             ("autoread", Bool(b)) => self.autoread = *b,
             ("indentdetect", Bool(b)) => self.indentdetect = *b,
             ("imagepreview", Bool(b)) => self.imagepreview = *b,
+            ("modeless", Bool(b)) => self.modeless = *b,
             ("timeout", Bool(b)) => self.timeout = *b,
             ("scrollanim", Bool(b)) => self.scrollanim = *b,
             ("qfdock", Bool(b)) => self.qfdock = *b,
@@ -417,6 +425,7 @@ impl Options {
             "autoread" => Bool(self.autoread),
             "indentdetect" => Bool(self.indentdetect),
             "imagepreview" => Bool(self.imagepreview),
+            "modeless" => Bool(self.modeless),
             "timeout" => Bool(self.timeout),
             "scrollanim" => Bool(self.scrollanim),
             "qfdock" => Bool(self.qfdock),
@@ -621,6 +630,7 @@ impl Default for Options {
             indentdetect: true,
             // Show image files as text, not pictures, until a config opts in.
             imagepreview: false,
+            modeless: false,
             // Plugin HTTP mounts stay on loopback, and pick a free port, until the
             // user says otherwise. Both inert until a plugin actually mounts.
             httphost: "127.0.0.1".to_string(),
@@ -2088,6 +2098,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Render image files as images instead of raw bytes.",
+        },
+        OptionInfo {
+            name: "modeless",
+            abbrev: Some("nm"),
+            kind: Bool,
+            scope: Global,
+            doc: "Edit like a GUI editor: type to insert, no Normal mode (GUI and web only).",
         },
         OptionInfo {
             name: "httphost",

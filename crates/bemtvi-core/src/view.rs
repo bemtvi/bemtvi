@@ -492,6 +492,15 @@ pub struct WindowView {
     /// [`cursor_row`]: WindowView::cursor_row
     /// [`cursor_screen_col`]: WindowView::cursor_screen_col
     pub secondary_cursors: Vec<(usize, usize)>,
+    /// Whether the pointer over this window's text is the text I-beam rather than
+    /// the arrow: a modeless session over a buffer it types into. See
+    /// [`Editor::text_pointer_over`].
+    pub text_pointer: bool,
+    /// Whether the cursor is off this window's screen — scrolled out of view, which
+    /// only a modeless session's wheel does to the focused window (see
+    /// [`Editor::detach_view`]). The client draws no cursor then; `cursor_row` is
+    /// clamped to an edge and means nothing.
+    pub cursor_hidden: bool,
     /// File name for this window's status line (`"[No Name]"` when unset).
     pub file_name: String,
     /// The buffer's **effective** treesitter filetype/language — the override
@@ -765,6 +774,11 @@ pub struct View {
     /// command mode), so a collapsed dock still advertises that it exists; clicking
     /// a chip re-shows that dock.
     pub hidden_docks: Vec<String>,
+    /// Whether the focused window's cursor is a modeless caret (typing or
+    /// selecting under `'modeless'`): a client drawing its own cursor shows a thin,
+    /// blinking bar. In a selection the window's cursor is projected at the
+    /// selection's head. See [`Editor::modeless_caret`].
+    pub caret: bool,
 }
 
 impl View {
@@ -827,6 +841,7 @@ impl View {
             dock_right: bands.right,
             dock_top: bands.top,
             dock_bottom: bands.bottom,
+            caret: ed.modeless_caret(),
         }
     }
 
@@ -956,6 +971,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             // just more rows in the band, counted by `screen_rows_between`.
             let base_line = ps.from_top.min(ps.to_top);
             let max_top = ps.from_top.max(ps.to_top);
+            // A caret the scroll left off screen (a modeless wheel) can be any
+            // distance from the band; it isn't drawn, so keep its row in the band
+            // rather than counting the rows all the way to it.
+            let in_band = |line: usize| line.clamp(base_line, max_top + height);
             let lead = screen_rows_between(
                 buf, base_line, max_top, line_count, wrap, width, tabstop, wo,
             );
@@ -1032,7 +1051,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 from_cursor_row: cursor_band_row(
                     buf,
                     base_line,
-                    ps.from_cursor,
+                    in_band(ps.from_cursor),
                     line_count,
                     wrap,
                     width,
@@ -1042,7 +1061,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 to_cursor_row: cursor_band_row(
                     buf,
                     base_line,
-                    ps.to_cursor,
+                    in_band(ps.to_cursor),
                     line_count,
                     wrap,
                     width,
@@ -1090,6 +1109,12 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // A cursor parked on a closed fold sits on the single collapsed row, so it has
     // no wrap segments — skip the wrap math (which would otherwise place it on a
     // continuation row that the fold replaced).
+    // The cursor to draw: the window's, except that a modeless selection's caret
+    // stands at its head (see `Editor::modeless_caret_head`).
+    let (cur_line, cur_col) = match ed.modeless_caret_head().filter(|_| w.focused) {
+        Some(head) => (head.line.min(line_count.saturating_sub(1)), head.col),
+        None => (cur_line, w.cursor.col),
+    };
     let cursor_folded = collapsed.iter().any(|f| f.contains(cur_line));
     let (cursor_extra_rows, cursor_seg_col, cursor_prefix) = if wrap && width > 0 && !cursor_folded
     {
@@ -1100,7 +1125,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent, wo.linebreak);
         let idx = segs
             .iter()
-            .rposition(|s| w.cursor.col >= s.start_byte)
+            .rposition(|s| cur_col >= s.start_byte)
             .unwrap_or(0);
         // The prefix sits on continuation rows only (segment index > 0).
         let prefix = if idx > 0 { indent } else { 0 };
@@ -1112,10 +1137,20 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         let line = buf.line_cow(cur_line);
         let tab = buf.options.effective_tabstop();
         (
-            unicode::virtcol(&line, w.cursor.col, tab).saturating_sub(cursor_seg_col)
-                + cursor_prefix,
-            unicode::cursor_cell_width(&line, w.cursor.col, tab),
+            unicode::virtcol(&line, cur_col, tab).saturating_sub(cursor_seg_col) + cursor_prefix,
+            unicode::cursor_cell_width(&line, cur_col, tab),
         )
+    };
+
+    // The cursor is off screen when its row isn't laid out (a closed fold shows on
+    // its first line's row), or, under `nowrap`, its column is scrolled off a side.
+    let cursor_hidden = {
+        let shown = collapsed
+            .iter()
+            .find(|f| f.contains(cur_line))
+            .map_or(cur_line, |f| f.start);
+        screen_row_of(&rows, shown).is_none()
+            || (!wrap && (cursor_screen_col < w.leftcol || cursor_screen_col >= w.leftcol + width))
     };
 
     // Secondary multi-cursors visible in the focused window, as (row, screen
@@ -1231,6 +1266,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         cursor_screen_col,
         cursor_width,
         secondary_cursors,
+        text_pointer: ed.text_pointer_over(w.buffer),
+        cursor_hidden,
         file_name,
         filetype,
         code_blocks: ed.doc_float_code_blocks(w.buffer).to_vec(),

@@ -613,6 +613,9 @@ where
                 // this terminal when its own host has no clipboard tool that could
                 // reach the user — the ssh case (see `osc52_enabled`).
                 (Value::from("osc52"), Value::from(caps.osc52)),
+                // Which client this is: the server refuses `'modeless'` (a GUI and
+                // web editing model) while a terminal is attached.
+                (Value::from("client"), Value::from("tui")),
             ]),
         ],
     )

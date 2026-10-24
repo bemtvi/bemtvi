@@ -286,7 +286,7 @@ count the way vim does.
 
 **Sizing (`editor.rs`, `WindowTree`):**
 
-- `<C-w>=` / `:wincmd =`: equalize — reset every `Split`'s `sizes` to equal shares
+- `<C-w>=`: equalize — reset every `Split`'s `sizes` to equal shares
   and re-layout.
 - `<C-w>+` / `<C-w>-` (height) and `<C-w><` / `<C-w>>` (width), with counts, and
   `:res[ize] {n}` / `:vert res[ize] {n}` (absolute): adjust the relevant ancestor

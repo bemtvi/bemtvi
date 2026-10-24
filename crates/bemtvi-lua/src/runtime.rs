@@ -598,6 +598,9 @@ pub struct GoMirror {
     /// `'imagepreview'` — whether image files open as rendered previews rather than
     /// raw bytes. Backs `vim.o.imagepreview` / `btv.o.imagepreview`.
     pub imagepreview: bool,
+    /// `'modeless'` — whether the session edits like a GUI editor (no Normal mode
+    /// over a modifiable buffer). Backs `btv.o.modeless`.
+    pub modeless: bool,
     /// `'httphost'` — the interface `btv.http.mount` binds its listener on. Backs
     /// `vim.o.httphost` / `btv.o.httphost`.
     pub httphost: String,
@@ -855,6 +858,15 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // the native selection engine through the `btv._helix_action` seam. Inert until a
     // Helix mode is entered. See docs/plans/2026-07-21-helix-editing-model.md (Phase 5).
     ("bemtvi:prelude/helix", include_str!("prelude/helix.lua")),
+    // The modeless key layout (opt-in — `'modeless'`, GUI and web only). Loads after
+    // helix.lua for the same reasons: its `modeless`-layer default maps defer to
+    // `btv.picker.open` / `btv.cmdline.open` / `btv.cmd` (resolved at call time) and
+    // drive the core verbs through the `btv._modeless_action` seam. Inert until the
+    // option is on. See docs/plans/2026-10-22-modeless-editing.md.
+    (
+        "bemtvi:prelude/modeless",
+        include_str!("prelude/modeless.lua"),
+    ),
     // The package manager (`btv.plugins`) — declarative install + lazy/eager load
     // over `git` (`btv.run`) and `btv.fs`. Loads AFTER btv.lua: it builds on
     // `btv.command` / `btv.on` (defined there) plus btv.run / btv.fs / btv.promise /
@@ -1163,6 +1175,12 @@ pub(crate) struct Shared {
     /// verbs). Each carries the optional count the map passed (usually `None`, so the
     /// verb reads the digits typed before it).
     pub(crate) helix_actions: Vec<(String, Option<usize>)>,
+    /// Named modeless verbs a key fired (`btv._modeless_action`), drained by the
+    /// server into `Editor::apply_modeless_action`.
+    pub(crate) modeless_actions: Vec<String>,
+    /// Command lines to open from Lua (`btv._cmdline_open`): `(kind, text)`, drained
+    /// by the server into `Editor::open_cmdline`.
+    pub(crate) cmdline_opens: Vec<(String, String)>,
     /// Marks a `btv.decor` provider published for a window's viewport
     /// (`btv._decor_publish`), drained by the server (generation-gated) into the
     /// provider's namespace in the extmark layer. Empty for a no-provider config.
@@ -1314,6 +1332,8 @@ impl Shared {
             qf_actions,
             cmdline_actions,
             helix_actions,
+            modeless_actions,
+            cmdline_opens,
             decor_publishes,
             decor_invalidations,
             confirms,
@@ -1393,6 +1413,8 @@ impl Shared {
         *qf_actions = Default::default();
         *cmdline_actions = Default::default();
         *helix_actions = Default::default();
+        *modeless_actions = Default::default();
+        *cmdline_opens = Default::default();
         *decor_publishes = Default::default();
         *decor_invalidations = Default::default();
         *confirms = Default::default();
@@ -2411,6 +2433,18 @@ impl LuaRuntime {
         /// Take the named Helix actions fired since the last drain, for the server to
         /// apply via `Editor::apply_helix_action` (name + optional count).
         take_helix_actions -> Vec<(String, Option<usize>)> = helix_actions
+    }
+
+    take_queue! {
+        /// Take the named modeless verbs fired since the last drain, for the server
+        /// to apply via `Editor::apply_modeless_action`.
+        take_modeless_actions -> Vec<String> = modeless_actions
+    }
+
+    take_queue! {
+        /// Take the command lines Lua asked to open (`btv.cmdline.open`), for the
+        /// server to open via `Editor::open_cmdline`.
+        take_cmdline_opens -> Vec<(String, String)> = cmdline_opens
     }
 
     take_queue! {
@@ -4501,8 +4535,14 @@ impl LuaRuntime {
     /// this client only delivers `<C-w>` when the user presses `Alt+w`, so anything
     /// that *displays* that key should name the pressable one. Passed as pairs and
     /// folded into a map Lua-side.
+    ///
+    /// `client` is the kind of client (`"tui"`, `"gui"`, `"web"`, or `""` when it
+    /// didn't say), the same name `'modeless'` is gated on. `platform` is its OS
+    /// (`"macos"`, `"linux"`, `"windows"`, or `""`).
     pub fn set_ui_caps(
         &self,
+        client: &str,
+        platform: &str,
         keyboard_protocol: bool,
         truecolor: bool,
         osc52: bool,
@@ -4514,7 +4554,7 @@ impl LuaRuntime {
             flat.push(chord.as_str())?;
             flat.push(label.as_str())?;
         }
-        set.call((keyboard_protocol, truecolor, osc52, flat))
+        set.call((keyboard_protocol, truecolor, osc52, flat, client, platform))
     }
 
     /// Mirror the focused window cursor's screen position (1-based row/col, the

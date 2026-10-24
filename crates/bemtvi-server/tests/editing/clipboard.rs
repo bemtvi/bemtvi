@@ -140,7 +140,7 @@ async fn ctrl_v_pastes_the_clipboard_in_normal_mode() {
     // Something external is on the clipboard — the whole point of the chord.
     clip.seed("X", false);
     // At the cursor, not after it: the cursor sits on `a` (`<Esc>` left it there),
-    // so the paste lands before it, where a non-modal editor would put it.
+    // so the paste lands before it, where a modeless editor would put it.
     feed(&rpc, "0<C-v>");
     assert_eq!(lines(&rpc).await, vec!["Xalpha"]);
 }

@@ -327,8 +327,22 @@ async fn clicking_a_picker_row_in_a_split_hits_via_editor_absolute_geometry() {
     command(&rpc, "set nonumber norelativenumber").await;
     // Split vertically and focus the RIGHT pane, so the focused window's origin is
     // well into the editor (~col 40) — not the (0,0) a single window would have.
+    // `:vsplit` focuses the new window, on the left, so move to the other one.
     command(&rpc, "vsplit").await;
-    command(&rpc, "wincmd l").await;
+    let left = exec_lua(&rpc, "return vim.api.nvim_get_current_win()").await;
+    exec_lua(
+        &rpc,
+        "local cur = vim.api.nvim_get_current_win() \
+         for _, w in ipairs(vim.api.nvim_list_wins()) do \
+           if w ~= cur then btv.win.set_current(w) return end \
+         end",
+    )
+    .await;
+    assert_ne!(
+        exec_lua(&rpc, "return vim.api.nvim_get_current_win()").await,
+        left,
+        "the right pane has focus, or this test can't tell the anchors apart",
+    );
 
     exec_lua(&rpc, "_G.picked = nil; btv.picker.open('fruits')").await;
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));

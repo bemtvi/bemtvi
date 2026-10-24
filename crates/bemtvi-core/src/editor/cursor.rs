@@ -436,6 +436,11 @@ impl Editor {
     }
 
     pub(crate) fn ensure_visible(&mut self) {
+        // A modeless view the wheel scrolled away from the caret stays where it is
+        // until the caret, the text or the mode changes.
+        if self.view_stays_detached() {
+            return;
+        }
         let th = self.text_height();
         // `'scrolloff'`: keep at least this many text rows above and below the cursor
         // — suspended while the mouse is driving the view, so a click / drag inside
@@ -680,6 +685,9 @@ impl Editor {
     /// `sidescrolloff` (the margin kept between the cursor and the edge). A no-op
     /// for a degenerate (zero-width) text area.
     fn ensure_visible_horizontal(&mut self) {
+        if self.view_stays_detached() {
+            return;
+        }
         // Soft-wrap lays long lines across rows instead of panning, so there is no
         // horizontal scroll: keep `leftcol` pinned at the left edge.
         if self.windows.cur().options.wrap {

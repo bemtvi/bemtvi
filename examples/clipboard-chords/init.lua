@@ -25,7 +25,7 @@
 -- Type-this:  vee<C-c>        (select two words, copy)
 -- Type-this:  j0<C-v>         (down a line, to column 0, paste)
 -- See-that:   the words land AT the cursor, pushing the rest of the line right.
---             Paste is `P`, not `p` — where a non-modal editor puts it.
+--             Paste is `P`, not `p` — where a modeless editor puts it.
 --
 -- Then paste into another application: it is on the real system clipboard, not
 -- just an editor register.

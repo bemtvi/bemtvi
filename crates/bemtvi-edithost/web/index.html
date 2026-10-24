@@ -72,6 +72,12 @@
   .cur-block { background: var(--cursor); color: var(--bg); }
   .cur-bar { box-shadow: inset 2px 0 0 0 var(--cursor); }
   .cur-underline { box-shadow: inset 0 -2px 0 0 var(--cursor); }
+  /* A modeless caret (`view.caret`): the bar, blinking (the server places it at a
+     selection's head). One cycle is CARET_CYCLE_MS; the cursor span is rebuilt every
+     frame, so `animation-delay` carries the phase across. */
+  .caret { box-shadow: inset 2px 0 0 0 var(--cursor);
+           animation: caret-blink 1060ms steps(1, end) infinite; }
+  @keyframes caret-blink { 0% { box-shadow: inset 2px 0 0 0 var(--cursor); } 50%, 100% { box-shadow: none; } }
   /* Multi-cursor: placed cursors are reverse-video; the active one is amber. */
   .seccur { background: #ebf3f3; color: #1e1e24; }
   .cur-mc { background: var(--accent); color: #121216; font-weight: 700; }
@@ -120,7 +126,7 @@
   #kbd { position: absolute; top: 0; left: 0; width: 1px; height: 1px; padding: 0; margin: 0;
          border: 0; outline: none; resize: none; overflow: hidden; z-index: 50;
          pointer-events: none; background: transparent; color: transparent;
-         caret-color: transparent; white-space: pre; font-size: 15px; line-height: 21px;
+         caret-color: transparent; white-space: pre; font-size: 13px; line-height: 18px;
          font-family: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Symbols Nerd Font Mono", monospace; }
   /* EditContext host (Chrome IME path). Its CSS position is irrelevant — the IME caret is
      placed from the bounds we report via `updateSelectionBounds`, not the element's layout —
@@ -163,7 +169,10 @@
         throw e;
       });
 
-    const FONT_PX = 15, LINE = 1.4;
+    const FONT_PX = 13, LINE = 1.4;
+    // The font size in px: `FONT_PX` until `'guifont'` sets one with `:h` (see
+    // `applyGuifont`), the same number the GUI takes as its point size.
+    let fontPx = FONT_PX;
     // When a *square* one-cell glyph (a Nerd Font icon) may be drawn at its natural size,
     // overflowing into the cell to its right, instead of being shrunk to fit the one cell
     // the editor reserved for it: `'guiglyphoverflow'`, wezterm's
@@ -232,7 +241,7 @@
     // remember the others here and pruned to what's on screen (see `setFrame`).
     const textByFile = new Map();
     let ts = null;            // tree-sitter highlighter (loaded lazily by language)
-    let cw = 9, ch = 21;
+    let cw = 8, ch = 18;
     let cols = 80, editorRows = 24; // editorRows = grid rows minus the command row
 
     // ============================================================================
@@ -243,16 +252,101 @@
     // ============================================================================
     function measureCell() {
       const probe = document.createElement("span");
-      probe.style.cssText = `position:absolute;visibility:hidden;font-family:${getComputedStyle(gridEl).fontFamily};font-size:${FONT_PX}px;`;
+      probe.style.cssText = `position:absolute;visibility:hidden;font-family:${getComputedStyle(gridEl).fontFamily};font-size:${fontPx}px;`;
       probe.textContent = "M".repeat(100);
       gridEl.appendChild(probe);
       cw = probe.getBoundingClientRect().width / 100;
       probe.remove();
-      ch = Math.round(FONT_PX * LINE);
-      gridEl.style.fontSize = FONT_PX + "px";
+      ch = Math.round(fontPx * LINE);
+      gridEl.style.fontSize = fontPx + "px";
       gridEl.style.setProperty("--ch", ch + "px");
       gridEl.style.setProperty("--cw", cw + "px");
     }
+    // ============================================================================
+    // `'guifont'`: the font list, tried in order for each character (CSS does that
+    // per character already), and the size. The server relays it parsed
+    // (`guifont_spec`). Each font is loaded as a `FontFace` over `local()` sources,
+    // aliased `btv-font-N`, which picks the face for its weight and carries its scale
+    // as `size-adjust`; whether that load succeeds also says whether it's installed.
+    // OpenType features can't be set per face in Chrome, so the primary's apply to the
+    // grid (where they are almost always wanted) and a later font's are reported as
+    // GUI-only. What isn't installed, or can't be applied, is reported once per value
+    // on the message line, as the GUI reports a missing font.
+    // ============================================================================
+    const WEIGHT_NAMES = { 100: "Thin", 200: "ExtraLight", 300: "Light", 400: "Regular",
+      500: "Medium", 600: "SemiBold", 700: "Bold", 800: "ExtraBold", 900: "Black" };
+    let appliedGuifont = "";
+    let guifontFaces = [];
+    // The `local()` names a face can go by: its family (for a regular face), its full
+    // name (`Family Style`), and its PostScript name (`Family-Style`, no spaces).
+    function localSources(family, weight) {
+      const style = WEIGHT_NAMES[Math.round((weight ?? 400) / 100) * 100] || "Regular";
+      const names = weight == null || weight === 400 ? [family] : [];
+      names.push(`${family} ${style}`, `${family.replace(/ /g, "")}-${style}`);
+      return names.map((n) => `local("${n.replace(/["\\]/g, "")}")`).join(", ");
+    }
+    // Whether a family renders at all, for one a `local()` name didn't reach: its
+    // width differs from both generic fallbacks for some text.
+    function familyRenders(family) {
+      const ctx = document.createElement("canvas").getContext("2d");
+      const probe = "MWmwil10 \u4e2d\u0627\u2500\uE0B0\uF07B";
+      return ["monospace", "serif"].every((generic) => {
+        ctx.font = `20px ${generic}`;
+        const base = ctx.measureText(probe).width;
+        ctx.font = `20px "${family}", ${generic}`;
+        return ctx.measureText(probe).width !== base;
+      });
+    }
+    function luaString(s) {
+      return '"' + s.replace(/[\\"]/g, (c) => "\\" + c).replace(/\n/g, "\\n") + '"';
+    }
+    async function applyGuifont(frame) {
+      const value = frame.guifont ?? "";
+      if (value === appliedGuifont) return;
+      appliedGuifont = value;
+      const spec = frame.guifont_spec || { fonts: [], size: null };
+      for (const f of guifontFaces) document.fonts.delete(f);
+      guifontFaces = [];
+      const families = [], missing = [], unapplied = [];
+      for (const [i, f] of (spec.fonts || []).entries()) {
+        const descriptors = {};
+        if (f.scale != null) descriptors.sizeAdjust = `${Math.round(f.scale * 1000) / 10}%`;
+        const face = new FontFace(`btv-font-${i}`, localSources(f.family, f.weight), descriptors);
+        try {
+          await face.load();
+          document.fonts.add(face);
+          guifontFaces.push(face);
+          families.push(`"btv-font-${i}"`);
+        } catch {
+          // No `local()` name matched. Named by its family it may still render (a face
+          // whose full name the guesses missed), just without its own weight or scale.
+          if (familyRenders(f.family)) {
+            families.push(`"${f.family.replace(/["\\]/g, "")}"`);
+            if (f.weight != null) unapplied.push(`weight on ${f.family}`);
+            if (f.scale != null) unapplied.push(`scale on ${f.family}`);
+          } else {
+            missing.push(f.family);
+          }
+        }
+        if (i > 0 && (f.features || []).length) unapplied.push(`features on ${f.family}`);
+      }
+      gridEl.style.fontFamily = families.length ? `${families.join(", ")}, monospace` : "";
+      const primary = spec.fonts?.[0];
+      gridEl.style.fontFeatureSettings = (primary?.features || [])
+        .map(([tag, v]) => `"${tag}" ${v}`).join(", ");
+      fontPx = spec.size ?? FONT_PX;
+      inkCache.clear();
+      measureCell();
+      layout();
+      attachOp(cols, editorRows);
+      const parts = [];
+      if (missing.length) parts.push(`not installed: ${missing.join(", ")}`);
+      if (unapplied.length) parts.push(`not applied in the browser: ${unapplied.join(", ")}`);
+      if (parts.length) {
+        execLuaOp(`btv.notify(${luaString("guifont: " + parts.join("; "))}, btv.log.levels.WARN)`);
+      }
+    }
+
     function layout() {
       const rect = gridEl.getBoundingClientRect();
       cols = Math.max(20, Math.floor(rect.width / cw));
@@ -487,7 +581,7 @@
           measureCtx.textAlign = "left";
           measureCtx.textBaseline = "alphabetic";
         }
-        measureCtx.font = `${FONT_PX}px ${getComputedStyle(gridEl).fontFamily}`;
+        measureCtx.font = `${fontPx}px ${getComputedStyle(gridEl).fontFamily}`;
         const t = measureCtx.measureText(String.fromCodePoint(cp));
         m = {
           left: -t.actualBoundingBoxLeft,
@@ -540,8 +634,11 @@
     // cell and tile with their neighbours. Same band as the GUI's `SQUARE_INK_BAND`.
     function inkIsSquare(m) {
       if (!m || m.height <= 0 || m.right <= m.left) return false;
-      const ratio = (m.right - m.left) / m.height;
-      return ratio >= 0.7 && ratio <= 1.4;
+      // Canvas ink is whole pixels, so at a small size a separator's wedge can round its
+      // way into the band (10x14 at 13px is 0.714): square has to hold at the narrow end
+      // however the rounding fell, a pixel either way (the GUI's `overflow_cells` too).
+      const w = m.right - m.left;
+      return (w - 1) / (m.height + 1) >= 0.7 && w / m.height <= 1.4;
     }
     // `nextBlank` says whether the cell to the right holds a space — the neighbour
     // `'guiglyphoverflow'`'s default mode asks about. Callers that don't know (or don't
@@ -599,7 +696,7 @@
     // `<C-w>` works there and only there.
     //
     // So on the platforms where Ctrl is stolen we accept Alt as its stand-in for exactly
-    // these chords: Alt+w feeds `<C-w>`, Alt+Shift+W feeds `<C-W>`. Every other Ctrl
+    // these chords: Alt+w feeds `<C-w>`, Alt+Shift+W feeds `<C-S-w>`. Every other Ctrl
     // chord is deliverable and is left alone, and on macOS nothing is remapped — Ctrl
     // already arrives there, and Alt is Option (the character-composing key).
     //
@@ -611,6 +708,17 @@
       "Tab", "PageUp", "PageDown",      // tab cycling
       "Digit1", "Digit2", "Digit3", "Digit4", "Digit5",
       "Digit6", "Digit7", "Digit8", "Digit9", // jump-to-tab (`<C-6>` is alternate-file)
+    ]);
+    // The Command chords sent to the editor on a Mac, by physical key: the modeless
+    // layout's (undo/redo, cut/copy, select all, save, find and next/previous, files and
+    // the palette, the command line, duplicate, indent), plus the arrows and
+    // Backspace/Delete it navigates and deletes with. Everything else stays with the
+    // browser: Cmd+V (the `paste` event carries the clipboard), and Cmd+W, which the
+    // browser keeps for itself and never shows the page.
+    const FORWARD_CMD = new Set([
+      "KeyZ", "KeyC", "KeyX", "KeyA", "KeyS", "KeyF", "KeyG", "KeyP", "KeyD",
+      "Semicolon", "BracketRight",
+      "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Backspace", "Delete",
     ]);
     // Case-insensitive on purpose: the two sources spell it differently — `userAgentData`
     // reports `"macOS"`, the legacy `platform` reports `"MacIntel"`.
@@ -630,8 +738,10 @@
       .flatMap((code) => {
         if (/^Key[A-Z]$/.test(code)) {
           const m = code.slice(3);
-          // Both cases: the client substitutes for `<C-w>` and `<C-W>` alike (Alt+Shift+W).
-          return [[`<C-${m.toLowerCase()}>`, `<A-${m.toLowerCase()}>`], [`<C-${m}>`, `<A-${m}>`]];
+          // With and without Shift: the client substitutes for `<C-w>` and `<C-S-w>`
+          // alike (Alt+Shift+W).
+          const l = m.toLowerCase();
+          return [[`<C-${l}>`, `<A-${l}>`], [`<C-S-${l}>`, `<A-S-${l}>`]];
         }
         const key = /^Digit\d$/.test(code) ? code.slice(5) : code;
         return [[`<C-${key}>`, `<A-${key}>`]];
@@ -658,6 +768,11 @@
     // before `eh_boot_finish` fires `UIEnter`, which is the point a config or plugin first
     // reads `btv.ui.caps()`.
     if (Object.keys(KEY_LABELS).length) workerUrl.searchParams.set("key_labels", JSON.stringify(KEY_LABELS));
+    // The platform, as Rust's `std::env::consts::OS` spells it (what the native GUI
+    // reports), for `btv.ui.caps().platform`.
+    workerUrl.searchParams.set("platform", IS_MAC ? "macos"
+      : /win/i.test(navigator.userAgentData?.platform || navigator.platform || "") ? "windows"
+      : "linux");
     // Daemon mode steers image-preview byte fetches (see `fetchImageBytes`): a daemon path's
     // bytes live over the wire (worker-routed), an OPFS/picker path is read UI-side. True from
     // boot when `?daemon=` is set; a runtime `:connect` flips it on the `connected` message.
@@ -1081,6 +1196,8 @@
       frame.mode = frame.mode_label;
       for (const w of frame.windows || []) w.secondary_cursors = w.cursors || [];
       view = frame;
+      restartBlink();
+      applyGuifont(frame);
       // `'guiglyphoverflow'`, relayed like `'guifont'`. Empty (its default) leaves this
       // client on its own setting; an unparseable value can only come from a raw `btv.o`
       // write (the `:set` path rejects it with E474) and says so rather than silently
@@ -1533,8 +1650,24 @@
       // like the menu, so it renders regardless of `serverStyled`.
       if (view.float) renderContentFloat(view.float, tablineRows);
       renderCommand(cmdRow);
+      // Keep a modeless caret's blink phase across the rebuilt cursor span.
+      const cur = document.getElementById(CURSOR_ID);
+      if (cur && view.caret) cur.style.animationDelay = `-${(performance.now() - blinkSince) % CARET_CYCLE_MS}ms`;
+      // What is under a still pointer may have changed (focus moved, a popup opened).
+      if (lastPointer) updateResizeCursor(lastPointer);
       gcImages(); // free blob URLs for previews no longer shown
       positionImeProxy(); // keep the hidden IME proxy over the cursor so composition popups follow it
+    }
+
+    // A modeless caret's blink restarts (shown) whenever it moves, comes up, or
+    // changes windows, so it is never hidden just after a keystroke. One full cycle,
+    // shown then hidden, matches the `caret-blink` animation in the stylesheet.
+    const CARET_CYCLE_MS = 1060;
+    let blinkSince = performance.now(), blinkKey = "";
+    function restartBlink() {
+      const w = view.windows?.find((x) => x.focused);
+      const key = [view.caret, w?.cursor_row, w?.cursor_screen_col].join();
+      if (key !== blinkKey) { blinkKey = key; blinkSince = performance.now(); }
     }
 
     function winRect(w) {
@@ -1609,6 +1742,11 @@
       const box = document.createElement("div");
       box.className = "win";
       place(box, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
+      // The pointer over this window's text is the I-beam (see `textPointerAt`); the
+      // text starts past the fold, sign and number gutters.
+      if (w.text_pointer) {
+        box.dataset.tp = String((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0));
+      }
       // This window's `'winhighlight'` chrome override (a dock's `Normal:NormalSB`
       // sidebar look), painted on its own box so only this window is recolored.
       applyWinChrome(box, w);
@@ -1792,7 +1930,7 @@
       // (`picker_open = menu.query.is_some()`). A queryless select / completion popup
       // keeps the buffer cursor where it is.
       const pickerOpen = !!(view.menu && view.menu.query != null);
-      const isFocused = w.focused && !view.command_mode && !pickerOpen;
+      const isFocused = w.focused && !w.cursor_hidden && !view.command_mode && !pickerOpen;
       const cursorCol = w.cursor_screen_col;
       const cursorRow = w.cursor_row;
       const sel = w.selection[row] || null;
@@ -1964,7 +2102,16 @@
       kbdEl.style.height = Math.max(1, r.height) + "px";
     }
 
+    // An input method starting to compose while a modeless wheel has the caret off
+    // screen: the composition goes in at the caret, so bring it back into view (the
+    // frame that follows re-anchors the candidate window there).
+    function revealForComposition() {
+      const w = view?.windows?.find((x) => x.focused);
+      if (w?.cursor_hidden) execLuaOp("btv.modeless.actions.reveal_caret()");
+    }
+
     function cursorClass() {
+      if (view.caret) return "caret";
       if (view.mode === "MULTICURSOR") return "cur-mc";
       if (view.mode === "INSERT") return "cur-bar";
       if (view.mode === "REPLACE" || view.pending_replace) return "cur-underline";
@@ -2177,7 +2324,8 @@
       // Hide the buffer cursor while a picker (a prompt-carrying menu) owns the input —
       // see the note in the plain renderLine above.
       const pickerOpen = !!(view.menu && view.menu.query != null);
-      const isFocused = w.focused && !view.command_mode && !pickerOpen;
+      // A caret a modeless wheel scrolled off screen isn't drawn (`cursor_hidden`).
+      const isFocused = w.focused && !w.cursor_hidden && !view.command_mode && !pickerOpen;
       const cursorRow = w.cursor_row;
       let inlayShift = 0;
       for (const [hcol, text] of hints) {
@@ -3133,6 +3281,7 @@
       const altKey = e.altKey && !sub;
       let base = SPECIAL[e.key];
       let isSpecial = !!base;
+      let shiftedLetter = false;
       // Function keys: the browser already names them "F1".."F12" — the vim notation
       // stem. Treat as a named key so it wraps (<F5>) and shift/ctrl become modifiers
       // (<S-F5>/<C-F6>), matching the TUI/GUI clients and the core parser.
@@ -3142,10 +3291,12 @@
       }
       if (!base) {
         // With a Ctrl/Alt modifier read e.code so the BASE letter survives composition.
-        if ((ctrlKey || altKey) && /^Key[A-Z]$/.test(e.code)) {
-          const m = e.code.slice(3);
-          base = e.shiftKey ? m : m.toLowerCase();
-        } else if ((ctrlKey || altKey) && /^Digit\d$/.test(e.code)) {
+        if ((ctrlKey || altKey || e.metaKey) && /^Key[A-Z]$/.test(e.code)) {
+          // The letter, lowercase, with Shift carried as `S-` below — the editor reads a
+          // modified key's case from `S-`, not from the letter (`<C-S-p>`, not `<C-P>`).
+          base = e.code.slice(3).toLowerCase();
+          shiftedLetter = e.shiftKey;
+        } else if ((ctrlKey || altKey || e.metaKey) && /^Digit\d$/.test(e.code)) {
           base = e.code.slice(5);
         } else if (e.key === " ") base = "Space";
         else if (e.key.length === 1) base = e.key === "<" ? "lt" : e.key;
@@ -3157,7 +3308,7 @@
       // for printable keys it's already folded into the character (Shift+a → "A"), and
       // a Ctrl/Alt+letter combo carries it via the capitalized base above — so without
       // this, Shift+Tab collapsed to a plain `<Tab>` and never sent the back-cycle.
-      if (e.shiftKey && isSpecial) mods.push("S");
+      if (e.shiftKey && (isSpecial || shiftedLetter)) mods.push("S");
       if (altKey) mods.push("A");
       if (e.metaKey) mods.push("D");
       if (mods.length === 0) {
@@ -3370,7 +3521,10 @@
       // are encoded by keyToNotation and fed. So a web dap session uses :DapContinue for
       // "continue" (the F5 default is browser-reserved here) but F10/F11/F6 work as keys.
       if (e.key === "F5" || e.key === "F12") return;
-      if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
+      // Cmd shortcuts stay with the browser, except on a Mac the chords the modeless
+      // key layout binds (Command is that layout's modifier there). Cmd+V is not among
+      // them: the browser's `paste` event already feeds the clipboard in.
+      if (e.metaKey && !e.ctrlKey && !(IS_MAC && FORWARD_CMD.has(e.code))) return;
       const n = keyToNotation(e);
       if (n == null) return;
       e.preventDefault();
@@ -3398,7 +3552,7 @@
         if (editCtx.text.length) editCtx.updateText(0, editCtx.text.length, "");
         editCtx.updateSelection(0, 0);
       };
-      editCtx.addEventListener("compositionstart", () => { composing = true; });
+      editCtx.addEventListener("compositionstart", () => { composing = true; revealForComposition(); });
       editCtx.addEventListener("textupdate", (e) => {
         if (composing) return; // wait for compositionend (next handler) to feed the commit
         if (e.text) feedOp(encodeText(e.text));
@@ -3424,7 +3578,7 @@
     } else {
       // Firefox path: re-anchor the textarea right as composition begins / updates (the
       // cursor doesn't move during composition, so no `render()` fires to reposition it).
-      kbdEl.addEventListener("compositionstart", positionImeProxy);
+      kbdEl.addEventListener("compositionstart", () => { revealForComposition(); positionImeProxy(); });
       kbdEl.addEventListener("compositionupdate", positionImeProxy);
     }
 
@@ -3484,12 +3638,28 @@
       }
       return null;
     }
+    // Whether the pointer at client `(x, y)` is over the text of a window that takes
+    // the I-beam (a modeless session over a buffer it types into): on a text row of a
+    // `data-tp` window box, past its gutters. The element under the pointer decides,
+    // so a popup, a float or a status line over the text keeps the arrow.
+    function textPointerAt(x, y) {
+      const el = document.elementFromPoint(x, y);
+      const row = el?.closest?.(".row");
+      if (!row || row.classList.contains("statusline")) return false;
+      const box = row.closest(".win");
+      if (!box || box.dataset.tp == null) return false;
+      const col = Math.floor((x - box.getBoundingClientRect().left) / cw);
+      return col >= Number(box.dataset.tp);
+    }
     // Set the grid's hover cursor from the cell under the pointer (left as-is while
     // a drag is in progress — that keeps the cursor it grabbed with).
+    let lastPointer = null;
     function updateResizeCursor(e) {
+      lastPointer = { clientX: e.clientX, clientY: e.clientY };
       const { row, col } = cellAt(e);
       const h = resizeHandleAt(row, col);
-      gridEl.style.cursor = h === "col" ? "col-resize" : h === "row" ? "row-resize" : "";
+      gridEl.style.cursor = h === "col" ? "col-resize" : h === "row" ? "row-resize"
+        : textPointerAt(e.clientX, e.clientY) ? "text" : "";
     }
 
     // Drag-select autoscroll: re-send the held drag on a timer while it sits in the

@@ -447,7 +447,7 @@ dependencies = [
  "pollster",
  "rmpv",
  "tokio",
- "unicode-script",
+ "ttf-parser",
  "unicode-segmentation",
  "unicode-width",
  "wgpu",

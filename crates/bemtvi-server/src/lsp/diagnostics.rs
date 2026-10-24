@@ -110,8 +110,21 @@ impl EditHost {
     /// (`vim.diagnostic.set`) keep their own Lua-side store, which is never held,
     /// so `vim.diagnostic.get` still reports those the moment they are set.
     pub(crate) fn diagnostics_paused(&self) -> bool {
-        self.editor.mode.is_insert()
-            && (!self.diag_config.update_in_insert || self.diag_config.insert_debounce_ms > 0)
+        let (update_in_insert, debounce_ms) = self.diag_insert_timing();
+        self.editor.mode.is_insert() && (!update_in_insert || debounce_ms > 0)
+    }
+
+    /// The insert-mode timing in force, `(update_in_insert, insert_debounce_ms)`: the
+    /// configured one, except that a modeless session never leaves Insert, so "hold
+    /// until `InsertLeave`" (`update_in_insert = false`) would hold forever there. It
+    /// falls back to the default debounce instead.
+    fn diag_insert_timing(&self) -> (bool, u64) {
+        let c = &self.diag_config;
+        if !c.update_in_insert && self.editor.modeless() {
+            (true, super::DEFAULT_INSERT_DEBOUNCE_MS)
+        } else {
+            (c.update_in_insert, c.insert_debounce_ms)
+        }
     }
 
     /// Arm (re-arm) the one-shot that ends a pause while you are still typing.
@@ -125,12 +138,13 @@ impl EditHost {
     /// Routed through [`apply_loop_op`](Self::apply_loop_op) rather than a native
     /// timer so the browser session debounces on the Worker's wheel identically.
     pub(crate) fn arm_diag_debounce(&mut self) {
-        if !self.diag_config.update_in_insert || self.diag_config.insert_debounce_ms == 0 {
+        let (update_in_insert, debounce_ms) = self.diag_insert_timing();
+        if !update_in_insert || debounce_ms == 0 {
             return;
         }
         self.apply_loop_op(bemtvi_lua::LoopOp::TimerStart {
             id: crate::DIAG_DEBOUNCE_TIMER_ID,
-            delay_ms: self.diag_config.insert_debounce_ms,
+            delay_ms: debounce_ms,
             repeat_ms: 0,
         });
     }
@@ -140,7 +154,7 @@ impl EditHost {
     /// "hold until `InsertLeave`" since the timer was armed — the already-scheduled
     /// wake must not then jump the gun (the `InsertLeave` commit still runs).
     pub(crate) fn on_diag_debounce(&mut self) {
-        if self.diag_config.update_in_insert {
+        if self.diag_insert_timing().0 {
             self.commit_pending_diagnostics();
         }
     }

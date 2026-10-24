@@ -153,6 +153,12 @@ pub struct WindowView {
     /// reverse-video block cells. Empty for an unfocused window or with no
     /// multi-cursors active (also empty from an older server that omits the key).
     pub secondary_cursors: Vec<(u16, u16)>,
+    /// Whether the pointer over this window's text is the text I-beam (a modeless
+    /// session over a buffer it types into) rather than the arrow.
+    pub text_pointer: bool,
+    /// Whether the cursor is scrolled off this window's screen (a modeless session's
+    /// wheel leaves the caret where it was): draw no cursor.
+    pub cursor_hidden: bool,
     /// First visible screen column (horizontal scroll offset) under `nowrap`. The
     /// renderer drops this many leading screen cells from each text row and shifts
     /// the cursor and every span left by it; the number gutter is not offset.
@@ -442,6 +448,80 @@ pub struct Separator {
     pub region: WindowRegion,
 }
 
+/// `'guifont'`, parsed by the server (see `bemtvi_core::guifont`): the fonts to try
+/// in order for each character, and the size in points.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GuiFontSpec {
+    pub fonts: Vec<FontSpec>,
+    pub size: Option<f32>,
+}
+
+/// One font in a [`GuiFontSpec`] list, with its own options.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FontSpec {
+    pub family: String,
+    /// The weight of its regular (non-bold) text, 1–1000.
+    pub weight: Option<u16>,
+    /// A factor on the size its glyphs are drawn at.
+    pub scale: Option<f32>,
+    /// OpenType features as `(tag, value)`: 1 on, 0 off, or an alternate's number.
+    pub features: Vec<(String, u16)>,
+}
+
+impl FontSpec {
+    /// A font with no options of its own.
+    pub fn named(family: &str) -> Self {
+        Self {
+            family: family.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+impl GuiFontSpec {
+    /// Decode the redraw's `guifont_spec` map. Missing (an older server) is the
+    /// default: no list, so the client's own font.
+    pub fn from_value(v: Option<&Value>) -> Self {
+        let Some(Value::Map(m)) = v else {
+            return Self::default();
+        };
+        let size = map_get(m, "size").and_then(Value::as_f64).map(|s| s as f32);
+        let fonts = match map_get(m, "fonts") {
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|f| {
+                    let f = f.as_map()?;
+                    let family = map_get(f, "family")?.as_str()?.to_string();
+                    let features = match map_get(f, "features") {
+                        Some(Value::Array(fs)) => fs
+                            .iter()
+                            .filter_map(|p| {
+                                let p = p.as_array()?;
+                                let tag = p.first()?.as_str()?.to_string();
+                                let val = p.get(1)?.as_u64()? as u16;
+                                Some((tag, val))
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    Some(FontSpec {
+                        family,
+                        weight: map_get(f, "weight")
+                            .and_then(Value::as_u64)
+                            .map(|w| w as u16),
+                        scale: map_get(f, "scale")
+                            .and_then(Value::as_f64)
+                            .map(|s| s as f32),
+                        features,
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self { fonts, size }
+    }
+}
+
 /// The server's view, mirrored client-side for rendering: the **global** chrome
 /// (mode, command line, message, panel, popup, style palette) plus the list of
 /// [`WindowView`]s to paint and the split [`Separator`]s between them.
@@ -483,6 +563,10 @@ pub struct View {
     /// True while `r` waits for its replacement character (a one-shot replace
     /// that stays in normal mode). Drives the replace cursor shape.
     pub pending_replace: bool,
+    /// Whether the focused window's cursor is a modeless caret (`'modeless'`,
+    /// typing or selecting): a thin bar that blinks, rather than vim's mode shapes.
+    /// In a selection the server places the cursor at the selection's head.
+    pub caret: bool,
     pub cmdline: String,
     /// The command-line prompt char (`:` ex, `/` / `?` search). Defaults to `:`.
     pub cmdline_prefix: char,
@@ -501,10 +585,13 @@ pub struct View {
     /// Whether `message` is an error — the client paints the message line with the
     /// theme's red `ErrorMsg` highlight rather than the default foreground.
     pub message_error: bool,
-    /// The `'guifont'` value (`"Fira Code:h14"`, neovim/neovide syntax), relayed
-    /// from the server. A GUI client parses it for the font family and `:h` size;
-    /// empty means the client's own default. Frontend-agnostic — the TUI ignores it.
+    /// The `'guifont'` value (`"Fira Code,Symbols Nerd Font:h14"`), relayed from the
+    /// server verbatim, so a client can tell when it changed. Empty means the client's
+    /// own default. The TUI ignores it.
     pub guifont: String,
+    /// `'guifont'` as the server parsed it: the font list, tried in order for each
+    /// character, and the `:h` size. What a client applies.
+    pub guifont_spec: GuiFontSpec,
     /// The `'guiglyphoverflow'` value (`"never"` / `"always"` /
     /// `"when-followed-by-space"`), relayed from the server: whether a square one-cell
     /// glyph — a Nerd Font icon — may be drawn at its natural size over the cell to its
@@ -930,6 +1017,7 @@ impl View {
         self.pending_replace = map_get(map, "pending_replace")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        self.caret = map_get(map, "caret").and_then(Value::as_bool) == Some(true);
         self.cmdline = map_str(map, "cmdline");
         self.cmdline_prefix = map_get(map, "cmdline_prefix")
             .and_then(Value::as_str)
@@ -941,6 +1029,7 @@ impl View {
         self.showcmd = map_str(map, "showcmd");
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
+        self.guifont_spec = GuiFontSpec::from_value(map_get(map, "guifont_spec"));
         self.guiglyphoverflow = map_str(map, "guiglyphoverflow");
         self.guiopacity = map_get(map, "guiopacity")
             .and_then(Value::as_u64)
@@ -1183,6 +1272,12 @@ impl View {
         self.mode_label == "MULTICURSOR"
     }
 
+    /// Whether the cursor is a thin bar rather than a block: Insert, or a modeless
+    /// caret ([`View::caret`]), which is a bar in Select too.
+    pub fn bar_cursor(&self) -> bool {
+        self.is_insert() || self.caret
+    }
+
     /// Build a view from a `redraw` notification's params — the client's own
     /// parsing path — so tests and tools can paint a known view.
     pub fn from_redraw(params: &[Value]) -> Self {
@@ -1254,6 +1349,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .unwrap_or(1)
             .max(1),
         secondary_cursors: parse_cursor_list(map_get(m, "cursors")),
+        text_pointer: map_get(m, "text_pointer").and_then(Value::as_bool) == Some(true),
+        cursor_hidden: map_get(m, "cursor_hidden").and_then(Value::as_bool) == Some(true),
         leftcol: map_u16(m, "leftcol"),
         status: parse_status(map_get(m, "status"), styles),
         // Default true so an older server (no flag) keeps the per-window status.

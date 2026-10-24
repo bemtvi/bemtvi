@@ -630,6 +630,10 @@ impl Editor {
             self.record_visual_marks();
             self.mode = Mode::Normal;
         }
+        // …and so it does a modeless one, which is Select, back to the caret.
+        if self.mode == Mode::Select && self.nm_sel.is_some() {
+            self.collapse_selection_to(self.cursor);
+        }
         self.set_window_cursor(win, line, bcol);
 
         let count = self.next_click_count(row, col, stamp_ms);
@@ -1569,6 +1573,12 @@ impl Editor {
         }
     }
 
+    /// The click count of the last selection gesture: 1 for a plain click or drag,
+    /// 2 for a word, 3 for a line.
+    pub(crate) fn mouse_gesture_count(&self) -> Option<u8> {
+        self.mouse_select.map(|s| s.count)
+    }
+
     /// Double-click: select the word under the cursor as a charwise Visual,
     /// returning its byte range as the drag anchor. Uses the same `iskeyword`-class
     /// run as `iw` ([`class_span`](Editor::class_span)).
@@ -1612,6 +1622,18 @@ impl Editor {
             return;
         };
         match sel.anchor {
+            // A modeless drag selects between caret positions, which may be past a
+            // line's last character; Visual's cursor sits on one, so a drag through
+            // Visual could never take the last character of a line.
+            SelectAnchor::Char(anchor) if self.rests_in_insert() => {
+                let head = Cursor {
+                    line,
+                    col: bcol.min(self.buffer().line_len(line)),
+                };
+                self.set_caret_selection(super::modeless::CaretSel { anchor, head });
+                self.desired_col = self.cursor_virtcol();
+                self.ensure_visible();
+            }
             SelectAnchor::Char(anchor) => {
                 // The first drag after a single click enters charwise Visual,
                 // anchored where the press landed; later drags just move the end.
@@ -2216,11 +2238,21 @@ impl Editor {
             }
             self.scroll_from = Some((old_top, self.cursor.line));
             self.top = new_top;
-            self.keep_cursor_in_scroll_margin(th);
+            // A modeless session leaves the caret where it is; vim pulls the cursor
+            // into the view.
+            if !self.detach_view((old_top, self.leftcol)) {
+                self.keep_cursor_in_scroll_margin(th);
+            }
             self.finalize_scroll_gesture();
         } else {
             // An inactive window (a split in another layer, or a non-focused dock)
-            // updates its stashed scroll — resolve its tree, which may be parked.
+            // updates its stashed scroll — resolve its tree, which may be parked. Its
+            // caret stays put in a modeless session, as in the focused window.
+            let keep_caret = self.options.modeless
+                && self.tree_of_window(win).is_some_and(|(_, t)| {
+                    let w = t.get(win);
+                    self.buffer_modifiable(w.buffer) && w.saved_cursors.is_empty()
+                });
             let Some(tree) = self.tree_of_window_mut(win) else {
                 return;
             };
@@ -2235,6 +2267,11 @@ impl Editor {
             let top_edge = new_top + so;
             let bottom = (new_top + th).saturating_sub(1).saturating_sub(so);
             w.saved_top = new_top;
+            if keep_caret {
+                let (buffer, cursor, leftcol) = (w.buffer, w.saved_cursor, w.saved_leftcol);
+                self.detach_unfocused_view(win, buffer, cursor, (old_top, leftcol));
+                return;
+            }
             if w.saved_cursor.line < top_edge {
                 w.saved_cursor.line = top_edge.min(last);
             } else if w.saved_cursor.line > bottom {
@@ -2260,7 +2297,9 @@ impl Editor {
                 return;
             }
             self.leftcol = new;
-            self.keep_cursor_in_leftcol();
+            if !self.detach_view((self.top, old)) {
+                self.keep_cursor_in_leftcol();
+            }
         } else {
             let Some(tree) = self.tree_of_window_mut(win) else {
                 return;
@@ -2482,7 +2521,8 @@ impl Editor {
     }
 
     /// Whether `'mouse'` enables mouse input for the current mode. `a` enables
-    /// every mode; otherwise the mode's own char must be present (`n`/`v`/`i`/`c`).
+    /// every mode; otherwise the mode's own char must be present (`n`/`v`/`i`/`c`,
+    /// with Select under `v`).
     fn mouse_enabled(&self) -> bool {
         let m = &self.options.mouse;
         if m.contains('a') {
@@ -2494,9 +2534,9 @@ impl Editor {
             // Helix-normal gates like normal, Helix-select like visual (both are
             // selection-first, but mouse maps reuse the vim `n`/`v` flags).
             Mode::Normal | Mode::MultiCursor | Mode::HelixNormal => 'n',
-            Mode::Visual | Mode::VisualLine | Mode::HelixSelect => 'v',
-            // Vim gates Select-mode mouse on the `s` flag.
-            Mode::Select => 's',
+            // Vim's `v` covers Select as well as Visual (`MOUSE_VISUAL`, "use mouse
+            // in Visual/Select mode"); `'mouse'` has no flag of its own for Select.
+            Mode::Visual | Mode::VisualLine | Mode::HelixSelect | Mode::Select => 'v',
             Mode::Insert | Mode::Replace => 'i',
             Mode::Command => 'c',
             // vim gates terminal-mode mouse on the `t` flag (we treat it like

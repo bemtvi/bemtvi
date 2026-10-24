@@ -69,7 +69,7 @@ register), so they work without any config:
 | `<C-v>` / `<C-S-v>` | command line | insert it into the line being typed (`<C-r>+`) |
 
 Paste is `P`, not `p`: the text lands *at* the cursor (charwise) or above the line
-(linewise), where a non-modal editor puts it. Nothing vim-ish is displaced — bemtvi
+(linewise), where a modeless editor puts it. Nothing vim-ish is displaced — bemtvi
 has no blockwise visual mode for `<C-v>` to open and no `i_CTRL-V` literal insert,
 and `<Esc>` is how you leave visual mode. The shifted twins exist because a GUI, a
 browser tab, or a terminal speaking the kitty keyboard protocol reports Ctrl+Shift+C

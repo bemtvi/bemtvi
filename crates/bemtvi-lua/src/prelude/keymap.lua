@@ -604,6 +604,25 @@ btv.autocmd.create("FileType", {
 -- keymaps (so they are not listed here).
 btv.cmdline = btv.cmdline or {}
 btv.cmdline.actions = btv.cmdline.actions or {}
+
+-- `btv.cmdline.open(text, opts)` opens the command line from any mode, prefilled
+-- with `text` (`""` when nil) and the cursor at its end. `opts.kind` picks the line:
+-- `":"` (the default) for an ex command, `"/"` or `"?"` for a search. Opened from
+-- Insert, the line returns to Insert when it closes, which is how the modeless key
+-- layout reaches ex commands without a Normal mode:
+--
+-- ```lua
+-- btv.cmdline.open("%s/")                -- a substitute, ready for its pattern
+-- btv.cmdline.open("", { kind = "/" })   -- a forward search
+-- ```
+function btv.cmdline.open(text, opts)
+  opts = opts or {}
+  local kind = opts.kind or ":"
+  if kind ~= ":" and kind ~= "/" and kind ~= "?" then
+    error('btv.cmdline.open: kind must be ":", "/" or "?", got ' .. tostring(kind), 2)
+  end
+  btv._cmdline_open(kind, text or "")
+end
 for _, name in ipairs({
   "cancel",
   "submit",
@@ -660,7 +679,7 @@ end
 -- unnamed register: `<C-c>` copies the visual selection, `<C-v>` pastes — at the
 -- cursor in normal mode, at the caret in insert mode, and into the line being typed
 -- on the command line. Paste is `P`, not `p` — the text lands at the
--- cursor (charwise) / above the line (linewise), which is where a non-modal editor
+-- cursor (charwise) / above the line (linewise), which is where a modeless editor
 -- puts it; vim's own mswin.vim maps the same chord to `"+gP` for that reason.
 --
 -- Each has a `<C-S-…>` twin. A terminal without the kitty keyboard protocol

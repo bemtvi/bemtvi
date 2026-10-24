@@ -3973,3 +3973,58 @@ async fn exec_autocmds_resolves_buffer_zero_to_the_current_buffer() {
         "`buffer = 0` must mean the current buffer on BOTH the register and fire sides"
     );
 }
+
+// ----- BufModifiedSet ---------------------------------------------------------
+
+#[tokio::test]
+async fn bufmodifiedset_fires_when_the_modified_flag_flips() {
+    // Once for the first edit (clean → modified), not for the edits after it, again
+    // for the write (modified → clean), and again for an undo past the saved text.
+    let dir = temp_dir("au_bufmodifiedset");
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "one\n").expect("seed file");
+    let (rpc, _incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.flips = {}\n\
+         btv.on('BufModifiedSet', {}, function(ev)\n\
+           _G.flips[#_G.flips + 1] = tostring(btv.bo[ev.buf].modified)\n\
+         end)\n",
+    )
+    .await;
+    let flips = |rpc: &Rpc| {
+        let rpc = rpc.clone();
+        async move {
+            exec_lua(&rpc, "return table.concat(_G.flips, ',')")
+                .await
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        }
+    };
+    feed(&rpc, "iab<Esc>");
+    assert_eq!(flips(&rpc).await, "true");
+    feed(&rpc, "x");
+    assert_eq!(flips(&rpc).await, "true", "already modified: no flip");
+    command(&rpc, "write").await;
+    assert_eq!(flips(&rpc).await, "true,false");
+    feed(&rpc, "u");
+    assert_eq!(flips(&rpc).await, "true,false,true");
+}
+
+#[tokio::test]
+async fn bufmodifiedset_fires_while_typing_in_a_modeless_session() {
+    // The `[+]` signal that `TextChanged` can't be in a session that never leaves
+    // Insert.
+    let dir = temp_dir("au_bufmodifiedset_modeless");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.n = 0\n\
+         btv.on('BufModifiedSet', {}, function() _G.n = _G.n + 1 end)\n",
+    )
+    .await;
+    command(&rpc, "set modeless").await;
+    feed(&rpc, "abc");
+    let n = exec_lua(&rpc, "return _G.n").await;
+    assert_eq!(n.as_u64(), Some(1));
+}

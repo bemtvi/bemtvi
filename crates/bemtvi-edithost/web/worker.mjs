@@ -151,6 +151,8 @@ const eh_ts_install_complete = M.cwrap("eh_ts_install_complete", null, ["number"
 const eh_ts_seed_installed = M.cwrap("eh_ts_seed_installed", null, ["number", "string"]);
 // The page's chord substitutions (`{"<C-w>": "<A-w>"}`), for `btv.ui.caps().key_labels`.
 const eh_set_key_labels = M.cwrap("eh_set_key_labels", null, ["number", "string"]);
+// The page's platform (`macos` / `linux` / `windows`), for `btv.ui.caps().platform`.
+const eh_set_platform = M.cwrap("eh_set_platform", null, ["number", "string"]);
 // Clipboard (`"+`/`"*`) leg: the editor enqueues each `"+`/`"*` yank/delete off-tick; the
 // Worker drains it and forwards to the UI thread (only the UI thread can reach
 // `navigator.clipboard`) to write out. The UI pushes the OS clipboard back in via
@@ -371,6 +373,10 @@ async function bootWithConfig() {
   // substitute (a Mac, or a host page that doesn't do this), and the map stays empty.
   const keyLabels = new URL(self.location.href).searchParams.get("key_labels");
   if (keyLabels) eh_set_key_labels(h, keyLabels);
+  // The platform rides the same URL, for the same reason: a key layout reads it from
+  // `UIEnter` (Command instead of Control on a Mac).
+  const platform = new URL(self.location.href).searchParams.get("platform");
+  if (platform) eh_set_platform(h, platform);
   if (daemon) {
     await applyRemoteConfigFromDaemon();
   } else {

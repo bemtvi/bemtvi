@@ -4,7 +4,7 @@
 
 Status: **done**. All four phases landed (`22005f8c`, `bb30fa6e`, `27433bc4`,
 and the docs commit). See [Outcome](#outcome) for where reality differed from
-the sketch. First of two plans: the non-modal (GUI/web-only) mode follows this
+the sketch. First of two plans: the modeless (GUI/web-only) mode follows this
 one and depends on it.
 
 ## The gap
@@ -12,7 +12,7 @@ one and depends on it.
 bemtvi took vim's undo *grouping*: a whole insert session is a single undo step.
 `ihello world, this is a paragraph<Esc>u` takes away everything typed since `i`.
 That is the part of vim's undo model that feels wrong. Every other editor the user
-works in undoes about a word at a time. It will be unworkable in a non-modal mode,
+works in undoes about a word at a time. It will be unworkable in modeless editing,
 where you never leave Insert, so a session covers everything since the file was
 opened.
 
@@ -27,7 +27,7 @@ the previous group and opens a new one unless `snapshot_taken` is set.
   abandoned branches, which `g-`/`g+`, `:earlier`/`:later`, `:undolist` and
   `btv.undotree` use. Nothing about storage, pruning (`'undolevels'`), time travel
   or the undotree projection changes.
-- **Change the grouping, for every mode.** Not gated on the non-modal mode. vim
+- **Change the grouping, for every mode.** Not gated on modeless editing. vim
   users' `u` after a long insert now undoes the last word. That is intended.
 - **No option to restore vim grouping.** We can add one later if someone asks;
   until then it is one code path, one behaviour.
@@ -170,8 +170,8 @@ Cases to keep in mind:
 - Changing the undo **tree** model, `'undolevels'`, time travel, or the
   persisted shape of anything.
 - Restoring the **selection** on undo (VS Code does this). Useful for the
-  non-modal mode; it is a separate change and belongs to that plan.
-- Ctrl-Z / Ctrl-Shift-Z bindings. They belong to the non-modal plan's key
+  modeless editing; it is a separate change and belongs to that plan.
+- Ctrl-Z / Ctrl-Shift-Z bindings. They belong to the modeless plan's key
   layout.
 
 ## Outcome

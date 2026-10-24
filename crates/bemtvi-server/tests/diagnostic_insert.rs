@@ -399,3 +399,28 @@ async fn update_in_insert_defaults_to_a_3s_debounce_and_round_trips() {
         assert_eq!(got.as_str(), Some(form), "`{form}` is echoed back as given");
     }
 }
+
+/// A modeless session never leaves Insert, so "hold until `InsertLeave`" would
+/// hold forever: there it falls back to the default debounce, and a held update
+/// lands once typing goes quiet.
+#[tokio::test]
+async fn update_in_insert_false_debounces_in_a_modeless_session() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "vim.diagnostic.config({ update_in_insert = false })").await;
+    open_with_a_diagnostic(&rpc).await;
+    exec_lua(&rpc, "btv.o.modeless = true").await;
+    assert_eq!(mode(&rpc).await, "i");
+
+    feed(&rpc, "abc");
+    move_the_diagnostic(&rpc).await;
+    assert_eq!(
+        painted_rows(&rpc, &mut incoming).await,
+        vec![1],
+        "still held while typing"
+    );
+    assert_eq!(
+        await_painted_rows(&rpc, &mut incoming, &[3]).await,
+        vec![3],
+        "applied once typing went quiet, without leaving Insert"
+    );
+}

@@ -62,6 +62,7 @@ impl Editor {
         // plugin snippet engine jumping to the next tabstop while completion is up) would
         // just linger, following the cursor. Close it before entering Select.
         self.close_completion();
+        self.nm_sel = None;
         self.select_escape_insert = escape_insert;
         if hi <= lo {
             self.mode = Mode::Insert;
@@ -105,6 +106,40 @@ impl Editor {
         // Normal-mode re-dispatch below (which would end the session's Insert context).
         if let Some(dir) = self.snippet_jump_for(&key) {
             self.snippet_jump(dir);
+            return;
+        }
+        // A modeless session's selection: Shift-motions extend it and plain ones
+        // collapse it; typing replaces it without writing a register; `<Esc>` and any
+        // key Select doesn't handle drop it and carry on in Insert. A snippet's
+        // placeholder keeps the path below, which keeps its mirrors in sync.
+        if self.nm_sel.is_some() || (self.rests_in_insert() && !self.snippet_active()) {
+            if self.modeless_nav(key) {
+                return;
+            }
+            match key.code {
+                // `<Tab>` over lines shifts them; `<S-Tab>` always does. Within one
+                // line `<Tab>` types over the selection like any character.
+                KeyCode::Tab if key.shift => {
+                    let _ = self.apply_modeless_action("outdent");
+                }
+                KeyCode::Tab if self.selection_spans_lines() => {
+                    let _ = self.apply_modeless_action("indent");
+                }
+                KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab if !key.ctrl && !key.alt => {
+                    self.replace_caret_selection();
+                    self.handle_insert(key);
+                }
+                KeyCode::Backspace | KeyCode::Delete => self.replace_caret_selection(),
+                KeyCode::Esc => {
+                    let head = self.caret_selection().head;
+                    self.collapse_selection_to(head);
+                }
+                _ => {
+                    let head = self.caret_selection().head;
+                    self.collapse_selection_to(head);
+                    self.handle_insert(key);
+                }
+            }
             return;
         }
         // `<C-g>` toggles back to Visual, keeping the selection and its shape (the

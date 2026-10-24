@@ -33,16 +33,15 @@ use bemtvi_view::{
     MenuField, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk, VirtPlacement,
     WindowRegion, WindowView,
 };
-use glyphon::cosmic_text::{Fallback, PlatformFallback};
 use glyphon::{
     fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use mitsuami::prelude::{SurfaceHandle, SurfaceSize};
-use unicode_script::Script;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::fontchain::FontChain;
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
 use crate::{GlyphOverflow, GuiConfig};
 
@@ -247,78 +246,6 @@ impl<'a> ScrollFrame<'a> {
     }
 }
 
-/// Intern a font-family name as a `&'static str`. cosmic-text's [`Fallback`] trait
-/// returns `&[&'static str]`, so the user's runtime fallback names must be promoted
-/// to `'static`. Interning (rather than leaking per call) bounds the leak to the set
-/// of distinct names ever configured, so repeated `:set guifont=…` can't grow it.
-fn intern_family(name: &str) -> &'static str {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut pool = pool.lock().unwrap();
-    if let Some(&existing) = pool.get(name) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    pool.insert(leaked);
-    leaked
-}
-
-/// Font fallback that tries the user's configured fallback families before the
-/// platform's defaults — bemtvi's analogue of wezterm's `font_with_fallback`. The
-/// user's families (every font after the first in `guifont` / `--font`) are
-/// prepended to the platform [`common_fallback`](Fallback::common_fallback), which
-/// cosmic-text consults right after the primary family for any glyph whose script
-/// has no curated list (`_ => &[]` in the platform tables) — symbols, icons, emoji,
-/// box-drawing, most punctuation: exactly the glyphs a coding font tends to miss. A
-/// real script (CJK, Arabic, …) still resolves through the platform's curated
-/// per-script font first; the user list then covers anything that misses.
-struct UserFallback {
-    /// The user fallback families (interned) followed by the platform common list.
-    common: Vec<&'static str>,
-}
-
-impl UserFallback {
-    /// Build from the user's fallback families (the `guifont` entries after the
-    /// primary), each tried before the platform's own common fallbacks.
-    fn new(fallback_families: &[String]) -> Self {
-        let common = fallback_families
-            .iter()
-            .map(|f| intern_family(f))
-            .chain(PlatformFallback.common_fallback().iter().copied())
-            .collect();
-        Self { common }
-    }
-}
-
-impl Fallback for UserFallback {
-    fn common_fallback(&self) -> &[&'static str] {
-        &self.common
-    }
-    // Forbidden and per-script lists are the platform's unchanged — the user list
-    // only augments the script-agnostic common path.
-    fn forbidden_fallback(&self) -> &[&'static str] {
-        PlatformFallback.forbidden_fallback()
-    }
-    fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
-        PlatformFallback.script_fallback(script, locale)
-    }
-}
-
-/// Build a [`FontSystem`] whose fallback prefers `fallback_families` (the configured
-/// families after the primary). Scans the system fonts once via [`FontSystem::new`],
-/// then rebuilds onto the same database with the custom [`UserFallback`] (cheap — no
-/// second scan).
-fn font_system_with_fallback(fallback_families: &[String]) -> FontSystem {
-    let (locale, db) = FontSystem::new().into_locale_and_db();
-    FontSystem::new_with_locale_and_db_and_fallback(
-        locale,
-        db,
-        UserFallback::new(fallback_families),
-    )
-}
-
 /// The GPU renderer. Owns the surface and everything needed to paint one frame.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -364,10 +291,10 @@ pub struct Renderer {
     /// trigger), so every requested size is clamped to it.
     max_dim: u32,
 
-    /// Configured font families: the first is the primary (shaped against directly
-    /// and measured for the cell); the rest are the fallback chain, baked into
-    /// `font_system`'s [`UserFallback`]. Empty means the system monospace.
-    fonts: Vec<String>,
+    /// The configured font list as installed: each character goes to the first font
+    /// in it that draws it, with that font's options (see [`FontChain`]). Its first
+    /// font is the primary, measured for the cell.
+    chain: FontChain,
     /// Ceiling on the render scale for an emoji / wide fallback glyph (see
     /// [`cluster_scale`] and [`Renderer::push_text`]), from [`GuiConfig::emoji_scale`].
     emoji_scale: f32,
@@ -404,6 +331,16 @@ pub struct Renderer {
     /// it). The client reads it via [`Renderer::ime_cursor_area`] to anchor the IME
     /// candidate window at the caret instead of the window origin.
     cursor_px: Option<(f32, f32)>,
+
+    /// Whether a modeless caret ([`View::caret`]) is in the off half of its blink.
+    /// The client flips it on a timer ([`Renderer::set_caret_hidden`]); the caret's
+    /// place is still recorded for the input method while it's hidden.
+    caret_hidden: bool,
+
+    /// The cells the last frame's popups (completion, the menu or picker, a hover
+    /// float) painted their backgrounds over, in physical pixels `(x, y, w, h)`. The
+    /// pointer over one is the arrow, whatever text lies under it.
+    popup_px: Vec<(f32, f32, f32, f32)>,
 
     /// An input method's composition in progress (the kana typed so far, the
     /// candidate it would convert to) and its own caret, in bytes: painted at the
@@ -529,18 +466,15 @@ impl Renderer {
         // the one atlas; only its own glyph-instance buffer is separate.
         let overlay_text =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let fonts = cfg.fonts.clone();
-        let mut font_system = font_system_with_fallback(fonts.get(1..).unwrap_or(&[]));
+        let mut font_system = FontSystem::new();
+        let chain = FontChain::resolve(&mut font_system, &cfg.fonts);
         let swash_cache = SwashCache::new();
 
         let font_size = physical_font_size(cfg.font_size, scale);
         let line_height = (font_size * LINE_SPACING).round();
-        let family = fonts
-            .first()
-            .map(|s| Family::Name(s))
-            .unwrap_or(Family::Monospace);
-        let (cell_w, cell_h) = measure_cell(&mut font_system, family, font_size, line_height);
-        let italic_face = ItalicFace::resolve(&mut font_system, &fonts);
+        let (cell_w, cell_h) =
+            measure_cell(&mut font_system, chain.primary(), font_size, line_height);
+        let italic_face = ItalicFace::resolve(&mut font_system, chain.primary());
 
         let rects = RectPipeline::new(&device, format);
         let image_store = ImageStore::new(&device, format, fetch_tx, decode_tx);
@@ -559,7 +493,7 @@ impl Renderer {
             _cache: cache,
             rects,
             image_store,
-            fonts,
+            chain,
             emoji_scale: cfg.emoji_scale,
             glyph_overflow: cfg.glyph_overflow,
             premultiplied,
@@ -575,6 +509,8 @@ impl Renderer {
             line_height,
             scale,
             cursor_px: None,
+            caret_hidden: false,
+            popup_px: Vec::new(),
             preedit: None,
             frame_quads: Vec::new(),
             frame_items: Vec::new(),
@@ -584,37 +520,32 @@ impl Renderer {
         })
     }
 
-    /// Re-shape with a new font family list (empty = system monospace) and point
-    /// size, re-measuring the cell and dropping the shaped-line cache (its buffers
-    /// were shaped at the old metrics). The caller then re-reports the grid (the cell
-    /// size, hence `grid_size`, has changed) and repaints. Backs `:set guifont=…`.
-    ///
-    /// `fonts[0]` is the primary; `fonts[1..]` is the fallback chain. When that chain
-    /// changes the [`FontSystem`] is rebuilt with a fresh [`UserFallback`] (reusing
-    /// the already-scanned font database — no rescan); a size-only change skips it.
-    pub fn set_font(&mut self, fonts: &[String], size_pt: f32) {
-        if fonts.get(1..) != self.fonts.get(1..) {
-            self.rebuild_font_system(fonts.get(1..).unwrap_or(&[]));
-        }
-        self.fonts = fonts.to_vec();
+    /// Re-shape with a new font list (empty = system monospace) and point size,
+    /// re-measuring the cell and dropping the shaped-line cache (its buffers were
+    /// shaped at the old metrics). The caller then re-reports the grid (the cell size,
+    /// hence `grid_size`, has changed), reports [`Self::missing_fonts`], and repaints.
+    /// Backs `:set guifont=…`. The list is re-resolved against the already-scanned
+    /// font database, so no rescan happens.
+    pub fn set_font(&mut self, fonts: &[bemtvi_view::FontSpec], size_pt: f32) {
+        self.chain = FontChain::resolve(&mut self.font_system, fonts);
         self.font_size = physical_font_size(size_pt, self.scale);
         self.line_height = (self.font_size * LINE_SPACING).round();
-        let family = self
-            .fonts
-            .first()
-            .map(|s| Family::Name(s))
-            .unwrap_or(Family::Monospace);
         let (cell_w, cell_h) = measure_cell(
             &mut self.font_system,
-            family,
+            self.chain.primary(),
             self.font_size,
             self.line_height,
         );
         self.cell_w = cell_w;
         self.cell_h = cell_h;
         // The primary face — and so which characters have a real italic — changed with it.
-        self.italic_face = ItalicFace::resolve(&mut self.font_system, &self.fonts);
+        self.italic_face = ItalicFace::resolve(&mut self.font_system, self.chain.primary());
         self.cache.clear();
+    }
+
+    /// The configured fonts that aren't installed, as the last [`Self::set_font`] found.
+    pub fn missing_fonts(&self) -> &[String] {
+        &self.chain.missing
     }
 
     /// Set which glyphs may overflow their cell, backing `'guiglyphoverflow'` (and the
@@ -679,21 +610,6 @@ impl Renderer {
         }
     }
 
-    /// Swap in a [`FontSystem`] whose fallback prefers `fallback_families`, reusing
-    /// the current system's font database so no rescan happens. The placeholder is an
-    /// empty-database system, immediately dropped once the real database is moved out.
-    fn rebuild_font_system(&mut self, fallback_families: &[String]) {
-        let placeholder =
-            FontSystem::new_with_locale_and_db(String::new(), fontdb::Database::new());
-        let old = std::mem::replace(&mut self.font_system, placeholder);
-        let (locale, db) = old.into_locale_and_db();
-        self.font_system = FontSystem::new_with_locale_and_db_and_fallback(
-            locale,
-            db,
-            UserFallback::new(fallback_families),
-        );
-    }
-
     /// The current grid size in cells: `(cols, total_rows)`. The caller reserves
     /// the last row for the command line before reporting the windows-area height
     /// to the server — mirroring the TUI's one reserved chrome row.
@@ -725,6 +641,25 @@ impl Renderer {
             global_status_rows: u16::from(!view.global_status.is_empty()),
         };
         bemtvi_view::resize_handle_at(view, geo, row, col)
+    }
+
+    /// Whether the pointer at physical pixel `(px, py)` is over text that takes the
+    /// I-beam ([`bemtvi_view::text_pointer_at`]), with the same chrome rows as
+    /// [`Self::resize_cursor_at`].
+    pub fn text_pointer_at(&self, view: &View, px: f64, py: f64) -> bool {
+        let (x, y) = (px as f32, py as f32);
+        if popup_covers(&self.popup_px, x, y) {
+            return false;
+        }
+        let (col, row) = self.cell_at(px, py);
+        let (cols, total_rows) = self.grid_size();
+        let geo = Geometry {
+            cols,
+            rows: total_rows.saturating_sub(1),
+            tabline_rows: u16::from(!view.tabline.is_empty()),
+            global_status_rows: u16::from(!view.global_status.is_empty()),
+        };
+        bemtvi_view::text_pointer_at(view, geo, row, col)
     }
 
     /// The measured cell size in physical pixels, for turning a trackpad's
@@ -1203,6 +1138,7 @@ impl Renderer {
             .focused()
             .map(|w| region_origin(w.region))
             .unwrap_or((main_x, mid_y));
+        let popups_from = overlay_quads.len();
         self.build_pmenu(view, focus_origin, overlay_quads, overlay_items);
 
         // The floating selectable-list menu (`btv.ui.select`), in the same overlay
@@ -1213,6 +1149,10 @@ impl Renderer {
         // The list-less content float (`btv.ui.float`; LSP hover / signature help),
         // same overlay layer, anchored at the focused window's region origin.
         self.build_content_float(view, focus_origin, overlay_quads, overlay_items);
+        self.popup_px = overlay_quads[popups_from..]
+            .iter()
+            .map(|q| (q.x, q.y, q.w, q.h))
+            .collect();
 
         // The global command / message line on the reserved bottom row.
         self.build_cmdline(view, cmd_row, quads, items);
@@ -1260,6 +1200,12 @@ impl Renderer {
                 punch: false,
             });
         }
+    }
+
+    /// Hide (or show) a modeless caret for the off (on) half of its blink. Has no
+    /// effect on vim's cursors, which don't blink.
+    pub fn set_caret_hidden(&mut self, hidden: bool) {
+        self.caret_hidden = hidden;
     }
 
     /// Set (or, with empty `text`, clear) the input method's composition painted at
@@ -1393,9 +1339,10 @@ impl Renderer {
         let block_cursor_fg = {
             let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
             let block = win.focused
+                && !win.cursor_hidden
                 && !view.command_mode
                 && !picker_open
-                && !view.is_insert()
+                && !view.bar_cursor()
                 && !view.is_replace()
                 && self.preedit.is_none();
             block.then(|| {
@@ -2124,7 +2071,8 @@ impl Renderer {
         // cursor while any is active (it reappears in that widget). While sliding it
         // tracks the interpolated cursor line so it moves with the text.
         let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
-        if win.focused && !view.command_mode && !picker_open && text_rows > 0 {
+        if win.focused && !win.cursor_hidden && !view.command_mode && !picker_open && text_rows > 0
+        {
             // The cursor shifts right by the inlay hints spliced in at or before its
             // column (a hint exactly at the cursor sits before the cursor glyph), so
             // it tracks the splice. Mid-slide that's the band's hints on the cursor's
@@ -2178,6 +2126,10 @@ impl Renderer {
             if self.preedit.is_some() {
                 return;
             }
+            // The off half of a modeless caret's blink.
+            if view.caret && self.caret_hidden {
+                return;
+            }
             // In MultiCursor placement mode the active (primary) cursor wears the
             // multi-cursor accent, distinct from the secondaries, so it reads as
             // "the one dropping cursors" — mirroring the TUI.
@@ -2202,7 +2154,7 @@ impl Renderer {
             let block_cells = (win.cursor_width as usize)
                 .min((ox + wcols).saturating_sub(cx).max(1) as usize)
                 as f32;
-            let (w, alpha) = if view.is_insert() {
+            let (w, alpha) = if view.bar_cursor() {
                 (self.cell_w * 0.15, 0.9)
             } else {
                 // Opaque: the covered glyph was re-drawn inverted on top of it by the
@@ -4155,54 +4107,15 @@ impl Renderer {
     }
 
     /// Shape `segments` into a fresh glyphon buffer (the expensive op the cache
-    /// exists to avoid repeating). Each run carries its own color, a `bold` weight
-    /// (cosmic-text picks the closest weight, synthesizing if needed), and an `italic`
-    /// that is scoped to the characters the primary font provides — see [`ItalicFace`].
+    /// exists to avoid repeating). Each run carries its own color and the font the
+    /// configured list gives its characters ([`rich_runs`]).
     fn shape_segments(&mut self, segments: &[Seg]) -> Buffer {
-        // Family borrows `fonts`, the italic face borrows its own field, the buffer
-        // borrows `font_system` — disjoint fields, so the borrows coexist. (The fallback
-        // chain lives in `font_system`'s `UserFallback`, so only the primary family is
-        // named here.)
-        let family = self
-            .fonts
-            .first()
-            .map(|s| Family::Name(s))
-            .unwrap_or(Family::Monospace);
-        let italic_face = &self.italic_face;
-        let mut buf = Buffer::new(
-            &mut self.font_system,
-            Metrics::new(self.font_size, self.line_height),
-        );
-        let default = Attrs::new().family(family);
-        // One entry per run, which is per segment except where an italic segment has to
-        // be split around the characters italic must not touch.
-        let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(segments.len());
-        for s in segments {
-            let mut attrs = default.clone().color(srgb_to_color(s.fg));
-            if s.bold {
-                attrs = attrs.weight(glyphon::Weight::BOLD);
-            }
-            if !s.italic {
-                rich.push((s.text.as_str(), attrs));
-                continue;
-            }
-            // Italic applies only where the primary face can draw the character. An icon
-            // or a kanji resolves to a fallback font that has no italic of its own, so
-            // slanting it — really or synthetically — only skews a glyph that was never
-            // meant to lean. Those runs keep the plain attrs and stay upright.
-            for (run, slanted) in italic_runs(&s.text, &|g| italic_face.slants(g)) {
-                // A real italic *face* — the designer's letterforms. Never a synthetic
-                // skew: a font without an italic simply renders upright.
-                rich.push((
-                    run,
-                    if slanted {
-                        attrs.clone().style(fontdb::Style::Italic)
-                    } else {
-                        attrs.clone()
-                    },
-                ));
-            }
-        }
+        // The chain and the italic face are fields of their own, the buffer borrows
+        // `font_system`: disjoint, so the borrows coexist.
+        let metrics = Metrics::new(self.font_size, self.line_height);
+        let mut buf = Buffer::new(&mut self.font_system, metrics);
+        let default = Attrs::new().family(self.chain.primary());
+        let rich = rich_runs(&self.chain, &self.italic_face, segments, metrics);
         buf.set_rich_text(
             &mut self.font_system,
             rich,
@@ -4315,6 +4228,14 @@ fn float_bg(view: &View, lighten_amt: u8) -> u32 {
 /// margin — clamped so at least a 1×1 cell survives. The window content paints
 /// into the returned rect; the margin shows whatever is behind it (the editor
 /// background, or a float's box fill).
+/// Whether pixel `(x, y)` falls on one of a frame's popup backgrounds — see
+/// `Renderer::popup_px`.
+pub fn popup_covers(popups: &[(f32, f32, f32, f32)], x: f32, y: f32) -> bool {
+    popups
+        .iter()
+        .any(|&(px, py, w, h)| x >= px && x < px + w && y >= py && y < py + h)
+}
+
 fn pad_rect(rect: (u16, u16, u16, u16), pad: bemtvi_view::Padding) -> (u16, u16, u16, u16) {
     let (x, y, w, h) = rect;
     let left = pad.left.min(w.saturating_sub(1));
@@ -5276,6 +5197,113 @@ pub fn physical_font_size(size_pt: f32, scale: f32) -> f32 {
     (size_pt * scale).round().max(1.0)
 }
 
+/// The runs `segments` shape as: per segment, its colour and bold, split where the
+/// configured list hands the characters to a different font ([`FontChain`]), each run
+/// in that font with its options. Italic, a real italic face only, applies where the
+/// primary draws the text and its italic face has the characters (see [`ItalicFace`]);
+/// a font further down the list is never slanted.
+fn rich_runs<'a>(
+    chain: &'a FontChain,
+    italic_face: &ItalicFace,
+    segments: &'a [Seg],
+    metrics: Metrics,
+) -> Vec<(&'a str, Attrs<'a>)> {
+    let mut rich: Vec<(&str, Attrs)> = Vec::with_capacity(segments.len());
+    for s in segments {
+        let base = Attrs::new().color(srgb_to_color(s.fg));
+        for (run, font) in crate::fontchain::runs_by(&s.text, &|g| chain.font_for(g)) {
+            let attrs = chain.attrs(font, base.clone(), s.bold, metrics);
+            if !s.italic || font.is_some_and(|i| i > 0) {
+                rich.push((run, attrs));
+                continue;
+            }
+            for (part, slanted) in italic_runs(run, &|g| italic_face.slants(g)) {
+                rich.push((
+                    part,
+                    if slanted {
+                        attrs.clone().style(fontdb::Style::Italic)
+                    } else {
+                        attrs.clone()
+                    },
+                ));
+            }
+        }
+    }
+    rich
+}
+
+/// One glyph as [`shape_with_fonts`] shaped it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TestGlyph {
+    /// The text it draws.
+    pub text: String,
+    /// The family of the font that drew it.
+    pub family: String,
+    pub font_size: f32,
+    pub weight: u16,
+    pub glyph_id: u16,
+    /// Whether the face that drew it is an italic one.
+    pub italic: bool,
+}
+
+/// Shape `text` the way the renderer does, against a font database holding only
+/// `files` (the first file's family standing in as the system monospace), with `fonts`
+/// as the configured list, at 10px, bold and italic as the arguments say. Returns each glyph and the configured fonts the database lacks. For
+/// the Tier-1 font-chain test: no window, no GPU, no dependence on the machine's fonts.
+pub fn shape_with_fonts(
+    files: &[std::path::PathBuf],
+    fonts: &[bemtvi_view::FontSpec],
+    text: &str,
+    (bold, italic): (bool, bool),
+) -> (Vec<TestGlyph>, Vec<String>) {
+    let mut db = fontdb::Database::new();
+    for f in files {
+        db.load_font_file(f).expect("a test font loads");
+    }
+    let first = db
+        .faces()
+        .next()
+        .and_then(|f| f.families.first().map(|(n, _)| n.clone()));
+    if let Some(name) = first {
+        db.set_monospace_family(name);
+    }
+    let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
+    let chain = FontChain::resolve(&mut font_system, fonts);
+    let metrics = Metrics::new(10.0, 12.0);
+    let segments = [Seg {
+        text: text.to_string(),
+        fg: 0,
+        bg: None,
+        bold,
+        italic,
+    }];
+    let italic_face = ItalicFace::resolve(&mut font_system, chain.primary());
+    let rich = rich_runs(&chain, &italic_face, &segments, metrics);
+    let mut buf = Buffer::new(&mut font_system, metrics);
+    let default = Attrs::new().family(chain.primary());
+    buf.set_rich_text(&mut font_system, rich, &default, Shaping::Advanced, None);
+    buf.shape_until_scroll(&mut font_system, false);
+    let mut glyphs = Vec::new();
+    for run in buf.layout_runs() {
+        for g in run.glyphs {
+            let face = font_system.db().face(g.font_id);
+            let family = face
+                .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+                .unwrap_or_default();
+            let italic = face.is_some_and(|f| f.style != fontdb::Style::Normal);
+            glyphs.push(TestGlyph {
+                text: text[g.start..g.end].to_string(),
+                family,
+                font_size: g.font_size,
+                weight: g.font_weight.0,
+                glyph_id: g.glyph_id,
+                italic,
+            });
+        }
+    }
+    (glyphs, chain.missing.clone())
+}
+
 /// Measure the cell size from the configured font by shaping a single `M`.
 fn measure_cell(
     font_system: &mut FontSystem,
@@ -5418,8 +5446,12 @@ pub fn overflow_cells(
     if ink.height <= 0.0 || ink.width <= 0.0 {
         return 0.0;
     }
-    let ratio = ink.width / ink.height;
-    let square = (SQUARE_INK_BAND.0..=SQUARE_INK_BAND.1).contains(&ratio);
+    // The ink is whole rasterised pixels, so at a small size a separator's narrow wedge
+    // can round its way into the band (10x14 at 13px is 0.714). Square has to hold at
+    // the narrow end however the rounding fell, a pixel either way; the wide end needs
+    // no slack, since the glyphs past it (rules) are far past it.
+    let narrowest = (ink.width - 1.0).max(0.0) / (ink.height + 1.0);
+    let square = narrowest >= SQUARE_INK_BAND.0 && ink.width / ink.height <= SQUARE_INK_BAND.1;
     // The same extent `cluster_scale` fits: the advance the font intends, or the ink
     // when it paints outside that.
     let overflows = adv.max(ink.left + ink.width) > cell_w;
@@ -5506,14 +5538,9 @@ pub(crate) struct ItalicFace {
 }
 
 impl ItalicFace {
-    /// Read the primary family's italic support out of the font database. `fonts` is the
-    /// configured family list; only its first entry is the primary (the rest are the
-    /// fallback chain, which italic deliberately never touches).
-    fn resolve(font_system: &mut FontSystem, fonts: &[String]) -> Self {
-        let family = fonts
-            .first()
-            .map(|s| Family::Name(s))
-            .unwrap_or(Family::Monospace);
+    /// Read the primary family's italic support out of the font database. Only the
+    /// primary has one: the fonts after it in the list are never slanted.
+    fn resolve(font_system: &mut FontSystem, family: Family) -> Self {
         // Face records carry concrete family names, so resolve the generic first:
         // `Family::Monospace` is whatever the database calls the system monospace.
         let name = font_system.db().family_name(&family).to_string();
@@ -5528,8 +5555,7 @@ impl ItalicFace {
             .find(|f| f.style != fontdb::Style::Normal)
             .map(|f| f.id);
         let coverage = italic
-            .and_then(|id| font_system.get_font(id, fontdb::Weight::NORMAL))
-            .map(|font| font.unicode_codepoints().iter().copied().collect())
+            .map(|id| crate::fontchain::coverage(font_system.db(), id))
             .unwrap_or_default();
         Self { coverage }
     }
@@ -5588,25 +5614,7 @@ pub fn is_letterform(cluster: &str) -> bool {
 /// is one unit — splitting `é` between its `e` and its accent would hand shaping two
 /// runs that can no longer compose. Pure, so it's tested in `tests/wide.rs`.
 pub fn italic_runs<'a>(text: &'a str, slants: &dyn Fn(&str) -> bool) -> Vec<(&'a str, bool)> {
-    let mut runs: Vec<(&str, bool)> = Vec::new();
-    let mut start = 0;
-    let mut current: Option<bool> = None;
-    for (i, cluster) in text.grapheme_indices(true) {
-        let want = slants(cluster);
-        match current {
-            Some(w) if w == want => {}
-            Some(w) => {
-                runs.push((&text[start..i], w));
-                start = i;
-                current = Some(want);
-            }
-            None => current = Some(want),
-        }
-    }
-    if let Some(w) = current {
-        runs.push((&text[start..], w));
-    }
-    runs
+    crate::fontchain::runs_by(text, slants)
 }
 
 /// Grid tolerance: how far a cluster's summed glyph advance may sit from its display

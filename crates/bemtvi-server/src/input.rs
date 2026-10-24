@@ -372,9 +372,19 @@ impl EditHost {
             self.editor_input_typed(key);
             return;
         }
-        let mode = self.editor.mode;
-        for step in self.keymaps.feed(MatchScope::Editing(mode), key) {
+        for step in self.keymaps.feed(self.editing_scope(), key) {
             self.apply_step(step);
+        }
+    }
+
+    /// The scope the buffer's keys match in: the mode's own maps, or — in a
+    /// modeless session that is typing or selecting — the `modeless` key layout
+    /// laid over them.
+    pub(crate) fn editing_scope(&self) -> MatchScope {
+        if self.editor.modeless_keys_active() {
+            MatchScope::Modeless(self.editor.mode)
+        } else {
+            MatchScope::Editing(self.editor.mode)
         }
     }
 
@@ -402,7 +412,7 @@ impl EditHost {
         // A click may have moved focus to another window/buffer; rebuild the tries for
         // the now-current buffer so its buffer-local mouse maps are in force.
         self.refresh_keymaps();
-        let scope = MatchScope::Editing(self.editor.mode);
+        let scope = self.editing_scope();
         for click in clicks {
             let key = Key {
                 code: KeyCode::Mouse {
@@ -413,6 +423,7 @@ impl EditHost {
                 shift: click.shift,
                 ctrl: click.ctrl,
                 alt: click.alt,
+                cmd: false,
             };
             match self.keymaps.lookup_mouse(scope, key) {
                 Some(m) => self.fire_mapping(m.rhs, m.silent, m.expr),
@@ -427,6 +438,7 @@ impl EditHost {
                 shift: wheel.shift,
                 ctrl: wheel.ctrl,
                 alt: wheel.alt,
+                cmd: false,
             };
             match self.keymaps.lookup_mouse(scope, key) {
                 Some(m) => self.fire_mapping(m.rhs, m.silent, m.expr),
@@ -455,7 +467,7 @@ impl EditHost {
         // in its bucket, the buffer's in its mode.
         let scope = match crate::keymap::widget_bucket(self.editor.key_context()) {
             Some(bucket) => MatchScope::Widget(bucket),
-            None => MatchScope::Editing(self.editor.mode),
+            None => self.editing_scope(),
         };
         for step in self.keymaps.flush(scope) {
             self.apply_step(step);
@@ -745,7 +757,7 @@ impl EditHost {
         }
         let scope = match crate::keymap::widget_bucket(self.editor.key_context()) {
             Some(bucket) => MatchScope::Widget(bucket),
-            None => MatchScope::Editing(self.editor.mode),
+            None => self.editing_scope(),
         };
         if let Some(m) = self.keymaps.lookup_default(scope, key) {
             self.fire_mapping(m.rhs, m.silent, m.expr);

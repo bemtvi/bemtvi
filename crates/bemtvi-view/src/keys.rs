@@ -45,12 +45,22 @@ pub enum Key {
 /// `key_to_notation`, and is what lets Shift+Tab reach the server as `<S-Tab>` and
 /// Ctrl+Shift+c as `<C-S-c>` rather than bare `<Tab>` / `<C-c>`.
 pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
+    notation_cmd(ctrl, alt, false, shift, key)
+}
+
+/// [`notation`] with the Command key too (macOS Command, Super elsewhere), notated
+/// `D-` as neovim does: Command+Z is `<D-z>`, Command+Shift+Z `<D-S-z>`. Only a GUI
+/// or a browser can deliver it; a terminal never sees the key.
+pub fn notation_cmd(ctrl: bool, alt: bool, cmd: bool, shift: bool, key: Key) -> String {
     let mut prefix = String::new();
     if ctrl {
         prefix.push_str("C-");
     }
     if alt {
         prefix.push_str("A-");
+    }
+    if cmd {
+        prefix.push_str("D-");
     }
     // The named-key prefix additionally carries `S-`; the character arms ignore it.
     let named_prefix = if shift {

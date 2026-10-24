@@ -119,6 +119,11 @@ form_urlencoded = { workspace = true, optional = true }
 # clipboard module (the browser build has its own clipboard seam).
 base64 = { workspace = true, optional = true }
 
+# `uselocale(3)`: the server thread keeps the C locale whatever the process's is
+# (`pin_c_locale` in lib.rs), so Lua's numbers keep a decimal point under GTK.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 # The daemon **dial** test exercises the handoff race between the link thread and the
 # caller's first seam op — a window a few instructions wide, which only opens under true

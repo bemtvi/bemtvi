@@ -336,6 +336,10 @@ impl Editor {
     /// Enter Helix's selection-first normal mode ([`Mode::HelixNormal`]) from
     /// vim's Normal mode: start from a single point selection at the cursor.
     pub(crate) fn enter_helix(&mut self) {
+        if self.options.modeless {
+            self.echo_err("helix: turn 'modeless' off first");
+            return;
+        }
         self.reset_pending();
         self.reset_helix_pending();
         self.clear_secondary_cursors();

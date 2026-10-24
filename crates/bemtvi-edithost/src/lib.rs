@@ -1223,6 +1223,19 @@ pub unsafe extern "C" fn eh_set_key_labels(h: *mut WasmEditHost, json: *const c_
     }
 }
 
+/// Declare the browser's platform (`"macos"`, `"linux"`, `"windows"`), which only
+/// the page can read, for `btv.ui.caps().platform`: the modeless key layout binds
+/// Command instead of Control on a Mac. Call where [`eh_set_key_labels`] is called,
+/// before [`eh_boot_finish`]. See [`EditHost::set_platform`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `platform` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_set_platform(h: *mut WasmEditHost, platform: *const c_char) {
+    let handle = host_or!(h);
+    handle.host.set_platform(as_str(platform).to_string());
+}
+
 /// Apply a fetched remote-config bundle in a daemon session — the browser twin of the
 /// native edit-host's fetch→materialize→source path. The Worker dials the daemon, fetches
 /// `config_bundle` over WebTransport, re-encodes the reply to msgpack, and hands the bytes

@@ -60,6 +60,10 @@ use bemtvi_lua::{RawKeymap, RawRhs};
 pub enum MatchScope {
     /// The buffer, in this mode — the per-mode trie + oracle.
     Editing(Mode),
+    /// The buffer in a modeless session (`'modeless'`), typing (Insert/Replace) or
+    /// selecting (Select): the `modeless` key layout laid over that mode's maps, so
+    /// a layout key wins and every other key still finds its Insert/Select map.
+    Modeless(Mode),
     /// A grabbing widget, in this bucket — the trie only, no oracle.
     Widget(char),
 }
@@ -69,6 +73,8 @@ impl MatchScope {
     fn bucket(self) -> char {
         match self {
             MatchScope::Editing(mode) => mode_key(mode),
+            MatchScope::Modeless(Mode::Select) => MODELESS_SELECT,
+            MatchScope::Modeless(_) => MODELESS_INSERT,
             MatchScope::Widget(bucket) => bucket,
         }
     }
@@ -81,7 +87,7 @@ impl MatchScope {
     fn oracle_mode(self) -> Option<Mode> {
         match self {
             MatchScope::Editing(mode) if mode.is_helix() => None,
-            MatchScope::Editing(mode) => Some(mode),
+            MatchScope::Editing(mode) | MatchScope::Modeless(mode) => Some(mode),
             MatchScope::Widget(_) => None,
         }
     }
@@ -93,13 +99,19 @@ impl MatchScope {
     /// [`mode_buckets`] / [`widget_bucket`] and must stay in sync with them.
     pub fn mode_code(self) -> &'static str {
         match self {
-            MatchScope::Editing(mode) => mode.short_code(),
+            MatchScope::Editing(mode) | MatchScope::Modeless(mode) => mode.short_code(),
             MatchScope::Widget('P') => "picker",
             MatchScope::Widget('S') => "select",
             MatchScope::Widget(_) => "",
         }
     }
 }
+
+/// The tries a modeless session matches in: the Insert (`'i'`) maps with the
+/// `modeless` layer laid over them, and the same for Select (`'s'`). Built in
+/// [`Keymaps::build_for`]; a declared `"modeless"` map lands in both.
+const MODELESS_INSERT: char = 'E';
+const MODELESS_SELECT: char = 'Z';
 
 /// The keymap bucket char a grabbing-widget [`KeyContext`] routes through, or `None`
 /// for [`KeyContext::Editing`] (the buffer's per-mode trie). Pairs with
@@ -438,6 +450,7 @@ impl Keymaps {
     pub fn build_for(&mut self, buffer: u64) {
         self.built_buffer = Some(buffer);
         self.tries.clear();
+        let mut layer: Vec<(Vec<Key>, Mapping)> = Vec::new();
         for entry in &self.snapshot {
             // Skip buffer-local maps that belong to a different buffer.
             if matches!(entry.buffer, Some(b) if b != buffer) {
@@ -477,6 +490,31 @@ impl Keymaps {
                         .or_default()
                         .insert(&lhs, mapping.clone());
                 }
+                // The modeless tries start as copies of the Insert / Select maps…
+                let overlay = match mode.as_str() {
+                    "i" => Some(MODELESS_INSERT),
+                    "s" => Some(MODELESS_SELECT),
+                    _ => None,
+                };
+                if let Some(bucket) = overlay {
+                    self.tries
+                        .entry(bucket)
+                        .or_default()
+                        .insert(&lhs, mapping.clone());
+                }
+            }
+            if entry.modes.iter().any(|m| m == "modeless") {
+                layer.push((lhs, mapping));
+            }
+        }
+        // …and the `modeless` layer goes on top, after every Insert / Select map, so
+        // a layout key beats an Insert map on the same keys whatever their rank.
+        for (lhs, mapping) in layer {
+            for bucket in [MODELESS_INSERT, MODELESS_SELECT] {
+                self.tries
+                    .entry(bucket)
+                    .or_default()
+                    .insert(&lhs, mapping.clone());
             }
         }
     }

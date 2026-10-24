@@ -46,6 +46,7 @@ impl Default for CompleteKeys {
             ctrl: false,
             alt: false,
             shift: true,
+            cmd: false,
         };
         CompleteKeys {
             next: vec![

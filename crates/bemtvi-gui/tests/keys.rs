@@ -4,8 +4,9 @@
 
 use bemtvi_gui::{
     dialog_action, encode_input, encode_paste, encode_text, is_paste, open_dialog_verb,
-    open_path_command, parse_guifont, save_dialog_needed, DialogAction, GuiConfig,
+    open_path_command, save_dialog_needed, DialogAction, GuiConfig,
 };
+use bemtvi_view::FontSpec;
 use mitsuami::prelude::{KeyCode, Modifiers, SurfaceInput};
 
 const NONE: Modifiers = Modifiers {
@@ -288,7 +289,7 @@ fn input_method_replacements_delete_what_they_replace() {
 }
 
 #[test]
-fn bare_modifier_release_and_command_chords_are_dropped() {
+fn bare_modifier_and_release_are_dropped() {
     // A lone modifier key (Control pressed by itself) has no editor meaning.
     assert_eq!(named(KeyCode::ControlLeft, CONTROL), None);
     // Nor does a release.
@@ -302,8 +303,26 @@ fn bare_modifier_release_and_command_chords_are_dropped() {
         unmodified: Some('a'),
     };
     assert_eq!(note(release), None);
-    // Command (macOS) / Super chords type nothing and aren't vim keys.
-    assert_eq!(note(press(KeyCode::KeyC, None, Some('c'), META)), None);
+}
+
+#[test]
+fn command_chords_are_d_notation() {
+    // Command (macOS) / Super is neovim's `D-`: the key's own character, Shift as
+    // `S-`, and the named keys wrapped like any other modifier.
+    assert_eq!(
+        note(press(KeyCode::KeyC, None, Some('c'), META)),
+        Some("<D-c>".into())
+    );
+    let meta_shift = Modifiers {
+        shift: true,
+        ..META
+    };
+    assert_eq!(
+        note(press(KeyCode::KeyZ, None, Some('z'), meta_shift)),
+        Some("<D-S-z>".into())
+    );
+    assert_eq!(named(KeyCode::ArrowLeft, META), Some("<D-Left>".into()));
+    assert_eq!(named(KeyCode::ArrowUp, meta_shift), Some("<D-S-Up>".into()));
 }
 
 #[test]
@@ -378,57 +397,31 @@ fn open_dialog_leaves_other_commands_alone() {
 }
 
 #[test]
-fn guifont_parses_family_and_size() {
-    let fams = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-
-    // `Family:h<size>` — the neovim/Neovide form set in init.lua.
-    assert_eq!(
-        parse_guifont("Source Code Pro:h14"),
-        (fams(&["Source Code Pro"]), Some(14.0))
-    );
-    // Backslash-escaped spaces (the `:set guifont=...` form) are unescaped.
-    assert_eq!(
-        parse_guifont("Fira\\ Code:h12"),
-        (fams(&["Fira Code"]), Some(12.0))
-    );
-    // A comma list is the full wezterm-style fallback chain (primary first), with
-    // extra `:` options ignored and each family trimmed/unescaped.
-    assert_eq!(
-        parse_guifont("JetBrains Mono,Noto Color Emoji,Symbols Nerd Font:h16:b:#e-subpixel"),
-        (
-            fams(&["JetBrains Mono", "Noto Color Emoji", "Symbols Nerd Font"]),
-            Some(16.0)
-        )
-    );
-    // Family only / size only / empty — each component falls back independently.
-    assert_eq!(parse_guifont("Iosevka"), (fams(&["Iosevka"]), None));
-    assert_eq!(parse_guifont(":h20"), (Vec::new(), Some(20.0)));
-    assert_eq!(parse_guifont(""), (Vec::new(), None));
-    // A non-positive or junk size is rejected (kept as None, not 0).
-    assert_eq!(parse_guifont("Mono:h0"), (fams(&["Mono"]), None));
-    assert_eq!(parse_guifont("Mono:hx"), (fams(&["Mono"]), None));
-}
-
-#[test]
 fn config_font_takes_a_comma_separated_fallback_list() {
     // `--font` / `BEMTVI_GUI_FONT` accepts the same comma list as `guifont`: the
     // primary first, then the fallback chain (each trimmed, `\ ` unescaped).
     let mut cfg = GuiConfig::default();
     assert!(cfg.fonts.is_empty()); // default = system monospace
 
-    cfg.set_font("JetBrains\\ Mono, Noto Color Emoji ,Symbols Nerd Font");
+    cfg.set_font("JetBrains\\ Mono, Noto Color Emoji ,Symbols Nerd Font[scale=0.9]");
     assert_eq!(
         cfg.fonts,
         vec![
-            "JetBrains Mono".to_string(),
-            "Noto Color Emoji".to_string(),
-            "Symbols Nerd Font".to_string(),
+            FontSpec::named("JetBrains Mono"),
+            FontSpec::named("Noto Color Emoji"),
+            FontSpec {
+                scale: Some(0.9),
+                ..FontSpec::named("Symbols Nerd Font")
+            },
         ]
     );
 
     // An all-blank spec leaves the existing list untouched (keeps the default rather
     // than asking the font system for `""`).
     cfg.set_font("  , ");
+    assert_eq!(cfg.fonts.len(), 3);
+    // So does one that doesn't parse (it says why on stderr).
+    cfg.set_font("Mono[wieght=500]");
     assert_eq!(cfg.fonts.len(), 3);
 }
 

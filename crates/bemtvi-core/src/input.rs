@@ -17,6 +17,10 @@ pub struct Key {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    /// The Command key on macOS (Super/Windows elsewhere), notated `D-` as in
+    /// neovim (`<D-c>`). Only a GUI or a browser can deliver it; a chord the
+    /// keymaps don't claim is dropped rather than typed (see [`crate::Editor::input`]).
+    pub cmd: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,6 +106,7 @@ impl Key {
             ctrl: false,
             alt: false,
             shift: false,
+            cmd: false,
         }
     }
 
@@ -115,6 +120,7 @@ impl Key {
             ctrl: true,
             alt: false,
             shift: false,
+            cmd: false,
         }
     }
 
@@ -122,7 +128,7 @@ impl Key {
     /// printable character.
     pub fn as_char(self) -> Option<char> {
         match self.code {
-            KeyCode::Char(c) if !self.ctrl && !self.alt => Some(c),
+            KeyCode::Char(c) if !self.ctrl && !self.alt && !self.cmd => Some(c),
             _ => None,
         }
     }
@@ -427,12 +433,12 @@ pub fn key_to_notation(key: Key) -> String {
         KeyCode::Char(' ') => (true, "Space".to_string()),
         // A bare '<' is written `<lt>` so the result re-parses to '<' and never
         // opens a spurious special form.
-        KeyCode::Char('<') if !key.ctrl && !key.alt => (true, "lt".to_string()),
+        KeyCode::Char('<') if !key.ctrl && !key.alt && !key.cmd => (true, "lt".to_string()),
         // A *modified* '>' must use its named escape (`<C-gt>`): written inline
         // as `<C->>` the parser would close the form at the FIRST '>', so it
         // could never round-trip. (A bare '>' stays literal, and a modified '<'
         // is fine inline — `<C-<>` parses.)
-        KeyCode::Char('>') if key.ctrl || key.alt => (true, "gt".to_string()),
+        KeyCode::Char('>') if key.ctrl || key.alt || key.cmd => (true, "gt".to_string()),
         KeyCode::Char(c) => (false, c.to_string()),
         KeyCode::Enter => (true, "CR".to_string()),
         KeyCode::Esc => (true, "Esc".to_string()),
@@ -487,7 +493,7 @@ pub fn key_to_notation(key: Key) -> String {
     };
     // A plain printable char with no ctrl/alt is bare (`f`, `F`, `5`); shift is
     // already baked into the character, so it adds no `S-` prefix.
-    if !named && !key.ctrl && !key.alt {
+    if !named && !key.ctrl && !key.alt && !key.cmd {
         return base;
     }
     let mut s = String::from("<");
@@ -496,6 +502,9 @@ pub fn key_to_notation(key: Key) -> String {
     }
     if key.alt {
         s.push_str("A-");
+    }
+    if key.cmd {
+        s.push_str("D-");
     }
     // Shift is only notated for the named keys (`<S-Tab>`); on a printable char it
     // is already reflected in the character itself.
@@ -549,8 +558,9 @@ fn parse_special(inner: &str) -> Option<Key> {
     let mut ctrl = false;
     let mut shift = false;
     let mut alt = false;
+    let mut cmd = false;
 
-    // Split modifier prefixes like `C-`, `S-`, `A-`/`M-`.
+    // Split modifier prefixes like `C-`, `S-`, `A-`/`M-`, `D-` (Command).
     let mut rest = inner;
     loop {
         let bytes = rest.as_bytes();
@@ -559,6 +569,7 @@ fn parse_special(inner: &str) -> Option<Key> {
                 b'C' => ctrl = true,
                 b'S' => shift = true,
                 b'A' | b'M' => alt = true,
+                b'D' => cmd = true,
                 _ => break,
             }
             rest = &rest[2..];
@@ -581,6 +592,7 @@ fn parse_special(inner: &str) -> Option<Key> {
             ctrl,
             alt,
             shift,
+            cmd,
         });
     }
 
@@ -637,6 +649,7 @@ fn parse_special(inner: &str) -> Option<Key> {
         ctrl,
         alt,
         shift,
+        cmd,
     })
 }
 

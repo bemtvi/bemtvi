@@ -107,6 +107,162 @@ async fn guifont_round_trips_and_reaches_the_redraw() {
     assert_eq!(field_str(&frame, "guifont"), "Fira Code:h14");
 }
 
+/// One font of the redraw's parsed `guifont_spec`: `(family, weight, scale, features)`.
+type SpecFont = (String, Option<u64>, Option<f64>, Vec<(String, u64)>);
+
+/// The redraw's parsed `guifont_spec`: the `:h` size and the fonts.
+fn guifont_spec(frame: &[(rmpv::Value, rmpv::Value)]) -> (Option<f64>, Vec<SpecFont>) {
+    use rmpv::Value;
+    let Some(Value::Map(m)) = field(frame, "guifont_spec") else {
+        panic!("no guifont_spec in the redraw");
+    };
+    let get = |m: &[(Value, Value)], k: &str| {
+        m.iter()
+            .find(|(key, _)| key.as_str() == Some(k))
+            .map(|(_, v)| v.clone())
+    };
+    let size = get(m, "size").and_then(|v| v.as_f64());
+    let fonts = match get(m, "fonts") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|f| {
+                let f = f.as_map().expect("a font is a map");
+                let features = match get(f, "features") {
+                    Some(Value::Array(fs)) => fs
+                        .iter()
+                        .map(|p| {
+                            let p = p.as_array().expect("a [tag, value] pair");
+                            (p[0].as_str().unwrap().to_string(), p[1].as_u64().unwrap())
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                (
+                    get(f, "family")
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap(),
+                    get(f, "weight").and_then(|v| v.as_u64()),
+                    get(f, "scale").and_then(|v| v.as_f64()),
+                    features,
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    (size, fonts)
+}
+
+async fn latest_frame(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Vec<(rmpv::Value, rmpv::Value)> {
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    drain_to_latest_redraw(incoming, |_| true).expect("a redraw arrived")
+}
+
+#[tokio::test]
+async fn guifont_reaches_the_redraw_parsed_with_each_fonts_options() {
+    let (rpc, mut incoming) = start().await;
+    command(
+        &rpc,
+        "set guifont=JetBrains\\ Mono[weight=medium;features=+ss01\\ -calt\\ cv01=2],Nerd[scale=0.9],Noto:h14:b",
+    )
+    .await;
+    let frame = latest_frame(&rpc, &mut incoming).await;
+    let (size, fonts) = guifont_spec(&frame);
+    assert_eq!(size, Some(14.0));
+    let feat = |v: &[(&str, u64)]| {
+        v.iter()
+            .map(|(t, n)| (t.to_string(), *n))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        fonts,
+        vec![
+            (
+                "JetBrains Mono".to_string(),
+                Some(500),
+                None,
+                feat(&[("ss01", 1), ("calt", 0), ("cv01", 2)])
+            ),
+            ("Nerd".to_string(), None, Some(0.9f32 as f64), vec![]),
+            ("Noto".to_string(), None, None, vec![]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_guifont_is_e474_and_keeps_the_old_value() {
+    let (rpc, mut incoming) = start().await;
+    command(&rpc, "set guifont=Mono:h12").await;
+    for (bad, why) in [
+        ("Mono[wieght=500]", "unknown option wieght on Mono"),
+        ("Mono[weight=5000]", "weight=5000 on Mono"),
+        ("Mono[scale=9]", "scale=9 on Mono"),
+        ("Mono[features=+toolong]", "feature +toolong on Mono"),
+        ("Mono[weight=500", "unclosed ["),
+        ("[scale=1]", "options without a font name"),
+        ("Mono:hbig", "bad size :hbig"),
+    ] {
+        let msg = set_message(&rpc, &mut incoming, &format!("guifont={bad}")).await;
+        assert!(
+            msg.starts_with("E474: Invalid argument: guifont: ") && msg.contains(why),
+            "{bad}: {msg:?}"
+        );
+    }
+    let frame = latest_frame(&rpc, &mut incoming).await;
+    assert_eq!(
+        field_str(&frame, "guifont"),
+        "Mono:h12",
+        "the old value stays"
+    );
+    // The Lua path checks it too.
+    exec_lua(&rpc, "btv.o.guifont = 'Mono[scale=0]'").await;
+    let frame = latest_frame(&rpc, &mut incoming).await;
+    assert!(message(&frame).contains("E474"), "{:?}", message(&frame));
+    assert_eq!(field_str(&frame, "guifont"), "Mono:h12");
+}
+
+#[tokio::test]
+async fn btv_ui_font_builds_the_guifont_value() {
+    let (rpc, mut incoming) = start().await;
+    let value = exec_lua(
+        &rpc,
+        "return btv.ui.font({ \
+           { 'JetBrains Mono', weight = 500, features = { '+ss01', '-calt' } }, \
+           { 'Symbols Nerd Font', scale = 0.9 }, \
+           'Noto Color Emoji', \
+         }, { size = 14 })",
+    )
+    .await;
+    assert_eq!(
+        value.as_str(),
+        Some(
+            "JetBrains Mono[weight=500;features=+ss01 -calt],Symbols Nerd Font[scale=0.9],Noto Color Emoji:h14"
+        )
+    );
+    let frame = latest_frame(&rpc, &mut incoming).await;
+    let (size, fonts) = guifont_spec(&frame);
+    assert_eq!(size, Some(14.0));
+    assert_eq!(fonts.len(), 3);
+    assert_eq!(fonts[0].1, Some(500));
+    // A name the syntax can't hold is refused, loud.
+    let err = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![
+                rmpv::Value::from("btv.ui.font({ 'Bad,Name' })"),
+                rmpv::Value::Array(vec![]),
+            ],
+        )
+        .await;
+    assert!(
+        err.as_ref()
+            .is_err_and(|e| e.to_string().contains("can't hold")),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn guifont_defaults_empty() {
     // Unset, both the read-back and the redraw field are empty — the GUI then uses

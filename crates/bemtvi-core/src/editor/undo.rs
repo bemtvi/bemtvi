@@ -78,6 +78,7 @@ impl UndoTree {
                 marks: buffer.marks.clone(),
                 changelist: (buffer.changelist.clone(), buffer.changelistidx),
                 cursor_window: None,
+                selection: None,
             },
         };
         UndoTree {
@@ -86,6 +87,7 @@ impl UndoTree {
             next_seq: 1,
             dirty: false,
             dirty_since: 0,
+            dirty_tick: 0,
             save_last: 0,
         }
     }
@@ -93,11 +95,20 @@ impl UndoTree {
     /// Mark that a change group has begun (the live buffer will diverge from
     /// `cur`), remembering when, for the virtual-node timestamp. Idempotent within
     /// a group — a re-mark keeps the original start time.
-    fn mark_dirty(&mut self, now: i64) {
+    fn mark_dirty(&mut self, now: i64, tick: u64) {
         if !self.dirty {
             self.dirty = true;
             self.dirty_since = now;
+            self.dirty_tick = tick;
         }
+    }
+
+    /// Whether the live buffer holds a change not yet committed: a group is open
+    /// *and* the buffer's `changedtick` (`tick`) has moved since it began. An open
+    /// group that changed nothing is not a state, so it is neither committed nor
+    /// shown.
+    fn pending(&self, tick: u64) -> bool {
+        self.dirty && tick != self.dirty_tick
     }
 
     /// Re-sync the current node's snapshot with the live state we are about to edit
@@ -312,12 +323,13 @@ impl UndoTree {
     /// `cur`, which stops being a leaf when it had no children of its own.
     ///
     /// Ordered oldest-first by seq, matching vim's listing order.
-    fn leaves(&self) -> Vec<UndoLeaf> {
+    fn leaves(&self, tick: u64) -> Vec<UndoLeaf> {
+        let pending = self.pending(tick);
         let mut out: Vec<UndoLeaf> = self
             .nodes
             .iter()
             .enumerate()
-            .filter(|(i, n)| n.children.is_empty() && !(self.dirty && *i == self.cur))
+            .filter(|(i, n)| n.children.is_empty() && !(pending && *i == self.cur))
             .map(|(i, n)| UndoLeaf {
                 seq: n.seq,
                 changes: self.depth_of(i),
@@ -325,7 +337,7 @@ impl UndoTree {
                 save: n.save,
             })
             .collect();
-        if self.dirty {
+        if pending {
             out.push(UndoLeaf {
                 seq: self.next_seq,
                 changes: self.depth_of(self.cur) + 1,
@@ -468,10 +480,10 @@ impl UndoTree {
     /// recursive form neovim's `undotree()` emits, from which the visualizer's
     /// parser reconstructs parent links. Order-tolerant: the consumer re-sorts
     /// children by seq, so only the parent relationships must be faithful.
-    fn view(&self) -> UndoTreeView {
+    fn view(&self, tick: u64) -> UndoTreeView {
         // The pending edit forks off `cur` and will take `next_seq` on commit.
         let pending = self
-            .dirty
+            .pending(tick)
             .then_some((self.cur, self.next_seq, self.dirty_since));
         // `save_cur` is vim's `b_u_save_nr_cur` — "the file write we are now after",
         // the base `:earlier 1f` counts back from — so it is the *ancestor* walk, not
@@ -675,6 +687,9 @@ impl Editor {
             marks: ob.buffer.marks.clone(),
             changelist: (ob.buffer.changelist.clone(), ob.buffer.changelistidx),
             cursor_window,
+            selection: (id == self.cur_buffer())
+                .then(|| self.undo_selection())
+                .flatten(),
         }
     }
 
@@ -682,7 +697,13 @@ impl Editor {
     /// when nothing is pending. Called at every change-group boundary and before
     /// any navigation, so the tree node always exists before we leave a state.
     pub(crate) fn commit_undo(&mut self, id: BufferId) {
-        if !self.buffers.get(id).undo.dirty {
+        let ob = self.buffers.get_mut(id);
+        if !ob.undo.dirty {
+            return;
+        }
+        // A group that changed nothing closes without becoming a state.
+        if !ob.undo.pending(ob.buffer.changedtick) {
+            ob.undo.dirty = false;
             return;
         }
         let snap = self.snapshot_of(id);
@@ -714,7 +735,8 @@ impl Editor {
     /// rather than committed here, so it stays visible without freezing the
     /// snapshot before later same-state extmark/mark mutations.
     pub fn undotree_of(&self, id: BufferId) -> UndoTreeView {
-        self.buffers.get(id).undo.view()
+        let ob = self.buffers.get(id);
+        ob.undo.view(ob.buffer.changedtick)
     }
 
     /// `:undol[ist]` — list the **leafs** in the tree of changes into a read-only
@@ -728,14 +750,15 @@ impl Editor {
     /// listing never freezes a snapshot mid-change-group.
     pub(crate) fn ex_undolist(&mut self) {
         let id = self.cur_buffer();
+        let tick = self.buffers.get(id).buffer.changedtick;
         let tree = &self.buffers.get(id).undo;
-        if tree.seq_last() == 0 && !tree.dirty {
+        if tree.seq_last() == 0 && !tree.pending(tick) {
             self.echo("Nothing to undo");
             return;
         }
         let now = self.now_mono;
         let mut lines = vec!["number changes  when               saved".to_string()];
-        for leaf in tree.leaves() {
+        for leaf in tree.leaves(tick) {
             let mut row = format!(
                 "{:>6} {:>7}  {}",
                 leaf.seq,
@@ -761,8 +784,14 @@ impl Editor {
     /// edit-start (the pending node's timestamp is fixed once dirty, so it adds no
     /// drift).
     pub fn undo_version(&self, id: BufferId) -> (u64, usize, u64, bool) {
-        let t = &self.buffers.get(id).undo;
-        (t.next_seq, t.cur, t.save_last, t.dirty)
+        let ob = self.buffers.get(id);
+        let t = &ob.undo;
+        (
+            t.next_seq,
+            t.cur,
+            t.save_last,
+            t.pending(ob.buffer.changedtick),
+        )
     }
 
     /// Begin an independently-undoable change to buffer `id` (a workspace edit:
@@ -783,7 +812,8 @@ impl Editor {
             self.refresh_undo_cursor_marks(id);
         }
         let now = self.now_mono;
-        self.buffers.get_mut(id).undo.mark_dirty(now);
+        let ob = self.buffers.get_mut(id);
+        ob.undo.mark_dirty(now, ob.buffer.changedtick);
     }
 
     /// Begin a new change group on the current buffer: finalize the previous
@@ -792,6 +822,18 @@ impl Editor {
     /// single node — every edit between a set/clear of the flag shares one commit.
     pub(crate) fn push_undo(&mut self) {
         if self.snapshot_taken {
+            // The session's group is open, but in *this* buffer's tree? `snapshot_taken`
+            // is one editor-wide flag, and the tree's own group closes under it: a save
+            // commits it, a reload or a switch to another buffer brings a tree with
+            // none open. Edits made then would belong to no group at all, and the next
+            // undo would step back past them for good. Open this buffer's group now.
+            if !self.cur_mut().undo.dirty {
+                let id = self.cur_buffer();
+                self.refresh_undo_cursor_marks(id);
+                let now = self.now_mono;
+                let ob = self.cur_mut();
+                ob.undo.mark_dirty(now, ob.buffer.changedtick);
+            }
             return;
         }
         let id = self.cur_buffer();
@@ -805,7 +847,8 @@ impl Editor {
         // multi-cursor set baked in at a branch point.
         self.refresh_undo_cursor_marks(id);
         let now = self.now_mono;
-        self.cur_mut().undo.mark_dirty(now);
+        let ob = self.cur_mut();
+        ob.undo.mark_dirty(now, ob.buffer.changedtick);
     }
 
     /// Open a fresh typing state for the insert session that just began: no step
@@ -830,7 +873,7 @@ impl Editor {
 
     /// Whether typing rules stand down: a replay (see
     /// [`replaying_one_change`](Self::replaying_one_change)) or an atomic span.
-    fn typing_undo_suppressed(&self) -> bool {
+    pub(super) fn typing_undo_suppressed(&self) -> bool {
         self.replaying_one_change() || self.undo_atomic > 0
     }
 
@@ -855,6 +898,11 @@ impl Editor {
         if self.undo_atomic == 0 && self.buffer().changedtick != self.undo_atomic_tick {
             self.owe_typing_step();
         }
+        // The span's keys were free to leave Insert (a fed `<Esc>dd`); once it
+        // closes, a modeless session settles back where it rests.
+        if self.undo_atomic == 0 {
+            self.settle_modeless();
+        }
     }
 
     /// Called by the insert path just before a typed key edits the text: open a
@@ -865,6 +913,8 @@ impl Editor {
     /// has moved since the last typed edit. Runs once per key, before the
     /// multi-cursor sweep, so one step spans every cursor.
     pub(crate) fn before_typed_edit(&mut self, kind: EditKind, ch: Option<char>) {
+        // A typed edit always lands in an open group of this buffer (see `push_undo`).
+        self.push_undo();
         if self.undo_atomic > 0 {
             self.open_atomic_step();
             return;
@@ -911,6 +961,8 @@ impl Editor {
         if !self.mode.is_insert() || self.replaying_one_change() {
             return;
         }
+        // What follows must land in an open group of this buffer (see `push_undo`).
+        self.push_undo();
         if self.buffer().changedtick != self.typing_undo.tick {
             self.break_undo_step();
         }
@@ -960,8 +1012,41 @@ impl Editor {
         self.commit_undo(id);
         self.refresh_undo_cursor_marks(id);
         let now = self.now_mono;
-        self.cur_mut().undo.mark_dirty(now);
+        let ob = self.cur_mut();
+        ob.undo.mark_dirty(now, ob.buffer.changedtick);
         self.typing_undo.tick = self.buffer().changedtick;
+    }
+
+    /// Make the live caret and selection what undo returns to, before an edit that
+    /// is about to drop the selection: the typing step closes here when it changed
+    /// anything, so the state it leaves is a node of its own, and otherwise the
+    /// current node, whose text is still the live text, takes them. Inside a
+    /// mapping's span this counts as the span's first edit; once the span has
+    /// edited, its edits are one step and stay that way.
+    pub(crate) fn mark_undo_point(&mut self) {
+        if !self.snapshot_taken
+            || self.replaying_one_change()
+            || (self.undo_atomic > 0 && self.undo_atomic_opened)
+        {
+            return;
+        }
+        self.push_undo();
+        if self.undo_atomic > 0 {
+            self.undo_atomic_opened = true;
+        }
+        if self.buffer().changedtick != self.typing_undo.tick {
+            self.break_undo_step();
+        } else {
+            let id = self.cur_buffer();
+            self.refresh_undo_cursor_marks(id);
+        }
+    }
+
+    /// The selection the current undo state was left with — see
+    /// [`Snapshot::selection`].
+    pub(crate) fn undo_state_selection(&self) -> Option<(usize, usize)> {
+        let tree = &self.buffers.get(self.cur_buffer()).undo;
+        tree.nodes[tree.cur].snap.selection
     }
 
     /// Update the current undo node's snapshot so its cursor and multi-cursor marks
@@ -974,6 +1059,7 @@ impl Editor {
         let primary = self.cursor;
         let positions = self.secondary_cursor_bytes();
         let window = Some(self.windows.current);
+        let selection = self.undo_selection();
         let ob = self.buffers.get_mut(id);
         // The extmark store is re-cloned only when a mark has actually been set /
         // deleted / cleared since this node was last synced — the structural
@@ -993,6 +1079,8 @@ impl Editor {
             marks,
             live_extmark_gen,
         );
+        let cur = ob.undo.cur;
+        ob.undo.nodes[cur].snap.selection = selection;
     }
 
     pub(crate) fn undo(&mut self) {

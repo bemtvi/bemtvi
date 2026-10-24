@@ -158,7 +158,13 @@ impl Editor {
         // The `'modifiable'` option is the third gate: an *ordinary* buffer the user (or
         // a built-in read-only scratch listing — `:messages`, `:registers`, …) flipped
         // `nomodifiable`, vim's plain per-buffer edit lock.
-        !self.buffer().read_only() && !self.is_quickfix_buffer() && self.buffer().options.modifiable
+        self.buffer_modifiable(self.cur_buffer())
+    }
+
+    /// [`modifiable`](Self::modifiable) for buffer `id`, focused or not.
+    pub(crate) fn buffer_modifiable(&self, id: BufferId) -> bool {
+        let buf = &self.buffers.get(id).buffer;
+        !buf.read_only() && self.qf_context_of_buffer(id).is_none() && buf.options.modifiable
     }
 
     /// Echo vim's `E21` when an edit is refused on a read-only (live terminal) buffer.

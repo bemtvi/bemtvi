@@ -4,7 +4,8 @@
 //! the client-side mirror of the server's `resize_handle_at`/`dock_handle_at`.
 
 use bemtvi_view::{
-    resize_handle_at, Geometry, ResizeCursor, Separator, View, WinRect, WindowRegion, WindowView,
+    resize_handle_at, text_pointer_at, Geometry, ResizeCursor, Separator, View, WinRect,
+    WindowRegion, WindowView,
 };
 
 /// An 80×24 grid with no chrome: 80 columns, 23 windows-area rows (24 − cmdline).
@@ -188,4 +189,73 @@ fn closed_docks_have_no_edge() {
                                 // The columns/rows a width-20 / height-6 dock edge would occupy are plain now.
     assert_eq!(resize_handle_at(&view, geo(), 5, 20), None);
     assert_eq!(resize_handle_at(&view, geo(), 16, 40), None);
+}
+
+/// A window at `rect` in the main region, taking the I-beam when `text`.
+fn text_win(rect: WinRect, text: bool) -> WindowView {
+    WindowView {
+        rect: Some(rect),
+        region: WindowRegion::Main,
+        text_pointer: text,
+        status_visible: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_i_beam_is_over_the_text_only() {
+    // A full-area window with a 4-cell number gutter and a status row at the bottom.
+    let mut win = text_win(
+        WinRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 23,
+        },
+        true,
+    );
+    win.number = true;
+    win.number_width = 4;
+    let view = View {
+        windows: vec![win],
+        ..Default::default()
+    };
+    assert!(text_pointer_at(&view, geo(), 3, 10));
+    assert!(text_pointer_at(&view, geo(), 0, 4), "the first text column");
+    assert!(!text_pointer_at(&view, geo(), 3, 3), "the number gutter");
+    assert!(!text_pointer_at(&view, geo(), 22, 10), "the status row");
+}
+
+#[test]
+fn a_read_only_window_or_a_float_over_the_text_keeps_the_arrow() {
+    let rect = |x, width| WinRect {
+        x,
+        y: 0,
+        width,
+        height: 23,
+    };
+    let mut float = text_win(
+        WinRect {
+            x: 5,
+            y: 2,
+            width: 20,
+            height: 5,
+        },
+        false,
+    );
+    float.floating = true;
+    let view = View {
+        windows: vec![
+            text_win(rect(0, 40), true),
+            text_win(rect(41, 39), false),
+            float,
+        ],
+        ..Default::default()
+    };
+    assert!(text_pointer_at(&view, geo(), 10, 10));
+    assert!(
+        !text_pointer_at(&view, geo(), 10, 50),
+        "the read-only split"
+    );
+    assert!(!text_pointer_at(&view, geo(), 3, 10), "the float on top");
 }

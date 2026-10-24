@@ -55,6 +55,61 @@ pub fn resize_handle_at(view: &View, geo: Geometry, row: u16, col: u16) -> Optio
     dock_edge_at(view, geo, row, col).or_else(|| split_handle_at(view, geo, row, col))
 }
 
+/// Whether the screen cell `(row, col)` is over the text of a window that takes the
+/// text I-beam pointer ([`WindowView::text_pointer`]) — its text columns, past the
+/// fold, sign and number gutters and above its status row. A float over the cell
+/// decides it (topmost first), so a read-only float over editable text shows the
+/// arrow. Mirrors the renderer's window placement, padding and float border.
+pub fn text_pointer_at(view: &View, geo: Geometry, row: u16, col: u16) -> bool {
+    let floats = view.windows.iter().filter(|w| w.floating).rev();
+    let tiled = view.windows.iter().filter(|w| !w.floating);
+    for win in floats.chain(tiled) {
+        let Some(r) = win.rect else {
+            continue;
+        };
+        let (ox, oy) = region_origin(view, geo, win.region);
+        let (x, y) = (ox.saturating_add(r.x), oy.saturating_add(r.y));
+        let inside = |x: u16, y: u16, w: u16, h: u16| {
+            col >= x && col < x.saturating_add(w) && row >= y && row < y.saturating_add(h)
+        };
+        if !inside(x, y, r.width, r.height) {
+            continue;
+        }
+        if !win.text_pointer {
+            return false;
+        }
+        let inset = u16::from(win.floating && win.border.is_some());
+        let (x, y) = (x.saturating_add(inset), y.saturating_add(inset));
+        let (w, h) = (
+            r.width.saturating_sub(2 * inset),
+            r.height.saturating_sub(2 * inset),
+        );
+        let pad = win.padding;
+        let left = pad.left.min(w.saturating_sub(1));
+        let top = pad.top.min(h.saturating_sub(1));
+        let (x, y) = (x.saturating_add(left), y.saturating_add(top));
+        let w = w.saturating_sub(left.saturating_add(pad.right)).max(1);
+        let h = h.saturating_sub(top.saturating_add(pad.bottom)).max(1);
+        let number = if win.number || win.relativenumber {
+            win.number_width
+        } else {
+            0
+        };
+        let gutter = win
+            .foldcolumn_width
+            .saturating_add(win.sign_width)
+            .saturating_add(number);
+        let text_h = h.saturating_sub(u16::from(win.status_visible));
+        return inside(
+            x.saturating_add(gutter),
+            y,
+            w.saturating_sub(gutter),
+            text_h,
+        );
+    }
+    false
+}
+
 /// The middle band (left dock | main | right docks) vertical span `(top, height)`
 /// — the rows the left/right dock edges run down, mirroring `region_geoms`.
 fn middle_band(view: &View, geo: Geometry) -> (u16, u16) {

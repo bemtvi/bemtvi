@@ -1642,6 +1642,12 @@ impl Editor {
     /// no-op (the Lua side only forwards the canonical wired set). This is the same
     /// state the `:set` ex path writes — the two routes share one home.
     pub fn set_global_option_bool(&mut self, name: &str, value: bool) {
+        // `'modeless'` is gated (no terminal client, no Helix session) and moves the
+        // mode when it flips.
+        if name == "modeless" {
+            self.set_modeless(value);
+            return;
+        }
         // Write the *base* layer; the effective `options` is recomputed with the workspace
         // overlay on top, so a workspace override of this option keeps winning.
         self.global_base
@@ -1684,6 +1690,9 @@ impl Editor {
                 "E5xx: {canon} is a {}-local option; only global options take a workspace override",
                 scope.as_str()
             ));
+        }
+        if canon == "modeless" {
+            return Err("modeless: a session setting, it takes no workspace override".into());
         }
         if let Some(ref v) = value {
             let ok = matches!(
@@ -1825,6 +1834,15 @@ impl Editor {
     /// loud (E518) on an unhandled name instead of silently no-op'ing; the Lua bridge
     /// ignores the result (it forwards only the canonical wired set).
     pub fn set_global_option_str(&mut self, name: &str, value: &str) -> bool {
+        // `'guifont'` has a syntax the core owns (see `crate::guifont`), checked on
+        // every path in so a typo fails loud instead of reaching a client that would
+        // have to guess.
+        if name == "guifont" {
+            if let Err(why) = crate::guifont::parse(value) {
+                self.echo_err(format!("E474: Invalid argument: guifont: {why}"));
+                return true;
+            }
+        }
         // Write the *base* layer; recompute applies the workspace overlay on top. The
         // shared name→field map (`Options::set_scalar`) reports whether `name` is a wired
         // string global, so the `:set` path can still fail loud (E518) on an unknown name.
@@ -1848,6 +1866,13 @@ impl Editor {
         }
         self.background_applied = self.options.background.clone();
         true
+    }
+
+    /// `'guifont'`, parsed, for the server to relay to the clients that draw fonts.
+    /// A value that doesn't parse (it can only come from a workspace override, the
+    /// one path in that isn't checked) relays as the client's default font.
+    pub fn gui_font(&self) -> crate::guifont::GuiFont {
+        crate::guifont::parse(&self.options.guifont).unwrap_or_default()
     }
 
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).
@@ -2698,7 +2723,7 @@ impl Editor {
         self.ensure_visible();
     }
 
-    /// `<C-w>=` / `:wincmd =` — reset every split to even shares and re-lay.
+    /// `<C-w>=` — reset every split to even shares and re-lay.
     pub(crate) fn equalize_windows(&mut self) {
         equalize_node(&mut self.windows.root);
         self.relayout();
@@ -2977,7 +3002,13 @@ impl Editor {
         // any leftover live marks first — a window close or tab switch can enter
         // here without the previous focus having stashed its own set).
         self.restore_secondary_cursors(saved_cursors);
+        // The window lands in Normal, whose clamp would take a caret off a line's
+        // end; a modeless session goes straight back to typing there, so keep it.
+        let at_eol = self.rests_in_insert() && self.cursor.col >= self.line_len();
         self.clamp_cursor();
+        if at_eol {
+            self.cursor.col = self.line_len();
+        }
         self.ensure_visible();
         // This tree may have been parked across a screen-width change (a restored
         // session's inactive tab is laid out at the boot placeholder width): now that it

@@ -512,7 +512,8 @@ try {
     const grid = document.getElementById("grid");
     const ctx = document.createElement("canvas").getContext("2d");
     ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
-    ctx.font = `15px ${getComputedStyle(grid).fontFamily}`;
+    // At the size the page draws at, which the ink test depends on.
+    ctx.font = `${getComputedStyle(grid).fontSize} ${getComputedStyle(grid).fontFamily}`;
     const measure = (cp) => {
       const m = ctx.measureText(String.fromCodePoint(cp));
       const inkLeft = -m.actualBoundingBoxLeft, inkRight = m.actualBoundingBoxRight;

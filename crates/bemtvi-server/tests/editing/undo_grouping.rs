@@ -454,3 +454,22 @@ async fn a_mapping_that_changes_nothing_does_not_split_a_word() {
 
     assert_eq!(undo(&rpc).await, v(&[""]));
 }
+
+#[tokio::test]
+async fn an_insert_that_typed_nothing_leaves_no_undo_step() {
+    // `i<Esc>` changes nothing, so it must not record a state: the next `u` takes
+    // back the text typed before it, not an empty step.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>i<Esc>");
+    assert_eq!(undo(&rpc).await, v(&[""]));
+    let seq = exec_lua(&rpc, "return btv.undotree.get().seq_last").await;
+    assert_eq!(seq.as_u64(), Some(1));
+}
+
+#[tokio::test]
+async fn an_open_insert_that_typed_nothing_shows_no_pending_state() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>i");
+    let seq = exec_lua(&rpc, "return btv.undotree.get().seq_last").await;
+    assert_eq!(seq.as_u64(), Some(1));
+}

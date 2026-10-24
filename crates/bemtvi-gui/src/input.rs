@@ -10,17 +10,18 @@
 //! modifier, a dead key) yields `None` and is dropped — the same contract the TUI
 //! follows.
 
-use bemtvi_view::{encode_text, notation, Key as VimKey};
+use bemtvi_view::{encode_text, notation, notation_cmd, Key as VimKey};
 use mitsuami::prelude::{KeyCode, Modifiers, SurfaceInput};
 
 /// Encode a surface input as vim key-notation, or `None` for one with no editor
-/// meaning: a key release, a bare modifier, a dead key, a Command/Super chord.
+/// meaning: a key release, a bare modifier, a dead key.
 /// `option_chords` is macOS's policy (below).
 ///
 /// - **Named keys** (Escape, Enter, arrows, F-keys, …) come from where the key is,
 ///   with their modifiers notated (`<S-Tab>`, `<C-Left>`).
-/// - **A chord** (Control or Alt held) is the key's layout character with the
-///   modifiers: `<C-w>`, `<A-x>`. Control+I/M/[/H stay `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>`,
+/// - **A chord** (Control, Alt or Command held) is the key's layout character with
+///   the modifiers: `<C-w>`, `<A-x>`, `<D-z>` (Command is neovim's `D-`, Super off
+///   macOS). Command+V never gets here: the caller claims it as a paste. Control+I/M/[/H stay `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>`,
 ///   apart from Tab/Enter/Escape/Backspace, since those are named by their key.
 ///   On macOS Option composes a character (Option+C types `ç`); `option_chords`
 ///   makes it `<A-c>` instead, so `<A-…>` bindings work there too.
@@ -55,18 +56,25 @@ pub fn encode_input(input: &SurfaceInput, option_chords: bool) -> Option<String>
         _ => return None,
     };
     if let Some(key) = named(code) {
-        return Some(notation(mods.control, mods.alt, mods.shift, key));
-    }
-    let altgr = !option_chords && mods.control && mods.alt;
-    if let Some(text) = text.filter(|_| altgr || !(mods.control || mods.alt)) {
-        return typed(text);
-    }
-    if mods.control || mods.alt {
-        // The key's own character, Shift carried as `S-` (`<C-S-c>`).
-        let base = unmodified.or_else(|| code.us_char())?;
-        return Some(notation(
+        return Some(notation_cmd(
             mods.control,
             mods.alt,
+            mods.meta,
+            mods.shift,
+            key,
+        ));
+    }
+    let altgr = !option_chords && mods.control && mods.alt;
+    if let Some(text) = text.filter(|_| altgr || !(mods.control || mods.alt || mods.meta)) {
+        return typed(text);
+    }
+    if mods.control || mods.alt || mods.meta {
+        // The key's own character, Shift carried as `S-` (`<C-S-c>`, `<D-S-z>`).
+        let base = unmodified.or_else(|| code.us_char())?;
+        return Some(notation_cmd(
+            mods.control,
+            mods.alt,
+            mods.meta,
             mods.shift,
             VimKey::Char(base),
         ));

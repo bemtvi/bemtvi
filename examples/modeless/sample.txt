@@ -1,0 +1,6 @@
+The quick brown fox jumps over the lazy dog.
+fox is the word to find, and fox again here.
+    an indented line
+first
+second
+third

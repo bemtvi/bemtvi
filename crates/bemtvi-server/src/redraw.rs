@@ -164,9 +164,11 @@ impl EditHost {
         let global_opts = self.editor.global_options();
         let statusline_fmt = global_opts.statusline;
         let tabline_fmt = global_opts.tabline;
-        // The `'guifont'` value, relayed verbatim for a GUI client to parse and
-        // apply; empty (the default) leaves the client on its own font.
+        // The `'guifont'` value, relayed verbatim (a client compares it to see a
+        // change) and parsed (`guifont_spec`, what a client applies); empty (the
+        // default) leaves the client on its own font.
         let guifont = global_opts.guifont;
+        let guifont_spec = guifont_spec_value(&self.editor.gui_font());
         // The `'guiglyphoverflow'` mode, relayed the same way: the GUI and the web
         // client size their off-grid glyphs with it (the TUI has no say — the terminal
         // draws them). Empty (the default) leaves the client on its own setting.
@@ -430,6 +432,7 @@ impl EditHost {
                 Value::from("pending_replace"),
                 Value::from(view.pending_replace),
             ),
+            (Value::from("caret"), Value::from(view.caret)),
             // Every string payload is display-scrubbed (`unicode::display_line`)
             // before it reaches the wire: the client paints these verbatim into
             // the terminal, so an ESC / control byte smuggled in via a file name,
@@ -466,6 +469,7 @@ impl EditHost {
                 Value::from(unicode::display_line(showcmd.as_str()).as_ref()),
             ),
             (Value::from("guifont"), Value::from(guifont.as_str())),
+            (Value::from("guifont_spec"), guifont_spec),
             (
                 Value::from("guiglyphoverflow"),
                 Value::from(guiglyphoverflow.as_str()),
@@ -684,6 +688,8 @@ impl EditHost {
                 ),
             ),
             (Value::from("leftcol"), Value::from(win.leftcol as u64)),
+            (Value::from("text_pointer"), Value::from(win.text_pointer)),
+            (Value::from("cursor_hidden"), Value::from(win.cursor_hidden)),
             (
                 Value::from("file_name"),
                 // A hostile *name* is a first-class injection source (statusline,
@@ -3165,4 +3171,43 @@ pub(crate) fn style_value(style: &Style) -> Value {
         }
     }
     Value::Map(map)
+}
+
+/// `'guifont'`, parsed, as the redraw carries it: `{ size, fonts }`, where `size` is
+/// the `:h` points or nil and each font is `{ family, weight, scale, features }`
+/// (`weight`/`scale` nil when unset, `features` a list of `[tag, value]`).
+fn guifont_spec_value(spec: &bemtvi_core::guifont::GuiFont) -> Value {
+    let opt_f = |v: Option<f32>| v.map_or(Value::Nil, |v| Value::from(f64::from(v)));
+    let fonts = spec
+        .fonts
+        .iter()
+        .map(|f| {
+            let features = f
+                .features
+                .iter()
+                .map(|(tag, val)| {
+                    Value::Array(vec![
+                        Value::from(String::from_utf8_lossy(tag).as_ref()),
+                        Value::from(u64::from(*val)),
+                    ])
+                })
+                .collect();
+            Value::Map(vec![
+                (
+                    Value::from("family"),
+                    Value::from(unicode::display_line(&f.family).as_ref()),
+                ),
+                (
+                    Value::from("weight"),
+                    f.weight.map_or(Value::Nil, |w| Value::from(u64::from(w))),
+                ),
+                (Value::from("scale"), opt_f(f.scale)),
+                (Value::from("features"), Value::Array(features)),
+            ])
+        })
+        .collect();
+    Value::Map(vec![
+        (Value::from("size"), opt_f(spec.size)),
+        (Value::from("fonts"), Value::Array(fonts)),
+    ])
 }

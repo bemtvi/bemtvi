@@ -26,6 +26,8 @@
   - [Helix mode (selection-first)](features/helix-mode.md)
   - [Multi-cursor mode](features/multicursor.md)
   - [Keyboard macros](features/macros.md)
+  - [Fonts](features/fonts.md)
+  - [Modeless editing](features/modeless.md)
   - [Undo steps](features/undo.md)
   - [Expressions](features/expressions.md)
   - [Smooth scrolling](features/smooth-scrolling.md)

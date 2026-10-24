@@ -681,6 +681,20 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
+        // Command lines Lua asked to open (`btv.cmdline.open`).
+        for (kind, text) in self.lua.take_cmdline_opens() {
+            let kind = kind.chars().next().unwrap_or(':');
+            if let Err(e) = self.editor.open_cmdline(kind, &text) {
+                self.editor.echo_err(format!("E5108: {e}"));
+            }
+        }
+        // Modeless verbs a key fired (`btv._modeless_action`). Unknown names, or a
+        // verb while `'modeless'` is off, fail loud.
+        for action in self.lua.take_modeless_actions() {
+            if let Err(e) = self.editor.apply_modeless_action(&action) {
+                self.editor.echo_err(format!("E5108: {e}"));
+            }
+        }
         // Dock requests from `btv.dock.*` drive the core's dock (edge-panel) state.
         for op in self.lua.take_dock_ops() {
             match op {
@@ -2729,6 +2743,7 @@ impl EditHost {
             autoread: go.autoread,
             indentdetect: go.indentdetect,
             imagepreview: go.imagepreview,
+            modeless: go.modeless,
             httphost: go.httphost.clone(),
             httpport: go.httpport,
             scrollanim: go.scrollanim,
@@ -3917,7 +3932,7 @@ impl EditHost {
         // keys (source C), mirroring how `feed_matcher` picks the match scope.
         let scope = match crate::keymap::widget_bucket(self.editor.key_context()) {
             Some(bucket) => crate::keymap::MatchScope::Widget(bucket),
-            None => crate::keymap::MatchScope::Editing(self.editor.mode),
+            None => self.editing_scope(),
         };
         // Source A/C: the matcher's withheld mapped prefix. Then **source B** — the
         // built-in command grammar — joins it (editing scopes only; a widget has no

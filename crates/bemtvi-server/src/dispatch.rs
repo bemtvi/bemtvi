@@ -176,9 +176,43 @@ impl EditHost {
                 // client attached — so a keymap that needs `keyboard_protocol` (a
                 // `<C-h>` / `<C-i>` / `<C-m>` / `<C-[>` chord, which a legacy terminal
                 // folds onto `<BS>` / `<Tab>` / `<CR>` / `<Esc>`) installs itself here.
-                let _ = self
-                    .lua
-                    .set_ui_caps(kbd, cap("truecolor"), cap("osc52"), &key_labels);
+                // `client` names the kind of client (`"tui"`, `"gui"`; absent for the
+                // harness and third-party clients). `'modeless'` is gated on it: a
+                // terminal attaching to a session that has it on turns it off.
+                let client = params
+                    .get(2)
+                    .and_then(|v| match v {
+                        Value::Map(m) => m
+                            .iter()
+                            .find(|(k, _)| k.as_str() == Some("client"))
+                            .and_then(|(_, val)| val.as_str()),
+                        _ => None,
+                    })
+                    .map(bemtvi_core::UiClient::from_name)
+                    .unwrap_or_default();
+                self.editor.set_ui_client(client);
+                // `platform` is the client's OS (`"macos"`, `"linux"`, `"windows"`, as
+                // Rust's `std::env::consts::OS` spells it), for a key layout that
+                // follows the platform's conventions. Absent ⇒ `""`.
+                let platform = params
+                    .get(2)
+                    .and_then(|v| match v {
+                        Value::Map(m) => m
+                            .iter()
+                            .find(|(k, _)| k.as_str() == Some("platform"))
+                            .and_then(|(_, val)| val.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+                    .to_string();
+                let _ = self.lua.set_ui_caps(
+                    client.name(),
+                    &platform,
+                    kbd,
+                    cap("truecolor"),
+                    cap("osc52"),
+                    &key_labels,
+                );
                 self.fire_ui_enter();
                 // The resize assigns the window its first rect, so a `btv.decor`
                 // provider's viewport is only now known. Drive `run_pending` to

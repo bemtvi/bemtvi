@@ -270,6 +270,38 @@ local function append_user_commands(out, seen)
   add(btv.user_command.get())
 end
 
+-- `btv.cmdline_complete.catalog()` -> every command the `:` line knows, as a list of
+-- `{ name, synopsis, description, user }`: the curated built-in commands first, then
+-- the registered user commands (`user = true`, with their `usage` as the synopsis and
+-- their `desc` as the description). A required argument is spelled `{arg}` in the
+-- synopsis, an optional one `[arg]`. The `commands` picker lists this.
+function btv.cmdline_complete.catalog()
+  local out = {}
+  local seen = {}
+  for _, cmd in ipairs(BUILTIN) do
+    seen[cmd[1]] = true
+    out[#out + 1] = { name = cmd[1], synopsis = cmd[2], description = cmd[3], user = false }
+  end
+  local users = {}
+  for name, rec in pairs(btv.user_command.get()) do
+    if not seen[name] then
+      users[#users + 1] = {
+        name = name,
+        synopsis = ":" .. name .. (rec.usage ~= "" and (" " .. rec.usage) or ""),
+        description = rec.desc,
+        user = true,
+      }
+    end
+  end
+  table.sort(users, function(a, b)
+    return a.name < b.name
+  end)
+  for _, u in ipairs(users) do
+    out[#out + 1] = u
+  end
+  return out
+end
+
 -- The candidate set for the **command name** itself: the curated built-in catalog
 -- plus the registered user commands.
 local function command_candidates()
@@ -549,6 +581,7 @@ local AUTOCMD_EVENTS = {
   "BufDelete",
   "BufEnter",
   "BufLeave",
+  "BufModifiedSet",
   "BufNewFile",
   "BufReadCmd",
   "BufReadPost",

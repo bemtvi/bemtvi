@@ -9,7 +9,10 @@
 //! web client, does the opposite: an opaque block with the glyph re-drawn inverted
 //! on top. That is what these tests pin.
 
-use bemtvi_gui::{apply_cursor_fg, block_cursor_colors, Seg};
+use bemtvi_gui::{
+    apply_cursor_fg, block_cursor_colors, caret_blink, popup_covers, Seg, CARET_BLINK,
+};
+use std::time::Duration;
 
 const NORMAL_FG: u32 = 0xab_b2_bf; // One Dark text
 const NORMAL_BG: u32 = 0x28_2c_34; // One Dark background
@@ -131,4 +134,33 @@ fn a_cursor_past_the_end_of_the_line_recolors_nothing() {
 #[test]
 fn an_empty_row_is_returned_as_is() {
     assert!(apply_cursor_fg(Vec::new(), 0, 0, 1, CUR).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `caret_blink(elapsed)` -> (hidden, until the next flip)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_caret_starts_shown_and_flips_each_half() {
+    let ms = Duration::from_millis;
+    assert_eq!(caret_blink(ms(0)), (false, CARET_BLINK));
+    assert_eq!(caret_blink(ms(100)), (false, CARET_BLINK - ms(100)));
+    assert_eq!(caret_blink(CARET_BLINK), (true, CARET_BLINK));
+    assert!(caret_blink(CARET_BLINK + ms(30)).0);
+    assert_eq!(caret_blink(CARET_BLINK * 2), (false, CARET_BLINK));
+    assert!(caret_blink(CARET_BLINK * 7 + ms(1)).0);
+}
+
+#[test]
+fn a_popup_background_keeps_the_arrow_over_it() {
+    // A completion box and its doc preview beside it, a gap between them.
+    let popups = [(100.0, 40.0, 80.0, 60.0), (190.0, 40.0, 50.0, 20.0)];
+    assert!(popup_covers(&popups, 120.0, 50.0));
+    assert!(popup_covers(&popups, 200.0, 45.0));
+    assert!(!popup_covers(&popups, 185.0, 50.0), "the gap between them");
+    assert!(
+        !popup_covers(&popups, 180.0, 50.0),
+        "the right edge is outside"
+    );
+    assert!(!popup_covers(&[], 120.0, 50.0));
 }

@@ -1480,6 +1480,52 @@ async fn insert_ctrl_o_open_line_stays_in_insert_without_a_second_shot() {
 }
 
 #[tokio::test]
+async fn insert_ctrl_o_ex_command_resumes_insert_and_keeps_the_next_space() {
+    // `<C-o>:{cmd}<CR>` is one command too: Insert resumes, and the very next key
+    // types — including a space, which used to vanish.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<C-o>:nohlsearch<CR>");
+    assert_eq!(mode(&rpc).await, "i", "back in Insert after the ex command");
+    feed(&rpc, " bar");
+    assert_eq!(lines(&rpc).await, vec!["foo bar"]);
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_cancelled_command_line_resumes_insert() {
+    // Abandoning the line with `<Esc>` is the end of the one command as well.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<C-o>:abc<Esc>");
+    assert_eq!(mode(&rpc).await, "i", "back in Insert after <Esc>");
+    feed(&rpc, " bar");
+    assert_eq!(lines(&rpc).await, vec!["foo bar"]);
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_normal_runs_all_its_keys_before_insert_resumes() {
+    // `:normal` keys are Normal commands to the last one: Insert resumes after
+    // the ex command, not after its first key.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>0i");
+    feed(&rpc, "<C-o>:normal! xx<CR>");
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "Z");
+    assert_eq!(lines(&rpc).await, vec!["Zllo"]);
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_write_resumes_insert() {
+    // `<C-o>:w` saves and goes back to Insert, as vim does.
+    let path = temp_path("ctrl-o-write").to_string_lossy().into_owned();
+    std::fs::write(&path, "").expect("write temp file");
+    let (rpc, _incoming) = start(Some(path.clone())).await;
+    feed(&rpc, "ifoo<C-o>:w<CR>");
+    assert_eq!(mode(&rpc).await, "i", "back in Insert after :w");
+    feed(&rpc, " bar");
+    assert_eq!(lines(&rpc).await, vec!["foo bar"]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn replace_ctrl_o_resumes_replace_not_insert() {
     // From Replace mode, `<C-o>` returns to Replace (reported `niR`), not Insert.
     let (rpc, _incoming) = start(None).await;

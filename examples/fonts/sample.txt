@@ -1,0 +1,5 @@
+The quick brown fox: != -> <= 0O0 il1
+icons:     
+中文 日本語 한국어
+emoji: 😀 🚀 ✅
+zero: 0 10 100

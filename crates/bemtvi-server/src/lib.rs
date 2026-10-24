@@ -1355,6 +1355,10 @@ pub struct EditHost {
     /// advance *within the same buffer* fires `TextChanged` (Normal) or `TextChangedI`
     /// (Insert). `None` until the seed. Gated like [`last_cursor`](Self::last_cursor).
     last_text: Option<(BufferId, u64)>,
+    /// Each buffer's `'modified'` flag at the last lifecycle diff; a flip fires
+    /// `BufModifiedSet` for that buffer. Refreshed every diff (a handful of buffers),
+    /// so a handler registered later never fires once off a stale flag.
+    last_modified: HashMap<BufferId, bool>,
     /// The `btv._au_version` the cached [`au_active_events`](Self::au_active_events) was
     /// last refreshed against. Read once per input batch; the set is only re-pulled
     /// across the bridge when this advanced (mirrors the keymap-version gate).
@@ -1866,6 +1870,11 @@ pub struct EditHost {
     /// same pairs ride the `btv_ui_attach` capabilities map instead. Wasm only.
     #[cfg(not(feature = "native"))]
     key_labels: Vec<(String, String)>,
+    /// The browser's platform (`"macos"`, `"linux"`, `"windows"`), as the page
+    /// reported it through [`set_platform`](EditHost::set_platform), mirrored into
+    /// `btv.ui.caps().platform`. Natively it rides the attach capabilities. Wasm only.
+    #[cfg(not(feature = "native"))]
+    platform: String,
     /// Whether [`boot_finish`](EditHost::boot_finish) has run: from then on a re-attach
     /// (the page's resize) runs the pending work a native resize does (`WinResized`,
     /// the Lua mirrors). The first attach, in `eh_new`, comes before the config and the
@@ -2060,6 +2069,7 @@ impl EditHost {
             known_tabs: Vec::new(),
             last_cursor: None,
             last_text: None,
+            last_modified: HashMap::new(),
             au_event_version: 0,
             au_active_events: HashSet::new(),
             keymaps: Keymaps::default(),
@@ -2154,6 +2164,8 @@ impl EditHost {
             #[cfg(not(feature = "native"))]
             key_labels: Vec::new(),
             #[cfg(not(feature = "native"))]
+            platform: String::new(),
+            #[cfg(not(feature = "native"))]
             booted: false,
         }
     }
@@ -2190,7 +2202,11 @@ impl EditHost {
         // attach runs at `eh_new`, before the Worker sources `init.lua`, so a config
         // subscribing to it wouldn't exist yet; `boot_finish` fires it once startup is
         // done, which is the native order (config, `VimEnter`, then the UI is known).
-        let _ = self.lua.set_ui_caps(true, true, false, &self.key_labels);
+        // The serverless edit host is always the web client.
+        self.editor.set_ui_client(bemtvi_core::UiClient::Web);
+        let _ = self
+            .lua
+            .set_ui_caps("web", &self.platform, true, true, false, &self.key_labels);
         // After boot, run what a native resize runs before its repaint: `WinResized`, the
         // mirror push, the decor providers' redispatch. Before boot (the first attach, in
         // `eh_new`) there is no config yet and the startup events have not fired.
@@ -2208,9 +2224,23 @@ impl EditHost {
     /// this — the platform and the browser's own reserved list are its to know — so it
     /// is pushed in rather than inferred. Call after [`attach_ui`](Self::attach_ui) and
     /// before [`boot_finish`](Self::boot_finish), so `UIEnter` handlers see them.
+    /// Declare the browser's platform (`"macos"`, `"linux"`, `"windows"`), which only
+    /// the page can read, mirrored into `btv.ui.caps().platform` so a key layout can
+    /// follow its conventions (Command on macOS). Call it where
+    /// [`set_key_labels`](Self::set_key_labels) is called, before
+    /// [`boot_finish`](Self::boot_finish).
+    pub fn set_platform(&mut self, platform: String) {
+        self.platform = platform;
+        let _ = self
+            .lua
+            .set_ui_caps("web", &self.platform, true, true, false, &self.key_labels);
+    }
+
     pub fn set_key_labels(&mut self, labels: Vec<(String, String)>) {
         self.key_labels = labels;
-        let _ = self.lua.set_ui_caps(true, true, false, &self.key_labels);
+        let _ = self
+            .lua
+            .set_ui_caps("web", &self.platform, true, true, false, &self.key_labels);
     }
 
     /// Run the serverless startup seed: snapshot the initial buffer for Lua, seed the
@@ -4136,6 +4166,31 @@ where
     run_io(reader, writer, init).await
 }
 
+/// Give the thread the server runs on, and its Lua VMs run on, the C locale, whatever
+/// the process's is. PUC Lua formats and reads numbers through the C library, so under
+/// a decimal-comma locale `tostring(0.9)` is `"0,9"` and `tonumber("0.9")` is wrong
+/// too: a plugin's JSON breaks, and `btv.ui.font` wrote `scale=0,9`. A bemtvi process
+/// never sets a locale itself, so it runs in C, which is what everything is written
+/// and tested against; but GTK sets the whole process to the user's when the GUI
+/// starts on Linux, on its own thread. `uselocale` sets this thread's apart from the
+/// process's, so GTK keeps its locale and the editor keeps C. The other platforms'
+/// toolkits leave the locale alone.
+#[cfg(feature = "native")]
+fn pin_c_locale() {
+    #[cfg(unix)]
+    {
+        // SAFETY: `newlocale` builds a fresh locale object from the always-present "C"
+        // locale; it is never freed, as this thread uses it for as long as it runs.
+        let c = unsafe { libc::newlocale(libc::LC_ALL_MASK, c"C".as_ptr(), std::ptr::null_mut()) };
+        if c.is_null() {
+            eprintln!("bemtvi: newlocale(C) failed; Lua numbers follow the process locale");
+            return;
+        }
+        // SAFETY: `c` is a valid locale object from `newlocale`.
+        unsafe { libc::uselocale(c) };
+    }
+}
+
 /// Run the server over **separate** read/write halves. [`run`] (the public,
 /// single-stream entry every front end uses) splits its stream and delegates here;
 /// the two-half shape is kept so a transport whose directions are distinct objects
@@ -4283,6 +4338,7 @@ where
             }
         }
     }
+    pin_c_locale();
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
     // The option / colorscheme / filetype catalogs core owns are installed by

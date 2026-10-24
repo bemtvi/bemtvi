@@ -47,6 +47,7 @@ mod jumps;
 mod macros;
 mod marks;
 mod menu;
+mod modeless;
 mod motions;
 mod mouse;
 mod multicursor;
@@ -92,6 +93,7 @@ pub use self::menu::{
     CmdlineCandidate, Extent, FilterSeed, MenuGeom, MenuItem, MenuMetrics, MenuPlacement,
     PickerRun, PreviewScroll, PreviewTarget, PromptField, PromptPos, RowLayout,
 };
+pub use self::modeless::UiClient;
 pub use self::mouse::{ClickSurface, MouseClick, MousePos, StatuslineClick, WheelGesture};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The shared selection vocabulary both grammars read (see `editor::selection`).
@@ -412,6 +414,10 @@ struct Snapshot {
     /// editing window's cursors would leak into another window. `None` for a state
     /// with no owning window (the root, a snapshot of a non-current buffer).
     cursor_window: Option<WindowId>,
+    /// The modeless selection at this history point, as `(anchor, head)` byte
+    /// offsets into `text`; `None` when nothing was selected. A modeless undo or
+    /// redo selects it again.
+    selection: Option<(usize, usize)>,
 }
 
 /// Index of a node within [`UndoTree::nodes`]. Stable for a node's lifetime —
@@ -476,6 +482,10 @@ struct UndoTree {
     /// `vim.fn.undotree()` shows for an uncommitted edit, so the projection is
     /// stable (doesn't drift with the clock) until the edit commits.
     dirty_since: i64,
+    /// The buffer's `changedtick` when the pending group began. A group whose
+    /// buffer never moved past it changed nothing (`i<Esc>`, a modeless session
+    /// resting in Insert), so it records no state: see [`UndoTree::pending`].
+    dirty_tick: u64,
     /// Number of writes (`:w`) of this buffer so far — the source of each saved
     /// node's `save` number. `vim.fn.undotree()` reports it as `save_last`.
     /// (Neovim's `b_u_save_nr_last`.)
@@ -1464,6 +1474,19 @@ pub struct Editor {
     /// (`c`), so leaving Insert returns to [`Mode::HelixNormal`] rather than vim's
     /// Normal (see [`Editor::base_normal_mode`]). `false` in the default vim model.
     helix: bool,
+    /// The client that attached (`btv_ui_attach`'s `client` capability), which
+    /// `'modeless'` is gated on. See [`modeless::UiClient`].
+    ui_client: modeless::UiClient,
+    /// The modeless selection in caret terms while Select mode shows it (see
+    /// [`modeless::CaretSel`]). `None` outside Select, and for a Select a plugin
+    /// entered over a range.
+    nm_sel: Option<modeless::CaretSel>,
+    /// Each modeless window the wheel scrolled away from its caret, and the state
+    /// it left the caret in (see [`modeless::ViewDetached`]). While that state holds,
+    /// [`ensure_visible`](Self::ensure_visible) leaves the window's view where the
+    /// wheel put it; the first change to it brings the view back to the caret. Kept
+    /// per window, so a window keeps its scroll while focus is elsewhere.
+    view_detached: HashMap<WindowId, modeless::ViewDetached>,
     /// Whether Helix-session search defaults to **smart-case** (case-insensitive
     /// unless the pattern carries an uppercase char) — Helix's own default, kept
     /// self-contained from the global `'ignorecase'`/`'smartcase'` that vim-mode
@@ -2319,6 +2342,9 @@ impl Editor {
             select_escape_insert: false,
             select_linewise: false,
             helix: false,
+            ui_client: modeless::UiClient::Unknown,
+            nm_sel: None,
+            view_detached: HashMap::new(),
             helix_smart_case: true,
             helix_count: None,
             helix_find: None,
@@ -2523,6 +2549,12 @@ impl Editor {
             self.set_paste_active(key.code == KeyCode::PasteStart);
             return;
         }
+        // A Command chord no mapping claimed. The core has no Command grammar, so it
+        // is dropped rather than typed as its letter, except for the arrows a
+        // modeless session navigates with (`<D-Left>` to the line's start, …).
+        if key.cmd && !(self.modeless_keys_active() && modeless::is_nav_key(key.code)) {
+            return;
+        }
         // The keyboard takes the viewport back from the mouse: any `'scrolloff'`
         // suspended for a click / drag is restored for this key, so the margin the
         // user configured is in force again from the next motion on (the cursor a
@@ -2637,9 +2669,11 @@ impl Editor {
         // `changedtick` check below) keeps typing/deleting crisp, and a
         // buffer/tab/window switch (which clears `scroll_from` itself) has no slide
         // to play. Skipped in insert/command mode, where the viewport tracks typing
-        // or the incsearch preview and should stay crisp, not animate per keystroke.
+        // or the incsearch preview and should stay crisp, not animate per keystroke —
+        // except a modeless session's Insert, where every navigation key lives: its
+        // typing is an edit, which unsets the snapshot like any other.
         let pre_tick = self.buffer().changedtick;
-        if !self.mode.is_insert() && self.mode != Mode::Command {
+        if self.scroll_gesture_mode() {
             self.scroll_from = Some((self.top, self.cursor.line));
         }
 
@@ -2691,21 +2725,14 @@ impl Editor {
         // enters Insert on its own (`o`/`a`/`cc`/…), which simply consumes the flag.
         // Runs before the dot-repeat `done` check below so the completing keystroke
         // isn't mistaken for the end of the change: the insert session continues.
-        if self.insert_normal.is_some() && !was_insert {
-            if self.mode.is_insert() {
-                self.insert_normal = None;
-            } else if self.mode == Mode::Normal && self.pending.is_clean() {
-                self.mode = self.insert_normal.take().expect("armed above");
-                // `<C-o>$` resumes Insert *after* the last char, ready to append: the
-                // `$` motion itself lands *on* the last char (Normal's EOL), but the
-                // pending eol-request means the user asked for the line end, so honour
-                // it in Insert terms (one past). Now that `mode` is Insert again,
-                // `clamp_cursor` permits the append column.
-                if self.eol_request {
-                    self.cursor.col = self.line_len();
-                }
-                self.clamp_cursor();
-            }
+        if !was_insert && self.resume_insert_normal() && self.eol_request {
+            // `<C-o>$` resumes Insert *after* the last char, ready to append: the
+            // `$` motion itself lands *on* the last char (Normal's EOL), but the
+            // pending eol-request means the user asked for the line end, so honour
+            // it in Insert terms (one past). Now that `mode` is Insert again,
+            // `clamp_cursor` permits the append column.
+            self.cursor.col = self.line_len();
+            self.clamp_cursor();
         }
 
         if recording {
@@ -2751,6 +2778,27 @@ impl Editor {
         if in_signature_session && !self.mode.is_insert() {
             self.end_signature_session();
         }
+    }
+
+    /// End an `i_CTRL-O` one-shot whose command has settled: a clean Normal resumes
+    /// the stored Insert/Replace, and a command that entered Insert on its own just
+    /// consumes the flag. Returns whether it resumed. A no-op while the command is
+    /// still unfolding (operator-pending, visual, cmdline) or when nothing is armed.
+    /// Called after each key and when a command line resolves, whose `<CR>`/`<Esc>`
+    /// are keymap actions rather than keys through [`Editor::input`].
+    pub(crate) fn resume_insert_normal(&mut self) -> bool {
+        let Some(resume) = self.insert_normal else {
+            return false;
+        };
+        if self.mode.is_insert() {
+            self.insert_normal = None;
+        } else if self.mode == Mode::Normal && self.pending.is_clean() {
+            self.insert_normal = None;
+            self.mode = resume;
+            self.clamp_cursor();
+            return true;
+        }
+        false
     }
 
     /// Settle the editor after an input has mutated it: refresh `curswant`,
@@ -2808,10 +2856,17 @@ impl Editor {
     /// while a snapshot is already open, so a nested convergence rides the outer
     /// gesture rather than replacing it.
     pub fn begin_scroll_gesture(&mut self) {
-        if self.scroll_from.is_some() || self.mode.is_insert() || self.mode == Mode::Command {
+        if self.scroll_from.is_some() || !self.scroll_gesture_mode() {
             return;
         }
         self.scroll_from = Some((self.top, self.cursor.line));
+    }
+
+    /// Whether a viewport move in the current mode slides: not in insert or command
+    /// mode (see [`input`](Self::input)), but in the Insert a modeless session
+    /// rests in, where the navigation keys are.
+    fn scroll_gesture_mode(&self) -> bool {
+        self.mode != Mode::Command && (!self.mode.is_insert() || self.rests_in_insert())
     }
 
     /// Close the gesture [`begin_scroll_gesture`](Self::begin_scroll_gesture)

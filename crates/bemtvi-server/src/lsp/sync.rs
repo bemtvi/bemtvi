@@ -129,7 +129,8 @@ impl EditHost {
                 // this moment, and "hold to `InsertLeave`" simply stops the timer.
                 if !self.diagnostics_paused() {
                     self.commit_pending_diagnostics();
-                } else if update_in_insert {
+                } else {
+                    // A no-op unless the timing in force has a debounce.
                     self.arm_diag_debounce();
                 }
                 self.lsp_dirty = true;

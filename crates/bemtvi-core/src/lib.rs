@@ -17,6 +17,7 @@ pub mod encoding;
 pub mod extmark;
 pub mod fuzzy;
 pub mod glob;
+pub mod guifont;
 pub mod highlight;
 pub mod host;
 pub mod indent;
@@ -48,9 +49,9 @@ pub use editor::{
     PendingSave, PendingSnapshot, PersistState, PickerRun, PluginEntry, PluginNamespace, PreWrite,
     PreviewScroll, PreviewTarget, PromptField, PromptPos, QfAction, QfEntry, QfList, QfStack,
     QfWhich, RegisterEntry, RowLayout, SessionDock, SessionState, SessionTab, SessionWindow,
-    ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture,
-    WindowConfigSpec, WindowId, WriteEvent, WriteScope, SIGNATURE_MARKER, SIGNATURE_MARKER_COL,
-    SIGNATURE_PARAM_INDENT,
+    ShadaRequest, StatuslineClick, TabId, TerminalOp, UiClient, UndoEntry, UndoTreeView,
+    WheelGesture, WindowConfigSpec, WindowId, WriteEvent, WriteScope, SIGNATURE_MARKER,
+    SIGNATURE_MARKER_COL, SIGNATURE_PARAM_INDENT,
 };
 pub use encoding::Encoding;
 pub use extmark::{

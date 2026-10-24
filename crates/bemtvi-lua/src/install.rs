@@ -4059,6 +4059,30 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `btv._cmdline_open(kind, text)`: open the `:` / `/` / `?` line prefilled with
+    // `text` from any mode (`btv.cmdline.open`); the server applies it via
+    // `Editor::open_cmdline`.
+    let sh = shared.clone();
+    btv.set(
+        "_cmdline_open",
+        lua.create_function(move |_, (kind, text): (String, String)| {
+            sh.borrow_mut().cmdline_opens.push((kind, text));
+            Ok(())
+        })?,
+    )?;
+
+    // `btv._modeless_action(name)`: a modeless key fired a named verb (copy, cut,
+    // paste, undo, select_all, …); the server applies it via
+    // `Editor::apply_modeless_action`. The modeless sibling of `btv._helix_action`.
+    let sh = shared.clone();
+    btv.set(
+        "_modeless_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().modeless_actions.push(name);
+            Ok(())
+        })?,
+    )?;
+
     // `btv._decor_register()`: a `btv.decor.provider` was registered — flip the live
     // gate so the server starts dispatching viewport-change signals to providers.
     // While it stays unset the server skips the whole off-tick decor path (never even

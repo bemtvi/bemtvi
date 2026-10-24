@@ -139,6 +139,7 @@ impl Editor {
             }
             "cancel" => {
                 self.cancel_cmdline();
+                self.resume_insert_normal();
                 return Ok(());
             }
             "submit" => {
@@ -152,6 +153,7 @@ impl Editor {
             "backspace" if self.cmdline.is_empty() => {
                 if !matches!(self.cmdline_kind, CmdlineKind::Prompt) {
                     self.cancel_cmdline();
+                    self.resume_insert_normal();
                 }
                 return Ok(());
             }
@@ -201,6 +203,10 @@ impl Editor {
         self.cmdline_col = 0;
         let kind = self.cmdline_kind;
         self.mode = self.cmdline_return_mode;
+        // An `i_CTRL-O` line is the one command: disarm it while the line runs, so
+        // a `:normal` it runs doesn't resume Insert after its first key, and resume
+        // once the line has run (`<C-o>:w` goes back to Insert, as in vim).
+        let insert_normal = self.insert_normal.take();
         // Drop the live `:s///` diff overlay now the line is taken — before any
         // `execute_ex` below pushes the real substitute's undo snapshot, so the
         // ephemeral preview marks are never captured in it.
@@ -237,6 +243,10 @@ impl Editor {
                 self.submit_expr_register(target, &text);
             }
             CmdlineKind::Confirm => {}
+        }
+        if insert_normal.is_some() {
+            self.insert_normal = insert_normal;
+            self.resume_insert_normal();
         }
     }
 
@@ -355,6 +365,11 @@ impl Editor {
     /// from Visual, which vim leaves on `:` (the `'<,'>` range carries the
     /// selection into the command).
     fn command_return_mode(&self) -> Mode {
+        // Opened from Insert (only a plugin or the modeless layout can, through
+        // `btv.cmdline.open`), the line goes back to the insert session.
+        if self.mode.is_insert() {
+            return self.mode;
+        }
         if self.mode == Mode::MultiCursor || self.mode.is_helix() {
             // Keep placement / Helix mode across a `:`-command so it resumes on
             // close (a `:helix`-toggle running last then swaps it deliberately).
@@ -373,12 +388,36 @@ impl Editor {
     /// returns to [`Mode::Normal`].
     fn search_return_mode(&self) -> Mode {
         match self.mode {
+            Mode::Insert | Mode::Replace => self.mode,
             Mode::Visual | Mode::VisualLine | Mode::MultiCursor => self.mode,
             // A Helix-mode search resumes Helix, where `run_search` re-selects the
             // whole match (anchor at its start, head on its last char).
             m if m.is_helix() => m,
             _ => Mode::Normal,
         }
+    }
+
+    /// Open the command line from any mode, prefilled with `text` — the core of
+    /// `btv.cmdline.open`. `kind` is `':'` for an ex command, `'/'` or `'?'` for a
+    /// search. A modeless selection collapses to its head first, so the line
+    /// returns to the caret in Insert.
+    pub fn open_cmdline(&mut self, kind: char, text: &str) -> Result<(), String> {
+        if self.mode == Mode::Command {
+            return Err("btv.cmdline.open: the command line is already open".into());
+        }
+        if self.mode == Mode::Select && self.nm_sel.is_some() {
+            let head = self.caret_selection().head;
+            self.collapse_selection_to(head);
+        }
+        match kind {
+            ':' => self.enter_command(),
+            '/' => self.enter_search(SearchDir::Forward, 1),
+            '?' => self.enter_search(SearchDir::Backward, 1),
+            _ => return Err(format!("btv.cmdline.open: unknown kind {kind:?}")),
+        }
+        self.cmdline.push_str(text);
+        self.cmdline_col = self.cmdline.len();
+        Ok(())
     }
 
     /// Open the command line as a scripted `vim.ui.input` prompt (Phase 8): a

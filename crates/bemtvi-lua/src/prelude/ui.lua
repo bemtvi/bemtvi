@@ -503,12 +503,21 @@ end
 -- server has no client to ask), so read it from a `UIEnter` handler — the event
 -- fires right after this mirror is refreshed.
 btv._ui_caps = btv._ui_caps
-  or { keyboard_protocol = false, truecolor = false, osc52 = false, key_labels = {} }
+  or {
+    client = "",
+    platform = "",
+    keyboard_protocol = false,
+    truecolor = false,
+    osc52 = false,
+    key_labels = {},
+  }
 
 -- Server-called: refresh the mirror from the attaching client's capabilities map.
 -- `key_labels` arrives as a flat `{ chord, label, chord, label, … }` list (the wire
 -- carries pairs, not a map) and is folded back into a table here.
-function btv._set_ui_caps(keyboard_protocol, truecolor, osc52, key_labels)
+function btv._set_ui_caps(keyboard_protocol, truecolor, osc52, key_labels, client, platform)
+  btv._ui_caps.client = type(client) == "string" and client or ""
+  btv._ui_caps.platform = type(platform) == "string" and platform or ""
   btv._ui_caps.keyboard_protocol = keyboard_protocol and true or false
   btv._ui_caps.truecolor = truecolor and true or false
   btv._ui_caps.osc52 = osc52 and true or false
@@ -525,6 +534,8 @@ end
 --
 -- ```lua
 -- {
+--   client            = "",    -- "tui", "gui" or "web"; "" when the client didn't say
+--   platform          = "",    -- "macos", "linux", "windows"; "" when it didn't say
 --   keyboard_protocol = false, -- the kitty keyboard protocol is on
 --   truecolor         = false, -- the terminal can show 24-bit color
 --   osc52             = false, -- the terminal accepts OSC 52 clipboard writes
@@ -572,9 +583,79 @@ function btv.ui.caps()
     labels[chord] = label
   end
   return {
+    client = btv._ui_caps.client,
+    platform = btv._ui_caps.platform,
     keyboard_protocol = btv._ui_caps.keyboard_protocol,
     truecolor = btv._ui_caps.truecolor,
     osc52 = btv._ui_caps.osc52,
     key_labels = labels,
   }
+end
+
+-- Characters a family name can't hold in `'guifont'` (they delimit the syntax).
+local GUIFONT_RESERVED = "[,:%[%];]"
+
+-- `btv.ui.font(fonts, opts)`: set `'guifont'` from a font list, tried in order for
+-- every character (wezterm's `font_with_fallback`). Each entry is a family name, or a
+-- table with the name first and options of that font's own:
+--
+-- ```lua
+-- btv.ui.font({
+--   { "JetBrains Mono", weight = 500, features = { "+ss01", "-calt" } },
+--   { "Symbols Nerd Font", scale = 0.9 },
+--   "Noto Color Emoji",
+-- }, { size = 14 })
+-- ```
+--
+-- Per-font options:
+--
+-- ```
+-- weight    1-1000, or "thin" … "normal" … "bold" … "black" (its regular text)
+-- scale     a factor on its glyphs' size, in (0, 4]
+-- features  OpenType features: "+tag" / "tag" on, "-tag" off, "tag=N" an alternate
+-- ```
+--
+-- `opts.size` is the point size. Returns the `'guifont'` value it set, which the
+-- editor checks like any other (a bad weight or feature tag is `E474`). The GUI
+-- honors every option; the browser takes the list and the size, and says so when a
+-- font has options it can't apply there.
+function btv.ui.font(fonts, opts)
+  opts = opts or {}
+  if type(fonts) ~= "table" then
+    error("btv.ui.font: fonts must be a list", 2)
+  end
+  local items = {}
+  for i, f in ipairs(fonts) do
+    local spec = type(f) == "string" and { f } or f
+    if type(spec) ~= "table" then
+      error(("btv.ui.font: font %d must be a name or a table"):format(i), 2)
+    end
+    local family = spec[1] or spec.family
+    if type(family) ~= "string" or family == "" then
+      error(("btv.ui.font: font %d has no name"):format(i), 2)
+    end
+    if family:find(GUIFONT_RESERVED) then
+      error(("btv.ui.font: %q: a font name can't hold , : [ ] or ;"):format(family), 2)
+    end
+    local o = {}
+    if spec.weight ~= nil then
+      o[#o + 1] = "weight=" .. tostring(spec.weight)
+    end
+    if spec.scale ~= nil then
+      o[#o + 1] = "scale=" .. tostring(spec.scale)
+    end
+    if spec.features ~= nil then
+      if type(spec.features) ~= "table" then
+        error(("btv.ui.font: features on %s must be a list"):format(family), 2)
+      end
+      o[#o + 1] = "features=" .. table.concat(spec.features, " ")
+    end
+    items[#items + 1] = #o > 0 and (family .. "[" .. table.concat(o, ";") .. "]") or family
+  end
+  local value = table.concat(items, ",")
+  if opts.size ~= nil then
+    value = value .. ":h" .. tostring(opts.size)
+  end
+  btv.o.guifont = value
+  return value
 end

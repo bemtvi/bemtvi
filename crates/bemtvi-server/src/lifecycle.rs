@@ -351,6 +351,12 @@ impl EditHost {
     /// non-current windows the current-buffer path never visits) fires it per
     /// restored window.
     pub(crate) fn emit_lifecycle_events(&mut self) {
+        // A modeless session rests in Insert over a modifiable buffer. Whatever
+        // this message did (an ex command, a Lua edit, a focus or buffer switch, a
+        // `FileType` handler flipping `'modifiable'`), correct the mode before it is
+        // diffed below, so `InsertEnter` / `ModeChanged` report where it settled.
+        self.editor.settle_modeless();
+
         // Buffers the editor read from a file *in place* this tick (a local `:edit`
         // reusing the throwaway `[No Name]`, or a `:e` / `:e!` reload of the current
         // file) keep their bufnr, so they're still "announced" from a prior life. Drop
@@ -503,6 +509,22 @@ impl EditHost {
                 .last_text
                 .is_some_and(|(b, t)| b == buf && t != cur_tick);
 
+        // `BufModifiedSet`: every buffer whose `'modified'` flag flipped since the
+        // last diff — typing into a clean buffer, a write, an undo back to the saved
+        // state, `:set nomodified`. The baseline is rebuilt every call; only the fire
+        // is gated on a handler. A buffer seen for the first time is its own baseline.
+        let mut modified_flips: Vec<BufferId> = Vec::new();
+        let want_modified = self.au_active_events.contains("BufModifiedSet");
+        let mut modified_now = HashMap::new();
+        for id in self.editor.buffer_ids() {
+            let m = self.editor.buffer_modified(id);
+            if want_modified && self.last_modified.get(&id).is_some_and(|&was| was != m) {
+                modified_flips.push(id);
+            }
+            modified_now.insert(id, m);
+        }
+        self.last_modified = modified_now;
+
         // Refresh the cursor / text baselines every call (mirrors `last_mode`), so a
         // motion that took the fast path is still the reference for the next diff.
         self.last_cursor = Some(cur_pos);
@@ -609,6 +631,7 @@ impl EditHost {
             && !mode_changed
             && !cursor_moved
             && !text_changed
+            && modified_flips.is_empty()
             && new_wins.is_empty()
             && closed_wins.is_empty()
             && !win_changed
@@ -1002,6 +1025,10 @@ impl EditHost {
                 "CursorMoved"
             };
             self.fire_lifecycle(event, &name, buf, &name);
+        }
+        for id in modified_flips {
+            let file = self.editor.buffer_name(id).unwrap_or_default();
+            self.fire_buf_lifecycle("BufModifiedSet", &file, id);
         }
 
         // ----- working directory: follow the current window (vim's fix_current_dir) -----

@@ -1679,6 +1679,38 @@ btv.picker.source({
   end,
 })
 
+-- commands: every ex command the `:` line knows (`btv.cmdline_complete.catalog()`:
+-- the built-ins, then user commands), the name as the aligned head and the
+-- description as the text. Confirm runs a command that needs no argument, and opens
+-- the `:` line prefilled with the name of one whose synopsis spells a required
+-- `{arg}`, so it can be typed. The modeless key layout's command palette.
+btv.picker.source({
+  name = "commands",
+  title = "Commands",
+  layer = "main",
+  items = function(ctx)
+    for _, c in ipairs(btv.cmdline_complete.catalog()) do
+      ctx.push({
+        head = c.name .. " ",
+        text = c.description or "",
+        name = c.name,
+        needs_arg = c.synopsis:find("{", 1, true) ~= nil,
+      })
+    end
+  end,
+  confirm = function(item)
+    -- After this picker has torn down, so the command (or the line) acts on the
+    -- buffer the picker was opened over.
+    btv.on_next_tick(function()
+      if item.needs_arg then
+        btv.cmdline.open(item.name .. " ")
+      else
+        btv.cmd(item.name)
+      end
+    end)
+  end,
+})
+
 -- pickers: a picker of pickers (telescope's `builtin`) — every registered source
 -- name, confirm opens the chosen one. Opening a picker from inside a `confirm` has
 -- to wait for this picker to tear down first, so it defers to `btv.on_next_tick`.

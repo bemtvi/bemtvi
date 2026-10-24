@@ -130,10 +130,17 @@ btv.test.describe("examples/telescope-parity", function()
 
   btv.test.it("\\fi is the picker-of-pickers, and lists this file's sources", function(t)
     open(t)
-    local box = picker(t, "<Bslash>fi")
-    local listed = table.concat(box.items, "\n")
-    btv.test.expect(listed).to_contain("live_grep_uu")
-    btv.test.expect(listed).to_contain("git_files")
+    picker(t, "<Bslash>fi")
+    -- The list is longer than the box shows, so filter down to each source rather
+    -- than reading whichever rows happen to be visible.
+    for _, name in ipairs({ "live_grep_uu", "git_files" }) do
+      t:feed(name)
+      t:wait_for(function()
+        local m = t:menu()
+        return m ~= nil and table.concat(m.items, "\n"):find(name, 1, true) ~= nil
+      end, { tries = 200, interval = 20, message = name .. " is not listed" })
+      t:feed(string.rep("<BS>", #name))
+    end
     t:feed("<Esc>")
   end)
 

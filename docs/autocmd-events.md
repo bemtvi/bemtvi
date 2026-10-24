@@ -186,6 +186,7 @@ no autocmd listens for them they cost nothing.
 | --- | --- |
 | `TextChanged` | The buffer's text changes in Normal mode (edit, paste, …). |
 | `TextChangedI` | The buffer's text changes in Insert mode (per keystroke). |
+| `BufModifiedSet` | A buffer's `'modified'` flag flips: the first edit to a clean buffer, a write, an undo back to the saved text, `:set nomodified`. Fires for that buffer (`buf` / `file`), current or not. **Gated on a registered handler.** This is the signal for a `[+]` indicator: unlike `TextChanged`, it fires the same way in a session that never leaves Insert (`'modeless'`). |
 | `CursorMoved` | The cursor moves in Normal mode. |
 | `CursorMovedI` | The cursor moves in Insert mode. |
 

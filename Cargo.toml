@@ -171,10 +171,9 @@ redb = "=4.1.0"
 rmp-serde = "=1.3.1"
 unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.3"
-# The GUI's custom font fallback (`UserFallback`) implements cosmic-text's
-# `Fallback` trait, whose `script_fallback` is keyed by `unicode_script::Script`.
-# Pinned to the version cosmic-text resolves so the trait's `Script` type unifies.
-unicode-script = "=0.5.8"
+# The GUI reads a font's character map with it (its font list resolves each
+# character to the first font that has it). Pinned to the version fontdb uses.
+ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
 regex = "=1.12.4"
 # The glob parser behind `bemtvi_core::glob` (and so `btv.glob`). Used purely as the
 # glob->regex TRANSLATOR — `Glob::regex()` hands back regex source that we compile

@@ -39,6 +39,7 @@
 //!   also binds the buffer to it). (`:wo` mirrors the `…o` open family and, unlike
 //!   `:wn`, collides with no real ex-command — vim's `:wn` is `:wnext`.)
 
+mod fontchain;
 mod images;
 mod input;
 mod mouse;
@@ -61,6 +62,7 @@ pub use session::{
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
 // The block-element geometry (`▀`, `█`, …), drawn as rectangles rather than glyphs, so
 // the Tier-1 `blocks` test can check it without a GPU.
+pub use fontchain::runs_by;
 pub use render::{block_element_rects, split_block_elements};
 pub use render::{
     inlay_shift, run_columns, seg_bg_spans, segment_columns, splice_inlay, split_at_char,
@@ -69,6 +71,7 @@ pub use render::{
     DEFAULT_VISUAL_BG, DEFAULT_WIN_SEPARATOR, DIAG_ERROR, DIAG_HINT, DIAG_INFO, DIAG_WARN,
     MULTICURSOR_ACCENT,
 };
+pub use render::{shape_with_fonts, TestGlyph};
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
 pub use render::{
@@ -83,7 +86,7 @@ pub use render::{
 };
 // The pure caret-cell math for the command line and the picker prompt (char-offset
 // wire fields → display-width cells), exported for the Tier-1 `caret` test.
-pub use render::{cmdline_caret_col, query_caret_col};
+pub use render::{cmdline_caret_col, popup_covers, query_caret_col};
 // The block cursor's reverse-video pair — the opaque quad's colour and the inverted
 // colour its covered glyph is re-drawn in — plus that recolor, exported for the
 // Tier-1 `cursor` test.
@@ -128,6 +131,20 @@ pub use render::ScrollFrame;
 /// selection dragged to the edge and held still would stop scrolling; this paces
 /// the continuous scroll the server does a line at a time per drag event.
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Each half of a modeless caret's blink: shown this long, then hidden as long.
+pub const CARET_BLINK: Duration = Duration::from_millis(530);
+
+/// Where a caret's blink stands `elapsed` after it last restarted (the caret moved,
+/// or appeared): whether it is in the hidden half, and how long until it flips. It
+/// starts shown, so a caret is always visible the moment it moves.
+pub fn caret_blink(elapsed: Duration) -> (bool, Duration) {
+    let half = CARET_BLINK.as_millis();
+    let ms = elapsed.as_millis();
+    let hidden = (ms / half) % 2 == 1;
+    let left = half - ms % half;
+    (hidden, Duration::from_millis(left as u64))
+}
 
 /// Whether a drag at grid `row` (global, 0-based) sits in the top/bottom edge
 /// band that arms continuous auto-scroll, for a grid `rows` cells tall. The top
@@ -192,14 +209,15 @@ impl GlyphOverflow {
 
 /// Client-side rendering configuration. The font family and point size are a
 /// purely client concern — the server works in cells, not pixels — so they're set
-/// here (CLI flags / environment), not through a server option. An unavailable
-/// font name falls back to the system monospace.
+/// here (CLI flags / environment), as well as through `'guifont'`, which wins. A font
+/// that isn't installed is reported on the message line and skipped; a missing first
+/// font gives its place to the system monospace.
 #[derive(Clone, Debug)]
 pub struct GuiConfig {
-    /// Ordered font families: the first is the primary, the rest a wezterm-style
-    /// fallback chain tried in turn for a glyph the primary lacks. Empty uses the
-    /// system monospace. Set from a comma-separated `--font` / `BEMTVI_GUI_FONT`.
-    pub fonts: Vec<String>,
+    /// Ordered fonts: the first is the primary, the rest a wezterm-style fallback
+    /// chain tried in turn for a glyph the primary lacks. Empty uses the system
+    /// monospace. Set from `--font` / `BEMTVI_GUI_FONT`, in `'guifont'`'s list syntax.
+    pub fonts: Vec<bemtvi_view::FontSpec>,
     /// Font point size, before the display's scale factor is applied.
     pub font_size: f32,
     /// *Maximum* render scale for an emoji / wide fallback glyph relative to the text
@@ -220,7 +238,7 @@ impl Default for GuiConfig {
     fn default() -> Self {
         Self {
             fonts: Vec::new(),
-            font_size: 15.0,
+            font_size: 13.0,
             emoji_scale: 1.2,
             glyph_overflow: GlyphOverflow::default(),
         }
@@ -262,15 +280,16 @@ impl GuiConfig {
         c
     }
 
-    /// Set the font family list from a comma-separated spec (`"JetBrains Mono,Noto
-    /// Color Emoji"`), like a `guifont` value: each family is trimmed and its
-    /// backslash-escaped spaces unescaped, and blanks are dropped. An all-blank spec
-    /// leaves the list untouched (keeping the monospace default rather than asking
-    /// the font system for `""`).
+    /// Set the font list from a spec in `'guifont'`'s syntax (`"JetBrains Mono,Noto
+    /// Color Emoji"`, per-font options in brackets; see `bemtvi_core::guifont`). An
+    /// all-blank spec leaves the list untouched (keeping the monospace default rather
+    /// than asking the font system for `""`); one that doesn't parse says why on
+    /// stderr and leaves it too.
     pub fn set_font(&mut self, spec: &str) {
-        let fonts = parse_font_list(spec);
-        if !fonts.is_empty() {
-            self.fonts = fonts;
+        match bemtvi_core::guifont::parse(spec) {
+            Ok(g) if !g.fonts.is_empty() => self.fonts = view_fonts(&g),
+            Ok(_) => {}
+            Err(why) => eprintln!("bemtvi-gui: ignoring font {spec:?}: {why}"),
         }
     }
 
@@ -762,6 +781,17 @@ struct App {
     /// or `None` for the default arrow. Tracked so a hover only sets the cursor when
     /// the shape actually changes, not on every pointer move.
     resize_hint: Option<ResizeCursor>,
+    /// Whether the pointer shows the text I-beam, over the text of a window a
+    /// modeless session types into ([`bemtvi_view::WindowView::text_pointer`]).
+    /// Tracked like [`Self::resize_hint`], so the shape is only set when it changes.
+    text_hint: bool,
+    /// When the modeless caret's blink last restarted ([`caret_blink`]): the caret
+    /// moved, or a frame turned it on.
+    blink_since: Instant,
+    /// What the blink restarts on: whether the caret is up, and its place.
+    blink_key: (bool, u16, u16),
+    /// Wakes the blink task when a caret comes up after a stretch without one.
+    blink: Rc<tokio::sync::Notify>,
     /// While the left button is held with the pointer in the top/bottom edge band,
     /// the cell to re-issue the drag at so the buffer keeps auto-scrolling without
     /// further pointer motion. `None` when not at an edge or the button is up.
@@ -790,6 +820,9 @@ struct App {
     /// The last `view.guifont` applied to the renderer, so a redraw only re-shapes
     /// when it actually changed (`:set guifont=…` / the init-time value).
     applied_guifont: String,
+    /// The configured fonts last reported as not installed, so each list is reported
+    /// once rather than on every re-apply (a DPI change re-applies the font).
+    reported_missing: Vec<String>,
     /// The last `view.guiglyphoverflow` applied to the renderer, so a redraw only
     /// re-applies when it actually changed (`:set guiglyphoverflow=…` / the init-time
     /// value). Empty is both the initial state and the option's default — which means
@@ -853,6 +886,10 @@ impl App {
                 mouse_down: false,
                 last_drag_cell: None,
                 resize_hint: None,
+                text_hint: false,
+                blink_since: Instant::now(),
+                blink_key: (false, 0, 0),
+                blink: Rc::new(tokio::sync::Notify::new()),
                 autoscroll: None,
                 autoscrolling: false,
                 wheel_accum: (0.0, 0.0),
@@ -861,6 +898,7 @@ impl App {
                 ime_area: None,
                 config,
                 applied_guifont: String::new(),
+                reported_missing: Vec::new(),
                 applied_glyph_overflow: String::new(),
                 applied_opacity: (None, None),
                 open_dir,
@@ -895,6 +933,7 @@ impl App {
             }
         });
         spawn_local(Self::paint_loop(this.clone()));
+        spawn_local(Self::blink_loop(this.clone()));
 
         let closing = this.clone();
         let content = this.clone();
@@ -950,6 +989,43 @@ impl App {
         }
     }
 
+    /// Repaints at each flip of a modeless caret's blink, and sleeps while there is
+    /// no caret.
+    async fn blink_loop(this: Rc<RefCell<Self>>) {
+        let wake = this.borrow().blink.clone();
+        loop {
+            let wait = {
+                let app = this.borrow();
+                app.view
+                    .caret
+                    .then(|| caret_blink(app.blink_since.elapsed()).1)
+            };
+            match wait {
+                Some(wait) => {
+                    sleep(wait).await;
+                    this.borrow().request_redraw();
+                }
+                None => wake.notified().await,
+            }
+        }
+    }
+
+    /// Restart the caret's blink when this frame moved it, turned it on, or put it
+    /// in another window, so a caret is never hidden right after it moves.
+    fn restart_blink(&mut self) {
+        let key = match self.view.focused() {
+            Some(w) => (self.view.caret, w.cursor_row, w.cursor_screen_col),
+            None => (self.view.caret, 0, 0),
+        };
+        if key != self.blink_key {
+            self.blink_key = key;
+            self.blink_since = Instant::now();
+            if self.view.caret {
+                self.blink.notify_one();
+            }
+        }
+    }
+
     /// Paint one frame; whether a slide is still running. A finished slide settles
     /// first, so the final frame is the live (destination) view rather than a clamped
     /// band.
@@ -958,7 +1034,9 @@ impl App {
             self.scroll = None;
         }
         let frame = self.scroll.as_ref().map(ScrollFrame::of);
+        let hidden = self.view.caret && caret_blink(self.blink_since.elapsed()).0;
         if let Some(r) = self.renderer.as_mut() {
+            r.set_caret_hidden(hidden);
             if let Err(e) = r.render(&self.view, frame.as_ref()) {
                 eprintln!("bemtvi-gui: render error: {e}");
             }
@@ -1047,6 +1125,10 @@ impl App {
             UserEvent::Redraw(view) => {
                 self.view = *view;
                 self.update_input_method();
+                self.restart_blink();
+                // A frame can change what is under a still pointer (a read-only
+                // window took focus, `'modeless'` turned on).
+                self.update_pointer();
                 // A changed `guifont` re-shapes the renderer (and re-reports the
                 // grid) before this frame paints.
                 if self.view.guifont != self.applied_guifont {
@@ -1148,7 +1230,7 @@ impl App {
                 self.cursor_px = self.pixels(*position);
                 // While the left button is held, a move into a new cell is a drag.
                 self.mouse_drag();
-                self.update_resize_cursor();
+                self.update_pointer();
             }
             SurfaceInput::Button {
                 button,
@@ -1201,6 +1283,18 @@ impl App {
             // so the platform can't show it — paint it at the cursor until it's
             // committed (a `Text`) or cancelled (an empty one).
             SurfaceInput::Preedit { text, cursor } => {
+                // A composition starting while a modeless wheel has the caret off
+                // screen: it goes in at the caret, so bring the caret back into view.
+                let hidden = self.view.focused().is_some_and(|w| w.cursor_hidden);
+                if hidden && !text.is_empty() {
+                    self.rpc.notify(
+                        "nvim_exec_lua",
+                        vec![
+                            Value::from("btv.modeless.actions.reveal_caret()"),
+                            Value::Array(vec![]),
+                        ],
+                    );
+                }
                 if let Some(r) = self.renderer.as_mut() {
                     r.set_preedit(text, *cursor);
                 }
@@ -1331,11 +1425,15 @@ impl App {
         // also paints 24-bit color natively, so declare `truecolor` too — the server
         // then defaults in the bundled `bemtvi` colorscheme (giving `Normal` a real
         // background, not just the renderer's syntax fallback) when the config hasn't
-        // chosen one. The map is read only at attach; a resize passes an empty one.
+        // chosen one. `client` names it a GUI, which `'modeless'` is gated on. The map
+        // is read only at attach; a resize passes an empty one.
         let caps = if attach {
             Value::Map(vec![
                 (Value::from("keyboard_protocol"), Value::Boolean(true)),
                 (Value::from("truecolor"), Value::Boolean(true)),
+                (Value::from("client"), Value::from("gui")),
+                // The OS, so a key layout can follow its conventions (Command on macOS).
+                (Value::from("platform"), Value::from(std::env::consts::OS)),
             ])
         } else {
             Value::Map(vec![])
@@ -1407,18 +1505,35 @@ impl App {
     /// `:set guifont=…` takes effect live. A no-op before the renderer exists; it's
     /// applied from [`Self::init_renderer`] once the renderer is built.
     fn apply_guifont(&mut self) {
-        let (families, size) = parse_guifont(&self.view.guifont);
-        // The `guifont` families win; with none set, fall back to the CLI/env list.
-        let fonts = if families.is_empty() {
+        // The server parsed `'guifont'`; its fonts win, and with none set the CLI/env
+        // list applies.
+        let spec = &self.view.guifont_spec;
+        let fonts = if spec.fonts.is_empty() {
             self.config.fonts.clone()
         } else {
-            families
+            spec.fonts.clone()
         };
-        let size = size.unwrap_or(self.config.font_size);
+        let size = spec.size.unwrap_or(self.config.font_size);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         renderer.set_font(&fonts, size);
+        // A font in the list that isn't installed is skipped; say so, on the message
+        // line, instead of drawing the next one without a word.
+        let missing = renderer.missing_fonts().to_vec();
+        if !missing.is_empty() && missing != self.reported_missing {
+            self.rpc.notify(
+                "nvim_exec_lua",
+                vec![
+                    Value::from("btv.notify(..., btv.log.levels.WARN)"),
+                    Value::Array(vec![Value::from(format!(
+                        "guifont: not installed: {}",
+                        missing.join(", ")
+                    ))]),
+                ],
+            );
+        }
+        self.reported_missing = missing;
         self.applied_guifont = self.view.guifont.clone();
         // The cell size changed, so the grid in cells did too — re-report it (the
         // server re-lays out for the new dimensions) and repaint.
@@ -1650,26 +1765,30 @@ impl App {
     }
 
     /// Update the pointer shape on hover: a resize cursor over a draggable split
-    /// separator or dock edge, the default arrow elsewhere. A no-op while a button
-    /// is held (a drag in progress keeps its grab cursor) and only sets the
-    /// surface's cursor when the shape changes, so an ordinary move over text costs
-    /// nothing.
-    fn update_resize_cursor(&mut self) {
+    /// separator or dock edge, the text I-beam over text a modeless session types
+    /// into, the default arrow elsewhere. A no-op while a button is held (a drag in
+    /// progress keeps its grab cursor) and only sets the surface's cursor when the
+    /// shape changes, so an ordinary move over text costs nothing.
+    fn update_pointer(&mut self) {
         if self.mouse_down {
             return;
         }
-        let hint = self
-            .renderer
-            .as_ref()
-            .and_then(|r| r.resize_cursor_at(&self.view, self.cursor_px.0, self.cursor_px.1));
-        if hint == self.resize_hint {
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
+        let (px, py) = self.cursor_px;
+        let hint = r.resize_cursor_at(&self.view, px, py);
+        let text = hint.is_none() && r.text_pointer_at(&self.view, px, py);
+        if hint == self.resize_hint && text == self.text_hint {
             return;
         }
         self.resize_hint = hint;
+        self.text_hint = text;
         if let Some(cursor) = self.cursor {
             cursor.set(match hint {
                 Some(ResizeCursor::Col) => Cursor::System(SystemCursor::ResizeEastWest),
                 Some(ResizeCursor::Row) => Cursor::System(SystemCursor::ResizeNorthSouth),
+                None if text => Cursor::System(SystemCursor::Text),
                 None => Cursor::Default,
             });
         }
@@ -1839,29 +1958,20 @@ pub fn dialog_action(cmdline: &str, unnamed: bool, remote: bool) -> Option<Dialo
     }
 }
 
-/// Split a comma-separated font-family list (`"JetBrains Mono,Noto Color Emoji"`)
-/// into individual families: each is trimmed and its backslash-escaped spaces
-/// (`Fira\ Code`, the `:set guifont` form) unescaped, and blank entries are dropped.
-fn parse_font_list(spec: &str) -> Vec<String> {
-    spec.split(',')
-        .map(|f| f.replace("\\ ", " ").trim().to_string())
-        .filter(|f| !f.is_empty())
+/// The GUI's copy of a list the core parsed (`--font`, `BEMTVI_GUI_FONT`), in the
+/// type the relayed `'guifont'` arrives as.
+fn view_fonts(g: &bemtvi_core::guifont::GuiFont) -> Vec<bemtvi_view::FontSpec> {
+    g.fonts
+        .iter()
+        .map(|f| bemtvi_view::FontSpec {
+            family: f.family.clone(),
+            weight: f.weight,
+            scale: f.scale,
+            features: f
+                .features
+                .iter()
+                .map(|(tag, v)| (String::from_utf8_lossy(tag).into_owned(), *v))
+                .collect(),
+        })
         .collect()
-}
-
-/// Parse a vim / Neovide `guifont` value into `(families, point size)`. The families
-/// are the comma-separated list, tried in order as a wezterm-style fallback chain (a
-/// backslash-escaped space, the `:set` form, is unescaped). A `:h<n>` field sets the
-/// size; other `:` options (`:w`, `:b`, `:i`, `:#e-…`) are accepted but ignored. The
-/// family list is empty / the size `None` when absent, so the caller can fall back to
-/// its configured default. Pure, so it's unit-tested in `tests/keys.rs`.
-pub fn parse_guifont(guifont: &str) -> (Vec<String>, Option<f32>) {
-    let mut parts = guifont.split(':');
-    let families = parse_font_list(parts.next().unwrap_or(""));
-
-    let size = parts.find_map(|opt| {
-        let pt = opt.strip_prefix('h')?.trim().parse::<f32>().ok()?;
-        (pt.is_finite() && pt > 0.0).then_some(pt)
-    });
-    (families, size)
 }

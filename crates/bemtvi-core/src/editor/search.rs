@@ -577,6 +577,13 @@ impl Editor {
             }
             self.clamp_cursor();
         }
+        // A modeless session finds the way a GUI editor does: the match comes up
+        // selected, so typing replaces it.
+        if op.is_none() && self.mode.is_insert() && self.rests_in_insert() && me > ms {
+            let anchor = self.caret_at_byte(ms);
+            let head = self.caret_at_byte(me);
+            self.set_caret_selection(super::modeless::CaretSel { anchor, head });
+        }
         if let Some(op) = op {
             // The cursor now rests on the (offset-adjusted) match; the operator
             // spans from there back to where the search began.

@@ -2163,6 +2163,13 @@ impl Editor {
             return;
         };
         let (ver, hor) = self.mousescroll_steps();
+        // A modeless session follows the GUI convention: Shift turns the wheel
+        // sideways, down to the right, rather than vim's page scroll.
+        let action = match action {
+            MouseAction::WheelDown if shift && self.options.modeless => MouseAction::WheelRight,
+            MouseAction::WheelUp if shift && self.options.modeless => MouseAction::WheelLeft,
+            a => a,
+        };
         match action {
             MouseAction::WheelUp | MouseAction::WheelDown => {
                 // Shift escalates a notch to a screenful (vim's `<S-ScrollWheel*>`
@@ -2301,12 +2308,26 @@ impl Editor {
                 self.keep_cursor_in_leftcol();
             }
         } else {
+            // As the vertical wheel: a modeless session holds the caret and the view.
+            let keep_caret = self.options.modeless
+                && self.tree_of_window(win).is_some_and(|(_, t)| {
+                    let w = t.get(win);
+                    self.buffer_modifiable(w.buffer) && w.saved_cursors.is_empty()
+                });
             let Some(tree) = self.tree_of_window_mut(win) else {
                 return;
             };
             let w = tree.get_mut(win);
-            let new = (w.saved_leftcol as i64 + delta).clamp(0, max) as usize;
+            let old = w.saved_leftcol;
+            let new = (old as i64 + delta).clamp(0, max) as usize;
+            if new == old {
+                return;
+            }
             w.saved_leftcol = new;
+            if keep_caret {
+                let (buffer, cursor, top) = (w.buffer, w.saved_cursor, w.saved_top);
+                self.detach_unfocused_view(win, buffer, cursor, (top, old));
+            }
         }
     }
 

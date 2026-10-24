@@ -63,7 +63,9 @@ row on screen.
 The mouse wheel scrolls the view and nothing else. The caret and any selection stay
 where they are, even off screen, and the first key that types or moves the caret
 brings the view back to it, as does an input method starting to compose. A page key
-pages from the caret's place. Each window keeps its own scroll while focus is
+pages from the caret's place. Shift with the wheel scrolls sideways (down goes
+right), as does a tilting wheel or a touchpad; a long line only scrolls sideways
+with `'wrap'` off. Each window keeps its own scroll while focus is
 elsewhere, including one you scrolled without focusing it. On macOS, Command with an arrow goes to the line's edges or the buffer's ends,
 and Option with Left or Right moves by word. Shift with any of them selects.
 

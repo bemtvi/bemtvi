@@ -4,9 +4,9 @@
 use bemtvi_rpc::{Incoming, Rpc};
 use bemtvi_server::ServerInit;
 use bemtvi_test_harness::{
-    attach_with_caps, command, cursor, exec_lua, feed, feed_mouse, feed_sync, field, lines,
-    map_get, menu_items, menu_of, message_after, mode, poll_menu, poll_true, redraw_after,
-    redraw_after_matching, spawn, start_clocked_init, write_temp, FakeClipboard,
+    attach_with_caps, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_mod, feed_sync,
+    field, lines, map_get, menu_items, menu_of, message_after, mode, poll_menu, poll_true,
+    redraw_after, redraw_after_matching, spawn, start_clocked_init, write_temp, FakeClipboard,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1472,4 +1472,73 @@ async fn reveal_caret_brings_a_scrolled_away_view_back() {
     exec_lua(&rpc, "btv.modeless.actions.reveal_caret()").await;
     assert_eq!(topline(&rpc).await, 1);
     assert_eq!(cursor(&rpc).await.0, 1, "the caret didn't move");
+}
+
+// ===== Shift with the wheel scrolls sideways ==================================
+
+/// A modeless session over `n` lines of 300 characters, without wrapping or the
+/// line-number gutter.
+async fn start_wide(n: usize) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let text: String = (0..n)
+        .map(|i| format!("{i:03}{}\n", "x".repeat(297)))
+        .collect();
+    let (rpc, inc) = start_modeless(&text).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    (rpc, inc)
+}
+
+/// The focused window's first visible screen column, 0-based.
+async fn leftcol(rpc: &Rpc) -> i64 {
+    exec_lua(rpc, "return btv.win.saveview().leftcol")
+        .await
+        .as_i64()
+        .expect("a leftcol")
+}
+
+#[tokio::test]
+async fn shift_with_the_wheel_scrolls_sideways() {
+    let (rpc, _inc) = start_wide(200).await;
+    for _ in 0..5 {
+        feed_mouse_mod(&rpc, "wheel", "down", "S", 5, 5);
+    }
+    assert_eq!(
+        leftcol(&rpc).await,
+        30,
+        "five notches of 'mousescroll' hor:6"
+    );
+    assert_eq!(topline(&rpc).await, 1, "and not down");
+    assert_eq!(cursor(&rpc).await, (1, 0), "the caret stayed");
+    for _ in 0..2 {
+        feed_mouse_mod(&rpc, "wheel", "up", "S", 5, 5);
+    }
+    assert_eq!(leftcol(&rpc).await, 18, "up goes left");
+}
+
+#[tokio::test]
+async fn shift_with_the_wheel_still_pages_in_vim_mode() {
+    let text: String = (0..200)
+        .map(|i| format!("{i:03}{}\n", "x".repeat(297)))
+        .collect();
+    let (rpc, _inc) = start_as("gui", &text).await;
+    command(&rpc, "set nowrap").await;
+    feed_mouse_mod(&rpc, "wheel", "down", "S", 5, 5);
+    assert!(topline(&rpc).await > 10, "a screenful down");
+    assert_eq!(leftcol(&rpc).await, 0);
+}
+
+#[tokio::test]
+async fn the_wheel_sideways_over_another_window_keeps_its_scroll_and_caret() {
+    let (rpc, _inc) = start_wide(200).await;
+    // `:vsplit` focuses the new window, on the left; the pointer is over the right.
+    command(&rpc, "vsplit").await;
+    for _ in 0..5 {
+        feed_mouse(&rpc, "wheel", "right", 5, 60);
+    }
+    focus_other(&rpc).await;
+    assert_eq!(leftcol(&rpc).await, 30, "the scroll is kept");
+    assert_eq!(cursor(&rpc).await, (1, 0), "the caret stayed");
+    feed(&rpc, "X");
+    assert!(lines(&rpc).await[0].starts_with("X000"));
+    // The smallest scroll that shows the caret, now on column 1.
+    assert_eq!(leftcol(&rpc).await, 1, "typing brings the view back");
 }

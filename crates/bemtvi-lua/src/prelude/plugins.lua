@@ -2218,7 +2218,7 @@ M.RECOMMENDED_DOC_URL = "https://bemtvi.github.io/bemtvi/guide/recommended-plugi
 M._default_recommended = {
   {
     "bemtvi/bemtvi-line",
-    tag = "v1.0.2",
+    tag = "v1.0.3",
     desc = "Configurable statusline (lualine)",
     config = [[ require("bemtvi-line").setup() ]],
   },

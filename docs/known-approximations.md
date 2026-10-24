@@ -153,8 +153,8 @@ fetch/compile — aren't listed; only the edges that still diverge are.)
   build an evaluator.
 - **`:TSInstall` approximations.** The command fetches/compiles grammars
   (`bemtvi_ts::install`), with a pinned, checksum-verified Zig fetched on demand
-  when no system `cc`/`clang`/`gcc`/`zig` (or `$BEMTVI_CC`) is found — on macOS,
-  Linux, and Windows alike. Remaining: (1) grammars needing `tree-sitter
+  (never a compiler from PATH; `$BEMTVI_CC` overrides) — on macOS, Linux, and
+  Windows alike. Remaining: (1) grammars needing `tree-sitter
   generate` (no committed `src/parser.c`) fail loud rather than generating;
   (2) the nvim-treesitter ref is pinned in source — no `:TSInstall`-from-`HEAD`;
   (3) in the **browser**, markdown can't be installed at all — no npm package publishes a

@@ -21,11 +21,10 @@
 -- "TSInstall: installed rust @ 77a37472 [<compiler>] (queries: …)". The buffer
 -- re-highlights and gains auto-indent immediately — no `:e` needed.
 --
--- THE COMPILER. `:TSInstall` needs a C compiler. It tries, in order:
---   1. $BEMTVI_CC (e.g. `BEMTVI_CC="zig cc"`), then
---   2. a system `cc` / `clang` / `gcc` / `zig` on $PATH, then
---   3. a pinned Zig it downloads + checksum-verifies on demand — so even with no
---      toolchain at all, the install just works (the download is one-time).
+-- THE COMPILER. `:TSInstall` builds every grammar with a pinned Zig it
+-- downloads + checksum-verifies on demand (one-time), so no toolchain is needed.
+-- A `cc` / `gcc` / `zig` on $PATH is never used; to pick a compiler explicitly,
+-- set $BEMTVI_CC (e.g. `BEMTVI_CC="zig cc"`).
 --
 -- ALREADY USE NEOVIM? If you've run nvim-treesitter, bemtvi also searches your
 -- existing `~/.local/share/nvim/site/` read-only, so those grammars light up

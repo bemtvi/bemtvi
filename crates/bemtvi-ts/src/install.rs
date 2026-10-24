@@ -13,9 +13,9 @@
 //!      `<data>/parser/<lang>.so`, using a resolved C compiler,
 //!   4. copy the standard queries into `<data>/queries/<lang>/`.
 //!
-//! The compiler is resolved in [`resolve_compiler`]: `$BEMTVI_CC` wins, else a
-//! system `cc`/`clang`/`gcc`/`zig`, else a **pinned Zig** is fetched and
-//! checksum-verified ([`ensure_zig`]) so the user needs no toolchain at all.
+//! The compiler is resolved in [`resolve_compiler`]: an explicit `$BEMTVI_CC`
+//! wins, else a **pinned Zig** is fetched and checksum-verified ([`ensure_zig`]) —
+//! never a compiler found on PATH — so the user needs no toolchain at all.
 //!
 //! Everything fails *loud* (no silent stub ever leaves a half-installed grammar
 //! that "loads but is wrong"). Tests avoid the network via `$BEMTVI_TS_MIRROR`,
@@ -39,7 +39,7 @@ const NVIM_TS_REF: &str = "4916d6592ede8c07973490d9322f187e07dfefac";
 /// core repo's `runtime/queries/`. Pinned; override with `$BEMTVI_TS_TEXTOBJECTS_REF`.
 const NVIM_TS_TEXTOBJECTS_REF: &str = "898ee307df58f854d11cd7edd06472574d48014e";
 
-/// Zig version fetched when no system compiler is found. The per-target archive
+/// Zig version fetched to build every grammar (unless `$BEMTVI_CC` is set). The per-target archive
 /// + SHA-256 are pinned in [`zig_target`]; bump all three together.
 const ZIG_VERSION: &str = "0.15.2";
 
@@ -557,8 +557,8 @@ fn compile(cc: &[String], src_dir: &Path, parser_c: &Path, out: &Path) -> Result
         .is_some_and(|p| p.extension().is_some_and(|e| e != "c"));
 
     let (prog, prefix) = cc.split_first().context("empty compiler command")?;
-    // We drive Zig as `<zig> cc …` (a `cc` subcommand) — true whether Zig is on
-    // PATH (`prog == "zig"`) or a fetched binary (`prog` is a path / `zig.exe`),
+    // We drive Zig as `<zig> cc …` (a `cc` subcommand) — true whether it is the
+    // fetched binary (`prog` is a path / `zig.exe`) or a `$BEMTVI_CC="zig cc"`,
     // so key off the subcommand, not the program name.
     let is_zig = prefix.first().is_some_and(|a| a == "cc");
     let mut cmd = Command::new(prog);
@@ -597,23 +597,17 @@ fn compile(cc: &[String], src_dir: &Path, parser_c: &Path, out: &Path) -> Result
 // Compiler resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve a C compiler as an argv prefix, plus a human label. Order: `$BEMTVI_CC`
-/// (split on whitespace), then a system `cc`/`clang`/`gcc`, then a system `zig`,
-/// then a fetched pinned Zig (downloaded on demand) so the user needs nothing.
+/// Resolve a C compiler as an argv prefix, plus a human label: `$BEMTVI_CC` (split
+/// on whitespace) when explicitly set, else the pinned Zig (downloaded on demand).
+/// PATH is never probed — whatever `cc`/`gcc`/`zig` happens to be installed is
+/// unknown (a MinGW `gcc` can't build a loadable MSVC-ABI parser, a stale `zig`
+/// differs in flags), so every build uses the one toolchain we pinned and verified.
 fn resolve_compiler(data_dir: &Path) -> Result<(Vec<String>, String)> {
     if let Ok(cc) = std::env::var("BEMTVI_CC") {
         if !cc.trim().is_empty() {
             let argv: Vec<String> = cc.split_whitespace().map(str::to_string).collect();
             return Ok((argv, format!("$BEMTVI_CC ({cc})")));
         }
-    }
-    for c in ["cc", "clang", "gcc"] {
-        if program_exists(c, &[]) {
-            return Ok((vec![c.to_string()], c.to_string()));
-        }
-    }
-    if program_exists("zig", &["version"]) {
-        return Ok((vec!["zig".into(), "cc".into()], "zig (system)".to_string()));
     }
     let zig = ensure_zig(data_dir)?;
     Ok((
@@ -622,8 +616,6 @@ fn resolve_compiler(data_dir: &Path) -> Result<(Vec<String>, String)> {
     ))
 }
 
-/// Whether running `name <probe…>` succeeds (the compiler/toolchain is present).
-/// `--version` for the cc family, `version` for zig.
 /// Ensure `<grammar_root>/src/parser.c` exists, generating it from `grammar.js`
 /// when the repo committed only the grammar definition. bemtvi can't generate a
 /// parser itself — that needs the **`tree-sitter` CLI** and its JS toolchain — so if
@@ -681,14 +673,10 @@ fn tree_sitter_cli() -> Option<String> {
     program_exists("tree-sitter", &["--version"]).then(|| "tree-sitter".to_string())
 }
 
+/// Whether running `name <args…>` succeeds (the tool is present on PATH).
 fn program_exists(name: &str, args: &[&str]) -> bool {
-    let probe = if args.is_empty() {
-        &["--version"][..]
-    } else {
-        args
-    };
     Command::new(name)
-        .args(probe)
+        .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -732,8 +720,8 @@ fn zig_target() -> Result<(&'static str, &'static str)> {
             "b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370",
         ),
         (arch, os) => bail!(
-            "no pinned Zig for {arch}-{os}; install a C compiler (cc/clang/gcc) \
-             or set $BEMTVI_CC"
+            "no pinned Zig for {arch}-{os}; set $BEMTVI_CC to a C compiler \
+             (e.g. `cc` or `zig cc`)"
         ),
     };
     Ok(t)

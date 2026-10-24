@@ -218,14 +218,34 @@ async fn wait_for_message(
     incoming: &mut UnboundedReceiver<Incoming>,
     needle: &str,
 ) -> String {
-    for _ in 0..300 {
+    wait_for_message_within(rpc, incoming, needle, Duration::from_secs(30)).await
+}
+
+/// [`wait_for_message`] with an explicit time budget — the live test may first
+/// download the pinned Zig, which can take minutes.
+async fn wait_for_message_within(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    needle: &str,
+    budget: Duration,
+) -> String {
+    let last = std::cell::RefCell::new(String::new());
+    for _ in 0..budget.as_millis() / 100 {
         let _ = mode(rpc).await; // barrier: cycle the server loop
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| message(m).contains(needle)) {
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            let msg = message(m);
+            let hit = msg.contains(needle);
+            if !msg.is_empty() {
+                *last.borrow_mut() = msg;
+            }
+            hit
+        }) {
             return message(&map);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("timed out waiting for message containing {needle:?}");
+    let last = last.into_inner();
+    panic!("timed out waiting for message containing {needle:?}; last message: {last:?}");
 }
 
 /// Total treesitter highlight spans across all rows in a redraw frame
@@ -422,21 +442,35 @@ async fn ts_install_rust_over_the_real_network() {
     std::env::set_var("BEMTVI_DATA_DIR", &data_dir);
     std::env::remove_var("BEMTVI_TS_MIRROR");
     std::env::remove_var("BEMTVI_TS_REF");
-    std::env::set_var(
-        "BEMTVI_CC",
-        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
-    );
+    // The production path: build with the fetched pinned Zig, unless `$CC` pins one.
+    let pinned_cc = std::env::var("CC").ok();
+    match &pinned_cc {
+        Some(cc) => std::env::set_var("BEMTVI_CC", cc),
+        None => std::env::remove_var("BEMTVI_CC"),
+    }
 
     let file = write_temp("tsinstall_live", "rs", "fn main() {\n}\n");
     let (rpc, mut incoming) = start(Some(file)).await;
     feed(&rpc, ":set expandtab<CR>");
     feed(&rpc, ":TSInstall rust<CR>");
     // "installed" is not a substring of the transient "installing…" echo.
-    let msg = wait_for_message(&rpc, &mut incoming, "installed rust").await;
+    let msg = wait_for_message_within(
+        &rpc,
+        &mut incoming,
+        "installed rust",
+        Duration::from_secs(600),
+    )
+    .await;
     assert!(
         msg.contains("installed rust"),
         "live install failed: {msg:?}"
     );
+    if pinned_cc.is_none() {
+        assert!(
+            msg.contains("[zig (fetched)]"),
+            "expected the pinned Zig: {msg:?}"
+        );
+    }
     assert!(data_dir.join("parser/rust.so").exists());
 
     feed(&rpc, "ggA<CR>let x = 1;<Esc>");
@@ -515,6 +549,53 @@ async fn ts_install_unknown_language_fails_loud() {
     assert!(
         msg.contains("no parser named 'nonesuch'"),
         "expected a named failure, got: {msg:?}"
+    );
+}
+
+/// With no `$BEMTVI_CC`, the installer must compile with the pinned, fetched Zig
+/// under `<data>/zig/` — never a `cc`/`gcc`/`clang`/`zig` that happens to be on
+/// PATH. The "fetched" Zig is pre-seeded as a non-executable stub so no download
+/// happens and running it fails: the install must then fail loud naming that stub,
+/// where probing PATH would have silently built with the system compiler.
+#[tokio::test]
+async fn ts_install_never_uses_a_compiler_from_path() {
+    let _guard = test_lock().lock().await;
+    let (data_dir, _mirror) = fixture("nopathcc");
+    std::env::remove_var("BEMTVI_CC");
+    let stem = format!(
+        "zig-{}-{}-0.15.2",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    let fake_zig = data_dir
+        .join("zig/0.15.2")
+        .join(&stem)
+        .join(format!("zig{}", std::env::consts::EXE_SUFFIX));
+    write_under(&fake_zig, b"not a zig binary");
+
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":TSInstall rust<CR>");
+    // Wait for either outcome: success (a PATH compiler was used) or failure.
+    let mut msg = String::new();
+    for _ in 0..300 {
+        let _ = mode(&rpc).await;
+        let done = |m: &[(Value, Value)]| {
+            let t = message(m);
+            t.contains("TSInstall: rust failed") || t.contains("TSInstall: installed rust")
+        };
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, done) {
+            msg = message(&map);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::env::set_var(
+        "BEMTVI_CC",
+        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
+    );
+    assert!(
+        msg.contains("TSInstall: rust failed") && msg.contains(&stem),
+        "expected the build to run the pinned Zig ({stem}), got: {msg:?}"
     );
 }
 

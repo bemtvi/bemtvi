@@ -1276,7 +1276,7 @@ screen," and that is exactly the shape of these tests.
 - **Treesitter control.** `:TSInstall` / `:TSUpdate` / `:TSInstallInfo` have
   **landed**: the native arm fetches + compiles each grammar into the data dir
   off the editor thread (`bemtvi_ts::install`, with a pinned checksum-verified Zig
-  fetched on demand when no system `cc`/`clang`/`gcc`/`zig`/`$BEMTVI_CC` is found),
+  fetched on demand — never a compiler from PATH — unless `$BEMTVI_CC` is set),
   and the browser arm fetches a *prebuilt* `.wasm` grammar instead. The
   `:set`-driven highlight toggle has landed too. (Residual `:TSInstall` edges —
   grammars needing `tree-sitter generate`, no install-from-`HEAD` — are tracked in

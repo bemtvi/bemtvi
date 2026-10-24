@@ -67,8 +67,10 @@ pages from the caret's place. Each window keeps its own scroll while focus is
 elsewhere, including one you scrolled without focusing it. On macOS, Command with an arrow goes to the line's edges or the buffer's ends,
 and Option with Left or Right moves by word. Shift with any of them selects.
 
-The command palette lists every ex command. A command that needs an argument opens
-the `:` line with its name typed, ready for the rest.
+The command palette lists every picker (Live Grep, Buffers, Find Files, and any a
+plugin registers with a title) and every ex command. A picker row opens that picker.
+A command that needs an argument opens the `:` line with its name typed, ready for
+the rest.
 
 Every key is a default you can replace. The layout lives in its own keymap layer,
 `modeless`, which is consulted ahead of the Insert maps while a modeless session is

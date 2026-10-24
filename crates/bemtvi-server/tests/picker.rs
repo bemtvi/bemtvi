@@ -5004,3 +5004,81 @@ async fn the_filter_history_api_works_from_a_config() {
         "clearing the history from a config must not raise"
     );
 }
+
+/// The command palette (the `commands` source, `<C-S-p>` in the modeless layout)
+/// lists every titled picker next to the ex commands, so a picker with no ex
+/// command — live grep, buffers, a plugin's own — is reachable from it. Confirming
+/// such a row opens that picker. An untitled source is internal plumbing (the
+/// cmdline completers, the LSP location list) with no name to show, and stays out,
+/// as does the palette itself.
+#[tokio::test]
+async fn command_palette_lists_and_opens_the_titled_pickers() {
+    let dir = temp_dir("picker_palette_pickers");
+    let init = format!(
+        "{STATIC_SRC}\n\
+         btv.picker.source {{\n\
+           name = 'veg',\n\
+           title = 'Vegetables',\n\
+           items = function(ctx) ctx.push {{ text = 'kale' }} end,\n\
+         }}\n"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    exec_lua(
+        &rpc,
+        "btv.picker.open('commands', { query = 'Vegetables' })",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("palette opens"));
+    let rows = menu_items(&menu);
+    assert!(
+        rows.first().is_some_and(|r| r.starts_with("Vegetables")),
+        "a titled plugin picker is a palette row, got {rows:?}"
+    );
+
+    feed(&rpc, "<Esc>");
+    exec_lua(&rpc, "btv.picker.open('commands', { query = 'Live Grep' })").await;
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("palette reopens"),
+    );
+    let rows = menu_items(&menu);
+    assert!(
+        rows.iter().any(|r| r.starts_with("Live Grep")),
+        "the shipped live grep picker is a palette row, got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("fruits")),
+        "an untitled source stays out of the palette, got {rows:?}"
+    );
+
+    // Confirming the row opens the picker it names.
+    feed(&rpc, "<Esc>");
+    exec_lua(
+        &rpc,
+        "btv.picker.open('commands', { query = 'Vegetables' })",
+    )
+    .await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("palette opens again");
+    feed(&rpc, "<CR>");
+    let mut title = None;
+    for _ in 0..20 {
+        let Some(map) = poll_menu(&rpc, &mut incoming).await else {
+            break;
+        };
+        title = map_get(&menu_of(&map), "title")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if title.as_deref() == Some("Vegetables") {
+            break;
+        }
+    }
+    assert_eq!(
+        title.as_deref(),
+        Some("Vegetables"),
+        "confirm opens the named picker"
+    );
+}

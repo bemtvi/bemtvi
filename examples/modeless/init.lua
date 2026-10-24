@@ -37,7 +37,8 @@ btv.o.modeless = true
 --    that line out, which is why `<S-End>` is needed here.)
 
 -- 7. Commands without a Normal mode. `<C-S-p>` opens the command palette: type
---    `split`, `<Enter>`. `<C-;>` opens the `:` line itself, and `<C-s>` saves.
+--    `split`, `<Enter>`. Pickers are listed too: `<C-S-p>`, type `Live`, `<Enter>`
+--    opens Live Grep. `<C-;>` opens the `:` line itself, and `<C-s>` saves.
 
 -- 8. Your own keys. The layout is the `modeless` keymap layer, so a map there wins
 --    over the default. `<C-e>` here selects the rest of the line, `<S-End>`'s twin.

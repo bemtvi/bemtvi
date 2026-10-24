@@ -1679,16 +1679,32 @@ btv.picker.source({
   end,
 })
 
--- commands: every ex command the `:` line knows (`btv.cmdline_complete.catalog()`:
--- the built-ins, then user commands), the name as the aligned head and the
--- description as the text. Confirm runs a command that needs no argument, and opens
--- the `:` line prefilled with the name of one whose synopsis spells a required
--- `{arg}`, so it can be typed. The modeless key layout's command palette.
+-- commands: the command palette (the modeless key layout's `<C-S-p>`). Every titled
+-- picker comes first — its title as the head, so live grep and a plugin's own picker
+-- are reachable though no ex command opens them — then every ex command the `:` line
+-- knows (`btv.cmdline_complete.catalog()`: the built-ins, then user commands), the
+-- name as the head and the description as the text. An untitled source is internal
+-- plumbing (the cmdline completers, the LSP location list) with no name to show, so
+-- it stays out, as does the palette itself. Confirm opens a picker; runs a command
+-- that needs no argument; and opens the `:` line prefilled with the name of one whose
+-- synopsis spells a required `{arg}`, so it can be typed.
 btv.picker.source({
   name = "commands",
   title = "Commands",
   layer = "main",
   items = function(ctx)
+    local pickers = {}
+    for name, src in pairs(btv.picker._sources) do
+      if src.title and name ~= "commands" then
+        pickers[#pickers + 1] = { title = src.title, source = name }
+      end
+    end
+    table.sort(pickers, function(a, b)
+      return a.title < b.title
+    end)
+    for _, p in ipairs(pickers) do
+      ctx.push({ head = p.title .. " ", text = "picker", source = p.source })
+    end
     for _, c in ipairs(btv.cmdline_complete.catalog()) do
       ctx.push({
         head = c.name .. " ",
@@ -1699,10 +1715,12 @@ btv.picker.source({
     end
   end,
   confirm = function(item)
-    -- After this picker has torn down, so the command (or the line) acts on the
-    -- buffer the picker was opened over.
+    -- After this picker has torn down, so the command (or the line, or the next
+    -- picker) acts on the buffer the palette was opened over.
     btv.on_next_tick(function()
-      if item.needs_arg then
+      if item.source then
+        btv.picker.open(item.source)
+      elseif item.needs_arg then
         btv.cmdline.open(item.name .. " ")
       else
         btv.cmd(item.name)

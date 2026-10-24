@@ -43,3 +43,10 @@ btv.o.modeless = true
 -- 8. Your own keys. The layout is the `modeless` keymap layer, so a map there wins
 --    over the default. `<C-e>` here selects the rest of the line, `<S-End>`'s twin.
 btv.keymap.set("modeless", "<C-e>", "<S-End>", { desc = "Select to the end of the line" })
+
+-- 9. Scrolling. Open the long, wide file beside this one: `<C-;>`, then
+--    `e examples/modeless/wide.txt`, `<Enter>`, and `<C-;>` `set nowrap` `<Enter>`.
+--    The wheel scrolls without moving the caret, and a slim thumb on the right edge
+--    shows where you are. Shift with the wheel scrolls sideways (down goes right),
+--    and a thumb along the bottom follows. Type a letter: the view comes back to
+--    the caret.

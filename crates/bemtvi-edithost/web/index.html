@@ -43,6 +43,8 @@
      text rows (which draw on top) so glyphs sit over the tint — the column analogue
      of the per-row `--cursorline` tint. */
   .colorcolumn { position: absolute; top: 0; background: var(--colorcolumn); }
+  /* A modeless session's scroll markers: slim thumbs over the text's right and bottom edges. */
+  .scrollthumb { position: absolute; background: var(--fg); border-radius: 2px; pointer-events: none; }
   .win { position: absolute; overflow: hidden; }
   /* A floating window's opaque chrome box (blocks the tiled windows beneath). */
   .float-win { background: #18181d; }
@@ -1826,6 +1828,7 @@
           box.appendChild(rowEl);
         }
       }
+      renderScrollbars(box, w, rect, textRows);
       if (statusRows > 0 && w.status_visible !== false) {
         // The server renders the `'statusline'` `%`-format (or its built-in default) into
         // styled segments on BOTH builds, so paint those — they honour `:set statusline`.
@@ -1833,6 +1836,42 @@
         if (w.status?.length) renderStatusSegments(box, w.status, textRows, rect.width, w.focused);
         else renderStatus(box, w, textRows);
       }
+    }
+
+    // A span's thumb as [offset, length] along a `track`-px track, or null when all of
+    // it is in view — the twin of bemtvi-view's `ScrollSpan::thumb`. `span` is the
+    // redraw's [start, shown, total]; a view scrolled past the end sits at the end.
+    function scrollThumb(span, track, min) {
+      if (!span || track <= 0) return null;
+      const [start, shown, total0] = span;
+      if (total0 === 0 || (start === 0 && shown >= total0)) return null;
+      const total = Math.max(total0, start + shown);
+      const len = Math.min(Math.max(shown / total * track, Math.min(min, track)), track);
+      return [Math.min(start / total * track, track - len), len];
+    }
+
+    // A modeless session's scroll markers (`w.scrollbars`): a slim thumb on the right
+    // edge for the lines in view and one along the bottom of the text for the columns,
+    // over the rows (appended after them) and ignoring the pointer.
+    function renderScrollbars(box, w, rect, textRows) {
+      const sb = w.scrollbars;
+      if (!sb) return;
+      const thick = Math.max(cw * 0.3, 2);
+      const right = rect.width * cw, bottom = textRows * ch;
+      const textLeft = ((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0)) * cw;
+      const opacity = w.focused ? "0.35" : "0.2";
+      const thumb = (left, top, width, height) => {
+        const el = document.createElement("div");
+        el.className = "scrollthumb";
+        Object.assign(el.style, { left: left + "px", top: top + "px", width: width + "px", height: height + "px", opacity });
+        box.appendChild(el);
+      };
+      const v = scrollThumb(sb.v, bottom, ch);
+      if (v) thumb(right - thick - 1, v[0], thick, v[1]);
+      // The bottom track stops short of the right one, so the two never cross.
+      const trackEnd = v ? right - thick - 2 : right;
+      const h = scrollThumb(sb.h, trackEnd - textLeft, cw);
+      if (h) thumb(textLeft + h[0], bottom - thick - 1, h[1], thick);
     }
 
     // `'colorcolumn'`: append a thin vertical ruler to the window box for each

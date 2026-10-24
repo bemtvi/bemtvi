@@ -690,6 +690,7 @@ impl EditHost {
             (Value::from("leftcol"), Value::from(win.leftcol as u64)),
             (Value::from("text_pointer"), Value::from(win.text_pointer)),
             (Value::from("cursor_hidden"), Value::from(win.cursor_hidden)),
+            (Value::from("scrollbars"), scrollbars_value(win.scrollbars)),
             (
                 Value::from("file_name"),
                 // A hostile *name* is a first-class injection source (statusline,
@@ -3210,4 +3211,24 @@ fn guifont_spec_value(spec: &bemtvi_core::guifont::GuiFont) -> Value {
         (Value::from("size"), opt_f(spec.size)),
         (Value::from("fonts"), Value::Array(fonts)),
     ])
+}
+
+/// A window's scroll markers as `{ v = [start, shown, total], h = [...] }`; `h` is
+/// absent under `'wrap'`, and the whole value is nil without markers.
+fn scrollbars_value(sb: Option<bemtvi_core::view::ScrollMarkers>) -> Value {
+    let Some(sb) = sb else {
+        return Value::Nil;
+    };
+    let span = |s: bemtvi_core::view::ScrollSpan| {
+        Value::Array(vec![
+            Value::from(s.start as u64),
+            Value::from(s.shown as u64),
+            Value::from(s.total as u64),
+        ])
+    };
+    let mut m = vec![(Value::from("v"), span(sb.vertical))];
+    if let Some(h) = sb.horizontal {
+        m.push((Value::from("h"), span(h)));
+    }
+    Value::Map(m)
 }

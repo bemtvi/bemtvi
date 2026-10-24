@@ -41,5 +41,5 @@ pub use style::{Border, Style};
 pub use view::{
     ContentFloatData, FontSpec, GuiFontSpec, ImageData, MenuData, MenuField, MenuFilters,
     MenuPreview, MenuStyles, Padding, PmenuData, RegionTabline, RegionTablines, ScrollData,
-    Separator, TabData, View, WinRect, WindowRegion, WindowView,
+    ScrollSpan, Scrollbars, Separator, TabData, View, WinRect, WindowRegion, WindowView,
 };

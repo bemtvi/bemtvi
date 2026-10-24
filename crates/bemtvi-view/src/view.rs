@@ -123,6 +123,38 @@ impl Padding {
     }
 }
 
+/// A window's scroll position on both axes (the redraw's `scrollbars`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scrollbars {
+    /// In buffer lines.
+    pub vertical: ScrollSpan,
+    /// In screen columns; `None` under `'wrap'`.
+    pub horizontal: Option<ScrollSpan>,
+}
+
+/// The part of a length a view shows: `shown` units from `start`, of `total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollSpan {
+    pub start: u64,
+    pub shown: u64,
+    pub total: u64,
+}
+
+impl ScrollSpan {
+    /// The thumb as `(offset, length)` along a track `track` long, or `None` when
+    /// everything is in view. The thumb keeps at least `min` of length, and a view
+    /// scrolled past the end keeps its thumb at the track's end.
+    pub fn thumb(&self, track: f32, min: f32) -> Option<(f32, f32)> {
+        if self.total == 0 || (self.start == 0 && self.shown >= self.total) || track <= 0.0 {
+            return None;
+        }
+        let total = self.total.max(self.start + self.shown) as f32;
+        let len = (self.shown as f32 / total * track).clamp(min.min(track), track);
+        let off = (self.start as f32 / total * track).min(track - len);
+        Some((off, len))
+    }
+}
+
 /// One window's content mirrored from a redraw `windows[i]` sub-map: its screen
 /// rect, focus flag, and all the per-window fields (text, cursor, selection,
 /// search, syntax/diagnostics, gutter, and status-line data). The client paints
@@ -159,6 +191,9 @@ pub struct WindowView {
     /// Whether the cursor is scrolled off this window's screen (a modeless session's
     /// wheel leaves the caret where it was): draw no cursor.
     pub cursor_hidden: bool,
+    /// Where the view sits in its buffer, for the scroll markers a modeless session
+    /// paints over the text's right and bottom edges. `None` without markers.
+    pub scrollbars: Option<Scrollbars>,
     /// First visible screen column (horizontal scroll offset) under `nowrap`. The
     /// renderer drops this many leading screen cells from each text row and shifts
     /// the cursor and every span left by it; the number gutter is not offset.
@@ -1291,6 +1326,24 @@ impl View {
 /// `rect`) or the legacy flat top-level redraw (no `rect`, so the renderer gives
 /// the single window the whole windows area). `styles` is the global palette the
 /// window's scroll band snapshots.
+/// A redraw window's `scrollbars` (`{ v = [start, shown, total], h = [...] }`).
+fn parse_scrollbars(v: Option<&Value>) -> Option<Scrollbars> {
+    let m = v?.as_map()?;
+    let span = |key| {
+        let a = map_get(m, key)?.as_array()?;
+        let n = |i: usize| a.get(i).and_then(Value::as_u64);
+        Some(ScrollSpan {
+            start: n(0)?,
+            shown: n(1)?,
+            total: n(2)?,
+        })
+    };
+    Some(Scrollbars {
+        vertical: span("v")?,
+        horizontal: span("h"),
+    })
+}
+
 fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
     let rect = match map_get(m, "rect") {
         Some(Value::Map(r)) => Some(WinRect {
@@ -1351,6 +1404,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         secondary_cursors: parse_cursor_list(map_get(m, "cursors")),
         text_pointer: map_get(m, "text_pointer").and_then(Value::as_bool) == Some(true),
         cursor_hidden: map_get(m, "cursor_hidden").and_then(Value::as_bool) == Some(true),
+        scrollbars: parse_scrollbars(map_get(m, "scrollbars")),
         leftcol: map_u16(m, "leftcol"),
         status: parse_status(map_get(m, "status"), styles),
         // Default true so an older server (no flag) keeps the per-window status.

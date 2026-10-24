@@ -11,7 +11,8 @@
 // reach the editor with their Shift (`<C-S-z>`, not `<C-z>`), Shift+arrows select and
 // typing replaces, and on a Mac the layout is on Command. Then the look: the cursor is a
 // blinking bar caret (at a selection's head), and the pointer is an I-beam over editable
-// text but the arrow over the gutter and over a popup.
+// text but the arrow over the gutter and over a popup. And the scroll markers, with
+// Shift and the wheel scrolling sideways.
 //
 // Prereqs: ./build.sh (dist/eh.mjs + eh.wasm) and a Chromium for Playwright. Run:
 //   node verify-modeless.mjs
@@ -237,8 +238,30 @@ try {
       hidden && revealed && composed === "Z日row1", JSON.stringify({ hidden, revealed, composed }));
     await page.evaluate(() => document.getElementById("kbd").focus());
 
+    // The scroll markers: a thumb on the right edge for the lines in view, and under
+    // 'nowrap' one along the bottom for the columns; Shift with the wheel scrolls
+    // sideways and moves the bottom one.
+    await luaStr(page, "local t = {} for i = 1, 300 do t[i] = ('w'):rep(300) .. i end " +
+      "btv.buf.set_lines(0, 0, -1, false, t) btv.win.set_cursor(0, 1, 0) btv.wo.wrap = false return 'ok'");
+    await sleep(200);
+    const thumbs = () => page.evaluate(() =>
+      [...document.querySelectorAll(".scrollthumb")].map((e) => ({ left: e.offsetLeft, top: e.offsetTop, w: e.offsetWidth, h: e.offsetHeight })));
+    const before = await thumbs();
+    await page.mouse.move(g.x, g.y);
+    await page.keyboard.down("Shift");
+    for (let i = 0; i < 5; i++) { await page.mouse.wheel(0, 300); await sleep(30); }
+    await page.keyboard.up("Shift");
+    await sleep(300);
+    const after = await thumbs();
+    const leftcol = await page.evaluate(() => window.__bemtvi.frame().windows.find((w) => w.focused)?.leftcol);
+    const flat = (t) => t.find((e) => e.w > e.h);
+    check("two scroll markers, and Shift with the wheel moves the bottom one right",
+      before.length === 2 && after.length === 2 && leftcol > 0 && flat(after)?.left > flat(before)?.left,
+      JSON.stringify({ before, after, leftcol }));
     await luaStr(page, "btv.o.modeless = false return 'ok'");
     await sleep(200);
+    const none = await thumbs();
+    check("vim mode has no scroll markers", none.length === 0, JSON.stringify(none));
     c = await caret();
     check("vim mode keeps vim's cursor", c !== null && !c.cls.includes("caret"), JSON.stringify(c));
     await page.close();

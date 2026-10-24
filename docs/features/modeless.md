@@ -60,14 +60,22 @@ first non-blank and then to column 0, `<C-Home>` / `<C-End>` go to the buffer's
 ends, and `<PageUp>` / `<PageDown>` slide the view a page with the caret keeping its
 row on screen.
 
+On macOS, Command with an arrow goes to the line's edges or the buffer's ends, and
+Option with Left or Right moves by word. Shift with any of them selects.
+
 The mouse wheel scrolls the view and nothing else. The caret and any selection stay
 where they are, even off screen, and the first key that types or moves the caret
 brings the view back to it, as does an input method starting to compose. A page key
-pages from the caret's place. Shift with the wheel scrolls sideways (down goes
-right), as does a tilting wheel or a touchpad; a long line only scrolls sideways
-with `'wrap'` off. Each window keeps its own scroll while focus is
-elsewhere, including one you scrolled without focusing it. On macOS, Command with an arrow goes to the line's edges or the buffer's ends,
-and Option with Left or Right moves by word. Shift with any of them selects.
+pages from the caret's place. Each window keeps its own scroll while focus is
+elsewhere, including one you scrolled without focusing it. Shift with the wheel
+scrolls sideways (down goes right), as does a tilting wheel or a touchpad; a long
+line only scrolls sideways with `'wrap'` off.
+
+Each window shows where its view is: a slim thumb along the right edge for the lines
+in view, and with `'wrap'` off one along the bottom of the text for the columns,
+measured against the widest line on screen (as far as you can scroll). A thumb
+shows only when there is something to scroll to. It marks the place and does not
+take clicks or drags yet. Floating windows have none.
 
 The command palette lists every picker (Live Grep, Buffers, Find Files, and any a
 plugin registers with a title) and every ex command. A picker row opens that picker.

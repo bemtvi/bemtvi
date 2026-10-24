@@ -137,4 +137,23 @@ btv.test.describe("examples/modeless", function()
     t:feed("<C-Right><C-e>!")
     btv.test.expect(t:line(1)).to_be("The!")
   end)
+
+  btv.test.it("9 — the wheel scrolls the view, and Shift with it scrolls sideways", function(t)
+    t:feed("<C-;>e " .. DIR .. "/wide.txt<CR>")
+    t:feed("<C-;>set nowrap<CR>")
+    btv.test.expect(t:mode()).to_be("i")
+    for _ = 1, 5 do
+      t:mouse("wheel", "down", 5, 5)
+    end
+    btv.test.expect(btv.win.saveview().topline).to_be(16)
+    btv.test.expect(t:cursor()).to_equal({ 1, 0 })
+    for _ = 1, 3 do
+      t:mouse("wheel", "down", 5, 5, "s")
+    end
+    btv.test.expect(btv.win.saveview().leftcol).to_be(18)
+    btv.test.expect(btv.win.saveview().topline).to_be(16)
+    t:feed("Z")
+    btv.test.expect(t:line(1):sub(1, 4)).to_be("Z001")
+    btv.test.expect(btv.win.saveview().topline).to_be(1)
+  end)
 end)

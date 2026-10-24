@@ -1062,6 +1062,7 @@ impl Renderer {
             let rect = pad_rect(rect, win.padding);
             let win_scroll = if win.focused { scroll } else { None };
             self.build_window(view, win, win_scroll, rect, quads, items, image_draws);
+            self.build_scrollbars(view, win, rect, overlay_quads);
         }
 
         // Separators between splits — thin lines, each offset by its region's
@@ -3779,6 +3780,71 @@ impl Renderer {
     }
 
     /// Pixel origin of cell `(col, row)`.
+    /// A modeless session's scroll markers over window `win`'s text, whose content
+    /// box is `rect` (cells): a slim thumb along the right edge for the lines in view
+    /// and one along the bottom of the text for the columns, each only where there is
+    /// something to scroll to. Into the overlay layer, so they sit over the text and
+    /// under floats and popups.
+    fn build_scrollbars(
+        &self,
+        view: &View,
+        win: &WindowView,
+        rect: (u16, u16, u16, u16),
+        overlay_quads: &mut Vec<Quad>,
+    ) {
+        let Some(sb) = win.scrollbars else {
+            return;
+        };
+        let (x, y, w, h) = rect;
+        let text_rows = h.saturating_sub(u16::from(win.status_visible));
+        let gutter = if win.number || win.relativenumber {
+            win.number_width
+        } else {
+            0
+        };
+        let text_x0 = (x + win.foldcolumn_width + win.sign_width + gutter).min(x + w);
+        let (left, top) = self.cell_px(x, y);
+        let (text_left, _) = self.cell_px(text_x0, y);
+        let right = left + w as f32 * self.cell_w;
+        let bottom = top + text_rows as f32 * self.cell_h;
+        // Slim enough to leave the glyph under it readable, and never under a couple
+        // of device pixels.
+        let thick = (self.cell_w * 0.3).max(2.0 * self.scale);
+        let inset = self.scale;
+        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+        let color = srgb_to_color_rgba(fg, if win.focused { 0.35 } else { 0.2 });
+        let vertical = sb.vertical.thumb(bottom - top, self.cell_h);
+        if let Some((off, len)) = vertical {
+            overlay_quads.push(Quad {
+                x: right - thick - inset,
+                y: top + off,
+                w: thick,
+                h: len,
+                color,
+                punch: false,
+            });
+        }
+        // The bottom track stops short of the right one, so the two never cross.
+        let track_end = if vertical.is_some() {
+            right - thick - 2.0 * inset
+        } else {
+            right
+        };
+        if let Some((off, len)) = sb
+            .horizontal
+            .and_then(|s| s.thumb(track_end - text_left, self.cell_w))
+        {
+            overlay_quads.push(Quad {
+                x: text_left + off,
+                y: bottom - thick - inset,
+                w: len,
+                h: thick,
+                color,
+                punch: false,
+            });
+        }
+    }
+
     fn cell_px(&self, col: u16, row: u16) -> (f32, f32) {
         (col as f32 * self.cell_w, row as f32 * self.cell_h)
     }

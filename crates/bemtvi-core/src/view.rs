@@ -435,6 +435,23 @@ pub struct Separator {
     pub region: WindowRegion,
 }
 
+/// A window's position in its buffer, on both axes. See [`WindowView::scrollbars`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollMarkers {
+    /// In buffer lines.
+    pub vertical: ScrollSpan,
+    /// In screen columns, `None` under `'wrap'`, which never scrolls sideways.
+    pub horizontal: Option<ScrollSpan>,
+}
+
+/// The part of a length a view shows: `shown` units from `start`, of `total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollSpan {
+    pub start: usize,
+    pub shown: usize,
+    pub total: usize,
+}
+
 /// One window's renderable content: its screen `rect`, whether it holds focus,
 /// and every field that is per-window (text, cursor, selection, search, gutter,
 /// status-line data, and any scroll gesture). The client paints each window at
@@ -501,6 +518,10 @@ pub struct WindowView {
     /// [`Editor::detach_view`]). The client draws no cursor then; `cursor_row` is
     /// clamped to an edge and means nothing.
     pub cursor_hidden: bool,
+    /// Where the view sits in what it shows, for the scroll markers a modeless
+    /// client paints over the text's right and bottom edges. `None` outside a
+    /// modeless session and on a float.
+    pub scrollbars: Option<ScrollMarkers>,
     /// File name for this window's status line (`"[No Name]"` when unset).
     pub file_name: String,
     /// The buffer's **effective** treesitter filetype/language — the override
@@ -1153,6 +1174,31 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             || (!wrap && (cursor_screen_col < w.leftcol || cursor_screen_col >= w.leftcol + width))
     };
 
+    // The scroll markers: the lines the rows show (a closed fold counts every line
+    // it hides), and sideways, the widest line in view, which is as far as the
+    // wheel can scroll.
+    let scrollbars = (ed.options.modeless && !w.floating).then(|| {
+        let last = rows
+            .iter()
+            .filter_map(|r| r.line())
+            .max()
+            .map(|l| collapsed.iter().find(|f| f.start == l).map_or(l, |f| f.end));
+        let vertical = ScrollSpan {
+            start: top,
+            shown: last.map_or(0, |l| l + 1 - top.min(l)),
+            total: line_count,
+        };
+        let horizontal = (!wrap).then(|| ScrollSpan {
+            start: w.leftcol,
+            shown: width,
+            total: (ed.window_max_leftcol(w.id) + width).max(w.leftcol + width),
+        });
+        ScrollMarkers {
+            vertical,
+            horizontal,
+        }
+    });
+
     // Secondary multi-cursors visible in the focused window, as (row, screen
     // col). Off-screen cursors are dropped; the primary is carried separately.
     let secondary_cursors = if w.focused {
@@ -1268,6 +1314,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         secondary_cursors,
         text_pointer: ed.text_pointer_over(w.buffer),
         cursor_hidden,
+        scrollbars,
         file_name,
         filetype,
         code_blocks: ed.doc_float_code_blocks(w.buffer).to_vec(),

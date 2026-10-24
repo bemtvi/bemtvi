@@ -1542,3 +1542,105 @@ async fn the_wheel_sideways_over_another_window_keeps_its_scroll_and_caret() {
     // The smallest scroll that shows the caret, now on column 1.
     assert_eq!(leftcol(&rpc).await, 1, "typing brings the view back");
 }
+
+// ===== Scroll markers =========================================================
+
+/// The focused window's `scrollbars` in `map`: its vertical `[start, shown, total]`
+/// and its horizontal one, if any. `None` when the window carries no markers.
+fn scrollbars(map: &[(Value, Value)]) -> Option<(Vec<u64>, Option<Vec<u64>>)> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        panic!("no windows in the redraw");
+    };
+    let w = wins
+        .iter()
+        .filter_map(Value::as_map)
+        .find(|w| flag(w, "focused"))
+        .expect("a focused window");
+    let sb = map_get(w, "scrollbars")
+        .filter(|v| !v.is_nil())?
+        .as_map()
+        .expect("a map");
+    let span = |key| {
+        map_get(sb, key).map(|v| {
+            v.as_array()
+                .expect("an array")
+                .iter()
+                .map(|n| n.as_u64().expect("a count"))
+                .collect::<Vec<_>>()
+        })
+    };
+    Some((span("v").expect("a vertical span"), span("h")))
+}
+
+/// The focused window's text rows.
+async fn text_rows(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return vim.api.nvim_win_get_height(0)")
+        .await
+        .as_u64()
+        .expect("a height")
+}
+
+#[tokio::test]
+async fn the_markers_say_where_the_view_is_in_the_buffer() {
+    let (rpc, mut inc) = start_long(200).await;
+    wheel_down(&rpc, 10);
+    let top = topline(&rpc).await as u64;
+    let rows = text_rows(&rpc).await;
+    let map = redraw_after(&rpc, &mut inc, "").await;
+    let (v, h) = scrollbars(&map).expect("markers in a modeless session");
+    assert_eq!(
+        v,
+        vec![top - 1, rows, 200],
+        "from the top line, a screenful of 200"
+    );
+    let (_, h) = (v, h.expect("a sideways span under 'nowrap'"));
+    assert!(
+        h[1] >= h[2],
+        "every line fits, so nothing to scroll to: {h:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_sideways_marker_spans_the_widest_line_in_view() {
+    let (rpc, mut inc) = start_wide(200).await;
+    for _ in 0..5 {
+        feed_mouse(&rpc, "wheel", "right", 5, 5);
+    }
+    let width = exec_lua(&rpc, "return vim.api.nvim_win_get_width(0)")
+        .await
+        .as_u64()
+        .expect("a width");
+    let map = redraw_after(&rpc, &mut inc, "").await;
+    let (_, h) = scrollbars(&map).expect("markers");
+    assert_eq!(h, Some(vec![30, width, 300]));
+}
+
+#[tokio::test]
+async fn a_wrapped_window_has_no_sideways_marker() {
+    let (rpc, mut inc) = start_wide(200).await;
+    command(&rpc, "set wrap").await;
+    let map = redraw_after(&rpc, &mut inc, "").await;
+    let (v, h) = scrollbars(&map).expect("markers");
+    assert_eq!(v[0], 0);
+    assert!(v[1] < 22, "a wrapped line takes several rows: {v:?}");
+    assert_eq!(h, None);
+}
+
+#[tokio::test]
+async fn vim_mode_has_no_markers() {
+    let text: String = (0..200).map(|i| format!("line{i}\n")).collect();
+    let (rpc, mut inc) = start_as("gui", &text).await;
+    let map = redraw_after(&rpc, &mut inc, "").await;
+    assert_eq!(scrollbars(&map), None);
+}
+
+#[tokio::test]
+async fn a_closed_fold_counts_every_line_it_hides() {
+    let (rpc, mut inc) = start_long(200).await;
+    // A fold of 50 lines on the last row on screen.
+    let rows = text_rows(&rpc).await;
+    exec_lua(&rpc, &format!("btv.cmd('normal! {rows}Gzf49jgg')")).await;
+    let map = redraw_after(&rpc, &mut inc, "").await;
+    let (v, _) = scrollbars(&map).expect("markers");
+    assert_eq!(v, vec![0, rows - 1 + 50, 200]);
+}

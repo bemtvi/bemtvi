@@ -1757,9 +1757,11 @@
       box.className = "win";
       place(box, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
       // The pointer over this window's text is the I-beam (see `textPointerAt`); the
-      // text starts past the fold, sign and number gutters.
+      // text starts past the fold, sign and number gutters, and only a row showing a
+      // buffer line has any (a virtual line or a `~` filler has no number).
       if (w.text_pointer) {
         box.dataset.tp = String((w.foldcolumn_width || 0) + (w.sign_width || 0) + (w.number_width || 0));
+        box._numbers = w.numbers || [];
       }
       // This window's `'winhighlight'` chrome override (a dock's `Normal:NormalSB`
       // sidebar look), painted on its own box so only this window is recolored.
@@ -3691,16 +3693,18 @@
     }
     // Whether the pointer at client `(x, y)` is over the text of a window that takes
     // the I-beam (a modeless session over a buffer it types into): on a text row of a
-    // `data-tp` window box, past its gutters. The element under the pointer decides,
-    // so a popup, a float or a status line over the text keeps the arrow.
+    // `data-tp` window box, past its gutters, on a row that shows a buffer line. The
+    // element under the pointer decides, so a popup, a float or a status line over the
+    // text keeps the arrow.
     function textPointerAt(x, y) {
       const el = document.elementFromPoint(x, y);
       const row = el?.closest?.(".row");
       if (!row || row.classList.contains("statusline")) return false;
       const box = row.closest(".win");
       if (!box || box.dataset.tp == null) return false;
-      const col = Math.floor((x - box.getBoundingClientRect().left) / cw);
-      return col >= Number(box.dataset.tp);
+      const r = box.getBoundingClientRect();
+      const line = box._numbers?.[Math.floor((y - r.top) / ch)];
+      return line != null && Math.floor((x - r.left) / cw) >= Number(box.dataset.tp);
     }
     // Set the grid's hover cursor from the cell under the pointer (left as-is while
     // a drag is in progress — that keeps the cursor it grabbed with).

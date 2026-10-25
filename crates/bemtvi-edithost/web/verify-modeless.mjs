@@ -179,6 +179,10 @@ try {
     await sleep(200);
     check("the pointer is an I-beam over the text", (await pointerAt(0, 8)) === "text");
     check("…and the arrow over the line numbers", (await pointerAt(0, 0)) === "");
+    await luaStr(page, "btv.buf.set_lines(0, 0, -1, false, { 'one', 'two' }) btv.win.set_cursor(0, 1, 0) return 'ok'");
+    await sleep(200);
+    check("…and over the `~` rows past the buffer, where there's nothing to select",
+      (await pointerAt(1, 8)) === "text" && (await pointerAt(5, 8)) === "");
     await luaStr(page, "btv.ui.float({ 'a hover popup', 'over the text' }, { relative = 'editor', persist = true }) return 'ok'");
     await page.waitForSelector(".pmenu", { timeout: 3000 }).catch(() => {});
     const box = await page.evaluate(() => {

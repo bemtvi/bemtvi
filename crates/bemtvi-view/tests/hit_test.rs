@@ -198,6 +198,7 @@ fn text_win(rect: WinRect, text: bool) -> WindowView {
         region: WindowRegion::Main,
         text_pointer: text,
         status_visible: true,
+        numbers: (1..=usize::from(rect.height)).map(Some).collect(),
         ..Default::default()
     }
 }
@@ -258,4 +259,29 @@ fn a_read_only_window_or_a_float_over_the_text_keeps_the_arrow() {
         "the read-only split"
     );
     assert!(!text_pointer_at(&view, geo(), 3, 10), "the float on top");
+}
+
+#[test]
+fn the_rows_past_the_buffer_keep_the_arrow() {
+    // Two buffer lines, a virtual line under the first, then `~` fillers.
+    let mut win = text_win(
+        WinRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 23,
+        },
+        true,
+    );
+    win.numbers = vec![Some(1), None, Some(2), None, None];
+    win.virt_lines = vec![None, Some(Vec::new()), None, None, None];
+    let view = View {
+        windows: vec![win],
+        ..Default::default()
+    };
+    assert!(text_pointer_at(&view, geo(), 0, 10));
+    assert!(text_pointer_at(&view, geo(), 2, 10), "a line's row");
+    assert!(!text_pointer_at(&view, geo(), 1, 10), "a virtual line");
+    assert!(!text_pointer_at(&view, geo(), 3, 10), "a `~` filler");
+    assert!(!text_pointer_at(&view, geo(), 10, 10), "past the last row");
 }

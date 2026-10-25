@@ -251,7 +251,7 @@ impl Editor {
         // placement may snap the primary onto a placed cursor, which the view
         // stash below must capture.
         self.stash_secondary_cursors();
-        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        let ((cursor, sel), top, leftcol) = (self.caret_to_stash(), self.top, self.leftcol);
         // A window whose buffer is still an in-flight off-tick read (a daemon / browser
         // session) is showing an EMPTY replica, so its live cursor is the placeholder the
         // clamp produced — stash the position it is waiting for instead, or leaving the
@@ -268,6 +268,7 @@ impl Editor {
         };
         let w = self.windows.cur_mut();
         w.saved_cursor = cursor;
+        w.saved_sel = sel;
         w.saved_top = top;
         w.saved_leftcol = leftcol;
     }

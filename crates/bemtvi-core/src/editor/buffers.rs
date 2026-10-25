@@ -1649,10 +1649,11 @@ impl Editor {
             return;
         }
         // Stash the outgoing position with its buffer; it becomes the alternate.
-        let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        let ((cursor, sel), top, leftcol) = (self.caret_to_stash(), self.top, self.leftcol);
         let outgoing = self.cur_buffer();
         let out = self.buffers.get_mut(outgoing);
         out.saved_cursor = cursor;
+        out.saved_sel = sel;
         out.saved_top = top;
         out.saved_leftcol = leftcol;
         // Leaving a buffer records its last-cursor mark `"` (vim's definition), so
@@ -1771,11 +1772,12 @@ impl Editor {
     /// the caller is responsible for that (or the outgoing buffer is gone, as
     /// when `:bdelete` removes the current one).
     fn enter_buffer(&mut self, id: BufferId) {
-        let incoming = self.buffers.get(id);
-        let (saved_cursor, saved_top, saved_leftcol) = (
+        let incoming = self.buffers.get_mut(id);
+        let (saved_cursor, saved_top, saved_leftcol, saved_sel) = (
             incoming.saved_cursor,
             incoming.saved_top,
             incoming.saved_leftcol,
+            incoming.saved_sel.take(),
         );
         self.set_cur_buffer(id);
         self.cursor = saved_cursor;
@@ -1783,7 +1785,7 @@ impl Editor {
         self.leftcol = saved_leftcol;
         self.mode = Mode::Normal;
         self.reset_transient_state();
-        self.clamp_cursor();
+        self.land_stashed_caret(saved_sel);
         self.ensure_visible();
         // A reopened file gets its shada-restored manual folds back when it becomes
         // the focused window's buffer (guarded on the window having no folds yet, so

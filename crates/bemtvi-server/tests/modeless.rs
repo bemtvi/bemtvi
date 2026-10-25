@@ -1644,3 +1644,74 @@ async fn a_closed_fold_counts_every_line_it_hides() {
     let (v, _) = scrollbars(&map).expect("markers");
     assert_eq!(v, vec![0, rows - 1 + 50, 200]);
 }
+
+// ===== Leaving and coming back keeps the caret and the selection ==============
+
+/// Two files, the first one current with `ha` selected on its second line.
+async fn select_then_open_another() -> (Rpc, FakeClipboard, UnboundedReceiver<Incoming>, String) {
+    let (rpc, clip, inc) = start_clip("alpha one\nalpha two\n").await;
+    let other = write_temp("modeless_other", "txt", "beta\n");
+    feed(&rpc, "<Down><Right><Right><Right><S-Right><S-Right>");
+    assert_eq!(mode(&rpc).await, "s");
+    (rpc, clip, inc, other)
+}
+
+#[tokio::test]
+async fn switching_buffers_and_back_keeps_the_selection() {
+    let (rpc, _clip, _inc, other) = select_then_open_another().await;
+    command(&rpc, &format!("edit {other}")).await;
+    assert_eq!(mode(&rpc).await, "i");
+    feed(&rpc, "<C-S-Tab>");
+    assert_eq!(mode(&rpc).await, "s", "the selection is back");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["alpha one", "alpX two"]));
+    // And again with the keys both ways.
+    feed(&rpc, "<S-Left>");
+    feed(&rpc, "<C-Tab>");
+    feed(&rpc, "<C-S-Tab>");
+    feed(&rpc, "Y");
+    assert_eq!(lines(&rpc).await, v(&["alpha one", "alpY two"]));
+}
+
+#[tokio::test]
+async fn switching_buffers_and_back_keeps_a_caret_at_the_line_end() {
+    let (rpc, _clip, _inc, other) = select_then_open_another().await;
+    feed(&rpc, "<Up><End>");
+    command(&rpc, &format!("edit {other}")).await;
+    feed(&rpc, "<C-S-Tab>");
+    feed(&rpc, "!");
+    assert_eq!(lines(&rpc).await, v(&["alpha one!", "alpha two"]));
+}
+
+#[tokio::test]
+async fn switching_tabs_and_back_keeps_the_selection() {
+    let (rpc, _clip, _inc, other) = select_then_open_another().await;
+    command(&rpc, &format!("tabedit {other}")).await;
+    assert_eq!(mode(&rpc).await, "i");
+    command(&rpc, "tabprevious").await;
+    assert_eq!(mode(&rpc).await, "s", "the selection is back");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["alpha one", "alpX two"]));
+}
+
+#[tokio::test]
+async fn switching_windows_and_back_keeps_the_selection() {
+    let (rpc, _clip, _inc, other) = select_then_open_another().await;
+    let first = exec_lua(&rpc, "return btv.win.current()").await;
+    command(&rpc, &format!("vsplit {other}")).await;
+    assert_eq!(lines(&rpc).await, v(&["beta"]));
+    exec_lua(&rpc, &format!("btv.win.set_current({first})")).await;
+    assert_eq!(mode(&rpc).await, "s", "the selection is back");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["alpha one", "alpX two"]));
+}
+
+#[tokio::test]
+async fn a_selection_left_behind_is_not_restored_over_a_move() {
+    // Something that moves the caret between the switch and the settle wins.
+    let (rpc, _clip, _inc, other) = select_then_open_another().await;
+    command(&rpc, &format!("edit {other}")).await;
+    exec_lua(&rpc, "btv.cmd('bprevious'); btv.cmd('normal! gg')").await;
+    assert_eq!(mode(&rpc).await, "i");
+    assert_eq!(cursor(&rpc).await, (1, 0));
+}

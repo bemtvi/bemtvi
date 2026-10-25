@@ -510,6 +510,9 @@ struct OpenBuffer {
     saved_cursor: Cursor,
     saved_top: usize,
     saved_leftcol: usize,
+    /// The modeless selection the buffer was left with, if any (its head is
+    /// `saved_cursor`). See [`Editor::caret_to_stash`].
+    saved_sel: Option<modeless::CaretSel>,
     /// Which window [`Layer`] this buffer belongs to — the layer of the window it
     /// was last shown in. The buffer list is **per-layer**: `:ls` lists only the
     /// focused layer's buffers, and closing a buffer falls back to a sibling in the
@@ -531,6 +534,7 @@ impl OpenBuffer {
             saved_cursor: Cursor::default(),
             saved_top: 0,
             saved_leftcol: 0,
+            saved_sel: None,
             // Assigned to the live layer as soon as the buffer is shown in a window;
             // the startup buffer (created before any dock) is a main buffer.
             layer: Layer::Main,
@@ -1481,6 +1485,11 @@ pub struct Editor {
     /// [`modeless::CaretSel`]). `None` outside Select, and for a Select a plugin
     /// entered over a range.
     nm_sel: Option<modeless::CaretSel>,
+    /// The selection a window or buffer that just took focus had when it lost it,
+    /// waiting for [`settle_modeless`](Self::settle_modeless) to bring it back as
+    /// the session comes back to typing. The buffer and caret it was stashed with
+    /// are kept so it only comes back while nothing has moved the caret since.
+    entry_sel: Option<(BufferId, modeless::CaretSel)>,
     /// Each modeless window the wheel scrolled away from its caret, and the state
     /// it left the caret in (see [`modeless::ViewDetached`]). While that state holds,
     /// [`ensure_visible`](Self::ensure_visible) leaves the window's view where the
@@ -2344,6 +2353,7 @@ impl Editor {
             helix: false,
             ui_client: modeless::UiClient::Unknown,
             nm_sel: None,
+            entry_sel: None,
             view_detached: HashMap::new(),
             helix_smart_case: true,
             helix_count: None,

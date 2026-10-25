@@ -248,9 +248,17 @@ impl Editor {
         if self.mode != Mode::Select {
             self.nm_sel = None;
         }
+        let entry_sel = self.entry_sel.take();
         match self.mode {
             Mode::Normal if self.pending.is_clean() && self.rests_in_insert() => {
                 self.enter_resting_insert();
+                // Back in a window or buffer that was left with a selection, and
+                // nothing has moved the caret since: the selection comes back too.
+                if let Some((buf, sel)) = entry_sel {
+                    if buf == self.cur_buffer() && sel.head == self.cursor {
+                        self.set_caret_selection(sel);
+                    }
+                }
             }
             Mode::Insert | Mode::Replace if !self.modifiable() => self.leave_resting_insert(),
             // A selection is Select, never Visual, over a modifiable buffer: a mouse
@@ -500,6 +508,48 @@ impl Editor {
         self.mode = Mode::Insert;
         self.cursor = at;
         self.clamp_cursor();
+    }
+
+    /// What a window or buffer stashes of the caret as it loses focus: where the
+    /// caret stands, and the modeless selection if there is one. A selection's caret
+    /// is its head, which Select's inclusive cursor can't hold (it may be past the
+    /// last selected character), so that is the position stashed.
+    pub(crate) fn caret_to_stash(&self) -> (Cursor, Option<CaretSel>) {
+        match self.modeless_caret_head() {
+            Some(head) => (head, Some(self.caret_selection())),
+            None => (self.cursor, None),
+        }
+    }
+
+    /// Clamp the cursor a window or buffer just took focus with, which it does in
+    /// Normal. A modeless session goes straight back to typing there, so a caret
+    /// at a line's end stays there instead of stepping back onto the last
+    /// character, and the selection it was left with (`sel`, from
+    /// [`caret_to_stash`](Self::caret_to_stash)) waits for
+    /// [`settle_modeless`](Self::settle_modeless) to bring it back. A selection the
+    /// text no longer has room for is dropped.
+    pub(crate) fn land_stashed_caret(&mut self, sel: Option<CaretSel>) {
+        let at_eol = self.rests_in_insert() && self.cursor.col >= self.line_len();
+        self.clamp_cursor();
+        if at_eol {
+            self.cursor.col = self.line_len();
+        }
+        self.entry_sel = sel
+            .filter(|s| {
+                self.rests_in_insert()
+                    && s.head == self.cursor
+                    && self.caret_fits(s.anchor)
+                    && self.caret_fits(s.head)
+            })
+            .map(|s| (self.cur_buffer(), s));
+    }
+
+    /// Whether `at` is a caret position in the current buffer: on a line it has,
+    /// at most at that line's end, and between characters.
+    fn caret_fits(&self, at: Cursor) -> bool {
+        at.line <= self.last_line()
+            && at.col <= self.buffer().line_len(at.line)
+            && self.buffer().line(at.line).is_char_boundary(at.col)
     }
 
     /// Navigation in a modeless session, for Insert and Select alike: arrows,

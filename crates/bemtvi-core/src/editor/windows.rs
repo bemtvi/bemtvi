@@ -379,6 +379,9 @@ pub(crate) struct Window {
     pub(crate) saved_cursor: Cursor,
     pub(crate) saved_top: usize,
     pub(crate) saved_leftcol: usize,
+    /// The modeless selection the window was left with, if any (its head is
+    /// `saved_cursor`). See [`Editor::caret_to_stash`].
+    pub(crate) saved_sel: Option<super::modeless::CaretSel>,
     /// Set when the screen width changed while this window was **parked** (an
     /// inactive tab, or a non-focused layer's tab): its `saved_leftcol` was derived
     /// against a viewport width that no longer applies, and no rect exists to measure
@@ -609,6 +612,7 @@ impl WindowTree {
             saved_cursor,
             saved_top,
             saved_leftcol,
+            saved_sel: None,
             leftcol_needs_clamp: false,
             saved_cursors: Vec::new(),
             rect: Rect::default(),
@@ -2433,6 +2437,7 @@ impl Editor {
     /// the new top/left window as vim's `:split` / `:vsplit` do. Both windows
     /// then show the same view position; the old one keeps it via its stash.
     pub(crate) fn split(&mut self, dir: SplitDir) {
+        let (stash, sel) = self.caret_to_stash();
         let cursor = self.cursor;
         let top = self.top;
         let leftcol = self.leftcol;
@@ -2445,7 +2450,8 @@ impl Editor {
         let secondaries = self.secondary_cursor_bytes();
         {
             let w = self.windows.get_mut(cur);
-            w.saved_cursor = cursor;
+            w.saved_cursor = stash;
+            w.saved_sel = sel;
             w.saved_top = top;
             w.saved_leftcol = leftcol;
             w.saved_cursors = secondaries;
@@ -2937,13 +2943,14 @@ impl Editor {
         // primary position — finalizing placement (see `stash_secondary_cursors`)
         // may snap the primary onto a placed cursor.
         self.stash_secondary_cursors();
-        let cursor = self.cursor;
+        let (cursor, sel) = self.caret_to_stash();
         let top = self.top;
         let leftcol = self.leftcol;
         let out = self.windows.current;
         {
             let w = self.windows.get_mut(out);
             w.saved_cursor = cursor;
+            w.saved_sel = sel;
             w.saved_top = top;
             w.saved_leftcol = leftcol;
         }
@@ -2975,13 +2982,19 @@ impl Editor {
     pub(crate) fn enter_window(&mut self, id: WindowId) {
         self.windows.current = id;
         let w = self.windows.get_mut(id);
-        let (buffer, cursor, top, leftcol) =
-            (w.buffer, w.saved_cursor, w.saved_top, w.saved_leftcol);
+        let (buffer, cursor, top, leftcol, sel) = (
+            w.buffer,
+            w.saved_cursor,
+            w.saved_top,
+            w.saved_leftcol,
+            w.saved_sel.take(),
+        );
         let saved_cursors = std::mem::take(&mut w.saved_cursors);
         // Consume any parked mode unconditionally (so it can never go stale); it is
         // only *resumed* when the dock chord asked for it via `restore_mode_on_enter`
         // — an ordinary focus change lands in Normal as always.
         let resume = w.resume.take();
+        let sel = sel.filter(|_| !(resume.is_some() && self.restore_mode_on_enter));
         let restore = std::mem::take(&mut self.restore_mode_on_enter);
         self.set_cur_buffer(buffer);
         // Entering a window whose buffer has not arrived yet (an off-tick read still in
@@ -3002,13 +3015,7 @@ impl Editor {
         // any leftover live marks first — a window close or tab switch can enter
         // here without the previous focus having stashed its own set).
         self.restore_secondary_cursors(saved_cursors);
-        // The window lands in Normal, whose clamp would take a caret off a line's
-        // end; a modeless session goes straight back to typing there, so keep it.
-        let at_eol = self.rests_in_insert() && self.cursor.col >= self.line_len();
-        self.clamp_cursor();
-        if at_eol {
-            self.cursor.col = self.line_len();
-        }
+        self.land_stashed_caret(sel);
         self.ensure_visible();
         // This tree may have been parked across a screen-width change (a restored
         // session's inactive tab is laid out at the boot placeholder width): now that it

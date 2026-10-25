@@ -516,6 +516,62 @@ async fn a_mouse_double_click_selects_the_word() {
     assert_eq!(lines(&rpc).await, v(&["hello X"]));
 }
 
+/// A shift-click grows a mouse selection from its anchor to the click, as a GUI
+/// editor's does, rather than starting a new one.
+#[tokio::test]
+async fn a_shift_click_extends_a_mouse_selection() {
+    let (rpc, _inc) = start_modeless("hello world foo\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 0, 5);
+    feed_mouse(&rpc, "left", "release", 0, 5);
+    feed_mouse_mod(&rpc, "left", "press", "S", 0, 11);
+    feed_mouse_mod(&rpc, "left", "release", "S", 0, 11);
+    assert_eq!(mode(&rpc).await, "s");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["X foo"]));
+}
+
+/// Shift-clicking before a selection's anchor flips it: the anchor stays, so the
+/// selection now runs from the click to where the drag began.
+#[tokio::test]
+async fn a_shift_click_before_the_anchor_selects_back_to_it() {
+    let (rpc, _inc) = start_modeless("hello world foo\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "left", "press", 0, 6);
+    feed_mouse(&rpc, "left", "drag", 0, 11);
+    feed_mouse(&rpc, "left", "release", 0, 11);
+    feed_mouse_mod(&rpc, "left", "press", "S", 0, 0);
+    feed_mouse_mod(&rpc, "left", "release", "S", 0, 0);
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["Xworld foo"]));
+}
+
+/// With no selection, a shift-click selects from the caret to the click.
+#[tokio::test]
+async fn a_shift_click_selects_from_the_caret() {
+    let (rpc, _inc) = start_modeless("hello world foo\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "left", "press", 0, 6);
+    feed_mouse(&rpc, "left", "release", 0, 6);
+    feed_mouse_mod(&rpc, "left", "press", "S", 0, 11);
+    feed_mouse_mod(&rpc, "left", "release", "S", 0, 11);
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["hello X foo"]));
+}
+
+/// A shift-click grows a keyboard selection too.
+#[tokio::test]
+async fn a_shift_click_extends_a_keyboard_selection() {
+    let (rpc, _inc) = start_modeless("hello world foo\n").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed(&rpc, "<S-Right><S-Right>");
+    feed_mouse_mod(&rpc, "left", "press", "S", 0, 11);
+    feed_mouse_mod(&rpc, "left", "release", "S", 0, 11);
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, v(&["X foo"]));
+}
+
 #[tokio::test]
 async fn a_click_drops_the_selection_and_places_the_caret() {
     let (rpc, _inc) = start_modeless("hello world\n").await;

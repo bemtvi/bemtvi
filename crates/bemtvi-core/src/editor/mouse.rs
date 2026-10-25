@@ -1414,8 +1414,13 @@ impl Editor {
             return;
         }
         // Charwise: anchor at the current cursor when not already selecting, then
-        // move the live end to the click.
-        if !self.mode.is_visual() {
+        // move the live end to the click. A modeless selection is Select, not
+        // Visual: it keeps its caret anchor, and the extended Visual settles back
+        // into a Select over the same anchor.
+        if self.mode == Mode::Select && self.rests_in_insert() {
+            self.visual_anchor = self.caret_selection().anchor;
+            self.mode = Mode::Visual;
+        } else if !self.mode.is_visual() {
             self.visual_anchor = self.cursor;
             self.mode = Mode::Visual;
         }

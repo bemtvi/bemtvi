@@ -1174,6 +1174,55 @@ async fn percent_bdelete_closes_tabs_whose_only_buffer_was_deleted() {
     let _ = std::fs::remove_file(&c);
 }
 
+/// `:bdelete` of a buffer that is also the only thing another tab shows: that tab
+/// closes through the parked-tab sweep, which used to relayout while the focused
+/// window still bound the freed buffer and panicked the server (`:tab split`, then
+/// `:bd`). Both endings: no other buffer left (a fresh `[No Name]`), and a hidden
+/// sibling to fall back to.
+#[tokio::test]
+async fn bdelete_of_a_buffer_another_tab_shows_alone_does_not_panic() {
+    let a = write_temp("bdts_a", "txt", "aaa\n");
+    let b = write_temp("bdts_b", "txt", "bbb\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await;
+    feed_sync(&rpc, ":tab split<CR>").await;
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        2,
+        "two tabs on the same buffer"
+    );
+    feed_sync(&rpc, ":bdelete<CR>").await;
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec![""],
+        "a fresh empty buffer is left"
+    );
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        1,
+        "the other tab closed with it"
+    );
+
+    feed_sync(&rpc, &format!(":edit {b}<CR>")).await;
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await;
+    feed_sync(&rpc, ":tab split<CR>").await;
+    feed_sync(&rpc, ":bdelete<CR>").await;
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec!["bbb"],
+        "the sibling buffer takes over"
+    );
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        1,
+        "the other tab closed with it"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
 /// The same sweep when the buffer that refuses to go is in a **background** tab:
 /// the focused tab closes through the current-buffer path, the other deleted
 /// buffer's tab closes through the parked-tab sweep, and focus lands on the tab

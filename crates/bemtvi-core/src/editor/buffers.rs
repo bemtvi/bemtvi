@@ -3274,7 +3274,7 @@ impl Editor {
         // buffer by the sweep below. Runs before the decision for the focused tab so
         // that one is taken against the tab count that is actually left (a layer
         // never closes its last tab).
-        self.close_tabs_emptied_by(target);
+        let closed_parked_tabs = self.close_tabs_emptied_by(target);
 
         // `'bdclosetab'` (bemtvi default): if `target` was the *only* buffer the
         // focused tab showed and other tabs are open, close the tab page rather than
@@ -3320,6 +3320,14 @@ impl Editor {
         // dock while still shown in the main area) — may still bind the freed id and
         // would panic the next time it is read. Rebind every such window.
         self.rebind_windows_off_buffer(target);
+        // The tabline row can vanish with the parked tabs (a layer down to one tab),
+        // so the remaining windows may have grown. Laid out only now: until the
+        // focused window was moved off `target` above, laying it out would read the
+        // freed buffer.
+        if closed_parked_tabs {
+            self.relayout();
+            self.ensure_visible();
+        }
         true
     }
 
@@ -3331,12 +3339,16 @@ impl Editor {
     /// a tab-per-buffer session down to one tab: without it, a buffer that refuses
     /// to be deleted (a modified one, no `!`) ends up shown in every tab.
     ///
+    /// Returns whether any tab closed. It doesn't lay the windows out itself: the
+    /// focused window may still show `target`, and the caller relayouts once it
+    /// doesn't.
+    ///
     /// A tab with a split onto another buffer stays, and a layer never closes its
     /// last tab — so a stack whose every tab was on `target` keeps one, which the
     /// rebind then moves onto a real buffer.
-    fn close_tabs_emptied_by(&mut self, target: BufferId) {
+    fn close_tabs_emptied_by(&mut self, target: BufferId) -> bool {
         if !self.options.bdclosetab {
-            return;
+            return false;
         }
         let mut layers = vec![Layer::Main];
         for side in DockSide::ALL {
@@ -3352,12 +3364,7 @@ impl Editor {
                 closed = true;
             }
         }
-        if closed {
-            // The tabline row can vanish (a layer down to one tab), so the remaining
-            // windows may have grown.
-            self.relayout();
-            self.ensure_visible();
-        }
+        closed
     }
 
     /// The first **parked** tab of `layer` whose every tiled window shows `buf` —

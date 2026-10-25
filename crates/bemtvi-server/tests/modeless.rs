@@ -1715,3 +1715,12 @@ async fn a_selection_left_behind_is_not_restored_over_a_move() {
     assert_eq!(mode(&rpc).await, "i");
     assert_eq!(cursor(&rpc).await, (1, 0));
 }
+
+#[tokio::test]
+async fn ctrl_w_in_a_second_tab_on_the_same_buffer_closes_it() {
+    let (rpc, _clip, _inc) = start_clip("alpha\n").await;
+    command(&rpc, "tab split").await;
+    feed(&rpc, "<C-w>");
+    assert_eq!(lines(&rpc).await, v(&[""]), "a fresh empty buffer is left");
+    assert_eq!(mode(&rpc).await, "i");
+}

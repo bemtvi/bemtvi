@@ -52,6 +52,7 @@
 //! files) so it does not change. Full design:
 //! `docs/plans/2026-06-11-shada-persistence.md`.
 
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,7 +64,8 @@ use bemtvi_core::{
 };
 use redb::backends::FileBackend;
 use redb::{
-    Database, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition, TableError,
+    BackendError, Database, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
+    TableError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -443,11 +445,41 @@ impl ShadaStore for RedbFileStore {
 
 /// A redb [`FileBackend`] shared between the [`Database`] and its [`RedbFileStore`]:
 /// every storage call delegates to the one file (and its lock), and the store keeps
-/// the other `Arc` to read the committed file back for the remote upload.
+/// the other `Arc` to read the committed file back for the remote upload. The lock
+/// methods must delegate too: redb's defaults report `Unsupported`, which would drop
+/// the file lock that tells a live sibling instance's store from a dead one's.
 #[derive(Debug)]
 struct SharedFileBackend(Arc<FileBackend>);
 
 impl StorageBackend for SharedFileBackend {
+    fn try_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.0.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.0.lock_range(start, end)
+    }
+
+    fn lock_shared_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.0.lock_shared_range(start, end)
+    }
+
+    fn unlock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.0.unlock_range(start, end)
+    }
+
+    fn query_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.0.query_lock_range(start, end)
+    }
+
     fn len(&self) -> std::io::Result<u64> {
         self.0.len()
     }

@@ -214,6 +214,36 @@ async fn an_absorbed_sibling_stays_visible_while_the_absorber_is_live() {
 }
 
 #[tokio::test]
+async fn a_live_instances_store_is_never_absorbed_by_a_sibling() {
+    // A live instance holds its own store's file lock for its whole session; that lock
+    // is the *only* thing telling a sibling "still running — skip me". If it is lost
+    // (e.g. a backend wrapper that drops redb's lock calls), B opens A's store as a
+    // dead one, absorbs it, and deletes it at its own clean exit — under a running A.
+    let dir = temp_dir("shada_live_lock");
+    let file_a = write_temp("shada_live_lock_a", "txt", "from A\n");
+
+    let (rpc_a, _inc_a) = start_attached(init_with_store(&dir, Some(file_a)), 80, 25).await;
+    feed(&rpc_a, "\"xyy");
+    assert_eq!(lines(&rpc_a).await, vec!["from A"]);
+    let a_store = store_files(&dir);
+    assert_eq!(a_store.len(), 1, "{a_store:?}");
+
+    {
+        let (rpc_b, inc_b) = start_attached(init_with_store(&dir, None), 80, 25).await;
+        feed(&rpc_b, ":qa!<CR>");
+        await_server_exit(inc_b).await;
+    }
+
+    assert!(
+        a_store[0].exists(),
+        "a sibling's clean exit deleted live instance A's store {}",
+        a_store[0].display()
+    );
+    // And A is still the one holding it: its session keeps working.
+    assert_eq!(lines(&rpc_a).await, vec!["from A"]);
+}
+
+#[tokio::test]
 async fn global_mark_survives_a_restart() {
     let dir = temp_dir("shada_global_mark");
     let file = write_temp("shada_global_mark", "txt", "alpha\n  beta\ngamma\n");

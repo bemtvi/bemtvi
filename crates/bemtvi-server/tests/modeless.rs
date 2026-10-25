@@ -473,6 +473,29 @@ async fn a_mouse_drag_back_from_past_the_line_end_takes_its_last_character() {
     assert_eq!(lines(&rpc).await, v(&["hello X", "next"]));
 }
 
+/// Held at the window's right edge, a modeless drag pans a `nowrap` view sideways
+/// and the selection grows with it, a column per drag event.
+#[tokio::test]
+async fn a_mouse_drag_at_the_right_edge_pans_and_extends() {
+    let (rpc, _inc) = start_modeless(&format!(
+        "{}
+",
+        "x".repeat(200)
+    ))
+    .await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 0, 79);
+    feed_mouse(&rpc, "left", "drag", 0, 79);
+    feed_mouse(&rpc, "left", "release", 0, 79);
+    feed(&rpc, "X");
+    assert_eq!(
+        lines(&rpc).await,
+        v(&[&format!("X{}", "x".repeat(119))]),
+        "two pans past the 80 visible columns selected 81 characters"
+    );
+}
+
 #[tokio::test]
 async fn a_mouse_double_click_selects_the_word() {
     let path = write_temp("modeless", "txt", "hello world\n");

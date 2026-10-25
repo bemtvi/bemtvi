@@ -1338,6 +1338,10 @@ pub(crate) struct PendingScroll {
     pub to_top: usize,
     pub from_cursor: usize,
     pub to_cursor: usize,
+    /// The horizontal scroll (`leftcol`) the slide pans from / to; equal when the
+    /// gesture is purely vertical.
+    pub from_leftcol: usize,
+    pub to_leftcol: usize,
     pub duration_ms: u64,
 }
 

@@ -43,6 +43,11 @@ pub struct ScrollAnim {
     /// the cursor (and the relative-number gutter) tracks the moving text.
     pub from_cursor_row: usize,
     pub to_cursor_row: usize,
+    /// The horizontal scroll (`leftcol`, in screen columns) the slide pans from /
+    /// to under `nowrap`. The client interpolates it alongside the row offset and
+    /// paints the band's rows from that column; equal for a purely vertical slide.
+    pub from_leftcol: usize,
+    pub to_leftcol: usize,
     pub duration_ms: u64,
     /// The over-scanned screen-row layout the slide reveals — the same
     /// [`RenderRow`] the settled frame uses, just taller. Carries each row's text,
@@ -1033,6 +1038,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             } else {
                 (ed.cursor, None)
             };
+            // A pan with no vertical travel slides the very rows the settled frame
+            // shows, so it keeps their folds (the vertical band can't yet; see below).
+            let pan_only = ps.from_top == ps.to_top;
             // The band is projected exactly like a window — one `render_rows` over the
             // taller screen-row range — so it carries every overlay the settled frame
             // does (selection, secondary selections, search, incsearch, and the
@@ -1051,10 +1059,23 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 eob,
                 // The scroll band ignores folds (its geometry helpers don't skip
                 // them yet); fold-aware scrolling lands in a later phase.
-                &[],
+                if pan_only { &collapsed } else { &[] },
                 w.cursor,
                 sel_head,
             );
+            // Over the settled rows a cursor line's row is read off them, which
+            // counts the folds the screen-row geometry below would not.
+            let pan_cursor_row = |line: usize| {
+                pan_only
+                    .then(|| {
+                        band_rows.iter().position(|r| match r.kind {
+                            RowKind::Line { line: l, start_col } => l == line && start_col == 0,
+                            RowKind::Fold { line: l, count } => (l..l + count).contains(&line),
+                            _ => false,
+                        })
+                    })
+                    .flatten()
+            };
             ScrollAnim {
                 from_row: screen_rows_between(
                     buf,
@@ -1069,26 +1090,32 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 to_row: screen_rows_between(
                     buf, base_line, ps.to_top, line_count, wrap, width, tabstop, wo,
                 ),
-                from_cursor_row: cursor_band_row(
-                    buf,
-                    base_line,
-                    in_band(ps.from_cursor),
-                    line_count,
-                    wrap,
-                    width,
-                    tabstop,
-                    wo,
-                ),
-                to_cursor_row: cursor_band_row(
-                    buf,
-                    base_line,
-                    in_band(ps.to_cursor),
-                    line_count,
-                    wrap,
-                    width,
-                    tabstop,
-                    wo,
-                ),
+                from_cursor_row: pan_cursor_row(ps.from_cursor).unwrap_or_else(|| {
+                    cursor_band_row(
+                        buf,
+                        base_line,
+                        in_band(ps.from_cursor),
+                        line_count,
+                        wrap,
+                        width,
+                        tabstop,
+                        wo,
+                    )
+                }),
+                to_cursor_row: pan_cursor_row(ps.to_cursor).unwrap_or_else(|| {
+                    cursor_band_row(
+                        buf,
+                        base_line,
+                        in_band(ps.to_cursor),
+                        line_count,
+                        wrap,
+                        width,
+                        tabstop,
+                        wo,
+                    )
+                }),
+                from_leftcol: ps.from_leftcol,
+                to_leftcol: ps.to_leftcol,
                 duration_ms: ps.duration_ms,
                 rows: band_rows,
                 sel_extends_down,

@@ -147,13 +147,14 @@ pub fn caret_blink(elapsed: Duration) -> (bool, Duration) {
     (hidden, Duration::from_millis(left as u64))
 }
 
-/// Whether a drag at grid `row` (global, 0-based) sits in the top/bottom edge
-/// band that arms continuous auto-scroll, for a grid `rows` cells tall. The top
-/// row and the bottom rows (the status line and the command row below the text
-/// body) qualify; the server decides whether that actually scrolls the focused
+/// Whether a drag at grid `cell` (`(col, row)`, global, 0-based) sits in the edge
+/// band that arms continuous auto-scroll, for a grid `size` (`(cols, rows)`) cells.
+/// The top row and the bottom rows (the status line and the command row below the
+/// text body) qualify, and so do the first and last columns, for a `nowrap` view
+/// panning sideways; the server decides whether that actually scrolls the focused
 /// window. Mirrors the TUI's `in_scroll_zone`.
-fn in_scroll_zone(row: u16, rows: u16) -> bool {
-    row == 0 || row + 2 >= rows
+fn in_scroll_zone((col, row): (u16, u16), (cols, rows): (u16, u16)) -> bool {
+    row == 0 || row + 2 >= rows || col == 0 || col + 1 >= cols
 }
 
 /// When a single-cell glyph may be drawn bigger than the one cell the editor reserved
@@ -1742,12 +1743,12 @@ impl App {
     }
 
     /// Arm or disarm continuous drag auto-scroll for a press/drag now at `cell`:
-    /// armed when the cell sits in the top/bottom edge band, cleared otherwise. While
+    /// armed when the cell sits in the screen's edge band, cleared otherwise. While
     /// it stays armed a task re-issues the drag every [`AUTOSCROLL_INTERVAL`], so the
     /// buffer keeps scrolling even though a drag is only reported on pointer motion.
     fn arm_autoscroll(&mut self, cell: (u16, u16)) {
-        let rows = self.renderer.as_ref().map_or(0, |r| r.grid_size().1);
-        if !in_scroll_zone(cell.1, rows) {
+        let size = self.renderer.as_ref().map_or((0, 0), |r| r.grid_size());
+        if !in_scroll_zone(cell, size) {
             self.autoscroll = None;
             return;
         }

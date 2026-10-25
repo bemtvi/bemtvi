@@ -164,6 +164,9 @@ struct TextItem {
 pub struct ScrollFrame<'a> {
     pub row_off: f32,
     pub cursor_row: f32,
+    /// The interpolated horizontal scroll: the band's rows paint from this
+    /// fractional column, so a `nowrap` pan slides sub-pixel like the rows do.
+    pub leftcol: f32,
     pub lines: &'a [String],
     /// Per-row visual-selection spans for the band (aligned with `lines`), so the
     /// selection slides with the text. `None` rows carry no selection.
@@ -222,6 +225,7 @@ impl<'a> ScrollFrame<'a> {
         ScrollFrame {
             row_off: lerp(d.from_row, d.to_row),
             cursor_row: lerp(d.from_cursor_row, d.to_cursor_row),
+            leftcol: lerp(d.from_leftcol, d.to_leftcol),
             lines: &d.lines,
             selection: &d.selection,
             secondary_selection: &d.secondary_selection,
@@ -1387,6 +1391,14 @@ impl Renderer {
             // buffers are cache hits frame to frame.
             Some(s) => {
                 let clip = self.text_bounds(ox, oy, wcols, text_rows);
+                // The pan (`nowrap`): the rows paint from the interpolated column —
+                // its whole columns dropped as on the settled path, the fraction left
+                // as a sub-pixel shift — clipped to the text past the gutter.
+                let lc = s.leftcol.max(0.0).floor();
+                let dx = (s.leftcol - lc) * self.cell_w;
+                let lc = lc as u16;
+                let text_clip =
+                    self.text_bounds(text_x0, oy, (ox + wcols).saturating_sub(text_x0), text_rows);
                 let slide_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
                 // `'colorcolumn'` rulers ride through the slide too: they're fixed
                 // screen columns (they don't scroll), so paint them behind the band
@@ -1426,6 +1438,9 @@ impl Renderer {
                 // moving edge clips to it (see `sel_clip`). `numbers` at that band
                 // row gives the cursor's 1-based buffer line.
                 let cur_row0 = s.cursor_row.round() as usize; // band-row of the cursor
+                                                              // The row overlays below are the text area's own quads: they shift
+                                                              // with the pan and clip to it (see after the loop).
+                let q0 = quads.len();
                 let current_line = s.numbers.get(cur_row0).copied().flatten().unwrap_or(1);
                 for (k, raw) in s.lines.iter().enumerate() {
                     // Screen-row band: row `k` sits `k - row_off` rows below the
@@ -1445,8 +1460,8 @@ impl Renderer {
                             .iter()
                             .map(|(t, id)| virt_chunk_seg(t, *id, s.styles, fg))
                             .collect();
-                        let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
-                        self.push_text(items, &segs, (x, y), fg, clip);
+                        let x = text_run_origin(text_x0, lc) as f32 * self.cell_w - dx;
+                        self.push_text(items, &segs, (x, y), fg, text_clip);
                         continue;
                     }
                     let inlay = s.inlay_hints.get(k).map(Vec::as_slice).unwrap_or(&[]);
@@ -1470,7 +1485,7 @@ impl Renderer {
                                 text_x0,
                                 y,
                                 *span,
-                                win.leftcol,
+                                lc,
                                 inlay,
                                 &[],
                                 sel_bg,
@@ -1488,7 +1503,7 @@ impl Renderer {
                                 text_x0,
                                 y,
                                 *span,
-                                win.leftcol,
+                                lc,
                                 inlay,
                                 &[],
                                 sel_bg,
@@ -1508,7 +1523,7 @@ impl Renderer {
                                 text_x0,
                                 y,
                                 *span,
-                                win.leftcol,
+                                lc,
                                 inlay,
                                 &[],
                                 search_bg,
@@ -1523,7 +1538,7 @@ impl Renderer {
                             text_x0,
                             y,
                             *span,
-                            win.leftcol,
+                            lc,
                             inlay,
                             &[],
                             inc_bg,
@@ -1551,8 +1566,7 @@ impl Renderer {
                     } else {
                         fg
                     };
-                    let mut segments =
-                        row_segments(&display, hl, s.styles, row_fg, slide_bg, win.leftcol);
+                    let mut segments = row_segments(&display, hl, s.styles, row_fg, slide_bg, lc);
                     // The cursor rides the band mid-slide (see `paint_cursor`), so its
                     // glyph inverts on the band row it sits on — otherwise the opaque
                     // block would swallow the character for the length of the slide.
@@ -1561,7 +1575,7 @@ impl Renderer {
                     {
                         segments = apply_cursor_fg(
                             segments,
-                            win.leftcol,
+                            lc,
                             win.cursor_screen_col,
                             win.cursor_width,
                             cfg,
@@ -1573,12 +1587,12 @@ impl Renderer {
                     // chunk backgrounds aren't painted mid-slide — a brief transient on
                     // the ~150ms animation; they settle into place when it ends.)
                     segments = if vtext.is_empty() {
-                        splice_inlay(segments, inlay, win.leftcol, s.styles)
+                        splice_inlay(segments, inlay, lc, s.styles)
                     } else {
-                        apply_row_virt(segments, inlay, vtext, win.leftcol, s.styles, fg)
+                        apply_row_virt(segments, inlay, vtext, lc, s.styles, fg)
                     };
-                    let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
-                    self.push_text(items, &segments, (x, y), row_fg, clip);
+                    let x = text_run_origin(text_x0, lc) as f32 * self.cell_w - dx;
+                    self.push_text(items, &segments, (x, y), row_fg, text_clip);
 
                     // Diagnostic sign + underlines ride the band too, at the row's
                     // sub-pixel offset, so they slide with the text instead of
@@ -1604,7 +1618,7 @@ impl Renderer {
                                 text_x0,
                                 y,
                                 (*ds, *de),
-                                win.leftcol,
+                                lc,
                                 inlay,
                                 &[],
                                 color,
@@ -1617,9 +1631,9 @@ impl Renderer {
                     // slide — positioned exactly like the settled path below.
                     if !matches!(s.numbers.get(k), Some(None)) {
                         if let Some(Some((text, severity, id))) = s.diagnostics_virt.get(k) {
-                            let inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
-                            let painted = cells(&display).saturating_sub(win.leftcol as usize)
-                                + inserted as usize;
+                            let inserted = inlay_shift(inlay, lc, u16::MAX, true);
+                            let painted =
+                                cells(&display).saturating_sub(lc as usize) + inserted as usize;
                             let start = text_x0 + painted as u16 + 1;
                             let limit = (ox + wcols).saturating_sub(start);
                             if limit > 0 {
@@ -1628,13 +1642,20 @@ impl Renderer {
                                 self.push_plain(
                                     items,
                                     &shown,
-                                    (start as f32 * self.cell_w, y),
+                                    (start as f32 * self.cell_w - dx, y),
                                     color,
-                                    clip,
+                                    text_clip,
                                 );
                             }
                         }
                     }
+                }
+                let (left, right) = (text_clip.left as f32, text_clip.right as f32);
+                for q in &mut quads[q0..] {
+                    let x0 = (q.x - dx).max(left);
+                    let x1 = (q.x + q.w - dx).min(right);
+                    q.x = x0;
+                    q.w = (x1 - x0).max(0.0);
                 }
             }
             // Settled: paint the live viewport with selection/search overlays.
@@ -2104,6 +2125,22 @@ impl Renderer {
             // column (a hint exactly at the cursor sits before the cursor glyph), so
             // it tracks the splice. Mid-slide that's the band's hints on the cursor's
             // band row; settled it's the window's hints on the cursor row.
+            // Mid-pan the cursor rides the band's interpolated column (see the band
+            // paint): whole columns as the scroll, the fraction a sub-pixel shift.
+            let (leftcol, dx) = match scroll {
+                Some(s) => {
+                    let lc = s.leftcol.max(0.0).floor();
+                    (lc as u16, (s.leftcol - lc) * self.cell_w)
+                }
+                None => (win.leftcol, 0.0),
+            };
+            // A cursor the pan has yet to bring into view stays hidden until it does.
+            let text_w = (ox + wcols).saturating_sub(text_x0);
+            let off_view =
+                win.cursor_screen_col < leftcol || win.cursor_screen_col - leftcol >= text_w;
+            if scroll.is_some() && off_view {
+                return;
+            }
             let cur_shift = match scroll {
                 None => {
                     let row_inlay = win
@@ -2118,22 +2155,22 @@ impl Renderer {
                         .get(win.cursor_row as usize)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
-                        + virt_inline_shift(row_vtext, win.leftcol, win.cursor_screen_col, true)
+                    inlay_shift(row_inlay, leftcol, win.cursor_screen_col, true)
+                        + virt_inline_shift(row_vtext, leftcol, win.cursor_screen_col, true)
                 }
                 Some(s) => {
                     let idx = s.cursor_row.round() as usize; // cursor's band-row index
                     let row_inlay = s.inlay_hints.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                    inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
+                    inlay_shift(row_inlay, leftcol, win.cursor_screen_col, true)
                 }
             };
             // Clamp to the window's text area so a tiny window (a dock dragged to its
             // minimum, or a split squeezed to a few cells) never paints the cursor on
             // its status row or over the next region — quads aren't scissored, so the
             // clamp is what keeps it in bounds (mirrors the TUI's cursor clamp).
-            let cx = (col_to_screen(text_x0, win.cursor_screen_col, win.leftcol) + cur_shift)
+            let cx = (col_to_screen(text_x0, win.cursor_screen_col, leftcol) + cur_shift)
                 .min((ox + wcols).saturating_sub(1));
-            let px = cx as f32 * self.cell_w;
+            let px = cx as f32 * self.cell_w - dx;
             let last_row = text_rows.saturating_sub(1);
             let py = match scroll {
                 Some(s) => {

@@ -78,9 +78,9 @@ pub fn arm_scroll(view: &View, current: Option<ScrollAnim>) -> Option<ScrollAnim
 }
 
 /// Whether `view` merely repaints the destination viewport `anim` is sliding
-/// toward — same first visible line and cursor line — rather than reflecting a
-/// new navigation state. Such a redraw (a delayed highlight reply) must not
-/// abort the slide.
+/// toward — same first visible line, cursor line and `leftcol` — rather than
+/// reflecting a new navigation state. Such a redraw (a delayed highlight reply)
+/// must not abort the slide.
 fn repaints_destination(view: &View, anim: &ScrollAnim) -> bool {
     // The destination viewport top / cursor buffer lines are read off the band at
     // its settle offsets (`to_row` / `to_cursor_row`): `numbers` carries each band
@@ -102,5 +102,7 @@ fn repaints_destination(view: &View, anim: &ScrollAnim) -> bool {
     let Some(win) = view.focused() else {
         return false;
     };
-    win.numbers.first().copied().flatten() == dest_top && Some(win.cursor_line) == dest_cursor
+    win.numbers.first().copied().flatten() == dest_top
+        && Some(win.cursor_line) == dest_cursor
+        && f32::from(win.leftcol) == anim.data.to_leftcol
 }

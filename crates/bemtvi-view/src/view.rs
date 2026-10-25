@@ -35,6 +35,11 @@ pub struct ScrollData {
     /// Screen-row offset of the cursor's row into the band at slide start / end.
     pub from_cursor_row: f32,
     pub to_cursor_row: f32,
+    /// The horizontal scroll (`leftcol`) the slide pans from / to under `nowrap`;
+    /// the client paints the band's rows from the interpolated column. Equal for a
+    /// purely vertical slide.
+    pub from_leftcol: f32,
+    pub to_leftcol: f32,
     pub duration: Duration,
     pub lines: Vec<String>,
     pub selection: Vec<Option<(u16, u16)>>,
@@ -1362,6 +1367,13 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             to_row: map_u64(s, "to_row") as f32,
             from_cursor_row: map_u64(s, "from_cursor_row") as f32,
             to_cursor_row: map_u64(s, "to_cursor_row") as f32,
+            // A gesture without the keys pans nowhere: it rests at the window's own.
+            from_leftcol: map_get(s, "from_leftcol")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| map_u64(m, "leftcol")) as f32,
+            to_leftcol: map_get(s, "to_leftcol")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| map_u64(m, "leftcol")) as f32,
             duration: Duration::from_millis(map_u64(s, "duration_ms")),
             lines: map_str_array(s, "lines"),
             selection: parse_spans(map_get(s, "selection")),

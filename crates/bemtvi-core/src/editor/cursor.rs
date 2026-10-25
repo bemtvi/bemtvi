@@ -700,8 +700,14 @@ impl Editor {
         }
         let opts = &self.windows.cur().options;
         // The margin can't claim more than half the window, or the left and right
-        // bounds would cross.
-        let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);
+        // bounds would cross. Suspended while the mouse drives the view, as
+        // `'scrolloff'` is ([`scroll_margin_now`](Self::scroll_margin_now)), so a drag
+        // at a side edge pans one column rather than the margin's worth.
+        let so = if self.mouse_dragging {
+            0
+        } else {
+            opts.sidescrolloff.min(tw.saturating_sub(1) / 2)
+        };
         let recenter = opts.sidescroll == 0;
         let vc = self.cursor_virtcol();
         let left = self.leftcol;

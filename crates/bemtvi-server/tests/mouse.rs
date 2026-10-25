@@ -1139,6 +1139,100 @@ async fn drag_above_window_scrolls_up() {
     );
 }
 
+/// Under `nowrap`, dragging the selection onto the window's last text column pans
+/// the view right a column per drag event, the live end riding the newly-exposed
+/// column — the sideways twin of the bottom-edge drag-scroll, so a selection can
+/// grow past a long line's visible part.
+#[tokio::test]
+async fn drag_to_right_edge_scrolls_sideways() {
+    let (rpc, _incoming) = start(&"x".repeat(200)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    let win = current_win(&rpc).await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 0, 79); // the last text column
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        1,
+        "one column scrolled into view"
+    );
+    assert_eq!(
+        cursor(&rpc).await.1,
+        80,
+        "the live end rode the new edge column"
+    );
+    // Held there (the client repeats the drag), it keeps scrolling.
+    feed_mouse(&rpc, "left", "drag", 0, 79);
+    assert_eq!(win_leftcol(&rpc, win).await, 2, "keeps scrolling right");
+    assert_eq!(cursor(&rpc).await.1, 81);
+}
+
+/// Dragging onto the window's first text column of a view panned right scrolls it
+/// back left — the text's first column, or the gutter left of it.
+#[tokio::test]
+async fn drag_to_left_edge_scrolls_back() {
+    let (rpc, _incoming) = start(&"x".repeat(200)).await;
+    command(&rpc, "set number nowrap sidescroll=1 sidescrolloff=0").await;
+    let win = current_win(&rpc).await;
+    feed(&rpc, "0149l");
+    let left0 = win_leftcol(&rpc, win).await;
+    assert!(left0 > 2, "the view panned right to show column 150");
+    feed_mouse(&rpc, "left", "press", 0, 40);
+    feed_mouse(&rpc, "left", "drag", 0, 0); // over the number gutter
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(win_leftcol(&rpc, win).await, left0 - 1, "one column back");
+    assert_eq!(
+        cursor(&rpc).await.1 as u64,
+        left0 - 1,
+        "on the new first column"
+    );
+    feed_mouse(&rpc, "left", "drag", 0, 0);
+    assert_eq!(
+        win_leftcol(&rpc, win).await,
+        left0 - 2,
+        "keeps scrolling left"
+    );
+}
+
+/// A sideways drag that stays inside the text does not pan.
+#[tokio::test]
+async fn drag_inside_text_does_not_scroll_sideways() {
+    let (rpc, _incoming) = start(&"x".repeat(200)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    let win = current_win(&rpc).await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 0, 40);
+    assert_eq!(cursor(&rpc).await.1, 40);
+    assert_eq!(win_leftcol(&rpc, win).await, 0, "no pan inside the text");
+}
+
+/// A horizontal wheel notch over the focused window slides the pan like a vertical
+/// notch does: the redraw carries a gesture from the old `leftcol` to the new one.
+#[tokio::test]
+async fn wheel_right_animates_the_pan() {
+    let (rpc, mut incoming) = start(&"x".repeat(200)).await;
+    command(&rpc, "set nonumber norelativenumber nowrap").await;
+    feed(&rpc, "gg0");
+    let _ = cursor(&rpc).await;
+    wheel_mod(&rpc, "right", "", 5, 10);
+    let _ = cursor(&rpc).await;
+    let map = wait_redraw(&mut incoming, |m| {
+        matches!(field(m, "scroll"), Some(Value::Map(_)))
+    })
+    .await;
+    let Some(Value::Map(s)) = field(&map, "scroll") else {
+        panic!("a scroll gesture");
+    };
+    let get = |k: &str| {
+        s.iter()
+            .find(|(kk, _)| kk.as_str() == Some(k))
+            .and_then(|(_, v)| v.as_u64())
+    };
+    assert_eq!(get("from_leftcol"), Some(0));
+    assert_eq!(get("to_leftcol"), Some(6));
+    assert_eq!(get("from_row"), get("to_row"), "no vertical travel");
+}
+
 /// A drag that stays inside the text body does not scroll — only crossing the
 /// edge does (regression guard for the auto-scroll branch).
 #[tokio::test]

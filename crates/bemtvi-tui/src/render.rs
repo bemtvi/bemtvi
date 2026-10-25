@@ -333,7 +333,7 @@ pub(crate) fn render(
     // Paint each window into its region (main area or a dock); capture the focused
     // one's text-inner rect and (possibly interpolated) cursor row for the terminal
     // cursor and the popup anchor. Tiled windows paint first; floats overlay them.
-    let mut focused_inner: Option<(Rect, u16, u16)> = None;
+    let mut focused_inner: Option<(Rect, u16, u16, u16)> = None;
     for win in view.windows.iter().filter(|w| !w.floating) {
         // `'padding'` insets the content box by a per-side margin; the server already
         // sized this window's rows/cursor to the inset area, so the renderer just
@@ -349,10 +349,10 @@ pub(crate) fn render(
         let area = pad_rect(outer, win.padding);
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
-        let (text_inner, cursor_row, cursor_shift) =
+        let (text_inner, cursor_row, cursor_shift, leftcol) =
             render_window(frame, area, win, view, win_anim, images.as_deref_mut());
         if win.focused {
-            focused_inner = Some((text_inner, cursor_row, cursor_shift));
+            focused_inner = Some((text_inner, cursor_row, cursor_shift, leftcol));
         }
     }
 
@@ -388,10 +388,10 @@ pub(crate) fn render(
         };
         // `'padding'` insets the content a further per-side margin inside any border.
         let inner = pad_rect(inner, win.padding);
-        let (text_inner, cursor_row, cursor_shift) =
+        let (text_inner, cursor_row, cursor_shift, leftcol) =
             render_window(frame, inner, win, view, None, images.as_deref_mut());
         if win.focused {
-            focused_inner = Some((text_inner, cursor_row, cursor_shift));
+            focused_inner = Some((text_inner, cursor_row, cursor_shift, leftcol));
         }
     }
 
@@ -404,7 +404,7 @@ pub(crate) fn render(
 
     // The insert-mode completion popup floats over the focused window's text area,
     // drawn after the windows so it sits on top.
-    if let (Some(pmenu), Some((inner, _, _))) = (&view.pmenu, focused_inner) {
+    if let (Some(pmenu), Some((inner, ..))) = (&view.pmenu, focused_inner) {
         render_pmenu(frame, inner, pmenu);
     }
 
@@ -418,7 +418,7 @@ pub(crate) fn render(
         // whole editor, not the focused split; every other menu anchors to the focused
         // window's text inner. The windows area is also the base for an editor-relative
         // docs sidebar.
-        (Some(menu), Some((inner, _, _))) => {
+        (Some(menu), Some((inner, ..))) => {
             let f = frame.area();
             let editor_area =
                 Rect::new(f.x, f.y, f.width, f.height.saturating_sub(dock.cmd.height));
@@ -450,7 +450,7 @@ pub(crate) fn render(
                 f.height.saturating_sub(dock.cmd.height),
             ))
         } else {
-            focused_inner.map(|(inner, _, _)| inner)
+            focused_inner.map(|(inner, ..)| inner)
         };
         if let Some(base) = base {
             render_content_float(frame, base, float, &view.styles, FloatTheme::of(view));
@@ -482,10 +482,11 @@ pub(crate) fn render(
             .saturating_add(prompt_width)
             .saturating_add(u16::try_from(caret).unwrap_or(u16::MAX));
         frame.set_cursor_position((col, cmd_area.y));
-    } else if let (Some((inner, cursor_row, shift)), Some(win)) = (focused_inner, view.focused()) {
-        // The cursor row is interpolated during a slide, but the column comes
-        // straight from the focused window — correct because the scroll commands
-        // move only vertically. The horizontal scroll offset (`leftcol`) shifts the
+    } else if let (Some((inner, cursor_row, shift, leftcol)), Some(win)) =
+        (focused_inner, view.focused())
+    {
+        // The cursor row is interpolated during a slide, and so is the horizontal
+        // scroll offset (`leftcol`, the window's own once settled): it shifts the
         // painted text left, so the cursor follows by the same amount; the core
         // keeps the cursor on screen, so this normally lands inside the text area.
         // The `.min` is a safety clamp (a stale frame, a degenerate width) so a
@@ -502,7 +503,7 @@ pub(crate) fn render(
         let col = inner.x.saturating_add(
             win.cursor_screen_col
                 .saturating_add(shift)
-                .saturating_sub(win.leftcol)
+                .saturating_sub(leftcol)
                 .min(inner.width.saturating_sub(1)),
         );
         let row = inner
@@ -880,8 +881,9 @@ impl FloatTheme {
 
 /// Paint one window into `area`: the theme background, the number gutter, the
 /// text body (or an interpolated slide when `anim` is set), and a status line on
-/// the bottom row. Returns the text-inner rect (past the gutter) and the
-/// (possibly interpolated) cursor row, for placing the terminal cursor.
+/// the bottom row. Returns the text-inner rect (past the gutter), the (possibly
+/// interpolated) cursor row, the inlay shift on it, and the (possibly
+/// interpolated) horizontal scroll, for placing the terminal cursor.
 fn render_window(
     frame: &mut Frame,
     area: Rect,
@@ -889,7 +891,7 @@ fn render_window(
     view: &View,
     anim: Option<&ScrollAnim>,
     images: Option<&mut ImageStore>,
-) -> (Rect, u16, u16) {
+) -> (Rect, u16, u16, u16) {
     // The status line is the window's bottom row (when this window shows one, per
     // `'laststatus'`); the text body is the rest. With no per-window status row the
     // text body claims the whole rect — the server already sized `lines` to fill it.
@@ -915,10 +917,15 @@ fn render_window(
         if let Some(status_area) = status_area {
             render_status(frame, status_area, &win.status, view, win.focused);
         }
-        return (text_area, 0, 0);
+        return (text_area, 0, 0, win.leftcol);
     }
 
     let height = text_area.height as usize;
+    // The horizontal scroll the text paints from: a slide's pan interpolates it (in
+    // whole cells, the terminal's grain), the settled window uses its own.
+    let leftcol = anim.map_or(win.leftcol, |a| {
+        lerp(a.data.from_leftcol, a.data.to_leftcol, a.progress()).round() as u16
+    });
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
     // window of the band by screen-row offset). The static path — the overwhelmingly
@@ -1320,7 +1327,7 @@ fn render_window(
         frame_inlay,
         frame_numbers,
         win.tabstop.max(1) as usize,
-        win.leftcol as usize,
+        leftcol as usize,
         &theme,
     );
     // Paint the secondary multi-cursors over the settled text. They're a
@@ -1352,14 +1359,10 @@ fn render_window(
     // window's once settled (both indexed by the cursor's screen row). Returned so
     // the caller places the focused window's cursor past the splice in either case.
     let cursor_shift =
-        inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, win.leftcol)
-            .saturating_add(virt_cursor_shift(
-                frame_virt_text,
-                cursor_row,
-                win.cursor_screen_col,
-                win.leftcol,
-            ));
-    (text_inner, cursor_row, cursor_shift)
+        inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, leftcol).saturating_add(
+            virt_cursor_shift(frame_virt_text, cursor_row, win.cursor_screen_col, leftcol),
+        );
+    (text_inner, cursor_row, cursor_shift, leftcol)
 }
 
 /// Paint each secondary multi-cursor as a styled cell over the already-rendered

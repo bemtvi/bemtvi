@@ -65,15 +65,19 @@ const CHROME_ROWS: u16 = 1;
 /// at a time per drag event.
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
 
-/// Whether a drag at windows-area `row` (global, 0-based) sits in the top/bottom
-/// edge band that arms continuous auto-scroll, for a terminal `height` rows tall.
-/// The top row (above a tabline, or the first text row) and the bottom windows
-/// rows (the status line and below, where a drag has crossed past the text body)
-/// qualify; the server decides whether that actually scrolls the focused window.
-fn in_scroll_zone(row: u16, height: u16) -> bool {
-    // Saturate: `row` comes straight off the terminal's wire, so a bogus value
+/// Whether a drag at windows-area `(row, col)` (global, 0-based) sits in the edge
+/// band that arms continuous auto-scroll, for a terminal `size`. The top row
+/// (above a tabline, or the first text row) and the bottom windows rows (the
+/// status line and below, where a drag has crossed past the text body) qualify,
+/// and so do the first and last columns, for a `nowrap` view panning sideways; the
+/// server decides whether that actually scrolls the focused window.
+fn in_scroll_zone(row: u16, col: u16, size: ratatui::layout::Size) -> bool {
+    // Saturate: `row`/`col` come straight off the terminal's wire, so a bogus value
     // near `u16::MAX` must not overflow (a debug-build panic in the input loop).
-    row == 0 || row.saturating_add(2) >= height
+    row == 0
+        || row.saturating_add(2) >= size.height
+        || col == 0
+        || col.saturating_add(1) >= size.width
 }
 
 /// RAII guard for terminal mouse capture: enables mouse reporting on creation
@@ -726,7 +730,7 @@ where
                         send_mouse(&rpc, "left", "press", &mouse_modifier(m.modifiers), m.row, m.column);
                         // Arm edge auto-scroll if the press already landed in the edge
                         // band (a press-and-hold there scrolls without a drag).
-                        autoscroll = in_scroll_zone(m.row, size.height).then_some((m.row, m.column));
+                        autoscroll = in_scroll_zone(m.row, m.column, size).then_some((m.row, m.column));
                     }
                     // Drag and release of the left button drive a text-area
                     // selection: the server extends Visual from the press anchor on
@@ -739,7 +743,7 @@ where
                         // the edge band; disarm once it moves back into the body.
                         let size = terminal.size().unwrap_or_default();
                         autoscroll =
-                            in_scroll_zone(m.row, size.height).then_some((m.row, m.column));
+                            in_scroll_zone(m.row, m.column, size).then_some((m.row, m.column));
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         autoscroll = None; // release ends the drag, so stop scrolling

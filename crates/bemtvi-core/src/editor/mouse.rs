@@ -1686,10 +1686,38 @@ impl Editor {
         } else {
             row - top_edge
         };
-        let rel_x = col
-            .saturating_sub(abs_x.saturating_add(pad.left))
-            .min(text_width.saturating_sub(1));
+        // Sideways the same, under `nowrap`: reaching the text's first column (the
+        // gutter left of it included) or its last pans the view a column that way and
+        // lands on the newly-exposed edge column. A `wrap`ped window never pans.
+        let origin = abs_x.saturating_add(pad.left);
+        let gutter = self.window_textoff(win).unwrap_or(0);
+        let rel_x = if !self.window_options(win)?.wrap && text_width > gutter + 1 {
+            let first = origin + gutter;
+            let last = origin + text_width - 1;
+            if col <= first {
+                self.drag_pan(win, false);
+                gutter
+            } else if col >= last {
+                self.drag_pan(win, true);
+                text_width - 1
+            } else {
+                col - origin
+            }
+        } else {
+            col.saturating_sub(origin).min(text_width.saturating_sub(1))
+        };
         self.text_cell_to_buf(win, rel_x, rel_y)
+    }
+
+    /// Pan the focused window's view one column toward a drag at its side edge
+    /// (`right` = the drag reached the last text column), clamped to the content
+    /// ([`window_max_leftcol`](Self::window_max_leftcol)). A no-op at the clamp.
+    fn drag_pan(&mut self, win: WindowId, right: bool) {
+        self.leftcol = if right {
+            (self.leftcol + 1).min(self.window_max_leftcol(win).max(self.leftcol))
+        } else {
+            self.leftcol.saturating_sub(1)
+        };
     }
 
     /// Scroll the focused window's viewport one line toward an out-of-band drag
@@ -2243,7 +2271,7 @@ impl Editor {
             if new_top == old_top {
                 return;
             }
-            self.scroll_from = Some((old_top, self.cursor.line));
+            self.scroll_from = Some((old_top, self.cursor.line, self.leftcol));
             self.top = new_top;
             // A modeless session leaves the caret where it is; vim pulls the cursor
             // into the view.
@@ -2303,10 +2331,12 @@ impl Editor {
             if new == old {
                 return;
             }
+            self.scroll_from = Some((self.top, self.cursor.line, old));
             self.leftcol = new;
             if !self.detach_view((self.top, old)) {
                 self.keep_cursor_in_leftcol();
             }
+            self.finalize_scroll_gesture();
         } else {
             // As the vertical wheel: a modeless session holds the caret and the view.
             let keep_caret = self.options.modeless

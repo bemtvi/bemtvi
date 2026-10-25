@@ -521,6 +521,49 @@ async fn ctrl_d_emits_half_page_scroll() {
     assert_eq!(scroll_lines_len(&map), 36);
 }
 
+/// Under `nowrap`, a key that pans the view sideways more than a column (`$` onto
+/// the end of a long line) slides like a vertical scroll: the gesture carries the
+/// `leftcol` the pan starts and ends at, over the same rows.
+#[tokio::test]
+async fn horizontal_jump_animates_the_pan() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "i");
+    feed(&rpc, &"abcdefghij".repeat(20)); // 200 columns
+    feed(&rpc, "<Esc>0");
+    let map = scroll_after(&rpc, &mut incoming, "$").await;
+    let leftcol = view_u64(&map, "leftcol");
+    assert!(leftcol > 1, "`$` panned the view right");
+    assert_eq!(scroll_u64(&map, "from_leftcol"), 0);
+    assert_eq!(scroll_u64(&map, "to_leftcol"), leftcol);
+    assert_eq!(scroll_u64(&map, "from_top"), 0, "no vertical travel");
+    assert_eq!(scroll_u64(&map, "to_top"), 0);
+
+    // And back: `0` pans to the line's start.
+    let back = scroll_after(&rpc, &mut incoming, "0").await;
+    assert_eq!(scroll_u64(&back, "from_leftcol"), leftcol);
+    assert_eq!(scroll_u64(&back, "to_leftcol"), 0);
+}
+
+/// A one-column pan (`l` walking off the right edge under `sidescroll=1`) stays
+/// crisp, like a one-line vertical scroll.
+#[tokio::test]
+async fn one_column_pan_carries_no_gesture() {
+    let (rpc, mut incoming) = start(None).await;
+    command(
+        &rpc,
+        "set nonumber norelativenumber nowrap sidescroll=1 sidescrolloff=0",
+    )
+    .await;
+    feed(&rpc, "i");
+    feed(&rpc, &"abcdefghij".repeat(20));
+    feed(&rpc, "<Esc>079l"); // the cursor on the last visible column
+    let at_edge = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(view_u64(&at_edge, "leftcol"), 0);
+    let map = redraw_after(&rpc, &mut incoming, "l").await;
+    assert_eq!(view_u64(&map, "leftcol"), 1, "one column panned");
+    assert!(scroll(&map).is_none(), "a one-column pan does not slide");
+}
+
 #[tokio::test]
 async fn virt_lines_scroll_animates_and_interleaves_the_virtual_row() {
     // A scroll whose range contains a `virt_lines` extmark used to fall back to an

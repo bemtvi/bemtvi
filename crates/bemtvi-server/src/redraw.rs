@@ -1258,6 +1258,11 @@ impl EditHost {
                 Value::from("to_cursor_row"),
                 Value::from(s.to_cursor_row as u64),
             ),
+            (
+                Value::from("from_leftcol"),
+                Value::from(s.from_leftcol as u64),
+            ),
+            (Value::from("to_leftcol"), Value::from(s.to_leftcol as u64)),
             (Value::from("duration_ms"), Value::from(s.duration_ms)),
             (Value::from("lines"), display_lines_value(&lines)),
             (Value::from("selection"), spans_value(&selection)),

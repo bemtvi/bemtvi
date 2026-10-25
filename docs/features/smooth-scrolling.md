@@ -11,8 +11,15 @@ Because the animation runs **client-side**, it stays smooth even over a slow
 [remote daemon](../edit-host-split.md) link, and any new keystroke interrupts the
 in-flight slide and snaps straight to the destination.
 
-Single-line motions at the window edge, typing in insert/command mode, and edits
-that reflow the buffer are kept crisp — only genuine viewport jumps animate.
+Sideways scrolls slide too. With `'wrap'` off, a pan of more than a column — the
+horizontal wheel (or Shift with the wheel in a modeless session), `$` or `0` on a
+long line, a jump that lands off the side of the screen — pans smoothly, and a
+jump that moves the view both ways slides diagonally. The GUI pans sub-pixel; the
+terminal and the browser step a column at a time.
+
+Single-line motions at the window edge, a one-column pan, typing in insert/command
+mode, and edits that reflow the buffer are kept crisp — only genuine viewport jumps
+animate.
 
 ## Options
 

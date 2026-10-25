@@ -1341,13 +1341,18 @@
       // `to_cursor_row`), which are 1-based like the window's.
       const nums = a.band.numbers;
       return w.numbers?.[0] === nums[Math.round(a.to_row)]
-        && w.cursor_line === nums[Math.round(a.to_cursor_row)];
+        && w.cursor_line === nums[Math.round(a.to_cursor_row)]
+        && (w.leftcol || 0) === a.to_leftcol;
     }
     function armScroll(w, s) {
       cancelScroll();
       scrollAnim = {
         from_row: s.from_row, to_row: s.to_row,
         from_cursor_row: s.from_cursor_row, to_cursor_row: s.to_cursor_row,
+        // A `nowrap` pan: the band paints from the interpolated column, stepped a
+        // whole cell at a time (the rows carry their gutter, so no sub-cell shift).
+        from_leftcol: s.from_leftcol ?? (w.leftcol || 0), to_leftcol: s.to_leftcol ?? (w.leftcol || 0),
+        leftcol: s.from_leftcol ?? (w.leftcol || 0),
         duration: s.duration_ms,
         band: bandWindow(w, s), start: performance.now(), strip: null,
       };
@@ -1361,7 +1366,13 @@
       const a = scrollAnim;
       if (!a) return;
       const t = scrollProgress(a, now);
-      if (a.strip) a.strip.style.transform = `translate3d(0, ${stripOffset(a, easeOutCubic(t))}px, 0)`;
+      const leftcol = Math.round(a.from_leftcol + (a.to_leftcol - a.from_leftcol) * easeOutCubic(t));
+      if (t < 1 && leftcol !== a.leftcol) {
+        a.leftcol = leftcol;
+        render(); // repaint the band from the new column
+      } else if (a.strip) {
+        a.strip.style.transform = `translate3d(0, ${stripOffset(a, easeOutCubic(t))}px, 0)`;
+      }
       if (t < 1) { scrollRAF = requestAnimationFrame(stepScroll); return; }
       scrollAnim = null;
       scrollRAF = 0;
@@ -1412,6 +1423,7 @@
     function renderScrollBand(box, w, rect, winSpans) {
       const a = scrollAnim;
       const band = a.band;
+      band.leftcol = a.leftcol;
       const gutterW = w.number_width || 0;
       const strip = document.createElement("div");
       strip.className = "scroll-band";
@@ -3702,12 +3714,15 @@
     }
 
     // Drag-select autoscroll: re-send the held drag on a timer while it sits in the
-    // top/bottom band, since the browser fires no mousemove while the pointer is still.
+    // edge band (top/bottom rows, and the first/last columns for a `nowrap` pan),
+    // since the browser fires no mousemove while the pointer is still.
     const AUTOSCROLL_MS = 40;
     let autoscrollCell = null, autoscrollTimer = null;
-    function inScrollZone(row) { return row <= 0 || row + 2 >= editorRows + 1; }
+    function inScrollZone(row, col) {
+      return row <= 0 || row + 2 >= editorRows + 1 || col <= 0 || col + 1 >= cols;
+    }
     function armAutoscroll(row, col) {
-      if (dragBtn === "left" && inScrollZone(row)) {
+      if (dragBtn === "left" && inScrollZone(row, col)) {
         autoscrollCell = { row, col };
         if (!autoscrollTimer) autoscrollTimer = setInterval(autoscrollTick, AUTOSCROLL_MS);
       } else {

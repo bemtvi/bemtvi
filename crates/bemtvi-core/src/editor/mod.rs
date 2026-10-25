@@ -1590,9 +1590,10 @@ pub struct Editor {
     pub mouse_wheels: Vec<mouse::WheelGesture>,
 
     /// Set by a scroll command or a cursor motion at the moment it fires:
-    /// `(top, cursor.line)` *before* the move. Consumed at the end of `input` to
-    /// build `pending_scroll` when the viewport ends up moving more than a line.
-    scroll_from: Option<(usize, usize)>,
+    /// `(top, cursor.line, leftcol)` *before* the move. Consumed at the end of
+    /// `input` to build `pending_scroll` when the viewport ends up moving more than a
+    /// line or a column.
+    scroll_from: Option<(usize, usize, usize)>,
     /// The scroll gesture from the most recent input, projected into the next
     /// `View` and then cleared (so it animates exactly once).
     pending_scroll: Option<PendingScroll>,
@@ -2684,7 +2685,7 @@ impl Editor {
         // typing is an edit, which unsets the snapshot like any other.
         let pre_tick = self.buffer().changedtick;
         if self.scroll_gesture_mode() {
-            self.scroll_from = Some((self.top, self.cursor.line));
+            self.scroll_from = Some((self.top, self.cursor.line, self.leftcol));
         }
 
         // Dot-repeat recording. The *outer* call (not a `.` replay) records its
@@ -2869,7 +2870,7 @@ impl Editor {
         if self.scroll_from.is_some() || !self.scroll_gesture_mode() {
             return;
         }
-        self.scroll_from = Some((self.top, self.cursor.line));
+        self.scroll_from = Some((self.top, self.cursor.line, self.leftcol));
     }
 
     /// Whether a viewport move in the current mode slides: not in insert or command
@@ -2892,16 +2893,19 @@ impl Editor {
     }
 
     /// Turn a recorded `scroll_from` into a `pending_scroll` animation when the
-    /// focused window's viewport moved more than a line — an explicit scroll, an
-    /// off-screen motion, or the mouse wheel. A one-line shift (holding `j`/`k` at
-    /// the edge, or a single-line wheel notch) is left alone so continuous
-    /// scrolling stays crisp. Shared by keyboard [`input`](Self::input) and the
-    /// wheel ([`mouse`](Self::mouse)) so both animate identically.
+    /// focused window's viewport moved more than a line or (under `nowrap`) a column
+    /// — an explicit scroll, an off-screen motion, or the mouse wheel. A one-line or
+    /// one-column shift (holding `j`/`k`/`l` at the edge, a single-line wheel notch,
+    /// a drag-scroll step) is left alone so continuous scrolling stays crisp. Shared
+    /// by keyboard [`input`](Self::input) and the wheel ([`mouse`](Self::mouse)) so
+    /// both animate identically.
     pub(crate) fn finalize_scroll_gesture(&mut self) {
-        let Some((from_top, from_cursor)) = self.scroll_from.take() else {
+        let Some((from_top, from_cursor, from_leftcol)) = self.scroll_from.take() else {
             return;
         };
-        if from_top.abs_diff(self.top) <= 1 {
+        let vertical = from_top.abs_diff(self.top) > 1;
+        let horizontal = from_leftcol.abs_diff(self.leftcol) > 1;
+        if !vertical && !horizontal {
             return;
         }
         // Honor `'scrollanim'` / `'scrollanimduration'`: with animation off (or a
@@ -2931,19 +2935,39 @@ impl Editor {
                 from.max(to.saturating_sub(cap))
             }
         };
-        let from_top = clamp(from_top, self.top);
-        let from_cursor = clamp(from_cursor, self.cursor.line);
-        let dist = from_top.abs_diff(self.top) as u64;
-        // 8ms per line of travel, clamped to the configurable `scrollanimduration`
-        // ceiling (default 160). The floor is the usual 80ms, lowered to the cap
-        // itself when the user picks a shorter one so a small cap means a fixed,
-        // snappy slide rather than an empty range.
+        // A one-line vertical shift riding a sideways pan is no slide of its own.
+        let (from_top, from_cursor) = if vertical {
+            (
+                clamp(from_top, self.top),
+                clamp(from_cursor, self.cursor.line),
+            )
+        } else {
+            (self.top, self.cursor.line)
+        };
+        // The same bound sideways: at most a couple of text widths of travel.
+        let hcap = self.text_width().saturating_mul(2).max(1);
+        let from_leftcol = if !horizontal {
+            self.leftcol
+        } else if from_leftcol > self.leftcol {
+            from_leftcol.min(self.leftcol + hcap)
+        } else {
+            from_leftcol.max(self.leftcol.saturating_sub(hcap))
+        };
+        // 8ms per line of travel (4ms per column, a column being about half a line's
+        // height wide), clamped to the configurable `scrollanimduration` ceiling
+        // (default 160). The floor is the usual 80ms, lowered to the cap itself when
+        // the user picks a shorter one so a small cap means a fixed, snappy slide
+        // rather than an empty range.
+        let dist = (from_top.abs_diff(self.top) as u64 * 8)
+            .max(from_leftcol.abs_diff(self.leftcol) as u64 * 4);
         self.pending_scroll = Some(PendingScroll {
             from_top,
             to_top: self.top,
             from_cursor,
             to_cursor: self.cursor.line,
-            duration_ms: (dist * 8).clamp(80.min(dur_cap), dur_cap),
+            from_leftcol,
+            to_leftcol: self.leftcol,
+            duration_ms: dist.clamp(80.min(dur_cap), dur_cap),
         });
     }
 

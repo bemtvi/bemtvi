@@ -69,7 +69,12 @@ brings the view back to it, as does an input method starting to compose. A page 
 pages from the caret's place. Each window keeps its own scroll while focus is
 elsewhere, including one you scrolled without focusing it. Shift with the wheel
 scrolls sideways (down goes right), as does a tilting wheel or a touchpad; a long
-line only scrolls sideways with `'wrap'` off.
+line only scrolls sideways with `'wrap'` off. Sideways scrolls slide like vertical
+ones.
+
+Dragging a selection to the top or bottom of a window scrolls it while the pointer
+stays there, and with `'wrap'` off so does dragging it to the window's left or right
+edge, so a selection can grow past what is on screen in any direction.
 
 Each window shows where its view is: a slim thumb along the right edge for the lines
 in view, and with `'wrap'` off one along the bottom of the text for the columns,
